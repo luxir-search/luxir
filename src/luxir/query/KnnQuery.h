@@ -246,6 +246,17 @@ public:
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
+  // Flat-slot rounds answered from a retained exact ranking, no column scan.
+  static inline std::atomic<int64_t> flatRoundsServedForTests{0};
+  // Test/benchmark seam: rescan flat slots every round (the old behavior).
+  static inline bool disableFlatRetainForTests = false;
+  // A flat slot scans plainly this many times per query before a scan
+  // retains its ranking (round 1 and the first deepen round stay as cheap
+  // as a rescan; tests lower it to reach served rounds sooner), and the
+  // retaining pass keeps FLAT_RETAIN_FACTOR times its round's cut past the
+  // already pooled docs, so later deepen rounds skip the column scan.
+  static inline int32_t flatRetainAfterScans = 2;
+  static constexpr int64_t FLAT_RETAIN_FACTOR = 4;
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
   // broke and deepen rounds silently regressed to re-returning the pool.
@@ -303,6 +314,13 @@ public:
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
     return a.valueRank < b.valueRank;
   }
+
+  // betterHit as a functor type, so sort and selection inline the order.
+  struct BetterHit {
+    bool operator()(const VectorEngineHit& a, const VectorEngineHit& b) const noexcept {
+      return betterHit(a, b);
+    }
+  };
 
   /// Strict total order on collapsed doc hits (same shape as betterHit).
   static bool betterDoc(const DocHit& a, const DocHit& b) noexcept {
@@ -1707,6 +1725,15 @@ public:
       int32_t dims;
       int32_t metric;
       bool normalizeColumnOnCosineRescore;
+      // Doc mode: the query the last pass scored and its plain passes so
+      // far, and the exact ranking the last retaining pass kept, its
+      // eligible doc count (-1: none yet) and the column's rank count.  See
+      // search() and serveRetained().
+      std::vector<VectorEngineHit> retained;
+      std::vector<float> retainedQuery;
+      int32_t queryScans = 0;
+      int64_t retainedEligible = -1;
+      int64_t retainedRanks = 0;
 
     public:
       SegmentFlatColumnVectorEngine(int32_t segOrd,
@@ -1739,7 +1766,15 @@ public:
           return result;
         }
 
-        BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
+        if constexpr (!Groups) {
+          if (!sameQuery(request)) {
+            retainedQuery.assign(request.query, request.query + dims);
+            retained.clear();
+            retainedEligible = -1;
+            queryScans = 0;
+          }
+          if (serveRetained(request, result)) return result;
+        }
         int64_t eligibleDocs = 0;
         int64_t scanned = 0;
         if (segInfo == nullptr) {
@@ -1766,12 +1801,17 @@ public:
         // served by exactly one slot, so cleared ranks here are exactly
         // this engine's prior emissions.)  Skipped docs do not count toward
         // eligibleDocs: poolExhausted means "a deeper request adds nothing",
-        // and pooled docs never will.
+        // and pooled docs never will.  A retaining pass (skipPooled false)
+        // ranks pooled docs too; serveRetained() applies the exclusion.
         std::span<const uint8_t> elig =
           (size_t)segOrd < request.eligible.size()
             ? request.eligible[(size_t)segOrd]
             : std::span<const uint8_t>{};
-        auto pooledInRun = [&elig](int64_t begin, int64_t end) {
+        // skipPooled is a compile-time tag (std::true_type / false_type): as
+        // a runtime flag captured by reference it was re-tested per rank and
+        // slowed plain single-valued scans by ~12%.
+        auto pooledInRun = [&elig](int64_t begin, int64_t end, auto skipPooled) LUXIR_INLINE {
+          if constexpr (!decltype(skipPooled)::value) return false;
           if (elig.empty()) return false;
           for (int64_t r = begin; r < end; r++) {
             if (((elig[(size_t)(r >> 3)] >> (r & 7)) & 1) == 0) return true;
@@ -1779,36 +1819,37 @@ public:
           return false;
         };
 
-        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
-        // of eligible docs, resolved through its own valDoc cursor (windows
-        // ascend).  Reads that cursor causes count as the window's cold pages,
-        // which only leans toward staying on.
-        StrColReader& col = vr.strColReader();
-        RowReadAhead::Gate gate;
-        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
-                           (size_t)col.fixedValueSize(), numVals);
-        std::optional<MonoReader::BulkValues> aheadValDoc;
-        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
-        int32_t aheadDoc = -1;
-        bool aheadEligible = false;
-        auto eligibleRank = [&](int64_t r) {
-          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
-          if (doc != aheadDoc) {
-            aheadDoc = doc;
-            aheadEligible = docEligible(doc);
-          }
-          return aheadEligible;
-        };
-        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
-          if (domain == nullptr) ahead.scanAt(rank);
-          else ahead.scanAt(rank, eligibleRank);
-        };
-
+        // One full pass over the column.  Read-ahead (see RowReadAhead); a
+        // filtered scan advises only the rows of eligible docs, resolved
+        // through its own valDoc cursor (windows ascend).  Reads that cursor
+        // causes count as the window's cold pages, which only leans toward
+        // staying on.
+        //
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
         // pass.  liveDocs/domain are applied as a per-run predicate.
-        auto scan = [&](auto emit) {
+        StrColReader& col = vr.strColReader();
+        RowReadAhead::Gate gate;
+        auto scan = [&](auto emit, auto skipPooled) {
+          RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
+                             (size_t)col.fixedValueSize(), numVals);
+          std::optional<MonoReader::BulkValues> aheadValDoc;
+          if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+          int32_t aheadDoc = -1;
+          bool aheadEligible = false;
+          auto eligibleRank = [&](int64_t r) {
+            int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+            if (doc != aheadDoc) {
+              aheadDoc = doc;
+              aheadEligible = docEligible(doc);
+            }
+            return aheadEligible;
+          };
+          auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+            if (domain == nullptr) ahead.scanAt(rank);
+            else ahead.scanAt(rank, eligibleRank);
+          };
           if (v2d.mono != nullptr) {
             MonoReader::BulkValues valDoc(*v2d.mono);
             int64_t idx = valDoc.next();
@@ -1822,7 +1863,7 @@ public:
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
               readAhead(rank);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
+              if (docEligible(docId) && !pooledInRun(rank, end, skipPooled)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
                   if constexpr (Groups) scanned += end - rank;
@@ -1839,7 +1880,7 @@ public:
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
               readAhead(rank);
-              if (pooledInRun(rank, rank + 1)) continue;
+              if (pooledInRun(rank, rank + 1, skipPooled)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
               eligibleDocs++;
@@ -1850,7 +1891,14 @@ public:
               });
             }
           }
+          if (statsForTests) {
+            int64_t count = Groups ? scanned : eligibleDocs;
+            statsForTests->vectors += count;
+            statsForTests->bytes += count * dims * (int64_t)sizeof(float);
+          }
         };
+
+        BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
         if constexpr (Groups) {
           // Exact vectors arrive in doc order. Join one bulk key walk to
           // that stream; drop-policy members are rejected before scoring.
@@ -1861,18 +1909,67 @@ public:
               if (!heap.competitive(hit)) return;
               const auto* key = keyAt(doc);
               if (key != nullptr) heap.offerKey(hit, *key, doc);
-            });
+            }, std::true_type{});
           });
-        } else scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
-          unused(doc);
-          heap.offer(makeHit());
-        });
-
-        if (statsForTests) {
-          int64_t count = Groups ? scanned : eligibleDocs;
-          statsForTests->vectors += count;
-          statsForTests->bytes += count * dims * (int64_t)sizeof(float);
+        } else if (disableFlatRetainForTests || queryScans < flatRetainAfterScans) {
+          // The first scans of a query are plain passes, as cheap as they
+          // get: a query that stops by its first deepen round (most do)
+          // never pays for retention, whose bigger selection costs more than
+          // one rescan saves.  Only a second deepen round retains (below).
+          scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
+            unused(doc);
+            heap.offer(makeHit());
+          }, std::true_type{});
+          queryScans++;
+        } else {
+          // Retaining pass: rank every eligible doc, pooled or not, and keep
+          // headroom past this round's cut, so later deepen rounds are
+          // served from memory.  Pooled docs are the slot's best-ranked
+          // ones (each round emits the top of the not-pooled rest), so the
+          // headroom past the cleared ranks is what a later round can use.
+          int64_t cleared = 0;
+          if (!elig.empty()) {
+            int64_t set = 0;
+            for (uint8_t byte : elig) set += std::popcount(byte);
+            cleared = std::max<int64_t>(0, numVals - set);
+          }
+          int64_t limit = std::min(numVals, cleared + mulClamped(
+              request.candidates, FLAT_RETAIN_FACTOR, numVals));
+          // Top-limit selection by buffer-and-prune: append hits that beat
+          // the last prune's cut, nth_element back to limit when the buffer
+          // doubles.  Amortized O(1) per hit, unlike a limit-sized heap.
+          retained.clear();
+          retained.reserve((size_t)(2 * limit));
+          VectorEngineHit cut{};
+          bool haveCut = false;
+          auto prune = [&] {
+            std::nth_element(retained.begin(), retained.begin() + (limit - 1),
+                             retained.end(), BetterHit{});
+            retained.resize((size_t)limit);
+            cut = retained.back();
+            haveCut = true;
+          };
+          scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
+            unused(doc);
+            VectorEngineHit hit = makeHit();
+            if (haveCut && !betterHit(hit, cut)) return;
+            retained.push_back(hit);
+            if ((int64_t)retained.size() == 2 * limit) prune();
+          }, std::false_type{});
+          if ((int64_t)retained.size() > limit) prune();
+          std::sort(retained.begin(), retained.end(), BetterHit{});
+          retainedEligible = eligibleDocs;
+          retainedRanks = numVals;
+          if (serveRetained(request, result)) return result;
+          // Exclusion bits that are not this slot's top-ranked emissions
+          // (only a test engine wrapper can send those): plain pass.
+          eligibleDocs = 0;
+          scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
+            unused(doc);
+            heap.offer(makeHit());
+          }, std::true_type{});
         }
+
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         if constexpr (Groups) result.poolExhausted = !heap.truncated;
@@ -1881,6 +1978,55 @@ public:
       }
 
     private:
+      // True when this engine's previous passes scored this query vector.
+      bool sameQuery(const VectorSearchRequest& request) const {
+        return !retainedQuery.empty()
+            && std::equal(retainedQuery.begin(), retainedQuery.end(), request.query);
+      }
+      // Serve a doc-mode round from the ranking a previous pass retained:
+      // the top request.candidates not-pooled docs, and poolExhausted iff no
+      // more remain - exactly what a pass honoring request.eligible returns,
+      // since the scores are the same exact column scores and betterHit is a
+      // strict total order.  That holds when every cleared bit in the slot's
+      // span is the best rank of a retained doc (so pooled docs are exactly
+      // the retained ones whose bit is clear, other docs' runs hold no
+      // cleared bit, and no doc is pooled through a non-best rank), and when
+      // the retained not-pooled docs either fill the request or are all the
+      // eligible docs there are.  Otherwise the caller scans.  Keyed on the
+      // query vector's contents, so search() stays a pure function of its
+      // arguments (the domain is fixed per engine).
+      bool serveRetained(const VectorSearchRequest& request,
+                         VectorSearchResult& result) const {
+        if (retainedEligible < 0 || !sameQuery(request)) return false;
+        std::span<const uint8_t> elig =
+          (size_t)segOrd < request.eligible.size()
+            ? request.eligible[(size_t)segOrd]
+            : std::span<const uint8_t>{};
+        auto pooled = [&elig](int64_t r) {
+          return !elig.empty()
+              && (((elig[(size_t)(r >> 3)] >> (r & 7)) & 1) == 0);
+        };
+        int64_t pooledRetained = 0;
+        for (const auto& hit : retained) pooledRetained += pooled(hit.valueRank) ? 1 : 0;
+        if (!elig.empty()) {
+          // Bits past the last rank are kept clear (fillAllRanksSet).
+          int64_t set = 0;
+          for (uint8_t byte : elig) set += std::popcount(byte);
+          if (retainedRanks - set != pooledRetained) return false;
+        }
+        int64_t fresh = (int64_t)retained.size() - pooledRetained;
+        bool complete = (int64_t)retained.size() == retainedEligible;
+        if (fresh < request.candidates && !complete) return false;
+        result.hits.clear();
+        result.hits.reserve((size_t)std::min(fresh, request.candidates));
+        for (const auto& hit : retained) {
+          if ((int64_t)result.hits.size() >= request.candidates) break;
+          if (!pooled(hit.valueRank)) result.hits.push_back(hit);
+        }
+        result.poolExhausted = retainedEligible - pooledRetained <= request.candidates;
+        flatRoundsServedForTests.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
       // The domain, when present, is live-filtered and is the complete
       // eligibility predicate (PrepareContext contract); null means the
       // segment has no deletes and no filters.
@@ -2279,8 +2425,10 @@ public:
         // after a poolExhausted=true round (host loop), so every prior list is
         // already drained at this depth - omitting them from this round's
         // exhaustion accounting is correct.  Flat (below-threshold) engines are
-        // breadth-independent and small, so they are simply re-run; they honor
-        // request.eligible like every engine (a doc whose pooled best vector is
+        // breadth-independent: they get a unit every round, and a doc-mode
+        // flat slot answers rounds after its third from the exact ranking
+        // its third scan retained, rescanning only once that runs out; they
+        // honor request.eligible like every engine (a doc whose pooled best vector is
         // excluded can never improve an exact score, so the whole doc is
         // skipped), which keeps search() a pure function of its arguments (the
         // bitmaps are arguments; test oracles rely on the purity).

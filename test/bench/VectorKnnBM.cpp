@@ -283,8 +283,12 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
   return true;
 }
 
+// flatSegments > 0 appends that many small segments without overlays after
+// the build, each 1/100 of nDocs, so the query mixes exact column slots into
+// its rounds; range(1) == 0 then makes those slots rescan their column each
+// round instead of serving later rounds from a retained ranking.
 void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
-                  bool skew = false) {
+                  bool skew = false, int32_t flatSegments = 0) {
   int64_t nDocs = luxir::unit_tests
       ? LuxirTest::scaleTestWork(240)
       : state.range(0);
@@ -294,6 +298,14 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
 
   CollectionHelper helper("main");
   buildVectorBenchIndex(helper, nDocs, dims, valuesPerDoc, faissAux, skew);
+  int64_t flatSegDocs = std::max<int64_t>(1, nDocs / 100);
+  for (int32_t seg = 0; seg < flatSegments; seg++) {
+    indexVectorBatch(helper, nDocs + seg * flatSegDocs, flatSegDocs, dims,
+                     valuesPerDoc, skew);
+    helper.commit();
+  }
+  SearchOverridesGuard retainGuard(KnnQuery::disableFlatRetainForTests);
+  KnnQuery::disableFlatRetainForTests = flatSegments > 0 && state.range(1) == 0;
   std::vector<float> query = makeQueryVector(dims);
   std::string field = multiValued ? "bench_vs" : "bench_v";
 
@@ -987,6 +999,11 @@ LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf, true, true)->Arg(50'000);
 // == 1).  IVF-only: the flat column engine doc-collapses during its scan
 // and so never deepens on multiplicity.
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf_skew, true, true, true)->Arg(50'000);
+// The skew query beside 40 small flat segments, whose docs fill the pool
+// target in round 1 (folds == 0): retention must cost a single-round query
+// nothing, so retain = 1 must match retain = 0 (the rescan baseline).
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf_skew_flat_tail, true, true, true, 40)
+    ->ArgNames({"nDocs", "retain"})->Args({50'000, 0})->Args({50'000, 1});
 
 // Two sweeps over (nprobe, refine); 0 = production default for either knob.
 // nprobe sweep at default refine: breadth axis, up to exhaustive-over-lists.

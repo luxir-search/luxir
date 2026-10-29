@@ -12213,6 +12213,8 @@ class BooleanQuery::Weight final : public Query::Weight {
     std::vector<DomainHandle> filterDomains;
     std::span<const uint8_t> prohibitedCacheRoutes;
     bool hasFilters = false;
+    // The prohibited clauses are folded into filterDomains.
+    bool prohibitedFolded = false;
     bool prohibitedCacheEnabled = false;
     ScorePolicy scorePolicy;
     int minShouldMatch = 0;
@@ -12229,7 +12231,8 @@ class BooleanQuery::Weight final : public Query::Weight {
                           std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                           std::vector<DomainHandle>&& filterDomains,
                           std::span<const uint8_t> prohibitedCacheRoutes,
-                          bool hasFilters, bool prohibitedCacheEnabled,
+                          bool hasFilters, bool prohibitedFolded,
+                          bool prohibitedCacheEnabled,
                           int minShouldMatch, bool needsScores,
                           bool allowsPruning,
                           bool uniformConstantCandidate,
@@ -12241,7 +12244,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         prohibitedSources(std::move(prohibitedSources)),
         filterDomains(std::move(filterDomains)),
         prohibitedCacheRoutes(prohibitedCacheRoutes),
-        hasFilters(hasFilters),
+        hasFilters(hasFilters), prohibitedFolded(prohibitedFolded),
         prohibitedCacheEnabled(prohibitedCacheEnabled),
         scorePolicy(scorePolicy), minShouldMatch(minShouldMatch),
         needsScores(needsScores), allowsPruning(allowsPruning),
@@ -12277,12 +12280,16 @@ class BooleanQuery::Weight final : public Query::Weight {
         filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
         filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
       }
-      auto prohibitedSegmentSources = QueryPrep::segmentSources(
-          targetPool, QueryPrep::preparedSpan(prohibitedSources));
-      auto prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
-          prohibitedSources.size());
+      std::span<Query::SegmentSource*> prohibitedSegmentSources;
+      std::span<Query::ScorerSupplier*> prohibitedSuppliers;
+      if (!prohibitedFolded) {
+        prohibitedSegmentSources = QueryPrep::segmentSources(
+            targetPool, QueryPrep::preparedSpan(prohibitedSources));
+        prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
+            prohibitedSources.size());
+      }
       size_t segmentCount = reader.segments().size();
-      for (size_t i = 0; i < prohibitedSources.size(); i++) {
+      for (size_t i = 0; i < prohibitedSuppliers.size(); i++) {
         QueryPrep::ProhibitedCacheRoute route = prohibitedCacheRoute(
             prohibitedCacheRoutes, i, (size_t) segment.ord, segmentCount);
         prohibitedSuppliers[i] = QueryPrep::prohibitedSupplier(
@@ -12574,18 +12581,39 @@ public:
   std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);
+    auto prohibitedSources = QueryPrep::prepareFilterSources(
+        prohibitedWeights, prohibitedUses, ctx);
     std::vector<DomainHandle> filterDomains(
         ctx.reader.segments().size());
     std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
 
-    if (!filterSources.empty()) {
+    // A domain-consuming child (kNN) selects its top-k inside the child
+    // domain, so an exclusion applied only to its output would act as a
+    // post-filter and return fewer than k hits. Whenever a scoring child
+    // prepares, fold the prohibited clauses into that domain as well: the
+    // domain becomes outer AND filters AND NOT prohibited, and it replaces
+    // the prohibited scorers as the required domain supplier, so each
+    // exclusion is evaluated once. Excluded docs can never match this
+    // boolean, so narrowing the domain changes no other child's result.
+    bool foldProhibited = !prohibitedSources.empty()
+        && !QueryPrep::disableProhibitedDomainFoldForTests
+        && (QueryPrep::anyNeedsPrepare(mandatoryWeights)
+            || QueryPrep::anyNeedsPrepare(optionalWeights));
+    if (!filterSources.empty() || foldProhibited) {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
-        filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
-          QueryPrep::preparedSpan(filterSources), ctx.reader,
-          ctx.reader.segments()[segnum], outerDomain);
-        filterDomains[segnum] = std::move(filterDomains[segnum])
-            .pinnedWith(context.filterUses);
+        auto& segment = ctx.reader.segments()[segnum];
+        DomainHandle domain = filterSources.empty()
+            ? DomainHandle::borrowed(outerDomain)
+            : QueryPrep::materializeEffectiveIntersection(
+                QueryPrep::preparedSpan(filterSources), ctx.reader,
+                segment, outerDomain);
+        if (foldProhibited) {
+          domain = QueryPrep::materializeEffectiveExclusion(
+              QueryPrep::preparedSpan(prohibitedSources), ctx.reader,
+              segment, std::move(domain));
+        }
+        filterDomains[segnum] = std::move(domain).pinnedWith(context.filterUses);
         childDomainPtrs[segnum] = filterDomains[segnum].get();
       }
     } else {
@@ -12600,15 +12628,22 @@ public:
       ctx.parallel, ctx.warnings};
     auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
     auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
-    auto prohibitedSources = QueryPrep::prepareFilterSources(
-        prohibitedWeights, prohibitedUses, ctx);
+    // The folded domain supplier is required, which would demote an
+    // optional-only group to pure scoring; keep at least one optional
+    // clause required, as it was beside a prohibited clause alone.
+    int preparedMinShouldMatch = minShouldMatch;
+    if (foldProhibited && filterSources.empty() && mandatoryWeights.empty()
+        && !optionalWeights.empty()) {
+      preparedMinShouldMatch = std::max(1, minShouldMatch);
+    }
 
     return std::make_unique<BooleanPreparedWeight>(
       filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores,
       std::move(optionalSources),
       std::move(prohibitedSources), std::move(filterDomains),
-      prohibitedCacheRoutes, !filterSources.empty(),
-      prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning,
+      prohibitedCacheRoutes, !filterSources.empty() || foldProhibited,
+      foldProhibited, prohibitedCacheEnabled, preparedMinShouldMatch,
+      needsScores, allowsPruning,
       uniformConstantCandidate, scorePolicy);
   }
 

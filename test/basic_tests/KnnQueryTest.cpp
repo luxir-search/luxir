@@ -1221,6 +1221,101 @@ TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
   req->done();
 }
 
+// must_not is a pre-filter for kNN like filter is: excluding the nearest
+// neighbors must still return k hits, for a required or optional kNN, with or
+// without filters and deletes, and through a nested boolean.
+TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 12; i++) {
+    h.index(flatdoc("id", std::format("d{}", i),
+                    "state_s", i < 5 ? "blocked" : "ok",
+                    "foo_w", i == 6 ? "orange" : "apple",
+                    "body_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto run = [&](bool optional, bool filtered, bool nested) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(10).countLimit().fields({"id"});
+    auto& mr = cur.mr();
+    std::vector<api::Query> knn{qb::knn(mr, "body_v", {0.0f, 0.0f}, 3)};
+    std::vector<api::Query> blocked{qb::match(mr, "state_s", "blocked")};
+    std::vector<api::Query> none, filter;
+    if (filtered) filter.push_back(qb::match(mr, "foo_w", "apple"));
+    std::vector<api::Query> q{optional
+        ? qb::boolean(mr, none, knn, blocked, filter)
+        : qb::boolean(mr, knn, none, blocked, filter)};
+    cur.rawQuery() = nested ? qb::boolean(mr, std::span<const api::Query>(q)) : q[0];
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->errorMsg();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    return ids;
+  };
+  using Ids = std::vector<std::string>;
+  for (bool optional : {false, true}) {
+    for (bool nested : {false, true}) {
+      EXPECT_EQ(run(optional, false, nested), (Ids{"d5", "d6", "d7"}));
+      // Beside a filter an optional clause only scores (min_match 0).
+      EXPECT_EQ(run(optional, true, nested), optional
+          ? (Ids{"d10", "d11", "d5", "d7", "d8", "d9"}) : (Ids{"d5", "d7", "d8"}));
+    }
+  }
+
+  {
+    // Without the fold, must_not post-filters the kNN top-k.
+    SearchOverridesGuard fold(QueryPrep::disableProhibitedDomainFoldForTests);
+    QueryPrep::disableProhibitedDomainFoldForTests = true;
+    EXPECT_TRUE(run(false, false, false).empty());
+  }
+
+  h.deleteById("d5", UpdateMessage::COMMIT);
+  EXPECT_EQ(run(false, false, false), (Ids{"d6", "d7", "d8"}));
+  EXPECT_EQ(run(false, true, false), (Ids{"d7", "d8", "d9"}));
+}
+
+// A prohibited clause that matches everything leaves the kNN no domain: 0
+// hits, not a hang or the unfiltered top-k. One that matches nothing changes
+// nothing.
+TEST_F(KnnQueryTest, booleanProhibitedMatchAllOrNothingWithKnn) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 6; i++) {
+    h.index(flatdoc("id", std::format("d{}", i), "state_s", "ok",
+                    "body_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto run = [&](bool optional, bool matchAll) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(10).countLimit().fields({"id"});
+    auto& mr = cur.mr();
+    std::vector<api::Query> knn{qb::knn(mr, "body_v", {0.0f, 0.0f}, 3)};
+    std::vector<api::Query> none;
+    std::vector<api::Query> prohibited{matchAll
+        ? qb::all()
+        : qb::match(mr, "state_s", "blocked")};
+    cur.rawQuery() = optional
+        ? qb::boolean(mr, none, knn, prohibited, none)
+        : qb::boolean(mr, knn, none, prohibited, none);
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->errorMsg();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    return ids;
+  };
+  using Ids = std::vector<std::string>;
+  for (bool optional : {false, true}) {
+    EXPECT_TRUE(run(optional, true).empty());
+    EXPECT_EQ(run(optional, false), (Ids{"d0", "d1", "d2"}));
+  }
+}
+
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
@@ -2569,6 +2664,93 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     EXPECT_EQ(ids[2], "c");
     EXPECT_EQ(ids[3], "d");
     for (const auto& id : ids) EXPECT_NE(id, "del");
+  }
+}
+
+// Flat slots answer deepen rounds from the exact ranking a retaining scan
+// kept. Many small multi-valued flat segments beside a deepening IVF
+// segment, with deletes: the output must be bit-identical to rescanning every
+// round, serial and parallel; a full scan fraction must match exact search.
+// By default the first two scans stay plain, so a two-round query never
+// retains; retaining from the first scan serves its second round.
+TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  // A background merge mid-test would reshape the slots between runs.
+  h.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+
+  auto vecs = [](float x, int n) {
+    std::vector<std::vector<float>> out;
+    for (int i = 0; i < n; i++) out.push_back({x + (float)i * 0.01f, (float)(i % 3) * 0.1f, 0, 0});
+    return out;
+  };
+  // Dense near docs make IVF candidates collapse, so the query deepens.
+  for (int i = 0; i < 6; i++) {
+    h.index(flatdoc("id", "z" + std::to_string(i), "emb_vs", vecs((float)i * 0.3f, 30)));
+  }
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs", vecs(5.0f + (float)i * 0.2f, 1)));
+  }
+  h.commit({"*"});
+  for (int seg = 0; seg < 10; seg++) {
+    for (int j = 0; j < 20; j++) {
+      float x = 0.11f + (float)seg * 0.07f + (float)j * 0.45f;
+      h.index(flatdoc("id", std::format("s{}_{}", seg, j), "emb_vs", vecs(x, 1 + j % 3)));
+    }
+    h.commit();
+  }
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 11u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr);
+  }
+  h.deleteByIds({"z2", "s3_0", "s7_1"}, UpdateMessage::COMMIT);
+
+  struct Run {
+    std::vector<std::string> ids;
+    std::vector<float> scores;
+    int64_t rounds = 0;
+  };
+  auto run = [&](bool retain, bool parallel, float minScanFraction, bool exact,
+                 int32_t refine) {
+    SearchOverridesGuard retainGuard(KnnQuery::disableFlatRetainForTests);
+    KnnQuery::disableFlatRetainForTests = !retain;
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4, /*nprobe=*/0,
+                           refine, exact, minScanFraction);
+    req->execute(parallel);
+    Run out{resultIds(*req), resultScores(*req), stats.rounds.load()};
+    req->done();
+    return out;
+  };
+  // refine 300 deepens once, 600 twice.
+  for (int32_t after : {0, 2}) for (int32_t refine : {300, 600}) for (float fraction : {0.0f, 1.0f}) {
+    SearchOverridesGuard afterGuard(KnnQuery::flatRetainAfterScans);
+    KnnQuery::flatRetainAfterScans = after;
+    int64_t served0 = KnnQuery::flatRoundsServedForTests.load();
+    Run base = run(false, false, fraction, false, refine);
+    EXPECT_EQ(KnnQuery::flatRoundsServedForTests.load(), served0);
+    if (fraction == 0.0f) {
+      EXPECT_EQ(base.rounds, refine == 300 ? 2 : 3) << "after=" << after << " refine=" << refine;
+    }
+    ASSERT_EQ(base.ids.size(), 4u);
+    for (bool parallel : {false, true}) {
+      SCOPED_TRACE(std::format("after={} refine={} fraction={} parallel={}", after, refine, fraction, parallel));
+      Run retained = run(true, parallel, fraction, false, refine);
+      EXPECT_EQ(retained.ids, base.ids);
+      EXPECT_EQ(retained.scores, base.scores);
+      EXPECT_EQ(retained.rounds, base.rounds);
+    }
+    if (fraction == 0.0f) {
+      int64_t served = KnnQuery::flatRoundsServedForTests.load() - served0;
+      if (after == 2 && refine == 300) EXPECT_EQ(served, 0);
+      else EXPECT_GT(served, 0) << "after=" << after << " refine=" << refine;
+    } else {
+      EXPECT_EQ(base.ids, run(false, false, 0.0f, true, refine).ids);
+    }
   }
 }
 

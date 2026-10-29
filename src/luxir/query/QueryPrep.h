@@ -21,6 +21,7 @@ namespace luxir::QueryPrep {
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
 inline bool disableProhibitedCacheForTests = false;
+inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
@@ -1520,6 +1521,56 @@ inline DomainHandle materializeEffectiveIntersection(
   if (ptrs.empty()) return {};
   if (ptrs.size() == 1) return std::move(sets[0]);
   return DomainHandle(DocSet::intersect(ptrs));
+}
+
+// domain AND NOT (union of sources), under the live-filtered domain contract:
+// a null domain is every doc of a segment without deletes. Each source is
+// materialized inside the domain through its filter cache use, exactly like a
+// filter clause, so a cached exclusion is reused rather than re-run. The
+// result is never null: callers install it as a required domain supplier.
+inline DomainHandle materializeEffectiveExclusion(
+    std::span<const PreparedSource> sources, IndexReader& reader,
+    IndexReader::Segment& segment, DomainHandle domain) {
+  DocSet* base = domain.get();
+  std::vector<DomainHandle> excluded;
+  excluded.reserve(sources.size());
+  for (auto& source : sources) {
+    DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
+    if (set.get() == nullptr) {
+      set = DomainHandle(materialize(
+          source.segmentSource(), segment, base));
+    }
+    if (set.get()->card() > 0) excluded.push_back(std::move(set));
+  }
+  if (excluded.empty() && base != nullptr) return domain;
+
+  int32_t maxDoc = segment.maxDoc();
+  auto out = std::make_unique<RAMBitDocSet>(maxDoc);
+  FixedBitSet& bits = out->mutableBits();
+  size_t numWords = FixedBitSet::sizeInWords(maxDoc);
+  if (base == nullptr) {
+    std::fill(bits.words, bits.words + numWords, ~(uint64_t)0);
+    if ((maxDoc & 63) != 0) {
+      bits.words[numWords - 1] = ((uint64_t)1 << (maxDoc & 63)) - 1;
+    }
+  } else if (base->type == DocSet::Type::BITSET) {
+    const FixedBitSet& from = ((BitDocSet*) base)->bits();
+    std::copy(from.words, from.words + numWords, bits.words);
+  } else {
+    for (int32_t doc : ((ArrDocSet*) base)->docs()) bits.set(doc);
+  }
+  for (auto& set : excluded) {
+    DocSet* docs = set.get();
+    if (docs->type == DocSet::Type::BITSET) {
+      const FixedBitSet& drop = ((BitDocSet*) docs)->bits();
+      for (size_t w = 0; w < numWords; w++) bits.words[w] &= ~drop.words[w];
+    } else {
+      for (int32_t doc : ((ArrDocSet*) docs)->docs()) {
+        bits.words[doc >> 6] &= ~((uint64_t)1 << (doc & 63));
+      }
+    }
+  }
+  return DomainHandle(std::move(out));
 }
 
 } // namespace luxir::QueryPrep

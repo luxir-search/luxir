@@ -303,7 +303,15 @@ explicit build succeeds.
 
 `KnnQuery` creates one vector engine per segment. A segment uses its
 `vec.<field>` FAISS overlay when present, or scans the vector column exactly
-when no overlay exists. FAISS ids are segment-local vector value ranks, so the
+when no overlay exists. The engines search inside the per-segment prepare
+domain, which is live-filtered and already holds every enclosing restriction:
+a boolean folds its `filter` clauses and, when a scoring child such as kNN
+prepares, its `prohibited` (must_not) clauses into the domain it hands its
+children (outer AND filters AND NOT prohibited). The folded domain then replaces the
+boolean's prohibited scorers as its required domain supplier, so each
+exclusion is materialized once, through the same filter cache uses as a
+filter clause. Scoring siblings are not folded: they intersect with the
+kNN's top-k after it ran. FAISS ids are segment-local vector value ranks, so the
 query path maps each returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
@@ -345,7 +353,27 @@ deletions) and handed to the scanners as an eligibility filter, so each
 round's result heap is spent entirely on new candidates and each round
 requests only the projected shortfall rather than re-requesting the whole
 pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
+queries.
+
+Exact column (flat) slots take part in every round with their share of the
+request, floored at k. Their first two scans (round 1 and the first deepen
+round, where the measured deepening queries stop) are plain passes: keeping
+a deeper ranking costs more than the one rescan it would save. A third scan
+scores every eligible
+document and keeps the best few times the round's cut (plus the already
+pooled documents) as an exact ranking; later rounds take the
+next not-pooled documents from it and report exhaustion from its counts,
+which is exactly what a fresh scan excluding the pooled ranks would return,
+since the scores are the same exact scores under the same total order. The
+ranking is used only when every pooled rank in the segment is the best rank
+of a retained document and it holds enough not-pooled documents (or every
+eligible one); otherwise the slot scans again and keeps a deeper ranking.
+Freezing a flat slot outright would not be output-preserving: its fresh
+hits never enter the final top-k (it already returned its own top k), but
+they count toward the pooled-document target that ends deepening, so
+dropping them would change how far the IVF slots deepen. Grouped queries
+still rescan, since excluding a group's pooled best document changes the
+group's representative. Once widening finishes, the final candidate pool is rescanned from
 the full-precision column, sorted by exact score, and collapsed to one hit per
 document.
 

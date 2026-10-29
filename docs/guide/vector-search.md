@@ -346,7 +346,12 @@ too few documents.
 
 The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
-[query facet](faceting.md#query-facets) bucket.
+[query facet](faceting.md#query-facets) bucket. A boolean's `filter` and
+`prohibited` clauses both apply inside the vector search of its `required`
+and `optional` kNN clauses: a required kNN beside `prohibited: [X]` returns
+`k` neighbors that do not match `X`. Other scoring clauses beside the kNN
+(another `required` clause, or `optional` clauses made a constraint through
+`min_match`) still intersect with its top `k` afterwards.
 
 ## Hybrid search
 
