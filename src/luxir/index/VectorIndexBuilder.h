@@ -61,10 +61,14 @@ public:
   static std::atomic<int64_t> ivfBuildCountForTests;
   static std::atomic<int64_t> ivfMergeBuildCountForTests;
   static size_t ivfTrainingSampleBytes;
-  // Per-buffer transform budget, capped by available vectors with a minimum
-  // of one vector. Training rotation uses one buffer; add uses up to two for
-  // raw cosine plus rotation. Untransformed PQ add passes column bytes directly to FAISS.
+  // Add chunk input-byte target. Chunks also hold at least four row tasks
+  // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
+  // Training coarse assignment, training rotation and the complete add
+  // pipeline split rows across TBB tasks. 0 derives the row floor from
+  // ceil(FAISS distance_compute_blas_threshold / dims) to retain BLAS.
+  // PQ codebooks train independently per sub-quantizer regardless of this floor.
+  static int64_t ivfBuildMinRowsPerTask;
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
   // dims shares one matrix (deduplicated in RAM by internVectorRotation).

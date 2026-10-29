@@ -91,7 +91,7 @@ void Collections::validate(const CollectionId& id) {
 Collections::Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
                          oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics)
     : metrics(std::move(metrics)), config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
-      verifyOnOpen(config.store.verify_on_open == "full") {
+      verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   if (config.store.backend == "fs") {
     factory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
@@ -159,16 +159,35 @@ bool Collections::reclaimStorage() {
   return true; // A concurrent drop also warrants retrying the allocation.
 }
 
+size_t Collections::cacheBytes(const CollectionId& id) const {
+  auto it = cacheExceptions.find(id);
+  return it == cacheExceptions.end() ? cacheDefaultBytes : it->second;
+}
+
+void Collections::applyCachePolicy(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
+  if (auto shard = collection->getShard()) {
+    if (auto cache = shard->getReaderManager().filterCache) cache->resize(cacheBytes(id));
+  }
+}
+
+void Collections::listCollection(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
+  std::lock_guard lock(listingMutex);
+  listing[id.tenant].insert_or_assign(id.name, collection);
+}
+
 void Collections::registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
   {
-    std::lock_guard lock(listingMutex);
-    listing[id.tenant].insert_or_assign(id.name, collection);
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(id, collection);
+    listCollection(id, collection);
   }
   events.registered(id, collection);
 }
 
 void Collections::removed(const CollectionId& id) {
   {
+    std::lock_guard policyLock(cachePolicyMutex);
+    cacheExceptions.erase(id);
     std::lock_guard lock(listingMutex);
     if (auto tenant = listing.find(id.tenant); tenant != listing.end()) {
       tenant->second.erase(id.name);
@@ -176,6 +195,47 @@ void Collections::removed(const CollectionId& id) {
     }
   }
   events.removed(id);
+}
+
+std::vector<Collections::Entry> Collections::setCacheBytes(
+    std::string_view tenant, std::string_view collection, size_t bytes) {
+  std::vector<Entry> selected;
+  {
+    std::lock_guard policyLock(cachePolicyMutex);
+    {
+      std::lock_guard lock(listingMutex);
+      if (!collection.empty()) {
+        CollectionId id{std::string(tenant.empty() ? CollectionId::kDefaultTenant : tenant),
+                        std::string(collection)};
+        if (auto t = listing.find(id.tenant); t != listing.end()) {
+          if (auto c = t->second.find(id.name); c != t->second.end()) {
+            selected.push_back({id, c->second, {}});
+          }
+        }
+        if (selected.empty()) {
+          validate(id);
+          throw CollectionNotFoundError("collection '" + id.label() + "' does not exist");
+        }
+      } else {
+        for (const auto& [t, collections] : listing) {
+          if (!tenant.empty() && t != tenant) continue;
+          for (const auto& [name, current] : collections) selected.push_back({{t, name}, current, {}});
+        }
+      }
+    }
+    if (tenant.empty() && collection.empty()) {
+      cacheDefaultBytes = bytes;
+      cacheExceptions.clear();
+    } else {
+      for (const auto& entry : selected) {
+        if (bytes == cacheDefaultBytes) cacheExceptions.erase(entry.id);
+        else cacheExceptions.insert_or_assign(entry.id, bytes);
+      }
+    }
+    for (const auto& entry : selected) applyCachePolicy(entry.id, entry.collection);
+  }
+  for (auto& entry : selected) entry.error = entry.collection->getUnavailableReason();
+  return selected;
 }
 
 std::vector<Collections::Entry> Collections::entries() {
@@ -213,8 +273,13 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
   col->id = name;
   col->shard = std::make_shared<Shard>(*col);
   col->shard->dir = std::move(directory);
+  size_t bytes;
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    bytes = cacheBytes(name);
+  }
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
-      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+      FilterCacheConfig{.maxBytes = bytes});
   col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
@@ -337,9 +402,14 @@ std::vector<Collections::Opened> Collections::open(Role role) {
         }
       }
       auto collection = openCollection(row.id, role, row.incarnation);
-      if (!map.insert(row.id, collection)) throw std::logic_error("collection opened twice");
+      {
+        std::lock_guard lock(cachePolicyMutex);
+        applyCachePolicy(row.id, collection);
+        if (!map.insert(row.id, collection)) throw std::logic_error("collection opened twice");
+        listCollection(row.id, collection);
+      }
       row.collection = std::move(collection);
-      registered(row.id, row.collection);
+      events.registered(row.id, row.collection);
       LOG_INFO("Loaded collection: {}", row.id.label());
     } catch (const std::exception& e) {
       failLoad(row, e);
@@ -548,8 +618,14 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
     throw;
   }
   // The transition owns the name, so the entry is still the expected one.
-  map.replace(name, reserved ? reserved : expected, collection);
-  registered(name, collection);
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(name, collection);
+    Signal::emit("collectionPublishing", collection.get());
+    map.replace(name, reserved ? reserved : expected, collection);
+    listCollection(name, collection);
+  }
+  events.registered(name, collection);
   if (auto shard = expected ? expected->getShard() : nullptr) shard->snapshots->detach();
   {
     std::lock_guard lock(slotsMutex);

@@ -149,7 +149,7 @@ TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeSco
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .exprQuery("rescore(body_w:alpha, neg(popularity_i))^2")
-      .fields({"id_s"}).getScores().getNumber().limit(-1);
+      .fields({"id_s"}).getScores().countLimit().limit(-1);
   req->execute(false);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((std::vector<std::string>{"one", "five"}), resultIds(*req));
@@ -186,7 +186,7 @@ TEST_F(RescoreQueryTest, rescoredMatchAllStillRanks) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .exprQuery("rescore(*:*, popularity_i)")
-      .fields({"id_s"}).getScores().getNumber().limit(2);
+      .fields({"id_s"}).getScores().countLimit().limit(2);
   req->execute(false);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   // Doc order would give 1,2; the rescore ranks by popularity.

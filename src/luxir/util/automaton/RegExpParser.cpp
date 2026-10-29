@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/Utf32ToUtf8.h"
 
 namespace luxir::automaton {
@@ -17,10 +18,24 @@ namespace {
   throw std::runtime_error(std::format("{} at byte {}: {}", message, position, pattern));
 }
 
+void mergeRanges(std::vector<std::pair<int32_t, int32_t>>& ranges) {
+  std::sort(ranges.begin(), ranges.end());
+  size_t size = 0;
+  for (auto [lo, hi] : ranges) {
+    if (size && lo <= ranges[size - 1].second + 1) {
+      ranges[size - 1].second = std::max(ranges[size - 1].second, hi);
+    } else {
+      ranges[size++] = {lo, hi};
+    }
+  }
+  ranges.resize(size);
+}
+
 class Parser {
   std::string_view pattern;
   Budget& budget;
   const CodepointFolder* folder;
+  bool caseInsensitive;
   size_t position = 0;
 
   int32_t next() {
@@ -52,6 +67,7 @@ class Parser {
   }
 
   Automaton fold(std::vector<Automaton>& parts, size_t begin, size_t end, bool unionParts) {
+    if (begin == end) return unionParts ? Automaton::empty(budget) : Automaton::epsilon(budget);
     if (end - begin == 1) return std::move(parts[begin]);
     size_t middle = begin + (end - begin) / 2;
     Automaton left = fold(parts, begin, middle, unionParts);
@@ -60,7 +76,7 @@ class Parser {
   }
 
   Automaton literal(int32_t codepoint) {
-    return Automaton::literal(codepoint, folder, budget);
+    return Automaton::literal(codepoint, folder, caseInsensitive, budget);
   }
 
   Automaton repetition(Automaton a) {
@@ -132,25 +148,24 @@ class Parser {
       first = false;
     }
     if (ranges.empty()) error("empty character class", open, pattern);
-    std::sort(ranges.begin(), ranges.end());
-    std::vector<std::pair<int32_t, int32_t>> merged;
-    for (auto [lo, hi] : ranges) {
-      if (!merged.empty() && lo <= merged.back().second + 1) merged.back().second = std::max(merged.back().second, hi);
-      else merged.emplace_back(lo, hi);
+    mergeRanges(ranges);
+    if (caseInsensitive) {
+      appendCaseAlternates(ranges, budget);
+      mergeRanges(ranges);
     }
     if (negated) {
       std::vector<std::pair<int32_t, int32_t>> complement;
       int32_t current = 0;
-      for (auto [lo, hi] : merged) {
+      for (auto [lo, hi] : ranges) {
         if (current < lo) complement.emplace_back(current, lo - 1);
         if (hi == 0x10ffff) { current = 0x110000; break; }
         current = hi + 1;
       }
       if (current <= 0x10ffff) complement.emplace_back(current, 0x10ffff);
-      merged.swap(complement);
+      ranges.swap(complement);
     }
     std::vector<Automaton> parts;
-    for (auto [lo, hi] : merged) {
+    for (auto [lo, hi] : ranges) {
       if (lo <= 0xd7ff) parts.push_back(Automaton::charRange(lo, std::min(hi, 0xd7ff), budget));
       if (hi >= 0xe000) parts.push_back(Automaton::charRange(std::max(lo, 0xe000), hi, budget));
     }
@@ -184,7 +199,7 @@ class Parser {
       if (cp == '*' || cp == '+' || cp == '?' || cp == '{') error("repetition has no preceding atom", position, pattern);
       parts.push_back(repetition(atom()));
     }
-    return parts.empty() ? Automaton::epsilon(budget) : fold(parts, 0, parts.size(), false);
+    return fold(parts, 0, parts.size(), false);
   }
 
   Automaton unionExpr() {
@@ -195,8 +210,9 @@ class Parser {
   }
 
 public:
-  Parser(std::string_view pattern, Budget& budget, const CodepointFolder* folder)
-      : pattern(pattern), budget(budget), folder(folder) {}
+  Parser(std::string_view pattern, Budget& budget, const CodepointFolder* folder,
+         bool caseInsensitive)
+      : pattern(pattern), budget(budget), folder(folder), caseInsensitive(caseInsensitive) {}
   Automaton parse() {
     Automaton result = unionExpr();
     if (position != pattern.size()) error("unbalanced ')'", position, pattern);
@@ -206,10 +222,11 @@ public:
 
 } // namespace
 
-ByteDfa compileRegex(std::string_view pattern, Budget& budget, const CodepointFolder* folder) {
+ByteDfa compileRegex(std::string_view pattern, Budget& budget, const CodepointFolder* folder,
+                     bool caseInsensitive) {
   if (pattern.size() > 1000) error("pattern too complex", 1000, pattern);
   try {
-    Parser parser(pattern, budget, folder);
+    Parser parser(pattern, budget, folder, caseInsensitive);
     return ByteDfa(utf32ToUtf8(parser.parse(), budget), budget);
   } catch (const std::runtime_error& e) {
     if (std::string_view(e.what()) == "pattern too complex") error("pattern too complex", 0, pattern);

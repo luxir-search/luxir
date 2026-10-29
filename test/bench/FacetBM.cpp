@@ -12,6 +12,7 @@
 #include "bench/luxir_bench.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/search/ops/FacetOp.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -72,7 +73,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     } else {
       topDocs.matchQuery(qfield, "0");
     }
-    topDocs.limit(topLimit).getNumber(true).getScores(false).fields({"id"});
+    topDocs.limit(topLimit).countLimit().getScores(false).fields({"id"});
 
     // add the field we want to facet
     auto& facet = topDocs.facet("f", ffield);
@@ -163,7 +164,8 @@ static void buildRangeFacetBenchIndex(CollectionHelper& helper,
 }
 
 static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
-                          std::string_view shape, bool forceWalk) {
+                          std::string_view shape, bool forceWalk,
+                          bool zones = true) {
   if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
@@ -173,9 +175,14 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
 
   struct HookGuard {
     bool saved = IntFacetRangeReq::disablePointsRangeFacetForTests;
-    ~HookGuard() { IntFacetRangeReq::disablePointsRangeFacetForTests = saved; }
+    bool savedZones = IntFacetRangeReq::disableZoneRangeFacetForTests;
+    ~HookGuard() {
+      IntFacetRangeReq::disablePointsRangeFacetForTests = saved;
+      IntFacetRangeReq::disableZoneRangeFacetForTests = savedZones;
+    }
   } hookGuard;
   IntFacetRangeReq::disablePointsRangeFacetForTests = forceWalk;
+  IntFacetRangeReq::disableZoneRangeFacetForTests = !zones;
   int64_t fingerprint = -1;
   for (auto _ : state) {
     auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
@@ -198,6 +205,160 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
   state.counters["reused"] = reuseIndex;
   state.counters["rate"] = benchmark::Counter(
       state.iterations(), benchmark::Counter::kIsRate);
+}
+
+constexpr int64_t DATE_BENCH_START = 1704067200000LL;  // 2024-01-01 UTC
+constexpr int64_t HOUR_MS = 60 * 60 * 1000LL;
+
+// DATE values without points, so every request walks the column; tag_s marks
+// every fourth doc. when(doc) is each doc's instant.
+template <typename When>
+static void buildDateBenchIndex(CollectionHelper& helper,
+                                std::span<const int32_t> docsPerSeg, When when) {
+  helper.clear();
+  SchemaBuilder b;
+  auto& field = b.field("when_dt");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.index = api::FieldDef::IndexMode::NONE;
+  b.set(helper.collection());
+
+  auto iw = helper.getIndexWriter();
+  std::vector<Inverter*> inverters;
+  std::vector<int64_t> starts;
+  int64_t start = 0;
+  for (int32_t docs : docsPerSeg) {
+    inverters.push_back(&iw->obtainInverter());
+    starts.push_back(start);
+    start += docs;
+  }
+  tbb::task_group tg;
+  for (size_t seg = 0; seg < docsPerSeg.size(); seg++) {
+    tg.run([&, seg]() {
+      Inverter& inverter = *inverters[seg];
+      auto& id = inverter.getIndexHandler("id");
+      auto& whenField = inverter.getIndexHandler("when_dt");
+      auto& tag = inverter.getIndexHandler("tag_s");
+      int64_t doc = starts[seg];
+      for (int32_t i = 0; i < docsPerSeg[seg]; i++, doc++) {
+        inverter.startDoc();
+        id.index(inverter, std::to_string(doc));
+        whenField.index(inverter, when(doc));
+        if (doc % 4 == 0) tag.index(inverter, "quarter");
+        inverter.finishDoc();
+      }
+      iw->releaseInverter(inverter, true);
+    });
+  }
+  tg.wait();
+  helper.commit();
+}
+
+// One range facet over when_dt per iteration, under a match-all or the
+// tag_s:quarter filter; every iteration must return the same counts.
+// zones=false forces the doc walk the zone walk replaces.
+template <typename Configure>
+static void runDateHistogram(benchmark::State& state, std::string_view collection,
+                             bool reused, bool filtered, bool zones,
+                             Configure&& configure) {
+  SearchOverridesGuard hooks(IntFacetRangeReq::disableZoneRangeFacetForTests);
+  IntFacetRangeReq::disableZoneRangeFacetForTests = !zones;
+  int64_t fingerprint = -1;
+  for (auto _ : state) {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& top = req->topDocs("q");
+    if (filtered) top.matchQuery("tag_s", "quarter");
+    else top.allQuery();
+    top.limit(0);
+    configure(top.rangeFacet("f", "when_dt"));
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
+    const auto* result = docs->ops.at("f")->facetResult();
+    int64_t current = 0;
+    for (int64_t count : result->counts) current = current * 31 + count;
+    benchmark::DoNotOptimize(current);
+    if (fingerprint != -1) {
+      ASSERT_EQ(fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = reused;
+  state.counters["rate"] = benchmark::Counter(
+      state.iterations(), benchmark::Counter::kIsRate);
+}
+
+// The facet a date histogram lane times. HOUR_SUB adds an avg sub-op, so
+// each bucket's domain is built from the zones too; sub-ops allow 1024
+// buckets, so it covers the first 1000 hours. DATA_* derive their bounds from
+// the data (bounds:data).
+enum class DateFacet { HOUR, MONTH, HOUR_SUB, DATA_HOUR, DATA_MONTH };
+
+// A date histogram over time-ordered values, one per second: whole zones
+// count without a decode.
+static void BM_DateHistogram(benchmark::State& state, int64_t nDocs,
+                             std::string_view shape, bool filtered,
+                             DateFacet kind, bool zones) {
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
+  CollectionHelper helper("date_histogram_bm");
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    buildDateBenchIndex(helper, docsPerSeg, [](int64_t doc) {
+      return DATE_BENCH_START + doc * 1000;
+    });
+  }
+  int64_t end = DATE_BENCH_START + (nDocs - 1) * 1000 + 1;
+  using Unit = api::CalendarGap_::Unit;
+  runDateHistogram(state, "date_histogram_bm", reused, filtered, zones,
+      [&](OpCursor& facet) {
+        switch (kind) {
+          case DateFacet::HOUR:
+            facet.range(DATE_BENCH_START, end, HOUR_MS);
+            break;
+          case DateFacet::MONTH:
+            facet.calendarRange("2024-01-01", "2025-01-01", 1, Unit::MONTH,
+                                "America/New_York");
+            break;
+          case DateFacet::HOUR_SUB:
+            facet.range(DATE_BENCH_START,
+                        std::min(end, DATE_BENCH_START + 1000 * HOUR_MS), HOUR_MS)
+                .avg("a", "when_dt");
+            break;
+          case DateFacet::DATA_HOUR:
+            facet.rangeData(HOUR_MS);
+            break;
+          case DateFacet::DATA_MONTH:
+            facet.rangeDataCalendar(1, Unit::MONTH, "America/New_York");
+            break;
+        }
+      });
+}
+
+// Unclustered DATE values over ten years with calendar DAY buckets: a zone
+// reaches nearly every fence, so whole zones are rare and the lanes measure
+// the zone walk's per-value cost against the doc walk. A DST zone's days have
+// a run directory; UTC days are affine.
+static void BM_DateHistShuffled(benchmark::State& state, int64_t nDocs,
+                                std::string_view shape, std::string_view tz,
+                                bool zones) {
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
+  CollectionHelper helper("date_shuffled_bm");
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    buildDateBenchIndex(helper, docsPerSeg, [](int64_t doc) {
+      return DATE_BENCH_START + SplitMix64((uint64_t)doc).rint(3653 * 24 * HOUR_MS);
+    });
+  }
+  runDateHistogram(state, "date_shuffled_bm", reused, false, zones,
+      [&](OpCursor& facet) {
+        facet.calendarRange("2024-01-01", "2034-01-01", 1,
+                            api::CalendarGap_::Unit::DAY, tz);
+      });
 }
 
 // Shared DATA corpus. Setup stays outside the timed search loop. In addition
@@ -759,6 +920,29 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_doc_walk, nDocs, shape, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_zones,        nDocs, shape, false, DateFacet::HOUR,       true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_walk,         nDocs, shape, false, DateFacet::HOUR,       false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_zones,       nDocs, shape, true,  DateFacet::HOUR,       true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_walk,        nDocs, shape, true,  DateFacet::HOUR,       false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_zones,       nDocs, shape, false, DateFacet::MONTH,      true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_walk,        nDocs, shape, false, DateFacet::MONTH,      false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_zones,      nDocs, shape, true,  DateFacet::MONTH,      true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_walk,       nDocs, shape, true,  DateFacet::MONTH,      false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_zones,   nDocs, shape, true,  DateFacet::HOUR_SUB,   true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_walk,    nDocs, shape, true,  DateFacet::HOUR_SUB,   false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_all_zones,   nDocs, shape, false, DateFacet::DATA_HOUR,  true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_all_walk,    nDocs, shape, false, DateFacet::DATA_HOUR,  false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_filt_zones,  nDocs, shape, true,  DateFacet::DATA_HOUR,  true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_filt_walk,   nDocs, shape, true,  DateFacet::DATA_HOUR,  false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_all_zones,  nDocs, shape, false, DateFacet::DATA_MONTH, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_all_walk,   nDocs, shape, false, DateFacet::DATA_MONTH, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_filt_zones, nDocs, shape, true,  DateFacet::DATA_MONTH, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_filt_walk,  nDocs, shape, true,  DateFacet::DATA_MONTH, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, ny_day_zones,  nDocs, shape, "America/New_York", true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, ny_day_walk,   nDocs, shape, "America/New_York", false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, utc_day_zones, nDocs, shape, "UTC", true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, utc_day_walk,  nDocs, shape, "UTC", false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int, nDocs, shape, RangeDataBenchMode::INT);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int_walk, nDocs, shape, RangeDataBenchMode::INT, true);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date, nDocs, shape, RangeDataBenchMode::DATE);

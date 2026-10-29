@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -12,6 +13,7 @@
 #include <utility>
 
 #include "luxir/util/ApiError.h"
+#include "luxir/util/DateTime.h"
 
 namespace luxir {
 
@@ -25,18 +27,34 @@ enum class ValueType : uint8_t {
 
 // Logical meaning carried independently of the physical numeric lane. DATE
 // values use the INT64/DOUBLE lanes but retain enough type information for
-// expression and aggregate validation.
+// expression and aggregate validation, including the date unit. Encoding the
+// unit in the nature keeps node metadata and numeric transports the same size.
 enum class ValueNature : uint8_t {
   NUMBER,
-  DATE,
+  DATE_MS,
+  DATE_NS,
 };
 
 inline std::string_view valueNatureName(ValueNature nature) {
   switch (nature) {
     case ValueNature::NUMBER: return "number";
-    case ValueNature::DATE: return "DATE";
+    case ValueNature::DATE_MS: return "DATE unit 'ms'";
+    case ValueNature::DATE_NS: return "DATE unit 'ns'";
   }
   return "unknown";
+}
+
+inline bool valueDate(ValueNature nature) {
+  return nature == ValueNature::DATE_MS || nature == ValueNature::DATE_NS;
+}
+
+inline ValueNature dateValueNature(DateUnit unit) {
+  return unit == DateUnit::MILLIS ? ValueNature::DATE_MS : ValueNature::DATE_NS;
+}
+
+inline DateUnit valueDateUnit(ValueNature nature) {
+  assert(valueDate(nature));
+  return nature == ValueNature::DATE_MS ? DateUnit::MILLIS : DateUnit::NANOS;
 }
 
 struct ResolvedValue {

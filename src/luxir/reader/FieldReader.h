@@ -31,14 +31,12 @@ public:
     fieldOffsetsLoc = postingsReader.fieldOffsetsLoc;
   }
 
-private:
-  friend class PostingsReader;
   FieldReader(PostingsReader& reader, int32_t ordinal) : FieldReader(reader) {
+    if (ordinal < 0 || ordinal >= nFields) throw std::logic_error("Invalid field ordinal");
     currField = ordinal - 1;
     if (!readNextField()) throw std::logic_error("Invalid field ordinal");
   }
 
-public:
   // TODO: should this read into a different structure?  Only if we want to iterate over all fields but not read them?
   // one possible use case: a wildcard in field names (fast iteration would be a bonus)
   [[nodiscard]] bool readNextField() {
@@ -67,6 +65,8 @@ public:
       fieldInfo.fieldname = fieldname;
       fieldInfo.type = static_cast<FieldType::Type>(fieldIS.readVint());
       fieldInfo.flags = fieldIS.readVint();
+      fieldInfo.typeFlags = fieldIS.readVint();
+      FieldType::typeParameters(fieldInfo.type, fieldInfo.typeFlags);
       fieldInfo.docsWithField = fieldIS.readVint();
       fieldInfo.rangeTableLoc = {0, 0};
       if (fieldInfo.flags & FieldType::INDEX_DOCS) {

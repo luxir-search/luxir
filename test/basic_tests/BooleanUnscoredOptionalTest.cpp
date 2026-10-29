@@ -148,7 +148,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q");
-    cursor.getNumber().limit(0);
+    cursor.countLimit().limit(0);
     cursor.rawQuery() = makeQuery(cursor, shape);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -161,7 +161,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q");
-    cursor.getNumber().limit(0);
+    cursor.countLimit().limit(0);
     cursor.rawQuery() = makeQuery(cursor, shape);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -226,7 +226,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q");
-    cursor.getNumber().limit(0);
+    cursor.countLimit().limit(0);
     cursor.rawQuery() = makeQuery(cursor, shape);
     cursor.facet("buckets", "bucket_s").limit(-1);
     req->execute(false);
@@ -253,7 +253,7 @@ public:
     req->collection("main");
     auto& cursor = req->topDocs("q");
     cursor.getScores().limit(3).batchSize(4).fields({"id"});
-    if (getNumber) cursor.getNumber();
+    if (getNumber) cursor.countLimit();
     cursor.rawQuery() = makeQuery(cursor, shape);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();

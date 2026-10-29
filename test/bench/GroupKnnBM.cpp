@@ -118,7 +118,7 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
     std::string collapse = key == 0 ? R"("product_s")" : key == 1 ? R"("product_i")"
         : R"({"field":["product_s","catalog_i"]})";
     std::string json = R"({"collection":")" + name
-        + R"(","limit":10,"get_scores":true,"get_number":true,"fields":["id","product_s"],"document_format":"rows",)"
+        + R"(","limit":10,"get_scores":true,"count_limit":-1,"fields":["id","product_s"],"document_format":"rows",)"
         + (groups ? R"("collapse":)" + collapse + ',' : "")
         + R"("query":{"knn":{"field":"vec_v","unit":")" + (groups ? "groups" : "docs") + R"(","query":)" + vectors[query]
         + R"(,"k":10,"refine_candidates":160,"exact":)" + (forceExact ? "true" : "false")

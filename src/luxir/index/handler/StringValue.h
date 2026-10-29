@@ -22,6 +22,15 @@ public:
 
   bool hasNormalizer() const { return normalizer != nullptr; }
 
+  size_t retainedBytes() const {
+    return normalized.capacity() > std::string{}.capacity() ? normalized.capacity() + 1 : 0;
+  }
+
+  // Normalize caller-owned materialization storage without another byte copy.
+  void normalizeInPlace(std::string& value) {
+    if (normalizer) normalizer->normalizeTerm(value);
+  }
+
   std::string_view normalize(std::string_view value) {
     if (normalizer) {
       normalized.assign(value);

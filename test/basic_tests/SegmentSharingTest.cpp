@@ -290,6 +290,7 @@ TEST_F(SegmentSharingTest, mergeReleasesItsSources) {
   auto latest = current();
   EXPECT_EQ(&after->segments()[0].postingsReader(), &latest->segments()[0].postingsReader());
   after.reset();
+  writer->testDrain();  // retired readers are dropped in the background
   for (auto& source : sources) EXPECT_TRUE(source.expired());
   EXPECT_EQ(1798, readAll(*latest));
 }

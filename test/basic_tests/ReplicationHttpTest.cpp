@@ -542,14 +542,14 @@ TEST_F(ReplicationHttpTest, ordinaryResponsesDoNotArmWriteDeadline) {
     EXPECT_EQ(200, response.result_int());
   };
   request("/health");
-  request("/collections/main/_search?get_number=true");
+  request("/collections/main/_search?count_limit=-1");
   EXPECT_EQ(0, deadlines.load());
   request(fileUrl(*snap, snap->files.front().name));
   auto fileDeadlines = deadlines.load();
   EXPECT_GT(fileDeadlines, 0);
   // Reuse the file transfer's connection for ordinary responses.
   request("/health");
-  request("/collections/main/_search?get_number=true");
+  request("/collections/main/_search?count_limit=-1");
   EXPECT_EQ(fileDeadlines, deadlines.load());
 }
 

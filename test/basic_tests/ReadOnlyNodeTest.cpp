@@ -79,7 +79,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
   int port = readerServer.getPort();
 
   auto search = httpRequest(port, http::verb::post, "/collections/main/_search",
-                            R"({"query":"title_w:lockless","fields":["id"],"get_number":true})");
+                            R"({"query":"title_w:lockless","fields":["id"],"count_limit":-1})");
   ASSERT_EQ(200, search.result_int()) << search.body();
   EXPECT_NE(search.body().find(R"("found":1)"), std::string::npos) << search.body();
   EXPECT_NE(search.body().find(R"("r1")"), std::string::npos) << search.body();

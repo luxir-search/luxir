@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bit>
+#include <format>
 #include <type_traits>
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/InputStream.h"
@@ -54,6 +55,7 @@ struct SegFieldInfo {
   PackedTerm fieldname;
   FieldType::Type type;
   int32_t flags;  // from FieldType
+  uint32_t typeFlags = 0;  // interpreted by the persisted type
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -113,6 +115,15 @@ struct SegFieldInfo {
   // its terms (see IdFilterReader).  Read only when applying deletes.
   seg_location idFilterLoc;
   int64_t idFilterLen = 0;
+  void requireCompatibleType(const SegFieldInfo& other) const {
+    if (type != other.type || FieldType::typeParameters(type, typeFlags)
+        != FieldType::typeParameters(other.type, other.typeFlags)) {
+      throw std::runtime_error(std::format(
+          "Incompatible persisted types for field '{}': {} and {}",
+          (std::string_view)fieldname, FieldType::describeType(type, typeFlags),
+          FieldType::describeType(other.type, other.typeFlags)));
+    }
+  }
 
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is

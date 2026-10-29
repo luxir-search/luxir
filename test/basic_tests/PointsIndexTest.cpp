@@ -388,7 +388,7 @@ TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   auto& multi = b.field("range_multi");
   multi.type = api::FieldDef::FieldClass::INT;
   multi.index = api::FieldDef::IndexMode::RANGE;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   b.set(helper.collection());
 
   std::vector<Doc> docs = {

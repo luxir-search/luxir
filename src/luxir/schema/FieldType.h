@@ -26,6 +26,8 @@ namespace api { struct Val; }  // the wire value oneof (api/luxir_types.hpp)
 struct CoerceContext {
   std::optional<int64_t> dateMathNowEpochMillis;
   TimeZone timeZone = TimeZone::utc();
+  // Omitted means the field's unit. Request modes may supply a different unit.
+  std::optional<DateUnit> dateInputUnit = std::nullopt;
 };
 
 
@@ -48,9 +50,15 @@ public:
     DOUBLE,
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
-    DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
+    DATE,     // timestamp; column-stored as int64 epoch units (default ms)
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
+
+  static std::string_view typeName(Type type);
+  // Decode parameters using the persisted type, independently of any schema.
+  // Unknown types and bits are invalid. DATE defines its unit in bit 0.
+  static uint32_t typeParameters(Type type, uint32_t typeFlags);
+  static std::string describeType(Type type, uint32_t typeFlags);
 
   using flag_type = int32_t;
 
@@ -79,6 +87,9 @@ public:
   // Segment-format marker, never supplied by schema configuration: the field
   // carries an id membership filter and its min/max term (SegFieldInfo::idFilterLoc).
   static constexpr flag_type ID_FILTER = (1 << 16);
+  // Multi-valued set is the default; arrays retain source order and repeats.
+  // This is a physical property persisted in each segment, not a format marker.
+  static constexpr flag_type MULTI_ARRAY = (1 << 15);
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED | ID_FILTER;
@@ -96,6 +107,7 @@ public:
   // constructor
   FieldType(std::string_view name, FieldType::Type type, int flags) :
      type_(type), name_(name), flags_(flags) {
+    if ((flags_ & MULTI_VALUED) && arrayOnly(type)) flags_ |= MULTI_ARRAY;
   }
 
   bool isSet(flag_type flag) {
@@ -119,6 +131,7 @@ public:
 
   // Segment flags describe physical structures; schema roles stay in the schema.
   flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+  virtual uint32_t segmentTypeFlags() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
@@ -138,9 +151,12 @@ public:
   bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
+  bool multiArray() const { return (flags_ & MULTI_ARRAY) != 0; }
+  bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
+  static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
   // Whether a sort on a field of this type orders by its int64 column
-  // values: raw integers for INT, epoch millis for DATE, sortable bits for
+  // values: raw integers for INT, epoch units for DATE, sortable bits for
   // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
   // of these types are the ones field-sort planning reads, so only they
   // persist a value sketch (NumColumnWriter).
@@ -154,6 +170,9 @@ public:
 
   bool isStored() { return (bool) (flags_ & STORED); }
 
+  // ID uses the indexed STRING representation in segment metadata.
+  Type persistedType() const { return type_ == ID ? STRING : type_; }
+
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce
   // identically (a doc ingested via one rule must be findable by querying the
@@ -164,12 +183,18 @@ public:
 
   // The encoded int64 the standard int column stores for this field type:
   // the raw integer for INT, sortable bits for FLOAT/DOUBLE (NumericUtils),
-  // epoch millis for DATE (ISO-8601 strings parsed on the way in).  Throws on
+  // epoch units for DATE (ISO-8601 strings parsed on the way in). Throws on
   // impossible values (per-doc failure at ingest, request error at query
   // build).
   // context fixes NOW for the surrounding request/update. Other numeric types
   // ignore it; a missing value lets DATE capture the clock at this call.
   virtual int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  // Same conversion, returning nullopt only for an uncoercible value.
+  // Unsupported column types still throw.
+  virtual std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
@@ -185,7 +210,7 @@ public:
 class TextFieldType : public FieldType {
 public:
   // The compiled chain (analysis/Analyzer.h), shared with every field that
-  // resolves to the same authored definition.
+  // resolves to the same effective definition.
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
@@ -230,6 +255,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 // FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
@@ -244,6 +273,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class DoubleFieldType : public FieldType {
@@ -254,35 +287,69 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
-// DATE stores int64 milliseconds since the Unix epoch directly in the standard
-// int column.  Signed millis already sorts in chronological order, so sort,
-// range-facet, and min/max stats run on the raw column with no per-value
-// transform (unlike FLOAT/DOUBLE, which store sortable bits).  The DATE tag
-// drives string<->millis parsing on input and date-aware rendering on output.
+// DATE stores int64 epoch units directly in the standard int column. Signed
+// counts sort chronologically without a transform. Numeric ingest uses the
+// field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
 class DateFieldType : public FieldType {
 public:
-  DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
+  struct QueryRange {
+    int64_t lo, hi; // inclusive, in field units; out-of-domain bounds saturate
+    bool granuleSkipped = false;
+    bool unroundedNow = false;
+  };
+  DateUnit unit;
+
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
+    : FieldType(name, FieldType::DATE, flags), unit(unit) {
+    typeFlagsForUnit(unit);
   }
+
+  static uint32_t typeFlagsForUnit(DateUnit unit);
+  static DateUnit unitFromTypeFlags(uint32_t typeFlags);
+  // The unit of a field type whose type() is DATE.
+  static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
+  uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  // The [lo, hiExclusive) epoch-millis window a query-side date literal
-  // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
-  // the month, epoch millis a single instant.  Queries match/round by the
-  // window; ingest and sorting use coerceColInt64 (the window start).
-  DateRange coerceDateRange(
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  // Exact set membership uses the literal's floored start. Out-of-domain
+  // members are omitted; malformed values remain request errors.
+  std::optional<int64_t> coerceDateInstant(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
+
+  // Match/range use the literal's granularity, expressed in column units.
+  QueryRange coerceDateRange(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  std::optional<QueryRange> tryCoerceDateRange(
+      const api::Val& val, const CoerceContext& context = {}) const;
 };
 
 class GeoPointFieldType : public FieldType {
 public:
-  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
-    : FieldType(name, FieldType::GEO_POINT, flags) {
+  // Skip a value that is not a valid point instead of failing the document.
+  bool ignoreMalformed;
+  // Accept a third (z, altitude) coordinate and drop it; otherwise reject it.
+  bool ignoreZValue;
+
+  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED,
+                    bool ignoreMalformed = false, bool ignoreZValue = true)
+    : FieldType(name, FieldType::GEO_POINT, flags),
+      ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
 };
 
@@ -342,6 +409,10 @@ public:
 
   // Squared norm at or below which a cosine vector has no direction.
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+  // Largest accepted element magnitude.  Squared norms stay below dims * 2^80,
+  // far enough under float32 range that every distance FAISS computes while
+  // training, assigning, and encoding, and every exact score, stays finite.
+  static constexpr float MAX_ELEMENT_MAGNITUDE = 0x1p40f;
 
   int32_t inputDims_;
   int32_t truncateDims_;
@@ -382,7 +453,8 @@ public:
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
-  // (or truncateDims() for an already truncated vector), all finite.  Returns
+  // (or truncateDims() for an already truncated vector), all finite with
+  // magnitude at most MAX_ELEMENT_MAGNITUDE.  Returns
   // the error text, or empty when vec is valid.  A valid vec is stored and
   // searched as its first storedSize(vec.size()) components.
   std::string inputError(std::span<const float> vec) const;
@@ -393,9 +465,9 @@ public:
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
-// How a stored-fields resource compresses its chunks.  codec and the two chunk
-// limits are recorded in each segment's resource metadata; the level only
-// affects compression.
+// How a stored-fields resource compresses its chunks.  codec, the two chunk
+// limits are recorded in each segment's resource metadata. The level affects
+// compression, and dictionary capacity is schema training policy.
 struct StoredChunkFormat {
   // Recorded on disk as one byte.
   enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
@@ -406,6 +478,7 @@ struct StoredChunkFormat {
   // cost for larger chunks.
   static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
   static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
+  static constexpr uint32_t DEFAULT_DICTIONARY_BYTES = 64 * 1024;
 
   Codec codec = LZ4;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
@@ -414,9 +487,12 @@ struct StoredChunkFormat {
   // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
   // target or this doc count is reached, whichever comes first.
   uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+  // ZSTD only: dictionary training capacity; 0 disables dictionaries.
+  uint32_t dictionaryBytes = 0;
 
   // Same chunk bytes and boundaries: compressed chunks of one format can be
-  // copied verbatim into a writer of the other.  The level is not part of it.
+  // copied verbatim into a writer of the other, provided both segments hold
+  // the same trained dictionary.  The level is not part of it.
   bool sameLayout(const StoredChunkFormat& o) const {
     return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
   }
