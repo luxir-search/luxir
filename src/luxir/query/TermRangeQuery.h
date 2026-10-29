@@ -53,6 +53,10 @@ public:
   bool lowerInclusive() const { return includeLower; }
   bool upperInclusive() const { return includeUpper; }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::termRangeMatch(view, field, lower, includeLower, upper, includeUpper);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

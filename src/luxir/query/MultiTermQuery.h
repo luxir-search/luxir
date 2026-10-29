@@ -16,6 +16,7 @@
 #include "QueryStats.h"
 #include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/util/screaming.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -35,6 +36,14 @@ public:
     : Query(kind), field(field) {}
 
   std::string_view getField() const { return field; }
+
+  // Expansions are unknown without the dictionary; only field absence proves
+  // emptiness. Subclasses with bounded shapes (prefix, range, set) refine this.
+  MatchState mayMatch(const SummaryView& view) const override {
+    MatchState state;
+    summary::requireField(view, field, state);
+    return state;
+  }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;

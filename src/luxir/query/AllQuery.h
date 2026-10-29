@@ -25,6 +25,11 @@ public:
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    unused(view);
+    return MatchState::NONEMPTY;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

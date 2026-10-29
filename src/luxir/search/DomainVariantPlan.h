@@ -252,6 +252,11 @@ public:
     return querySources[source].weight;
   }
 
+  Query* sourceQuery(size_t source) const {
+    assert(source < querySources.size());
+    return querySources[source].query;
+  }
+
   FilterCache::Use* sourceUse(size_t source) const {
     assert(source < querySources.size());
     return querySources[source].use;
