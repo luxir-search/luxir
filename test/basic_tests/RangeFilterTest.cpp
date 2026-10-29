@@ -46,6 +46,8 @@ protected:
     for (int32_t doc = 0; doc < N; doc++) {
       int64_t value = 2 * ((doc * 1543) % N);
       std::string body = "pad";
+      // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
+      for (int32_t i = 0; i < doc % 20; i++) body += " pad";
       if (doc % 64 == 0) body += " a";
       if (doc % 2048 == 0) body += " rare";
       if (doc % 256 == 0) body += " threshold";

@@ -349,9 +349,8 @@ TEST_F(NormsFormatTest, constantFieldStoresOneByte) {
   tag.startIndexing();
   for (int32_t doc = 0; doc < 8; doc++) {
     body.add(doc, doc % 3 == 0 ? "needle filler" : "filler filler");
+    if (doc == 3 || doc == 7) tag.add(doc, "needle");
   }
-  tag.add(3, "needle");
-  tag.add(7, "needle");
   testIndex.flush();
   testIndex.initReader();
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();

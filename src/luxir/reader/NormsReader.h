@@ -187,10 +187,13 @@ public:
     int32_t maxRank = 0;
     bool densePresence = false;
     bool flatDirectAdvance = false;
+    // True: advance/next stop only on docs that have the field, even for
+    // docid-addressed layouts (whose values are unspecified elsewhere).
+    bool checkPresence = false;
 
   public:
-    Iterator(const NormsReader& reader)
-        : reader(reader), docsIter(reader.docs.bitset()) {
+    Iterator(const NormsReader& reader, bool checkPresence = false)
+        : reader(reader), docsIter(reader.docs.bitset()), checkPresence(checkPresence) {
       maxRank = reader.docs.numDocs();
       densePresence = !reader.docs.hasBitset();
     }
@@ -217,7 +220,7 @@ public:
     }
 
     int32_t advance(int32_t target) {
-      if (reader.byDoc) {
+      if (reader.byDoc && !checkPresence) {
         if (target >= reader.maxdoc) {
           doc = ENDDOC;
         } else {

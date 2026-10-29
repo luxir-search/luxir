@@ -6519,7 +6519,10 @@ TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
   TestField f(testIndex, "body_w");
   f.startIndexing();
   for (int32_t doc = 0; doc < N; doc++) {
-    f.add(doc, "latch_a latch_b filler");
+    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
+    std::string body = "latch_a latch_b filler";
+    appendRepeatedTerm(body, "pad", doc % 20);
+    f.add(doc, body);
   }
   testIndex.flush();
   f.startReading();
@@ -6579,6 +6582,8 @@ TEST_F(TermScorerTest, conjunctionDenseScoredRejectsAsymmetricClauseCosts) {
   for (int32_t doc = 0; doc < N; doc++) {
     std::string body = "producer";
     if ((doc % 10) == 0) body += " lead";
+    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
+    appendRepeatedTerm(body, "pad", doc % 20);
     f.add(doc, body);
   }
   testIndex.flush();
@@ -6644,6 +6649,8 @@ TEST_F(TermScorerTest, conjunctionScoredProbeKeepsBlockWorkSurvivorBounded) {
     if ((doc % 257) == 0) {
       appendRepeatedTerm(body, "probe_lead", 1 + (doc % 7));
     }
+    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
+    appendRepeatedTerm(body, "pad", doc % 20);
     f.add(doc, body);
   }
   testIndex.flush();
