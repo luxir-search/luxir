@@ -59,6 +59,7 @@ enum class QueryKind : uint8_t {
   TERM_RANGE,
   TERM_IN_SET,
   EXISTS,
+  BOOL_VALUE,
   GEO_BOX,
   GEO_DISTANCE,
   ALL,
