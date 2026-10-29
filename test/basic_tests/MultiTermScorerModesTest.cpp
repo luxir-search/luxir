@@ -529,7 +529,7 @@ TEST_F(MultiTermScorerModesTest,
         ? qb::boolean(top.mr(), {}, {beta, alpha})
         : qb::boolean(top.mr(), {}, {alpha, beta});
     top.fields({"id"}).getScores().limit(10);
-    if (exhaustive) top.getNumber();
+    if (exhaustive) top.countLimit();
     req->execute(parallel);
     EXPECT_TRUE(req->ok()) << req->toString();
 

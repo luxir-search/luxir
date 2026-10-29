@@ -156,8 +156,9 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
 void ReaderManager::cacheStats(CacheStats& out) const {
   auto cache = filterCache;
   if (!cache) return;
-  out.filterCacheEnabled = cache->enabled();
-  out.filterCacheMaxBytes = cache->configuration().maxBytes;
+  auto config = cache->configuration();
+  out.filterCacheEnabled = config.maxBytes != 0;
+  out.filterCacheMaxBytes = config.maxBytes;
   out.filterCacheResidentBytes = cache->bytesUsed();
   out.filterCacheMetadataBytes = cache->metadataBytesUsed();
   out.filterCacheCounters = cache->counters();

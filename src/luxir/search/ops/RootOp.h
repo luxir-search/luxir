@@ -35,9 +35,9 @@ public:
         const StructuralConstraint* structural = nullptr)
       : SearchOp::Calculator(op, parent, slot, numSlots, structural) {}
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
       // Top-level ops map: slot array sized to the root op's subOps; one Val per sub.
-      return build::opsSlot(resp->proto.ops, op.subOps.size(), sub->getOp().name, resp->mr);
+      return build::opsSlot(resp->proto.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
     void calc(

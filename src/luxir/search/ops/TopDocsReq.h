@@ -575,7 +575,7 @@ public:
     if (collapse && !topDocsProto.collapse->sort.empty()) resolveMetricGroupOrder(*this);
   }
   bool enrichGroups() const {
-    return collapse != nullptr && (topDocsProto.collapse->get_number || headSort.has_value() || !groupOps.empty())
+    return collapse != nullptr && (topDocsProto.collapse->get_count || headSort.has_value() || !groupOps.empty())
         && topCount > topDocsProto.offset;
   }
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
@@ -596,6 +596,9 @@ public:
   std::span<FilterCache::Use*> filterUses;
   DomainVariantPlan domainVariants;
   CollectionRequirements requirements;
+  // The requested quantity stays in requirements; exact routes need no hold.
+  bool boundedCount = false;
+  bool countLimitProven = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
@@ -657,15 +660,15 @@ public:
     // Page result columns live in the final response arena, pinned through
     // all streaming batches. They are sliced only after every binding closes.
     luxir::api::GroupTable* pageGroups = nullptr;
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
       auto& groups = thisOp().groupOps;
-      auto found = groups.find(sub->getOp().name);
-      if (found != groups.end() && found->second == &sub->getOp()) {
+      auto found = groups.find(sub.name);
+      if (found != groups.end() && found->second == &sub) {
         assert(pageGroups != nullptr);
         assert(resp == op.req.lastResponse); // bucket children never stream
-        return build::opsSlot(pageGroups->ops, groups.size(), sub->getOp().name, resp->mr);
+        return build::opsSlot(pageGroups->ops, groups.size(), sub.name, resp->mr);
       }
-      auto* ourVal = parent->getTargetForSub(resp, this);
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       // Our DocList lives in our bucket slot when this TopDocs is a facet
       // bucket child; the Val should either be unset or already hold it.
@@ -673,7 +676,7 @@ public:
       assert(std::holds_alternative<luxir::api::DocList>(target.kind)
              || std::holds_alternative<std::monostate>(target.kind));
       auto& dl = oneofMut<luxir::api::DocList>(target);
-      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
     CalcBase(TopDocsReq& op, Calculator* parent, int64_t slot, int64_t numSlots,
@@ -694,6 +697,9 @@ public:
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
       };
+      if (op.boundedCount) {
+        scoreAccumulator.holdUntilHits(op.requirements.countLimit, op.countLimitProven);
+      }
 
       if (op.subOps.size() > 0) {
         if (op.domainVariants.empty()
@@ -876,9 +882,12 @@ public:
       if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
         if (disableCollapsePruningForTests) return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
       }
+      // First-K collection applies any collector filter before accepting hits.
       if (!TopDocsReq::disableConstantWindowCaptureForTests
-          && !op.requirements.needExactCount && builder == nullptr
-          && op.filters.empty()) {
+          && (!op.requirements.needsCount()
+              || (op.boundedCount && scoreAccumulator.canPrune()))
+          && builder == nullptr) {
+        skipCount(SkipStats::constantLimitOnlyCollections);
         return ConstantScoreDisposition::LIMIT_ONLY;
       }
       // Document first-K/count drains cannot supply distinct totals or child
@@ -1962,7 +1971,7 @@ public:
             if (counted) {
               // fall through to the sub-calc/merge tail below
             } else if (!Collapsed && routedDomainsReady && !data->useFieldSort
-                       && op.requirements.needExactCount
+                       && op.requirements.needsCount()
                        && scoreCollector->topCount > 0) {
               int64_t count = routedProduction->domains[0].get() == nullptr
                   ? seg.maxDoc()
@@ -1980,8 +1989,8 @@ public:
               // Collapse totals disable every skipping arm, even over an
               // exact cached domain.
               bool mustStreamForCompleteness =
-                  (Collapsed && op.requirements.needExactCount)
-                  || (op.requirements.needExactCount && !wholeFieldSortAvailable
+                  (Collapsed && op.requirements.needsCount())
+                  || (op.requirements.needsCount() && !wholeFieldSortAvailable
                    && !routedExactDomain)
                   || builderPtr != nullptr;
               bool maySkipNoncompetitiveDocs =
@@ -2008,9 +2017,6 @@ public:
                   sortSourceCost);
               bool usedBulk = false;
               int64_t fieldHitsBefore = fieldCollector->hitCount;
-              // A MATCH_WINDOWS plan taken by a declined arm is retained here
-              // so the ordinary bulk arm never re-plans the same context.
-              std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
               Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
               // Group proof: gathered leaves admit by exact identity before
               // truncation. A leaf loses on a worse bound, or on an equal
@@ -2109,13 +2115,18 @@ public:
               // external filter only the filter's share of it. Seeding prices
               // the same work; leaf descent the same domain.
               std::optional<Query::ScorerSupplier::MembershipWork> walkWork;
+              std::optional<ExactDomainSortCosts::Rest> walkRest;
               if (!usedBulk && supplier != nullptr && maySkipNoncompetitiveDocs
                   && fieldCollector->topCount > 0
                   && fieldCollector->primaryKeys.has_value()) {
                 walkWork = walkMembershipWork(*supplier, collectorFilter,
                                               seg.maxDoc());
-                fieldCollector->setWalkCard(
-                    (int64_t)std::max(1.0, walkWork->matches));
+                int64_t card = (int64_t)std::max(1.0, walkWork->matches);
+                fieldCollector->setWalkCard(card);
+                walkRest = fieldCollector->segmentRest(card,
+                    fieldCollector->predictedVisitFloor(card), 0, seg.maxDoc() - 1);
+                matchWindowsContext.expectedConsumption = fieldCollector->expectedWindowDemand(
+                    *walkRest, supplier->cost(), seg.maxDoc());
               }
               // Group seeding changes only visit order. The visited-leaf mask
               // prevents duplicates, and the sweep covers every unvisited
@@ -2140,7 +2151,7 @@ public:
                   const auto& work = *walkWork;
                   auto& seedCollector = *fieldCollector;
                   int64_t jointCard = (int64_t)std::max(1.0, work.matches);
-                  int64_t leafFloor = seedCollector.predictedVisitFloor(jointCard);
+                  int64_t leafFloor = walkRest->floor;
                   int64_t seedBudget = seedCollector.predictedVisitFloor(
                       jointCard, seedDepth(seedCollector.topCount));
                   bool startable = leafFloor > 0 && seedBudget > 0;
@@ -2153,8 +2164,7 @@ public:
                     int64_t head = seedCollector.headLeaf(leafFloor);
                     seedCosts.emplace(QueryDrivenSeedCosts{
                         work,
-                        seedCollector.segmentRest(jointCard, leafFloor, 0,
-                                                   seg.maxDoc() - 1),
+                        *walkRest,
                         head >= 0 && 2 * head >= seedCollector.primaryKeys->leafCount(),
                         plan.leafSize, trend});
                   }
@@ -2163,10 +2173,12 @@ public:
                   bool profitable = startable
                       && seedCosts->worth(0, 0, seedBudget, 1, leafFloor, work.matches);
                   if (profitable || forceFieldSortSeeding) {
-                    matchWindowsPlan = supplier->planBulk(
+                    auto seedContext = matchWindowsContext;
+                    seedContext.expectedConsumption = fieldCollector->expectedWindowDemand(
+                        *walkRest, supplier->cost(), seg.maxDoc(), seedBudget);
+                    auto bulkPlan = supplier->planBulk(
                         Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                        matchWindowsContext);
-                    auto& bulkPlan = *matchWindowsPlan;
+                        seedContext);
                     if (bulkPlan.available
                             == Query::ScorerSupplier::BulkAnswer::YES
                         && bulkPlan.supportsMatchWindows
@@ -2175,7 +2187,6 @@ public:
                             == Query::ScorerSupplier::BulkAnswer::YES
                         && !bulkPlan.hasConstantCount()) {
                       auto* bulk = supplier->buildBulk(poolGuard.pool(), bulkPlan);
-                      matchWindowsPlan.reset();  // consumed by the build
                       if (bulk != nullptr) {
                         if (fieldSortSeedBudgetPerMilleForTests > 0) {
                           seedBudget = std::max<int64_t>(
@@ -2196,11 +2207,9 @@ public:
               if (!usedBulk && supplier != nullptr && !captureSharedRaw
                   && !disableFieldSortBulk
                   && !fieldCollector->needsScores) {
-                auto plan = matchWindowsPlan.has_value()
-                    ? *matchWindowsPlan
-                    : supplier->planBulk(
-                          Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                          matchWindowsContext);
+                auto plan = supplier->planBulk(
+                    Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                    matchWindowsContext);
                 bool plannedNo =
                     plan.available != Query::ScorerSupplier::BulkAnswer::YES
                     || plan.supportsMatchWindows
@@ -2229,8 +2238,9 @@ public:
                 }
               }
               if (!usedBulk && supplier != nullptr) {
-                Query::ScorerPlan* pullPlan = resolvePullScorer(
-                    poolGuard.pool(), *supplier);
+                auto pullContext = supplier->makePlanContext(Query::Demand{});
+                pullContext.expectedSpan = matchWindowsContext.expectedConsumption.span;
+                Query::ScorerPlan* pullPlan = supplier->resolve(poolGuard.pool(), pullContext);
                 Query::ReportedTwoPhase reportedTwoPhase =
                     pullPlan->shape().reportedTwoPhase;
                 auto* scorer = pullPlan->build(poolGuard.pool());
@@ -2250,7 +2260,7 @@ public:
                   fieldCollector->recordSegmentSkipStats(segnum);
                 }
               }
-              if (!Collapsed && op.requirements.needExactCount
+              if (!Collapsed && op.requirements.needsCount()
                   && (wholeFieldSortAvailable || routedExactDomain)) {
                 int64_t collected =
                     fieldCollector->hitCount - fieldHitsBefore;
@@ -2269,7 +2279,7 @@ public:
               // domain. Without pruning, windowed scoring still beats the
               // doc-at-a-time heap disjunction by using per-clause window drives.
               bool allowPruning = op.weight->allowsPruning()
-                  && (!Collapsed || (!op.requirements.needExactCount
+                  && (!Collapsed || (!op.requirements.needsCount()
                       && !disableCollapsePruningForTests));
               BulkScorer* bulk = nullptr;
               bool composedExactCountTopK = false;
@@ -2372,7 +2382,9 @@ public:
                       constantRoute
                               == ConstantScoreDisposition::LIMIT_ONLY
                           ? ConstantScoreDrain::LIMIT_ONLY
-                          : ConstantScoreDrain::COMPLETE);
+                          : op.boundedCount ? ConstantScoreDrain::BOUNDED
+                                            : ConstantScoreDrain::COMPLETE,
+                      op.boundedCount ? &scoreAccumulator : nullptr);
                 } else if (!Collapsed && op.weight->isConstantScoring()) {
                   // In the test-forced arrangement, the bulk scorer drives the
                   // exhaustive count/domain and an independent scorer visits only
@@ -2413,11 +2425,14 @@ public:
                     : buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {
                   if (constantRoute
-                      == ConstantScoreDisposition::LIMIT_ONLY) {
+                          == ConstantScoreDisposition::LIMIT_ONLY
+                      || (!Collapsed && op.boundedCount
+                          && op.weight->isConstantScoring())) {
                     collectFirstKConstant(
                         segnum, scorer, collectorFilter,
                         *scoreCollector,
-                        scoreCollector->topCount);
+                        scoreCollector->topCount,
+                        op.boundedCount ? &scoreAccumulator : nullptr);
                   } else {
                     collectTopK(
                         segnum, scorer, collectorFilter, builderPtr,
@@ -2561,7 +2576,7 @@ public:
           && !requirements.needExactDomain
           && ((this->sortPlan.useFieldSort
                   && requirements.needRankedDocs && !requestNeedsScores)
-              || (requirements.needExactCount
+              || (requirements.needsCount()
                   && (!requirements.needRankedDocs
                       || scoreProfile.kind
                           != Query::ScoreProfile::Kind::VARIABLE)));

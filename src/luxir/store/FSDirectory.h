@@ -23,8 +23,21 @@ class RAMDelegatingFile;
 /// InputFile backed by mmap. The mapping remains valid after its fd is closed
 /// and after the underlying file is unlinked.
 class MMapInputFile : public InputFile {
+  // The kernel reads at most max(read_ahead_kb, max_sectors_kb) pages per
+  // MADV_WILLNEED call (128 KiB on common devices) and drops the rest of the
+  // range, so advice goes out in chunks of this size.
+  static constexpr size_t ADVISE_BYTES = 128 * 1024;
+  // A prefetch of at least this many bytes checks residency first: mincore
+  // costs a few ns per mapped page, advice on a resident page tens of ns.
+  static constexpr size_t CHECK_BYTES = 64 * 1024;
+  static constexpr size_t CHECK_PAGES = 2048;
+
   char* data_;
   size_t sz_;
+  // mincore reports every page of a file the process can neither own nor
+  // write as resident (to close a page-cache side channel), so residency is
+  // only checked for files it reports truthfully.
+  bool checkResidency_;
 
 public:
   // The caller retains ownership of fd. O_DIRECT affects pread, not mmap.
@@ -39,12 +52,14 @@ public:
     if (mapped == MAP_FAILED) {
       throw FileIOException("MMapInputFile: mmap failed for " + path.string() + ": " + strerror(errno));
     }
+    bool checkResidency = st.st_uid == geteuid() || faccessat(AT_FDCWD, path.c_str(), W_OK, AT_EACCESS) == 0;
     try {
-      return std::make_shared<MMapInputFile>((char*)mapped, size);
+      return std::make_shared<MMapInputFile>((char*)mapped, size, checkResidency);
     } catch (...) { munmap(mapped, size); throw; }
   }
 
-  MMapInputFile(char* data, size_t size) : data_(data), sz_(size) {}
+  MMapInputFile(char* data, size_t size, bool checkResidency = false)
+    : data_(data), sz_(size), checkResidency_(checkResidency) {}
 
   ~MMapInputFile() override {
     if (data_ && sz_ > 0) {
@@ -60,8 +75,26 @@ public:
   void prefetch(size_t offset, size_t length) override {
     if (offset >= sz_ || length == 0) return;
     static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-    size_t start = offset / pageSize * pageSize;
-    (void)madvise(data_ + start, offset - start + std::min(length, sz_ - offset), MADV_WILLNEED);
+    char* start = data_ + offset / pageSize * pageSize;
+    char* end = data_ + offset + std::min(length, sz_ - offset);
+    if (!checkResidency_ || (size_t)(end - start) < CHECK_BYTES) return advise(start, end);
+#if defined(__APPLE__)
+    char vec[CHECK_PAGES];
+#else
+    unsigned char vec[CHECK_PAGES];
+#endif
+    while (start < end) {
+      size_t pages = std::min(CHECK_PAGES, ((size_t)(end - start) + pageSize - 1) / pageSize);
+      if (mincore(start, pages * pageSize, vec) != 0) return advise(start, end);
+      for (size_t i = 0; i < pages;) {
+        if (vec[i] & 1) { i++; continue; }
+        size_t run = i + 1;
+        while (run < pages && !(vec[run] & 1)) run++;
+        advise(start + i * pageSize, std::min(end, start + run * pageSize));
+        i = run;
+      }
+      start += pages * pageSize;
+    }
   }
 
   std::string_view read() override {
@@ -70,6 +103,13 @@ public:
 
   InputStream getInputStream() override {
     return {data_, data_ + sz_};
+  }
+
+private:
+  static void advise(char* start, char* end) {
+    for (; start < end; start += ADVISE_BYTES) {
+      (void)madvise(start, std::min(ADVISE_BYTES, (size_t)(end - start)), MADV_WILLNEED);
+    }
   }
 };
 

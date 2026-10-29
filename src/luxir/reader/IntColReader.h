@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 
 #include "DocsReader.h"
@@ -115,6 +116,7 @@ private:
   NumColumnFormat::LeafMeta leaves;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
+  bool arrayMode = false;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
@@ -136,6 +138,7 @@ public:
   docs(postingsReader, fieldInfo)
   {
     nvals = fieldInfo.numValues;
+    arrayMode = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
     docsWithField = fieldInfo.docsWithField;
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
     const char* blocks = columnIS.ptr();
@@ -224,6 +227,11 @@ public:
     return values.blockInfo(blockNum);
   }
 
+  std::optional<NumColumnFormat::RankBounds> rankBounds(
+      int64_t blockNum, int64_t lo, int64_t hi) const {
+    return values.rankBounds(blockNum, lo, hi);
+  }
+
   NumBlockZone blockZone(int64_t blockNum) const {
     assert(blockNum >= 0 && blockNum < numBlocks());
     NumBlockZone zone;
@@ -265,19 +273,7 @@ public:
   // value rank of decoded[0] and writes the number of valid values to count.
   int64_t decodeResidualSubBlock(int64_t valueRank, uint32_t* decoded,
                                  uint32_t& count) const {
-    constexpr int64_t SUB_BLOCK_SIZE = 128;
-    static_assert(BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
-    assert(valueRank >= 0 && valueRank < nvals);
-    int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
-    int64_t blockNum = start / BLOCK_SIZE;
-    int64_t rankInBlock = start % BLOCK_SIZE;
-    const NumericBlockInfo& block = blockInfo(blockNum);
-    assert(block.bits() <= 32 && block.scaledSlope == 0);
-    count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
-    LinearPack::unpack128(
-        columnIS.ptr() + block.payloadOffset(), rankInBlock, count,
-        block.bits(), LinearPack::mask32(block.bits()), decoded);
-    return start;
+    return values.decodeResidualFrame(valueRank, decoded, count);
   }
 
   // Decode reconstructed values for packed predicted/wide or raw blocks.
@@ -296,6 +292,33 @@ public:
   /// only valid if multiValued() is true
   int64_t getStartValueRank(int32_t docRank) {
     return docRank == 0 ? 0 : endValueRankReader->valueAt(docRank - 1);
+  }
+
+  bool multiSet() const { return multiValued() && !arrayMode; }
+
+  /// First or last stored value rank. Only valid for multi-valued columns.
+  int64_t getEdgeValueRank(int32_t docRank, bool last) {
+    return last ? endValueRankReader->valueAt(docRank) - 1 : getStartValueRank(docRank);
+  }
+
+  // Numeric sort selection in encoded order. Set columns read an edge;
+  // arrays scan their source sequence. NaN remains a present encoded value.
+  int64_t selectedValue(int32_t docRank, bool maximum, auto& values) {
+    assert(multiValued());
+    if (multiSet()) return values.valueAt(getEdgeValueRank(docRank, maximum));
+    return scanSelectedValue(docRank, maximum, values);
+  }
+
+  // Out of line so the array scan does not enlarge the comparators' inlined
+  // per-document reads.
+  LUXIR_NOINLINE int64_t scanSelectedValue(int32_t docRank, bool maximum, auto& values) {
+    auto [start, end] = getStartEndValueRank(docRank);
+    int64_t selected = values.valueAt(start);
+    for (int64_t rank = start + 1; rank < end; rank++) {
+      int64_t next = values.valueAt(rank);
+      selected = maximum ? std::max(selected, next) : std::min(selected, next);
+    }
+    return selected;
   }
 
   template <class DocAcceptor>

@@ -21,11 +21,39 @@ struct PointsMaterialize {
   };
 
   static uint64_t arrayLimit(int32_t maxDoc) {
-    return ((uint64_t)(uint32_t)maxDoc + 31) >> 5;
+    // Point traversal emits docids in value order. Switch before the memory
+    // break-even (maxDoc/32) to avoid sorting moderately sparse result sets.
+    return ((uint64_t)(uint32_t)maxDoc + 127) >> 7;
   }
 
   static bool useBitset(uint64_t expected, int32_t maxDoc) {
     return expected > arrayLimit(maxDoc);
+  }
+
+  // Prices in point emissions (see Query::Demand) shared by the points
+  // producers and the column verifiers they compete with. Bitset words and
+  // the sorted array were measured by forcing each arm under a 35-candidate
+  // pull lead (5M docs, one segment, 2026-10-28). One verification costs
+  // about a cache miss at the sparse candidate densities where verifying can
+  // win: fitted on that board's forced-arm oracle for numeric ranges, and
+  // flat from 5 to 40 for geo boxes on the two-filter boards (2026-10-28).
+  static constexpr double WORD_POINTS = 0.15;   // zero one bitset word
+  static constexpr double ARRAY_POINTS = 10;    // one point through the sorted array
+  static constexpr double VERIFY_POINTS = 20;   // verify one candidate in the column
+
+  // Verifying `candidates` instead of producing, plus the consumer's own work
+  // that producing would spare it (Query::Demand::sparedWork).
+  static double verifyPrice(double candidates, const Query::Demand& demand) {
+    return VERIFY_POINTS * candidates + demand.sparedWork;
+  }
+
+  // Materializing `emitted` points: into a bitset (a complement fills it
+  // before clearing), or below the bitset threshold into an array sorted
+  // afterwards.
+  static double price(uint64_t emitted, int32_t maxDoc, bool complement = false) {
+    if (!complement && !useBitset(emitted, maxDoc)) return ARRAY_POINTS * (double)emitted;
+    return (double)emitted
+        + (complement ? 2 : 1) * WORD_POINTS * (double)FixedBitSet::sizeInWords(maxDoc);
   }
 
   static void setRun(FixedBitSet& bits, int32_t begin, int32_t end) {

@@ -78,6 +78,14 @@ public:
   void add(int64_t value, int64_t count = 1) requires std::is_same_v<T, int64_t> {
     counters[observe(value)] += count;
   }
+  // The directory cell holding value, without marking it occupied; nullopt
+  // where observe() would grow.
+  std::optional<size_t> find(int64_t value) const {
+    uint64_t offset = (uint64_t)value - (uint64_t)base;
+    if (offset >= width) return std::nullopt;
+    if (gap) return (size_t)(offset / gap);
+    return (size_t)(std::upper_bound(fences.begin(), fences.end(), value) - fences.begin() - 1);
+  }
   T& entry(size_t index) { return counters[index]; }
   std::span<T> entries() { return counters; }
   std::span<const T> entries() const { return counters; }

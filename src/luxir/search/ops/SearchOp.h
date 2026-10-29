@@ -54,8 +54,11 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
 
 struct CollectionRequirements {
   bool needRankedDocs = false;
-  bool needExactCount = false;
+  int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+
+  bool needsCount() const { return countLimit != 0; }
+  bool isBounded() const { return countLimit > 0; }
 };
 
 // --- Response-side (owning) oneof / optional mutators ---
@@ -145,6 +148,7 @@ class SearchOp {
 public:
   SearchRequest& req;
   std::string_view name;
+  uint64_t flags = 0; // effective packed options, set by the parser
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;
@@ -402,12 +406,15 @@ public:
     //     encode's it and respondRaw(..., more=true), then it is dropped (per-emit
     //     eager-drop). The accumulating/final response is untouched; multiple intermediates
     //     may precede the final, which goes out more=false.
-    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+    luxir::api::Val* getTarget(SearchResponse* resp, SearchOp& sub, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
       resp = resp ? resp : op.req.lastResponse;
-      auto* val = parent->getTargetForSub(resp, this);
+      auto* val = parent->getTargetForSub(resp, sub);
       visitor(*val); // call the visitor with the target Val with mutex held.
       return val;
+    }
+    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+      return getTarget(resp, op, std::forward<decltype(visitor)>(visitor));
     }
     luxir::api::Val* getTarget(SearchResponse* resp) {
       return getTarget(resp, [](luxir::api::Val&){});
@@ -427,10 +434,10 @@ public:
       return arm;
     }
 
-    // Called by a subCalculator on us to get the target for the subCalculator to set.
+    // Resolve a named child, including when another child emits its result.
     // `resp` is non-null (getTarget resolves it). Do not call this without op.req.mutex
     // held to protect the response from concurrent modifications.
-    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) = 0;
+    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) = 0;
 
     SearchOp& getOp() {
       return op;
@@ -491,7 +498,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
@@ -571,9 +578,6 @@ class KeyedAggregateTable {
   BigFlatMap<Key, char*, Hash> sparseEntries;
   [[no_unique_address]] Payload payload;
   static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
-  // The entry header counts documents delivered to metrics. Repeated values
-  // add only facet occurrences, without changing compact metric denominators.
-  boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
@@ -924,28 +928,6 @@ public:
     }
   }
 
-  void addOccurrence(char* entry, int64_t count = 1) {
-    assert(loadUnaligned<int64_t>(entry) > 0);
-    auto it = extraOccurrences.find(entry);
-    if (it != extraOccurrences.end()) {
-      it->second += count;
-    } else {
-      constexpr size_t bytes = 2 * (sizeof(std::pair<char*, int64_t>) + 1);
-      charge(bytes);
-      sparseBytesCharged += bytes;
-      extraOccurrences.emplace(entry, count);
-    }
-  }
-
-  int64_t occurrenceCount(char* entry) const {
-    int64_t count = loadUnaligned<int64_t>(entry);
-    if (!extraOccurrences.empty()) {
-      auto it = extraOccurrences.find(entry);
-      if (it != extraOccurrences.end()) count += it->second;
-    }
-    return count;
-  }
-
   template <typename RemapKey>
   void merge(KeyedAggregateTable& other, RemapKey&& remapKey) {
     assert(rep != Rep::UNINITIALIZED || other.empty());
@@ -955,7 +937,6 @@ public:
         stats->mixedMerges.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    const bool carryOccurrences = !other.extraOccurrences.empty();
     other.forEachEntry([&](KeyArg key, char* from) {
       decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
@@ -964,10 +945,6 @@ public:
         mergeNewEntry(target, from, other);
       } else {
         mergeEntry(target, from, other);
-      }
-      if (carryOccurrences) {
-        auto it = other.extraOccurrences.find(from);
-        if (it != other.extraOccurrences.end()) addOccurrence(target, it->second);
       }
     });
   }

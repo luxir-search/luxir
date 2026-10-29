@@ -282,9 +282,12 @@ POST /collections/books/_update
 }
 ```
 
-Integer elements are accepted. Every element must be a finite float32: a double
-past float32 range, or a NaN or infinity in any arm (typed gRPC vectors included),
-fails the document.
+Integer elements are accepted. Every element must be a finite float32 with
+magnitude at most 2^40 (about 1.1e12): a double past float32 range, a NaN or
+infinity in any arm (typed gRPC vectors included), or a larger element fails the
+document. The limit keeps every distance computed while indexing and searching
+finite; embeddings sit many orders of magnitude below it. Query vectors follow
+the same rule.
 
 Over gRPC, use the typed `Val.vec` and `Val.arr_vec` arms. In protobuf text,
 a single-valued vector field is:
@@ -445,7 +448,7 @@ has no root shorthand, so both request and response use named `ops`.
 | `weights` | Per-source weights keyed by source name; a source without an entry has weight `1`. |
 | `rrf.k` | The rank-smoothing constant, `>= 0`. Omitted selects `60`, the conventional choice. |
 | `linear.normalization` | Score normalization for [linear fusion](#linear-fusion); `min_max`, the default, is the only one today. |
-| `limit`, `offset`, `fields`, `get_scores`, `get_number`, `document_format` | Response shape, on the fusion, not on a source. |
+| `limit`, `offset`, `fields`, `get_scores`, `count_limit`, `document_format` | Response shape, on the fusion, not on a source. |
 | `ops` | Operations over the fused candidate set, including collapsed `top_docs`. |
 
 A source's `limit` bounds its candidate pool: a document outside a source's
@@ -485,7 +488,7 @@ A source can use `collapse` for diversity: its `limit` then counts groups,
 and its best member documents enter ordinary document fusion; under
 `linear`, the source normalizes its head scores over its group list. Sources
 may use independent keys and missing policies. Source collapse accepts only
-`field` and `missing`; `head_sort`, metric `sort`, `get_number` and `ops` are
+`field` and `missing`; `head_sort`, metric `sort`, `get_count` and `ops` are
 errors. A source's `knn.unit: "groups"` uses that source's collapse key.
 
 `fusion.collapse` groups the fused document list before paging. Groups rank
@@ -513,10 +516,10 @@ groups by default (`count_unit: "docs"` counts documents), and a source's
           }
         },
         "collapse": {
-          "field": "product_s", "head_sort": "price_i asc", "get_number": true,
+          "field": "product_s", "head_sort": "price_i asc", "get_count": true,
           "ops": {"colors": {"field_facet": {"field": "color_s"}}}
         },
-        "limit": 10, "get_scores": true, "get_number": true
+        "limit": 10, "get_scores": true, "count_limit": -1
       }
     }
   }
@@ -661,6 +664,9 @@ overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
+
+Builds run as indexing tasks, so their parallelism is bounded by the indexing
+arena, sized by `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
 
 ### Index settings
 

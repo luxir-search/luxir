@@ -406,3 +406,12 @@ TEST_F(GrowingDistinctTupleTest, workerTupleIdsRemappedBothOrders) {
     EXPECT_EQ(2, merged->missing());
   }
 }
+
+TEST(GrowingDistinctFacetTest, nanosecondCellsAtReservedExtrema) {
+  auto grid = Grid::fixed(FieldType::DATE, 5, 0, TimeZone::utc(), DateUnit::NANOS);
+  for (int64_t base : {INT64_MIN + 1, INT64_MAX - 8}) {
+    std::vector<int64_t> values;
+    for (int i = 0; i < 8; i++) values.push_back(base + i);
+    randomized(grid, values);
+  }
+}

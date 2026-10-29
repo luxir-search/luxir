@@ -33,6 +33,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/RowReadAhead.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
@@ -294,8 +295,9 @@ public:
   /// asc.  Being total makes every bounded top-N cut deterministic regardless
   /// of scan or merge order - the property the parallel scan accumulator
   /// relies on for parallel == serial results.  Totality requires non-NaN
-  /// scores: the query vector is validated finite up front, and finiteScore
-  /// maps any NaN arising from stored vectors to the worst finite score.
+  /// scores: query and stored vectors share VectorFieldType::inputError's
+  /// bounds, which keep distances finite, and finiteScore maps any NaN that
+  /// still arises to the worst finite score.
   static bool betterHit(const VectorEngineHit& a, const VectorEngineHit& b) noexcept {
     if (a.score != b.score) return a.score > b.score;
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
@@ -852,7 +854,7 @@ public:
           if (rot == rotation) return buf.data();
         }
         auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
-        rotation->apply_noalloc(1, queryPtr, entry.second.data());
+        rotateVector(*rotation, queryPtr, entry.second.data());
         return entry.second.data();
       };
       // RaBitQ query quantization is a search-time knob: the current
@@ -1777,6 +1779,31 @@ public:
           return false;
         };
 
+        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
+        // of eligible docs, resolved through its own valDoc cursor (windows
+        // ascend).  Reads that cursor causes count as the window's cold pages,
+        // which only leans toward staying on.
+        StrColReader& col = vr.strColReader();
+        RowReadAhead::Gate gate;
+        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
+                           (size_t)col.fixedValueSize(), numVals);
+        std::optional<MonoReader::BulkValues> aheadValDoc;
+        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+        int32_t aheadDoc = -1;
+        bool aheadEligible = false;
+        auto eligibleRank = [&](int64_t r) {
+          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+          if (doc != aheadDoc) {
+            aheadDoc = doc;
+            aheadEligible = docEligible(doc);
+          }
+          return aheadEligible;
+        };
+        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+          if (domain == nullptr) ahead.scanAt(rank);
+          else ahead.scanAt(rank, eligibleRank);
+        };
+
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
@@ -1794,6 +1821,7 @@ public:
                 idx = valDoc.next();
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
+              readAhead(rank);
               if (docEligible(docId) && !pooledInRun(rank, end)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
@@ -1810,6 +1838,7 @@ public:
           } else {
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
+              readAhead(rank);
               if (pooledInRun(rank, rank + 1)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
@@ -2627,7 +2656,7 @@ private:
       [kDocs, groupPlan]() { return new RescoreAccumulator<Groups>(kDocs, groupPlan); },
       [](RescoreAccumulator<Groups>* acc) { delete acc; });
 
-    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd) {
+    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd, RowReadAhead::Gate& gate) {
       int32_t segOrd = candidates[bucketBegin].segOrd;
       if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
@@ -2648,10 +2677,38 @@ private:
           std::optional<VectorReader::Iterator>, NoGroupState> fullDocs;
       if constexpr (Groups) if (vr && vr->isMultiValued()) fullDocs.emplace(vr->strColReader());
 
+      // Read-ahead of the bucket's rows on a column that is not resident (see
+      // RowReadAhead).  A unit is a candidate's row, or for a group witness
+      // its document's whole value run (the witness can sit anywhere in it),
+      // found by a second iterator in doc order.  Reads that iterator causes
+      // count as the batch's cold pages, which only leans toward staying on.
+      int64_t units = (int64_t)(bucketEnd - bucketBegin);
+      std::optional<RowReadAhead> ahead;
+      [[no_unique_address]] std::conditional_t<Groups,
+          std::optional<VectorReader::Iterator>, NoGroupState> aheadDocs;
+      auto rankAt = [&](int64_t k) { return candidates[bucketBegin + (size_t)k].valueRank; };
+      auto queue = [&](int64_t k) {
+        int64_t rank = rankAt(k);
+        if constexpr (Groups) if (aheadDocs) {
+          int32_t doc = v2d.resolve(rank);
+          if (aheadDocs->docId() < doc) aheadDocs->advance(doc);
+          auto [begin, end] = aheadDocs->valueRange();
+          ahead->queueRows(begin, end);
+          return;
+        }
+        ahead->queueRows(rank, rank + 1);
+      };
+      if (vr) {
+        ahead.emplace(gate, vr->strColReader());
+        if constexpr (Groups) if (fullDocs) aheadDocs.emplace(vr->strColReader());
+        ahead->probe({rankAt(units / 4), rankAt(units / 2 + units / 4)});
+      }
+
       // unique_ptr guards the obtained accumulator against a throw before
       // release (same idiom as FacetOp).
       std::unique_ptr<RescoreAccumulator<Groups>> acc(merger.obtain());
       for (size_t i = bucketBegin; i < bucketEnd;) {
+        if (ahead) ahead->sparseAt((int64_t)(i - bucketBegin), units, queue);
         int32_t docId = v2d.resolve(candidates[i].valueRank);
         size_t runEnd = i + 1;
         while (runEnd < bucketEnd && v2d.resolve(candidates[runEnd].valueRank) == docId) {
@@ -2701,10 +2758,11 @@ private:
     // Cancel and drain published buckets if a caller-side bucket throws.
     int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
     std::vector<std::pair<size_t, size_t>> tasks, local;
+    RowReadAhead::Gate gate;  // shared by the buckets that run on this thread
     for (size_t b = 0; b < candidates.size();) {
       size_t e = b + 1;
       while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
-      if (!parallel) rescoreBucket(b, e);
+      if (!parallel) rescoreBucket(b, e, gate);
       else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
       else local.emplace_back(b, e);
       b = e;
@@ -2712,9 +2770,12 @@ private:
     TaskGroupRunner runner;
     task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
       auto [b, e] = tasks[i];
-      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
+      return [&rescoreBucket, b, e]() {
+        RowReadAhead::Gate taskGate;
+        rescoreBucket(b, e, taskGate);
+      };
     });
-    for (auto [b, e] : local) rescoreBucket(b, e);
+    for (auto [b, e] : local) rescoreBucket(b, e, gate);
     runner.join();
 
     RescoreAccumulator<Groups>* acc = merger.getData();
@@ -2722,12 +2783,11 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
+  // Query and stored vectors share inputError's element bound, which keeps
+  // every exact and FAISS distance finite.  A NaN score would break the
+  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
+  // cuts deterministic and std::sort defined, so any NaN that slips past the
+  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
   // minCompetitiveVal starts at lowest() and admits only strictly greater
   // scores, and a kNN hit must rank last, not be counted in matches yet
   // vanish from the returned docs.

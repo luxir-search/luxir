@@ -274,7 +274,7 @@ Two byte counts measure different things and will disagree:
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+`delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
 (`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
 cumulative, aligned with `service.request_duration_bounds` (requests, search
 execution and index batches, from 10 microseconds) or
@@ -494,7 +494,9 @@ statistics exist for those features.
 
 HTTP defaults to one connection-I/O shard per available logical CPU, with a
 minimum of one, plus one dedicated accept thread. gRPC defaults to half the
-available logical CPUs, also with a minimum of one. Automatic sizing respects
+available logical CPUs, also with a minimum of one; its completion-queue
+threads only move bytes and hand requests off, so they need not match the
+query concurrency. Automatic sizing respects
 the process's CPU affinity, so a server restricted to 28 logical CPUs defaults
 to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 
@@ -518,22 +520,24 @@ workers.
 ./luxir --server.workers=2
 ```
 
-Search requests default to serial execution directly on the transport thread
-that received them (an HTTP io shard or gRPC completion-queue thread). This
-avoids a scheduler handoff and idle-worker wakeups but occupies that
-connection's thread for the query's duration. The request-level
-`max_parallel` changes that: `1` moves the request onto the shared
-work-stealing scheduler, still serial (use this for requests expected to be
-expensive, so they do not delay other traffic on the same connection thread);
-`-1` keeps the request on its transport thread but lets the scheduler's
-workers join in with unlimited intra-request parallelism; values above `1` are
-reserved for a bounded parallelism budget and not implemented yet. No setting
-runs a request in parallel off its transport thread. Two paths leave the
-transport thread whatever the setting: a request with `min_commit` continues on
-a shared worker once its commit wait ends, and a gRPC search stream paused by
-flow control resumes on one. The current gRPC unary update handler waits for
-indexing on its completion-queue thread; streaming update and search use their
-separate flow-control paths.
+HTTP search requests default to serial execution directly on the io shard
+that received them. This avoids a scheduler handoff and idle-worker wakeups
+but occupies that connection's thread for the query's duration. The
+request-level `max_parallel` changes that: `1` moves the request onto the
+shared work-stealing scheduler, still serial (use this for requests expected
+to be expensive, so they do not delay other traffic on the same connection
+thread); `-1` keeps the request on its transport thread but lets the
+scheduler's workers join in with unlimited intra-request parallelism; values
+above `1` are reserved for a bounded parallelism budget and not implemented
+yet. A request with `min_commit` continues on a shared worker once its commit
+wait ends, whatever the setting.
+
+gRPC searches always run on the shared workers, never on the completion-queue
+thread: a client such as a gateway multiplexes many calls over one HTTP/2
+connection, and gRPC offers a connection's new calls to its preferred
+completion queue first, so inline execution would run them one at a time.
+`max_parallel` keeps its parallelism meaning there: `0` and `1` run serially
+on a worker, and `-1` fans out from one.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above
@@ -581,6 +585,12 @@ the node unlimited. The resolved values are logged at startup.
 - Lower `indexing.max-inverter-ram-mb` to trade merge work for flush latency and
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
+- A merge that cannot reserve its memory waits and asks indexing to give some
+  back, but never more than half of `indexing.max-ram-mb`: idle inverters are
+  flushed for it only while indexing holds more than that half, and only an
+  inverter holding at least its share of the half (and at least
+  `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
+  inverters are flushed only once the whole budget is in use.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
@@ -604,10 +614,10 @@ The HTTP request limits distinguish bounded material from streams:
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
 - `max-inflight-batches` bounds the number of internal batches one connection
-  can submit concurrently. `0` (the default) uses the worker count
-  (`--server.workers`) plus two; `1` makes batch submission serial. Reads pause when the limit is
-  reached and resume as batches complete. A larger limit uses more staging
-  memory.
+  has decoding or indexing at once. `0` (the default) uses the worker count
+  (`--server.workers`) plus two; `1` indexes one batch at a time. Reads pause
+  when the limit is reached and resume as batches are indexed, without waiting
+  for earlier batches to complete. A larger limit uses more staging memory.
 
 gRPC has one request limit, on the size of each received message (a unary
 request or one message of a stream):
@@ -633,12 +643,23 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `multi_match` field lists containing patterns may resolve to at most `64`
+  distinct physical targets after resolving search bindings and deduplicating,
+  including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
   disables it). Cached filters are evicted by rebuild cost per byte, so under
   pressure the cache keeps expensive compound filters and drops cheap ones
   first. Cache counters appear in `_stats?collections=true`
   (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
   `NOW` bound are never cached; see [Dates](dates.md#date-math).
+  The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
+  changes the budget at runtime: a shrink evicts down to the new budget, a
+  grow evicts nothing, and `0` disables the cache and drops its entries.
+  Without a tenant or collection it sets every collection, including ones
+  created later; with a tenant or collection it sets the existing ones
+  selected. The setting is kept when a collection is replaced (for example by
+  a follower's re-download), dropped when the collection is deleted, and not
+  persisted: a restart returns to `query-cache-bytes`.
 
 ## Time-zone data
 

@@ -69,7 +69,10 @@ every core busy even when work is skewed.
   output streams with no coordination. Tasks are admitted against a
   node-wide indexing-RAM budget: merge memory is predictable up front from
   segment statistics, so heavy fields are priced exactly, scheduled
-  largest-first, and light column merges pack around them.
+  largest-first, and light column merges pack around them. A merge waiting
+  for that budget claims at most half of it from in-progress indexing, so
+  ingest keeps building large segments instead of flushing a small one per
+  batch to make room.
 
 ### Asynchronous network IO
 
@@ -81,15 +84,17 @@ response paths keep connection handling separate from long-running engine work.
   shard with the fewest live connections and the connection stays pinned to
   that shard; an idle shard parks independently and does no per-request work
   for active shards. The gRPC server runs on completion queues.
-- Search work defaults to serial execution inline on the connection thread
-  that received it: cheap queries pay no scheduler handoff, and request rate
-  never wakes idle workers. A request can instead opt onto the shared
-  work-stealing scheduler (`max_parallel: 1`) so an expensive query does
-  not occupy its connection thread, or parallelize (`max_parallel: -1`):
-  it starts on the receiving thread, which enters the scheduler with a slot
-  reserved for transport threads, and idle workers steal its tasks. The gRPC
-  unary update path currently waits for indexing on its completion-queue
-  handler.
+- HTTP search work defaults to serial execution inline on the connection
+  thread that received it: cheap queries pay no scheduler handoff, and
+  request rate never wakes idle workers. A request can instead opt onto the
+  shared work-stealing scheduler (`max_parallel: 1`) so an expensive query
+  does not occupy its connection thread, or parallelize (`max_parallel:
+  -1`): it starts on the receiving thread, which enters the scheduler with
+  a slot reserved for transport threads, and idle workers steal its tasks.
+  gRPC hands every search to the scheduler instead: it offers a
+  connection's new calls to that connection's preferred completion queue
+  first, so inline execution would serialize the calls a client (a gateway,
+  say) multiplexes over one HTTP/2 connection.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is

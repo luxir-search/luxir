@@ -71,6 +71,8 @@ public:
   // Internal synthetic commits use this to publish an already-produced segment
   // layout without flushing unrelated inverter state that arrived later.
   bool publishOnly = false;
+  // Internal maintenance on commitFinishNode, without flushing or publication.
+  bool applyOnly = false;
   std::optional<CommitId> resultingCommit;
 
   // Aux index rebuild request, applied during this commit (no effect if commit == NO_COMMIT).

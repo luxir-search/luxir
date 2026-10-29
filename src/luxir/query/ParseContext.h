@@ -18,6 +18,8 @@
 namespace luxir {
 
 class CollapsePlan;
+class IndexReader;
+class LuxirNode;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
@@ -26,6 +28,11 @@ class CollapsePlan;
 // query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
   const CollapsePlan* collapse = nullptr;
+  // The searched reader, when there is one: wildcard field lists reuse its
+  // schema-specific search catalog.
+  IndexReader* reader = nullptr;
+  // Null for offline parsing; request parsers pass their engine's node.
+  LuxirNode* node = nullptr;
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;
@@ -57,8 +64,8 @@ struct ParseContext {
                const CoerceContext& coerceContext,
                std::string_view opName,
                std::vector<api::Warning>* warnings = nullptr,
-               FieldResolver* fields = nullptr)
-    : pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
+               FieldResolver* fields = nullptr, LuxirNode* node = nullptr)
+    : node(node), pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
       coerceContext(coerceContext), localFields(schema),
       fields(fields ? *fields : localFields) {}
 

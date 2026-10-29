@@ -76,13 +76,15 @@ One request contains:
 - `freshness_ms` and `time_zone`: request-level view/date controls.
 - `profile`: include instrumented per-segment execution details on the final
   response; string field facets are currently instrumented.
-- `max_parallel`: maximum intra-request parallelism - `1` for serial on the
-  shared worker pool, `-1` for unlimited (starts on the completion-queue
-  thread that received it, with shared workers joining in). `0` (the
-  default) lets the engine decide; today that runs the request serially,
-  inline on the completion-queue thread that received it (no scheduler
-  handoff). `0` and `-1` occupy that thread for the request's duration.
-  Larger values are reserved.
+- `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
+  for unlimited (shared workers join in across segments and operations).
+  `0` (the default) lets the engine decide; today that is serial. Over gRPC
+  every search runs on the shared worker pool, never on the completion-queue
+  thread that received it: gRPC offers a connection's new calls to its
+  preferred completion queue first, so running queries there would
+  serialize the calls multiplexed on that connection. `0` and `1` therefore
+  behave alike,
+  and `-1` fans out from a worker. Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
@@ -163,6 +165,28 @@ collection cannot be resolved. Responses already accepted are still delivered
 before that status. The kinds, codes, and their meanings are
 transport-independent; see [HTTP API conventions](http-api.md#errors) for the
 table.
+
+## Packed request flags
+
+`SearchRequest` and the `SearchOp` wrapper carry `uint64 flags` and
+`uint64 flags_set`. Starting from request defaults of 0, resolve each level as:
+
+```text
+effective = (inherited & ~flags_set) | (flags & flags_set)
+```
+
+Subops inherit their parent's effective word. The date mode occupies bits 0-1:
+`0` is native, `1` is iso, `2` is ms, and `3` is ns. To override it, set
+`flags_set = 3` and put the mode value in `flags`. Explicit native uses
+`flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
+Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
+or clear it in either word. It affects HTTP JSON rendering only, and binary
+gRPC responses retain their integer types. Unknown bits are rejected in either
+word. Bits absent from `flags_set` have no effect on inheritance.
+
+`RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the
+position when constructing masks. JSON uses lowercase name arrays instead of
+the two wire words. See [date literal units](dates.md#request-flags-and-literal-units).
 
 ## HTTP JSON versus protobuf values
 

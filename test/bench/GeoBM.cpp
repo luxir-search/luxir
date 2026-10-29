@@ -291,7 +291,7 @@ std::shared_ptr<Schema> geoSchema(bool multi) {
   auto& field = b.field(FIELD);
   field.type = api::FieldDef::FieldClass::GEO_POINT;
   field.index = api::FieldDef::IndexMode::RANGE;
-  field.multi = multi;
+  field.multi = (multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   auto base = Schema::createDefaultSchema();
   return b.build(base.get());
 }
