@@ -111,6 +111,12 @@ locations, browse `src/luxir/<area>/`.
    - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
      optional points indexes at flush; `SegmentMerger` carries 1-D points
      forward by run-merging and rebuilds geo BKDs from the merged column.
+   - `SummaryCollector` gathers each field's bounds while flush and merge
+     write it, and `PostingsWriter::finish` turns the field directory into one
+     summary record per field; `IndexWriter` writes the result as the segment's
+     `segment_summary` overlay. `SegmentSummary` is the decoded sidecar, loaded
+     with the segment by `IndexReader` (`Segment::summary()`). See
+     [segment summaries](../design/segment-summaries.md).
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
