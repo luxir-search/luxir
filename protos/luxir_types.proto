@@ -2486,18 +2486,25 @@ message SchemaDef {
 
   // A merge writes its documents in this field's order: postings, columns,
   // stored fields, norms and points all follow the new doc ids, so a merged
-  // segment is exactly sorted. Ties keep merge source order, and sources are
-  // concatenated by their minimum (ascending) or maximum (descending) value.
-  // Documents without a value go last. A multi-valued document sorts by its
-  // minimum value ascending, its maximum descending. Flushed segments keep
-  // arrival order.
+  // segment is exactly sorted. Ties keep merge source order, and with ASC or
+  // DESC sources are concatenated by their minimum (ascending) or maximum
+  // (descending) value. Documents without a value go last. A multi-valued
+  // document sorts by its minimum value ascending, its maximum descending,
+  // and its minimum Hilbert key under HILBERT. Flushed segments keep arrival
+  // order.
   message IndexSort {
-    // A concrete field or template instance of type int or date with a column.
+    // A concrete field or template instance: an int or date column for ASC
+    // and DESC, a geo_point column for HILBERT. A plugin-typed field names
+    // its sort proxy, one of its derived fields, instead.
     string field = 1;
 
     enum Order {
       ASC = 0;
       DESC = 1;
+      // The 64-bit Hilbert curve key of the encoded latitude and longitude,
+      // so spatially close points get close doc ids: geo leaves and column
+      // zones cover small areas.
+      HILBERT = 2;
     }
     Order order = 2;  // unset selects ASC
   }

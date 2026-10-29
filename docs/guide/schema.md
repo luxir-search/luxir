@@ -871,7 +871,10 @@ representations.
 
 `index_sort` makes merges write their documents sorted by a field. It names
 an `int` or `date` column field, either concrete or a template instance, and
-an optional `order` (`asc`, the default, or `desc`):
+an optional `order` (`asc`, the default, or `desc`). `order: "hilbert"` sorts
+a `geo_point` field along a Hilbert curve instead; see
+[Geo search](geo-search.md#sort-the-index-by-location). A plugin field type
+can be named when it declares a sort proxy field.
 
 ```json
 {"index_sort": {"field": "timestamp_dt", "order": "desc"}}
@@ -881,8 +884,8 @@ an optional `order` (`asc`, the default, or `desc`):
   source order, and documents without a value go last. A multi-valued field
   sorts a document by its minimum value ascending, its maximum descending.
 - Merge sources are concatenated by their minimum (ascending) or maximum
-  (descending) value, so ties and the segment's leading documents follow
-  time order. When the sources are already in key order the merge just
+  (descending) value, so ties follow that order (creation order for
+  `hilbert`). When the documents are already in key order the merge just
   concatenates them.
 - Freshly flushed segments keep arrival order; only merged segments are
   sorted.
@@ -904,9 +907,12 @@ an optional `order` (`asc`, the default, or `desc`):
   (the response then carries an `index_sort_cleared` warning).
   A change affects only future merges; existing segments keep their order
   until they merge again.
-- Changing the field's type to one that is not an `int` or `date` column is
-  rejected while it is the index sort; switching between `int` and `date` is
-  allowed.
+- Changing the field's type to one the order cannot sort (not an `int` or
+  `date` column, or for `hilbert` not a `geo_point` column) is rejected while
+  it is the index sort; switching between `int` and `date` is allowed. A
+  persisted sort that no longer resolves when the collection loads (for
+  example, a plugin upgrade removed its sort proxy) is cleared with a logged
+  warning instead of failing the load.
 
 ## The operations
 

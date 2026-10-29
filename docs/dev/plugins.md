@@ -712,6 +712,12 @@ and defaults do not.
   `DerivedValues::exact(i)` is false when it may be. Decode from column-only fields, which
   hold their bytes exactly, and treat bytes as untrusted (check their length). A type that
   does not project is not retrievable as a whole; its non-opaque derived fields still are.
+- **Index sort.** `sortProxy()` returns the suffix of a derived field that stands in for
+  the authored field when a schema's `index_sort` names it, so
+  `{"index_sort": {"field": "shape", "order": "hilbert"}}` sorts merges by `shape$<suffix>`
+  (a centroid GEO_POINT, for example). The derived field must suit the order: a GEO_POINT
+  column for `hilbert`, an INT or DATE column for `asc` and `desc`. The default (empty)
+  refuses the field as an index sort.
 - **Persistence.** The authored definition is in the persisted schema, and its canonical
   form (the name, the params, sorted, and `version()` when not 0) is part of every derived
   field's signature (`plugin_type`). A changed definition is reported as a new
@@ -726,9 +732,11 @@ and defaults do not.
 
 The example plugin registers `pair` (above, with `separator` and `multi` params and their
 `canonicalParams()`; `project` decodes the opaque packed column) and `spot` (a GEO_POINT,
-an analyzed TEXT and a pre-analyzed TEXT; not retrievable). `FieldTypeExampleTest` covers validation, HTTP and gRPC ingest,
+an analyzed TEXT and a pre-analyzed TEXT; not retrievable; its point is the sort proxy).
+`FieldTypeExampleTest` covers validation, HTTP and gRPC ingest,
 queries, sorts and facets on derived fields, projection, templates, malformed values,
-merges with deletes, persistence and the missing-type failure.
+merges with deletes, persistence, the missing-type failure and a Hilbert index sort
+through the sort proxy.
 
 ## Storage backends and layers
 

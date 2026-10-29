@@ -18,12 +18,14 @@
 
 #include <glaze/glaze.hpp>
 
+#include "luxir/api/padded_input.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/util/geo.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/GrpcClient.h"
@@ -456,6 +458,74 @@ TEST_F(FieldTypeExampleTest, mergesWithDeletesKeepDerivedFields) {
   EXPECT_EQ((Strings{}), ids(R"("pt$key:\"5/95\"")"));
   auto body = search(R"("query":"pt$a:<=3","fields":["pt"],"sort":"pt$a asc")");
   EXPECT_EQ((Strings{R"({"a":0,"b":100})", R"({"a":2,"b":98})", R"({"a":3,"b":97})"}), values(body, "pt"));
+}
+
+// A plugin field type is an index sort through its sort proxy: spot's
+// GEO_POINT "at" orders a merged segment by Hilbert key, for a concrete field
+// and for a template instance alike.
+class FieldTypeSortProxyTest : public FieldTypeExampleTest, public ::testing::WithParamInterface<bool> {};
+
+TEST_P(FieldTypeSortProxyTest, hilbertIndexSortThroughSortProxy) {
+  bool templated = GetParam();
+  std::string field = templated ? "home_sp" : "s";
+  EXPECT_NE(std::string::npos, schemaError(R"({"fields":{"pt":"pair"},"index_sort":{"field":"pt","order":"hilbert"}})")
+                                   .find("names no sort proxy"));
+  schema(templated ? R"({"templates":{"_sp":"spot"},"index_sort":{"field":"home_sp","order":"hilbert"}})"
+                   : R"({"fields":{"s":"spot"},"index_sort":{"field":"s","order":"hilbert"}})");
+  EXPECT_EQ(field + "$at", helper.collection().getSchema()->indexSortField);
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  std::vector<std::pair<uint64_t, std::string>> keyed;
+  for (int seg = 0; seg < 3; seg++) {
+    std::string docs = "[";
+    for (int i = 0; i < 8; i++) {
+      int n = seg * 8 + i;
+      double lat = (double)((n * 37) % 160) - 79.5;
+      double lon = (double)((n * 91) % 340) - 169.75;
+      if (i) docs += ",";
+      docs += R"({"id":"p)" + std::to_string(n) + R"(",")" + field + R"(":{"lat":)" + std::to_string(lat) +
+              R"(,"lon":)" + std::to_string(lon) + "}}";
+      keyed.push_back({geo::hilbertKey(geo::encodePoint(lat, lon)), "p" + std::to_string(n)});
+    }
+    update(docs + "]");
+  }
+  auto merged = post("/collections/main/_update", R"({"docs":[],"commit":{"max_segments":1,"wait_for_merges":true}})");
+  ASSERT_EQ(200, merged.result_int()) << merged.body();
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+  std::sort(keyed.begin(), keyed.end());
+  Strings expected;
+  for (const auto& [key, id] : keyed) expected.push_back(id);
+  EXPECT_EQ(expected, ids(R"({"all":true})", R"(,"sort":"_docid_")"));
+  EXPECT_EQ((Strings{"p0"}), ids(R"({"geo_box":{"field":")" + field +
+                                 R"($at","min_lat":-80,"max_lat":-79,"min_lon":-170,"max_lon":-169}})"));
+}
+
+INSTANTIATE_TEST_SUITE_P(FieldTypeExample, FieldTypeSortProxyTest, ::testing::Bool(),
+                         [](const auto& info) { return info.param ? "templateInstance" : "concreteField"; });
+
+// A persisted schema still loads when its sort no longer resolves (here a
+// plugin type without a sort proxy, as after an upgrade dropped it): the sort
+// is cleared, from the authored source too. A request is rejected.
+TEST_F(FieldTypeExampleTest, storedIndexSortWithoutProxyLoadsCleared) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  ASSERT_TRUE(api::read_json(def, R"({"fields":{"pt":"pair"}})", arena));
+  def.index_sort = api::SchemaDef::IndexSort{"pt", api::SchemaDef::IndexSort::Order::HILBERT};
+  EXPECT_THROW(Schema::fromProto(def), SchemaError);
+  def.index_sort.reset();
+  auto valid = Schema::fromProto(def);
+  // The persisted source as if written when the type still had a proxy.
+  api::SchemaInfo info = valid->storedInfo(arena);
+  api::SchemaDef stored;
+  ASSERT_TRUE(api::decode(stored, api::copyToPaddedInput(info.source_def, arena), arena));
+  stored.index_sort = api::SchemaDef::IndexSort{"pt", api::SchemaDef::IndexSort::Order::HILBERT};
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(stored, bytes));
+  info.source_def = bytes;
+  auto loaded = Schema::fromStored(info, 3);
+  EXPECT_EQ("", loaded->indexSortField);
+  api::SchemaDef echoed;
+  loaded->toProto(&echoed, arena);
+  EXPECT_FALSE(echoed.index_sort.has_value());
 }
 
 class FieldTypeGrpcTest : public GrpcLuxirTest {};

@@ -1418,6 +1418,30 @@ TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
     SCOPED_TRACE(field);
     EXPECT_THROW(schemaJson(std::format(R"({{"index_sort":{{"field":"{}"}}}})", field), s.get()), SchemaError);
   }
+  // Hilbert order sorts a geo_point column; ASC and DESC do not.
+  EXPECT_EQ("loc_p", schemaJson(R"({"fields":{"loc_p":"geo_point"},"index_sort":{"field":"loc_p","order":"hilbert"}})", s.get())->indexSortField);
+  EXPECT_THROW(schemaJson(R"({"fields":{"loc_p":"geo_point"},"index_sort":{"field":"loc_p"}})", s.get()), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"index_sort":{"field":"ts","order":"hilbert"}})", s.get()), SchemaError);
+
+  // An order outside the enum (proto enums are open) is rejected. A stored
+  // schema whose sort no longer validates loads with the sort cleared, also
+  // from the authored source.
+  for (auto order : {(api::SchemaDef::IndexSort::Order)7, api::SchemaDef::IndexSort::Order::HILBERT}) {
+    api::SchemaDef def;
+    def.index_sort = api::SchemaDef::IndexSort{"ts", order};
+    EXPECT_THROW(Schema::fromProto(def, s.get()), SchemaError);
+    api::SchemaInfo info = s->storedInfo(arena);
+    api::SchemaDef stored;
+    ASSERT_TRUE(api::decode(stored, api::copyToPaddedInput(info.source_def, arena), arena));
+    stored.index_sort = def.index_sort;
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(stored, bytes));
+    info.source_def = bytes;
+    auto loaded = Schema::fromStored(info, 2);
+    EXPECT_EQ("", loaded->indexSortField);
+    EXPECT_EQ(std::string::npos, authoredJson(*loaded).find("index_sort"));
+  }
+
   // Retyping the sort field away from an int/date column must also clear or
   // move the index sort; int <-> date stays valid.
   EXPECT_THROW(schemaJson(R"({"fields":{"ts":"string"}})", s.get()), SchemaError);

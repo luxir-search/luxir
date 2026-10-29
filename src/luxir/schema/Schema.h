@@ -72,8 +72,10 @@ public:
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
-  // SchemaDef.index_sort: merges write their documents in this int/date
-  // column's order (see SegmentMerger). Empty keeps arrival order.
+  // SchemaDef.index_sort: merges write their documents in this column's
+  // order (see SegmentMerger). The physical field: a plugin-typed field's
+  // sort proxy is already resolved to its derived field. Empty keeps arrival
+  // order.
   std::string indexSortField;
   api::SchemaDef::IndexSort::Order indexSortOrder = api::SchemaDef::IndexSort::Order::ASC;
   // Introduction generations for declared concrete and template representations.
@@ -94,8 +96,8 @@ private:
 
   RootField findRoot(std::string_view root) const;
   const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
-  static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base,
-                                         InvalidStopWords invalidStopWords);
+  // stored: a persisted schema (fromStored), loaded leniently.
+  static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base, bool stored);
 
 public:
   Schema() = default;
