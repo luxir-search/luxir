@@ -483,6 +483,13 @@ bases forward every virtual, including `createFile` with options, `expectSynced`
 `deletePrefix`, `sync`, `underlying`, `linkFile`, `openChecksum` and `capabilities`.
 A wrapper that changes the semantics of a mutator must override it explicitly.
 
+`LuxirNode::detachCollection` stops serving a collection without removing its storage
+(the writer commits what it holds and closes), and `attachCollection` opens one that
+storage lists but the node has not opened, as startup does. Together they let a plugin
+hand a collection's storage from one node to another. Storage is not touched, so a
+layer that writes in the background settles its own directories after the detach, and
+it must stop listing a detached collection, or the next startup opens it again.
+
 ### Capabilities
 
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
