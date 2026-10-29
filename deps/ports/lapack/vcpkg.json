@@ -2,10 +2,13 @@
   "name": "lapack",
   "version-date": "2023-06-10",
   "port-version": 5,
-  "description": "LAPACK supplied by the C LAPACK build of OpenBLAS",
+  "description": "LAPACK supplied by the C LAPACK build of OpenBLAS, or by Accelerate on macOS",
   "license": null,
-  "supports": "linux & (x64 | arm64)",
+  "supports": "(linux & (x64 | arm64)) | (osx & arm64)",
   "dependencies": [
-    "openblas"
+    {
+      "name": "openblas",
+      "platform": "!osx"
+    }
   ]
 }

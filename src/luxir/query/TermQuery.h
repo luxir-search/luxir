@@ -14,9 +14,7 @@
 
 #include "ImpactsIndex.h"
 #include "Query.h"
-#include "luxir/reader/IntColReader.h"
 #include "luxir/reader/NormsReader.h"
-#include "luxir/reader/OrdColReader.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -129,17 +127,23 @@ public:
       // read. FuzzyQuery injects blended stats per clause, so those scorers are
       // weight-local; normal term queries keep sharing the cached scorer.
       if (needScores && cachedTermInfo != nullptr) {
-        if (query.hasInjectedStats()) {
+        if (!query.hasInjectedStats()) simScorer = cachedTermInfo->simScorer;
+        if (simScorer == nullptr) {
+          // Segments decide norms, as in the supplier; the schema may no longer
+          // list a field that older segments still hold.
+          bool hasNorms = false;
+          const auto& segInfos = cachedFieldInfo->segInfos;
+          for (size_t i = 0; i < segInfos.size(); i++) {
+            if (const auto* info = segInfos.at(i)) {
+              hasNorms = info->type == FieldType::TEXT;
+              break;
+            }
+          }
           simScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
               luxir::Similarity().getScorer(
-                  1.0f, cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo)));
-        } else {
-          if (cachedTermInfo->simScorer == nullptr) {
-            cachedTermInfo->simScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
-                luxir::Similarity().getScorer(1.0f, cachedFieldInfo->fieldStats,
-                                              cachedTermInfo->termStats));
-          }
-          simScorer = cachedTermInfo->simScorer;
+                  1.0f, cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo),
+                  hasNorms));
+          if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
         }
       }
     }
@@ -166,22 +170,11 @@ public:
 
       auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
-      luxir::IntColReader* valueReader = nullptr;
-      luxir::OrdColReader* ordReader = nullptr;
       if (segFieldInfo->type == FieldType::TEXT) {
         normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *segFieldInfo);
-      } else if (segFieldInfo->ordFormat != SegFieldInfo::ORD_NONE) {
-        ordReader = targetPool.make<luxir::OrdColReader>(segment.postingsReader(), *segFieldInfo);
-      } else if (segFieldInfo->columnLoc.offset() > 0) {
-        valueReader = targetPool.make<luxir::IntColReader>(segment.postingsReader(), *segFieldInfo);
-      }
-      if (ordReader != nullptr) {
-        return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, ordReader,
-                                                  simScorer, boost,
-                                                  query.shouldUseFrontierBound());
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
-                                                valueReader, simScorer, boost,
+                                                simScorer, boost,
                                                 query.shouldUseFrontierBound());
     }
 
@@ -248,7 +241,7 @@ public:
         // Warm exhaustive production costs about 14-16 instructions per
         // dense posting; sparse windows retain roughly 700 instructions of
         // dispatch/navigation. Round upward for admission, not execution.
-        return {df, 16 * df, std::ceil(df / DocsEnumMeta::L1_DOCS), 85, 1024, 8 * df};
+        return {df, 16 * df, std::ceil(df / DocsEnumMeta::L1_DOCS), 85, 1024, 8 * df, true};
       }
 
       Query::ScorerShape describeScorer(
@@ -267,6 +260,10 @@ public:
           .independentTerm = Query::IndependentTermAccess::SUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::SUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+          .membershipConsumption = buildContext.membershipConsumption
+                  == Query::MembershipConsumption::CANDIDATES
+              ? Query::MembershipConsumption::CANDIDATES
+              : Query::MembershipConsumption::WINDOWS,
         };
       }
 
@@ -302,7 +299,7 @@ public:
           BulkAnswer::NO,
           BulkAnswer::NO,
         };
-        plan.acceptsWindowFilter = BulkAnswer::YES;
+        plan.windowFilterConsumption = WindowFilterConsumption::FILL_OR_PROBE;
         if (!weight.needsScores() && isMembershipWindowUse(use)) {
           plan.statelessReposition = BulkAnswer::YES;
         }
@@ -326,11 +323,9 @@ public:
   class Scorer final : public Query::Scorer {
   public:
     luxir::DocsFreqEnum& docsEnum;
-    // Both absent when scores are not needed; score() is 0. Text fields use
-    // normsIter; non-text term queries keep the existing column-backed lookup.
+    // Text fields use normsIter; non-text fields configure BM25 without norms.
+    // simScorer is absent when scores are not needed; score() is then 0.
     std::optional<luxir::NormsReader::Iterator> normsIter;
-    std::optional<luxir::IntColReader::Iterator> valueIter;
-    luxir::OrdColReader* ordReader = nullptr;
     const uint8_t* flatNormsBase = nullptr;
     luxir::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
@@ -362,37 +357,13 @@ public:
     Scorer(luxir::DocsFreqEnum& docsEnum, luxir::NormsReader* normsReader,
            luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
-            : Scorer(docsEnum, normsReader, nullptr, nullptr, simScorer, boost,
-                     useFrontierBound) {
-    }
-
-    Scorer(luxir::DocsFreqEnum& docsEnum, luxir::NormsReader* normsReader,
-           luxir::IntColReader* valueReader, luxir::Similarity::BM25Scorer* simScorer,
-           float boost = 1.0f, bool useFrontierBound = true)
-            : Scorer(docsEnum, normsReader, valueReader, nullptr, simScorer, boost,
-                     useFrontierBound) {}
-
-    Scorer(luxir::DocsFreqEnum& docsEnum, luxir::OrdColReader* ordReader,
-           luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
-           bool useFrontierBound = true)
-            : Scorer(docsEnum, nullptr, nullptr, ordReader, simScorer, boost,
-                     useFrontierBound) {}
-
-    Scorer(luxir::DocsFreqEnum& docsEnum, luxir::NormsReader* normsReader,
-           luxir::IntColReader* valueReader, luxir::OrdColReader* ordReader,
-           luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
-           bool useFrontierBound = true)
-            : docsEnum(docsEnum), ordReader(ordReader), simScorer(simScorer), boost(boost) {
+            : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
       unused(useFrontierBound);
-      // Scoring needs both BM25 and an encoded norm/value lookup, or neither.
-      assert((simScorer == nullptr) ==
-             (normsReader == nullptr && valueReader == nullptr && ordReader == nullptr));
-      assert((normsReader != nullptr) + (valueReader != nullptr) + (ordReader != nullptr) <= 1);
+      assert(normsReader == nullptr || simScorer != nullptr);
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
       }
-      if (valueReader != nullptr) valueIter.emplace(*valueReader);
       competitiveBound = std::numeric_limits<float>::infinity();
     }
 
@@ -400,22 +371,7 @@ public:
            luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, normsReader != nullptr, useFrontierBound);
-    }
-
-    Scorer(luxir::MemPool& pool, luxir::DocsFreqEnum& docsEnum, luxir::NormsReader* normsReader,
-           luxir::IntColReader* valueReader, luxir::Similarity::BM25Scorer* simScorer,
-           float boost = 1.0f, bool useFrontierBound = true)
-            : Scorer(docsEnum, normsReader, valueReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, normsReader != nullptr || valueReader != nullptr,
-                   useFrontierBound);
-    }
-
-    Scorer(luxir::MemPool& pool, luxir::DocsFreqEnum& docsEnum,
-           luxir::OrdColReader* ordReader, luxir::Similarity::BM25Scorer* simScorer,
-           float boost = 1.0f, bool useFrontierBound = true)
-            : Scorer(docsEnum, ordReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, ordReader != nullptr, useFrontierBound);
+      buildImpacts(pool, useFrontierBound);
     }
 
     [[gnu::cold]] void prepareMembership() override {
@@ -437,9 +393,8 @@ public:
       return !impacts.empty();
     }
 
-    void buildImpacts(luxir::MemPool& pool, bool hasNormLookup,
-                      bool useFrontierBound = true) {
-      if (simScorer == nullptr || !hasNormLookup) {
+    void buildImpacts(luxir::MemPool& pool, bool useFrontierBound = true) {
+      if (simScorer == nullptr) {
         competitiveUpTo = PostingsReader::END;
         competitiveBound = std::numeric_limits<float>::infinity();
         return;
@@ -590,10 +545,9 @@ public:
         assert(normDoc == doc);
         return normsIter->value();
       }
-      if (ordReader != nullptr) return ordReader->firstOrdAt(doc);
-      int32_t normDoc = valueIter->advance(doc);
-      assert(normDoc == doc);
-      return valueIter->value();
+      // The no-norms scorer's LUT is constant, including code zero. The
+      // postings reader also synthesizes zero for norm-free impact headers.
+      return 0;
     }
 
     int64_t LUXIR_NOINLINE advanceNorm(int32_t doc) {
@@ -1230,24 +1184,6 @@ public:
                                      : windowFilter->accepts(doc));
     }
 
-    void applyWindowFilterProbe() {
-      int32_t innerSize = windowEnd - windowStart;
-      for (int32_t word = 0; word < kWindowWords; word++) {
-        uint64_t bits = windowBits[(size_t) word];
-        while (bits != 0) {
-          int32_t bit = (int32_t) std::countr_zero(bits);
-          int32_t index = (word << 6) + bit;
-          if (index >= innerSize) {
-            break;
-          }
-          if (!windowFilter->acceptsProbe(windowStart + index)) {
-            windowBits[(size_t) word] &= ~(1ULL << bit);
-          }
-          bits &= bits - 1;
-        }
-      }
-    }
-
     void prepareOutputWindow(ScoreWindow& out) {
       out.min = windowStart;
       out.max = windowEnd;
@@ -1272,11 +1208,7 @@ public:
         applyDocSetFilter(filter);
       }
       if (windowFilter != nullptr) {
-        if (windowFilter->probes()) {
-          applyWindowFilterProbe();
-        } else {
-          windowFilter->intersect(windowBits);
-        }
+        windowFilter->intersect(windowBits, windowStart);
       }
       return true;
     }

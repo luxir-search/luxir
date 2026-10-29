@@ -8,8 +8,9 @@ one query with no post-filter stage.
 
 ## Define a point field
 
-Geo fields need an explicit schema definition; the default suffix templates
-do not include one:
+A field whose name ends in `_p` (single point) or `_ps` (several points)
+uses a default template with the points index on, so `location_p` needs no
+definition. Any other name needs an explicit schema definition:
 
 ```http
 POST /collections/places/_schema
@@ -26,15 +27,19 @@ index for boxes and circles. If it is omitted, the same queries remain correct
 and scan the point column instead. The indexed and scan paths return the
 same results; only the cost differs.
 
+Geo fields reject `stored: true`: points are kept in the field's column for
+queries and sorting, not as stored values.
+
 For a document with several locations, set `multi: true`:
 
 ```json
 {"type":"geo_point","index":"range","multi":true}
 ```
 
-## Index points in longitude, latitude order
+## Point formats
 
-A point value is `[lon, lat]`, the same coordinate order used by GeoJSON:
+The canonical point value is `[lon, lat]`, the same coordinate order used by
+GeoJSON:
 
 ```http
 POST /collections/places/_update
@@ -51,11 +56,60 @@ POST /collections/places/_update
 Longitude must be within `[-180,180]` and latitude within `[-90,90]`. Luxir
 quantizes each coordinate into a 32-bit grid, roughly centimeter resolution.
 
-A multi-valued field takes an array of point arrays:
+The same point can be written in any of these forms, over HTTP JSON and gRPC
+alike:
+
+| Form | Example | Notes |
+|---|---|---|
+| Array | `[-74.0060, 40.7128]` | `[lon, lat]` |
+| Object | `{"lat": 40.7128, "lon": -74.0060}` | values may be numeric strings |
+| GeoJSON | `{"type": "Point", "coordinates": [-74.0060, 40.7128]}` | `[lon, lat]` |
+| String | `"40.7128,-74.0060"` | latitude first, as in Elasticsearch |
+| WKT | `"POINT (-74.0060 40.7128)"` | longitude first; case-insensitive |
+| Geohash | `"dr5regw3p"` | 1 to 12 characters; decoded to the centre of the cell |
+
+Keep the order straight: arrays, GeoJSON and WKT put longitude first, while
+the `"lat,lon"` string puts latitude first. A string with no comma that is
+not WKT is read as a geohash. For example, a coordinate sent as the bare
+string `"40"` becomes a coarse geohash cell, not a number.
+
+A multi-valued field takes an array of points, in any mix of forms:
 
 ```json
-{"id":"tour","location":[[-74.0060,40.7128],[-0.1278,51.5074]]}
+{"id":"tour","location":[[-74.0060,40.7128],"51.5074,-0.1278","u4pruydqqvj"]}
 ```
+
+An array whose elements are all numbers is always one point, so
+`[-74.0060, 40.7128]` sent to a multi-valued field is one point, not two.
+Any other array lists points, one per element, and `null` elements are
+skipped. A single-valued field also accepts a one-element array of points,
+and rejects a document that gives it more than one.
+
+## Malformed points and altitude
+
+By default a value that is not a valid point, such as an unreadable string, a
+coordinate out of range, or an array of the wrong length, fails the whole
+document with an error naming the field. Two field properties relax this:
+
+```json
+{"type":"geo_point","index":"range","ignore_malformed":true,"ignore_z_value":true}
+```
+
+- `ignore_malformed: true` skips a malformed point and indexes the rest of the
+  document. In a multi-valued field only the bad points are skipped. Skipped
+  values are not reported in the update response.
+- A third coordinate (`[lon, lat, z]`, `"lat,lon,z"`, `POINT Z (lon lat z)`)
+  is an altitude. By default `ignore_z_value: true` accepts the point and
+  drops the altitude. Set `ignore_z_value: false` to reject a third coordinate.
+  Altitude is never indexed.
+
+`ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`.
+An in-range longitude/latitude swap cannot be detected. Rejected points name
+the recognized form and interpreted `lon` and `lat` when both can be read.
+Templates and `parent` inheritance carry these options like other
+properties. They belong to the logical field, like `multi`: a
+[variant](schema.md#field-variants) of a geo field follows the primary's
+settings and cannot set its own.
 
 ## Bounding boxes
 
@@ -75,7 +129,7 @@ POST /collections/places/_search
     }
   },
   "fields": ["id","name_s"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 
@@ -116,7 +170,7 @@ POST /collections/places/_search
     }
   },
   "fields":["id","name_s"],
-  "get_number":true
+  "count_limit":-1
 }
 ```
 

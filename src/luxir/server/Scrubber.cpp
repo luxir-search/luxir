@@ -38,7 +38,10 @@ void Scrubber::stop() {
 void Scrubber::run(std::stop_token stop) {
   nameThisThread("luxir_scrub");
   // CPU priority only: the byte rate is what keeps a pass off the disks.
+  // macOS has no per-thread nice, and its QoS classes also lower I/O priority.
+#if defined(__linux__)
   (void)setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+#endif
   while (!stop.stop_requested()) {
     {
       std::unique_lock lock(wakeMutex);

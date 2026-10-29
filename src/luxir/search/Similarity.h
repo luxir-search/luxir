@@ -179,7 +179,11 @@ public:
     }
 
   public:
-    BM25Scorer(float boost, float k1, float b, float idf, float avgdl);
+    // Without norms, score as fieldLength == avgdl: the same scale as a text
+    // field at average length. The constant LUT keeps scalar, block and impact
+    // scoring on the same path.
+    BM25Scorer(float boost, float k1, float b, float idf, float avgdl,
+               bool hasNorms = true);
 
     float score(float termFreq, int64_t encodedNorm) {
       luxir::unused(boost,k1,b,idf,avgdl); // already folded in
@@ -255,10 +259,11 @@ public:
 
 
   // Pass in field stats and term stats to get a scorer for this Similarity
-  BM25Scorer getScorer(float boost, const FieldStats& fieldStats, const TermStats& termStats) {
+  BM25Scorer getScorer(float boost, const FieldStats& fieldStats, const TermStats& termStats,
+                       bool hasNorms = true) {
     auto idf_ = idf(fieldStats, termStats);
     auto avgdl = avgFieldLength(fieldStats);
-    return BM25Scorer(boost, k1, b, idf_, avgdl);
+    return BM25Scorer(boost, k1, b, idf_, avgdl, hasNorms);
   }
 
   BM25Scorer getScorer(float boost, const FieldStats& fieldStats, float idf_) {

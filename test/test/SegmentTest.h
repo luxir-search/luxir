@@ -5,6 +5,7 @@
 #include "luxir/reader/FieldReader.h"
 #include <tuple>
 #include "luxir/index/PostingsWriter.h"
+#include "test/TestUtils.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/util/random.h"
@@ -104,6 +105,7 @@ public:
   }
 
   void initReader() {
+    luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
     reader = std::make_unique<PostingsReader>(dir, 0);

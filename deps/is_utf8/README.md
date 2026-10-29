@@ -10,3 +10,6 @@ Update by re-copying these two files from the upstream tag.
 
 Local fix: close the Ice Lake region with `IS_UTF8_UNTARGET_ICELAKE` so GCC's
 target pragmas remain balanced when that instruction set is already enabled.
+
+Local fix: name the ARM `simd16<bool>` constructors without the template-id,
+which GCC rejects in C++20 (`-Wtemplate-id-cdtor`).

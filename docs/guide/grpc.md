@@ -79,24 +79,48 @@ One request contains:
 - `freshness_ms` and `time_zone`: request-level view/date controls.
 - `profile`: include instrumented per-segment execution details on the final
   response; string field facets are currently instrumented.
-- `max_parallel`: maximum intra-request parallelism - `1` for serial on the
-  shared worker pool, `-1` for unlimited (starts on the completion-queue
-  thread that received it, with shared workers joining in). `0` (the
-  default) lets the engine decide; today that runs the request serially,
-  inline on the completion-queue thread that received it (no scheduler
-  handoff). `0` and `-1` occupy that thread for the request's duration.
-  Larger values are reserved.
+- `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
+  for unlimited (shared workers join in across segments and operations).
+  `0` (the default) lets the engine decide; today that is serial. Over gRPC
+  every search runs on the shared worker pool, never on the completion-queue
+  thread that received it: gRPC offers a connection's new calls to its
+  preferred completion queue first, so running queries there would
+  serialize the calls multiplexed on that connection. `0` and `1` therefore
+  behave alike,
+  and `-1` fans out from a worker. Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
 `response_format=docs`; gRPC messages are already framed.
 
 Returned documents default to `DocFormat.COLUMNS`. `DocList.row_count` is the
-authoritative number of rows. Each requested dense column has that many slots
-and its type-specific missing sentinel identifies absent values. `DocList.docs`
-contains per-row maps when row placement is requested or when a field is not
-placed in a dense column. A document row is the merge of `columns[i]` and
-`docs[i]`.
+authoritative number of rows. Each dense column has that many slots and its
+type-specific missing sentinel identifies absent values. `DocList.docs`
+contains per-row maps for the fields placed in rows. A document row is the
+merge of `columns[i]` and `docs[i]`; a field name never appears in both.
+
+### Column placement
+
+`document_format` (on `TopDocs` or `Fusion`) chooses where each returned
+field lands:
+
+- `ROWS`: every field in `docs`.
+- `COLUMNS`: every field as a dense column, which decodes far faster in
+  clients than a map of oneofs per document. A field type with no typed
+  column arm comes back as `col_val`, one `Val` per document. Explicitly
+  named fields are present in every batch. Fields returned by an empty or
+  wildcard `fields` selector ("discovered" fields) are left out of a batch in
+  which no document has a value, so the set of discovered columns can vary
+  between batches.
+- `ADAPTIVE`: per batch and field, whichever placement encodes the batch more
+  compactly: a field present in few of the batch's documents goes to `docs`,
+  a dense one stays a column, and a field with no value in the batch is left
+  out. The choice is a heuristic, not a contract: the column set varies per
+  batch, and a named field may be in `docs` or absent. `_score_` is always
+  a column.
+
+Treat each batch's `columns` keys as authoritative and merge `docs[i]` into
+row `i`.
 
 ## Update streams
 
@@ -147,6 +171,28 @@ collection cannot be resolved. Responses already accepted are still delivered
 before that status. The kinds, codes, and their meanings are
 transport-independent; see [HTTP API conventions](http-api.md#errors) for the
 table.
+
+## Packed request flags
+
+`SearchRequest` and the `SearchOp` wrapper carry `uint64 flags` and
+`uint64 flags_set`. Starting from request defaults of 0, resolve each level as:
+
+```text
+effective = (inherited & ~flags_set) | (flags & flags_set)
+```
+
+Subops inherit their parent's effective word. The date mode occupies bits 0-1:
+`0` is native, `1` is iso, `2` is ms, and `3` is ns. To override it, set
+`flags_set = 3` and put the mode value in `flags`. Explicit native uses
+`flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
+Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
+or clear it in either word. It affects HTTP JSON rendering only, and binary
+gRPC responses retain their integer types. Unknown bits are rejected in either
+word. Bits absent from `flags_set` have no effect on inheritance.
+
+`RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the
+position when constructing masks. JSON uses lowercase name arrays instead of
+the two wire words. See [date literal units](dates.md#request-flags-and-literal-units).
 
 ## HTTP JSON versus protobuf values
 

@@ -7,8 +7,10 @@
 #include <array>
 #include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory_resource>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -19,9 +21,13 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "luxir/query/BooleanWeight.h"
+#include "luxir/query/DisMaxQuery.h"
+#include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermQuery.h"
+#include "luxir/search/Collector.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/FilterCache.h"
+#include "luxir/value/ValueExprParser.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -554,7 +560,7 @@ TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q");
-  cur.getNumber().limit(100).fields({"id"});
+  cur.countLimit().limit(100).fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "body_w", "b"), qb::match(cur.mr(), "body_w", "d")});
   req->execute(false);
@@ -630,7 +636,7 @@ TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(10);
+    cur.countLimit().limit(10);
     cur.rawQuery() = q;
     req->execute(false);
     return req->getMatchCount();
@@ -738,7 +744,7 @@ TEST_F(BooleanFuzzTest, negatedDenseCountHandlesWindowsSegmentsDeletesAndDomain)
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(0);
+    cur.countLimit().limit(0);
     std::vector<api::Query> required = {
         qb::match(cur.mr(), "body_w", sparse ? "nc_sparse" : "nc_pos")};
     std::vector<api::Query> prohibited = {
@@ -860,7 +866,7 @@ TEST_F(BooleanFuzzTest, randomizedNegatedCountMatchesPullOracle) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(0);
+    cur.countLimit().limit(0);
     std::vector<api::Query> required = {
         qb::match(cur.mr(), "body_w",
                   "rn_pos" + std::to_string(positive))};
@@ -968,7 +974,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
-      cur.getNumber()
+      cur.countLimit()
          .limit(numDocs)
          .batchSize(numDocs + 1)
          .fields({"id"});
@@ -1141,10 +1147,10 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
       auto queries = explicitCase(nestedCursor.mr(), spec);
-      nestedCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      nestedCursor.countLimit().getScores().limit(64).batchSize(65).fields({"id"});
       nestedCursor.rawQuery() = queries.first;
       auto& twinCursor = req->topDocs("twin");
-      twinCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      twinCursor.countLimit().getScores().limit(64).batchSize(65).fields({"id"});
       twinCursor.rawQuery() = queries.second;
       req->testForcePrepare = prepared;
       req->execute(iter % 2 == 0);
@@ -1175,10 +1181,10 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
       auto queries = explicitCase(nestedCursor.mr(), spec);
-      nestedCursor.getNumber().limit(0);
+      nestedCursor.countLimit().limit(0);
       nestedCursor.rawQuery() = queries.first;
       auto& twinCursor = req->topDocs("twin");
-      twinCursor.getNumber().limit(0);
+      twinCursor.countLimit().limit(0);
       twinCursor.rawQuery() = queries.second;
       req->testForcePrepare = prepared;
       req->execute(iter % 2 != 0);
@@ -1435,4 +1441,227 @@ TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
   }
   EXPECT_GT(SkipStats::mandOptBulkWindows, 0);
   SkipStats::enabled = savedStats;
+}
+
+TEST_F(BooleanFuzzTest, randomDisMaxScoresAndTopKMatchOracle) {
+  constexpr int32_t segmentDocs = DocsEnumMeta::L1_DOCS + 257;
+  constexpr int32_t segmentCount = 3;
+  std::vector<std::vector<std::string>> tokens;
+  std::vector<int32_t> signals;
+  for (int32_t seg = 0; seg < segmentCount; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t doc = 0; doc < segmentDocs; doc++) {
+      auto& words = tokens.emplace_back();
+      std::string body;
+      int length = (int) rng.rint(2, 25);
+      for (int i = 0; i < length; i++) {
+        // Cluster common terms, with a sparse background vocabulary, so
+        // windows have different bounds and phrase approximations overmatch.
+        int term = rng.rint(5) == 0 ? (int) rng.rint(VOCAB_SIZE)
+            : (seg * 7 + doc / 256 + (int) rng.rint(5)) % VOCAB_SIZE;
+        words.emplace_back(VOCAB[term]);
+        body += words.back() + " ";
+      }
+      int32_t signal = (int32_t) rng.rint(-8, 33);
+      signals.push_back(signal);
+      docs.push_back(flatdoc("id", "dm" + std::to_string(tokens.size()),
+                            "body_w", body, "signal_i", signal));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(segmentCount, reader->segments().size());
+  for (auto& segment : reader->segments()) ASSERT_EQ(segmentDocs, segment.maxDoc());
+  google::protobuf::Arena arena;
+  auto schema = helper.collection().getSchema();
+  ValueExprOptions options{schema.get(), {}};
+  auto* negative = ValueExprParser(options, arena).parse("neg(signal_i)");
+  int32_t positions[] = {0, 1, 2};
+  enum { TERM, PHRASE, RESCORE, CONSTANT };
+  struct Clause {
+    int kind;
+    std::vector<std::string> words;
+    float weight;
+  };
+  using ScoreDoc = TopDocsCollector::ScoreDoc;
+
+  for (int64_t iter = 0; iter < scaleTestWork(16); iter++) {
+    std::vector<Clause> clauses;
+    std::string summary;
+    // Each case has a term, a phrase, and a signed rescore. Four or more
+    // clauses also include a constant; extras can repeat a scoring clause.
+    for (int i = 0; i < 3 + iter % 4; i++) {
+      Clause clause{i < 4 ? i : (int) rng.rint(4), {}, 0.25f * (float) rng.rint(1, 17)};
+      int length = clause.kind == PHRASE ? (int) rng.rint(2, 4) : 1;
+      for (int word = 0; word < length; word++) clause.words.push_back(randTerm());
+      if (i >= 4 && rng.rint(4) == 0) clause = clauses[0];
+      summary += " kind=" + std::to_string(clause.kind) + " weight=" + std::to_string(clause.weight);
+      for (auto& word : clause.words) summary += " " + word;
+      clauses.push_back(std::move(clause));
+    }
+    SCOPED_TRACE(::testing::Message() << "seed=" << global_random_seed
+                 << " rng=" << rng_seed << " iter=" << iter << summary);
+    auto makeClauses = [&](MemPool& pool) {
+      auto queries = pool.make_span<Query*>(clauses.size());
+      for (size_t i = 0; i < clauses.size(); i++) {
+        const auto& clause = clauses[i];
+        auto* term = pool.make<TermQuery>("body_w", clause.words[0], clause.weight);
+        switch (clause.kind) {
+          case TERM:
+            queries[i] = term;
+            break;
+          case PHRASE: {
+            auto words = pool.make_span<std::string_view>(clause.words.size());
+            std::copy(clause.words.begin(), clause.words.end(), words.begin());
+            auto* phrase = pool.make<PhraseQuery>("body_w", words,
+                std::span<const int32_t>(positions, words.size()));
+            queries[i] = pool.make<BoostQuery>(phrase, clause.weight);
+            break;
+          }
+          case CONSTANT:
+            queries[i] = pool.make<ConstantScoreQuery>(term, clause.weight);
+            break;
+          case RESCORE: {
+            auto* rescore = pool.make<RescoreQuery>(term, negative);
+            queries[i] = pool.make<BoostQuery>(rescore, clause.weight);
+            break;
+          }
+        }
+      }
+      return queries;
+    };
+
+    // Snapshot standalone term/phrase scores with no pruning or disjunction.
+    // Membership comes from raw tokens; constant/rescore values from raw data.
+    std::vector<std::array<std::optional<float>, 6>> leafScores(tokens.size());
+    {
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      auto queries = makeClauses(pool);
+      for (size_t i = 0; i < clauses.size(); i++) {
+        if (clauses[i].kind == CONSTANT || clauses[i].kind == RESCORE) continue;
+        auto* weight = queries[i]->createWeight(context, Query::NEED_SCORES);
+        for (auto& segment : reader->segments()) {
+          auto* scorer = weight->createScorer(pool, segment);
+          if (scorer == nullptr) continue;
+          for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+            leafScores[(size_t) segment.ord * segmentDocs + doc][i] = scorer->score();
+          }
+        }
+      }
+    }
+    bool hasNegative = false;
+    for (size_t doc = 0; doc < tokens.size(); doc++) {
+      for (size_t i = 0; i < clauses.size(); i++) {
+        const auto& clause = clauses[i];
+        bool matches = clause.kind == PHRASE ? tokensContainPhrase(tokens[doc], clause.words)
+                                            : tokensContain(tokens[doc], clause.words[0]);
+        auto& score = leafScores[doc][i];
+        if (matches && clause.kind == CONSTANT) score = clause.weight;
+        if (matches && clause.kind == RESCORE) score = -(float) signals[doc] * clause.weight;
+        hasNegative |= score.has_value() && *score < 0.0f;
+        ASSERT_EQ(matches, score.has_value()) << "doc=" << doc << " clause=" << i;
+      }
+    }
+
+    ASSERT_TRUE(hasNegative);
+    for (float tie : {0.0f, (float) rng.rint(1, 1000) / 1000.0f, 1.0f}) {
+      SCOPED_TRACE(::testing::Message() << "tie=" << tie);
+      std::vector<std::optional<float>> reference(tokens.size());
+      std::vector<ScoreDoc> ranked;
+      for (size_t doc = 0; doc < tokens.size(); doc++) {
+        double sum = 0.0, best = -std::numeric_limits<double>::infinity();
+        bool matched = false;
+        for (const auto& score : leafScores[doc]) {
+          if (!score) continue;
+          sum += *score;
+          best = std::max(best, (double) *score);
+          matched = true;
+        }
+        if (!matched) continue;
+        float score = (float) ((1.0 - (double) tie) * best + (double) tie * sum);
+        reference[doc] = score;
+        ranked.push_back({score, segdoc((int32_t) (doc / segmentDocs), (int32_t) (doc % segmentDocs))});
+      }
+      std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.score != b.score ? a.score > b.score : a.doc < b.doc;
+      });
+      ASSERT_GE(ranked.size(), 20u);
+      auto nearScore = [](float a, float b) {
+        return std::abs(a - b) <= 1e-5f * std::max({1.0f, std::abs(a), std::abs(b)});
+      };
+      auto check = [&](int mode, int k) {
+        SCOPED_TRACE(::testing::Message() << "mode=" << mode << " k=" << k);
+        MemPool pool;
+        Query::Context context(pool, *reader);
+        auto queries = makeClauses(pool);
+        int flags = Query::NEED_SCORES | (k == 0 ? 0 : Query::ALLOW_PRUNING);
+        auto* query = DisMaxQuery::make(pool, queries, tie);
+        auto* weight = query->createWeight(context, flags);
+        TopDocsCollector collector(k);
+        size_t matches = 0;
+        for (auto& segment : reader->segments()) {
+          Query::Scorer* scorer;
+          if (mode == 0) {
+            scorer = weight->createScorer(pool, segment);
+          } else {
+            auto children = pool.make_span<Query::Scorer*>(queries.size());
+            size_t count = 0;
+            for (auto* child : queries) {
+              auto* next = child->createWeight(context, flags)->createScorer(pool, segment);
+              if (next != nullptr) children[count++] = next;
+            }
+            children = children.first(count);
+            if (count == 0) continue;
+            int32_t window = mode == 1 ? DocsEnumMeta::L1_DOCS : segment.maxDoc() + 1;
+            scorer = tie == 1.0f
+                ? (Query::Scorer*)pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+                    pool, children, segment.maxDoc(), window)
+                : pool.make<BooleanQuery::MaxScoreDisjunctionScorerT<true>>(
+                    pool, children, segment.maxDoc(), window, tie);
+          }
+          if (scorer == nullptr) continue;
+          if (k != 0) {
+            collectTopK(segment.ord, scorer, nullptr, nullptr, collector, true);
+          } else {
+            int32_t previous = -1;
+            for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+              ASSERT_GT(doc, previous);
+              previous = doc;
+              auto expected = reference[(size_t) segment.ord * segmentDocs + doc];
+              ASSERT_TRUE(expected.has_value()) << "unexpected doc=" << doc;
+              ASSERT_TRUE(nearScore(*expected, scorer->score())) << "doc=" << doc
+                  << " expected=" << *expected << " actual=" << scorer->score();
+              matches++;
+            }
+          }
+        }
+        if (k == 0) {
+          ASSERT_EQ(ranked.size(), matches);
+          return;
+        }
+        auto top = collector.sort();
+        ASSERT_EQ((size_t) k, top.size());
+        std::set<segdoc> seen;
+        for (size_t rank = 0; rank < top.size(); rank++) {
+          const auto& hit = top[rank];
+          auto expected = reference[(size_t) hit.doc.segment() * segmentDocs + hit.doc.docId()];
+          ASSERT_TRUE(expected.has_value());
+          ASSERT_TRUE(seen.insert(hit.doc).second);
+          ASSERT_TRUE(nearScore(*expected, hit.score)) << "rank=" << rank
+              << " expected=" << *expected << " actual=" << hit.score;
+          // Use the full oracle at the k boundary: a different member of a
+          // rounding-sized score tie is valid, but a worse score is not.
+          ASSERT_TRUE(nearScore(ranked[rank].score, hit.score)) << "rank=" << rank
+              << " expected=" << ranked[rank].score << " actual=" << hit.score;
+        }
+      };
+      for (int mode : {0, 1, 2}) {
+        for (int k : {0, 1, 5, 20}) {
+          check(mode, k);
+          if (HasFatalFailure()) return;
+        }
+      }
+    }
+  }
 }

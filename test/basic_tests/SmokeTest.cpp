@@ -120,7 +120,7 @@ TEST_F(SmokeTest, IndexSearchRoundTrip) {
     EXPECT_EQ(std::get<int64_t>(*find(*d3, "foo_i")), 5);
     EXPECT_EQ(std::get<std::string>(*find(*d3, "color_s")), "brown");
     ASSERT_NE(find(*d3, "colors_ss"), nullptr);
-    // Multi-valued string columns return sorted+deduped (SortedSet semantics), so the
+    // Default SET string columns return sorted unique values, so the
     // stored {"red","black"} comes back as {"black","red"}.
     EXPECT_EQ(std::get<std::vector<std::string>>(*find(*d3, "colors_ss")),
               (std::vector<std::string>{"black", "red"}));

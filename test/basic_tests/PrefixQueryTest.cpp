@@ -314,7 +314,7 @@ TEST_F(PrefixQueryTest, exactCountKeepsDeletesAndFiltersAcrossSegments) {
         auto req = localReq(helper.getSearchEngine());
         req->collection("main");
         auto& top = req->topDocs("q").exprQuery("body_w:pre*")
-            .getNumber().getScores().fields({"id"}).limit(limit);
+            .countLimit().getScores().fields({"id"}).limit(limit);
         if (filtered) top.matchFilter("keep_s", "yes");
         req->execute(parallel);
         ASSERT_TRUE(req->ok()) << req->errorMsg();

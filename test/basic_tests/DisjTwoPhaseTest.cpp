@@ -240,7 +240,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().getScores().limit(32).batchSize(33).fields({"id"});
+    cur.countLimit().getScores().limit(32).batchSize(33).fields({"id"});
     api::Query group = qb::boolean(
       cur.mr(), {},
       {qb::boost(cur.mr(),
@@ -344,7 +344,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().getScores().limit(32).batchSize(33).fields({"id"});
+    cur.countLimit().getScores().limit(32).batchSize(33).fields({"id"});
     cur.rawQuery() = qb::boolean(
       cur.mr(), {qb::match(cur.mr(), "body_w", "pc")}, {},
       {qb::phraseWords(cur.mr(), "body_w", {"pa", "pb"}),

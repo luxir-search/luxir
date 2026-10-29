@@ -103,7 +103,7 @@ public:
     if (limit_)  j += R"(,"limit":)"      + std::to_string(*limit_);
     if (offset_) j += R"(,"offset":)"     + std::to_string(*offset_);
     if (batch_)  j += R"(,"batch_size":)" + std::to_string(*batch_);
-    if (count_)  j += R"(,"get_number":true)";
+    if (count_)  j += R"(,"count_limit":-1)";
     if (scores_) j += R"(,"get_scores":true)";
     if (!fields_.empty()) {
       j += R"(,"fields":[)";

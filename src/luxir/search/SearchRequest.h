@@ -103,6 +103,7 @@ public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
+  uint64_t flags = 0;             // effective packed options, resolved during parsing
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;

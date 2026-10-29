@@ -1764,11 +1764,11 @@ template <> struct simd16<bool> : base16<bool> {
     return vmovq_n_u16(uint16_t(-(!!_value)));
   }
 
-  is_utf8_really_inline simd16<bool>() : base16() {}
-  is_utf8_really_inline simd16<bool>(const uint16x8_t _value)
+  is_utf8_really_inline simd16() : base16() {}
+  is_utf8_really_inline simd16(const uint16x8_t _value)
       : base16<bool>(_value) {}
   // Splat constructor
-  is_utf8_really_inline simd16<bool>(bool _value)
+  is_utf8_really_inline simd16(bool _value)
       : base16<bool>(splat(_value)) {}
 };
 

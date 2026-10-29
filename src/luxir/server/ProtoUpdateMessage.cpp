@@ -121,8 +121,12 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
         auto fname = fieldMap.resolve(name);
         if (!fname) continue;
         // A cached handler proves its name was accepted; creation validates a
-        // new name (a derived selector is not a document key).
+        // new name (a derived selector is not a document key, and the engine
+        // assigns _version_).
         if (handler == nullptr || *handler != *fname) {
+          if (*fname == "_version_") {
+            throw DocumentError("Field '_version_' is assigned by the engine; optimistic concurrency is not supported");
+          }
           handler = &inverter.getIndexHandler(*fname);
         }
         uint32_t slot = handler->claim(inverter, (uint32_t)fields.size());

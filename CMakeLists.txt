@@ -2,19 +2,62 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.16)
+
+# The native presets name a dependency variant; its vcpkg triplets depend on the
+# host (see deps/make_deps.sh). Set before project() loads the vcpkg toolchain.
+if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
+  if(CMAKE_HOST_APPLE)
+    set(_luxir_triplet arm64-osx-luxir-m1)
+  else()
+    set(_luxir_triplet x64-linux-luxir-native)
+  endif()
+  if(LUXIR_NATIVE_DEPS STREQUAL "native")
+    set(_luxir_host_triplet ${_luxir_triplet})
+  elseif(LUXIR_NATIVE_DEPS STREQUAL "native-asan")
+    set(_luxir_host_triplet ${_luxir_triplet}-host)
+    string(APPEND _luxir_triplet -asan)
+  else()
+    message(FATAL_ERROR "LUXIR_NATIVE_DEPS must be native or native-asan")
+  endif()
+  set(VCPKG_TARGET_TRIPLET ${_luxir_triplet} CACHE STRING "")
+  set(VCPKG_HOST_TRIPLET ${_luxir_host_triplet} CACHE STRING "")
+endif()
+
 project(Luxir VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
-set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  if(LUXIR_CPU_TARGET STREQUAL "native")
-    set(_luxir_cpu_tune native)
-  else()
-    set(_luxir_cpu_tune generic)
+set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a
+             apple-m1 apple-m2 apple-m3 apple-m4 apple-m5)
+set(_luxir_cpu_name ${LUXIR_CPU_TARGET})
+# GCC's native detection reports every Apple core as apple-m1; name the chip.
+if(LUXIR_CPU_TARGET STREQUAL "native" AND APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  execute_process(COMMAND sysctl -n machdep.cpu.brand_string
+                  OUTPUT_VARIABLE _luxir_brand OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(_luxir_brand MATCHES "^Apple (M[0-9]+)")
+    string(TOLOWER "apple-${CMAKE_MATCH_1}" _luxir_cpu_name)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mcpu=${_luxir_cpu_name}" LUXIR_MCPU_${CMAKE_MATCH_1})
+    if(NOT LUXIR_MCPU_${CMAKE_MATCH_1})
+      message(WARNING "${CMAKE_CXX_COMPILER} does not know -mcpu=${_luxir_cpu_name}; "
+                      "using -march=native")
+      set(_luxir_cpu_name native)
+    endif()
   endif()
-  add_compile_options("-march=${LUXIR_CPU_TARGET}" "-mtune=${_luxir_cpu_tune}")
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(_luxir_cpu_name MATCHES "^apple-")
+    # An Apple core name selects both the architecture and the tuning.
+    add_compile_options("-mcpu=${_luxir_cpu_name}")
+  else()
+    if(LUXIR_CPU_TARGET STREQUAL "native")
+      set(_luxir_cpu_tune native)
+    else()
+      set(_luxir_cpu_tune generic)
+    endif()
+    add_compile_options("-march=${_luxir_cpu_name}" "-mtune=${_luxir_cpu_tune}")
+  endif()
   # Plain -fstack-protector instead of the distro-default -strong. -strong also
   # instruments functions with any array or address-taken local, putting canary
   # loads in per-document loops (up to 9% on facet loops). The canary lives at
@@ -49,7 +92,11 @@ string(APPEND _luxir_build_flags
        "${CMAKE_C_FLAGS_${_luxir_config}} ${CMAKE_CXX_FLAGS_${_luxir_config}} "
        "${CMAKE_EXE_LINKER_FLAGS_${_luxir_config}} ")
 set(_luxir_sanitizer "")
+# jemalloc is not yet supported on macOS (deps/make_deps.sh omits it there).
 set(_luxir_jemalloc_default ON)
+if(APPLE)
+  set(_luxir_jemalloc_default OFF)
+endif()
 if(_luxir_build_flags MATCHES
    " -fsanitize=([a-z,-]*,)?(address|hwaddress|thread|memory|leak)[ ,]")
   set(_luxir_sanitizer "${CMAKE_MATCH_2}")
@@ -78,18 +125,94 @@ option(LUXIR_PROBE_WRAPPER_TRIMS
 # masked by a plausible zero (zero-init also blinds valgrind/MSan detection).
 
 # Build acceleration
+# ---- Build parallelism: compile limit sized from this machine ----
+# hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
+# tool's default -j (logical cores) can exhaust memory. tools/build-jobs sizes the limit
+# from physical cores and memory (cgroup limits included): at most one compile per core,
+# never above 16 (hyperthreads add little compile throughput). Measured peak RSS of the
+# heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at -Og with ASan. Links need no
+# limit: mold links luxir_test in under 2s with about 1.4G of anonymous memory. Override
+# with -DLUXIR_COMPILE_JOBS=N. It is a cap, not a forced -j: a smaller -j still wins.
+if(NOT DEFINED LUXIR_COMPILE_JOBS)
+  if(_luxir_sanitizer)
+    set(_luxir_compile_mb 4000)
+  else()
+    set(_luxir_compile_mb 3000)
+  endif()
+  execute_process(COMMAND "${CMAKE_SOURCE_DIR}/tools/build-jobs" ${_luxir_compile_mb}
+                  OUTPUT_VARIABLE LUXIR_COMPILE_JOBS OUTPUT_STRIP_TRAILING_WHITESPACE
+                  RESULT_VARIABLE _luxir_jobs_result ERROR_QUIET)
+  if(NOT _luxir_jobs_result EQUAL 0 OR NOT LUXIR_COMPILE_JOBS MATCHES "^[0-9]+$")
+    message(WARNING "tools/build-jobs failed; assuming 4 compile jobs")
+    set(LUXIR_COMPILE_JOBS 4)
+  endif()
+  if(LUXIR_COMPILE_JOBS GREATER 16)
+    set(LUXIR_COMPILE_JOBS 16)
+  endif()
+endif()
+message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS}")
+set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
+set(CMAKE_JOB_POOL_COMPILE luxir_compile)
+
+# The Ninja pool only sees this build. Compiles also hold one of LUXIR_COMPILE_JOBS
+# machine-wide lock files (tools/build-slot), so concurrent builds from other worktrees,
+# presets, or the development container share the limit instead of each assuming the
+# whole machine. Set LUXIR_BUILD_SLOT_DIR to an empty string to limit this build alone.
+if(DEFINED ENV{LUXIR_CACHE_DIR})
+  set(_luxir_cache_dir "$ENV{LUXIR_CACHE_DIR}")
+elseif(DEFINED ENV{XDG_CACHE_HOME})
+  set(_luxir_cache_dir "$ENV{XDG_CACHE_HOME}/luxir")
+else()
+  set(_luxir_cache_dir "$ENV{HOME}/.cache/luxir")
+endif()
+set(LUXIR_BUILD_SLOT_DIR "${_luxir_cache_dir}/build-slots" CACHE PATH
+    "Directory of machine-wide build slot locks shared by concurrent builds; empty disables")
+find_program(LUXIR_FLOCK flock)
+set(_luxir_compile_launcher "")
+if(LUXIR_BUILD_SLOT_DIR AND LUXIR_FLOCK)
+  file(MAKE_DIRECTORY "${LUXIR_BUILD_SLOT_DIR}")
+  set(_luxir_compile_launcher
+      "${CMAKE_SOURCE_DIR}/tools/build-slot;${LUXIR_BUILD_SLOT_DIR}/compile;${LUXIR_COMPILE_JOBS}")
+  message(STATUS "Luxir: build slots shared through ${LUXIR_BUILD_SLOT_DIR}")
+endif()
+
 # ccache: transparent compiler cache. No-op if ccache is not installed.
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below). Apply it in
 # the launcher rather than relying on each developer's global ccache config.
+# tools/ccache-launch also deletes a stale .gch before the PCH compile, without
+# which ccache never caches a rebuilt PCH.
+# LUXIR_CCACHE_RELATIVE_PATHS shares objects between checkouts and worktrees at different
+# paths: CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes
+# the debug info's compilation directory relative to the checkout. PWD gives ccache the
+# build directory as configured (Ninja runs every compile there, and ccache ignores a PWD
+# naming another directory), so the prefix map still applies to a checkout reached through
+# a symlink. Relative paths only match between checkouts when the build directory is
+# physically inside its checkout. It is off by default because compiler diagnostics and
+# __FILE__ then name sources relative to the build directory, and debuggers resolve
+# sources from the checkout root.
+option(LUXIR_CCACHE_RELATIVE_PATHS "Use checkout-relative paths so ccache shares objects across checkouts" OFF)
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  set(_LUXIR_CCACHE_LAUNCHER
-      "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=pch_defines,time_macros;${CCACHE_PROGRAM}")
-  set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-  set(CMAKE_CXX_COMPILER_LAUNCHER "${_LUXIR_CCACHE_LAUNCHER}")
+  list(APPEND _luxir_compile_launcher "${CMAKE_SOURCE_DIR}/tools/ccache-launch" CCACHE_SLOPPINESS=pch_defines,time_macros)
+  if(LUXIR_CCACHE_RELATIVE_PATHS)
+    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}" "PWD=${CMAKE_BINARY_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    endif()
+    file(REAL_PATH "${CMAKE_SOURCE_DIR}" _luxir_real_source)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _luxir_real_binary)
+    cmake_path(IS_PREFIX _luxir_real_source "${_luxir_real_binary}" _luxir_binary_inside)
+    if(NOT _luxir_binary_inside)
+      message(WARNING "Luxir: build directory ${_luxir_real_binary} is not inside ${_luxir_real_source}, "
+                      "so ccache cannot share its objects with other checkouts")
+    endif()
+  endif()
+  list(APPEND _luxir_compile_launcher "${CCACHE_PROGRAM}")
   message(STATUS "Luxir: ccache enabled (${CCACHE_PROGRAM})")
 endif()
+set(CMAKE_C_COMPILER_LAUNCHER   "${_luxir_compile_launcher}")
+set(CMAKE_CXX_COMPILER_LAUNCHER "${_luxir_compile_launcher}")
 
 # Fast linker: prefer mold, then lld, then gold. Each candidate is verified with
 # a real test link, so a linker that cannot handle this toolchain (e.g. mold
@@ -105,12 +228,15 @@ endif()
 # writable extension entries, so some links put the entries in a read-only
 # segment and the binary segfaults in ld.so before main(). A test link cannot
 # catch a race, so check the version. It is not cached, so old caches get it.
+#
+# GCC on darwin accepts any of these -fuse-ld values but always runs the
+# system linker, so the probe would only mislabel it.
 include(CheckLinkerFlag)
 set(LUXIR_LINKER "")
 # Cross builds use their toolchain's linker. A host linker can pass the small
 # probe but mishandle target relocations: mold placed ARM64 upb extension
 # pointers in a read-only segment, causing a loader crash before main().
-if(NOT CMAKE_CROSSCOMPILING)
+if(NOT CMAKE_CROSSCOMPILING AND NOT APPLE)
   foreach(_cand mold lld gold)
     check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
     if(LUXIR_LD_WORKS_${_cand} AND _cand STREQUAL "mold")
@@ -138,6 +264,14 @@ elseif(CMAKE_CROSSCOMPILING)
   message(STATUS "Luxir: using the cross-toolchain linker")
 else()
   message(STATUS "Luxir: using default system linker (no faster linker usable)")
+endif()
+
+# A Mach-O executable exports every external symbol, and GCC makes each inline
+# function and template instance a weak one, so dyld coalesced about 200k weak
+# definitions at every launch (0.5 s for luxir). Export only main, as an ELF
+# executable does without -rdynamic. Unstripped stack traces keep their names.
+if(APPLE)
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,-exported_symbol,_main")
 endif()
 
 # Thin static archives: the project's libraries only feed this build's own
@@ -179,6 +313,7 @@ find_package(faiss CONFIG REQUIRED)
 # luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(absl CONFIG REQUIRED)
 if(LUXIR_JEMALLOC)
   # The vcpkg port installs a static archive and pkg-config metadata only.
   set(_luxir_triplet_dir "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
@@ -220,7 +355,6 @@ include_directories(deps)
 # tokenizer/filter classes are built on top of it.
 add_library(uni_algo STATIC deps/uni-algo/src/data.cpp)
 target_include_directories(uni_algo PUBLIC deps/uni-algo/include)
-set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # FastPFOR (vendored under deps/FastPFOR, v0.5.0): SIMD bit-packing kernels with
 # native ARM NEON support (headers/fastpfor_neon.h). We compile the bit-packing
@@ -233,7 +367,6 @@ add_library(fastpfor STATIC
   deps/FastPFOR/src/simdunalignedbitpacking.cpp
   deps/FastPFOR/src/streamvbyte.c)
 target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
-set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
@@ -267,57 +400,6 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   #add_link_options("/nodefaultlib:msvcrt")
 endif()
 
-# ---- Adaptive compile-parallelism CAP (memory-aware, Ninja job pool) ----
-# hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
-# tool's default -j (logical cores: 32 on a hyperthreaded 16-core box) OOMs.
-# This caps CONCURRENT COMPILES via a Ninja pool sized from THIS machine's physical cores
-# and RAM, never above 16 (hyperthreads add no compile throughput past real cores). It is a
-# cap, not a forced -j: a smaller -j still wins, and it adapts DOWN automatically on a
-# smaller laptop. Override explicitly with -DLUXIR_COMPILE_JOBS=N. Tune _ram_jobs divisor
-# (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
-# Measured peak RSS of the heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at
-# -Og with ASan. The divisor covers the plain -Og case; an ASan build on a RAM-bound box
-# uses a 4G/job divisor. Both account for the container memory limit.
-# On a box with enough RAM per physical core the core count still binds.
-if(NOT DEFINED LUXIR_COMPILE_JOBS)
-  cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
-  cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
-  # Host memory may exceed Docker's allowance. Honor either cgroup version.
-  foreach(_limit_file /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes)
-    if(EXISTS "${_limit_file}")
-      file(READ "${_limit_file}" _memory_limit)
-      string(STRIP "${_memory_limit}" _memory_limit)
-      if(_memory_limit MATCHES "^[0-9]+$" AND _memory_limit LESS 9223372036854771712)
-        math(EXPR _limit_mb "${_memory_limit} / 1048576")
-        if(_limit_mb LESS _rammb)
-          set(_rammb ${_limit_mb})
-        endif()
-      endif()
-    endif()
-  endforeach()
-  if(_luxir_sanitizer)
-    set(_ram_per_job 4000)
-  else()
-    set(_ram_per_job 3000)
-  endif()
-  math(EXPR _ram_jobs "${_rammb} / ${_ram_per_job}")
-  set(LUXIR_COMPILE_JOBS ${_ncores})
-  if(_ram_jobs LESS LUXIR_COMPILE_JOBS)
-    set(LUXIR_COMPILE_JOBS ${_ram_jobs})
-  endif()
-  if(LUXIR_COMPILE_JOBS GREATER 16)
-    set(LUXIR_COMPILE_JOBS 16)
-  endif()
-  if(LUXIR_COMPILE_JOBS LESS 1)
-    set(LUXIR_COMPILE_JOBS 1)
-  endif()
-  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
-else()
-  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (configured)")
-endif()
-set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
-set(CMAKE_JOB_POOL_COMPILE luxir_compile)
-
 # Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -345,9 +427,9 @@ target_compile_definitions(luxir_lib PUBLIC
   LUXIR_PROBE_WRAPPER_TRIMS=$<BOOL:${LUXIR_PROBE_WRAPPER_TRIMS}>)
 
 add_executable(luxir src/luxir/main.cpp)
-target_link_libraries(luxir luxir_lib)
+target_link_libraries(luxir PRIVATE luxir_lib)
 set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
-  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${LUXIR_CPU_TARGET}\"")
+  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${_luxir_cpu_name}\"")
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -388,6 +470,21 @@ include(cmake/hpp_proto.cmake)
 add_subdirectory(protos)
 add_subdirectory(test)
 
+# Compiled-in plugins (docs/dev/plugins.md). LUXIR_PLUGIN_DIRS lists directories whose
+# CMakeLists.txt call luxir_add_plugin; the in-tree test-only example is always added.
+set(LUXIR_PLUGIN_DIRS "" CACHE STRING "Semicolon-separated plugin directories compiled into the engine")
+include(cmake/LuxirPlugins.cmake)
+# Binary dirs carry the list index so two plugin dirs with one basename do not collide.
+set(_plugin_index 0)
+foreach(_plugin_dir IN LISTS LUXIR_PLUGIN_DIRS)
+  cmake_path(ABSOLUTE_PATH _plugin_dir BASE_DIRECTORY "${CMAKE_SOURCE_DIR}" NORMALIZE)
+  cmake_path(GET _plugin_dir FILENAME _plugin_base)
+  math(EXPR _plugin_index "${_plugin_index} + 1")
+  add_subdirectory("${_plugin_dir}" "${CMAKE_BINARY_DIR}/plugins/${_plugin_index}_${_plugin_base}")
+endforeach()
+add_subdirectory(test/plugins/example "${CMAKE_BINARY_DIR}/plugins/example")
+luxir_finalize_plugins()
+
 # luxir_descriptors.cpp #include "luxir_fds_data.h" (generated descriptor set); order its
 # compile after generation. The PCH no longer force-includes any generated proto header.
 add_dependencies(luxir_lib luxir_fds_gen)
@@ -424,9 +521,14 @@ if(_luxir_tbb_type STREQUAL "STATIC_LIBRARY")
   # Preserve TBB's internal allocator when its weak references cannot dlopen
   # tbbmalloc. This does not replace the application's malloc/free.
   target_link_libraries(luxir_lib PRIVATE TBB::tbbmalloc)
+  # Mach-O symbol names carry a leading underscore.
+  set(_luxir_sym "")
+  if(APPLE)
+    set(_luxir_sym _)
+  endif()
   target_link_options(luxir_lib INTERFACE
-    -Wl,-u,scalable_malloc -Wl,-u,scalable_free
-    -Wl,-u,scalable_aligned_malloc -Wl,-u,scalable_aligned_free)
+    -Wl,-u,${_luxir_sym}scalable_malloc -Wl,-u,${_luxir_sym}scalable_free
+    -Wl,-u,${_luxir_sym}scalable_aligned_malloc -Wl,-u,${_luxir_sym}scalable_aligned_free)
 endif()
 target_link_libraries(luxir_lib PRIVATE xxHash::xxhash)
 target_link_libraries(luxir_lib PUBLIC Boost::core Boost::thread Boost::sort)
@@ -440,6 +542,8 @@ target_link_libraries(luxir_lib PRIVATE fastpfor)
 target_link_libraries(luxir_lib PUBLIC luxir_proto_concrete)
 target_link_libraries(luxir_lib PUBLIC protobuf::libprotobuf)
 target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
+# IANA zones decode from the system's compiled TZif files (DateTime.cpp).
+target_link_libraries(luxir_lib PRIVATE absl::time)
 # log.h is included by tests and other dependents; propagate spdlog's compiled
 # mode so every TU shares the same default-logger registry.
 target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)

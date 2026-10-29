@@ -11,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -40,6 +41,8 @@ struct NumBlockInfo {
   int64_t scaledSlope = 0;
 
   static constexpr uint64_t OFFSET_MASK = (1ULL << 56) - 1;
+  static constexpr uint8_t MAX_PACKED_BITS = 57;
+  static constexpr uint8_t RAW_BITS = 64;
 
   uint64_t payloadOffset() const {
     return offsetAndBits & OFFSET_MASK;
@@ -47,6 +50,20 @@ struct NumBlockInfo {
 
   uint8_t bits() const {
     return (uint8_t)(offsetAndBits >> 56);
+  }
+
+  bool forPacked() const {
+    return bits() <= MAX_PACKED_BITS;
+  }
+
+  bool linearFit() const {
+    return forPacked() && scaledSlope != 0;
+  }
+
+  // Packed values are (value - min) / gcd, directly comparable with bounds
+  // transformed into that residual domain.
+  bool residualComparable() const {
+    return forPacked() && bits() <= 32 && scaledSlope == 0;
   }
 
   void setPayload(uint64_t payloadOffset, uint8_t bits) {
@@ -93,9 +110,24 @@ struct NumColumnFormat {
   static constexpr uint8_t SLOPE_SHIFT =
       (uint8_t)(std::bit_width(BLOCK_SIZE) + 1);
   static_assert(BLOCK_SIZE <= (1u << SLOPE_SHIFT), "block drift must stay < 1");
-  static constexpr uint8_t MAX_PACKED_BITS = 57;
-  static constexpr uint8_t RAW_BITS = 64;
+  static constexpr uint8_t MAX_PACKED_BITS = NumBlockInfo::MAX_PACKED_BITS;
+  static constexpr uint8_t RAW_BITS = NumBlockInfo::RAW_BITS;
   static constexpr uint8_t MIN_LINEAR_BITS_SAVED = 1;
+
+  struct RankBounds {
+    // Ranks outside [checkBegin, checkEnd) cannot match; those in
+    // [insideBegin, insideEnd) all match. Ranks are relative to the block.
+    uint32_t checkBegin, checkEnd;
+    uint32_t insideBegin, insideEnd;
+  };
+
+  struct ResidualBounds {
+    // Inclusive; lower > upper represents an empty interval.
+    uint32_t lower;
+    uint32_t upper;
+
+    static constexpr ResidualBounds empty() { return {1, 0}; }
+  };
 
   struct BlockPlan {
     NumBlockInfo info;
@@ -122,9 +154,9 @@ struct NumColumnFormat {
   // the engine (endValueRank and endOffset, read twice per doc).
   // leafZones == false skips the per-leaf extrema pass for writers that never
   // persist zones (monotonic sidecars), whose finish() drops them anyway.
-  static BlockPlan planBlock(std::span<const int64_t> values,
-                             std::vector<uint64_t>& quotients,
-                             bool useGcd = true, bool leafZones = true) {
+  template<class Values>
+  static BlockPlan planBlock(const Values& values, std::vector<uint64_t>& quotients,
+                            bool useGcd = true, bool leafZones = true) {
     assert(!values.empty() && values.size() <= BLOCK_SIZE);
 
     auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
@@ -473,6 +505,7 @@ struct NumColumnFormat {
   class LeafMeta {
     const char* zones = nullptr;  // NumBlockZones, then the uint32 orders
     int64_t count = 0;
+    int64_t values = 0;
     ValueSketch sketch;
 
     int64_t orderAt(int64_t order, int64_t rank) const {
@@ -486,13 +519,22 @@ struct NumColumnFormat {
     }
 
   public:
+    // Populations of value ranks, not documents. The OUTSIDE population is
+    // exact at leaf granularity; bounded intervals can leave INSIDE uncertain.
+    struct RangeSummary {
+      int64_t outside = 0;
+      int64_t insideLower = 0;
+      int64_t insideUpper = 0;
+    };
+
     LeafMeta() = default;
 
     // `leafZones` points at the first leaf zone of a column of numValues
     // values; `end` receives the first byte past the sketch.
     LeafMeta(const char* leafZones, int64_t numValues, const char*& end)
         : zones(leafZones),
-          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE) {
+          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE),
+          values(numValues) {
       end = zones + count * (int64_t)(sizeof(NumBlockZone)
                                       + 2 * sizeof(uint32_t));
       if (count == 0) return;
@@ -520,6 +562,41 @@ struct NumColumnFormat {
       return orderAt(1, rank);
     }
 
+    RangeSummary summarizeRange(int64_t lo, int64_t hi) const {
+      assert(lo <= hi);
+      if (count == 0) return {};
+      // Independent boundary searches, not forward traversal of leaf ranks.
+      auto prefixCount = [&](auto predicate) {
+        int64_t begin = 0, end = count;
+        while (begin < end) {
+          int64_t mid = begin + (end - begin) / 2;
+          if (predicate(mid)) begin = mid + 1;
+          else end = mid;
+        }
+        return begin;
+      };
+      NumBlockZone tail = leafZone(count - 1);
+      int64_t padding = count * LEAF_ZONE_SIZE - values;
+      auto population = [&](int64_t leaves, bool includesTail) {
+        return leaves * LEAF_ZONE_SIZE - (includesTail ? padding : 0);
+      };
+      int64_t below = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMaxDescending(rank)).max >= lo;
+      }), tail.max < lo);
+      int64_t above = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMinAscending(rank)).min <= hi;
+      }), tail.min > hi);
+      int64_t maxInside = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMaxDescending(rank)).max > hi;
+      }), tail.max <= hi);
+      int64_t minInside = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMinAscending(rank)).min < lo;
+      }), tail.min >= lo);
+      return {below + above,
+          std::max<int64_t>(0, maxInside + minInside - values),
+          std::min(maxInside - below, minInside - above)};
+    }
+
     // Empty for a column without values or written without a sketch.
     const ValueSketch& valueSketch() const { return sketch; }
   };
@@ -539,6 +616,80 @@ struct NumColumnFormat {
   // so the two cannot drift.
   static int64_t slopeTerm(uint64_t rank, int64_t scaledSlope) {
     return (int64_t)(((__int128)(int64_t)rank * scaledSlope) >> SLOPE_SHIFT);
+  }
+
+  // Values lie in [L(rank), L(rank) + gcd * (2^bits - 1)] with L monotonic.
+  // Partitioning those envelopes gives conservative check and inside runs.
+  // Recover the signed intercept from rank zero: planBlock chooses a linear
+  // fit only when it saves a bit, so gcd * residual0 fits uint64 and equals
+  // (value0 - baseBits) mod 2^64 even when the persisted base wraps.
+  static std::optional<RankBounds> linearRankBounds(
+      const NumBlockInfo& block, int64_t value0, uint32_t count,
+      int64_t lo, int64_t hi) {
+    assert(count > 0 && count <= BLOCK_SIZE);
+    if (!block.linearFit()) return std::nullopt;
+    if (hi < lo) return RankBounds{0, 0, 0, 0};
+    uint64_t gcd = block.gcd;
+    assert(gcd != 0);
+    __int128 spread = (__int128)gcd * (__int128)((1ULL << block.bits()) - 1);
+    if (spread > (__int128)UINT64_MAX) return std::nullopt;
+    uint64_t scaledResidual0 = (uint64_t)value0 - block.baseBits;
+    assert(scaledResidual0 % gcd == 0);
+    __int128 intercept = (__int128)value0 - (__int128)scaledResidual0;
+    int64_t slope = block.scaledSlope;
+    auto lower = [&](uint32_t rank) {
+      return intercept + (__int128)gcd * (__int128)slopeTerm(rank, slope);
+    };
+    auto upper = [&](uint32_t rank) { return lower(rank) + spread; };
+    // First rank where pred stops holding; pred must hold on a prefix.
+    auto partition = [count](auto pred) {
+      uint32_t first = 0;
+      uint32_t last = count;
+      while (first < last) {
+        uint32_t mid = first + (last - first) / 2;
+        if (pred(mid)) first = mid + 1;
+        else last = mid;
+      }
+      return first;
+    };
+    RankBounds bounds;
+    if (slope > 0) {
+      bounds.checkBegin = partition([&](uint32_t r) { return upper(r) < lo; });
+      bounds.checkEnd = partition([&](uint32_t r) { return lower(r) <= hi; });
+      bounds.insideBegin = partition([&](uint32_t r) { return lower(r) < lo; });
+      bounds.insideEnd = partition([&](uint32_t r) { return upper(r) <= hi; });
+    } else {
+      bounds.checkBegin = partition([&](uint32_t r) { return lower(r) > hi; });
+      bounds.checkEnd = partition([&](uint32_t r) { return upper(r) >= lo; });
+      bounds.insideBegin = partition([&](uint32_t r) { return upper(r) > hi; });
+      bounds.insideEnd = partition([&](uint32_t r) { return lower(r) >= lo; });
+    }
+    bounds.checkEnd = std::max(bounds.checkBegin, bounds.checkEnd);
+    bounds.insideBegin = std::clamp(
+        bounds.insideBegin, bounds.checkBegin, bounds.checkEnd);
+    bounds.insideEnd = std::clamp(
+        bounds.insideEnd, bounds.insideBegin, bounds.checkEnd);
+    return bounds;
+  }
+
+  // Constant FOR blocks reconstruct as signed base + gcd * residual. Unsigned
+  // distances cover the full INT64 span; quotient+remainder gives ceil without
+  // overflow. Clip before narrowing so empty lattice intervals stay empty.
+  static ResidualBounds residualBounds(
+      const NumBlockInfo& block, int64_t lo, int64_t hi) {
+    assert(block.residualComparable() && block.gcd != 0);
+    int64_t base = (int64_t)block.baseBits;
+    if (hi < lo || hi < base) return ResidualBounds::empty();
+    uint64_t lower = 0;
+    if (lo > base) {
+      uint64_t delta = (uint64_t)lo - (uint64_t)base;
+      lower = delta / block.gcd + (delta % block.gcd != 0);
+    }
+    uint64_t upper = std::min<uint64_t>(
+        ((uint64_t)hi - (uint64_t)base) / block.gcd,
+        (1ULL << block.bits()) - 1);
+    if (lower > upper) return ResidualBounds::empty();
+    return {(uint32_t)lower, (uint32_t)upper};
   }
 };
 

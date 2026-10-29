@@ -296,6 +296,8 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
     ASSERT_EQ(200, response.result_int()) << response.body();
     Json json;
     ASSERT_FALSE(glz::read_json(json, response.body()));
+    EXPECT_TRUE(json["fields"]["_version_"]["bindings"]["search"].is_null());
+    EXPECT_TRUE(json["fields"]["_version_"]["bindings"]["value"].is_null());
     auto& author = json["fields"]["author"];
     auto& rep = author["representations"]["s"];
     EXPECT_EQ("author__s", rep["name"].get<std::string>());

@@ -22,7 +22,23 @@ struct MergeCostModel {
   static constexpr int32_t STREAM_BUDGET_FLOOR = 32;
   static constexpr uint64_t TARGET_FILE_BYTES = 256ULL * 1024 * 1024;
   static constexpr int32_t STREAM_BUDGET_CAP = 128;
-  static constexpr int64_t TERM_RANGE_SOURCE_BYTES = 64 * 1024;
+  // A range holds one TermsEnum (about 1 KiB with its term buffer) per source;
+  // postings decode state lives on the stack.
+  static constexpr int64_t TERM_RANGE_SOURCE_BYTES = 4 * 1024;
+  // Range term blocks buffer in RAM until stitch and are charged as they grow,
+  // in steps of this size.  Debug builds resync often so the suite exercises
+  // in-range growth.
+#ifdef NDEBUG
+  static constexpr int64_t TERM_RANGE_RESYNC_BYTES = 1024 * 1024;
+#else
+  static constexpr int64_t TERM_RANGE_RESYNC_BYTES = 4 * 1024;
+#endif
+  // Split planning materializes one estimate (first term plus byte counts) per
+  // sampled source term block; the term's heap bytes are charged separately.
+  static constexpr int64_t TERM_PLAN_BLOCK_BYTES = 96;
+  // Cuts only balance range work, so planning samples every k-th block of each
+  // source, keeping a field's plan to about this many estimates.
+  static constexpr int64_t MAX_TERM_PLAN_SAMPLES = 256 * 1024;
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
@@ -47,9 +63,15 @@ struct MergeCostModel {
         (uint64_t) STREAM_BUDGET_CAP);
   }
 
+  // A finished range returns its streams for the next range to append to, so
+  // ranges beyond the concurrently runnable ones add no files; they queue
+  // largest first and even out the uneven ranges a cut on block-leading terms
+  // leaves.
+  static constexpr int32_t RANGE_QUEUE_FACTOR = 2;
+
   static constexpr int32_t maxTermRangesForStreams(int32_t streamBudget) {
     return std::min(MAX_TERM_RANGES_CAP,
-                    streamBudget / TERM_RANGE_STREAMS);
+                    RANGE_QUEUE_FACTOR * streamBudget / TERM_RANGE_STREAMS);
   }
 
   // Doc ids must stay below PostingsReader::MAX_SEGMENT_DOCS (see the
@@ -90,6 +112,10 @@ struct MergeCostModel {
   // a TermsEnum and its decode state for the duration of the range merge.
   static int64_t termRangeWorkingBytes(int64_t sources) {
     return LIGHT_BYTES + sources * TERM_RANGE_SOURCE_BYTES;
+  }
+
+  static int64_t termPlanBytes(int64_t sourceBlocks) {
+    return sourceBlocks * TERM_PLAN_BLOCK_BYTES;
   }
 
   static int64_t pointsBytes(int64_t sourceRuns, int64_t totalValues,

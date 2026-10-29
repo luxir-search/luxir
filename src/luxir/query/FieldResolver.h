@@ -48,6 +48,12 @@ public:
     return target;
   }
 
+  // Adds a line to ?explain=resolved (a no-op outside explain), e.g. what a
+  // plugin query resolved its parameters to. Repeats are dropped.
+  void note(std::string text) {
+    if (explanations && !std::ranges::contains(*explanations, text)) explanations->push_back(std::move(text));
+  }
+
   TokenChain* chain(const ResolvedFieldHandle& target) {
     auto* type = target.fieldType;
     auto [entry, added] = chains.try_emplace(type);

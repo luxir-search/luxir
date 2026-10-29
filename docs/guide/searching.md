@@ -55,7 +55,7 @@ POST /collections/books/_search
   "query": "title_t:(dune OR messiah) AND year_i:>=1965",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "get_scores": true,
   "fields": ["id", "title_t", "year_i", "price_f"]
 }
@@ -95,22 +95,43 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `get_number` | Compute and return the exact match count as `found`. |
+| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
-| `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
+| `document_format` | `rows`, `columns`, or `adaptive`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
-### Counts are exact, and opt-in
+### Counts are opt-in, exact or bounded
 
-`found` is opt-in, and the choice changes how the engine runs. Without
-`get_number`, a top-k request uses per-block score bounds and MaxScore-style
-skipping to avoid scoring documents that cannot enter the top k. With
-`get_number`, the engine counts the whole match set and returns the exact
-total, even when you retrieve only a few documents.
+`found` is opt-in. Unset or `count_limit: 0` omits the count and permits
+competitive-score skipping. `count_limit: -1` requests an exact count, even
+when only a few documents are returned.
+
+A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
+list holds competitive-score skipping until N matches have been counted, or
+index statistics already prove at least N matches. If collection then skips
+remaining work, `found` is N and `found_gte: true` marks it as a lower bound.
+Otherwise the count is exact and `found_gte` is omitted. An exact total is a
+valid answer even when it equals or exceeds N. Metadata and already-resident
+membership can supply an exact count without a counting pass.
+
+```http
+POST /collections/books/_search
+
+{"query": "title_t:the", "count_limit": 10000}
+```
+
+```json
+{"found": 10000, "found_gte": true, "docs": [...]}
+```
+
+Lists with `ops`, `collapse`, or `diversify`, field sorts, nested lists, and
+`limit: 0` count-only requests retain exact counting for any nonzero
+`count_limit`. Fusion also always supplies an exact count when requested.
+Values below -1 are rejected.
 
 For a count plus analytics with no documents at all, set `limit: 0`. No
 document fields are loaded:
@@ -121,7 +142,7 @@ POST /collections/books/_search
 {
   "query": "title_t:dune",
   "limit": 0,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "categories": {
       "field_facet": {
@@ -169,7 +190,7 @@ POST /collections/books/_search
 {
   "query": "title_t:dune",
   "min_score": 0.5,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {"categories": {"field_facet": {"field": "category_s"}}}
 }
 ```
@@ -191,7 +212,7 @@ Use `diversify` to keep at most a fixed number of documents per key:
   "sort": "price_i asc",
   "diversify": {"field": "product_id_s", "max_per_key": 2, "missing": "expand"},
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id", "price_i"]
 }
 ```
@@ -200,7 +221,7 @@ This returns documents in the ordinary list order (sort values, then document
 order), keeping each key's best `max_per_key` documents. The cap applies before
 `offset`, so concatenating pages gives the same result as one large page.
 `limit: -1` returns the entire capped list; `limit: 0` returns only requested
-counts and operations. With `get_number`, `found` counts capped documents and
+counts and operations. With `count_limit: -1`, `found` counts capped documents and
 `found_groups` counts distinct eligible keys. Exact totals read every matching
 key and retain per-key counts in request memory. Without totals, competitive
 pruning remains available.
@@ -243,7 +264,7 @@ selects another member. For example:
   "collapse": "product_id_s",
   "sort": "price_i asc",
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id", "title_t", "price_i"]
 }
 ```
@@ -261,7 +282,7 @@ If five matching documents describe three products, a response might be:
 }
 ```
 
-`limit` and `offset` count groups. With `get_number: true`, `found` is the
+`limit` and `offset` count groups. With `count_limit: -1`, `found` is the
 exact number of groups and `found_docs` is the number of eligible matching
 documents, both before paging. `limit: 0` returns totals without documents;
 `limit: -1` returns every group. Exact totals require examining all matching
@@ -324,15 +345,15 @@ and show their cheapest matching variant:
   "collapse": {
     "field": "product_id_s",
     "head_sort": ["price_i asc", "id asc"],
-    "get_number": true
+    "get_count": true
   },
   "fields": ["id", "price_i"],
   "limit": 10
 }
 ```
 
-`collapse.get_number` adds `_group_.count`, the number of members in each
-returned group. This differs from the list's `get_number`, which returns
+`collapse.get_count` adds `_group_.count`, the number of members in each
+returned group. This differs from the list's `count_limit: -1`, which returns
 totals before paging. When `head_sort` picks another member and `get_scores`
 is true, `_group_.rank` contains the group's original sort values as a typed
 array in clause order. The row's `_score_` is the displayed member's own score.
@@ -423,7 +444,7 @@ a column. Use an object to group by a tuple of fields:
 Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `{"val":["shop-A",null]}` for a tuple, or
 `{"val":null,"singleton":true}` for a document grouped separately by
-`expand`. String keys use indexed values; date keys use epoch milliseconds.
+`expand`. String keys use indexed values; date keys use epoch values in the field's unit (`ms` or `ns`).
 Groups tied on all sort values follow their best member's document order,
 including documents grouped separately by `expand`. The best member within a
 group uses the same sort and document tiebreak. With the default
@@ -441,8 +462,8 @@ only their head documents enter fusion. For example:
 {"ops":{"hybrid":{"fusion":{
   "rrf":{},
   "sources":{"text":{"query":"title_t:jacket","collapse":"product_s","limit":100}},
-  "collapse":{"field":"product_s","get_number":true},
-  "limit":10,"get_number":true
+  "collapse":{"field":"product_s","get_count":true},
+  "limit":10,"count_limit":-1
 }}}}
 ```
 
@@ -515,7 +536,7 @@ POST /collections/books/_search
   "query": "title_t:dune",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t","price_f"],
   "ops": {
     "categories": {
@@ -558,7 +579,7 @@ With root query shorthand, `found` and `docs` appear in the HTTP envelope;
 the query's sub-operation results appear under `ops` by name. Expression metrics fold `avg`,
 `sum`, `min`, or `max` over value expressions and ignore missing document
 values. Integer results stay integers; averages and floating-point results are
-doubles. An empty metric domain renders as `null` in JSON.
+doubles. These four aggregates render as `null` in JSON for an empty domain.
 
 One request returned the documents, the facet counts for a sidebar, and the
 total for a header. See [Faceting](faceting.md) for
@@ -590,6 +611,8 @@ clauses, filters, fusion sources, or another query wrapper.
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
 | Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
+| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","description_t"]}}` | `combined` (default) uses BM25F within TEXT analyzer groups; non-TEXT matches form singleton groups. `per_field` weights each match or phrase score. `tie` defaults to `1` (sum); field patterns expand to at most `64` physical targets. |
+| Disjunction max | `{"dis_max":{"queries":[{"match":{"title_t":"dune"}},{"match":{"description_t":"dune"}}],"tie":0.3}}` | Best matching query score plus `tie` times the other scores. Default `tie: 0` keeps the best; `tie: 1` is a boolean disjunction. Duplicates contribute separately. |
 | Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe `$vars`. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
@@ -599,7 +622,7 @@ clauses, filters, fusion sources, or another query wrapper.
 produces several terms. Boolean `optional` clauses rank but do not constrain a
 query that already has `required` or `filter` clauses unless `min_match` is set.
 
-There are two query types for text. Text a person typed goes through
+There are two syntaxes for text queries. Text a person typed goes through
 [`simple_query`](query-reference.md#simple-query), which never fails to
 parse. Text your application authored uses the strict
 [query language](query-language.md), which reports parse errors with a byte
@@ -611,7 +634,7 @@ default.
 ### Field bindings
 
 A bare field name selects a representation by operation: text operations
-(match, phrase, prefix, fuzzy, simple query, expression terms) use the
+(match, multi-match, phrase, prefix, fuzzy, simple query, expression terms) use the
 field's `search` binding, and value operations (`any_of`, ranges, facets,
 sorts, metrics) use its `value` binding. `f__label` selects a variant
 exactly and `f__self` forces the primary. The rules live in
@@ -627,7 +650,7 @@ POST /collections/authors/_search
 {
   "query": "author_name:Asher",
   "fields": ["title_t", "author_name", "author_name__s", "author_name__self"],
-  "get_number": true,
+  "count_limit": -1,
   "sort": ["author_name", "id"],
   "limit": 1
 }
@@ -657,7 +680,7 @@ POST /collections/authors/_search
     "all": true
   },
   "fields": ["id"],
-  "get_number": true,
+  "count_limit": -1,
   "filter": [
     {
       "any_of": {
@@ -753,11 +776,8 @@ Field names use the value binding. Numeric, date, string, and ID fields keep
 the direct column-sort path. Use `col("name")` when a field name is reserved
 or is not an identifier. To sort analyzed text, use a string variant.
 
-A bare multi-valued string field sorts by its smallest value ascending and its
-largest value descending (string values are stored as a per-document sorted
-set, so either edge is free to read). A bare multi-valued numeric field sorts
-by its first stored value, the one key that needs no per-document scan; use
-`min(f)` or `max(f)` for edge semantics when the scan is worth paying.
+Multi-valued field sorting and per-document reducers follow the field's
+[multi-valued mode](schema.md#multi-valued-modes).
 
 Integer-only addition, subtraction, and multiplication stay int64; a double
 operand promotes that operation to double, and division always returns double.
@@ -769,8 +789,12 @@ zip two arrays. A NaN read from a stored column is missing; stored infinities
 remain values, including for `min` and `max`; a non-finite result produced by
 arithmetic, an invalid math domain, or int64 overflow is an evaluation error.
 
-DATE values keep their DATE meaning through `def`, `min`, `max`, `avg`, and
-DATE plus or minus a number. DATE minus DATE produces a number.
+DATE values keep their unit (`ms` or `ns`) through `def`, `min`, `max`, `avg`,
+and DATE plus or minus a number. Numeric offsets and `def` fallbacks use that
+unit. DATE minus DATE produces a number in the operands' common unit. Combining
+ms/ns DATE operands converts the ms operand to ns before the operation; any
+DATE result then uses ns. See [date expressions](dates.md#value-expressions-and-aggregates)
+for conversion overflow behavior.
 Multiplication, division, unary minus, and unary math such as `floor` demote a
 DATE to a number (`floor(when_dt / 86400000)` is an epoch-day number); adding
 two DATE values or subtracting a DATE from a number is rejected.
@@ -785,7 +809,12 @@ query.
 to row documents: a document without a requested field omits the key rather
 than returning `null`. Set `document_format: "columns"`
 when consumers prefer every requested key in every row, with missing cells
-rendered as `null`.
+rendered as `null`. That holds for named fields; a field returned by an empty
+or wildcard `fields` selector is left out of a batch in which no document has
+a value. `document_format: "adaptive"` picks per batch and field
+whichever placement encodes the batch more compactly: sparse fields as row
+keys, dense ones as columns (see [column placement](grpc.md#column-placement)).
+`columns` and `adaptive` are rejected with `format=docs`.
 
 With no `fields`, every retrievable logical field comes back: stored text,
 string, numeric, date, and `id` values, discovered from the index itself (so
@@ -793,12 +822,12 @@ dynamic suffix fields appear under their concrete names), `id` first and the
 rest in name order. Vector fields and engine fields such as `_version_` are
 returned only when named. A `fields` entry containing `*` is a wildcard
 pattern (`"attr_*"`, `"*_s"`, `"t*s"`) that expands through the same
-discovery. Discovered fields are always placed in row documents, whatever
-`document_format` says; naming fields produces dense columns. A field both
-named and matched by a pattern is
-returned once, in its explicit placement, so `"fields": ["id", "*"]` returns
-an `id` column beside rows of everything else. `_score_` is requested
-explicitly (`get_scores`) and keeps the format's placement.
+discovery. Discovered fields follow `document_format` like named ones, except
+that under `columns` a discovered field with no value in a batch is left out
+of that batch, while a named column is always present. A field both named
+and matched by a pattern is returned once, so `"fields": ["id", "*"]` returns
+`id` and everything else. `_score_` is requested explicitly (`get_scores`)
+and is a column except under `rows`.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and
@@ -810,9 +839,8 @@ names only (`author_name*`). A pattern containing `__` expands over variants
 that have a column, under their physical names: `author_name__*` returns
 `author_name__s`, and `*__s` returns every `s` variant in the index.
 TEXT variants are skipped; retrieve their logical primary for source text.
-Name `__self` explicitly to retrieve it. A multi-valued string variant returns
-a sorted, deduplicated set while the stored primary retains source order and
-duplicates.
+Name `__self` explicitly to retrieve it. Variant columns follow their resolved
+[multi-valued mode](schema.md#multi-valued-modes).
 
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
@@ -832,7 +860,7 @@ operation in a request-level `ops` map:
         "query": "title_t:dune",
         "filter": ["stock_i:>0"],
         "limit": 10,
-        "get_number": true,
+        "count_limit": -1,
         "fields": ["id","title_t","price_f"],
         "ops": {
           "categories": {"field_facet": {"field":"category_s","limit":10}},
@@ -913,8 +941,9 @@ The recognized top-document parameters are:
 | `fields` | Comma-separated field names. An empty value clears the body list. |
 | `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
 | `batch_size` | Signed 32-bit decimal integer. |
-| `document_format` | Exactly `default`, `rows`, or `columns`. |
-| `get_number`, `get_scores` | Exactly `true` or `false`. |
+| `document_format` | Exactly `default`, `rows`, `columns`, or `adaptive`. |
+| `get_scores` | Exactly `true` or `false`. |
+| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, positive values permit a lower bound. |
 
 URL form decoding happens before these grammars are applied, so `+` in a
 `sort` value is a space. `sort=` clears the body sort list; empty and non-empty
@@ -958,15 +987,26 @@ beside `ops` in the full form:
   latest commit.
 - `time_zone` sets the default time zone for date queries and facets in the
   request. See [Dates and time zones](dates.md).
+- `flags` is an array of lowercase packed option names, for example
+  `["date_ms"]`. An operation wrapper can override inherited flags, and its
+  subops inherit the result. Naming `date_native` restores field-native
+  literal units and numeric output; `[]` overrides nothing. Duplicate/conflicting
+  names, unknown names, and reserved flags are rejected. See [request flags](http-api.md#packed-request-flags)
+  and [date literal units and output](dates.md#request-flags-and-literal-units).
+  Date modes apply to fields, sort values, facet bounds, group keys/ranks and
+  DATE metrics emitted by that operation; internal order and identities stay
+  native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
+  output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
-  executes serially on the transport thread that received it, with no
+  executes serially on the HTTP io thread that received it, with no
   scheduler handoff. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
   not occupy its connection thread. `-1` removes the cap: the request starts
   on the receiving thread and shared workers join in, parallelizing across
   segments and operations; like the default, it occupies the receiving
-  thread for its duration. The path collection overrides any collection
-  target in the HTTP body.
+  thread for its duration. gRPC runs every search on the shared workers
+  instead (see [gRPC](grpc.md)), so there `0` and `1` are alike. The path
+  collection overrides any collection target in the HTTP body.
 - `profile: true` returns an execution profile on the final response.
 
 Every final response carries `took_us`: the server-side wall time, in
@@ -1036,7 +1076,7 @@ there is no cursor, scroll state, or page size to manage:
 ```http
 POST /collections/books/_search?format=docs
 
-{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"], "get_number": true}
+{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"], "count_limit": -1}
 ```
 
 ```jsonl
@@ -1047,11 +1087,16 @@ POST /collections/books/_search?format=docs
 {"id":"b4","title_t":"Neuromancer"}
 ```
 
-Each line is one bare document. If `get_number` or warnings are present, a
+Each line is one bare document. If a count was requested or warnings are present, a
 leading `_header_` record carries them. Multi-operation document streams use
 header markers to name the following operation. The output pipes directly into
 the [NDJSON update endpoint](indexing.md#unbounded-ndjson-ingest), which
 recognizes and skips header lines.
+
+For re-import, omit `_version_` from the projection or remove it from the
+exported documents. It is returned only when explicitly named and is rejected
+as document input; the engine assigns it and does not support optimistic
+concurrency.
 
 A clean HTTP chunk terminator means the result set completed; a failure after
 output began aborts the chunked body so a conforming client sees truncation
@@ -1094,6 +1139,9 @@ preparation without collecting results. See
 
 ## Limits
 
+- `multi_match` field lists containing patterns may resolve to at most `64`
+  distinct physical targets, including explicit fields. See
+  [Multi-match](query-reference.md#multi-match) for field types and phrase options.
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date

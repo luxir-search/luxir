@@ -24,6 +24,8 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/server/RpcStatus.h"
 #include "luxir/util/Signal.h"
 
@@ -188,7 +190,7 @@ public:
     // Build the SearchRequest with the LocalReq builder (used only as a builder; we serialize
     // its `proto`, we do not execute locally).
     auto lreq = localReq(luxirNode->getSearchEngine());
-    lreq->collection("main").topDocs("q").allQuery().getNumber();
+    lreq->collection("main").topDocs("q").allQuery().countLimit();
 
     bool wrote = rstream.Write(lreq->proto);  // lreq stays alive through Write
     EXPECT_TRUE(wrote);
@@ -676,7 +678,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   RequestCreator requestCreator = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));  // set request id to the id so we know what doc we are looking for
     // try to retrieve the document we just indexed
-    auto& q = req.topDocs("q").getNumber().matchQuery("id", std::to_string(docid));
+    auto& q = req.topDocs("q").countLimit().matchQuery("id", std::to_string(docid));
     for (auto& field : retrieveFields) q.fields({std::string(field)});
 
     // Sometimes add integer facet request for id_i
@@ -715,7 +717,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     // the field t2_w contains integers from 1-10, 1-100, and 1-1000.  So if we search for
     // something like "0" it should match > 11% of the docs and use block compression in the codec
     // provided there are enough docs in the index (otherwise tail compression is used).
-    req.topDocs("q").getNumber().limit(1).matchQuery("t2_w", std::to_string(docid % 10));
+    req.topDocs("q").countLimit().limit(1).matchQuery("t2_w", std::to_string(docid % 10));
   };
 
   // record the number of hits per query in a boost flat unordered map
@@ -750,7 +752,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   int32_t batchSize = 5;
   RequestCreator reqc3 = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));
-    auto& q = req.topDocs("q").getNumber().limit(limit).batchSize(batchSize)
+    auto& q = req.topDocs("q").countLimit().limit(limit).batchSize(batchSize)
                  .matchQuery("t2_w", std::to_string(docid % 10));
     for (auto& field : retrieveFields) q.fields({std::string(field)});
   };
@@ -817,6 +819,42 @@ TEST_F(GrpcIndexTest, addDocs) {
     GRPC_DEBUG("I got id:{}", idString(response.msg.request_id));
   }
 
+}
+
+// Geo point objects and strings arrive as Map and string Vals in the binary
+// protobuf encoding, the same as over HTTP JSON.
+TEST_F(GrpcIndexTest, geoPointFormatsOverProtobuf) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("loc");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  field.multi = api::FieldDef::MultiMode::DEFAULT;
+  schema.set(helper.collection());
+
+  std::pmr::monotonic_buffer_resource mr;
+  api::UpdateRequest request;
+  std::string error;
+  ASSERT_TRUE(api::read_json(request,
+      R"({"docs":[{"id":"obj","loc":{"lat":50.5,"lon":10.5}},)"
+      R"({"id":"geojson","loc":{"type":"Point","coordinates":[10.6,50.6]}},)"
+      R"j({"id":"strs","loc":["50.7,10.7","POINT (10.8 50.8)","u0zrq"]},)j"
+      R"({"id":"far","loc":[-74.0,40.7]}],"commit":{}})", mr, &error)) << error;
+  Reply<api::UpdateResponse> response;
+  grpc::ClientContext context;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Update, &context, request, &response).ok());
+  EXPECT_EQ(api::UpdateResponse_::Status::OK, response.msg.status);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.rawQuery() = qb::geoBox(cur.mr(), "loc", 50.0, 51.0, 10.0, 11.0);
+  cur.fields({"id"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
+  std::vector<std::string> ids;
+  for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
+  std::ranges::sort(ids);
+  EXPECT_EQ((std::vector<std::string>{"geojson", "obj", "strs"}), ids);
 }
 
 TEST_F(GrpcIndexTest, unsafeCollectionNameIsInvalidArgument) {
