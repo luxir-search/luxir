@@ -3978,106 +3978,6 @@ TEST_F(IndexWriterTest, storageLimitDiscardsPartialOutputBeforeRecovery) {
   EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
 }
 
-namespace {
-
-// Ids "s<seg>-<doc>" give each committed segment a disjoint id range.
-std::string idFilterId(int seg, int doc) { return fmt::format("s{}-{:02}", seg, doc); }
-
-constexpr int ID_FILTER_SEGS = 8;
-constexpr int ID_FILTER_DOCS = 20;
-
-void addIdFilterSegments(test::CollectionHelper& h) {
-  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
-  for (int s = 0; s < ID_FILTER_SEGS; s++) {
-    std::vector<test::Doc> docs;
-    for (int d = 0; d < ID_FILTER_DOCS; d++) docs.push_back(test::flatdoc("id", idFilterId(s, d)));
-    ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
-  }
-}
-
-// Sums, over every segment of a commit, the ids that passed the id filter.
-struct ProbeCounter {
-  std::atomic<int64_t> probes = 0;
-  ProbeCounter() {
-    Signal::listen("deleteIdsProbed", [this](void*, void* n, void*) -> void* {
-      probes += (int64_t)n;
-      return nullptr;
-    });
-  }
-  ~ProbeCounter() { Signal::unlisten("deleteIdsProbed"); }
-};
-
-} // namespace
-
-TEST_F(IndexWriterTest, idFilterPrunesOverwritesAcrossSegments) {
-  LuxirNode node;
-  test::CollectionHelper h(node);
-  addIdFilterSegments(h);
-
-  // One overwrite per segment in one request: each id is sought only in the
-  // segment that holds it.
-  ProbeCounter counter;
-  std::vector<test::Doc> docs;
-  for (int s = 0; s < ID_FILTER_SEGS; s++) docs.push_back(test::flatdoc("id", idFilterId(s, 7)));
-  ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
-  EXPECT_EQ(ID_FILTER_SEGS, counter.probes.load());
-
-  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
-  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS, reader->liveDocs());
-  EXPECT_EQ(ID_FILTER_SEGS * (ID_FILTER_DOCS + 1), reader->maxDoc());
-}
-
-TEST_F(IndexWriterTest, idFilterSkipsAbsentDeletes) {
-  LuxirNode node;
-  test::CollectionHelper h(node);
-  addIdFilterSegments(h);
-
-  // Ids outside every segment's range never reach a terms seek; ids inside one
-  // segment's range pass only on a bloom false positive (about 1%).
-  ProbeCounter counter;
-  std::vector<std::string> ids;
-  for (int i = 0; i < 50; i++) ids.push_back(fmt::format("t-{}", i));
-  for (int i = 0; i < 50; i++) {
-    ids.push_back(idFilterId(i % ID_FILTER_SEGS, i % ID_FILTER_DOCS) + "x");
-  }
-  ASSERT_TRUE(h.deleteByIds(ids, UpdateMessage::COMMIT).success);
-  EXPECT_LT(counter.probes.load(), 10);
-  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS,
-            h.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
-}
-
-TEST_F(IndexWriterTest, idFilterRebuiltOnMerge) {
-  LuxirNode node;
-  test::CollectionHelper h(node);
-  addIdFilterSegments(h);
-  int lastSeg = ID_FILTER_SEGS - 1, lastDoc = ID_FILTER_DOCS - 1;
-  ASSERT_TRUE(h.deleteByIds({idFilterId(0, 0), idFilterId(lastSeg, lastDoc)},
-                            UpdateMessage::COMMIT).success);
-  test::CollectionHelper::UpdateBuilder merge;
-  merge.commit(true, 1);
-  ASSERT_TRUE(h.submit(merge).success);
-
-  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
-  ASSERT_EQ(1u, reader->segments().size());
-  PostingsReader& postings = reader->segments()[0].postingsReader();
-  IdFilterReader filter(postings, *postings.fieldInfo("id"));
-  ASSERT_TRUE(filter.present());
-  // The merge drops the deleted ids, so the range shrinks to the live ones.
-  EXPECT_EQ(idFilterId(0, 1), filter.minTerm());
-  EXPECT_EQ(idFilterId(lastSeg, lastDoc - 1), filter.maxTerm());
-  EXPECT_FALSE(filter.mayContain(idFilterId(0, 0)));
-  for (int s = 0; s < ID_FILTER_SEGS; s++) {
-    for (int d = 0; d < ID_FILTER_DOCS; d++) {
-      if ((s == 0 && d == 0) || (s == lastSeg && d == lastDoc)) continue;
-      EXPECT_TRUE(filter.mayContain(idFilterId(s, d)));
-    }
-  }
-
-  ProbeCounter counter;
-  ASSERT_TRUE(h.index(test::flatdoc("id", idFilterId(4, 4)), UpdateMessage::COMMIT, true).success);
-  EXPECT_EQ(1, counter.probes.load());
-  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS - 2,
-            h.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
 TEST_F(IndexWriterTest, shadowFrontierWaitsForCompletedHandlers) {
   using namespace luxir::test;
   class HeldUpdate : public ProtoUpdateMessage {
@@ -4806,4 +4706,106 @@ TEST_F(IndexWriterTest, deleteFactReachesMergedDuplicatePostings) {
   helper.commit();
   EXPECT_EQ((std::multiset<std::string>{"dup", "dup", "keep"}), publishedIds(helper));
   EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+namespace {
+
+// Ids "s<seg>-<doc>" give each committed segment a disjoint id range.
+std::string idFilterId(int seg, int doc) { return fmt::format("s{}-{:02}", seg, doc); }
+
+constexpr int ID_FILTER_SEGS = 8;
+constexpr int ID_FILTER_DOCS = 20;
+
+void addIdFilterSegments(test::CollectionHelper& h) {
+  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int s = 0; s < ID_FILTER_SEGS; s++) {
+    std::vector<test::Doc> docs;
+    for (int d = 0; d < ID_FILTER_DOCS; d++) docs.push_back(test::flatdoc("id", idFilterId(s, d)));
+    ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+  }
+}
+
+// Sums, over every segment of a commit, the ids that passed the id filter.
+struct ProbeCounter {
+  std::atomic<int64_t> probes = 0;
+  ProbeCounter() {
+    Signal::listen("deleteIdsProbed", [this](void*, void* n, void*) -> void* {
+      probes += (int64_t)n;
+      return nullptr;
+    });
+  }
+  ~ProbeCounter() { Signal::unlisten("deleteIdsProbed"); }
+};
+
+} // namespace
+
+TEST_F(IndexWriterTest, idFilterPrunesOverwritesAcrossSegments) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+
+  // One overwrite per segment in one request: each id is sought only in the
+  // segment that holds it.
+  ProbeCounter counter;
+  std::vector<test::Doc> docs;
+  for (int s = 0; s < ID_FILTER_SEGS; s++) docs.push_back(test::flatdoc("id", idFilterId(s, 7)));
+  ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(ID_FILTER_SEGS, counter.probes.load());
+
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS, reader->liveDocs());
+  EXPECT_EQ(ID_FILTER_SEGS * (ID_FILTER_DOCS + 1), reader->maxDoc());
+}
+
+TEST_F(IndexWriterTest, idFilterSkipsAbsentDeletes) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+
+  // Ids outside every segment's range never reach a terms seek; ids inside one
+  // segment's range pass only on a bloom false positive (about 1%).
+  ProbeCounter counter;
+  std::vector<std::string> ids;
+  for (int i = 0; i < 50; i++) ids.push_back(fmt::format("t-{}", i));
+  for (int i = 0; i < 50; i++) {
+    ids.push_back(idFilterId(i % ID_FILTER_SEGS, i % ID_FILTER_DOCS) + "x");
+  }
+  ASSERT_TRUE(h.deleteByIds(ids, UpdateMessage::COMMIT).success);
+  EXPECT_LT(counter.probes.load(), 10);
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS,
+            h.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, idFilterRebuiltOnMerge) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+  int lastSeg = ID_FILTER_SEGS - 1, lastDoc = ID_FILTER_DOCS - 1;
+  ASSERT_TRUE(h.deleteByIds({idFilterId(0, 0), idFilterId(lastSeg, lastDoc)},
+                            UpdateMessage::COMMIT).success);
+  test::CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(h.submit(merge).success);
+
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  PostingsReader& postings = reader->segments()[0].postingsReader();
+  IdFilterReader filter(postings, *postings.fieldInfo("id"));
+  ASSERT_TRUE(filter.present());
+  // The merge drops the deleted ids, so the range shrinks to the live ones.
+  EXPECT_EQ(idFilterId(0, 1), filter.minTerm());
+  EXPECT_EQ(idFilterId(lastSeg, lastDoc - 1), filter.maxTerm());
+  EXPECT_FALSE(filter.mayContain(idFilterId(0, 0)));
+  for (int s = 0; s < ID_FILTER_SEGS; s++) {
+    for (int d = 0; d < ID_FILTER_DOCS; d++) {
+      if ((s == 0 && d == 0) || (s == lastSeg && d == lastDoc)) continue;
+      EXPECT_TRUE(filter.mayContain(idFilterId(s, d)));
+    }
+  }
+
+  ProbeCounter counter;
+  ASSERT_TRUE(h.index(test::flatdoc("id", idFilterId(4, 4)), UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(1, counter.probes.load());
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS - 2,
+            h.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
 }
