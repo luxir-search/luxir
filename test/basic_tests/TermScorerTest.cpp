@@ -7706,6 +7706,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     std::vector<segdoc> docs;
     std::type_index bulkType;
     int64_t fillCalls;
+    int64_t pointArms;
   };
   auto run = [&](Query& query, bool pull, bool forceFill,
                  bool disableShapes) {
@@ -7740,7 +7741,9 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     return Run{std::move(resultDocs),
                bulk == nullptr ? std::type_index(typeid(void))
                                : std::type_index(typeid(*bulk)),
-               SkipStats::countBulkFillCalls};
+               SkipStats::countBulkFillCalls,
+               SkipStats::numericPredicatePointsArms
+                   + SkipStats::numericPredicateComplementArms};
   };
 
   for (const auto& shape : cases) {
@@ -7756,7 +7759,11 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
       Run fill = run(*shape.query, false, true, false);
       EXPECT_EQ(fill.bulkType, shape.bulkType);
       EXPECT_EQ(fill.docs, pull.docs);
-      EXPECT_GT(fill.fillCalls, attached.fillCalls);
+      EXPECT_GE(fill.pointArms, attached.pointArms);
+      // A fill that does not produce the range fills its windows.
+      if (fill.pointArms == 0) {
+        EXPECT_GT(fill.fillCalls, attached.fillCalls);
+      }
     }
   }
 }

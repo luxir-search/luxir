@@ -13,6 +13,7 @@
 #include "LuxirTest.h"
 #include "GrpcLuxirTest.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
@@ -314,6 +315,7 @@ int main(int argc, char **argv) {
   testing::AddGlobalTestEnvironment(new luxir::LuxirEnvironment());
 
   int ret = 0;
+  luxir::initPlugins(luxir::addConfiguredPlugins);
   luxir::LuxirNode node{config};
   luxir::LuxirTest::luxirNode = &node;
 

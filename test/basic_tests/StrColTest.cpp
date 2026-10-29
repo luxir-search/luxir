@@ -13,6 +13,9 @@
 #include "luxir/index/handler/StrColHandler.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include <algorithm>
+#include <numeric>
+#include <string>
 #include <vector>
 
 using namespace luxir;
@@ -146,6 +149,52 @@ TEST_F(StrColTest, basicMerge) {
 
 }
 
+
+// The merge queue orders sources by a 16-byte key before comparing whole
+// terms; merged ords must still follow byte order for values that tie on that
+// key, differ only past it, embed zero bytes, or prefix one another.
+TEST_F(StrColTest, mergeOrdersKeyTiesAndZeroBytes) {
+  using namespace std::string_literals;
+  const std::vector<std::string> values = {
+      "a"s, "a\0"s, "a\0\0"s, "a\x01"s, "a\xff"s, "\xff"s, "\xff\0"s,
+      "0123456789abcde"s, "0123456789abcdef"s, "0123456789abcdef\0"s,
+      "0123456789abcdef0"s, "0123456789abcdeg"s, "0123456789abcdefghij"s,
+      "0123456789abcdefghi"s, "0123456789abcdef\xff"s};
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_s");
+  std::vector<size_t> valueOfDoc;
+  for (int32_t segment = 0; segment < 3; segment++) {
+    f.startIndexing();
+    int32_t doc = 0;
+    for (size_t i = 0; i < values.size(); i++) {
+      if ((i + (size_t) segment) % 3 == 0) continue;
+      f.add(doc++, values[i]);
+      valueOfDoc.push_back(i);
+    }
+    testIndex.flush();
+  }
+  testIndex.iw->mergeSegments();
+
+  std::vector<int64_t> ordOfValue(values.size(), -1);
+  f.startReading();
+  for (size_t expected = 0; expected < valueOfDoc.size(); expected++) {
+    ASSERT_EQ((int64_t) expected, f.nextDoc());
+    size_t value = valueOfDoc[expected];
+    int64_t ord = f.ord();
+    if (ordOfValue[value] < 0) ordOfValue[value] = ord;
+    EXPECT_EQ(ordOfValue[value], ord) << "value " << value;
+  }
+  ASSERT_EQ(-1, f.nextDoc());
+
+  std::vector<size_t> byBytes(values.size());
+  std::iota(byBytes.begin(), byBytes.end(), 0);
+  std::sort(byBytes.begin(), byBytes.end(),
+            [&](size_t a, size_t b) { return values[a] < values[b]; });
+  for (size_t i = 1; i < byBytes.size(); i++) {
+    EXPECT_LT(ordOfValue[byBytes[i - 1]], ordOfValue[byBytes[i]])
+        << "values " << byBytes[i - 1] << " and " << byBytes[i];
+  }
+}
 
 TEST_F(StrColTest, multiValued) {
 
