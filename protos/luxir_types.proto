@@ -795,8 +795,9 @@ enum SelectionMode {
 }
 
 // Buckets of distinct field values, using the field's value binding.
-// STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
-// counts, limits, mincount, missing, and selections.
+// STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount,
+// missing, selections, sub-operations, and metric sorts. Distinct counts are
+// supported except on TEXT; metric sorts with distinct counts are unsupported.
 message FieldFacet {
   enum CountUnit {
     DOCS = 0; // Count documents.
@@ -810,7 +811,7 @@ message FieldFacet {
 
   // Minimum bucket count. Unset includes only buckets with matches.
   // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
-  // INT/DATE require a positive value when set.
+  // INT/DATE/FLOAT/DOUBLE require a positive value when set.
   optional int64 mincount = 3;
   bool missing = 4; // Return the count without a value, in the chosen count unit.
 
@@ -1077,6 +1078,7 @@ message DocList {
 
 
 message FacetResult {
+  // Always-present bucket labels; Column.missing_val sentinels do not apply.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
   optional int64 missing = 4; // the number of documents that do not have this field
@@ -1363,6 +1365,7 @@ message ColStr {
 // Vector and value columns use the missing-value rules described on their
 // fields.  Every returned field type has a column form: a type with no typed
 // arm uses col_val.
+// In FacetResult.bucket_ids, every value is present and missing_val is ignored.
 message Column {
   oneof kind {
     ColStr col_s = 1;

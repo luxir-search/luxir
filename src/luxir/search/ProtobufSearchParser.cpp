@@ -695,8 +695,7 @@ public:
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
-      if (ftype->type() == FieldType::Type::DATE
-          || ftype->type() == FieldType::Type::INT) {
+      if (QueryBuilder::isNumericColumnType(ftype->type())) {
         selectedInts = preparedSelected->numericsInInputOrder();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
@@ -707,20 +706,15 @@ public:
 
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
-      // DATE stores native ticks in the int column; it terms-facets exactly
-      // like INT (distinct values). Date-histogram bucketing is a range
-      // facet, not a terms facet.
+      // Numeric columns hold raw integers, date ticks, or sortable floating
+      // bits. Field facets count distinct encoded values for all of them;
+      // date-histogram bucketing is a range facet, not a terms facet.
       case FieldType::Type::FLOAT:
       case FieldType::Type::DOUBLE:
-        if (facetReq.selected.has_value()) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': selected is not supported for floating-point field facets");
-        }
-        [[fallthrough]];
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
+          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedInts);
@@ -941,7 +935,7 @@ public:
       if (dataBounds) {
         auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
             facetField, facetName, std::move(grid), encodedStart, encodedEnd,
-            fieldType->type(), minCount, facetReq.missing);
+            minCount, facetReq.missing);
         configureMeasure(*facet, measure);
         return facet;
       }
@@ -954,7 +948,7 @@ public:
       });
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
-          parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+          parsed.affine, parsed.affineGap, minCount,
           facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
       return facet;
@@ -1002,7 +996,7 @@ public:
     if (dataBounds) {
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
           facetField, facetName, std::move(grid), givenStart, givenEnd,
-          fieldType->type(), minCount, facetReq.missing);
+          minCount, facetReq.missing);
       configureMeasure(*facet, measure);
       return facet;
     }
@@ -1014,7 +1008,7 @@ public:
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
-        parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+        parsed.affine, parsed.affineGap, minCount,
         facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
     return facet;
