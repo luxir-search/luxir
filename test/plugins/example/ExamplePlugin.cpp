@@ -400,7 +400,7 @@ public:
   PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
 
   void registerComponents(Registries& r) override {
-    r.analysis.addFilter("reverse", [](const api::AnalyzerComponent& def) {
+    r.analysis.addFilter("example_reverse", [](const api::AnalyzerComponent& def) {
       noParams(def);
       struct Factory : TokenFilterFactory {
         std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
@@ -408,7 +408,7 @@ public:
         }
       };
       auto factory = std::make_unique<Factory>();
-      factory->name = "reverse";
+      factory->name = "example_reverse";
       factory->normalizing = true;
       return std::unique_ptr<TokenFilterFactory>(std::move(factory));
     });
@@ -427,7 +427,7 @@ public:
     whitespace.name = "whitespace";
     stripX.name = "strip_x";
     lowercase.name = "lowercase";
-    reverse.name = "reverse";
+    reverse.name = "example_reverse";
     api::AnalyzerDef example;
     example.tokenizer = whitespace;
     const api::AnalyzerComponent charFilters[] = {stripX};
