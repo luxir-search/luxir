@@ -454,6 +454,19 @@ public:
   uint16_t maxPointsPerLeaf() const { return leafSizeMax; }
   uint64_t sizeInBytes() const { return byteSize; }
 
+  // Points in leaves [firstLeaf, firstLeaf + leaves). Every leaf but the
+  // last is full (the writer's partition; validate() checks it), so the
+  // population follows from leaf positions without reading leaf headers.
+  uint64_t leafRangePoints(uint32_t firstLeaf, uint32_t leaves) const {
+    if ((uint64_t)firstLeaf + leaves > leavesCount) {
+      throw std::out_of_range("BKDReader: leaf range");
+    }
+    uint64_t begin = (uint64_t)firstLeaf * leafSizeMax;
+    uint64_t end = std::min(pointsCount,
+                            ((uint64_t)firstLeaf + leaves) * leafSizeMax);
+    return end - begin;
+  }
+
   InnerNode innerNode(uint32_t nodeId) const {
     if (nodeId == 0 || nodeId >= leavesCount) {
       throw std::out_of_range("BKDReader: inner node id");
@@ -734,13 +747,6 @@ public:
     uint64_t estimated = 0;
     uint64_t upper = 0;
     uint64_t crossing = 0;
-    auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
-      for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-        uint64_t count = leafInfo(leaf).count;
-        estimated += count;
-        upper += count;
-      }
-    };
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
                      uint32_t firstLeaf, int32_t cellLatMin,
                      int32_t cellLatMax, int32_t cellLonMin,
@@ -749,7 +755,9 @@ public:
           cellLatMin, cellLatMax, cellLonMin, cellLonMax);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        addLeaves(firstLeaf, leaves);
+        uint64_t points = leafRangePoints(firstLeaf, leaves);
+        estimated += points;
+        upper += points;
         return;
       }
       if (leaves != 1) {
@@ -803,9 +811,7 @@ public:
           cellLatMin, cellLatMax, cellLonMin, cellLonMax);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-          count += leafInfo(leaf).count;
-        }
+        count += leafRangePoints(firstLeaf, leaves);
         return;
       }
       if (leaves != 1) {
