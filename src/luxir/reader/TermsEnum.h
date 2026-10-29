@@ -86,6 +86,10 @@ class TermsEnum {
   uint32_t posOffRunLen = 0;
   uint32_t termImpactRunLen = 0;
   uint32_t pulsedRunLen = 0;
+  // Start of term impactCursorOrd's frontier in termImpactRun, so in-order
+  // access skips one frontier per term instead of all earlier ones.
+  const char* impactCursor = nullptr;
+  int32_t impactCursorOrd = 0;
 
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> packedBlockCounts{};
@@ -119,7 +123,6 @@ public:
   struct BlockEstimate {
     std::string firstTerm;
     uint64_t bytes;
-    uint64_t safetyBytes;
   };
 
   struct EncodedImpactFrontier {
@@ -243,9 +246,15 @@ public:
     return (int64_t) bytes;
   }
 
-  std::vector<BlockEstimate> estimateTermBlocks() const {
+  // One estimate per `stride` term blocks of each range row: the sampled
+  // block's leading term and the postings bytes up to the next sample.  The
+  // dictionary does not record where a row's last block ends, so the row's last
+  // sample is charged the row's average per block (an estimate from the field
+  // stats when the row has a single sample).
+  std::vector<BlockEstimate> estimateTermBlocks(int32_t stride = 1) const {
+    assert(stride >= 1);
     std::vector<BlockEstimate> blocks;
-    blocks.reserve((size_t) numTermBlocks);
+    blocks.reserve((size_t) (numTermBlocks / stride + rangeCount));
     for (int32_t rangeOrd = 0; rangeOrd < rangeCount; rangeOrd++) {
       const TermRangeRow& sourceRow = rangeRows[rangeOrd];
       int32_t firstBlock = (int32_t) sourceRow.firstBlockOrd;
@@ -253,29 +262,36 @@ public:
           ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
       int32_t count = endBlock - firstBlock;
       assert(count > 0);
+      int32_t samples = (count - 1) / stride + 1;
 
-      std::vector<uint64_t> docsOffsets((size_t) count);
-      std::vector<uint64_t> posOffsets((size_t) count);
+      std::vector<uint64_t> docsOffsets((size_t) samples);
+      std::vector<uint64_t> posOffsets((size_t) samples);
       InputStream input = postingsReader.getInputStream(sourceRow.termsBase.filenum());
       size_t outputBase = blocks.size();
-      for (int32_t i = 0; i < count; i++) {
-        int32_t blockOrd = firstBlock + i;
+      for (int32_t i = 0; i < samples; i++) {
+        int32_t blockOrd = firstBlock + i * stride;
         input.seek(blockLocation(&sourceRow, blockOrd));
         PackedTerm first = input.readPackedTerm();
-        blocks.push_back({std::string(first.data(), first.size()), 0, 0});
+        blocks.push_back({std::string(first.data(), first.size()), 0});
         docsOffsets[(size_t) i] = input.readVlong();
         posOffsets[(size_t) i] = input.readVlong();
       }
 
       uint64_t precedingBytes = 0;
-      for (int32_t i = 0; i + 1 < count; i++) {
+      for (int32_t i = 0; i + 1 < samples; i++) {
         assert(docsOffsets[(size_t) i + 1] >= docsOffsets[(size_t) i]);
         assert(posOffsets[(size_t) i + 1] >= posOffsets[(size_t) i]);
         uint64_t bytes = docsOffsets[(size_t) i + 1] - docsOffsets[(size_t) i]
             + posOffsets[(size_t) i + 1] - posOffsets[(size_t) i];
         blocks[outputBase + (size_t) i].bytes = bytes;
-        blocks[outputBase + (size_t) i].safetyBytes = bytes;
         precedingBytes += bytes;
+      }
+      if (samples > 1) {
+        uint64_t precedingBlocks = (uint64_t) (samples - 1) * (uint64_t) stride;
+        uint64_t lastBlocks = (uint64_t) count - precedingBlocks;
+        blocks.back().bytes = (uint64_t) ((unsigned __int128) precedingBytes * lastBlocks
+                                          / precedingBlocks);
+        continue;
       }
       uint64_t lastDocsOffset = docsOffsets.back();
       uint64_t lastPosOffset = posOffsets.back();
@@ -286,38 +302,25 @@ public:
         finalBytes = sourceRow.docsBytes - lastDocsOffset
             + sourceRow.posBytes - lastPosOffset;
       } else {
-        InputStream docsInput = postingsReader.getInputStream(sourceRow.docsBase.filenum());
-        uint64_t docsStart = sourceRow.docsBase.offset() + lastDocsOffset;
-        assert(docsStart <= (uint64_t) docsInput.size());
-        finalBytes = (uint64_t) docsInput.size() - docsStart;
-        if (FieldType::hasPositions(fieldInfo.flags)) {
-          InputStream posInput = postingsReader.getInputStream(sourceRow.posBase.filenum());
-          uint64_t posStart = sourceRow.posBase.offset() + lastPosOffset;
-          assert(posStart <= (uint64_t) posInput.size());
-          finalBytes += (uint64_t) posInput.size() - posStart;
-        }
-      }
-      uint64_t finalEstimate = finalBytes;
-      if (count == 1 && fieldInfo.rangeTableLoc.isNull()) {
+        // A single untabled row is the whole field, which the stats size
+        // better than the file tail (later fields' postings follow it).
         assert(fieldInfo.sumDocFreq >= 0 && fieldInfo.sumTotalTermFreq >= 0);
         auto addEstimate = [&](uint64_t values, uint64_t bytesPerValue) {
           uint64_t bytes = values > UINT64_MAX / bytesPerValue
               ? UINT64_MAX : values * bytesPerValue;
-          finalEstimate = UINT64_MAX - finalEstimate < bytes
-              ? UINT64_MAX : finalEstimate + bytes;
+          finalBytes = UINT64_MAX - finalBytes < bytes
+              ? UINT64_MAX : finalBytes + bytes;
         };
-        finalEstimate = 0;
+        finalBytes = 0;
         addEstimate((uint64_t) fieldInfo.sumDocFreq,
                     FieldType::hasFreqs(fieldInfo.flags) ? 10 : 5);
         if (FieldType::hasPositions(fieldInfo.flags)) {
           addEstimate((uint64_t) fieldInfo.sumTotalTermFreq, 5);
         }
       }
-      blocks.back().bytes = count > 1
-          ? precedingBytes / (uint64_t) (count - 1) : finalEstimate;
-      blocks.back().safetyBytes = finalBytes;
+      blocks.back().bytes = finalBytes;
     }
-    assert((int32_t) blocks.size() == numTermBlocks);
+    assert(stride > 1 || (int32_t) blocks.size() == numTermBlocks);
     return blocks;
   }
 
@@ -331,6 +334,20 @@ public:
   /// If called before nextTerm() or seek() is done, returns a 0 length term.
   PackedTerm term() const {
     return currTerm;
+  }
+
+  /// The first 16 bytes of term() as a big-endian integer, zero padded: where
+  /// two keys differ they order the terms, and equal keys need a full compare.
+  /// A short term's load runs into the buffer's COPY_SLACK.
+  unsigned __int128 termPrefixKey() const {
+    const char* data = currTerm.data();
+    uint64_t hi, lo;
+    memcpy(&hi, data, 8);
+    memcpy(&lo, data + 8, 8);
+    auto key = ((unsigned __int128) std::byteswap(hi) << 64) | std::byteswap(lo);
+    uint32_t len = currTerm.size();
+    if (len < 16) key &= ~(~(unsigned __int128) 0 >> (8 * len));
+    return key;
   }
 
   /// Byte length of term().  Same value as term().size(), but read from a
@@ -414,12 +431,18 @@ public:
       return {};
     }
     parseMetadataRuns();
-    const char* p = termImpactRun;
+    if (impactCursorOrd > ordInBlock) {
+      impactCursor = termImpactRun;
+      impactCursorOrd = 0;
+    }
+    const char* p = impactCursor;
     const char* end = termImpactRun + termImpactRunLen;
-    for (int32_t t = 0; t < ordInBlock; t++) {
+    for (int32_t t = impactCursorOrd; t < ordInBlock; t++) {
       skipEncodedImpactFrontier(p, end);
     }
     const char* start = p;
+    impactCursor = start;
+    impactCursorOrd = ordInBlock;
     skipEncodedImpactFrontier(p, end);
     assert(p <= end);
     return {start, (uint32_t) (p - start)};
@@ -540,6 +563,8 @@ protected:
     } else {
       termImpactRun = nullptr;
     }
+    impactCursor = termImpactRun;
+    impactCursorOrd = 0;
     pulsedRun = p;
     p += pulsedRunLen;
     assert(p <= blockEnd);

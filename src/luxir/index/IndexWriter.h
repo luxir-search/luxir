@@ -299,7 +299,7 @@ public:
       {
         // const std::lock_guard<std::mutex> lock(iw.indexMutex);
         mergeLevel = _update(seg);
-        if (mergeLevel < 0 || outstandingMerges > 0) {
+        if (mergeLevel < 0 || outstandingMerges > 0 || iw._forceMergePendingLocked()) {
           return false;
         }
       }
@@ -350,6 +350,11 @@ public:
   // protected by indexMutex
   std::vector<std::unique_ptr<SegInfo>> segmentsToDelete;
 
+  // Retired segments whose files are deleted, waiting for segmentReleaseNode
+  // to drop their readers.  protected by retiredMutex
+  std::mutex retiredMutex;
+  std::vector<std::unique_ptr<SegInfo>> retiredSegments;
+
 
   // protected by indexMutex
   // If we don't need to look up by segment id, we could just use a vector for idleInverters.
@@ -367,6 +372,16 @@ public:
   // is completed.  Protected by indexMutex.
   std::deque<UpdateMessage*> pendingForceMerges;
   UpdateMessage* activeForceMerge = nullptr;
+  // max_segments commits from initiation through their commit body.  Until a
+  // force merge is in the (serial) merge queue, policy merges hold off: one
+  // queued ahead of it, e.g. started by the commit's own flushes, would rewrite
+  // segments the force merge rewrites again.  Policy merges submitted after it
+  // run after it.  Protected by indexMutex.
+  int32_t forceMergeIntents = 0;
+
+  bool _forceMergePendingLocked() const {
+    return forceMergeIntents > 0 || !pendingForceMerges.empty();
+  }
 
   // The last updateNumber generated (the first update number generated will be 1).
   // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
@@ -533,11 +548,16 @@ public:
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
-  using PressureCheckMultiFunc =
+  using ContinueMultiFunc =
       tbb::flow::multifunction_node<tbb::flow::continue_msg, std::tuple<void*>>;
-  std::unique_ptr<PressureCheckMultiFunc> pressureCheckNode;
+  std::unique_ptr<ContinueMultiFunc> pressureCheckNode;
   std::atomic<bool> pressureCheckQueued = false;
   IndexRamBudget::PressureRegistration pressureRegistration;
+
+  // Drops retired segments' readers.  That unmaps their files, which for a
+  // large merge's sources can take most of a second (on tmpfs the unmap frees
+  // the unlinked files' pages), so it stays off the commit that retired them.
+  std::unique_ptr<ContinueMultiFunc> segmentReleaseNode;
 
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
@@ -786,6 +806,7 @@ private:
   void completeForceMergeOrigins(const std::vector<UpdateMessage*>& origins);
   void enqueueForceMerge(UpdateMessage& origin);
   void completeForceMerge(MergeMessage& msg);
+  void _resumePolicyMergesLocked();
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
@@ -838,6 +859,7 @@ private:
   void tryDeleteSegments();
   std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
+  void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
@@ -857,6 +879,9 @@ public:
 
   // Cheap test-only snapshot of committed and buffered index state.
   bool testIsEmpty();
+
+  // Waits for queued graph work, including releasing retired segments.
+  void testDrain() { updateGraph->wait_for_all(); }
 
   // Test hook for the rebuild-without-reindex path: remove an overlay entry
   // from one live segment, leaving the segment data untouched.

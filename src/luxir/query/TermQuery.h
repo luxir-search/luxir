@@ -241,7 +241,7 @@ public:
         // Warm exhaustive production costs about 14-16 instructions per
         // dense posting; sparse windows retain roughly 700 instructions of
         // dispatch/navigation. Round upward for admission, not execution.
-        return {df, 16 * df, std::ceil(df / DocsEnumMeta::L1_DOCS), 85, 1024, 8 * df};
+        return {df, 16 * df, std::ceil(df / DocsEnumMeta::L1_DOCS), 85, 1024, 8 * df, true};
       }
 
       Query::ScorerShape describeScorer(

@@ -9,6 +9,7 @@
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/Collector.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -44,10 +45,18 @@ struct RangeFilterIndex {
     auto& column = inverter.getIndexHandler("column_i");
     auto& indexed = inverter.getIndexHandler("points_i");
     auto& clustered = inverter.getIndexHandler("cluster_i");
-  auto& partial = inverter.getIndexHandler("partial_i");
+    auto& partial = inverter.getIndexHandler("partial_i");
+    auto& random = inverter.getIndexHandler("random_i");
+    auto& uniform = inverter.getIndexHandler("uniform_i");
+    auto& fragmented = inverter.getIndexHandler("fragmented_i");
+    auto& missing = inverter.getIndexHandler("missing_i");
+    auto& multi = inverter.getIndexHandler("cluster_is");
     auto& sort = inverter.getIndexHandler("sort_i");
+    SplitMix64 prices(0), terms(1);
     for (int32_t doc = 0; doc < size; doc++) {
       std::string text = "pad";
+      if (terms.rint(10) == 0) text += " medium";
+      if (terms.rint(2) == 0) text += " high";
       if (doc % 64 == 0) text += " a";
       if (doc % 64 == 1 || doc % 128 == 0) text += " c";
       if (doc % 3 == 0) text += " b";
@@ -62,6 +71,9 @@ struct RangeFilterIndex {
       if (doc % 200 == 0) text += " d0_5";
       if (doc % 150 == 0) text += " d0_67";
       if (doc % 64 == 0) text += " d1_56";
+      if (((uint64_t)doc * 2654435761u) % 11 != 0) text += " e90";
+      if (((uint64_t)doc * 2246822519u) % 13 != 0) text += " f90";
+      if (((uint64_t)doc * 3266489917u) % 17 != 0) text += " g90";
       text += " all";
       int64_t value = ((int64_t)doc * 1543) % size;
       inverter.startDoc();
@@ -74,6 +86,13 @@ struct RangeFilterIndex {
       // A multiplicative hash keeps the rest crossing every zone at any size.
       partial.index(inverter, (int64_t)doc * 20 < (int64_t)size * 9 ? size + doc
           : (int64_t)(((uint64_t)doc * 2654435761u) % (uint64_t)size));
+      random.index(inverter, (int64_t)(((uint64_t)doc * 2654435761u) % (uint64_t)size));
+      uniform.index(inverter, prices.rint(100000));
+      fragmented.index(inverter, (doc / 512) % 2 == 0
+          ? doc % (size / 2) : size + doc);
+      if (doc % 3 != 0) missing.index(inverter, (int64_t)doc);
+      std::array<int64_t, 2> values{doc, (int64_t)doc + 1};
+      multi.index(inverter, std::span<const int64_t>(values));
       sort.index(inverter, ((int64_t)doc * 7919) % size);
       inverter.finishDoc();
     }
@@ -83,16 +102,25 @@ struct RangeFilterIndex {
   }
 };
 
-enum class Consumer { COUNT, MATCH, TOP, MAND_OPT, MAX_SCORE };
+enum class Consumer { COUNT, MATCH, TOP, MAND_OPT, MAX_SCORE, NARROW_MANY };
 
 void rangeFilterBench(benchmark::State& state, const char* lead,
-                      const char* field, int32_t percent, Consumer consumer) {
+                      const char* field, int32_t percent, Consumer consumer,
+                      const char* tail, int32_t valueCount) {
   RangeFilterIndex index;
-  int64_t hi = (int64_t)index.size * percent / 100 - 1;
-  TermQuery a("body_w", lead), b("body_w", lead[0] == 'd' ? "all" : "b");
+  int64_t hi = (int64_t)(valueCount == 0 ? index.size : valueCount) * percent / 100 - 1;
+  int64_t lo = 0;
+  if (consumer == Consumer::NARROW_MANY) {
+    lo = index.size / 2;
+    hi = lo + std::max(1, index.size / 100000) - 1;
+  }
+  TermQuery a("body_w", lead), b("body_w", tail != nullptr ? tail : lead[0] == 'd' ? "all" : "b");
   TermQuery c("body_w", "c");
-  NumericPredicateQuery range(field, 0, hi);
-  std::array<Query*, 2> required{&a, &b}, optional{&a, &c};
+  TermQuery e("body_w", "e90"), f("body_w", "f90"), g("body_w", "g90");
+  NumericPredicateQuery range(field, lo, hi);
+  std::array<Query*, 5> terms{&a, &b, &e, &f, &g};
+  auto required = std::span<Query*>(terms).first(consumer == Consumer::NARROW_MANY ? 5 : 2);
+  std::array<Query*, 2> optional{&a, &c};
   BooleanQuery body = consumer == Consumer::MAND_OPT
       ? BooleanQuery(std::span(required).first(1), std::span(optional).last(1), {}, {})
       : consumer == Consumer::MAX_SCORE
@@ -100,7 +128,8 @@ void rangeFilterBench(benchmark::State& state, const char* lead,
           : BooleanQuery(required, {}, {}, {});
   std::array<Query*, 1> bodyClause{&body}, filters{&range};
   BooleanQuery query(bodyClause, {}, {}, filters);
-  bool scored = consumer != Consumer::COUNT && consumer != Consumer::MATCH;
+  bool scored = consumer != Consumer::COUNT && consumer != Consumer::MATCH
+      && consumer != Consumer::NARROW_MANY;
   auto run = [&](bool pull) {
     MemPool pool;
     Query::Context context(pool, *index.reader);
@@ -165,6 +194,19 @@ void rangeFilterBench(benchmark::State& state, const char* lead,
   state.counters["match_windows"] = (double)SkipStats::conjDenseMatchWindows;
   state.counters["segments"] = (double)index.reader->segments().size();
   state.counters["result"] = (double)expected;
+  state.counters["posting_blocks"] = (double)SkipStats::docBlocksDecoded;
+  auto infos = index.reader->field(field);
+  int64_t outside = 0;
+  for (auto& segment : index.reader->segments()) {
+    IntColReader column(segment.postingsReader(), *infos.at(segment.ord));
+    for (int64_t block = 0; block < column.numBlocks(); block++) {
+      range.classifyBlock(column, block).forEachRun(column.valuesInBlock(block),
+          [&](NumericPredicateQuery::BlockRelation relation, uint32_t begin, uint32_t end) {
+            if (relation == NumericPredicateQuery::BlockRelation::OUTSIDE) outside += end - begin;
+          });
+    }
+  }
+  state.counters["outside_values"] = (double)outside;
 }
 
 void rangeFilterSortBench(benchmark::State& state) {
@@ -201,10 +243,11 @@ void rangeFilterSortBench(benchmark::State& state) {
 
 [[maybe_unused]] bool registered = [] {
   auto add = [](std::string name, const char* lead, const char* field,
-                int32_t percent, Consumer consumer) {
+                int32_t percent, Consumer consumer, const char* tail = nullptr,
+                int32_t valueCount = 0) {
     benchmark::RegisterBenchmark("BM_RangeFilter/" + name,
         [=](benchmark::State& state) {
-          rangeFilterBench(state, lead, field, percent, consumer);
+          rangeFilterBench(state, lead, field, percent, consumer, tail, valueCount);
         })->UseRealTime();
   };
   for (auto lead : {"d10", "d30", "d40", "d50", "d90"}) {
@@ -219,6 +262,12 @@ void rangeFilterSortBench(benchmark::State& state) {
   for (auto lead : {"d10", "d20", "d25", "d30"}) {
     add(std::string("partial_") + lead, lead, "partial_i", 90, Consumer::COUNT);
   }
+  add("proof_random", "d20", "random_i", 90, Consumer::COUNT);
+  add("proof_rare_outside", "medium", "uniform_i", 1, Consumer::COUNT, "high", 100000);
+  add("proof_fragmented", "d0_5", "fragmented_i", 50, Consumer::COUNT);
+  add("proof_missing", "d0_5", "missing_i", 50, Consumer::COUNT);
+  add("proof_multi", "d0_5", "cluster_is", 50, Consumer::COUNT);
+  add("proof_unsettled_many", "d20", "random_i", 1, Consumer::NARROW_MANY);
   add("match", "a", "column_i", 90, Consumer::MATCH);
   add("mandopt", "a", "column_i", 90, Consumer::MAND_OPT);
   add("maxscore", "a", "column_i", 90, Consumer::MAX_SCORE);

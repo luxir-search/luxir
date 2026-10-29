@@ -111,7 +111,7 @@ protected:
     auto cout = std::cout.rdbuf(output.rdbuf()), cerr = std::cerr.rdbuf(output.rdbuf());
     auto level = spdlog::get_level();
     auto restore = scope_guard([&] { std::cout.rdbuf(cout); std::cerr.rdbuf(cerr); spdlog::set_level(level); });
-    int code = luxir_main((int)argv.size(), argv.data());
+    int code = luxir_main((int)argv.size(), argv.data(), luxir::addConfiguredPlugins);
     return {code, output.str()};
   }
   std::pair<int, std::string> pull(std::string url = {}) {

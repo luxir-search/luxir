@@ -36,6 +36,7 @@ struct RangeRun {
   int64_t count = -1;
   int64_t cost = -1;
   bool zoneBulkAvailable = false;
+  Query::MatchState matchState = Query::MatchState::UNKNOWN;
 };
 
 std::vector<int32_t> collect(Query::Scorer* scorer) {
@@ -66,8 +67,12 @@ RangeRun runQuery(IndexReader& reader, NumericPredicateQuery& query) {
     run.zoneBulkAvailable = sparseSupplier->bulkScorer(pool) != nullptr;
     auto* sparsePlan = resolveScorerPlanForTests(pool, *sparseSupplier, 0);
     auto* sparse = sparsePlan->build(pool);
-    EXPECT_EQ(Query::ReportedTwoPhase::YES,
-              sparsePlan->shape().reportedTwoPhase);
+    run.matchState = sparsePlan->shape().matchState;
+    // A segment proven empty needs no verification phase.
+    if (run.matchState != Query::MatchState::EMPTY) {
+      EXPECT_EQ(Query::ReportedTwoPhase::YES,
+                sparsePlan->shape().reportedTwoPhase);
+    }
     run.sparseVerify = collect(sparse);
   }
 
@@ -276,6 +281,19 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
               oracle(extremeGcd, endpoint, endpoint));
   }
 
+  // Ranges strictly between lattice points cross a leaf's zone but hold no
+  // representable value. Execution still settles the blocks OUTSIDE; cheap
+  // supplier estimates need not discover their residual lattice gaps.
+  for (auto [field, values, lo, hi] : std::array<std::tuple<std::string_view,
+           const std::vector<std::vector<int64_t>>*, int64_t, int64_t>, 2>{{
+           {"dense_i", &dense, -119'999, -119'995},
+           {"extreme_gcd_i", &extremeGcd, std::numeric_limits<int64_t>::min() + 1,
+            std::numeric_limits<int64_t>::max() - 1}}}) {
+    auto run = runRange(*index.reader, field, lo, hi);
+    expectRun(run, oracle(*values, lo, hi));
+    EXPECT_NE(Query::MatchState::NONEMPTY, run.matchState) << field;
+  }
+
   // A selective correlated range must advertise its selective estimate.
   auto selective = runRange(*index.reader, "dense_i", -120'000, -119'800);
   EXPECT_GT(selective.cost, 0);
@@ -360,9 +378,9 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   index.flush();
   index.initReader();
 
-  auto makeFilter = [&](MemPool& pool) {
-    Query::Context context(pool, *index.reader);
-    NumericPredicateQuery query("window_i", 1, 1);
+  // Scorers classify blocks lazily, so the query and context must outlive them.
+  NumericPredicateQuery query("window_i", 1, 1);
+  auto makeFilter = [&](MemPool& pool, Query::Context& context) {
     auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
@@ -376,7 +394,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   };
 
   MemPool fillPool;
-  WindowFilter fill(fillPool, makeFilter(fillPool));
+  Query::Context fillContext(fillPool, *index.reader);
+  WindowFilter fill(fillPool, makeFilter(fillPool, fillContext));
   int32_t start = IntColReader::BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
   int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
@@ -385,7 +404,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   }
 
   MemPool probePool;
-  WindowFilter probe(probePool, makeFilter(probePool), true);
+  Query::Context probeContext(probePool, *index.reader);
+  WindowFilter probe(probePool, makeFilter(probePool, probeContext), true);
   for (int32_t doc = 0; doc < nDocs; doc += 7) {
     EXPECT_EQ(probe.acceptsProbe(doc), expected(doc)) << "doc=" << doc;
   }
@@ -532,7 +552,7 @@ namespace {
 
 #ifndef NDEBUG
 thread_local int64_t verifications = 0;
-void countVerification(int32_t) { verifications++; }
+void countVerification(const NumericPredicateQuery&, int32_t) { verifications++; }
 #endif
 
 // Docs the zone-map scorer verifies value by value for [lo, hi], or -1
