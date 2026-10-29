@@ -3,10 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFFlat.h>
+
 #include <array>
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <format>
 #include <map>
 #include <memory>
 #include <random>
@@ -1823,6 +1827,44 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
   req->done();
 }
 
+// A boolean filter around a kNN clause is materialized per segment during
+// prepare, concurrently for a parallel request; the result must match the
+// serial run.
+TEST_F(KnnQueryTest, booleanFilterDomainsParallelMatchesSerial) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int seg = 0; seg < 4; seg++) {
+    for (int i = 0; i < 20; i++) {
+      int n = seg * 20 + i;
+      h.index(flatdoc("id", std::to_string(n), "foo_w", n % 3 == 0 ? "apple" : "pear",
+                      "embedding_v", std::vector<float>{(float)n, 0.0f, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  std::vector<std::string> dels{"21", "42"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  auto run = [&](bool parallel) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().limit(10).countLimit().fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::knn(cur.mr(), "embedding_v", {40.2f, 0.0f, 0.0f, 0.0f}, 6)},
+        /*optional=*/{}, /*prohibited=*/{},
+        /*filter=*/{qb::match(cur.mr(), "foo_w", "apple")});
+    req->execute(parallel);
+    auto out = std::make_pair(resultIds(*req), resultScores(*req));
+    req->done();
+    return out;
+  };
+  auto serial = run(false);
+  auto parallel = run(true);
+  ASSERT_EQ(serial.first.size(), 6u);
+  EXPECT_EQ(serial.first, parallel.first);
+  EXPECT_EQ(serial.second, parallel.second);
+  for (const auto& id : serial.first) EXPECT_EQ(std::stoi(id) % 3, 0) << id;
+}
+
 // Unfiltered queries on a segment with deletes use the rank-space liveness
 // bitmap as the whole FAISS selector, built ONCE per liveDocs generation and
 // cached on the aux reader: a second query must not rebuild it, and a commit
@@ -1872,19 +1914,131 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
     for (const auto& id : ids) EXPECT_NE(id, deletedId);
   };
 
+  auto walks = []() { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
   int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks0 = walks();
   runAndCheck("d40");
   int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks1 = walks();
   EXPECT_EQ(builds1, builds0 + 1) << "first query builds the bitmap";
+  EXPECT_GT(walks1, walks0) << "first query counts its lists' live sizes";
   runAndCheck("d40");
   int64_t builds2 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds2, builds1) << "second query must reuse the cached bitmap";
+  EXPECT_EQ(walks(), walks1) << "second query must reuse the memoized list counts";
 
   std::vector<std::string> dels2{"d41"};
   h.deleteByIds(dels2, UpdateMessage::COMMIT);
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+  EXPECT_GT(walks(), walks1) << "new liveGen must recount list sizes";
+}
+
+// Memoized per-list live counts are per delete generation: each delete commit
+// must recount, a repeat query must not, and a commit that empties almost every
+// list must still give exact results (empty lists memoize as 0).
+TEST_F(KnnQueryTest, ivfDeletesRecountListsPerGeneration) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  auto walks = []() { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
+  auto check = [&](const std::vector<std::string>& want) {
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                           /*nprobe=*/0, /*refineCandidates=*/200,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    EXPECT_EQ(ids, want);
+  };
+
+  check({"d40", "d41", "d39", "d42", "d38"});
+  std::vector<std::string> first10;
+  for (int i = 0; i < 10; i++) first10.push_back("d" + std::to_string(i));
+  h.deleteByIds(first10, UpdateMessage::COMMIT);
+  int64_t w1 = walks();
+  check({"d40", "d41", "d39", "d42", "d38"});
+  int64_t w2 = walks();
+  EXPECT_GT(w2, w1) << "a new delete generation must recount";
+  check({"d40", "d41", "d39", "d42", "d38"});
+  EXPECT_EQ(walks(), w2) << "a repeat query at the same generation must not recount";
+
+  std::vector<std::string> most;
+  for (int i = 10; i < 155; i++) most.push_back("d" + std::to_string(i));
+  h.deleteByIds(most, UpdateMessage::COMMIT);
+  check({"d155", "d156", "d157", "d158", "d159"});
+  check({"d155", "d156", "d157", "d158", "d159"});
+}
+
+// Eligible bitmaps are copied per segment only once something of it is
+// pooled: with several IVF segments that have deletes but no hits in the
+// result, a deepening query must give exact results and copy at most the
+// segments it actually pooled into.  The multi-vector "z" doc fills the pool
+// with its own ranks, which forces the deepen.
+TEST_F(KnnQueryTest, ivfDeepenCopiesEligibleOnlyForPooledSegments) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  std::vector<std::vector<float>> zvecs;
+  for (int i = 0; i < 40; i++) zvecs.push_back({(float)i * 0.001f, 0, 0, 0});
+  h.index(flatdoc("id", std::string("z"), "emb_vs", zvecs));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("del"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0, 0}, {0.6f, 0, 0, 0}}));
+  for (int i = 0; i < 155; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{50.0f + (float)i, 0, 0, 0}}));
+  }
+  h.commit({"*"});
+  for (int seg = 0; seg < 5; seg++) {
+    for (int i = 0; i < 160; i++) {
+      float x = 1000.0f * (float)(seg + 1) + (float)i;
+      h.index(flatdoc("id", std::format("far{}_{}", seg, i),
+                      "emb_vs", std::vector<std::vector<float>>{{x, 0, 0, 0}}));
+    }
+    h.commit({"*"});
+  }
+  std::vector<std::string> dels{"del"};
+  for (int seg = 0; seg < 5; seg++) dels.push_back(std::format("far{}_7", seg));
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 6u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr);
+  }
+
+  int64_t copies0 = KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed);
+  int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                         /*nprobe=*/0, /*refineCandidates=*/8,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  auto ids = resultIds(*req);
+  req->done();
+  EXPECT_GT(KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed), folds0)
+      << "query never deepened; fold path unexercised";
+  EXPECT_EQ(KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed) - copies0, 1)
+      << "every segment copied its eligible bits, not just the pooled ones";
+
+  auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                           /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids, exactIds);
+  EXPECT_EQ(ids, (std::vector<std::string>{"z", "b", "c", "d"}));
 }
 
 // Filtered query on an IVF segment with deletes: the domain is filter
@@ -2536,9 +2690,23 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
       ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
           << "segment fell back to flat (below IVF training floor)";
     }
-    std::vector<std::string> dels{"del"};
+    // A far IVF segment with deletes the query never pools from: the fold
+    // must borrow its cached liveness bitmap instead of copying it.
+    for (int i = 0; i < 160; i++) {
+      h.index(flatdoc("id", "far" + std::to_string(i), "emb_vs",
+                      std::vector<std::vector<float>>{{1000.0f + (float)i, 0, 0, 0}}));
+    }
+    h.commit({"*"});
+    std::vector<std::string> dels{"del", "far7"};
     h.deleteByIds(dels, UpdateMessage::COMMIT);
+    {
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(reader->segments().size(), 2u);
+      ASSERT_NE(reader->segments()[1].getAuxReader("vec.emb_vs"), nullptr);
+      ASSERT_NE(reader->segments()[1].liveDocs(), nullptr);
+    }
 
+    int64_t copies0 = KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed);
     int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
     int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
     auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
@@ -2555,6 +2723,8 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     // look right, because markSeen dedups - this counter is the tripwire).
     int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
     EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
+    EXPECT_EQ(KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed), copies0 + 1)
+        << "only the pooled-into segment needs a private eligible copy";
 
     auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
                              /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
@@ -3105,5 +3275,131 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     EXPECT_NE(a.hash(), b.hash());
     EXPECT_TRUE(a.equals(c));
     EXPECT_EQ(a.hash(), c.hash());
+  }
+}
+
+// All-exact compositions hand the similarity floor to the column scans,
+// which drop below-floor rows up front; the result must equal the
+// unfloored top k filtered by the floor, scores included.
+TEST_F(KnnQueryTest, exactSimilarityFloorMatchesPostFilter) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 10; i++) {
+      h.index(flatdoc("id", std::format("s{}d{}", seg, i), "embedding_v",
+                      std::vector<float>{(float)i + 0.5f * (float)seg, 0.0f, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  std::vector<std::string> dels{"s0d1"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  auto run = [&](std::optional<float> similarity, bool exact) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {0.2f, 0, 0, 0}, 6,
+                             0, exact, 0, 0, similarity);
+    req->execute();
+    auto out = std::make_pair(resultIds(*req), resultScores(*req));
+    req->done();
+    return out;
+  };
+  for (bool exact : {false, true}) {
+    for (float similarity : {0.1f, 2.4f, 100.0f}) {
+      auto [allIds, allScores] = run(std::nullopt, exact);
+      ASSERT_EQ(allIds.size(), 6u);
+      float floor = 1.0f / (1.0f + similarity * similarity);
+      std::vector<std::string> wantIds;
+      std::vector<float> wantScores;
+      for (size_t i = 0; i < allIds.size(); i++) {
+        if (allScores[i] >= floor) {
+          wantIds.push_back(allIds[i]);
+          wantScores.push_back(allScores[i]);
+        }
+      }
+      auto [ids, scores] = run(similarity, exact);
+      EXPECT_EQ(ids, wantIds) << "similarity " << similarity;
+      EXPECT_EQ(scores, wantScores) << "similarity " << similarity;
+    }
+  }
+}
+
+// The flat docs scan applies the floor at its heap: with the floor between
+// every pair of neighboring scores (0 to all docs above it, around the
+// slot's candidate count), hits equal the post-filtered top k and the
+// above-floor exhaustion ends the query in one round.
+TEST_F(KnnQueryTest, exactSimilarityFloorAtEveryCut) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int i = 0; i < 12; i++) {
+    h.index(flatdoc("id", std::format("d{}", i), "embedding_v",
+                    std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit();
+  for (int above = 0; above <= 12; above++) {
+    // L2 distance i from the query at 0; the floor admits d0..d{above-1}.
+    float similarity = (float)above - 0.5f;
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {0, 0, 0, 0}, 6,
+                             0, false, 0, 0, std::optional<float>(std::max(similarity, 0.0f)));
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    std::vector<std::string> want;
+    for (int i = 0; i < std::min(above, 6); i++) want.push_back(std::format("d{}", i));
+    if (above == 0) want = {"d0"};  // similarity 0 admits the exact match
+    EXPECT_EQ(ids, want) << above;
+    EXPECT_EQ(stats.rounds.load(), 1) << above;
+  }
+}
+
+// The lazy coarse ranking must reproduce FAISS's full k = nlist quantizer
+// search exactly (distances and order, ties included), however far it has
+// been advanced.  Duplicate centroids force exact distance ties on both
+// FAISS result paths (heap below 100 lists, reservoir above).
+TEST(KnnCoarseRanking, lazyRankingMatchesFullQuantizerSearch) {
+  constexpr int d = 8;
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
+    for (int nlist : {1, 50, 300}) {
+      faiss::IndexFlat quantizer(d, metric);
+      std::vector<float> centroids;
+      for (int j = 0; j < nlist; j++) {
+        if (j % 3 == 2) {
+          // Duplicate the previous centroid.
+          std::vector<float> prev(centroids.end() - d, centroids.end());
+          centroids.insert(centroids.end(), prev.begin(), prev.end());
+        } else {
+          for (int c = 0; c < d; c++) centroids.push_back(uni(rng));
+        }
+      }
+      quantizer.add(nlist, centroids.data());
+      faiss::IndexIVFFlat ivf(&quantizer, d, (size_t)nlist, metric);
+      for (int q = 0; q < 5; q++) {
+        std::vector<float> query(d);
+        for (auto& x : query) x = uni(rng);
+        std::vector<faiss::idx_t> ids((size_t)nlist);
+        std::vector<float> dists((size_t)nlist);
+        quantizer.search(1, query.data(), nlist, dists.data(), ids.data());
+        auto ranking = KnnQuery::rankCentroids(ivf, query.data());
+        ASSERT_EQ(ranking.ranked, 0u) << "a flat quantizer ranks lazily";
+        ASSERT_EQ(ranking.entries.size(), (size_t)nlist);
+        // Advance one entry at a time, the way the allocator's cursor does.
+        for (size_t i = 0; i < (size_t)nlist; i++) {
+          ranking.rankThrough(i + 1);
+          ASSERT_EQ(ranking.entries[i].listId, ids[i])
+              << "metric " << (int)metric << " nlist " << nlist << " rank " << i;
+          ASSERT_EQ(std::bit_cast<uint32_t>(ranking.entries[i].dist),
+                    std::bit_cast<uint32_t>(dists[i]));
+        }
+      }
+    }
   }
 }

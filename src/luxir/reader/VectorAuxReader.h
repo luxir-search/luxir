@@ -14,6 +14,7 @@
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -270,6 +271,20 @@ struct RankLiveBitmap {
   size_t numBytes;
   int64_t liveVectors;
   std::shared_ptr<const void> backing;
+  // Per-IVF-list live vector counts for this liveGen, memoized on first use
+  // (-1 = not yet counted) so the global list allocator walks a list's ids
+  // at most once per delete generation instead of once per query.  The
+  // value is a pure function of immutable data, so concurrent queries may
+  // race to store the same count; relaxed atomics suffice.  numLists is 0
+  // for a flat (non-IVF) overlay.
+  size_t numLists = 0;
+  std::unique_ptr<std::atomic<int64_t>[]> listLive;
+
+  void initListLive(size_t nlist) {
+    numLists = nlist;
+    listLive = std::make_unique<std::atomic<int64_t>[]>(nlist);
+    for (size_t i = 0; i < nlist; i++) listLive[i].store(-1, std::memory_order_relaxed);
+  }
 };
 
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
@@ -303,7 +318,8 @@ class VectorAuxReader : public AuxReader {
   // FAISS eligibility selector for unfiltered queries and the allocator's
   // live-list accounting both read the bits instead of resolving rank ->
   // doc -> liveDocs per scanned vector, and its cardinality is the
-  // segment's exact live vector count.  Keyed by liveGen, so a reader
+  // segment's exact live vector count.  Per-list live counts are memoized
+  // on the same object, so they too are computed once per liveGen.  Keyed by liveGen, so a reader
   // version with newer deletes rebuilds.
   mutable std::mutex rankLiveMutex;
   mutable uint64_t rankLiveGen = 0;

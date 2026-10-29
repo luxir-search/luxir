@@ -323,11 +323,18 @@ For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan
 fraction is reached. List cost is based on that list's live vector count
 divided by the field's live vector count. This handles uneven list sizes and
-avoids applying equal work to every segment. For an IVF segment with deletions
+avoids applying equal work to every segment. Each segment's centroid distances
+are computed in full, but ordered lazily: the ranking is extended by
+partial selection only as far as the allocator's cursor reaches, in the same
+total order (distance, then list id) a full FAISS quantizer search produces.
+For an IVF segment with deletions
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
+simply borrows the liveDocs bits). Per-list live counts are memoized on the
+same cached bitmap: the first query to price a list under a given delete
+generation counts its ids against the bitmap, later queries reuse the count.
+Flat-scanned segments with deletions use a
 cheap upper bound instead (exact counting there would scan the field per
 query); the bound only errs toward slightly leaner initial effort, which
 auto-deepening recovers.
@@ -344,10 +351,19 @@ copies of the segments' liveness bitmaps (all-ones where a segment has no
 deletions) and handed to the scanners as an eligibility filter, so each
 round's result heap is spent entirely on new candidates and each round
 requests only the projected shortfall rather than re-requesting the whole
-pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
+pool. Copies are made only for segments that have pooled candidates;
+the others scan against the shared liveness bitmap (or with no filter at all
+when they have no deletions). The shared per-segment liveness cache itself is
+never modified by queries. Once widening finishes, the final candidate pool is rescanned from
 the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+document. A `similarity` threshold is applied to those exact scores. When every
+segment is scanned exactly from the column, the threshold is also handed to
+the scans, which return only above-threshold rows and report exhaustion over
+them (a document-mode scan keeps one extra heap slot to tell whether more
+than its cut clear the threshold, so its per-row loop is unchanged); with
+any approximate segment it is applied only after rescoring, since
+approximate scores do not bound the exact ones and a smaller pool would
+change the deepening decisions.
 
 ## Parallel Execution
 

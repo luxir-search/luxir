@@ -4,6 +4,7 @@
 #pragma once
 
 #include <faiss/Index.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/IndexIVF.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/MetricType.h>
@@ -138,6 +139,93 @@ class KnnQuery final : public luxir::Query {
   }
 
 public:
+  /// One IVF list in a segment's centroid ranking.
+  struct CoarseEntry {
+    float dist;
+    faiss::idx_t listId;
+  };
+
+  /// A segment's query-to-centroid ranking, ordered lazily: entries[0,
+  /// ranked) are final, the rest are unordered.  The order is the total
+  /// order FAISS's flat-quantizer search with k = nlist produces (heap
+  /// reorder on (distance, id)): ascending (dist, listId) for L2,
+  /// descending (dist, listId) for inner product.  It is total, so the
+  /// prefix is the same however far ranking has advanced, and the lazy
+  /// selection is bit-identical to a full sort.
+  struct CoarseRanking {
+    std::vector<CoarseEntry> entries;
+    size_t ranked = 0;
+    bool similarity = false;
+
+    bool before(const CoarseEntry& a, const CoarseEntry& b) const noexcept {
+      if (a.dist != b.dist) return similarity ? a.dist > b.dist : a.dist < b.dist;
+      return similarity ? a.listId > b.listId : a.listId < b.listId;
+    }
+
+    /// Make entries[0, need) final.  Each extension at least doubles the
+    /// ranked prefix (nth_element on the rest, then sort the new chunk), so
+    /// a query that consumes r of n lists pays O(n log(r) + r log r)
+    /// instead of a full O(n log n) sort.
+    void rankThrough(size_t need) {
+      if (need <= ranked) return;
+      size_t n = entries.size();
+      size_t end = std::min(n, std::max(need, ranked + std::max(ranked, (size_t)32)));
+      auto cmp = [this](const CoarseEntry& a, const CoarseEntry& b) { return before(a, b); };
+      auto first = entries.begin() + (std::ptrdiff_t)ranked;
+      auto last = entries.begin() + (std::ptrdiff_t)end;
+      if (end < n) std::nth_element(first, last, entries.end(), cmp);
+      std::sort(first, last, cmp);
+      ranked = end;
+    }
+  };
+
+  /// FAISS's flat search takes a separate (BLAS) distance path for very
+  /// large databases (faiss::knn_L2sqr's database-parallel mode, at 10000+
+  /// vectors); at or above this many lists rankCentroids defers to the
+  /// quantizer's own full search so the distances stay bit-identical.
+  static constexpr int64_t LAZY_COARSE_MAX_LISTS = 10000;
+
+  /// Rank every IVF list of `ivf` for `query` (already in index space).
+  /// For a flat L2 / inner-product quantizer (what the builder makes),
+  /// computes each centroid distance with the same kernels FAISS's
+  /// sequential flat search uses and leaves the order to rankThrough();
+  /// lists FAISS's heap would never admit (non-finite or NaN distances)
+  /// are dropped.  Any other quantizer uses one fully ranked search.
+  static CoarseRanking rankCentroids(const faiss::IndexIVF& ivf, const float* query) {
+    CoarseRanking out;
+    out.similarity = faiss::is_similarity_metric(ivf.metric_type);
+    auto* flat = dynamic_cast<const faiss::IndexFlat*>(ivf.quantizer);
+    size_t nlist = ivf.nlist;
+    size_t d = (size_t)ivf.d;
+    bool lazy = flat != nullptr && (size_t)flat->ntotal == nlist
+      && (int64_t)nlist < LAZY_COARSE_MAX_LISTS
+      && (flat->metric_type == faiss::METRIC_L2 || flat->metric_type == faiss::METRIC_INNER_PRODUCT);
+    if (lazy) {
+      const float* xb = flat->get_xb();
+      out.entries.reserve(nlist);
+      for (size_t j = 0; j < nlist; j++) {
+        const float* c = xb + j * d;
+        if (out.similarity) {
+          float ip = faiss::fvec_inner_product(query, c, d);
+          if (ip > std::numeric_limits<float>::lowest()) out.entries.push_back({ip, (faiss::idx_t)j});
+        } else {
+          float l2 = faiss::fvec_L2sqr(query, c, d);
+          if (l2 < std::numeric_limits<float>::max()) out.entries.push_back({l2, (faiss::idx_t)j});
+        }
+      }
+      return out;
+    }
+    std::vector<faiss::idx_t> ids(nlist, (faiss::idx_t)-1);
+    std::vector<float> dists(nlist, 0.0f);
+    ivf.quantizer->search(1, query, (faiss::idx_t)nlist, dists.data(), ids.data());
+    out.entries.reserve(nlist);
+    for (size_t j = 0; j < nlist; j++) {
+      if (ids[j] >= 0) out.entries.push_back({dists[j], ids[j]});
+    }
+    out.ranked = out.entries.size();
+    return out;
+  }
+
   /// One result hit within a segment.  docId is the local docRank within the
   /// segment; score is converted to "higher is better" regardless of vector
   /// metric (see scoreFromDist).
@@ -245,7 +333,12 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  // Number of IVF list id walks liveListSize() performed (memo misses).
+  static inline std::atomic<int64_t> listLiveCountsForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
+  // Per-query writable eligible-bitmap copies made by the widen loop (one
+  // per segment that had something pooled after the fold).
+  static inline std::atomic<int64_t> eligibleCopiesForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
   // broke and deepen rounds silently regressed to re-returning the pool.
@@ -800,7 +893,7 @@ public:
               // segment's EXACT live vector count.
               rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(
                 seg.segInfo.live_gen, [&]() {
-                  return buildRankLiveBitmap(seg, vr, segCount);
+                  return buildRankLiveBitmap(seg, vr, segCount, vauxPerSeg[i]->getNList());
                 });
               segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
             } else {
@@ -1002,84 +1095,99 @@ public:
       // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
       // common only round) uses the small seenVectors hash set and passes no
       // eligible bitmaps.  The FIRST deepen of either axis folds the seen set
-      // into per-segment rank-space "eligible" bitmaps (init: the segment's
-      // cached rank-live bitmap when it has one, else all-ones; pooled ranks
+      // into per-segment rank-space "eligible" bitmaps (the segment's cached
+      // rank-live bitmap when it has one, else all-ones; pooled ranks
       // cleared), which then serve double duty: the host's dedup structure
       // (O(1) bit test instead of a hash probe, and bounded at numVectors/8
       // bytes where the hash set would grow toward the candidate cap), and
       // the engines' NOT-pooled exclusion filter via request.eligible - so
       // every post-fold round spends its whole result heap on fresh hits
       // (the resumable cursor FAISS does not provide), and kReq switches
-      // from cumulative pool depth to a per-round fresh budget.  A segment
-      // with no liveness seed gets its span only once something of its is
-      // pooled (markSeen activates it), so untouched no-delete segments
-      // keep FAISS's compiled-out no-selector fast path.  Fold cost is
-      // O(ntotal/8 + seen), paid only by queries that deepen.
+      // from cumulative pool depth to a per-round fresh budget.  Copies are
+      // made lazily, per segment, only once something of that segment is
+      // pooled (ownEligible): an untouched segment with a liveness seed
+      // borrows the shared cached bitmap read-only (its eligible set IS the
+      // live set), and an untouched no-delete segment gets no span at all,
+      // keeping FAISS's compiled-out no-selector fast path.  Fold cost is
+      // O(bytes of pooled-into segments + seen), paid only by queries that
+      // deepen.
       std::vector<std::vector<uint8_t>> eligibleStore;
       std::vector<std::span<const uint8_t>> eligibleSpans;
       bool seenFolded = false;
+      // The segment's private, writable eligible copy, seeded from what its
+      // span showed so far (the borrowed liveness bits, or all-ones).
+      auto ownEligible = [&](size_t seg) -> std::vector<uint8_t>& {
+        auto& bits = eligibleStore[seg];
+        if (bits.empty()) {
+          eligibleCopiesForTests.fetch_add(1, std::memory_order_relaxed);
+          if (rankLivePerSeg[seg] != nullptr) {
+            size_t numBytes = ((size_t)segVectorCounts[seg] + 7) / 8;
+            assert(rankLivePerSeg[seg]->numBytes == numBytes);
+            bits.assign(rankLivePerSeg[seg]->bits, rankLivePerSeg[seg]->bits + numBytes);
+          } else {
+            // No cached liveness (no deletes, or a flat slot): not-pooled
+            // only.  Flat engines filter the domain themselves, so for them
+            // the bit means just "not pooled yet" - same dedup semantics.
+            fillAllRanksSet(bits, segVectorCounts[seg]);
+          }
+          eligibleSpans[seg] = bits;
+        }
+        return bits;
+      };
       auto foldSeen = [&]() {
         if (seenFolded) return;
         seenFolded = true;
         seenFoldsForTests.fetch_add(1, std::memory_order_relaxed);
         eligibleStore.resize(numSegs);
         eligibleSpans.assign(numSegs, {});
-        std::vector<char> cleared(numSegs, 0);
         for (size_t i = 0; i < numSegs; i++) {
-          int64_t n = segVectorCounts[i];
-          if (n <= 0) continue;
-          auto& bits = eligibleStore[i];
-          if (rankLivePerSeg[i] != nullptr) {
-            size_t numBytes = ((size_t)n + 7) / 8;
-            assert(rankLivePerSeg[i]->numBytes == numBytes);
-            bits.assign(rankLivePerSeg[i]->bits, rankLivePerSeg[i]->bits + numBytes);
-          } else {
-            // No cached liveness (no deletes, or a flat slot): not-pooled
-            // only.  Flat engines filter the domain themselves, so for them
-            // the bit means just "not pooled yet" - same dedup semantics.
-            fillAllRanksSet(bits, n);
+          if (segVectorCounts[i] > 0 && rankLivePerSeg[i] != nullptr) {
+            eligibleSpans[i] = std::span<const uint8_t>(
+              rankLivePerSeg[i]->bits, rankLivePerSeg[i]->numBytes);
           }
         }
         for (uint64_t key : seenVectors) {
           size_t seg = (size_t)(key >> PACK_RANK_BITS);
           uint64_t r = key & (((uint64_t)1 << PACK_RANK_BITS) - 1);
-          eligibleStore[seg][(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
-          cleared[seg] = 1;
-        }
-        // Hand engines a span only where it can exclude something: a
-        // liveness seed or at least one pooled rank. An all-ones span would
-        // demote a selector-free scan to a per-vector always-true probe.
-        for (size_t i = 0; i < numSegs; i++) {
-          if (!eligibleStore[i].empty()
-              && (rankLivePerSeg[i] != nullptr || cleared[i])) {
-            eligibleSpans[i] = eligibleStore[i];
-          }
+          ownEligible(seg)[(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
         }
         seenVectors = boost::unordered_flat_set<uint64_t>{};
       };
       // Mark a hit seen; true if it was fresh.  Post-fold every engine
       // returns only fresh hits (eligible is binding), so a stale hit here
       // means a broken engine/selector wiring - counted for tests.  The
-      // first pooled rank of a span-less segment activates its span for the
-      // next round.
+      // first pooled rank of a segment gives it its own copy (and, for a
+      // span-less segment, activates its span for the next round).
       auto markSeen = [&](int32_t segOrd, int64_t valueRank) -> bool {
         if (!seenFolded) {
           return seenVectors.insert(packSegRank(segOrd, valueRank)).second;
         }
-        auto& bits = eligibleStore[(size_t)segOrd];
+        auto& bits = ownEligible((size_t)segOrd);
         size_t byteIdx = (size_t)(valueRank >> 3);
         uint8_t mask = (uint8_t)(1u << (valueRank & 7));
         bool fresh = (bits[byteIdx] & mask) != 0;
         bits[byteIdx] &= (uint8_t)~mask;
         if (!fresh) {
           staleHitsForTests.fetch_add(1, std::memory_order_relaxed);
-        } else if (eligibleSpans[(size_t)segOrd].empty()) {
-          eligibleSpans[(size_t)segOrd] = bits;
         }
         return fresh;
       };
 
       bool candidatesExhausted = true;
+
+      // With every engine exact, the terminal similarity filter sees the
+      // engines' own scores, so they can drop below-floor hits up front.
+      // The widen loop's decisions are unchanged: an all-exact pool fills
+      // k above-floor docs or every engine reports its above-floor hits
+      // exhausted, and either way the loop ends on the same final set.
+      // Approximate scores carry unbounded (PQ) or only probabilistically
+      // bounded (RaBitQ) error, and in mixed compositions the floor would
+      // shrink the pooled doc count that drives deepening, so neither is
+      // bounded.
+      std::optional<float> exactScoreFloor;
+      if (!approximateEngine && query.getSimilarity().has_value()) {
+        exactScoreFloor = query.similarityScoreFloor();
+      }
 
       // WIDEN loop: pool candidates until targetDocReq distinct live docs (or
       // a pool/breadth/cap limit).  Two deepen axes, tried in order:
@@ -1104,6 +1212,7 @@ public:
           .minScanFraction = query.getMinScanFraction(),
           .eligible = std::span<const std::span<const uint8_t>>(eligibleSpans),
           .perKey = perKey,
+          .minScore = exactScoreFloor,
         };
         VectorSearchResult result = engine->search(request);
         if (statsForTests) statsForTests->rounds++;
@@ -1294,7 +1403,7 @@ public:
     /// selector and by the host after collapse.
     ///
     /// IVF indexes do not drive themselves: the CompositeVectorEngine's global
-    /// allocator calls coarseRun() (full sorted centroid ranking) and
+    /// allocator calls coarseRun() (lazily ordered centroid ranking) and
     /// liveListSize() to pick lists across ALL segments, then hands the chosen
     /// lists back through searchSelectedLists().  The plain search() override
     /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
@@ -1501,24 +1610,21 @@ public:
 
       int32_t getNList() const noexcept { return nlist; }
 
-      void coarseRun(int32_t dims,
-                     std::vector<faiss::idx_t>& listIds,
-                     std::vector<float>& centroidDists) const {
+      CoarseRanking coarseRun(int32_t dims) const {
         assert(ivf != nullptr);
         assert(dims == index.d);
         unused(dims);
-        listIds.assign((size_t)nlist, (faiss::idx_t)-1);
-        centroidDists.assign((size_t)nlist, 0.0f);
         // The rotation is orthonormal, so these distances compare directly
         // with other segments' (rotated or not) in the global list ranking.
-        ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
+        return rankCentroids(*ivf, preparedQuery.query);
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
       /// charges against the scan-fraction budget (cost = liveListSize / N).
       /// Uses the ACTUAL invlist length so list imbalance prices correctly
-      /// (full selection always sums to ~N).  Under deletes this reads the
-      /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
+      /// (full selection always sums to ~N).  Under deletes this counts the
+      /// cached rank-space liveness bitmap per id (no rank -> doc resolve)
+      /// once per list and liveGen, memoized on the shared RankLiveBitmap;
       /// liveness only (not the query domain), matching the live-N
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId) const {
@@ -1528,6 +1634,13 @@ public:
         if (rawSize == 0) return 0;
         if (liveDocs == nullptr) return (int64_t)rawSize;
 
+        std::atomic<int64_t>* memo = (size_t)listId < rankLive->numLists
+          ? &rankLive->listLive[(size_t)listId] : nullptr;
+        if (memo != nullptr) {
+          int64_t cached = memo->load(std::memory_order_relaxed);
+          if (cached >= 0) return cached;
+        }
+        listLiveCountsForTests.fetch_add(1, std::memory_order_relaxed);
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
         const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
@@ -1536,6 +1649,7 @@ public:
           liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
         ivf->invlists->release_ids((size_t)listId, listIds);
+        if (memo != nullptr) memo->store(liveSize, std::memory_order_relaxed);
         return liveSize;
       }
 
@@ -1592,8 +1706,12 @@ public:
           return result;
         }
 
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
+        // FAISS output scratch from the thread-local pool, reused by every
+        // chunk task of every round instead of fresh (filled) vectors.
+        // FAISS initializes all k slots (padding with -1) itself.
+        auto scratchGuard = MemPool::threadLocalPoolGuard();
+        auto ids = scratchGuard.pool().make_span<faiss::idx_t>((size_t)request.candidates);
+        auto dists = scratchGuard.pool().make_span<float>((size_t)request.candidates);
 
         // Local stats sink, discarded: with a null stats argument FAISS does
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
@@ -1666,8 +1784,12 @@ public:
           return result;
         }
 
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
+        // FAISS output scratch from the thread-local pool, reused by every
+        // chunk task of every round instead of fresh (filled) vectors.
+        // FAISS initializes all k slots (padding with -1) itself.
+        auto scratchGuard = MemPool::threadLocalPoolGuard();
+        auto ids = scratchGuard.pool().make_span<faiss::idx_t>((size_t)request.candidates);
+        auto dists = scratchGuard.pool().make_span<float>((size_t)request.candidates);
 
         RoundSelector roundSel(*this, request);
         faiss::SearchParameters flatParams;
@@ -1739,9 +1861,20 @@ public:
           return result;
         }
 
-        BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
+        // Exact scores: a below-floor doc can never survive the host's
+        // similarity filter.  Docs mode keeps the plain per-doc scan (a
+        // floor test there cost single-valued scans ~4%) and applies the
+        // floor to the heap instead: one extra slot tells whether more than
+        // request.candidates docs clear the floor.  Exact scores are never
+        // NaN (finiteScore), so the floor cut is a prefix of the ranking.
+        bool docFloor = !Groups && request.minScore.has_value();
+        BoundedHits<Groups, VectorEngineHit, betterHit> heap(
+            request.candidates + (docFloor ? 1 : 0), groupPlan, groupV2d);
         int64_t eligibleDocs = 0;
         int64_t scanned = 0;
+        auto belowFloor = [&request](const VectorEngineHit& hit) LUXIR_INLINE {
+          return request.minScore.has_value() && hit.score < *request.minScore;
+        };
         if (segInfo == nullptr) {
           result.poolExhausted = true;
           return result;
@@ -1858,7 +1991,7 @@ public:
           keys.withKeyWalk(segOrd, domain, [&](auto keyAt) {
             scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
               auto hit = makeHit();
-              if (!heap.competitive(hit)) return;
+              if (belowFloor(hit) || !heap.competitive(hit)) return;
               const auto* key = keyAt(doc);
               if (key != nullptr) heap.offerKey(hit, *key, doc);
             });
@@ -1876,7 +2009,15 @@ public:
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         if constexpr (Groups) result.poolExhausted = !heap.truncated;
-        else result.poolExhausted = eligibleDocs <= request.candidates;
+        else if (docFloor) {
+          // Above-floor docs <= candidates iff the (candidates + 1)-th best
+          // eligible doc is missing or below the floor.
+          size_t cut = (size_t)request.candidates;
+          result.poolExhausted = result.hits.size() <= cut || belowFloor(result.hits[cut]);
+          size_t above = 0;
+          while (above < result.hits.size() && above < cut && !belowFloor(result.hits[above])) above++;
+          result.hits.resize(above);
+        } else result.poolExhausted = eligibleDocs <= request.candidates;
         return result;
       }
 
@@ -1930,11 +2071,6 @@ public:
       int32_t metric;
       bool parallel;
 
-      struct CoarseRun {
-        std::vector<faiss::idx_t> listIds;
-        std::vector<float> centroidDists;
-      };
-
       struct CoarseHead {
         float score = 0.0f;
         int32_t slotOrd = -1;
@@ -1950,9 +2086,10 @@ public:
       };
 
       // Coarse-selection state, persisted across deepen rounds (this IS the
-      // resumable breadth state).  Per slot: runs holds the full sorted
-      // (listId, centroidDist) ranking from coarseRun(); cursors[i] is the
-      // k-way-merge position into it.  heads/heapIndexes/heapSize back the
+      // resumable breadth state).  Per slot: runs holds the lazily ordered
+      // (listId, centroidDist) ranking from coarseRun(), ranked only as far
+      // as the cursor has reached; cursors[i] is the k-way-merge position
+      // into it.  heads/heapIndexes/heapSize back the
       // IndexedPQ of each slot's current head, keyed by centroid score -
       // updateTop() (replace-top) advances a slot in one sift, the same heap
       // discipline the doc collectors use.  selected* accumulate the
@@ -1960,7 +2097,7 @@ public:
       // selectedListLiveSizes stay 1:1 with selectedListIds because
       // search_preassigned consumes the first pair positionally and the
       // scan-task chunker prices ranges off the third.
-      std::vector<CoarseRun> runs;
+      std::vector<CoarseRanking> runs;
       std::vector<size_t> cursors;
       std::vector<CoarseHead> heads;
       std::vector<int32_t> heapIndexes;
@@ -1977,6 +2114,10 @@ public:
       // since post-fold they are per-round fresh budgets and may repeat or
       // shrink between rounds.
       std::vector<size_t> scannedListCount;
+      // The current round's scan worklist, kept to reuse its capacity
+      // across deepen rounds.
+      struct ScanUnit;
+      std::vector<ScanUnit> units;
       int32_t lastScannedBreadth = -1;
       double allocatedCost = 0.0;
       int32_t referenceBreadth = 1;
@@ -1999,15 +2140,20 @@ public:
       }
 
       CoarseHead makeHead(int32_t slotOrd) const {
-        const auto& run = runs[(size_t)slotOrd];
-        size_t cursor = cursors[(size_t)slotOrd];
-        faiss::idx_t listId = run.listIds[cursor];
-        float dist = run.centroidDists[cursor];
+        const auto& entry = runs[(size_t)slotOrd].entries[cursors[(size_t)slotOrd]];
         return {
-          .score = scoreFromDist(dist, metric),
+          .score = scoreFromDist(entry.dist, metric),
           .slotOrd = slotOrd,
-          .listId = listId,
+          .listId = entry.listId,
         };
+      }
+
+      // Rank the slot's run through its cursor; false once it is drained.
+      bool cursorValid(size_t slotOrd) {
+        auto& run = runs[slotOrd];
+        if (cursors[slotOrd] >= run.entries.size()) return false;
+        run.rankThrough(cursors[slotOrd] + 1);
+        return true;
       }
 
       void ensureCoarseReady(const VectorSearchRequest& request) {
@@ -2027,11 +2173,8 @@ public:
         for (size_t i = 0; i < slots.size(); i++) {
           auto* ivf = slots[i].ivfEngine;
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
-          ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
-          while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
-            cursors[i]++;
-          }
-          if (cursors[i] >= runs[i].listIds.size()) continue;
+          runs[i] = ivf->coarseRun(request.dims);
+          if (!cursorValid(i)) continue;
           heads[i] = makeHead((int32_t)i);
           heapIndexes.push_back((int32_t)i);
           hasIvfSlots = true;
@@ -2101,18 +2244,14 @@ public:
 
           selectedListIds[(size_t)slotOrd].push_back(listId);
           selectedCentroidDists[(size_t)slotOrd].push_back(
-            runs[(size_t)slotOrd].centroidDists[cursors[(size_t)slotOrd]]);
+            runs[(size_t)slotOrd].entries[cursors[(size_t)slotOrd]].dist);
           selectedListLiveSizes[(size_t)slotOrd].push_back(liveSize);
           if (liveTotalVectors > 0) {
             allocatedCost += (double)liveSize / (double)liveTotalVectors;
           }
 
           cursors[(size_t)slotOrd]++;
-          while (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()
-                 && runs[(size_t)slotOrd].listIds[cursors[(size_t)slotOrd]] < 0) {
-            cursors[(size_t)slotOrd]++;
-          }
-          if (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()) {
+          if (cursorValid((size_t)slotOrd)) {
             head = makeHead(slotOrd);
             pq.updateTop();
           } else {
@@ -2310,7 +2449,7 @@ public:
         // slots for non-IVF engines.  An under-grain remainder folds into the
         // previous chunk rather than becoming a trivial task.  Boundaries do
         // not depend on the execution mode.
-        std::vector<ScanUnit> units;
+        units.clear();
         for (size_t i = 0; i < slots.size(); i++) {
           auto& slot = slots[i];
           if (slot.ivfEngine != nullptr) {
@@ -2492,7 +2631,8 @@ private:
   /// segment's cached live count is the cardinality.
   static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
                                             VectorReader& vr,
-                                            int64_t numVectors) {
+                                            int64_t numVectors,
+                                            int32_t nlist) {
     rankLiveBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
     LiveDocs& live = *seg.liveDocs();
     const screaming::FixedBitSet& liveBits = live.bitset();
@@ -2504,8 +2644,10 @@ private:
       static_assert(std::endian::native == std::endian::little,
                     "liveDocs words double as the LSB-first byte bitmap");
       assert((int64_t)live.size() == numVectors);
-      return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
-              seg.liveDocsShared()};
+      RankLiveBitmap out{(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
+                         seg.liveDocsShared()};
+      out.initListLive((size_t)std::max(0, nlist));
+      return out;
     }
 
     auto owned = std::make_shared<std::vector<uint8_t>>();
@@ -2546,7 +2688,9 @@ private:
       });
     }
     const uint8_t* data = bits.data();
-    return {data, numBytes, numVectors - cleared, std::move(owned)};
+    RankLiveBitmap out{data, numBytes, numVectors - cleared, std::move(owned)};
+    out.initListLive((size_t)std::max(0, nlist));
+    return out;
   }
 
   /// O(1) UPPER BOUND on a segment's live vector count, used as the budget

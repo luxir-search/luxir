@@ -17,6 +17,7 @@
 #include "ScoreCompact.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/util/screaming.h"
+#include "luxir/util/thread.h"
 
 namespace luxir {
 
@@ -12579,7 +12580,7 @@ public:
     std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
 
     if (!filterSources.empty()) {
-      for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
+      auto materializeSegment = [&](size_t segnum) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
         filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
           QueryPrep::preparedSpan(filterSources), ctx.reader,
@@ -12587,7 +12588,18 @@ public:
         filterDomains[segnum] = std::move(filterDomains[segnum])
             .pinnedWith(context.filterUses);
         childDomainPtrs[segnum] = filterDomains[segnum].get();
-      }
+      };
+      // Segments are independent and each task writes only its own slot,
+      // so a parallel request materializes them concurrently with results
+      // identical to the serial loop (the filter cache's per-segment
+      // request slots serialize same-segment work).
+      size_t numSegs = ctx.reader.segments().size();
+      TaskGroupRunner runner;
+      task_group_fanout(ctx.parallel && numSegs > 1 ? runner.group() : nullptr, numSegs,
+          [&](size_t segnum) {
+        return [&materializeSegment, segnum]() { materializeSegment(segnum); };
+      });
+      runner.join();
     } else {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         childDomainPtrs[segnum] = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -60,6 +61,12 @@ struct VectorSearchRequest {
   std::span<const std::span<const uint8_t>> eligible;
   // Group policy only; docs engines ignore it. Exact cuts always use one.
   int64_t perKey = 1;
+  // Optional exact score floor: an engine whose scores are exact may omit
+  // hits scoring below it (NaN included), and then answers poolExhausted
+  // for the above-floor hits only.  The host sets it only when every
+  // engine is exact, so the omitted hits are exactly those its terminal
+  // similarity filter would drop; approximate engines ignore it.
+  std::optional<float> minScore;
 };
 
 /// Candidate from the vector engine seam. score is exact for flat engines;
