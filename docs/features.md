@@ -234,7 +234,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   TEXT matching, prefer a folding variant (`_t`, `_un`, `_wl`); it is faster.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
+  (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
+  `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
+  and Elasticsearch-style `gauss`, `exp`, and `linear` decay functions over
+  numeric, date, and geo values. `rescore` takes an optional `min_score`
   cut-off (the `function_score` / `script_score` counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
