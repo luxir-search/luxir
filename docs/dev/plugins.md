@@ -476,7 +476,7 @@ public:
 };
 
 void registerComponents(luxir::Registries& r) override {
-  r.fieldTypes.add("pair", [](const luxir::PluginParams& params) -> std::unique_ptr<const luxir::PluginFieldType> {
+  r.fieldTypes.add("pair", [](const luxir::ParamReader& params) -> std::unique_ptr<const luxir::PluginFieldType> {
     auto separator = params.getString("separator", ":");  // unread params are refused afterwards
     return std::make_unique<PairType>(/* ... */);
   });
@@ -499,7 +499,7 @@ and defaults do not.
 
 - **Registration.** Names are `[a-z0-9_]+`, not a built-in type name and not `plugin`; a
   duplicate or an add after the freeze throws. The maker reads its params through
-  `PluginParams` (errors name the type and the parameter), and any param it did not read is
+  `ParamReader` (errors name the type and the parameter), and any param it did not read is
   refused after it returns. Makers throw `std::invalid_argument` or `RequestError` with a
   message that teaches; the schema adds the field name.
 - **Derived fields.** `PluginFieldType::fields` declares each `DerivedField`: a `suffix`

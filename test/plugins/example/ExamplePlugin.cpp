@@ -387,12 +387,12 @@ public:
   }
 
   static void registerFieldTypes(Registries& r) {
-    r.fieldTypes.add("pair", [](const PluginParams& params) -> std::unique_ptr<const PluginFieldType> {
+    r.fieldTypes.add("pair", [](const ParamReader& params) -> std::unique_ptr<const PluginFieldType> {
       std::string separator(params.getString("separator", ":"));
       if (separator.empty()) params.fail("separator", "must not be empty");
       return std::make_unique<PairType>(std::move(separator), params.getBool("multi", false));
     });
-    r.fieldTypes.add("spot", [](const PluginParams&) -> std::unique_ptr<const PluginFieldType> {
+    r.fieldTypes.add("spot", [](const ParamReader&) -> std::unique_ptr<const PluginFieldType> {
       return std::make_unique<SpotType>();
     });
   }
