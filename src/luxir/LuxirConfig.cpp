@@ -233,7 +233,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
+                 "Streaming NDJSON: batches decoding or indexing at once per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",

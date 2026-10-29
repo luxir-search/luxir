@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "luxir/index/CommitSnapshotRegistry.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Signal.h"
@@ -235,6 +236,43 @@ TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecover
   ASSERT_TRUE(addSegment(helper, "policy-", 1));
   EXPECT_TRUE(commit(helper, 0, /*waitForMerges=*/true).success);
   EXPECT_FALSE(writer->testMergeRunning());
+}
+
+// A max_segments commit rewrites its own flushes once: the policy merges those
+// flushes would start hold off until the force merge has run.
+TEST_F(ForceMergeTest, policyMergesYieldToPendingForceMerge) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+  std::atomic<int> merges{0};
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    merges++;
+    return nullptr;
+  });
+  auto cleanup = luxir::scope_guard([]() { Signal::unlisten("mergeStart"); });
+
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, schema);
+  iw.mergePolicy->setMergeFactor(2);
+  // Three concurrently busy inverters, released idle: the commit flushes all
+  // three, and any two of them fill a merge level.
+  std::vector<Inverter*> inverters;
+  for (int i = 0; i < 3; i++) {
+    Inverter& inverter = iw.obtainInverter();
+    for (int doc = 0; doc < 10; doc++) {
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(inverter, std::string_view("force merge body"));
+      inverter.finishDoc();
+    }
+    inverters.push_back(&inverter);
+  }
+  for (Inverter* inverter : inverters) iw.releaseInverter(*inverter);
+
+  iw.mergeSegments();
+  EXPECT_EQ(1, merges.load());
+  EXPECT_EQ(1u, readDurableIndexInfo(dir)->segments.size());
+  EXPECT_FALSE(iw.testMergeRunning());
 }
 
 TEST_F(ForceMergeTest, dirtySingletonRewritesAndCleanSingletonStillPublishes) {

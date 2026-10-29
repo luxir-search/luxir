@@ -69,7 +69,7 @@ struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Qu
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
-struct DisMaxQuery;
+struct DisMaxQuery; struct PluginQuery; struct PluginOp;
 struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
@@ -261,6 +261,7 @@ struct AnalyzerDef {                                              // needs Analy
   std::optional<AnalyzerComponent> tokenizer;
   std::span<const AnalyzerComponent> filters;
   std::span<const AnalyzerComponent> char_filters;
+  std::string_view name;
 };
 struct FieldVariants {
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> entries;
@@ -1037,8 +1038,13 @@ struct RangeFacet {                                             // needs Val,Cal
   RangeFacet_::Bounds bounds = RangeFacet_::Bounds::EXPLICIT;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
+struct PluginOp {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+};
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,PluginOp,Domain
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp, PluginOp> kind;
   std::optional<Domain> domain;
   uint64_t flags = 0;
   uint64_t flags_set = 0;
@@ -1080,6 +1086,10 @@ struct Match {
 struct AnyOfQuery {
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> values;
+};
+struct PluginQuery {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
 };
 struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -1153,7 +1163,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, DisMaxQuery>
+               AnyOfQuery, MultiMatchQuery, DisMaxQuery, PluginQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1178,7 +1188,7 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
-LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery)
+LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery) LUXIR_TD(PluginQuery) LUXIR_TD(PluginOp)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
@@ -1225,7 +1235,7 @@ LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXI
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
-LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery)
+LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery) LUXIR_ENTRY(PluginQuery) LUXIR_ENTRY(PluginOp)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)

@@ -333,6 +333,13 @@ class RescoreQuery final : public Query {
 
     int64_t cost() override { return childSupplier->cost(); }
 
+    // The scorer forwards its child's approximation enums.
+    void approximationCosts(
+        MemPool& planPool, const Query::PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) override {
+      childSupplier->approximationCosts(planPool, context, out);
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
       Query::ScorerShape child = childSupplier->describeScorer(buildContext);

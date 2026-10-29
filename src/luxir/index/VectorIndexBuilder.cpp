@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "VectorIndexBuilder.h"
+#include "luxir/util/thread.h"
 
+#include <oneapi/tbb/parallel_for.h>
+#include <oneapi/tbb/task_arena.h>
+#include <faiss/Clustering.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
@@ -17,6 +21,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
+
+#include <omp.h>
 
 #include "luxir/util/Signal.h"
 #include "luxir/reader/FieldReader.h"
@@ -68,7 +74,7 @@ faiss::MetricType toFaissMetric(VectorFieldType::Metric m) {
     case VectorFieldType::METRIC_L2: return faiss::METRIC_L2;
     case VectorFieldType::METRIC_IP: return faiss::METRIC_INNER_PRODUCT;
     // Cosine = IP on L2-normalized vectors.  buildField copies + normalizes
-    // each segment's vectors before calling index->add().
+    // each segment's vectors before encoding.
     case VectorFieldType::METRIC_COSINE: return faiss::METRIC_INNER_PRODUCT;
     default:
       throw std::runtime_error("VectorIndexBuilder: unsupported metric");
@@ -114,34 +120,96 @@ bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
   return ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_;
 }
 
-// Shared by the owned training sample and borrowed column vectors. Rotation
-// always writes to separate storage: FAISS's matrix multiply cannot alias.
-template <typename Consume>
-void transformVectorChunks(const float* base, int64_t numVals, int32_t dims,
-                            bool normalizeForFaiss, const faiss::VectorTransform* rotation,
-                            size_t chunkBytes, Consume consume) {
-  if (numVals <= 0) return;
-  size_t bytesPerVec = (size_t)dims * sizeof(float);
-  size_t chunkVecs = std::min((size_t)numVals, std::max((size_t)1, chunkBytes / bytesPerVec));
-  size_t chunkFloats = chunkVecs * (size_t)dims;
-  std::vector<float> scratch, rotated;
-  if (normalizeForFaiss) scratch.resize(chunkFloats);
-  if (rotation != nullptr) rotated.resize(chunkFloats);
+// Minimum rows per build task: FAISS routes a batch to BLAS only from
+// distance_compute_blas_threshold floats, so a smaller slice would run its
+// scalar kernels instead of a GEMM.
+int64_t buildMinRowsPerTask(int32_t dims) {
+  if (VectorIndexBuilder::ivfBuildMinRowsPerTask > 0) return VectorIndexBuilder::ivfBuildMinRowsPerTask;
+  return ((int64_t)faiss::distance_compute_blas_threshold + dims - 1) / std::max(1, dims);
+}
 
-  for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
-    int64_t n = std::min((int64_t)chunkVecs, numVals - off);
-    const float* x = base + off * dims;
-    if (normalizeForFaiss) {
-      std::memcpy(scratch.data(), x, (size_t)n * bytesPerVec);
-      faiss::fvec_renorm_L2((size_t)dims, (size_t)n, scratch.data());
-      x = scratch.data();
-    }
-    if (rotation != nullptr) {
-      rotation->apply_noalloc(n, x, rotated.data());
-      x = rotated.data();
-    }
-    consume(off, n, x);
+// Runs fn(begin, end) over the rows [0, n) in TBB tasks of the current arena,
+// each at least minRows rows, up to four per compute slot for balance; fewer
+// than two tasks' worth of rows runs inline.  OpenBLAS is serial, so GEMM
+// parallelism comes from these tasks. FAISS OpenMP is pinned to one thread
+// by the arena observer. The caller is isolated: while it waits it must not
+// pick up an unrelated merge or flush.
+template <typename Fn>
+void forRowPartitions(int64_t n, int64_t minRows, Fn fn) {
+  int64_t width = computeWidth(oneapi::tbb::this_task_arena::max_concurrency());
+  int64_t tasks = std::min(n / std::max<int64_t>(1, minRows), width * 4);
+  if (tasks <= 1) {
+    fn((int64_t)0, n);
+    return;
   }
+  oneapi::tbb::this_task_arena::isolate([&] {
+    oneapi::tbb::parallel_for((int64_t)0, tasks, [&](int64_t task) {
+      int64_t begin = n * task / tasks;
+      int64_t end = n * (task + 1) / tasks;
+      fn(begin, end);
+    });
+  });
+}
+
+// Coarse quantizer whose batch searches split their rows across TBB tasks.
+// Installed as the IVF's actual quantizer (not only its clustering_index) it
+// covers k-means and residual-training assignment. FAISS serializes it by
+// dynamic_cast to IndexFlat, so readers open a plain IndexFlat.
+class PartitionedFlatQuantizer final : public faiss::IndexFlat {
+  int64_t minRows;
+public:
+  PartitionedFlatQuantizer(int32_t dims, faiss::MetricType metric, int64_t minRows)
+      : faiss::IndexFlat(dims, metric), minRows(minRows) {}
+
+  void search(faiss::idx_t n, const float* x, faiss::idx_t k, float* distances,
+              faiss::idx_t* labels, const faiss::SearchParameters* params = nullptr) const override {
+    forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
+      faiss::IndexFlat::search(end - begin, x + begin * d, k,
+                               distances + begin * k, labels + begin * k, params);
+    });
+  }
+};
+
+// Each sub-quantizer trains independently, exactly as ProductQuantizer's
+// Train_default path. FAISS writes this subclass as a plain IndexIVFPQ.
+class PartitionedIVFPQ final : public faiss::IndexIVFPQ {
+public:
+  using faiss::IndexIVFPQ::IndexIVFPQ;
+
+  void train_encoder(faiss::idx_t n, const float* x, const faiss::idx_t*) override {
+    assert(pq.train_type == faiss::ProductQuantizer::Train_default);
+    assert(pq.assign_index == nullptr);
+    assert(!do_polysemous_training && polysemous_training == nullptr);
+    oneapi::tbb::this_task_arena::isolate([&] {
+      oneapi::tbb::parallel_for((size_t)0, pq.M, [&](size_t m) {
+        std::vector<float> slice((size_t)n * pq.dsub);
+        for (faiss::idx_t j = 0; j < n; j++) {
+          std::memcpy(slice.data() + j * pq.dsub, x + j * d + m * pq.dsub,
+                      pq.dsub * sizeof(float));
+        }
+        faiss::Clustering clus((int)pq.dsub, (int)pq.ksub, pq.cp);
+        if (pq.verbose) clus.verbose = true;
+        faiss::IndexFlatL2 flat((int)pq.dsub);
+        clus.train(n, slice.data(), flat);
+        pq.set_params(clus.centroids.data(), m);
+      });
+    });
+    if (by_residual) precompute_table();
+  }
+};
+
+// Rotate the owned training sample through separate storage; GEMM cannot alias.
+void rotateTrainingSample(std::vector<float>& training, int32_t dims,
+                          const faiss::VectorTransform& rotation) {
+  int64_t n = (int64_t)(training.size() / (size_t)dims);
+  if (n <= 0) return;
+  int64_t minRows = buildMinRowsPerTask(dims);
+  std::vector<float> rotated(training.size());
+  forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
+    rotation.apply_noalloc(end - begin, training.data() + begin * dims,
+                           rotated.data() + begin * dims);
+  });
+  training.swap(rotated);
 }
 
 void appendTrainingVectors(std::vector<float>& sample, int64_t sampleCap,
@@ -212,6 +280,7 @@ std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
 size_t VectorIndexBuilder::ivfTrainingSampleBytes = 64 * 1024 * 1024;
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
+int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -311,6 +380,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
                                   const VectorFieldType& ft,
                                   std::vector<std::string>& outFilesToSync,
                                   BuildSite buildSite) {
+  assert(omp_get_max_threads() == 1);
   // Test hook: a listener may throw (or block) to exercise vector
   // build-failure paths.  Args: the field name (std::string_view*) and the
   // build site, so a listener can target a specific field and/or site.
@@ -396,7 +466,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // stay unit) are preserved and centroid distances stay comparable across
   // segments of either codec.
   std::unique_ptr<faiss::RandomRotationMatrix> rotation;
-  auto quantizer = std::make_unique<faiss::IndexFlat>(dims, metric);
+  int64_t minRows = buildMinRowsPerTask(dims);
+  auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows);
   std::unique_ptr<faiss::IndexIVF> index;
   if (rabitq) {
     rotation = std::make_unique<faiss::RandomRotationMatrix>(dims, dims);
@@ -407,7 +478,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     rq->qb = (uint8_t)std::clamp(ann.rabitqQueryBits, 0, 8);
     index = std::move(rq);
   } else {
-    auto pq = std::make_unique<faiss::IndexIVFPQ>(
+    auto pq = std::make_unique<PartitionedIVFPQ>(
         quantizer.get(), (size_t)dims, (size_t)nlist, (size_t)pqM,
         (size_t)pqBits, metric);
     // See min_points_per_centroid below.
@@ -418,10 +489,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   index->own_fields = true;
 
   if (rotation != nullptr) {
-    transformVectorChunks(training.data(), ntrain, dims, false, rotation.get(),
-        ivfAddChunkBytes, [&](int64_t off, int64_t n, const float* x) {
-      std::memcpy(training.data() + off * dims, x, (size_t)n * bytesPerVec);
-    });
+    rotateTrainingSample(training, dims, *rotation);
   }
 
   LOG_TRACE("VectorIndexBuilder: training {} {} ntotal={} ntrain={} dims={} "
@@ -444,14 +512,48 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   training.clear();
   training.shrink_to_fit();
 
+  // Each slice owns its entire row pipeline. Append serially to preserve
+  // input order within each inverted list for every codec.
+  int64_t width = computeWidth(oneapi::tbb::this_task_arena::max_concurrency());
+  int64_t chunkRows = std::max((int64_t)(ivfAddChunkBytes / bytesPerVec),
+                               4 * width * minRows);
+  size_t codeBytes = index->code_size + index->coarse_code_size();
+  std::vector<uint8_t> codes;
+  std::vector<float> scratch, rotated;
+  bool normalize = shouldNormalizeForFaiss(ft);
+  auto* flat = static_cast<faiss::IndexFlat*>(index->quantizer);
   forEachVectorSegment(segments_, fieldName, dims,
       [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
-    if (vr.numVectors() > 0) {
-      const float* base = (const float*)vr.vectorAtRank(0).data();
-      transformVectorChunks(base, vr.numVectors(), dims, shouldNormalizeForFaiss(ft), rotation.get(),
-          ivfAddChunkBytes, [&](int64_t, int64_t n, const float* x) {
-        index->add(n, x);
+    int64_t capacity = std::min(chunkRows, vr.numVectors());
+    codes.resize((size_t)capacity * codeBytes);
+    if (normalize) scratch.resize((size_t)capacity * dims);
+    if (rotation) rotated.resize((size_t)capacity * dims);
+    for (int64_t off = 0; off < vr.numVectors(); off += chunkRows) {
+      int64_t n = std::min(chunkRows, vr.numVectors() - off);
+      const float* base = (const float*)vr.vectorAtRank(off).data();
+      forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
+        int64_t count = end - begin;
+        const float* x = base + begin * dims;
+        if (normalize) {
+          float* dest = scratch.data() + begin * dims;
+          std::memcpy(dest, x, (size_t)count * bytesPerVec);
+          faiss::fvec_renorm_L2((size_t)dims, (size_t)count, dest);
+          x = dest;
+        }
+        if (rotation) {
+          float* dest = rotated.data() + begin * dims;
+          rotation->apply_noalloc(count, x, dest);
+          x = dest;
+        }
+        std::vector<faiss::idx_t> listNos((size_t)count);
+        std::vector<float> distances((size_t)count);
+        flat->faiss::IndexFlat::search(count, x, 1, distances.data(), listNos.data());
+        // Bounded input elements keep every distance finite, so each row gets a list.
+        assert(std::none_of(listNos.begin(), listNos.end(), [](faiss::idx_t l) { return l < 0; }));
+        index->encode_vectors(count, x, listNos.data(),
+                              codes.data() + (size_t)begin * codeBytes, /*include_listnos=*/true);
       });
+      index->add_sa_codes(n, codes.data(), nullptr);
     }
     return true;
   });

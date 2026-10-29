@@ -11,12 +11,15 @@
 #include <limits>
 #include <memory_resource>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
 
 #include "luxir/api/build.h"
 #include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
@@ -550,6 +553,127 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   EXPECT_EQ(oracle(points, box), run(*reader, "geo_single", box, false));
   SkipStats::enabled = false;
   EXPECT_EQ(1, SkipStats::geoScanArms);
+}
+
+// A 64 x 64 grid of single points, latitude -80 + 2.5 * (doc % 64), with a
+// body of terms t3, t5 and t7 on every third, fifth and seventh doc. Calls
+// `check` with the index reader.
+template <typename Check>
+void withGrid(bool range, Check&& check) {
+  CollectionHelper helper;
+  setGeoSchema(helper, range);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  auto& body = inverter.getIndexHandler("body_w");
+  for (int32_t doc = 0; doc < 4096; doc++) {
+    inverter.startDoc();
+    handler.index(inverter, -80.0 + 2.5 * (doc % 64), -170.0 + 5.0 * (doc / 64));
+    std::string text = "pad";
+    for (int32_t k : {3, 5, 7}) if (doc % k == 0) text += " t" + std::to_string(k);
+    body.index(inverter, std::string_view(text));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+  check(*reader);
+}
+
+// The southern half of the grid (2,112 docs): its supplier and a probe that
+// resolves it for a pull consumer's expected candidates and spared work,
+// returning whether the plan verifies (two-phase).
+template <typename Check>
+void withGridBox(bool range, Check&& check) {
+  withGrid(range, [&](IndexReader& reader) {
+    constexpr int32_t N = 4096;
+    MemPool pool;
+    QueryState state(pool, reader, "geo_single", Box{-80.0, 0.0, -180.0, 180.0});
+    auto* supplier = state.weight->scorerSupplier(pool, reader.segments()[0]);
+    ASSERT_NE(nullptr, supplier);
+    auto verifies = [&](double candidates, double spared) {
+      Query::Demand demand = Query::Demand::fromLeadCost(N);
+      demand.expectedCandidates = candidates;
+      demand.sparedWork = spared;
+      auto* plan = supplier->resolve(pool, supplier->makePlanContext(demand));
+      return plan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
+    };
+    check(*supplier, verifies, pool, N);
+  });
+}
+
+// With the candidates a pull consumer expects to reach it, or an exposure's
+// candidates, the box verifies or produces its BKD by point emissions:
+// candidates times the verify price plus the consumer's spared work, against
+// materializing about 2,100 matches into a bitset. Otherwise it verifies for
+// a lead sparser than its matches.
+TEST_F(GeoBoxQueryTest, armChoicePricesVerificationAgainstBKDProduction) {
+  withGridBox(true, [](Query::ScorerSupplier& supplier, auto& verifies, MemPool& pool,
+                       int32_t n) {
+    EXPECT_TRUE(verifies(10, 0));
+    EXPECT_FALSE(verifies(1000, 0));
+    EXPECT_FALSE(verifies(10, 10000));
+    auto verifiesFor = [&](int64_t lead, bool exposure) {
+      auto context = supplier.makePlanContext(Query::Demand::fromCandidatesAndSpan(
+          lead, n, exposure ? Query::ExecutionUse::MATCH_WINDOWS : Query::ExecutionUse::PULL));
+      if (exposure) context.expectedSpan = n;
+      auto* plan = supplier.resolve(pool, context);
+      return plan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
+    };
+    EXPECT_TRUE(verifiesFor(1000, false));
+    EXPECT_FALSE(verifiesFor(3000, false));
+    // Filling windows over an exposure, the box prices that exposure's
+    // candidates: verifying 1,000 costs more than producing.
+    EXPECT_FALSE(verifiesFor(1000, true));
+  });
+}
+
+// Without a BKD both arms verify; the scan iterates the column once the
+// consumer reaches every document with a value.
+TEST_F(GeoBoxQueryTest, armChoiceWithoutPointsScansAFullReach) {
+  withGridBox(false, [](Query::ScorerSupplier& supplier, auto& verifies, MemPool& pool,
+                        int32_t n) {
+    EXPECT_TRUE(verifies(10, 0));
+    SkipStats::reset();
+    SkipStats::enabled = true;
+    supplier.resolve(pool, supplier.makePlanContext(Query::Demand::fromLeadCost(n)))
+        ->build(pool);
+    SkipStats::enabled = false;
+    EXPECT_EQ(1, SkipStats::geoScanArms);
+  });
+}
+
+// A box holding 3,392 docs under a 3-term union of about 2,800 candidates: the
+// union's cost is below the box's matches, but verifying every union candidate
+// costs far more than producing the box, so the conjunction builds the BKD,
+// and describing the Boolean reports the same (no verification).
+TEST_F(GeoBoxQueryTest, boxUnderAUnionProducesItsBKD) {
+  withGrid(true, [](IndexReader& reader) {
+    constexpr int32_t N = 4096;
+    MemPool pool;
+    Query::Context context(pool, reader);
+    GeoBoxQuery box("geo_single", -90.0, 51.0, -180.0, 180.0);
+    TermQuery t3("body_w", "t3"), t5("body_w", "t5"), t7("body_w", "t7");
+    std::array<Query*, 3> optional{&t3, &t5, &t7};
+    std::array<Query*, 1> filters{&box};
+    BooleanQuery query({}, optional, {}, filters, 1);
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader.segments()[0]);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(Query::VerificationWork::ABSENT,
+              supplier->verificationWork(supplier->makePlanContext(Query::Demand::fromLeadCost(N))));
+    SkipStats::reset();
+    SkipStats::enabled = true;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+    SkipStats::enabled = false;
+    EXPECT_EQ(1, SkipStats::geoBKDArms);
+    EXPECT_EQ(0, SkipStats::geoSparseVerifyArms);
+    std::vector<int32_t> docs, expected;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (doc % 64 <= 52 && (doc % 3 == 0 || doc % 5 == 0 || doc % 7 == 0)) expected.push_back(doc);
+    }
+    EXPECT_EQ(expected, docs);
+  });
 }
 
 TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {

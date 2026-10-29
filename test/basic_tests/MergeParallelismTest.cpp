@@ -176,9 +176,10 @@ TEST(MergeCostModelTest, StreamBudgetAndRangeLimitScaleWithOutputBytes) {
     previous = current;
   }
 
-  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(32));
-  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(33));
-  EXPECT_EQ(17, MergeCostModel::maxTermRangesForStreams(34));
-  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(128));
+  // Twice the ranges that can hold streams at once: the rest queue.
+  EXPECT_EQ(32, MergeCostModel::maxTermRangesForStreams(32));
+  EXPECT_EQ(33, MergeCostModel::maxTermRangesForStreams(33));
+  EXPECT_EQ(34, MergeCostModel::maxTermRangesForStreams(34));
+  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(64));
   EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(256));
 }

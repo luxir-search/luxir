@@ -46,6 +46,11 @@ std::string ReaderManager::resolvedSchema() {
       rep["ignore_malformed"] = geo->ignoreMalformed;
       rep["ignore_z_value"] = geo->ignoreZValue;
     }
+    // The analyzer property is always the expanded definition; a named analyzer
+    // additionally reports the name it came from.
+    if (auto* text = dynamic_cast<const TextFieldType*>(type); text && !text->analyzer_->presetName.empty()) {
+      rep["analyzer_preset"] = text->analyzer_->presetName;
+    }
     if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
       const auto& config = vector->ann();
       auto& ann = rep["ann"];

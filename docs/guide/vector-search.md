@@ -282,9 +282,12 @@ POST /collections/books/_update
 }
 ```
 
-Integer elements are accepted. Every element must be a finite float32: a double
-past float32 range, or a NaN or infinity in any arm (typed gRPC vectors included),
-fails the document.
+Integer elements are accepted. Every element must be a finite float32 with
+magnitude at most 2^40 (about 1.1e12): a double past float32 range, a NaN or
+infinity in any arm (typed gRPC vectors included), or a larger element fails the
+document. The limit keeps every distance computed while indexing and searching
+finite; embeddings sit many orders of magnitude below it. Query vectors follow
+the same rule.
 
 Over gRPC, use the typed `Val.vec` and `Val.arr_vec` arms. In protobuf text,
 a single-valued vector field is:
@@ -661,6 +664,9 @@ overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
+
+Builds run as indexing tasks, so their parallelism is bounded by the indexing
+arena, sized by `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
 
 ### Index settings
 

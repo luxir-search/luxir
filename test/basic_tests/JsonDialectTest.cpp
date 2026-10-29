@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
+#include "luxir/schema/Schema.h"
 
 namespace {
 using namespace std::string_view_literals;
@@ -792,6 +793,67 @@ TEST(JsonDialect, AnalyzerComponentStringShorthand) {
   ASSERT_TRUE(P::read_json(nameless, R"({"type":"text","analyzer":{"tokenizer":""}})", mr));
   ASSERT_TRUE(nameless.analyzer->tokenizer.has_value());
   EXPECT_TRUE(nameless.analyzer->tokenizer->name.empty());
+}
+
+TEST(JsonDialect, AnalyzerDefNamedForms) {
+  // "english" == {"name": "english"} in analyzer position; char_filters read
+  // like filters; the generated writer stays canonical (object form).
+  std::pmr::monotonic_buffer_resource mr;
+  std::string err;
+  P::FieldDef bare;
+  ASSERT_TRUE(P::read_json(bare, R"({"type":"text","analyzer":"english"})", mr, &err)) << err;
+  ASSERT_TRUE(bare.analyzer.has_value());
+  EXPECT_EQ("english", bare.analyzer->name);
+  EXPECT_FALSE(bare.analyzer->tokenizer.has_value());
+  EXPECT_TRUE(bare.analyzer->filters.empty());
+  P::FieldDef object;
+  ASSERT_TRUE(P::read_json(object, R"({"type":"text","analyzer":{"name":"english"}})", mr, &err)) << err;
+  EXPECT_EQ("english", object.analyzer->name);
+  std::string out;
+  ASSERT_TRUE(P::write_json(bare, out));
+  EXPECT_EQ(R"({"type":"text","analyzer":{"name":"english"}})", out);
+
+  P::AnalyzerDef top;
+  ASSERT_TRUE(P::read_json(top, R"("standard")", mr, &err)) << err;
+  EXPECT_EQ("standard", top.name);
+
+  P::AnalyzerDef full;
+  ASSERT_TRUE(P::read_json(full,
+      R"({"char_filters":["a",{"name":"b","params":{"k":true}}],"tokenizer":"whitespace","filters":["lowercase"]})", mr, &err)) << err;
+  ASSERT_EQ(2u, full.char_filters.size());
+  EXPECT_EQ("a", full.char_filters[0].name);
+  EXPECT_EQ("b", full.char_filters[1].name);
+  EXPECT_TRUE(full.name.empty());
+  ASSERT_TRUE(P::write_json(full, out));
+  EXPECT_EQ(R"({"tokenizer":"whitespace","filters":["lowercase"],"char_filters":["a",{"name":"b","params":{"k":true}}]})", out);
+
+  P::AnalyzerDef bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"nam":"english"})", mr));
+  EXPECT_FALSE(P::read_json(bad, R"({"name":5})", mr));
+}
+
+TEST(JsonDialect, AnalyzerEmptyNames) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (auto json : {R"({"type":"text","analyzer":""})", R"({"type":"text","analyzer":{"name":""}})"}) {
+    P::FieldDef def;
+    std::string error;
+    EXPECT_FALSE(P::read_json(def, json, mr, &error)) << json;
+    EXPECT_NE(std::string::npos, error.find("analyzer name must not be empty; use {} to inherit or name an analyzer"))
+        << error;
+  }
+}
+
+TEST(JsonDialect, AnalyzerEmptyObjectInherits) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SchemaDef def;
+  std::string error;
+  ASSERT_TRUE(P::read_json(def, R"({
+    "templates":{"_body":{"type":"text","analyzer":{"tokenizer":"keyword","filters":["lowercase"]}}},
+    "fields":{"body":{"parent":"_body","analyzer":{}}}
+  })", mr, &error)) << error;
+  auto schema = luxir::Schema::fromProto(def);
+  auto* analyzer = ((luxir::TextFieldType*)schema->getFieldTypePtr("body"))->analyzer_.get();
+  EXPECT_EQ(R"({"char_filters":[],"filters":["lowercase"],"tokenizer":"keyword"})", analyzer->canonical);
 }
 
 TEST(JsonDialect, FieldDefStrictReads) {
