@@ -198,7 +198,7 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount
-            && segment.liveDocs() == nullptr) {
+            && !segment.hasDeletes()) {
           return {
             BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO, nullptr, cost(),

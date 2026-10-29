@@ -124,7 +124,7 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
     auto& range = rangeOp();
     auto& segment = range.reader.segments()[(size_t)segnum];
     const auto* info = range.segInfos.at((size_t)segnum);
-    if (disablePointsRangeFacetForTests || domain || segment.liveDocs() || !range.subOps.empty()
+    if (disablePointsRangeFacetForTests || domain || segment.hasDeletes() || !range.subOps.empty()
         || !info || !info->columnBounds || !numericIdentityPoints(*info)
         || !valuesAreDocuments(*info)) return false;
     auto [lo, hi] = *info->columnBounds;
