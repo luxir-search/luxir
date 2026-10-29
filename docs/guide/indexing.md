@@ -217,6 +217,11 @@ ID overwrite/deduplication. This disables overwrites for that request. If
 the IDs are not in fact unique, the outcome is unspecified: some duplicates
 remain as separate documents, and others replace each other.
 
+Each segment records its smallest and largest ID and a small bloom filter over
+its IDs (about 10 bits per ID). Overwrites and deletes skip the segments that
+cannot hold an ID, which keeps updates cheap with random IDs such as UUIDs and
+with mostly-append workloads where most overwritten IDs are new.
+
 Delete by ID with no document body:
 
 ```http

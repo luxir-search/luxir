@@ -110,6 +110,11 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // Optional id membership filter, present only with FieldType::ID_FILTER:
+  // the field's min and max term followed by a split-block bloom filter over
+  // its terms (see IdFilterReader).  Read only when applying deletes.
+  seg_location idFilterLoc;
+  int64_t idFilterLen = 0;
   void requireCompatibleType(const SegFieldInfo& other) const {
     if (type != other.type || FieldType::typeParameters(type, typeFlags)
         != FieldType::typeParameters(other.type, other.typeFlags)) {
@@ -142,6 +147,7 @@ struct SegFieldInfo {
     relocate(monoLoc);
     relocate(mono2Loc);
     relocate(valDocLoc);
+    relocate(idFilterLoc);
   }
 };
 

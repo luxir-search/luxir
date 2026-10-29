@@ -787,6 +787,13 @@ private:
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus a pool delta stream per multi-valued doc.  This is the
       // heavy class the budget exists for.
+      int64_t idFilterBytes = 0;
+      if ((allFlags & FieldType::ID_FILTER) != 0) {
+        int64_t sourceTerms = 0;
+        for (const auto& field : fields) sourceTerms += field.segFieldInfo.nTerms;
+        idFilterBytes = (int64_t)BlockBloomFilter::numBlocksFor(sourceTerms)
+            * BlockBloomFilter::BLOCK_BYTES;
+      }
       if (allFlags & FieldType::MULTI_ARRAY) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
@@ -794,7 +801,7 @@ private:
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
-            + MergeCostModel::LIGHT_BYTES + pointsBytes;
+            + idFilterBytes + MergeCostModel::LIGHT_BYTES + pointsBytes;
       }
       // A doc's first value takes its ords[maxDoc] slot.  A multi-valued doc
       // spills into a pool delta stream: about 40 bytes for its header and
@@ -802,7 +809,7 @@ private:
       int64_t spilledValues = std::max<int64_t>(0, numValues - docsWithField);
       int64_t multiValuedDocs = std::min(spilledValues, docsWithField);
       return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
-          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+          + idFilterBytes + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
@@ -1684,7 +1691,11 @@ private:
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
     int32_t allFlags = 0;
     FieldType::Type type = firstInfo.type;
+    bool idFilter = false;  // rebuilt when any source carries one
+    int64_t sourceTerms = 0;
     for (auto* field : compactFields) {
+      idFilter |= (field->segFieldInfo.flags & FieldType::ID_FILTER) != 0;
+      sourceTerms += field->segFieldInfo.nTerms;
       allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
     }
     bool isText = type == FieldType::Type::TEXT;
@@ -1750,6 +1761,10 @@ private:
       textWriter.startField(&outputFieldInfo);
       if (hasImpactNorms) {
         textWriter.setNorms(preparedNorms.textView());
+      }
+      if (idFilter) {
+        // Sized by the source term count, an upper bound when deletes drop terms.
+        textWriter.buildIdFilter(sourceTerms);
       }
 
       mergeTerms(textWriter, compactFields, isOrdCol, FieldType::hasPositions(allFlags),
