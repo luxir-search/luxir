@@ -5,10 +5,21 @@
 
 namespace luxir {
 
+FacetBucketBlockExecutor::InputDomainBytes FacetBucketBlockExecutor::inputDomainBytes(IndexReader& reader) {
+  InputDomainBytes result;
+  for (const auto& seg : reader.segments()) {
+    size_t bitset = sizeof(RAMBitDocSet) + FixedBitSet::sizeInWords(seg.maxDoc()) * sizeof(uint64_t);
+    size_t array = sizeof(ArrDocSet) + (size_t)DocSetBuilder::arrayLimitFor(seg.maxDoc()) * sizeof(int32_t);
+    size_t bytes = saturatingAdd(std::max(bitset, array), sizeof(DomainHandle));
+    result.largestSegment = std::max(result.largestSegment, bytes);
+    result.wholeReader = saturatingAdd(result.wholeReader, bytes);
+  }
+  return result;
+}
+
 FacetBucketBlockExecutor::StructuralRoute::StructuralRoute(SearchOp::Calculator& parent,
                                                            std::span<SearchOp* const> children,
                                                            IndexReader& reader, bool hasSelection) {
-  auto segments = reader.segments();
   ancestor = parent.structuralConstraint();
   scopeNeeded = std::ranges::any_of(children, [](auto* child) { return child->needsStructuralScope; });
   overrides = std::ranges::any_of(children, [](auto* child) { return child->bucketDomain != nullptr; });
@@ -28,17 +39,12 @@ FacetBucketBlockExecutor::StructuralRoute::StructuralRoute(SearchOp::Calculator&
                     size_t variant = plan.variantForChild(child->name);
                     return variant == 0 || plan.frame(variant) == DomainVariantPlan::Frame::INHERIT;
                   });
-  size_t prefixBytes = 0, inputBytes = 0;
-  if (scopeNeeded || needInherited)
-    for (const auto& seg : segments) {
-      size_t bitset = sizeof(RAMBitDocSet) + FixedBitSet::sizeInWords(seg.maxDoc()) * sizeof(uint64_t);
-      size_t array = sizeof(ArrDocSet) + (size_t)DocSetBuilder::arrayLimitFor(seg.maxDoc()) * sizeof(int32_t);
-      size_t bytes = saturatingAdd(std::max(bitset, array), sizeof(DomainHandle));
-      prefixBytes = wholeReaderPrefixes ? saturatingAdd(prefixBytes, bytes) : std::max(prefixBytes, bytes);
-      inputBytes = saturatingAdd(inputBytes, bytes);
-    }
-  if (scopeNeeded) retainedBytesPerBucket = saturatingAdd(retainedBytesPerBucket, prefixBytes);
-  if (needInherited) retainedBytesPerBucket = saturatingAdd(retainedBytesPerBucket, inputBytes);
+  if (scopeNeeded || needInherited) {
+    auto bytes = inputDomainBytes(reader);
+    if (scopeNeeded) retainedBytesPerBucket = saturatingAdd(retainedBytesPerBucket,
+        wholeReaderPrefixes ? bytes.wholeReader : bytes.largestSegment);
+    if (needInherited) retainedBytesPerBucket = saturatingAdd(retainedBytesPerBucket, bytes.wholeReader);
+  }
   if (overrides) {
     for (auto* child : children) {
       if (child->bucketDomain && std::ranges::find(plans, child->bucketDomain) == plans.end()) {

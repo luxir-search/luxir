@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-#if defined(__unix__)
+#if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -65,7 +65,7 @@ TEST(DecodedSuccessorTest, DisableHookKeepsScalarSemantics) {
 }
 
 TEST(DecodedSuccessorTest, TailLoadDoesNotCrossGuardPage) {
-#if defined(__unix__)
+#if defined(__unix__) || defined(__APPLE__)
   const long pageSize = sysconf(_SC_PAGESIZE);
   ASSERT_GT(pageSize, 0);
   void* mapping = mmap(nullptr, (size_t) pageSize * 2,

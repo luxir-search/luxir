@@ -10,11 +10,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   auto split = name.rfind("__");
   logicalName = name.substr(0, split);
   label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
-  static constexpr const char* types[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
-  };
-  properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
-  properties["multi"] = type.multiValued() ? "true" : "false";
+  properties["type"] = "\"" + std::string(FieldType::typeName(type.type())) + "\"";
+  properties["multi"] = !type.multiValued() ? "false"
+      : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
   if (type.type() == FieldType::TEXT || type.type() == FieldType::ID
@@ -39,8 +37,12 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
       }
     }
   }
+  if (auto* date = dynamic_cast<DateFieldType*>(&type)) {
+    properties["unit"] = "\"" + std::string(dateUnitName(date->unit)) + "\"";
+  }
   if (auto* vector = dynamic_cast<VectorFieldType*>(&type)) {
-    properties["dims"] = std::to_string(vector->dims());
+    properties["dims"] = std::to_string(vector->inputDims());
+    if (vector->truncateDims() > 0) properties["truncate_dims"] = std::to_string(vector->truncateDims());
     static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine"};
     properties["metric"] = "\"" + std::string(metrics[vector->metric()]) + "\"";
     properties["normalize_on_write"] = vector->normalizeOnWrite() ? "true" : "false";

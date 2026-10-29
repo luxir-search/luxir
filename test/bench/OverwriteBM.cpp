@@ -90,9 +90,8 @@ static void BM_Overwrite(benchmark::State& state, int nThreads, int64_t maxDoc, 
 
 
 // Vary thread count with overwrite on, off, and off+extraInt.
-// noOW_int adds an extra int field to approximate the cost of indexing _version_ without the delete
-// buffering, so the difference between overwrite and noOW_int isolates
-// the delete buffering + application cost.
+// noOW_int measures the added cost of indexing a numeric field with overwrite disabled.
+// Compare overwrite with noOW for overwrite overhead.
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k,           1, 100'000, 100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW,      1, 100'000, 100, false);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW_int,  1, 100'000, 100, false, true);
@@ -113,3 +112,8 @@ LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k,         4, 10'000,    100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_noOW,    4, 10'000,    100, false);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m,          4, 1'000'000, 100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m_noOW,     4, 1'000'000, 100, false);
+
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1,       1, 10'000, 1, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1_noOW,  1, 10'000, 1, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1,       4, 10'000, 1, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1_noOW,  4, 10'000, 1, false);

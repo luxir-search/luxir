@@ -79,7 +79,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
   int port = readerServer.getPort();
 
   auto search = httpRequest(port, http::verb::post, "/collections/main/_search",
-                            R"({"query":"title_w:lockless","fields":["id"],"get_number":true})");
+                            R"({"query":"title_w:lockless","fields":["id"],"count_limit":-1})");
   ASSERT_EQ(200, search.result_int()) << search.body();
   EXPECT_NE(search.body().find(R"("found":1)"), std::string::npos) << search.body();
   EXPECT_NE(search.body().find(R"("r1")"), std::string::npos) << search.body();
@@ -108,7 +108,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
 
   // Reads stay available, and the update to a collection that does not exist is
   // refused as read-only rather than auto-creating it.
-  EXPECT_EQ(200, httpRequest(port, http::verb::get, "/_stats").result_int());
+  EXPECT_EQ(200, httpRequest(port, http::verb::get, "/_stats?collections=true&files=true").result_int());
   EXPECT_EQ(200, httpRequest(port, http::verb::get, "/collections").result_int());
   EXPECT_EQ(200, httpRequest(port, http::verb::get, "/collections/main/_schema").result_int());
   expectRefused("update of absent collection", http::verb::post, "/collections/absent/_update",

@@ -5,6 +5,7 @@
 #include <iosfwd>
 #include <memory>
 #include <memory_resource>
+#include <span>
 #include <string_view>
 #include <vector>
 #include "Collections.h"
@@ -30,6 +31,11 @@ public:
   void start();
   void stop();
   void deleteOrphan(const CollectionId& id);
+  // After Collections::fail: repair the failed collection, or a replacement
+  // still holding one of its suspect descriptors. Unrelated replacements stay
+  // available. Repair downloads marker-named files and verifies other files.
+  void repair(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
+              std::span<const FileDescriptor> suspects);
   void stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena);
 };
 }

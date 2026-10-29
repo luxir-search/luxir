@@ -14,10 +14,23 @@
 
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
 namespace {
+
+FilterCacheConfig normalizeConfig(FilterCacheConfig config) {
+  if (config.wholeAdmissionHistorySize == 0) {
+    config.wholeAdmissionHistorySize = config.admissionHistorySize;
+  }
+  config.minSegmentDocs = std::max(0, config.minSegmentDocs);
+  return config;
+}
+
+size_t ninetyPercent(size_t bytes) {
+  return bytes / 10 * 9 + bytes % 10 * 9 / 10;
+}
 
 bool identityLess(const FilterCache::SegmentIdentity& a,
                   const FilterCache::SegmentIdentity& b) {
@@ -223,17 +236,25 @@ void FilterCache::Use::pinValue(
   if (value == nullptr || segmentOrd >= requestSlotCount) return;
   auto& requestSlot = requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  bool alreadyPinned = requestSlot.firstPin == value
+      || std::ranges::find(requestSlot.pins, value) != requestSlot.pins.end();
+  // Everything that can throw precedes publishing raw: a throw here may
+  // release the only owner of the value.
+  if (!alreadyPinned) {
+    if (requestSlot.firstPin != nullptr) {
+      requestSlot.pins.reserve(requestSlot.pins.size() + 1);
+    }
+    if (requestOwned) {
+      requestSlot.requestOwnedPins.reserve(requestSlot.requestOwnedPins.size() + 1);
+      requestSlot.chargeRouted(value->ramBytesUsed());
+      requestSlot.requestOwnedPins.push_back(value);
+    }
+  }
   if (requestSlot.raw == nullptr) {
     requestSlot.raw = value->docSet();
     requestSlot.rawOwned = false;
   }
-  bool alreadyPinned = requestSlot.firstPin == value
-      || std::ranges::find(requestSlot.pins, value) != requestSlot.pins.end();
   if (!alreadyPinned) {
-    if (requestOwned) {
-      requestSlot.chargeRouted(value->ramBytesUsed());
-      requestSlot.requestOwnedPins.push_back(value);
-    }
     if (requestSlot.firstPin == nullptr) {
       requestSlot.firstPin = std::move(value);
     } else {
@@ -448,7 +469,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
       || reader.segments().size() != readerSegments.size()) {
     return {};
   }
-  if (key.bytes().size() > cache->config.maxEntryBytes) {
+  if (key.bytes().size() > cache->maxEntryBytes()) {
     cache->counter.oversizedKeyBypasses.fetch_add(
         1, std::memory_order_relaxed);
     return {};
@@ -831,10 +852,10 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
       throw std::logic_error(
           "FilterCache request key reused with different scope");
     }
-    if (cache != nullptr) cache->observeAdmissionLane(*use, lane);
+    if (use->cache != nullptr) use->cache->observeAdmissionLane(*use, lane);
     return use;
   }
-  auto use = cache != nullptr
+  auto use = cache != nullptr && usesSharedFilterCache(scope)
       ? cache->beginUse(
           key, scope, readerCoreGen, readerVersion, segments, lane)
       : std::unique_ptr<Use>(new Use(
@@ -932,44 +953,57 @@ FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
       ? clauseAdmission : wholeAdmission;
 }
 
+size_t FilterCache::lowWatermarkBytes(size_t bytes) const {
+  return config.lowWatermarkBytes == 0 ? ninetyPercent(bytes)
+      : std::min(config.lowWatermarkBytes, bytes);
+}
+
+size_t FilterCache::maxEntryBytes(size_t bytes) const {
+  return config.maxEntryBytes != 0 ? config.maxEntryBytes
+      : bytes == 0 ? 0 : std::max<size_t>(1, bytes / 5);
+}
+
+size_t FilterCache::maxMetadataBytes(size_t bytes) const {
+  return config.maxMetadataBytes != 0 ? config.maxMetadataBytes
+      : bytes == 0 ? 0 : std::max<size_t>(1, bytes / 4);
+}
+
+size_t FilterCache::lowWatermarkMetadataBytes(size_t bytes) const {
+  size_t metadata = maxMetadataBytes(bytes);
+  return config.lowWatermarkMetadataBytes == 0 ? ninetyPercent(metadata)
+      : std::min(config.lowWatermarkMetadataBytes, metadata);
+}
+
 FilterCache::FilterCache(FilterCacheConfig config)
-  : config(config),
-    clauseAdmission(config.admissionHistorySize, config.admissionThreshold),
-    wholeAdmission(config.wholeAdmissionHistorySize == 0
-        ? config.admissionHistorySize : config.wholeAdmissionHistorySize,
-        config.admissionThreshold) {
-  if (this->config.wholeAdmissionHistorySize == 0) {
-    this->config.wholeAdmissionHistorySize = this->config.admissionHistorySize;
-  }
-  if (this->config.lowWatermarkBytes == 0) {
-    this->config.lowWatermarkBytes = this->config.maxBytes * 9 / 10;
-  }
-  this->config.lowWatermarkBytes = std::min(
-      this->config.lowWatermarkBytes, this->config.maxBytes);
-  if (this->config.maxEntryBytes == 0 && this->config.maxBytes != 0) {
-    this->config.maxEntryBytes = std::max<size_t>(1,
-        this->config.maxBytes / 5);
-  }
-  if (this->config.maxMetadataBytes == 0 && this->config.maxBytes != 0) {
-    this->config.maxMetadataBytes = std::max<size_t>(1,
-        this->config.maxBytes / 4);
-  }
-  if (this->config.lowWatermarkMetadataBytes == 0) {
-    this->config.lowWatermarkMetadataBytes =
-        this->config.maxMetadataBytes * 9 / 10;
-  }
-  this->config.lowWatermarkMetadataBytes = std::min(
-      this->config.lowWatermarkMetadataBytes, this->config.maxMetadataBytes);
-  this->config.minSegmentDocs = std::max(0, this->config.minSegmentDocs);
+  : config(normalizeConfig(config)), budget(config.maxBytes),
+    clauseAdmission(this->config.admissionHistorySize,
+                    this->config.admissionThreshold),
+    wholeAdmission(this->config.wholeAdmissionHistorySize,
+                   this->config.admissionThreshold) {
   activeSegments.store(std::make_shared<const ActiveSnapshot>(),
                        std::memory_order_release);
 }
 
-size_t FilterCache::StripedCounter::threadStripe() {
-  static std::atomic<size_t> nextStripe{0};
-  thread_local size_t stripe =
-      nextStripe.fetch_add(1, std::memory_order_relaxed) % STRIPES;
-  return stripe;
+FilterCacheConfig FilterCache::configuration() const {
+  size_t bytes = budgetBytes();
+  FilterCacheConfig out = config;
+  out.maxBytes = bytes;
+  out.lowWatermarkBytes = lowWatermarkBytes(bytes);
+  out.maxEntryBytes = maxEntryBytes(bytes);
+  out.maxMetadataBytes = maxMetadataBytes(bytes);
+  out.lowWatermarkMetadataBytes = lowWatermarkMetadataBytes(bytes);
+  return out;
+}
+
+void FilterCache::resize(size_t maxBytes) {
+  size_t old = budget.exchange(maxBytes, std::memory_order_acq_rel);
+  if (maxBytes == 0) {
+    Signal::emit("filterCacheDisabled", this);
+    clear();
+  } else if (maxBytes < old) {
+    sweepRequested.store(true, std::memory_order_release);
+    sweep();
+  }
 }
 
 uint64_t FilterCache::nextEpoch() {
@@ -1078,10 +1112,18 @@ FilterCache::findOrCreateEntry(const FilterKey& key, FilterKeyScope scope) {
     // Charge before the map publishes the entry. A racing erase can therefore
     // never subtract an entry that has not yet been charged.
     metadataBytes.fetch_add(metadataCharge, std::memory_order_relaxed);
+    Signal::emit("filterCacheBeforeInsert", this);
     bool inserted = entries.try_emplace_or_cvisit(
         key, candidate, [&](const auto& item) { result = item.second; });
     if (inserted) {
       counter.admissions.fetch_add(1, std::memory_order_relaxed);
+      Signal::emit("filterCacheEntryInserted", this);
+      // clear visits every group under its lock. If it passed this group
+      // before insertion, that lock handoff makes its zero visible here.
+      if (!enabled()) {
+        detachEntry(result);
+        eraseEntry(key, result);
+      }
       return result;
     }
     metadataBytes.fetch_sub(metadataCharge, std::memory_order_relaxed);
@@ -1201,6 +1243,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
     const FilterKey& key, FilterKeyScope scope, uint64_t readerCoreGen,
     uint64_t readerVersion,
     std::span<const SegmentIdentity> readerSegments, AdmissionLane lane) {
+  assert(usesSharedFilterCache(scope));
   auto use = std::unique_ptr<Use>(new Use(
       this, key, scope, nullptr,
       std::vector<std::shared_ptr<SegmentSlot>>(readerSegments.size()),
@@ -1216,7 +1259,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
     uint64_t readerVersion,
     std::span<const SegmentIdentity> readerSegments) {
   if (!enabled() || readerSegments.empty()
-      || scope == FilterKeyScope::UNCACHEABLE) {
+      || !usesSharedFilterCache(scope)) {
     return nullptr;
   }
   auto entry = findEntry(key);
@@ -1346,6 +1389,7 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
 }
 
 void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
+  assert(use.cache == this && usesSharedFilterCache(use.scope_));
   uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
   if ((use.observedAdmissionLanes & laneBit) != 0) return;
   use.observedAdmissionLanes |= laneBit;
@@ -1355,7 +1399,7 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
   // observations are retained here and recorded by probeReaderStable only
   // after that gate accepts the request.
   if (use.scope_ == FilterKeyScope::READER_STABLE) return;
-  if (use.key.bytes().size() > config.maxEntryBytes) {
+  if (use.key.bytes().size() > maxEntryBytes()) {
     counter.oversizedKeyBypasses.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -1421,7 +1465,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
           && use.readerCoreGen >= publishedCoreGen.load(std::memory_order_acquire)
           && isActive(*active, identity)
           && local->card() != slot->maxDoc
-          && local->ramBytesUsed() <= config.maxEntryBytes;
+          && local->ramBytesUsed() <= maxEntryBytes();
       if (valid) {
         size_t valueCount = residentValueCount(*use.entry) + 1;
         double effectiveBytes = effectiveValueBytes(
@@ -1497,7 +1541,7 @@ FilterCache::publishReaderValue(
               == publishedReaderVersion.load(std::memory_order_acquire)
           && active->readerVersion == use.readerVersion
           && identitiesMatch
-          && local->ramBytesUsed() <= config.maxEntryBytes;
+          && local->ramBytesUsed() <= maxEntryBytes();
       if (valid) {
         size_t valueCount = residentValueCount(*localEntry);
         if (current == nullptr) valueCount++;
@@ -1655,10 +1699,11 @@ bool FilterCache::onReaderPublished(IndexReader& reader) {
 }
 
 void FilterCache::maybeSweep() {
-  if (residentBytes.load(std::memory_order_relaxed) > config.maxBytes
+  size_t bytes = budgetBytes();
+  if (residentBytes.load(std::memory_order_relaxed) > bytes
       || entries.size() > config.maxMetadataEntries
       || metadataBytes.load(std::memory_order_relaxed)
-          > config.maxMetadataBytes) {
+          > maxMetadataBytes(bytes)) {
     sweepRequested.store(true, std::memory_order_release);
     sweep();
   }
@@ -1682,11 +1727,12 @@ void FilterCache::sweep() {
     // publication is visible; the winner consumes that handoff before taking
     // its snapshots.
     if (sweeping.test_and_set(std::memory_order_acquire)) return;
-    sweepRequested.store(false, std::memory_order_release);
+    Signal::emit("filterCacheSweepStarted", this);
+    sweepRequested.exchange(false, std::memory_order_acq_rel);
     {
       SweepGuard guard{sweeping};
       while (residentBytes.load(std::memory_order_relaxed)
-             > config.lowWatermarkBytes) {
+             > lowWatermarkBytes(budgetBytes())) {
         std::vector<std::shared_ptr<FilterEntry>> entrySnapshot;
         entrySnapshot.reserve(entries.size());
         entries.cvisit_all([&](const auto& item) {
@@ -1715,7 +1761,9 @@ void FilterCache::sweep() {
         bool detached = false;
         for (const auto& candidate : candidates) {
           if (residentBytes.load(std::memory_order_relaxed)
-              <= config.lowWatermarkBytes) break;
+              <= lowWatermarkBytes(budgetBytes())) {
+            break;
+          }
           if (candidate.readerValue != nullptr) {
             std::lock_guard<FilterEntry> feedbackLock(*candidate.entry);
             auto expected = candidate.readerValue;
@@ -1762,9 +1810,11 @@ void FilterCache::sweep() {
 }
 
 void FilterCache::sweepMetadata() {
+  size_t bytes = budgetBytes();
+  size_t low = lowWatermarkMetadataBytes(bytes);
   if (entries.size() <= config.maxMetadataEntries
       && metadataBytes.load(std::memory_order_relaxed)
-          <= config.maxMetadataBytes) {
+          <= maxMetadataBytes(bytes)) {
     return;
   }
   struct Candidate {
@@ -1784,7 +1834,7 @@ void FilterCache::sweepMetadata() {
   for (const auto& candidate : candidates) {
     bool overCount = entries.size() > config.maxMetadataEntries;
     bool overBytes = metadataBytes.load(std::memory_order_relaxed)
-        > config.lowWatermarkMetadataBytes;
+        > low;
     if (!overCount && !overBytes) break;
     bool canErase = true;
     {
@@ -1792,7 +1842,7 @@ void FilterCache::sweepMetadata() {
       if (!candidate.entry->resident) continue;
       overCount = entries.size() > config.maxMetadataEntries;
       overBytes = metadataBytes.load(std::memory_order_relaxed)
-          > config.lowWatermarkMetadataBytes;
+          > low;
       if (!overCount && !overBytes) break;
       auto readerValue = candidate.entry->readerValue.load(
           std::memory_order_acquire);
@@ -1852,6 +1902,34 @@ void FilterCache::sweepMetadata() {
   }
 }
 
+void FilterCache::detachEntry(const std::shared_ptr<FilterEntry>& entry) {
+  std::lock_guard<std::mutex> lock(entry->mutex);
+  entry->resident = false;
+  std::lock_guard<FilterEntry> readerFeedbackLock(*entry);
+  auto readerValue = entry->readerValue.exchange(
+      nullptr, std::memory_order_acq_rel);
+  if (readerValue != nullptr) {
+    residentBytes.fetch_sub(readerValue->ramBytesUsed(),
+                            std::memory_order_relaxed);
+  }
+  entry->readerDeadBuildStreak.store(
+      0, std::memory_order_relaxed);
+  entry->readerBuildBypassesRemaining.store(
+      0, std::memory_order_relaxed);
+  auto slots = entry->slots.load(std::memory_order_acquire);
+  for (const auto& slot : *slots) {
+    std::lock_guard<SegmentSlot> feedbackLock(*slot);
+    slot->active.store(false, std::memory_order_release);
+    slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+    slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
+    auto value = slot->value.exchange(nullptr, std::memory_order_acq_rel);
+    if (value != nullptr) {
+      residentBytes.fetch_sub(value->ramBytesUsed(),
+                              std::memory_order_relaxed);
+    }
+  }
+}
+
 void FilterCache::clear() {
   struct Candidate {
     FilterKey key;
@@ -1863,33 +1941,7 @@ void FilterCache::clear() {
     snapshot.push_back({item.first, item.second});
   });
   for (const auto& candidate : snapshot) {
-    {
-      std::lock_guard<std::mutex> lock(candidate.entry->mutex);
-      candidate.entry->resident = false;
-      std::lock_guard<FilterEntry> readerFeedbackLock(*candidate.entry);
-      auto readerValue = candidate.entry->readerValue.exchange(
-          nullptr, std::memory_order_acq_rel);
-      if (readerValue != nullptr) {
-        residentBytes.fetch_sub(readerValue->ramBytesUsed(),
-                                std::memory_order_relaxed);
-      }
-      candidate.entry->readerDeadBuildStreak.store(
-          0, std::memory_order_relaxed);
-      candidate.entry->readerBuildBypassesRemaining.store(
-          0, std::memory_order_relaxed);
-      auto slots = candidate.entry->slots.load(std::memory_order_acquire);
-      for (const auto& slot : *slots) {
-        std::lock_guard<SegmentSlot> feedbackLock(*slot);
-        slot->active.store(false, std::memory_order_release);
-        slot->deadBuildStreak.store(0, std::memory_order_relaxed);
-        slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
-        auto value = slot->value.exchange(nullptr, std::memory_order_acq_rel);
-        if (value != nullptr) {
-          residentBytes.fetch_sub(value->ramBytesUsed(),
-                                  std::memory_order_relaxed);
-        }
-      }
-    }
+    detachEntry(candidate.entry);
     eraseEntry(candidate.key, candidate.entry);
   }
 }

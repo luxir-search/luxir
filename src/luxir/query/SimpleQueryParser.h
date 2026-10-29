@@ -179,6 +179,7 @@ public:
       try {
         target = &resolver().resolve(f, OpClass::SEARCH);
       } catch (const RequestError& e) {
+        if (e.code == "retrieval_only") throw;
         throw std::runtime_error(fmt::format(
             "simple_query 'fields' entry '{}' is not a queryable text/string/id field: {}", f, e.what()));
       }
@@ -460,6 +461,9 @@ private:
     api::Val v;
     v.kind = value;
     try {
+      if (fieldType.type() == FieldType::DATE) {
+        return ((DateFieldType&)fieldType).tryCoerceDateRange(v, opts.coerceContext).has_value();
+      }
       fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
       return true;
     } catch (const std::exception&) {
@@ -477,7 +481,8 @@ private:
   const ResolvedFieldHandle* fieldFor(std::string_view name, OpClass op) {
     try {
       return &resolver().resolve(name, op);
-    } catch (const RequestError&) {
+    } catch (const RequestError& e) {
+      if (e.code == "retrieval_only") throw;
       return nullptr;
     }
   }

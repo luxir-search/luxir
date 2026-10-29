@@ -13,7 +13,11 @@
 #include <variant>
 #include <vector>
 
+#include "luxir/api/RequestFlags.h"
+#include "luxir/search/SearchOpRegistry.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchEngine.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/search/ops/SearchOp.h"
@@ -23,8 +27,10 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/QueryShape.h"
@@ -91,9 +97,24 @@ std::vector<double> resolveSourceWeights(
   return resolved;
 }
 
+// Also used before ops are constructed: domains and selections belong to the
+// child's options even though its parent pointer does not exist yet.
+struct OpParseContext {
+  uint64_t flags = 0;
+
+  OpParseContext child(const api::SearchOp& op, std::string_view name) const {
+    try {
+      return {RequestFlags::resolve(flags, op.flags, op.flags_set, RequestFlags::Level::OP)};
+    } catch (const RequestError& error) {
+      throw RequestError("op '" + std::string(name) + "': " + error.what());
+    }
+  }
+};
+
 struct SearchParserImpl {
   SearchRequest& req;
   FieldResolver fields;
+  OpParseContext options;
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
@@ -106,7 +127,6 @@ struct SearchParserImpl {
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
-  static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
 
   enum class TopDocsPlacement : uint8_t {
     ROOT_OP,
@@ -120,12 +140,14 @@ struct SearchParserImpl {
     FACET_BUCKET,
     GROUP_BUCKET,
     FUSION,
+    PLUGIN,
   };
 
   struct ParsedFences {
     std::span<const int64_t> values;
     int64_t affineGap = 0;
     bool affine = false;
+    std::span<const RangeFacetRun> runs;
   };
 
   struct ParsedDomain {
@@ -146,64 +168,6 @@ struct SearchParserImpl {
     req.warnOnce(code, message);
   }
 
-  ParsedFences makeAffineFences(std::string_view facetName,
-                                 int64_t start, int64_t end, int64_t gap) {
-    uint64_t distance = (uint64_t)end - (uint64_t)start;
-    uint64_t bucketCount = distance / (uint64_t)gap
-                         + (distance % (uint64_t)gap != 0);
-    if (bucketCount > MAX_RANGE_BUCKETS) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range exceeds the 100000 bucket limit");
-    }
-    auto fences = req.requestPool.make_span<int64_t>((size_t)bucketCount + 1);
-    for (uint64_t i = 0; i <= bucketCount; i++) {
-      __uint128_t product = (__uint128_t)i * (uint64_t)gap;
-      uint64_t offset = product < distance ? (uint64_t)product : distance;
-      fences[(size_t)i] = (int64_t)((uint64_t)start + offset);
-    }
-    return {fences, gap, true};
-  }
-
-  ParsedFences makeFloatingFences(std::string_view facetName,
-                                  FieldType::Type type,
-                                  double start, double end, double gap) {
-    std::vector<int64_t> built;
-    built.reserve(256);
-    for (size_t i = 0; ; i++) {
-      if (i > MAX_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range exceeds the 100000 bucket limit");
-      }
-      double nominal = start + (double)i * gap;
-      double value = nominal < end ? nominal : end;
-      int64_t encoded;
-      if (type == FieldType::Type::FLOAT) {
-        float rounded = (float)value;
-        if (!std::isfinite(rounded)) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': fence " + std::to_string(i)
-              + " is not finite after FLOAT rounding");
-        }
-        encoded = (int64_t)floatToSortableInt32(rounded);
-      } else {
-        encoded = doubleToSortableInt64(value);
-      }
-      if (!built.empty() && encoded <= built.back()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': fence " + std::to_string(i)
-            + " is not strictly increasing after "
-            + (type == FieldType::Type::FLOAT ? "FLOAT" : "DOUBLE")
-            + " rounding");
-      }
-      built.push_back(encoded);
-      if (value == end) break;
-    }
-
-    auto fences = req.requestPool.make_span<int64_t>(built.size());
-    std::copy(built.begin(), built.end(), fences.begin());
-    return {fences, 0, false};
-  }
-
   static std::optional<CalendarUnit> calendarUnit(
       api::CalendarGap::Unit unit) {
     using Unit = api::CalendarGap::Unit;
@@ -218,112 +182,32 @@ struct SearchParserImpl {
     return std::nullopt;
   }
 
-  ParsedFences makeCalendarFences(
-      std::string_view facetName, int64_t start, int64_t end,
-      const api::CalendarGap& gap, const TimeZone& zone) {
-    auto unit = calendarUnit(gap.unit);
-    if (gap.n <= 0 || !unit) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
-    }
-    if (!zone.isIana()
-        && (*unit == CalendarUnit::DAY || *unit == CalendarUnit::WEEK)) {
-      int64_t daysPerUnit = *unit == CalendarUnit::WEEK ? 7 : 1;
-      __int128 fixedGap = (__int128)gap.n * daysPerUnit
-                        * datetime_detail::kMsPerDay;
-      if (fixedGap > std::numeric_limits<int64_t>::max()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar_gap is too large");
-      }
-      return makeAffineFences(facetName, start, end, (int64_t)fixedGap);
-    }
-
-    CivilCalendarStepper stepper(start, zone);
-    if (!stepper.valid() || !civilFromInstant(end, zone)) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar bounds are outside the supported civil range");
-    }
-    auto previous = stepper.at(0, *unit);
-    if (!previous || previous->instant != start) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar start cannot be resolved in its civil frame");
-    }
-
-    std::vector<int64_t> built;
-    built.reserve(256);
-    built.push_back(start);
-    std::optional<int64_t> shiftedFence;
-    for (int64_t i = 1; ; i++) {
-      __int128 amount = (__int128)i * gap.n;
-      if (amount > std::numeric_limits<int64_t>::max()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fence arithmetic overflow");
-      }
-      auto fence = stepper.at((int64_t)amount, *unit);
-      if (!fence) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fence is outside the supported civil range");
-      }
-      bool substituted = shiftedFence.has_value();
-      int64_t instant = substituted ? *shiftedFence : fence->instant;
-      shiftedFence.reset();
-
-      // A whole skipped date can be reported one nominal endpoint late by
-      // libstdc++'s text-tzdb reader. Detect it from the forward jump covering
-      // the civil interval, drop its bucket now, and carry its shifted instant
-      // as the surviving next label's fence.
-      if (!substituted) {
-        __int128 nextAmount = (__int128)(i + 1) * gap.n;
-        if (nextAmount <= std::numeric_limits<int64_t>::max()) {
-          auto next = stepper.at((int64_t)nextAmount, *unit);
-          if (next && civilIntervalSkipped(
-                  fence->civilMillis, next->civilMillis, zone)) {
-            std::string label = formatEpochMillisIso8601(
-                fence->civilMillis).substr(0, 10);
-            warnOnce("calendar_bucket_skipped",
-                "facet '" + std::string(facetName) + "': calendar bucket "
-                + label + " skipped: no such local day in " + zone.name());
-            shiftedFence = fence->instant;
-            previous = fence;
-            continue;
-          }
-        }
-      }
-
-      if (instant >= end) {
-        built.push_back(end);
-        if (built.size() - 1 > MAX_RANGE_BUCKETS) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': range exceeds the 100000 bucket limit");
-        }
-        break;
-      }
-      if (instant < built.back()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fences are not increasing");
-      }
-      if (instant == built.back()) {
-        std::string label = formatEpochMillisIso8601(previous->civilMillis).substr(0, 10);
+  ParsedFences makeGridFences(std::string_view facetName,
+                              const RangeFacetGrid& grid,
+                              int64_t lo, int64_t hi, bool clip) {
+    try {
+      auto built = grid.fences(lo, hi, clip, MAX_RANGE_BUCKETS);
+      for (int64_t civil : built.skippedCivil) {
         warnOnce("calendar_bucket_skipped",
-            "facet '" + std::string(facetName) + "': calendar bucket " + label
-            + " skipped: no such local day in " + zone.name());
-        previous = fence;
-        continue;
+            "facet '" + std::string(facetName) + "': calendar bucket "
+            + formatEpochMillisIso8601(civil).substr(0, 10)
+            + " skipped: no such local day in " + grid.timeZone().name());
       }
-      built.push_back(instant);
-      if (built.size() - 1 > MAX_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range exceeds the 100000 bucket limit");
+      auto fences = req.requestPool.make_span<int64_t>(built.values.size());
+      std::copy(built.values.begin(), built.values.end(), fences.begin());
+      std::span<RangeFacetRun> runs;
+      if (!built.affineGap) {
+        auto compressed = grid.runs(built.values);
+        if (!compressed.empty()) {
+          runs = req.requestPool.make_span<RangeFacetRun>(compressed.size());
+          std::copy(compressed.begin(), compressed.end(), runs.begin());
+        }
       }
-      previous = fence;
+      return {fences, built.affineGap, built.affineGap != 0, runs};
+    } catch (const std::runtime_error& error) {
+      throw std::runtime_error("facet '" + std::string(facetName) + "': " + error.what());
     }
-
-    auto fences = req.requestPool.make_span<int64_t>(built.size());
-    std::copy(built.begin(), built.end(), fences.begin());
-    return {fences, 0, false};
   }
-
-
 
 public:
   // The provided pool will be used to store the parsed query tree.
@@ -333,16 +217,23 @@ public:
     : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
+  CoerceContext coerceContext(const TimeZone& zone) const {
+    return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags)};
+  }
+
   RootOp* parse() {
+    req.flags = RequestFlags::resolve(0, req.proto.flags, req.proto.flags_set);
+    options.flags = req.flags;
     RootOp& rootOp = *luxir::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
+    rootOp.flags = options.flags;
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
-      "root", &req.warnings, &fields};
-    ProtobufQueryParser parser(parseContext);
-    ParsedDomains domains = parseChildDomains(req.proto.ops, parser);
+      coerceContext(*req.timeZone),
+      "root", &req.warnings, &fields, &req.engine.getNode()};
+    parseContext.reader = req.reader.get();
+    ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
       rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
           req.arena, req.requestPool, *req.reader,
@@ -383,6 +274,46 @@ public:
     }
   }
 
+  void groupExprStats(SearchOp& parent, OpsPlacement placement,
+      const boost::unordered_flat_map<std::string_view, SearchOp*>& block) {
+    if (disableAggregateSharingForTests || block.size() < 2) return;
+    struct Candidate {
+      ExprStatsOp* op;
+      const DomainVariantPlan* plan;
+      size_t variant;
+    };
+    const DomainVariantPlan* parentPlan = nullptr;
+    if (placement == OpsPlacement::REQUEST_ROOT) {
+      parentPlan = &static_cast<RootOp&>(parent).domainVariants;
+    } else if (placement == OpsPlacement::TOP_DOCS) {
+      parentPlan = &static_cast<TopDocsReq&>(parent).domainVariants;
+    }
+    std::vector<Candidate> candidates;
+    for (auto& [name, child] : block) {
+      auto* metric = dynamic_cast<ExprStatsOp*>(child);
+      if (metric == nullptr || !metric->hasOnlyIndirectProducers()) continue;
+      auto* plan = parentPlan ? parentPlan
+          : child->bucketDomain ? &child->bucketDomain->variants : nullptr;
+      size_t variant = plan ? plan->variantForChild(name) : 0;
+      candidates.push_back({metric, variant == 0 ? nullptr : plan, variant});
+    }
+    std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
+      return candidate.op->name;
+    });
+    std::vector<Candidate> leaders;
+    for (const Candidate& candidate : candidates) {
+      bool shared = false;
+      for (const Candidate& leader : leaders) {
+        if (candidate.plan == leader.plan && candidate.variant == leader.variant
+            && candidate.op->shareProducersFrom(*leader.op)) {
+          shared = true;
+          break;
+        }
+      }
+      if (!shared) leaders.push_back(candidate);
+    }
+  }
+
   void addSubs(SearchOp& currOp, OpsMap ops, int depth,
                OpsPlacement placement,
                boost::unordered_flat_map<std::string_view, SearchOp*>* destination = nullptr,
@@ -398,11 +329,11 @@ public:
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
       ParseContext context{req.requestPool, *req.schema, req.arena,
-          CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
-          currOp.name, &req.warnings, &fields};
+          coerceContext(*req.timeZone),
+          currOp.name, &req.warnings, &fields, &req.engine.getNode()};
       context.collapse = enclosingCollapse;
-      ProtobufQueryParser parser(context);
-      auto domains = parseChildDomains(ops, parser);
+      context.reader = req.reader.get();
+      auto domains = parseChildDomains(ops, context);
       if (!domains.empty()) {
         std::vector<Query*> filters;
         auto* owner = placement == OpsPlacement::GROUP_BUCKET ? currentList : owningList;
@@ -469,15 +400,22 @@ public:
         currOp.needsStructuralScope = true;
       }
     }
+    groupExprStats(currOp, placement, destination ? *destination : currOp.subOps);
   }
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
+    auto inherited = options;
+    options = inherited.child(searchOp, name);
+    auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
+    if (searchOp.domain && placement == OpsPlacement::PLUGIN) {
+      throw RequestError("domain is not supported under a plugin operation's ops");
+    }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
-    return std::visit(luxir::overloaded{
+    SearchOp* op = std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
         auto* oldCollapse = enclosingCollapse;
         auto* oldMeasure = inheritedFacetMeasure;
@@ -485,8 +423,9 @@ public:
           enclosingCollapse = oldCollapse;
           inheritedFacetMeasure = oldMeasure;
         });
-        auto topDocsPlacement = depth == 1 ? TopDocsPlacement::ROOT_OP
-                                           : TopDocsPlacement::NESTED_OP;
+        // An explicit domain supplies external eligibility, as for nested lists.
+        auto topDocsPlacement = depth == 1 && !searchOp.domain
+            ? TopDocsPlacement::ROOT_OP : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
         if (topDocs.collapse) {
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
@@ -547,9 +486,10 @@ public:
         } else {
           ParseContext parseContext{
             req.requestPool, *req.schema, req.arena,
-            CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
-            name, &req.warnings, &fields};
+            coerceContext(*req.timeZone),
+            name, &req.warnings, &fields, &req.engine.getNode()};
           parseContext.collapse = enclosingCollapse;
+          parseContext.reader = req.reader.get();
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -565,13 +505,19 @@ public:
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
         options.fieldResolver = &fields;
+        options.shareProducers = !disableAggregateSharingForTests;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
       },
+      [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
+        return parsePluginOp(name, pluginOp, depth);
+      },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
+    if (op != nullptr) op->flags = options.flags;
+    return op;
   }
 
   template<typename Facet>
@@ -600,6 +546,7 @@ public:
       std::string location = placement == OpsPlacement::REQUEST_ROOT
           ? "request root"
           : placement == OpsPlacement::FUSION ? "Fusion.ops"
+          : placement == OpsPlacement::PLUGIN ? "a plugin operation's ops"
                                               : "nested facet bucket";
       throw std::runtime_error("facet '" + std::string(facetName) + "' at "
           + location
@@ -650,7 +597,9 @@ public:
       }
       collapse->fields.push_back({field.physicalName, wireType,
           ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
-          req.reader->field(field.physicalName)});
+          req.reader->field(field.physicalName), type.type() == FieldType::DATE
+              ? dateValueNature(DateFieldType::unitOf(type))
+              : ValueNature::NUMBER});
     }
     return collapse;
   }
@@ -672,7 +621,7 @@ public:
       }
     }
     if (facetReq.count_distinct) {
-      if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()
+      if (facetReq.count_distinct->get_count || !facetReq.count_distinct->head_sort.empty()
           || !facetReq.count_distinct->sort.empty()
           || !facetReq.count_distinct->ops.empty()) {
         throw RequestError("count_distinct accepts only field and missing");
@@ -714,7 +663,9 @@ public:
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
-      limit = *facetReq.limit;
+      // Any negative limit means all, as for top docs; facet ops test the
+      // -1 sentinel exactly.
+      limit = std::max<int64_t>(*facetReq.limit, -1);
     }
     int64_t minCount = -1;
     if (facetReq.mincount.has_value()) {
@@ -736,8 +687,7 @@ public:
         : ValueSequence();
     CanonicalValueSet ownedSelected;
     if (preparedSelected == nullptr && !selectedValues.empty()) {
-      CoerceContext selectionContext{
-          req.dateMathNowEpochMillis, *req.timeZone};
+      CoerceContext selectionContext = coerceContext(*req.timeZone);
       QueryBuilder builder(req.requestPool, *req.schema,
                            selectionContext, facetName, &req.warnings, &fields);
       ownedSelected = builder.canonicalizeFieldValues(
@@ -757,8 +707,8 @@ public:
 
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
-      // DATE is epoch millis in the int column; it terms-facets exactly like
-      // INT (distinct millis values).  Date-histogram bucketing is a range
+      // DATE stores native ticks in the int column; it terms-facets exactly
+      // like INT (distinct values). Date-histogram bucketing is a range
       // facet, not a terms facet.
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
@@ -810,9 +760,25 @@ public:
     const CollapsePlan* measure = resolveMeasure(facetReq);
     const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
-    if (!facetReq.start.has_value() || !facetReq.end.has_value()) {
+    bool dataBounds = facetReq.bounds == api::RangeFacet_::Bounds::DATA;
+    if (!dataBounds && facetReq.bounds != api::RangeFacet_::Bounds::EXPLICIT) {
       throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range start and end are required");
+          + "': bounds must be EXPLICIT or DATA");
+    }
+    if (dataBounds) {
+      if (facetReq.selected.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': selected is not supported with bounds DATA");
+      }
+    } else {
+      if (facetReq.origin.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': origin requires bounds DATA");
+      }
+      if (!facetReq.start.has_value() || !facetReq.end.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': range start and end are required unless bounds is DATA");
+      }
     }
     if (std::holds_alternative<std::monostate>(facetReq.gap_kind)) {
       throw std::runtime_error("facet '" + std::string(facetName)
@@ -834,23 +800,25 @@ public:
           + "': time_zone and calendar_gap are only valid for DATE fields");
     }
 
+    std::optional<CalendarUnit> calendarGridUnit;
+    if (calendar) {
+      const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
+      calendarGridUnit = calendarUnit(spec.unit);
+      if (spec.n <= 0 || !calendarGridUnit) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
+      }
+      if (facetReq.origin.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': origin is not supported with calendar_gap");
+      }
+    }
+
     int64_t minCount = facetReq.mincount.value_or(0);
     if (minCount < 0) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': mincount must be >= 0");
     }
-
-    // With sub-ops, every bucket carries a domain builder per segment plus
-    // per-bucket response slots, so the cap sits far below the plain-counting
-    // bucket limit.
-    auto checkSubOpBucketCap = [&](const ParsedFences& parsed) {
-      if (!facetReq.ops.empty()
-          && parsed.values.size() - 1 > MAX_SUBOP_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range facets with sub-ops are limited to "
-            + std::to_string(MAX_SUBOP_RANGE_BUCKETS) + " buckets");
-      }
-    };
 
     TimeZone zone = TimeZone::utc();
     if (fieldType->type() == FieldType::Type::DATE) {
@@ -868,7 +836,7 @@ public:
         zone = *resolved;
       }
     }
-    CoerceContext context{req.dateMathNowEpochMillis, zone};
+    CoerceContext context = coerceContext(zone);
 
     auto resolveSelectedBuckets = [&](const ParsedFences& parsed,
                                       auto&& encode) {
@@ -915,7 +883,7 @@ public:
 
     auto dateBound = [&](const api::Val& value) {
       auto& dateType = (DateFieldType&)*fieldType;
-      DateRange range = dateType.coerceDateRange(value, facetField, context);
+      auto range = dateType.coerceDateRange(value, facetField, context);
       if (range.granuleSkipped) {
         const auto* text = std::get_if<std::string_view>(&value.kind);
         if (text != nullptr) {
@@ -939,9 +907,10 @@ public:
         }
         return result == 0.0 ? 0.0 : result;
       };
-      double start = floatingValue(*facetReq.start, "start");
-      double end = floatingValue(*facetReq.end, "end");
-      if (start >= end) {
+      std::optional<double> givenStart, givenEnd;
+      if (facetReq.start.has_value()) givenStart = floatingValue(*facetReq.start, "start");
+      if (facetReq.end.has_value()) givenEnd = floatingValue(*facetReq.end, "end");
+      if (givenStart && givenEnd && *givenStart >= *givenEnd) {
         throw std::runtime_error("facet '" + std::string(facetName)
             + "': range start must be less than end");
       }
@@ -955,9 +924,21 @@ public:
         throw std::runtime_error("facet '" + std::string(facetName)
             + "': range gap must be > 0");
       }
-      ParsedFences parsed = makeFloatingFences(
-          facetName, fieldType->type(), start, end, gap);
-      checkSubOpBucketCap(parsed);
+      auto gridType = fieldType->type();
+      double origin = dataBounds
+          ? (facetReq.origin.has_value() ? floatingValue(*facetReq.origin, "origin") : 0.0)
+          : *givenStart;
+      auto grid = RangeFacetGrid::floating(gridType, gap, origin);
+      auto encodedStart = givenStart ? std::optional<int64_t>(grid.encode(*givenStart)) : std::nullopt;
+      auto encodedEnd = givenEnd ? std::optional<int64_t>(grid.encode(*givenEnd)) : std::nullopt;
+      if (dataBounds) {
+        auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+            facetField, facetName, std::move(grid), encodedStart, encodedEnd,
+            fieldType->type(), minCount, facetReq.missing);
+        configureMeasure(*facet, measure);
+        return facet;
+      }
+      auto parsed = makeGridFences(facetName, grid, *encodedStart, *encodedEnd, true);
       auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
         double canonical = floatingValue(value, "selected value");
         return fieldType->type() == FieldType::Type::FLOAT
@@ -967,56 +948,67 @@ public:
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
-          facetReq.missing, selected);
+          facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
       return facet;
     }
 
-    int64_t start = fieldType->type() == FieldType::Type::DATE
-        ? dateBound(*facetReq.start)
-        : fieldType->coerceColInt64(*facetReq.start, facetField, context);
-    int64_t end = fieldType->type() == FieldType::Type::DATE
-        ? dateBound(*facetReq.end)
-        : fieldType->coerceColInt64(*facetReq.end, facetField, context);
-    if (start >= end) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range start must be less than end");
-    }
-
-    ParsedFences parsed;
-    if (const auto* gapValue = std::get_if<api::Val>(&facetReq.gap_kind)) {
-      int64_t gap;
-      if (fieldType->type() == FieldType::Type::DATE) {
-        const auto* millis = std::get_if<int64_t>(&gapValue->kind);
-        if (millis == nullptr) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': a DATE fixed gap must be integer milliseconds");
-        }
-        gap = *millis;
-      } else {
-        gap = fieldType->coerceColInt64(*gapValue, facetField, context);
-      }
-      if (gap <= 0) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range gap must be > 0");
-      }
-      parsed = makeAffineFences(facetName, start, end, gap);
-    } else {
-      parsed = makeCalendarFences(facetName, start, end,
-          std::get<api::CalendarGap>(facetReq.gap_kind), zone);
-    }
-    checkSubOpBucketCap(parsed);
-
-    auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
+    auto intBound = [&](const api::Val& value) {
       return fieldType->type() == FieldType::Type::DATE
           ? dateBound(value)
           : fieldType->coerceColInt64(value, facetField, context);
+    };
+    std::optional<int64_t> givenStart, givenEnd;
+    if (facetReq.start.has_value()) givenStart = intBound(*facetReq.start);
+    if (facetReq.end.has_value()) givenEnd = intBound(*facetReq.end);
+    if (givenStart && givenEnd && *givenStart >= *givenEnd) {
+      throw std::runtime_error("facet '" + std::string(facetName)
+          + "': range start must be less than end");
+    }
+    bool date = fieldType->type() == FieldType::DATE;
+    auto dateUnit = date ? DateFieldType::unitOf(*fieldType) : DateUnit::MILLIS;
+    auto grid = [&]() {
+      if (calendar) {
+        const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
+        return RangeFacetGrid::calendar(*calendarGridUnit, spec.n, zone,
+            dataBounds ? std::nullopt : givenStart, dateUnit);
+      }
+      auto integer = [&](const api::Val& value, std::string_view name) -> __int128 {
+        if (!date) return fieldType->coerceColInt64(value, facetField, context);
+        const auto* number = std::get_if<int64_t>(&value.kind);
+        if (!number) {
+          throw RequestError(std::format("facet '{}': a DATE {} must be integer {}",
+              facetName, name, dateUnitName(context.dateInputUnit.value_or(dateUnit))));
+        }
+        return convertDateUnits(*number, context.dateInputUnit.value_or(dateUnit), dateUnit);
+      };
+      auto convertedGap = integer(std::get<api::Val>(facetReq.gap_kind), "fixed gap");
+      if (convertedGap <= 0 || convertedGap > INT64_MAX) {
+        throw RequestError(std::format("facet '{}': range gap must be > 0 and fit int64 in field units", facetName));
+      }
+      int64_t gap = (int64_t)convertedGap;
+      int64_t origin = dataBounds && facetReq.origin.has_value()
+          ? (int64_t)(integer(*facetReq.origin, "origin") % gap) : 0;
+      return RangeFacetGrid::fixed(fieldType->type(), gap, origin, zone, dateUnit,
+          dataBounds ? std::nullopt : givenStart);
+    }();
+    if (dataBounds) {
+      auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+          facetField, facetName, std::move(grid), givenStart, givenEnd,
+          fieldType->type(), minCount, facetReq.missing);
+      configureMeasure(*facet, measure);
+      return facet;
+    }
+    auto parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
+
+    auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
+      return intBound(value);
     });
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, fieldType->type(), minCount,
-        facetReq.missing, selected);
+        facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
     return facet;
   }
@@ -1108,11 +1100,18 @@ public:
   }
 
   ParsedDomains parseChildDomains(
-      OpsMap ops, ProtobufQueryParser& parser) {
+      OpsMap ops, ParseContext& parseContext) {
     ParsedDomains out;
     for (const auto& [key, childView] : lastWins(ops)) {
       const api::SearchOp& child = **childView;
+      auto childOptions = options.child(child, key);
       if (!child.domain.has_value()) continue;
+      auto inheritedCoercion = parseContext.coerceContext;
+      parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(childOptions.flags);
+      auto restoreCoercion = scope_guard([&]() noexcept {
+        parseContext.coerceContext = inheritedCoercion;
+      });
+      ProtobufQueryParser parser(parseContext);
       const api::Domain& domain = *child.domain;
       std::string path = "op '" + std::string(key) + "'.domain";
       if (domain.apply_parent_filters.has_value()
@@ -1375,6 +1374,14 @@ public:
       if (fieldProto == nullptr && rangeProto == nullptr
           && queryProto == nullptr) continue;
 
+      auto inherited = options;
+      options = inherited.child(child, key);
+      auto inheritedCoercion = parseContext.coerceContext;
+      parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(options.flags);
+      auto restoreOptions = scope_guard([&]() noexcept {
+        options = inherited;
+        parseContext.coerceContext = inheritedCoercion;
+      });
       constexpr auto placement = OpsPlacement::TOP_DOCS;
       if (fieldProto != nullptr) {
         validateSelectionEnvelope(key, *fieldProto, placement);
@@ -1537,25 +1544,14 @@ public:
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
                            TopDocsPlacement placement) {
-    /*
-    message TopDocs {
-            Query query = 1;
-            int64 offset = 2;
-            optional sint64 limit = 3;
-            bool get_number = 4;          // return the number of matching documents
-            bool get_scores = 5;          // return the relevancy score for each document returned
-            repeated string fields = 6;   // fields to return for each document (empty: every retrievable field)
-            repeated SortSpec sort = 7;
-    }
-    */
-
+    int64_t countLimit = topDocsReq.count_limit.value_or(0);
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
     DiversifyPlan* diversify = nullptr;
     if (topDocsReq.diversify) {
       auto keys = diversifyKeySpec(topDocsReq);
       auto* resolved = resolveCollapse(keys,
-          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
+          placement != TopDocsPlacement::FUSION_SOURCE && countLimit != 0);
       diversify = luxir::arenaCreate<DiversifyPlan>(req.arena,
           *resolved, (size_t)*topDocsReq.diversify->max_per_key, req.memoryTracker);
     }
@@ -1563,22 +1559,23 @@ public:
     if (topDocsReq.collapse) {
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
         const auto& spec = *topDocsReq.collapse;
-        if (!spec.head_sort.empty() || !spec.sort.empty() || spec.get_number || !spec.ops.empty()) {
+        if (!spec.head_sort.empty() || !spec.sort.empty() || spec.get_count || !spec.ops.empty()) {
           throw RequestError("fusion source '" + std::string(name)
-              + "': collapse supports only field and missing; head_sort, sort, get_number and ops"
+              + "': collapse supports only field and missing; head_sort, sort, get_count and ops"
                 " require source finalization");
         }
       }
       collapse = resolveCollapse(*topDocsReq.collapse,
-          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
+          placement != TopDocsPlacement::FUSION_SOURCE && countLimit != 0);
       enclosingCollapse = collapse;
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
     }
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -1586,11 +1583,26 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    // A minimum score turns the query's score into part of its membership,
+    // so the cut-off wraps the query before filters fold in beside it: every
+    // ranking, count, and ops-domain route below then sees the same matches.
+    if (topDocsReq.min_score.has_value()) {
+      if (!std::isfinite(*topDocsReq.min_score)) {
+        throw std::runtime_error(
+            "top_docs '" + std::string(name) + "': min_score must be finite");
+      }
+      query = req.requestPool.make<MinScoreQuery>(
+          query, *topDocsReq.min_score);
+    }
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
     if (offset < 0) {
       throw std::runtime_error(
           "top_docs '" + std::string(name) + "': offset must be >= 0");
+    }
+    if (countLimit < -1) {
+      throw std::runtime_error(
+          "top_docs '" + std::string(name) + "': count_limit must be >= -1");
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
@@ -1624,8 +1636,8 @@ public:
         explicitFilters,
         prepareFacetSelections(
             topDocsReq, parseContext, parser,
-            specifiedLimit != 0 || topDocsReq.get_number));
-    ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
+            specifiedLimit != 0 || countLimit != 0));
+    ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parseContext);
 
     DomainVariantPlan domainVariants;
     bool routedFilterSyntax = std::any_of(
@@ -1644,14 +1656,14 @@ public:
     // query tree owns both matching and preparation. Keep the routed filter
     // metadata on TopDocsReq; the toggle preserves the former passive domain
     // path as the benchmark baseline.
-    bool countClauseDisabled =
-        BooleanQuery::disableFilterClauseCountForTests
-        && limit == 0 && topDocsReq.get_number;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
-      .needExactCount = topDocsReq.get_number,
+      .countLimit = countLimit,
       .needExactDomain = !topDocsReq.ops.empty()
     };
+    bool countClauseDisabled =
+        BooleanQuery::disableFilterClauseCountForTests
+        && limit == 0 && requirements.needsCount();
     bool foldFilters = !routedFilters && !filters.empty()
         && !disableTopDocsFilterFold
         && !countClauseDisabled;
@@ -1727,27 +1739,34 @@ public:
             || (headSort && headSort->rankNeedsScores))) {
       requestFlags |= Query::NEED_SCORES;
     }
+    // Document cardinality is not a distinct-group count; collapse totals
+    // read every eligible key through the normal exhaustive driver.
+    bool exactCountTopKShape = collapse == nullptr && diversify == nullptr
+        && requirements.needRankedDocs
+        && requirements.needsCount() && !requirements.needExactDomain
+        && !parsedSorts.useFieldSort
+        && parsedSorts.rankNeedsScores;
+    // A bounded root list uses an exact count when the whole-membership plan
+    // supplies it from metadata or a resident entry. Otherwise collection
+    // holds the competitive threshold at lowest until countLimit hits.
+    bool boundedCount = exactCountTopKShape
+        && placement == TopDocsPlacement::ROOT_OP && requirements.isBounded();
     // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
     // pruning because a separate exhaustive windowed pass produces their
     // complete match domain and exact count before the ranking pass. Match-all
     // reuses the incoming domain and its cardinality instead.
     bool allowPruning = requirements.needRankedDocs
         && !parsedSorts.useFieldSort
-        && (!requirements.needExactCount || requirements.needExactDomain);
-    if (allowPruning && !(diversify && topDocsReq.get_number)
+        && (!requirements.needsCount() || requirements.needExactDomain || boundedCount);
+    if (allowPruning && !(diversify && requirements.needsCount())
         && !(collapse && !topDocsReq.collapse->sort.empty())) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
-    // Document cardinality is not a distinct-group count; collapse totals
-    // read every eligible key through the normal exhaustive driver.
-    bool exactCountTopK = collapse == nullptr && diversify == nullptr && requirements.needRankedDocs
-        && requirements.needExactCount && !requirements.needExactDomain
-        && !parsedSorts.useFieldSort
-        && parsedSorts.rankNeedsScores;
+    bool exactCountTopK = exactCountTopKShape && !boundedCount;
     bool pureCountShape = collapse == nullptr && diversify == nullptr
         && !QueryPrep::disableWholeMembershipPlanForTests
-        && limit == 0 && topDocsReq.get_number
+        && limit == 0 && requirements.needsCount()
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
@@ -1770,7 +1789,7 @@ public:
     if (cacheFirstMembershipUse == nullptr
         && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
-        && exactCountTopK && (foldFilters || filters.empty())
+        && exactCountTopKShape && (foldFilters || filters.empty())
         && canOmitWeightForCacheFirstMembership(*query)
         && !directCountAvailable(*query, *req.reader)
         && cache != nullptr && cache->enabled()) {
@@ -1948,7 +1967,7 @@ public:
     bool wholeConstantRanking = false;
     bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
-        && exactCountTopK
+        && exactCountTopKShape
         && (cacheFirstTopKCount
             || (weight != nullptr && !weight->needsPrepare()))
         && filterWeights.empty();
@@ -1997,17 +2016,18 @@ public:
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA
                 && shortcut.maxMatches == 0;
-            if (shortcut.how > Query::COUNT_PROBE_LIMIT) {
+            if (shortcut.how > (boundedCount
+                    ? Query::CountHow::METADATA : Query::COUNT_PROBE_LIMIT)) {
               everySegmentConstant = false;
               break;
             }
           }
-          if (everySegmentEmpty && hasRequiredConjunction(*query)) {
+          if (!boundedCount && everySegmentEmpty && hasRequiredConjunction(*query)) {
             everySegmentConstant = false;
           }
         }
         bool fieldSortFullyRouted = false;
-        if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
+        if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
           if (wholeFieldSort && !readerStableWhole) {
             wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
@@ -2036,8 +2056,11 @@ public:
                       *query, FilterCache::AdmissionLane::WHOLE);
           }
         }
+        // Field-sort constants are useful per segment even without a cache.
+        // Prepared membership still requires its reader-stable cache source.
         if (!everySegmentConstant && wholeMembershipUse == nullptr
-            && !fieldSortFullyRouted) {
+            && !fieldSortFullyRouted
+            && !(wholeFieldSort && !wholeMembershipWeight->needsPrepare())) {
           wholeMembershipWeight = nullptr;
           wholeFieldSortCacheRoutes = {};
         }
@@ -2050,14 +2073,14 @@ public:
       } else if (weight != nullptr && wholeTopKCount
           && wholeMembershipWeight != nullptr
           && !weight->isConstantScoring()) {
-        Query::Weight* countFreeRankingWeight = rankingWeight;
+        Query::Weight* countFreeRankingWeight = boundedCount ? weight : rankingWeight;
         if (countFreeRankingWeight == nullptr) {
           int32_t rankingFlags =
               requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
           countFreeRankingWeight =
               query->createWeight(*qcontext, rankingFlags);
         }
-        bool reroute = foldFilters
+        bool reroute = !boundedCount && foldFilters
             && !countFreeRankingWeight->needsPrepare()
             && TopDocsReq::admitSparseFilteredTopK(
                 *countFreeRankingWeight, *req.reader, topCount);
@@ -2094,6 +2117,15 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
+    qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
+        && wholeMembershipUse == nullptr;
+    if (qr->boundedCount && filterWeights.empty()) {
+      int64_t minMatches = 0;
+      for (auto& segment : req.reader->segments()) {
+        minMatches += weight->countShortcut(segment, nullptr).minMatches;
+      }
+      qr->countLimitProven = minMatches >= requirements.countLimit;
+    }
     qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
       firstQuery = qr;
@@ -2141,7 +2173,109 @@ public:
     return out;
   }
 
+  // The parser side of a plugin op: query parsing, a planning context of its
+  // own, TopDocs sources and nested ops, all bound to this request.
+  class PluginOpContextImpl final : public PluginOpContext {
+    SearchParserImpl& parser;
+    int depth;
+    ParseContext context;
+    Query::PlanningContext* planningContext = nullptr;
+    Query::Context* executionContext = nullptr;
+
+  public:
+    PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
+      : PluginOpContext(parser.req, name, proto,
+                        ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
+        parser(parser), depth(depth),
+        context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
+                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings,
+                &parser.fields, &parser.req.engine.getNode()) {
+      context.collapse = parser.enclosingCollapse;
+      context.reader = parser.req.reader.get();
+    }
+
+    ParseContext& parseContext() override { return context; }
+
+    Query::PlanningContext& planning() override {
+      if (planningContext == nullptr) {
+        planningContext = luxir::arenaCreate<Query::PlanningContext>(
+            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+      }
+      return *planningContext;
+    }
+
+    Query::Context& weightContext() override {
+      if (executionContext == nullptr) executionContext = Query::Context::create(&req.arena, planning());
+      return *executionContext;
+    }
+
+    Query* parseQuery(const luxir::api::Query& query) override {
+      ProtobufQueryParser queryParser(context);
+      Query* parsed = queryParser.parse(query);
+      parsed->validateLogical(planning());
+      return parsed;
+    }
+
+    Query* parseQuery(const luxir::api::Val& value) override {
+      return parseQuery(*readMessage<luxir::api::Query>(value, "query"));
+    }
+
+    TopDocsReq* parseSource(std::string_view sourceName, const luxir::api::Val& topDocs) override {
+      auto* proto = readMessage<luxir::api::TopDocs>(topDocs, "top_docs source");
+      auto* oldCollapse = parser.enclosingCollapse;
+      auto* oldMeasure = parser.inheritedFacetMeasure;
+      auto restore = scope_guard([&]() noexcept {
+        parser.enclosingCollapse = oldCollapse;
+        parser.inheritedFacetMeasure = oldMeasure;
+      });
+      auto* source = parser.parseTopDocs(sourceName, *proto, TopDocsPlacement::FUSION_SOURCE);
+      source->flags = parser.options.flags;
+      return source;
+    }
+
+    void addSubs(SearchOp& op) override {
+      parser.addSubs(op, proto.ops, depth, OpsPlacement::PLUGIN);
+    }
+
+  private:
+    // A param value read as a request message: the same JSON the message's
+    // own field accepts. The text and the views it yields live in the arena.
+    template <typename M>
+    M* readMessage(const luxir::api::Val& value, std::string_view what) {
+      std::string json;
+      if (!luxir::api::write_json(value, json)) {
+        throw RequestError(params.owner + ": cannot serialize a " + std::string(what) + " param");
+      }
+      ArenaResource mr(&req.arena);
+      std::string_view text = luxir::api::build::arenaStr(mr, json);
+      auto* message = new (mr.allocate(sizeof(M), alignof(M))) M();
+      std::string error;
+      if (!luxir::api::read_json(*message, text, mr, &error)) {
+        throw RequestError(params.owner + ": invalid " + std::string(what) + ": " + error);
+      }
+      return message;
+    }
+  };
+
+  SearchOp* parsePluginOp(std::string_view name, const luxir::api::PluginOp& pluginOp, int depth) {
+    const auto& maker = SearchOpRegistry::global().require(pluginOp.name);
+    PluginOpContextImpl context(*this, name, pluginOp, depth);
+    SearchOp* op;
+    try {
+      op = maker(context);
+    } catch (const ParamError& e) {
+      throw RequestError(e.what());
+    }
+    if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
+    return op;
+  }
+
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
+    int64_t countLimit = fusionProto.count_limit.value_or(0);
+    if (countLimit < -1) {
+      throw std::runtime_error(fusionPrefix(name) + "count_limit must be >= -1");
+    }
     auto* oldCollapse = enclosingCollapse;
     auto* oldMeasure = inheritedFacetMeasure;
     auto restore = scope_guard([&]() noexcept {
@@ -2153,7 +2287,7 @@ public:
       if (!fusionProto.collapse->sort.empty()) {
         throw RequestError("fusion.collapse.sort is not supported");
       }
-      collapse = resolveCollapse(*fusionProto.collapse, fusionProto.get_number);
+      collapse = resolveCollapse(*fusionProto.collapse, countLimit != 0);
       enclosingCollapse = collapse;
       inheritedFacetMeasure = collapse;
     }
@@ -2215,6 +2349,7 @@ public:
       });
       auto* src = parseTopDocs(
           srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
+      src->flags = options.flags;
       // Linear fusion normalizes relevance scores; a field-sorted source
       // ranks by something else and carries no score to normalize.
       if (method != FusionOp::Method::RRF && src->sortPlan.useFieldSort) {
@@ -2230,8 +2365,9 @@ public:
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");

@@ -218,7 +218,7 @@ void emitPage(const CollapsedPageSettings& settings,
       }
     }
     auto* keys = build::allocArray(table.keys, (size_t)(end - begin), mr);
-    int64_t* counts = page && settings.spec.get_number
+    int64_t* counts = page && settings.spec.get_count
         ? build::allocArray(table.counts, (size_t)(end - begin), mr) : nullptr;
     luxir::api::ArrVal* ranks = settings.getScores
         && (metricOrder || settings.alwaysRank || (page && settings.headSort))
@@ -237,8 +237,13 @@ void emitPage(const CollapsedPageSettings& settings,
             *qr.req.reader, rank.doc, rank.score, mr);
       }
     }
+    settings.collapse.renderKeys(table.keys, qr.flags, mr);
+    if (ranks) {
+      if constexpr (metricOrder) collector.renderRanks(table.ranks, qr.flags, mr);
+      else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
+    }
   };
-  emitDocsResponse(qr.req, getDocList,
+  emitDocsResponse(qr.req, qr.flags, getDocList,
     (int64_t)scoreDocs.size(),
     [scoreDocs, page, offset](int64_t i) {
       return page ? page->heads[(size_t)(i - offset)] : scoreDocs[(size_t)i].doc;
@@ -248,13 +253,13 @@ void emitPage(const CollapsedPageSettings& settings,
     },
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
-    settings.getNumber, settings.getScores,
+    settings.emitCount, settings.getScores,
     settings.documentFormat, emission, std::move(metadata));
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
       op.headSort, op.groupOps, op.topDocsProto.fields, op.topDocsProto.batch_size,
-      op.topDocsProto.offset, op.topDocsProto.get_number, op.topDocsProto.get_scores,
+      op.topDocsProto.offset, op.requirements.needsCount(), op.topDocsProto.get_scores,
       op.topDocsProto.document_format,
       calc.memberReplay ? (calc.preparedWeight
           ? static_cast<Query::SegmentSource*>(calc.preparedWeight.get()) : op.weight) : nullptr,
@@ -279,7 +284,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       docListProto.offset = qr.topDocsProto.offset;
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
-      if (qr.topDocsProto.get_number) {
+      if (qr.requirements.needsCount()) {
         docListProto.found = 0;
         if (qr.collapse != nullptr) docListProto.found_docs = 0;
         if (qr.diversify != nullptr) docListProto.found_groups = 0;
@@ -305,7 +310,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     } else if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
       auto sortDocs = collector.sort();
-      emitDocsResponse(qr.req, getDocList,
+      emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)sortDocs.size(),
         [sortDocs](int64_t i) { return sortDocs[i].doc; },
         [sortDocs](int64_t i) { return sortDocs[i].score; },
@@ -313,25 +318,29 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
-        qr.topDocsProto.get_number,
+        qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
         emission);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
-      emitDocsResponse(qr.req, getDocList,
+      // Opening the threshold alone does not invalidate an exhaustive count.
+      int64_t found = collector.totalHits();
+      bool foundGte = qr.boundedCount && collector.countIncomplete;
+      if (foundGte) found = qr.requirements.countLimit;
+      emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },
-        collector.totalHits(),
+        found,
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
-        qr.topDocsProto.get_number,
+        qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, foundGte);
     }
   }
 
@@ -341,7 +350,7 @@ void TopDocsReq::fillMetricGroupResponse(CalcBase& calc) {
   else {
     auto& list = *calc.slotArm<api::DocList>(nullptr);
     list.offset = topDocsProto.offset;
-    if (topDocsProto.get_number) { list.found = 0; list.found_docs = 0; }
+    if (requirements.needsCount()) { list.found = 0; list.found_docs = 0; }
   }
 }
 }  // namespace luxir

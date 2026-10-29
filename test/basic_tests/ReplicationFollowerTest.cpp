@@ -6,13 +6,16 @@
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
+#include "luxir/server/Promotion.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/server/CommitWaits.h"
 #include "luxir/server/ReplicationState.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/luxir_main.h"
 #include <sstream>
 #include <filesystem>
@@ -21,6 +24,7 @@
 #include <future>
 #include <deque>
 #include <unistd.h>
+#include <CLI/CLI.hpp>
 
 namespace luxir::test {
 using namespace std::chrono_literals;
@@ -107,7 +111,7 @@ protected:
     auto cout = std::cout.rdbuf(output.rdbuf()), cerr = std::cerr.rdbuf(output.rdbuf());
     auto level = spdlog::get_level();
     auto restore = scope_guard([&] { std::cout.rdbuf(cout); std::cerr.rdbuf(cerr); spdlog::set_level(level); });
-    int code = luxir_main((int)argv.size(), argv.data());
+    int code = luxir_main((int)argv.size(), argv.data(), luxir::addConfiguredPlugins);
     return {code, output.str()};
   }
   std::pair<int, std::string> pull(std::string url = {}) {
@@ -116,8 +120,11 @@ protected:
     return command({"luxir", "--server.http.port", std::to_string(sourcePort),
         "--server.grpc.port", std::to_string(sourcePort), "pull", url, followerConfig.store.data_dir});
   }
-  std::pair<int, std::string> promote(std::string dir = {}) {
-    return command({"luxir", "promote", dir.empty() ? followerConfig.store.data_dir : dir});
+  std::pair<int, std::string> promote(std::string dir = {}, std::vector<std::string> options = {}) {
+    std::vector<std::string> args{"luxir"};
+    args.insert(args.end(), options.begin(), options.end());
+    args.insert(args.end(), {"promote", dir.empty() ? followerConfig.store.data_dir : dir});
+    return command(std::move(args));
   }
   std::filesystem::path makeLocalUnreadable() {
     auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
@@ -174,7 +181,7 @@ protected:
     ASSERT_TRUE(h.submit(merge).success);
     ASSERT_TRUE(caughtUp());
     EXPECT_EQ(2, col->getReaderManager().getReader()->liveDocs());
-    EXPECT_EQ(200, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").result_int());
+    EXPECT_EQ(200, httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true").result_int());
   }
 };
 
@@ -519,7 +526,7 @@ TEST_F(ReplicationFollowerTest, unreadableStartupPreservesDataUntilEligibleInsta
   stopSource(); startFollower();
   EXPECT_THROW(follower->getCollection("main"), CollectionUnavailableError);
   EXPECT_TRUE(std::filesystem::exists(retained));
-  EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").body().find("collection_unavailable"));
+  EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true").body().find("collection_unavailable"));
   std::pmr::monotonic_buffer_resource arena;
   EXPECT_FALSE(follower->getReplication().catalog(arena).collections.front().available);
   startSource();
@@ -656,7 +663,7 @@ TEST_F(ReplicationFollowerTest, barriersCountFsAndRamAndReadYourWrite) {
     EXPECT_GE(outcome["replicas"]["serving"].get<double>(), wanted == "1" ? 1 : 2);
     auto token = outcome["commit"].get<std::string>();
     auto search = httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:" + wanted + "&min_commit=" + token + "&get_number=true");
+        "/collections/main/_search?query=id:" + wanted + "&min_commit=" + token + "&count_limit=-1");
     EXPECT_EQ(200, search.result_int()) << search.body();
     EXPECT_NE(std::string::npos, search.body().find("\"found\":1"));
   }
@@ -698,7 +705,7 @@ TEST_F(ReplicationFollowerTest, slowBarrierDoesNotHoldLaterCommitAndFloorWaits) 
   Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked = true; return nullptr; });
   auto search = std::async(std::launch::async, [&] {
     return httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:new&get_number=true&min_commit=" + token + "&min_commit_timeout_ms=5000&freshness_ms=60000");
+        "/collections/main/_search?query=id:new&count_limit=-1&min_commit=" + token + "&min_commit_timeout_ms=5000&freshness_ms=60000");
   });
   ASSERT_TRUE(until([&] { return parked.load(); }));
   resume.count_down();
@@ -1073,7 +1080,7 @@ TEST_P(ReplicationMatrixTest, snapshotsBarriersAndRestarts) {
     EXPECT_EQ(wanted, result["replicas"]["serving"].get<double>());
     EXPECT_EQ("satisfied", result["replicas"]["outcome"].get<std::string>());
     auto search = httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:" + id + "&get_number=true&min_commit=" + result["commit"].get<std::string>());
+        "/collections/main/_search?query=id:" + id + "&count_limit=-1&min_commit=" + result["commit"].get<std::string>());
     EXPECT_EQ(200, search.result_int());
     EXPECT_NE(std::string::npos, search.body().find("\"found\":1"));
   };
@@ -1139,10 +1146,10 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   auto memory = follower->storageBytes(CollectionId::of("main"));
   EXPECT_GT(memory, 0);
-  auto memoryStats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats?memory=true");
+  auto memoryStats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
   glz::generic memoryJson; ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body()));
   EXPECT_EQ(1024 * 1024, memoryJson["memory"]["storage_ram"]["limit_bytes"].get<double>());
-  auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
+  auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true");
   glz::generic json; ASSERT_FALSE(glz::read_json(json, stats.body()));
   EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
   source->deleteCollection("main");
@@ -1683,6 +1690,206 @@ TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
   }));
   EXPECT_EQ(2, peerFed.getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_GT(fromSource.load(), 0);
+}
+
+// Full verification at startup refuses a damaged local copy, the follower
+// fetches the file again, and promotion under the same policy refuses to link
+// a damaged file.
+TEST_F(ReplicationFollowerTest, corruptLocalFilesAreRefetchedAndNeverPromoted) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
+  auto flip = [&] {
+    std::fstream file(path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / largest.name,
+                      std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1);
+    file.seekp(0);
+    byte = (char)~byte;
+    file.write(&byte, 1);
+  };
+  stopFollower();
+  flip();
+  followerConfig.store.verify_on_open = "full";
+  std::atomic<int> refetched{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (((FileDescriptor*)descriptor)->name == largest.name) refetched++;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  startFollower();
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, refetched.load());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  stopFollower(); stopSource();
+  flip();
+  auto [code, output] = promote({}, {"--store.verify-on-open", "full"});
+  EXPECT_NE(0, code);
+  EXPECT_NE(std::string::npos, output.find("checksum mismatch: " + largest.name)) << output;
+}
+
+// A scrub hit on a follower repairs the copy in place: the collection is
+// unavailable until the next sync re-verifies the local files, fetches only
+// the damaged one and installs the same incarnation again.
+TEST_F(ReplicationFollowerTest, scrubHitIsRepairedByTheNextSync) {
+  followerConfig.store.scrub_max_bytes_per_sec = 0;
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
+  auto dir = path / "follower" / "t" / "t0" / "main" / installed->id.incarnation;
+  {
+    std::fstream file(dir / largest.name, std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1); file.seekp(0); byte = (char)~byte; file.write(&byte, 1);
+  }
+  std::atomic<int> downloads{0};
+  std::vector<std::string> names;
+  std::mutex namesMutex;
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    std::lock_guard lock(namesMutex);
+    names.push_back(((FileDescriptor*)descriptor)->name); downloads++;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  EXPECT_EQ(1u, follower->getScrubber().scrub());
+  EXPECT_TRUE(until([&] {
+    try { return follower->getCollection("main")->getShard() != nullptr; }
+    catch (const CollectionUnavailableError&) { return false; }
+  }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1, downloads.load());
+  { std::lock_guard lock(namesMutex); EXPECT_EQ(std::vector<std::string>{largest.name}, names); }
+  EXPECT_TRUE(std::ranges::none_of(std::filesystem::directory_iterator(dir), [](const auto& entry) {
+    return entry.path().filename().string().starts_with("corrupted_");
+  }));
+  // Repaired, so a second pass finds nothing.
+  EXPECT_EQ(0u, follower->getScrubber().scrub());
+}
+
+TEST_F(ReplicationFollowerTest, repairDownloadsIntactSuspectFile) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto collection = follower->getCollection("main");
+  auto snapshot = collection->getShard()->getSnapshots().snapshot();
+  std::array<FileDescriptor, 1> suspects{snapshot->files.front()};
+  std::array<std::string, 1> names{suspects[0].name};
+  std::vector<std::string> downloads;
+  std::mutex mutex;
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    std::lock_guard lock(mutex);
+    downloads.push_back(((FileDescriptor*)descriptor)->name);
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  follower->collections().fail(CollectionId::of("main"), collection, "suspect intact file", names);
+  follower->getFollower()->repair(CollectionId::of("main"), collection, "suspect intact file", suspects);
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  { std::lock_guard lock(mutex); EXPECT_EQ(std::vector<std::string>{names[0]}, downloads); }
+}
+
+TEST_F(ReplicationFollowerTest, staleRepairLeavesUnrelatedReplacementAvailable) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto old = follower->getCollection("main");
+  std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
+  source->deleteCollection("main"); source->createCollection("main");
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto current = follower->getCollection("main");
+  ASSERT_NE(old, current);
+  auto files = current->getShard()->getSnapshots().snapshot()->files;
+  ASSERT_NE(files.end(), std::ranges::find(files, suspects[0].name, &FileDescriptor::name));
+  ASSERT_EQ(files.end(), std::ranges::find(files, suspects[0]));
+  std::atomic<unsigned> downloads{0};
+  std::atomic<bool> processed{false};
+  Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* { downloads++; return nullptr; });
+  Signal::listen("replicationRepairProcessed", [&](void*, void*, void*) -> void* { processed = true; return nullptr; });
+  auto cleanup = scope_guard([&] { stopFollower(); });
+  old->fail("late scrub result");
+  follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+  ASSERT_TRUE(until([&] { return processed.load(); }));
+  EXPECT_EQ(current, follower->getCollection("main"));
+  EXPECT_EQ(1, current->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(0u, downloads.load());
+}
+
+TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacement) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto old = follower->getCollection("main");
+  std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
+  stopSource();
+  {
+    FSDirFactory factory(sourceConfig.store.data_dir);
+    auto storage = factory.collection(CollectionId::of("main"));
+    auto selected = *storage.current();
+    storage.select(copySnapshot(storage, selected, Manifest::load(*storage.open(selected))));
+  }
+  startSource();
+  ASSERT_TRUE(caughtUp());
+  auto current = follower->getCollection("main");
+  ASSERT_NE(old, current);
+  auto snapshot = current->getShard()->getSnapshots().snapshot();
+  ASSERT_NE(snapshot->files.end(), std::ranges::find(snapshot->files, suspects[0]));
+  std::atomic<unsigned> downloads{0}, otherDownloads{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
+    else otherDownloads++;
+    return nullptr;
+  });
+  auto cleanup = scope_guard([&] { stopFollower(); });
+  old->fail("late scrub result");
+  follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+  ASSERT_TRUE(until([&] {
+    try { return follower->getCollection("main") != current; }
+    catch (const CollectionUnavailableError&) { return false; }
+  }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1u, downloads.load());
+  EXPECT_EQ(0u, otherDownloads.load());
+}
+
+TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto snapshot = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto suspect = *std::ranges::max_element(snapshot->files, {}, &FileDescriptor::size);
+  auto dir = path / "follower" / "t" / "t0" / "main" / snapshot->id.incarnation;
+  stopFollower(); stopSource();
+  {
+    FSDirectory sourceDir(dir, false);
+    std::array<std::string, 2> suspects{suspect.name, "s0_absent"};
+    CorruptionMarker::write(sourceDir, suspects, "pending scrub hit");
+    std::fstream file(dir / suspect.name, std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1); file.seekp(0); byte = (char)~byte; file.write(&byte, 1);
+  }
+  auto [code, output] = promote();
+  ASSERT_EQ(0, code) << output;
+  {
+    FSDirFactory factory(followerConfig.store.data_dir);
+    auto storage = factory.collection(CollectionId::of("main"));
+    auto selected = storage.current();
+    ASSERT_TRUE(selected);
+    EXPECT_NE(snapshot->id.incarnation, *selected);
+    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.open(*selected)));
+  }
+  auto writerConfig = followerConfig;
+  writerConfig.replication.source.clear();
+  LuxirNode writer(writerConfig);
+  EXPECT_THROW(writer.getCollection("main"), CollectionUnavailableError);
+  EXPECT_NE(std::string::npos, writer.collections().get(CollectionId::of("main"))->getUnavailableReason().find("checksum mismatch: " + suspect.name));
 }
 
 // A replica reopens each installed snapshot from the reader it serves: an

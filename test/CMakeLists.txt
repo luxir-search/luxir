@@ -8,8 +8,28 @@ find_package(benchmark REQUIRED)
 # without a manual reconfigure (otherwise new files link as undefined symbols).
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 list(FILTER Test_SOURCES EXCLUDE REGEX "/allocation_tests/")
+# Plugin sources build into their own libraries (luxir_add_plugin), not luxir_test.
+list(FILTER Test_SOURCES EXCLUDE REGEX "/test/plugins/")
+
+# The benchmarks (bench/) are about a tenth of the test build. Debug builds
+# serve edit-build-test and the ASan gate, so they leave them out unless asked;
+# optimized builds keep luxir_test --bench.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(_luxir_bench_default OFF)
+else()
+  set(_luxir_bench_default ON)
+endif()
+option(LUXIR_TEST_BENCHMARKS "Compile the benchmarks (test/bench) into luxir_test"
+       ${_luxir_bench_default})
+# blas_lapack_test.cpp is a standalone program with its own main (below).
+list(FILTER Test_SOURCES EXCLUDE REGEX "/blas_lapack_test\\.cpp$")
+if(NOT LUXIR_TEST_BENCHMARKS)
+  list(FILTER Test_SOURCES EXCLUDE REGEX "/bench/[^/]*\\.cpp$")
+endif()
 
 add_executable(luxir_test ${Test_SOURCES})
+set_source_files_properties(test/LuxirTest.cpp PROPERTIES
+  COMPILE_DEFINITIONS "LUXIR_TEST_BENCHMARKS=$<BOOL:${LUXIR_TEST_BENCHMARKS}>")
 target_include_directories(luxir_test PRIVATE .)
 target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
 # HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
@@ -17,6 +37,23 @@ target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::g
 # uni-algo (vendored): AnalysisTest exercises Unicode case folding / NFKC / UAX#29
 # segmentation directly to gate conformance before the real filters are built.
 target_link_libraries(luxir_test PRIVATE uni_algo)
+
+# Standalone check of the OpenBLAS overlay without a vector corpus: the
+# library must be serial (vector builds partition GEMMs across TBB tasks and
+# the query path must never queue behind a BLAS thread pool), its scratch
+# buffers must serve concurrent callers, and the ten LAPACK entry points FAISS
+# uses must have the LP64 ABI.  The dev-container image and tools/build-arm64
+# compile the same source directly.  macOS links Accelerate instead.
+if(NOT APPLE)
+  find_package(OpenBLAS CONFIG REQUIRED)
+  find_package(Threads REQUIRED)
+  add_executable(blas_lapack_test blas_lapack_test.cpp)
+  target_link_libraries(blas_lapack_test PRIVATE OpenBLAS::OpenBLAS Threads::Threads)
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(TARGET blas_lapack_test POST_BUILD COMMAND blas_lapack_test
+                       COMMENT "Checking the OpenBLAS overlay")
+  endif()
+endif()
 
 # gtest/benchmark are the dominant parse cost across the ~40 test TUs; add them
 # to the shared heavy-header set (LUXIR_PCH_COMMON comes from the root CMake).
@@ -32,9 +69,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Cla
   add_executable(response_allocation_failure_test
     allocation_tests/ResponseAllocationFailureTest.cpp)
   target_include_directories(response_allocation_failure_test PRIVATE .)
-  target_link_libraries(response_allocation_failure_test PRIVATE luxir_lib GTest::gtest_main)
+  target_link_libraries(response_allocation_failure_test PRIVATE luxir_plugins luxir_lib GTest::gtest_main)
   target_link_options(response_allocation_failure_test PRIVATE
     -Wl,--wrap=_Znwm -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdlPvm)
+endif()
+
+set(LUXIR_TEST_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+  set(LUXIR_TEST_X86 ON)
 endif()
 
 # Compile the same exhaustive decoded-successor tests with AVX-512 forcibly
@@ -43,7 +85,7 @@ add_executable(decoded_successor_no_avx512_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_no_avx512_test PRIVATE .)
 target_link_libraries(decoded_successor_no_avx512_test PRIVATE GTest::gtest_main)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+if(LUXIR_TEST_X86)
   target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
 endif()
 target_compile_definitions(decoded_successor_no_avx512_test PRIVATE
@@ -55,7 +97,7 @@ add_executable(decoded_successor_scalar_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_scalar_test PRIVATE .)
 target_link_libraries(decoded_successor_scalar_test PRIVATE GTest::gtest_main)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+if(LUXIR_TEST_X86)
   target_compile_options(decoded_successor_scalar_test PRIVATE
     -mno-avx512f -mno-avx2)
 endif()
@@ -65,11 +107,13 @@ target_compile_definitions(decoded_successor_scalar_test PRIVATE
 # The analysis ASCII kernels (AsciiScan.h) with AVX2 unavailable, so AVX2 hosts
 # also exercise the SSE2 path the x86-64-v2 container build ships. The NEON
 # path is covered by the arm64 build's luxir_test, the SWAR path everywhere.
-add_executable(ascii_scan_sse2_test
-  basic_tests/AsciiScanTest.cpp)
-target_include_directories(ascii_scan_sse2_test PRIVATE .)
-target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
-target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
+if(LUXIR_TEST_X86)
+  add_executable(ascii_scan_sse2_test
+    basic_tests/AsciiScanTest.cpp)
+  target_include_directories(ascii_scan_sse2_test PRIVATE .)
+  target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
+  target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
+endif()
 
 
 # (luxir_smoke removed: it was migration scaffolding to run SmokeTest while luxir_test was
@@ -104,6 +148,9 @@ set(LUXIR_TEST_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data")
 file(MAKE_DIRECTORY "${LUXIR_TEST_DATA_DIR}")
 set_property(SOURCE test/TestData.cpp APPEND PROPERTY COMPILE_DEFINITIONS
   "LUXIR_TEST_DATA_DIR=\"${LUXIR_TEST_DATA_DIR}\"")
+# In-repo fixtures are copied too, so tests do not depend on __FILE__, which
+# LUXIR_CCACHE_RELATIVE_PATHS makes relative.
+configure_file(basic_tests/data/kstem_examples.txt "${LUXIR_TEST_DATA_DIR}/kstem_examples.txt" COPYONLY)
 download("${LUXIR_TEST_DATA_DIR}/book.txt" https://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
 
 # Unicode 15.1.0 conformance files for AnalysisTest (must match uni-algo's

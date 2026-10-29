@@ -11,10 +11,15 @@ locations, browse `src/luxir/<area>/`.
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
    - `LuxirNode`: Central coordinator wiring collections and services
+   - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
+     allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
+     `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
      (startup discovery, creation, activation of a new incarnation, removal),
      announced in order through `CollectionEvents`
    - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+   - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
+     fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
      fed by the ordered `CollectionEvents` interface.
    - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,
@@ -61,6 +66,16 @@ locations, browse `src/luxir/<area>/`.
    [`Query.h`](../../src/luxir/query/Query.h) is the authoritative hierarchy and
    planning-contract description.
 
+   Each query defines `createWeight` (a `MultiTermQuery` subclass,
+   `createFilteredEnum`) out of line. That virtual is the class's key
+   function, so its vtable and the Weight and scorer code reached from it
+   compile once rather than in every translation unit that constructs the
+   query. `BooleanQuery` and `KnnQuery` define it in their own `.cpp`; the
+   other queries share `QueryWeights.cpp` rather than each paying a
+   translation unit's header parsing for a few lines of code. `BooleanQuery`'s
+   Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
+   and white-box tests include.
+
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
@@ -99,7 +114,7 @@ locations, browse `src/luxir/<area>/`.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF+PQ aux overlays for ANN
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (PQ by default, or opt-in RaBitQ) aux overlays for ANN
    - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 
@@ -107,6 +122,9 @@ locations, browse `src/luxir/<area>/`.
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
    - `InputStream` / `OutputStream`: segment I/O primitives
+   - `FileVerifier`: size + xxh3 checks of files against manifest `FileDescriptor`s over
+     `Directory::openChecksum` (pread, optional O_DIRECT; never mmap): verify-on-open, scrub
+   - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
      handle: CURRENT selects one of its incarnation directories
@@ -122,6 +140,23 @@ locations, browse `src/luxir/<area>/`.
      and introduction/segment generations for conservative coverage
    - `FieldSignature`: Effective properties for schema introduction history and
      the resolved view; `SchemaInfo` persists authored definitions and introductions
+   - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
+     token filters, char filters, plus named analyzers) is the only path from an authored
+     `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
+     more before the registry freezes. `Analyzer::compile` expands a named analyzer into
+     its definition (the canonical JSON, and so segment metadata, never names the preset)
+     and builds an immutable plan; `createChain` instantiates a per-thread `TokenChain`
+     (char filters, tokenizer, token filters). All callers feed text through
+     `TokenChain::setValue`, which runs the char filters; `sourceOffset` maps token offsets back
+
+9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
+   - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by
+     `initPlugins()` at startup, then frozen. Plugins are CMake targets added with
+     `luxir_add_plugin` and selected at build time via `LUXIR_PLUGIN_DIRS`.
+   - Extension registries: `QueryRegistry` (`src/luxir/query/`, the `plugin` Query arm),
+     `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm) and
+     `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
+   - See [plugins.md](plugins.md).
 
 ## Data Organization
 

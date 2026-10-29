@@ -165,7 +165,7 @@ public:
       MembershipWork membershipWork(int32_t maxDoc) override {
         unused(maxDoc);
         double matches = (double)cost();
-        return {matches, 4 * matches, 0, 32, 64};
+        return {matches, 4 * matches, 0, 32, 64, 0, true};
       }
 
       Query::ScorerShape describeScorer(
@@ -232,12 +232,6 @@ public:
 
   };
 };
-
-inline ExistsQuery::Weight* ExistsQuery::createWeight(
-    Context& context, int32_t flags, float multiplier) {
-  return context.pool.make<ExistsQuery::Weight>(
-      context, *this, flags, Query::constantWhenScored(flags, multiplier));
-}
 
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Weight>);
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Scorer>);

@@ -17,7 +17,7 @@
 #include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/RescoreQuery.h"
@@ -529,7 +529,7 @@ TEST_F(MultiTermScorerModesTest,
         ? qb::boolean(top.mr(), {}, {beta, alpha})
         : qb::boolean(top.mr(), {}, {alpha, beta});
     top.fields({"id"}).getScores().limit(10);
-    if (exhaustive) top.getNumber();
+    if (exhaustive) top.countLimit();
     req->execute(parallel);
     EXPECT_TRUE(req->ok()) << req->toString();
 

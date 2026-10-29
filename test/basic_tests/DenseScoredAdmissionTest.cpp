@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/SkipStats.h"
@@ -105,7 +105,7 @@ AdmissionRun runShape(CollectionHelper& helper, const Shape& shape,
   auto& topDocs = req->topDocs("q");
   topDocs.getScores().limit(topK);
   if (exactCount) {
-    topDocs.getNumber();
+    topDocs.countLimit();
   }
   topDocs.rawQuery() = qb::boolean(
       topDocs.mr(),

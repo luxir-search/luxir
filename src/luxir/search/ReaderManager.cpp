@@ -15,11 +15,12 @@ void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
 }
 
-std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot) {
+std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
+  MetricWork metric(*metrics, MetricStage::READER_REFRESH);
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(dir, snapshot, previous.get(), filterCache);
+  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -76,6 +77,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
   reader = indexReader.load(std::memory_order_acquire);
   if (!reader || stale(*reader) || schemaChanged(*reader)) {
+    MetricWork metric(*metrics, MetricStage::READER_REFRESH);
     auto openPublished = [&](IndexReader* previous) {
       for (;;) {
         checkOpen();
@@ -99,7 +101,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   return reader;
 }
 
-ReaderManager::Stats ReaderManager::stats(bool includeSegments) {
+ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   auto current = snapshot();
   std::pmr::monotonic_buffer_resource arena;
@@ -110,7 +112,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments) {
   out.updateVersion = info.update_version;
   out.schemaGen = info.schema_gen;
   out.segments = out.committedSegments = info.segments.size();
-  out.totalBytes = dir.totalBytes();
+  if (includeFiles) out.totalBytes = dir.totalBytes();
   auto copyAux = [](const api::AuxIndexInfo& aux) {
     AuxStats result;
     result.kind = aux.kind;
@@ -154,8 +156,9 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments) {
 void ReaderManager::cacheStats(CacheStats& out) const {
   auto cache = filterCache;
   if (!cache) return;
-  out.filterCacheEnabled = cache->enabled();
-  out.filterCacheMaxBytes = cache->configuration().maxBytes;
+  auto config = cache->configuration();
+  out.filterCacheEnabled = config.maxBytes != 0;
+  out.filterCacheMaxBytes = config.maxBytes;
   out.filterCacheResidentBytes = cache->bytesUsed();
   out.filterCacheMetadataBytes = cache->metadataBytesUsed();
   out.filterCacheCounters = cache->counters();

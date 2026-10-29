@@ -33,6 +33,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/RowReadAhead.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
@@ -57,7 +58,7 @@ namespace luxir {
 ///   2. Build one engine slot per segment behind the VectorEngine seam:
 ///      SegmentFlatColumnVectorEngine (exact brute-force over the mmapped
 ///      column - the default and the below-IVF-threshold fallback) or
-///      SegmentFaissVectorEngine (IVF+PQ aux, approximate).  All slots are
+///      SegmentFaissVectorEngine (IVF+RaBitQ or IVF+PQ aux, approximate).  All slots are
 ///      wrapped in one CompositeVectorEngine, which owns global IVF list
 ///      allocation across segments (see its class comment).
 ///   3. WIDEN: the host loop below re-enters engine->search() until enough
@@ -122,24 +123,18 @@ class KnnQuery final : public luxir::Query {
     return true;
   }
 
+  // Minimum similarity in the metric's own space (see similarityScoreFloor).
+  std::optional<float> similarity;
+
   void validateKnnLogical() const {
     if (!fieldType.knnSearchable()) {
       throw std::runtime_error(std::format(
           "KnnQuery on vector field '{}' without a metric", field));
     }
-    if (fieldType.dims() > 0
-        && (int32_t) queryVec.size() != fieldType.dims()) {
-      throw std::runtime_error(std::format(
-          "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-          queryVec.size(), fieldType.dims(), field));
-    }
-    for (float value : queryVec) {
-      if (!std::isfinite(value)) {
-        throw std::runtime_error(std::format(
-            "KnnQuery: query vector for field '{}' must contain only finite values",
-            field));
-      }
-    }
+    // The parser enforces the field's input contract and cuts the query to
+    // its stored prefix.
+    assert(fieldType.storedDims() == 0 || (int32_t)queryVec.size() == fieldType.storedDims());
+    assert(std::ranges::all_of(queryVec, [](float x) { return std::isfinite(x); }));
   }
 
 public:
@@ -213,6 +208,26 @@ public:
   static constexpr double REFINE_UNITY_K = 1000.0;
   static constexpr double REFINE_MIN_RATIO = 1.1;
 
+  // Dimension-aware default IVF effort.  The nprobe=0 scan fraction
+  // (1/sqrt(referenceBreadth), see defaultBudget) is scaled by
+  //   clamp(sqrt(dims / defaultAnnBreadthReferenceDims), 1, ANN_BREADTH_MAX_DIM_FACTOR).
+  // Coarse partitions localize neighbors worse as dimension grows (distances
+  // to centroids concentrate, so a query's true neighbors spill over many
+  // more lists), and when the codes rank well inside the probed lists (1-bit
+  // RaBitQ at >= 768 dims) recall is bounded by the lists probed, not by the
+  // candidate pool: on GIST-960 / Cohere-768 the unscaled default stops at
+  // 0.82-0.87 recall@10 whatever refine_candidates is, and ~2.5x the lists
+  // reaches ~0.95.  At <= 128 dims (SIFT, Deep) the unscaled default already
+  // reaches ~0.96 and is left unchanged.  Depends only on dims, so it stays
+  // merge-stable.  0 disables the scaling.  Mutable for tests / benches.
+  static inline int32_t defaultAnnBreadthReferenceDims = 128;
+  static constexpr double ANN_BREADTH_MAX_DIM_FACTOR = 4.0;
+  static double defaultAnnBreadthDimFactor(int32_t dims) {
+    if (defaultAnnBreadthReferenceDims <= 0 || dims <= defaultAnnBreadthReferenceDims) return 1.0;
+    return std::min(ANN_BREADTH_MAX_DIM_FACTOR,
+                    std::sqrt((double)dims / (double)defaultAnnBreadthReferenceDims));
+  }
+
   // Test seam: when set, prepare() wraps the production flat engine and runs
   // the host deepen loop against the wrapper instead.  Lets tests drive the
   // loop with non-flat engine behaviors (breadth rounds, approximate scores)
@@ -280,8 +295,9 @@ public:
   /// asc.  Being total makes every bounded top-N cut deterministic regardless
   /// of scan or merge order - the property the parallel scan accumulator
   /// relies on for parallel == serial results.  Totality requires non-NaN
-  /// scores: the query vector is validated finite up front, and finiteScore
-  /// maps any NaN arising from stored vectors to the worst finite score.
+  /// scores: query and stored vectors share VectorFieldType::inputError's
+  /// bounds, which keep distances finite, and finiteScore maps any NaN that
+  /// still arises to the worst finite score.
   static bool betterHit(const VectorEngineHit& a, const VectorEngineHit& b) noexcept {
     if (a.score != b.score) return a.score > b.score;
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
@@ -411,11 +427,13 @@ public:
            std::span<const float> queryVec, int32_t k,
            int32_t nprobe = 0, int32_t refineCandidates = 0,
            float minScanFraction = 0.0f, bool exact = false,
-           const CollapsePlan* groups = nullptr)
+           const CollapsePlan* groups = nullptr,
+           std::optional<float> similarity = std::nullopt)
     : Query(QueryKind::KNN), field(field), fieldType(fieldType),
       queryVec(queryVec), k(k),
       nprobe(nprobe), refineCandidates(refineCandidates),
-      minScanFraction(minScanFraction), exact(exact), groups(groups) {}
+      minScanFraction(minScanFraction), exact(exact), groups(groups),
+      similarity(similarity) {}
 
   bool recoverableAsPredicate() const noexcept override { return false; }
 
@@ -426,9 +444,15 @@ public:
         && refineCandidates == rhs.refineCandidates
         && std::bit_cast<uint32_t>(minScanFraction)
             == std::bit_cast<uint32_t>(rhs.minScanFraction)
-        && exact == rhs.exact && queryVec.size() == rhs.queryVec.size()
-        && fieldType.dims() == rhs.fieldType.dims()
+        && exact == rhs.exact
+        && similarity.has_value() == rhs.similarity.has_value()
+        && (!similarity.has_value()
+            || std::bit_cast<uint32_t>(*similarity)
+                == std::bit_cast<uint32_t>(*rhs.similarity))
+        && queryVec.size() == rhs.queryVec.size()
+        && fieldType.storedDims() == rhs.fieldType.storedDims()
         && fieldType.metric() == rhs.fieldType.metric()
+        && fieldType.ann().rabitqQueryBits == rhs.fieldType.ann().rabitqQueryBits
         && fieldType.normalized() == rhs.fieldType.normalized()
         && fieldType.normalizeOnWrite()
             == rhs.fieldType.normalizeOnWrite()
@@ -452,13 +476,17 @@ public:
         value = mixHash(value, (int32_t)component.type);
       }
     }
+    if (similarity.has_value()) {
+      value = mixHash(value, std::bit_cast<uint32_t>(*similarity));
+    }
     value = mixSampledSequence(
         value, std::as_bytes(queryVec),
         [](uint64_t seed, std::byte byte) {
           return mixHash(seed, byte);
         });
-    value = mixHash(value, fieldType.dims());
+    value = mixHash(value, fieldType.storedDims());
     value = mixHash(value, (int32_t) fieldType.metric());
+    value = mixHash(value, fieldType.ann().rabitqQueryBits);
     value = mixHash(value, fieldType.normalized());
     return mixHash(value, fieldType.normalizeOnWrite());
   }
@@ -471,6 +499,25 @@ public:
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
+  const std::optional<float>& getSimilarity() const noexcept {
+    return similarity;
+  }
+
+  /// The similarity threshold as a floor in score space, or -inf when unset.
+  /// L2 similarity is a maximum (non-squared) distance d, scored as
+  /// 1 / (1 + d^2); IP and COSINE scores are the similarity itself. The float
+  /// expression mirrors scoreFromDist's nonnegative branch, so a hit at
+  /// exactly distance d keeps its place.
+  float similarityScoreFloor() const noexcept {
+    if (!similarity.has_value()) {
+      return -std::numeric_limits<float>::infinity();
+    }
+    float value = *similarity;
+    if (fieldType.metric() == VectorFieldType::METRIC_L2) {
+      return 1.0f / (1.0f + value * value);
+    }
+    return value;
+  }
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -500,6 +547,10 @@ public:
         out.appendInt32((int32_t)component.type);
       }
     }
+    // Membership is score dependent, but only through the raw similarity
+    // (boost applies after the cut), so the threshold is a semantic key part.
+    out.appendBool(similarity.has_value());
+    if (similarity.has_value()) out.appendFloat(*similarity);
     // The mutable execution policies are resolved into the semantic key
     // directly. This is intentionally the MVP alternative to maintaining a
     // policy-generation counter: every value that can change candidate
@@ -508,6 +559,7 @@ public:
     out.appendInt32(std::max(0, maxKnnBreadth));
     out.appendInt32(defaultAnnRefineCount);
     out.appendInt32(defaultAnnRefineRatio);
+    out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract. Production engines are deterministic for a pinned reader.
     return engineWrapperForTests || groups != nullptr ? FilterKeyScope::UNCACHEABLE
@@ -515,9 +567,7 @@ public:
   }
 
   Query::Weight* createWeight(Query::Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    return context.pool.make<KnnQuery::Weight>(context, *this, flags, multiplier);
-  }
+                              float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     KnnQuery& query;
@@ -619,6 +669,11 @@ public:
     };
 
   private:
+    struct PreparedQuery {
+      const float* query;
+      uint8_t queryBits;
+    };
+
     template <bool Groups> class SegmentFaissVectorEngine;
 
     template <bool Groups> struct EngineSlot {
@@ -687,9 +742,7 @@ public:
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
-      int32_t dims = query.getFieldType().dims() > 0
-        ? query.getFieldType().dims()
-        : (int32_t)query.getQueryVec().size();
+      int32_t dims = (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
         throw std::runtime_error(std::format(
           "KnnQuery: query vector for field '{}' must have positive dims", query.getField()));
@@ -791,6 +844,22 @@ public:
       std::vector<EngineSlot<Groups>> slots;
       slots.reserve(numSegs);
       bool approximateEngine = false;
+      // RaBitQ overlays index the rotated space: the query is rotated once
+      // per distinct rotation (overlays of one dims share one interned
+      // matrix) and outlives every engine built below.  Each inner buffer
+      // keeps its address when the outer vector grows.
+      std::vector<std::pair<const faiss::LinearTransform*, std::vector<float>>> rotatedQueries;
+      auto rotatedQuery = [&](const faiss::LinearTransform* rotation) -> const float* {
+        for (const auto& [rot, buf] : rotatedQueries) {
+          if (rot == rotation) return buf.data();
+        }
+        auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
+        rotateVector(*rotation, queryPtr, entry.second.data());
+        return entry.second.data();
+      };
+      // RaBitQ query quantization is a search-time knob: the current
+      // schema's value applies to every overlay.
+      int32_t rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
         if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
@@ -822,15 +891,22 @@ public:
               "KnnQuery: segment FAISS ntotal={} != segment vector count={} for field '{}'",
               idx->ntotal, segCount, query.getField()));
           }
-          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+          // Both codecs are IVF; each segment is served by its own overlay's
+          // meta, so segments built with different codecs mix freely.
+          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ
+            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFRABITQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          const float* indexQuery = vaux->getRotation() != nullptr
+            ? rotatedQuery(vaux->getRotation())
+            : queryPtr;
           // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
           // loop's foldSeen() seeds the eligible bitmaps from it.
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine<Groups>>(
             *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
             rankLivePerSeg[i],
             metric, vaux->scoresAreExact(), isIvf,
-            vaux->getNList(), query.groups, v2dSpan);
+            vaux->getNList(), query.groups, v2dSpan,
+            PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits});
           SegmentFaissVectorEngine<Groups>* ivfEngine = isIvf ? faissEngine.get() : nullptr;
           slots.push_back({
             .engine = std::move(faissEngine),
@@ -1012,8 +1088,9 @@ public:
       //   BREADTH - pool exhausted but more IVF lists remain: grow breadth
       //             (the engine allocates the next globally-best lists).
       // The whole loop runs on ENGINE scores (exact for column slots,
-      // approximate for IVF+PQ): the stopping condition is a distinct-doc
-      // COUNT, which approximate scores answer just as well, so exact rescore
+      // approximate for IVF overlays, possibly above 1 for L2): the stopping
+      // condition is a distinct-doc COUNT, which approximate scores answer
+      // just as well, so exact rescore
       // is deferred to one terminal pass after the loop.  Deliberately not
       // overlapped with rescore: interleaving would re-read column vectors
       // for segments that later rounds add candidates to, trading throughput
@@ -1158,6 +1235,17 @@ public:
         }
       }
 
+      // The similarity threshold drops hits from the k nearest rather than
+      // reaching past them, so fewer than k docs may remain (Elasticsearch
+      // knn.similarity semantics). Scores are exact here: the refine pass
+      // (or an all-exact pool) produced them.
+      if (query.getSimilarity().has_value()) {
+        float floor = query.similarityScoreFloor();
+        std::erase_if(docHits, [floor](const DocHit& hit) {
+          return !(hit.score >= floor);
+        });
+      }
+
       // Boost is applied only after the raw-similarity top-k cut, so it can
       // change scores (including zeroing them) but never the retained docs.
       if (boost != 1.0f) {
@@ -1210,7 +1298,7 @@ public:
     /// liveListSize() to pick lists across ALL segments, then hands the chosen
     /// lists back through searchSelectedLists().  The plain search() override
     /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
-    /// exists today (ENGINE_IVFPQ is the only one), so it is reserved seam
+    /// exists today (both codecs are IVF), so it is reserved seam
     /// surface, not a live code path.
     template <bool Groups> class SegmentFaissVectorEngine final : public VectorEngine {
       const CollapsePlan* groupPlan;
@@ -1271,6 +1359,8 @@ public:
       bool exactScores;
       bool isIvf;
       int32_t nlist;
+      // Owned by prepareUnit(): canonical for PQ, rotated for RaBitQ.
+      const PreparedQuery preparedQuery;
 
       /// The ONLY selector policy: built per scan call from (domain,
       /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
@@ -1321,6 +1411,32 @@ public:
         }
       };
 
+      struct ScanContext {
+        RoundSelector selector;
+        const float* const query;
+        // PQ ignores the RaBitQ fields. sel points into selector, so this
+        // context must stay at its construction address throughout the scan.
+        faiss::IVFRaBitQSearchParameters params;
+
+        ScanContext(const SegmentFaissVectorEngine& eng,
+                    const VectorSearchRequest& request, size_t listCount)
+            : selector(eng, request), query(eng.preparedQuery.query) {
+          params.sel = selector.get();
+          params.nprobe = listCount;
+          params.qb = eng.preparedQuery.queryBits;
+          // max_codes stays 0: scan every selected list in full.
+        }
+
+        ScanContext(const ScanContext&) = delete;
+        ScanContext& operator=(const ScanContext&) = delete;
+        ScanContext(ScanContext&&) = delete;
+        ScanContext& operator=(ScanContext&&) = delete;
+      };
+
+      ScanContext prepareScan(const VectorSearchRequest& request, size_t listCount) const {
+        return ScanContext(*this, request, listCount);
+      }
+
       struct GroupResultHandler final : faiss::ResultHandler {
         BoundedHits<true, VectorEngineHit, betterHit>& heap;
         int32_t metric, segment;
@@ -1336,7 +1452,10 @@ public:
           // the distance outward too (L2's score conversion rounds twice).
           float score = std::nextafter(floor->score, -std::numeric_limits<float>::infinity());
           if (metric == (int32_t)api::VectorMetric::L2) {
-            if (score > 0) threshold = std::nextafter(1.0f / score - 1.0f, std::numeric_limits<float>::infinity());
+            if (score > 0) {
+              float distance = score >= 1.0f ? 1.0f - score : 1.0f / score - 1.0f;
+              threshold = std::nextafter(distance, std::numeric_limits<float>::infinity());
+            }
           } else threshold = score;
         }
         bool add_result(float distance, faiss::idx_t rank) override {
@@ -1357,7 +1476,8 @@ public:
                                bool exactScores,
                                bool isIvf,
                                int32_t nlist, const CollapsePlan* groupPlan,
-                               std::span<const SegV2D> groupV2d)
+                               std::span<const SegV2D> groupV2d,
+                               PreparedQuery preparedQuery)
         : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
@@ -1370,7 +1490,9 @@ public:
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
-          nlist(nlist) {
+          nlist(nlist),
+          preparedQuery(preparedQuery) {
+        assert(preparedQuery.query != nullptr);
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
@@ -1379,16 +1501,17 @@ public:
 
       int32_t getNList() const noexcept { return nlist; }
 
-      void coarseRun(const float* query, int32_t dims,
+      void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
                      std::vector<float>& centroidDists) const {
         assert(ivf != nullptr);
-        assert(query != nullptr);
         assert(dims == index.d);
         unused(dims);
         listIds.assign((size_t)nlist, (faiss::idx_t)-1);
         centroidDists.assign((size_t)nlist, 0.0f);
-        ivf->quantizer->search(1, query, nlist, centroidDists.data(), listIds.data());
+        // The rotation is orthonormal, so these distances compare directly
+        // with other segments' (rotated or not) in the global list ranking.
+        ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -1437,10 +1560,11 @@ public:
           return result;
         }
 
+        auto scan = prepareScan(request, listIds.size());
         if constexpr (Groups) {
-          RoundSelector selector(*this, request);
-          std::unique_ptr<faiss::InvertedListScanner> scanner(ivf->get_InvertedListScanner(false, selector.get()));
-          scanner->set_query(request.query);
+          std::unique_ptr<faiss::InvertedListScanner> scanner(
+              ivf->get_InvertedListScanner(false, scan.params.sel, &scan.params));
+          scanner->set_query(scan.query);
           BoundedHits<true, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d,
               exactScores ? 1 : (size_t)request.perKey);
           GroupResultHandler handler(heap, metric, segOrd);
@@ -1471,21 +1595,13 @@ public:
         std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
         std::vector<float> dists((size_t)request.candidates, 0.0f);
 
-        // Single per-round selector policy (see RoundSelector); null when
-        // the segment needs no filtering this round, so the scanner
-        // compiles the per-vector check out.
-        RoundSelector roundSel(*this, request);
-        faiss::SearchParametersIVF ivfParams;
-        ivfParams.sel = roundSel.get();
-        // max_codes remains 0: selected IVF lists are scanned in full.
-        ivfParams.nprobe = listIds.size();
         // Local stats sink, discarded: with a null stats argument FAISS does
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
         // concurrent chunk tasks of one query would race on it.
         faiss::IndexIVFStats stats;
-        ivf->search_preassigned(1, request.query, request.candidates,
+        ivf->search_preassigned(1, scan.query, request.candidates,
                                 listIds.data(), centroidDists.data(),
-                                dists.data(), ids.data(), false, &ivfParams,
+                                dists.data(), ids.data(), false, &scan.params,
                                 &stats);
         if (statsForTests) {
           statsForTests->lists += (int64_t)listIds.size();
@@ -1663,6 +1779,31 @@ public:
           return false;
         };
 
+        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
+        // of eligible docs, resolved through its own valDoc cursor (windows
+        // ascend).  Reads that cursor causes count as the window's cold pages,
+        // which only leans toward staying on.
+        StrColReader& col = vr.strColReader();
+        RowReadAhead::Gate gate;
+        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
+                           (size_t)col.fixedValueSize(), numVals);
+        std::optional<MonoReader::BulkValues> aheadValDoc;
+        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+        int32_t aheadDoc = -1;
+        bool aheadEligible = false;
+        auto eligibleRank = [&](int64_t r) {
+          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+          if (doc != aheadDoc) {
+            aheadDoc = doc;
+            aheadEligible = docEligible(doc);
+          }
+          return aheadEligible;
+        };
+        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+          if (domain == nullptr) ahead.scanAt(rank);
+          else ahead.scanAt(rank, eligibleRank);
+        };
+
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
@@ -1680,6 +1821,7 @@ public:
                 idx = valDoc.next();
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
+              readAhead(rank);
               if (docEligible(docId) && !pooledInRun(rank, end)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
@@ -1696,6 +1838,7 @@ public:
           } else {
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
+              readAhead(rank);
               if (pooledInRun(rank, rank + 1)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
@@ -1884,7 +2027,7 @@ public:
         for (size_t i = 0; i < slots.size(); i++) {
           auto* ivf = slots[i].ivfEngine;
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
-          ivf->coarseRun(request.query, request.dims, runs[i].listIds, runs[i].centroidDists);
+          ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
           while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
             cursors[i]++;
           }
@@ -1896,9 +2039,10 @@ public:
         heapSize = (int32_t)heapIndexes.size();
       }
 
-      double defaultBudget() const {
+      double defaultBudget(int32_t dims) const {
         // nprobe=0 default: probe as many lists as a SINGLE IVF index of
-        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist).  As
+        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist),
+        // times the dimension factor (defaultAnnBreadthDimFactor).  As
         // a scan fraction that is sqrt(referenceBreadth) / referenceBreadth =
         // 1 / sqrt(referenceBreadth) (= N^-0.25 for referenceBreadth=sqrt(N)).
         // This depends only on the total live vector count, so it is
@@ -1910,13 +2054,14 @@ public:
         // sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
         // per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
         // keeps an S-dependent term that drifts on merges.
-        return 1.0 / std::sqrt((double)std::max(1, referenceBreadth));
+        return defaultAnnBreadthDimFactor(dims)
+          / std::sqrt((double)std::max(1, referenceBreadth));
       }
 
       double budgetForRequest(const VectorSearchRequest& request) const {
         double p = request.breadth > 0
           ? (double)request.breadth / (double)std::max(1, referenceBreadth)
-          : defaultBudget();
+          : defaultBudget(request.dims);
         p = std::max(p, (double)request.minScanFraction);
         return std::clamp(p, 0.0, 1.0);
       }
@@ -2323,8 +2468,6 @@ public:
   };
 
 private:
-  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
-
   /// Fill `bits` with the all-set pattern for n ranks: ceil(n/8) 0xFF bytes
   /// with the tail bits past n cleared.  Every rank bitmap in this file
   /// keeps that tail invariant, so popcount(bits) == set ranks (see
@@ -2513,7 +2656,7 @@ private:
       [kDocs, groupPlan]() { return new RescoreAccumulator<Groups>(kDocs, groupPlan); },
       [](RescoreAccumulator<Groups>* acc) { delete acc; });
 
-    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd) {
+    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd, RowReadAhead::Gate& gate) {
       int32_t segOrd = candidates[bucketBegin].segOrd;
       if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
@@ -2534,10 +2677,38 @@ private:
           std::optional<VectorReader::Iterator>, NoGroupState> fullDocs;
       if constexpr (Groups) if (vr && vr->isMultiValued()) fullDocs.emplace(vr->strColReader());
 
+      // Read-ahead of the bucket's rows on a column that is not resident (see
+      // RowReadAhead).  A unit is a candidate's row, or for a group witness
+      // its document's whole value run (the witness can sit anywhere in it),
+      // found by a second iterator in doc order.  Reads that iterator causes
+      // count as the batch's cold pages, which only leans toward staying on.
+      int64_t units = (int64_t)(bucketEnd - bucketBegin);
+      std::optional<RowReadAhead> ahead;
+      [[no_unique_address]] std::conditional_t<Groups,
+          std::optional<VectorReader::Iterator>, NoGroupState> aheadDocs;
+      auto rankAt = [&](int64_t k) { return candidates[bucketBegin + (size_t)k].valueRank; };
+      auto queue = [&](int64_t k) {
+        int64_t rank = rankAt(k);
+        if constexpr (Groups) if (aheadDocs) {
+          int32_t doc = v2d.resolve(rank);
+          if (aheadDocs->docId() < doc) aheadDocs->advance(doc);
+          auto [begin, end] = aheadDocs->valueRange();
+          ahead->queueRows(begin, end);
+          return;
+        }
+        ahead->queueRows(rank, rank + 1);
+      };
+      if (vr) {
+        ahead.emplace(gate, vr->strColReader());
+        if constexpr (Groups) if (fullDocs) aheadDocs.emplace(vr->strColReader());
+        ahead->probe({rankAt(units / 4), rankAt(units / 2 + units / 4)});
+      }
+
       // unique_ptr guards the obtained accumulator against a throw before
       // release (same idiom as FacetOp).
       std::unique_ptr<RescoreAccumulator<Groups>> acc(merger.obtain());
       for (size_t i = bucketBegin; i < bucketEnd;) {
+        if (ahead) ahead->sparseAt((int64_t)(i - bucketBegin), units, queue);
         int32_t docId = v2d.resolve(candidates[i].valueRank);
         size_t runEnd = i + 1;
         while (runEnd < bucketEnd && v2d.resolve(candidates[runEnd].valueRank) == docId) {
@@ -2587,10 +2758,11 @@ private:
     // Cancel and drain published buckets if a caller-side bucket throws.
     int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
     std::vector<std::pair<size_t, size_t>> tasks, local;
+    RowReadAhead::Gate gate;  // shared by the buckets that run on this thread
     for (size_t b = 0; b < candidates.size();) {
       size_t e = b + 1;
       while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
-      if (!parallel) rescoreBucket(b, e);
+      if (!parallel) rescoreBucket(b, e, gate);
       else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
       else local.emplace_back(b, e);
       b = e;
@@ -2598,9 +2770,12 @@ private:
     TaskGroupRunner runner;
     task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
       auto [b, e] = tasks[i];
-      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
+      return [&rescoreBucket, b, e]() {
+        RowReadAhead::Gate taskGate;
+        rescoreBucket(b, e, taskGate);
+      };
     });
-    for (auto [b, e] : local) rescoreBucket(b, e);
+    for (auto [b, e] : local) rescoreBucket(b, e, gate);
     runner.join();
 
     RescoreAccumulator<Groups>* acc = merger.getData();
@@ -2608,12 +2783,11 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
+  // Query and stored vectors share inputError's element bound, which keeps
+  // every exact and FAISS distance finite.  A NaN score would break the
+  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
+  // cuts deterministic and std::sort defined, so any NaN that slips past the
+  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
   // minCompetitiveVal starts at lowest() and admits only strictly greater
   // scores, and a kNN hit must rank last, not be counted in matches yet
   // vanish from the returned docs.
@@ -2622,8 +2796,8 @@ private:
     return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
   }
 
-  // Keep L2/IP conversions in sync with scoreFromDist below.  COSINE has a
-  // separate stored-vector norm branch for raw-column rescore mode.
+  // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
+  // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
   static float exactScore(const float* queryPtr,
                           std::span<const float> vec,
                           int32_t dims,
@@ -2647,7 +2821,7 @@ private:
         // explicit tradeoff for preserving the originally submitted bytes when
         // normalize_on_write=false; the default cosine path stores unit vectors.
         float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
+        if (!std::isfinite(normSq) || normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) return 0.0f;
         return finiteScore(sum / std::sqrt(normSq));
       }
       default:
@@ -2679,8 +2853,8 @@ private:
     }
   }
 
-  // Convert FAISS's per-metric distance to a "higher is better" score.
-  //   L2:    FAISS returns squared distance - invert to 1/(1+d).
+  // Convert FAISS's per-metric distance to an internal "higher is better" score.
+  //   L2:    squared distance d >= 0 maps to 1/(1+d); d < 0 maps to 1-d.
   //   IP:    FAISS returns dot product - already higher-is-better.
   //   COSINE: stored as IP over normalized vectors (write path or builder),
   //           query is normalized at search time - same as IP.
@@ -2688,7 +2862,9 @@ private:
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:
-        return finiteScore(1.0f / (1.0f + dist));
+        // Preserve ordering among negative RaBitQ estimates. Scores above
+        // 1 are internal only: terminal rescore restores exact L2 scores.
+        return finiteScore(dist >= 0.0f ? 1.0f / (1.0f + dist) : 1.0f - dist);
       case (int32_t)luxir::api::VectorMetric::IP:
       case (int32_t)luxir::api::VectorMetric::COSINE:
       default:

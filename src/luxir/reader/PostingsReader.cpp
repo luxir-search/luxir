@@ -32,6 +32,42 @@ void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
 
 } // namespace
 
+// Metadata layout: see StoredFieldsWriter.
+StoredFieldsMetadata::StoredFieldsMetadata(PostingsReader& reader, const SegFieldInfo& field) {
+  auto input = reader.getInputStream(field.columnLoc.filenum());
+  const char* ptr = input.ptr((int64_t)field.columnLoc.offset() + field.columnMetaOff);
+  const char* end = input.ptr(input.size());
+  maxChunkBytes = (int64_t)InputStream::readVlong(ptr, end);
+  numDirtyChunks = (int32_t)InputStream::readVint(ptr, end);
+  uint8_t codec = (uint8_t)*ptr++;
+  if (codec != StoredChunkFormat::LZ4 && codec != StoredChunkFormat::ZSTD) {
+    throw std::runtime_error("stored fields: unknown codec " + std::to_string(codec));
+  }
+  format.codec = (StoredChunkFormat::Codec)codec;
+  format.chunkTarget = InputStream::readVint(ptr, end);
+  format.maxDocsPerChunk = InputStream::readVint(ptr, end);
+  uint32_t dictSize = InputStream::readVint(ptr, end);
+  if (dictSize > (size_t)(end - ptr)) {
+    throw std::runtime_error("stored fields: dictionary exceeds file end");
+  }
+  dictionary = std::string_view(ptr, dictSize);
+  ptr += dictSize;
+  uint32_t numFields = InputStream::readVint(ptr, end);
+  fieldNames.reserve(numFields);
+  for (uint32_t i = 0; i < numFields; i++) {
+    // The bytes live in the segment mapping for the PostingsReader's lifetime.
+    PackedTerm term(const_cast<char*>(ptr));
+    fieldNames.emplace_back(term.data(), term.size());
+    ptr += term.memorySize();
+  }
+  if (!dictionary.empty()) {
+    if (format.codec != StoredChunkFormat::ZSTD) {
+      throw std::runtime_error("stored fields: dictionary requires ZSTD");
+    }
+    ddict.emplace(dictionary);
+  }
+}
+
 
 struct PostingsReader::FieldPage {
   std::atomic<Field*> slots[FIELDS_PER_PAGE]{};
@@ -83,6 +119,8 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
     previous = fileNum;
   }
 
+  auto versionsLoc = seg_location::read(firstIS);
+  uint32_t versionCount = firstIS.readVint();
   files.resize((size_t) physicalFileNums.back() + 1);
   inputStreams.resize((size_t) physicalFileNums.back() + 1);
 
@@ -100,6 +138,16 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
     }
     validateSegmentFileHeader(*files[fileNum], fileName);
     inputStreams[fileNum] = files[fileNum]->getInputStream();
+  }
+  if (maxdoc > 0) {
+    uint32_t fileNum = versionsLoc.filenum();
+    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= inputStreams.size() || !files[fileNum]) {
+      throw std::runtime_error("Segment has invalid request birth versions");
+    }
+    const auto& input = inputStreams[fileNum];
+    versions = VersionRuns(input.ptr(0), input.size(), versionsLoc.offset(), versionCount, maxdoc);
+  } else if (maxdoc != 0 || versionCount != 0 || !versionsLoc.isNull()) {
+    throw std::runtime_error("Segment has invalid request birth versions");
   }
   auto fields = inputStreams[0];
   fields.seek(segInfoOffset - sizeof(int32_t));
@@ -140,7 +188,7 @@ PostingsReader::~PostingsReader() {
   fieldMetadataMemory.pages.fetch_sub(stats.pages, std::memory_order_relaxed);
   fieldMetadataMemory.pageBytes.fetch_sub(stats.pages * sizeof(FieldPage), std::memory_order_relaxed);
   fieldMetadataMemory.entries.fetch_sub(stats.entries, std::memory_order_relaxed);
-  fieldMetadataMemory.entryBytes.fetch_sub(stats.entries * sizeof(Field), std::memory_order_relaxed);
+  fieldMetadataMemory.entryBytes.fetch_sub(stats.entryBytes, std::memory_order_relaxed);
   for (size_t i = 0; i < ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE; ++i) {
     delete fieldPages[i].load(std::memory_order_relaxed);
   }
@@ -180,6 +228,9 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     auto fresh = std::make_unique<Field>();
     FieldReader fields(*this, ordinal);
     fields.readFieldInfo(*fresh);
+    if (fresh->type == FieldType::BIN && (fresh->flags & FieldType::STORED) != 0) {
+      fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
+    }
     if (FieldType::sortsByIntColumn(fresh->type) && fresh->columnLoc.offset() > 0) {
       IntColReader column(*this, *fresh);
       fresh->columnBounds = Field::ColumnBounds{column.getMin(), column.getMax()};
@@ -190,7 +241,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
                                     std::memory_order_acquire)) {
       entry = fresh.release();
       fieldMetadataMemory.entries.fetch_add(1, std::memory_order_relaxed);
-      fieldMetadataMemory.entryBytes.fetch_add(sizeof(Field), std::memory_order_relaxed);
+      fieldMetadataMemory.entryBytes.fetch_add(entry->allocatedBytes(), std::memory_order_relaxed);
     }
   }
   return entry;
@@ -207,12 +258,13 @@ PostingsReader::FieldCacheStats PostingsReader::fieldCacheStats() const noexcept
     stats.pages++;
     stats.bytes += sizeof(FieldPage);
     for (auto& slot : page->slots) {
-      if (slot.load(std::memory_order_relaxed)) {
+      if (auto* entry = slot.load(std::memory_order_acquire)) {
         stats.entries++;
-        stats.bytes += sizeof(Field);
+        stats.entryBytes += entry->allocatedBytes();
       }
     }
   }
+  stats.bytes += stats.entryBytes;
   return stats;
 }
 

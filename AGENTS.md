@@ -28,6 +28,16 @@ grep -n "warning:" /tmp/build.log
 [ $ec -ne 0 ] && tail -100 /tmp/build.log
 ```
 
+### Concurrent builds and worktrees
+
+Builds size their compile parallelism from cores and memory, and
+concurrent builds (other worktrees, presets, or the dev container) share one
+machine-wide limit, so running several at once needs no manual `-j` or job
+caps. Native vcpkg dependencies and the ARM64 toolchain and packages are
+shared between worktrees; ccache objects are shared only when the checkouts are
+configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`.
+See [Parallelism and shared caches](docs/dev/build-setup.md#parallelism-and-shared-caches).
+
 ### Iterate (default): non-ASan, fastest edit-build-test
 
 ```bash
@@ -61,8 +71,10 @@ per-test/per-suite lines otherwise burn context on every green run.
 
 # Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
 # gcc-release and memory caps appropriate to the machine for real measurements.
-# For quick iteration/coverage use the small-corpus unit-test mode instead:
-#   ./build/gcc-debug/bin/luxir_test --gtest_filter="Benchmarks.all" --gtest_brief=1 --gtest_print_time=0
+# For quick iteration/coverage use the small-corpus unit-test mode instead.
+# Debug builds leave the benchmarks out unless configured with
+# -DLUXIR_TEST_BENCHMARKS=ON:
+#   ./build/gcc-release/bin/luxir_test --gtest_filter="Benchmarks.all" --gtest_brief=1 --gtest_print_time=0
 ./build/gcc-release/bin/luxir_test --bench
 
 # Run all benchmarks except the slow vector ones (HNSW/IVFPQ builds dominate

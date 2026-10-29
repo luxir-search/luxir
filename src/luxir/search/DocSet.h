@@ -688,6 +688,40 @@ public:
     return bits ? bitCard : (int32_t) docs.size();
   }
 
+  // Every doc in [begin, end), all above the docs added so far.
+  void addRange(int32_t begin, int32_t end) {
+    assert(begin >= 0 && begin <= end && end <= max);
+    if (begin == end) {
+      return;
+    }
+    #ifndef NDEBUG
+    assert(begin > lastDoc);
+    lastDoc = end - 1;
+    #endif
+    int32_t n = end - begin;
+    if (!bits) {
+      if ((int32_t) docs.size() + n <= arrayLimit()) {
+        for (int32_t doc = begin; doc < end; doc++) {
+          docs.emplace_back(doc);
+        }
+        return;
+      }
+      promoteToBits();
+    }
+    int32_t firstWord = begin >> 6;
+    int32_t lastWord = (end - 1) >> 6;
+    uint64_t firstMask = ~0ULL << (begin & 63);
+    uint64_t lastMask = ~0ULL >> (63 - ((end - 1) & 63));
+    if (firstWord == lastWord) {
+      bits->words[firstWord] |= firstMask & lastMask;
+    } else {
+      bits->words[firstWord] |= firstMask;
+      std::fill(bits->words + firstWord + 1, bits->words + lastWord, ~0ULL);
+      bits->words[lastWord] |= lastMask;
+    }
+    bitCard += n;
+  }
+
   void addWindowWords(const uint64_t* words, int32_t windowStart,
                       int32_t windowEnd, int32_t wordCard) {
     assert(words != nullptr);

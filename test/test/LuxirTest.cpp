@@ -13,9 +13,11 @@
 #include "LuxirTest.h"
 #include "GrpcLuxirTest.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "benchmark/benchmark.h"
 
 
@@ -75,20 +77,13 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   }
   if (auto* l = dynamic_cast<const TextFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const TextFieldType*>(&rhs);
-    // Component names only: the default schema's components take no parameters.
-    if (r == nullptr || l->analyzer_->tokenizer->name != r->analyzer_->tokenizer->name ||
-        l->analyzer_->filters.size() != r->analyzer_->filters.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < l->analyzer_->filters.size(); i++) {
-      if (l->analyzer_->filters[i]->name != r->analyzer_->filters[i]->name) return false;
-    }
-    return true;
+    return r != nullptr && l->analyzer_->canonical == r->analyzer_->canonical;
   }
   if (auto* l = dynamic_cast<const VectorFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const VectorFieldType*>(&rhs);
     return r != nullptr
-           && l->dims_ == r->dims_
+           && l->inputDims_ == r->inputDims_
+           && l->truncateDims_ == r->truncateDims_
            && l->metric_ == r->metric_
            && l->normalized_ == r->normalized_
            && l->normalizeOnWrite_ == r->normalizeOnWrite_;
@@ -320,6 +315,7 @@ int main(int argc, char **argv) {
   testing::AddGlobalTestEnvironment(new luxir::LuxirEnvironment());
 
   int ret = 0;
+  luxir::initPlugins(luxir::addConfiguredPlugins);
   luxir::LuxirNode node{config};
   luxir::LuxirTest::luxirNode = &node;
 
@@ -327,9 +323,15 @@ int main(int argc, char **argv) {
   tbb::task_arena test_arena;
   test_arena.execute([&] {
     if (!luxir::unit_tests) {
+#if LUXIR_TEST_BENCHMARKS
       benchmark::Initialize(&myargc, &(myargv[0]));
       benchmark::RunSpecifiedBenchmarks();
       ret = testing::Test::HasFatalFailure();
+#else
+      std::cerr << "luxir_test was built without benchmarks; configure with "
+                   "-DLUXIR_TEST_BENCHMARKS=ON" << std::endl;
+      ret = 1;
+#endif
     } else {
       ret = RUN_ALL_TESTS();
     }
@@ -358,6 +360,7 @@ int main(int argc, char **argv) {
 
 
 
+#if LUXIR_TEST_BENCHMARKS
 // unit test that runs all benchmarks at a faster speed
 TEST(Benchmarks, all) {
   // if we are running unit tests, we want the benchmarks to run faster
@@ -393,3 +396,4 @@ TEST(Benchmarks, all) {
   benchmark::Initialize(&myargc, &(myargv[0]));
   benchmark::RunSpecifiedBenchmarks();
 }
+#endif

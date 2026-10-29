@@ -6,6 +6,7 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "Prometheus.h"
 
 #include <cassert>
 #include <array>
@@ -45,12 +46,14 @@
 #include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
+#include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/util/log.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchRequest.h"
 #include "JsonRequest.h"
 #include "luxir/api/build.h"
+#include "luxir/api/RequestFlags.h"
 #include "luxir/api/sort_clause.h"
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
@@ -174,13 +177,21 @@ struct HttpStreamAccumError {
 
 struct HttpStreamBatchState {
   ~HttpStreamBatchState() { Signal::emit("httpBatchBodyDestroyed"); }
+  // The request envelope (collection, request id, commit, field map); it lives
+  // until the batch completes.
   std::pmr::monotonic_buffer_resource resource;
-  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
-  // Raw document records: views into the stream's NDJSON chunks, which
+  HttpUpdateReqProto proto;  // non-owning; backed by `resource`, docs by `staging`
+  // Raw document records (views into the stream's NDJSON chunks, which
   // `chunks` keeps alive until decodeDocs() has turned them into proto.docs on
-  // the task arena.  The I/O thread only frames them.
-  luxir::api::build::SpanBuilder<std::string_view> records;
-  std::vector<std::shared_ptr<NdjsonChunk>> chunks;
+  // the task arena; the I/O thread only frames them) and the decoded docs.
+  // Dropped once the batch is indexed, so a batch waiting for the ones before
+  // it to complete holds only its envelope.
+  struct Staging {
+    std::pmr::monotonic_buffer_resource resource;
+    luxir::api::build::SpanBuilder<std::string_view> records{resource};
+    std::vector<std::shared_ptr<NdjsonChunk>> chunks;
+  };
+  std::unique_ptr<Staging> staging = std::make_unique<Staging>();
   std::shared_ptr<HttpStreamControlRequest> requestOwner;
   std::string collectionName;
   std::size_t sourceBytes = 0;
@@ -192,38 +203,46 @@ struct HttpStreamBatchState {
   // completion.
   std::shared_ptr<ProtoUpdateMessage> message;
 
-  explicit HttpStreamBatchState(std::size_t reserveDocs) : records(resource) {
-    records.reserve(reserveDocs);
+  explicit HttpStreamBatchState(std::size_t reserveDocs) {
+    staging->records.reserve(reserveDocs);
   }
 
+  std::size_t recordCount() const { return staging->records.size(); }
+
   void addRecord(std::string_view record, const std::shared_ptr<NdjsonChunk>& chunk) {
-    records.push_back(record);
+    staging->records.push_back(record);
+    auto& chunks = staging->chunks;
     if (chunks.empty() || chunks.back() != chunk) chunks.push_back(chunk);
   }
 
   // Decodes the raw records into proto.docs.  Called from the update message's
   // handle() on an indexing worker, so a single connection's JSON decoding
   // scales with the task arena instead of its I/O thread.  The I/O thread no
-  // longer touches the batch once it is submitted, and `resource` lives as long
-  // as the batch, which outlives the message.  Decoded strings are copied into
-  // `resource`, so the raw bytes go as soon as decoding succeeds.  A malformed
-  // record fails the whole batch before any of it is indexed.
+  // longer touches the batch once it is submitted.  Decoded strings are copied
+  // into the staging arena, so the raw bytes go as soon as decoding succeeds.
+  // A malformed record fails the whole batch before any of it is indexed.
   void decodeDocs() {
-    auto raw = records.finish();
+    auto raw = staging->records.finish();
     if (raw.empty()) return;
-    luxir::api::build::SpanBuilder<luxir::api::Map> docs(resource);
+    luxir::api::build::SpanBuilder<luxir::api::Map> docs(staging->resource);
     docs.reserve(raw.size());
     std::string err;
     for (std::size_t i = 0; i < raw.size(); i++) {
       luxir::api::Map& map = docs.emplace_back();
-      if (!luxir::api::read_json(map, raw[i], resource, &err)) {
+      if (!luxir::api::read_json(map, raw[i], staging->resource, &err)) {
         throw RequestError("malformed NDJSON record (stream document " + std::to_string(firstDocIndex + i) +
                                "): " + (err.empty() ? std::string("invalid JSON") : err),
                            "invalid_json");
       }
     }
     proto.docs = docs.finish();
-    chunks.clear();
+    staging->chunks.clear();
+  }
+
+  // Called once the docs are indexed; nothing reads them after that.
+  void releaseStaging() {
+    proto.docs = {};
+    staging.reset();
   }
 };
 
@@ -319,7 +338,13 @@ struct HttpStreamUpdateState {
   std::string tenant; // the stream's, fixed when it starts
   std::unique_ptr<HttpStreamBatchState> batch;
   bool batchReady = false;
-  std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
+  // Submitted batches by ordinal until they complete; `indexing` marks the
+  // ones still holding an admission slot.
+  struct InFlightBatch {
+    std::shared_ptr<HttpStreamBatchState> batch;
+    bool indexing = true;
+  };
+  std::map<std::uint64_t, InFlightBatch> inFlightBatches;
   std::map<std::uint64_t, HttpStreamBatchResult> completedBatchResults;
   std::optional<HttpStreamControl> pendingControl;
   std::optional<ErrorInfo> inputFailurePending;
@@ -327,8 +352,20 @@ struct HttpStreamUpdateState {
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
-  std::size_t inFlight = 0;
+  // Batches are admitted while fewer than maxIndexing are decoding or being
+  // indexed, which bounds staging memory and inverter concurrency.  The graph
+  // completes batches in stream order, so if a batch held its slot until it
+  // completed, one slow batch would hold every slot behind it and idle the
+  // workers.  An indexed batch frees its slot and keeps only its envelope and
+  // result, and the stream runs at most kCompletionLag windows ahead of its
+  // oldest incomplete batch.
+  static constexpr std::size_t kCompletionLag = 16;
+  std::size_t inFlight = 0;   // submitted, not yet completed
+  std::size_t indexing = 0;   // submitted, not yet indexed
+  std::size_t maxIndexing;
   std::size_t maxInFlight;
+  // A batch failed while indexing; its completion ends the stream.
+  bool admissionHalted = false;
   std::uint64_t nextSubmitOrdinal = 0;
   std::uint64_t nextFoldOrdinal = 0;
   // url.commit is cleared once the EOF commit is submitted.
@@ -344,20 +381,29 @@ struct HttpStreamUpdateState {
   bool urlCommitInFlight = false;
   size_t urlCommitsPending = 0;
   bool failed = false;
+  // Whether any batch applied documents or deletes, and the first failure's
+  // kind: a stream that applied nothing failed.
+  bool anyApplied = false;
+  std::optional<ErrorKind> firstFailureKind;
 
   HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs,
                         std::size_t maxRecordBytes, std::size_t maxRequestBody,
-                        std::size_t maxInFlight)
+                        std::size_t maxIndexing)
     : batchTargetBytes(batchTargetBytes),
       batchMaxDocs(batchMaxDocs),
       maxRequestBody(maxRequestBody),
       framer(maxRecordBytes, batchTargetBytes),
       batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)),
-      maxInFlight(maxInFlight) {
-    assert(maxInFlight > 0);
+      maxIndexing(maxIndexing),
+      maxInFlight(maxIndexing > SIZE_MAX / kCompletionLag ? SIZE_MAX
+                                                           : maxIndexing * kCompletionLag) {
+    assert(maxIndexing > 0);
   }
 
-  bool canAdmit() const { return inFlight < maxInFlight && !barrierPending; }
+  bool canAdmit() const {
+    return indexing < maxIndexing && inFlight < maxInFlight && !barrierPending &&
+           !admissionHalted;
+  }
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -380,6 +426,7 @@ public:
   // (getTarget takes and releases it during batch assembly; maybeSendFinal
   // sends outside its critical section), so the lock cannot recurse.
   DocLinesState docsState;
+  JsonResponseOptions jsonOptions;
   // True once output has been handed to the session (enqueued, not necessarily
   // flushed) - the boundary past which an error must abort the chunked stream
   // rather than answer with a plain HTTP error response.
@@ -389,7 +436,8 @@ public:
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
     : SearchRequest(engine, requestState->proto, arena),
       requestState(std::move(requestState)),
-      session(std::move(s)) {
+      session(std::move(s)),
+      jsonOptions{.int64Str = (proto.flags & proto.flags_set & RequestFlags::INT64_STR) != 0} {
     docFormatDefault = luxir::api::DocFormat::ROWS;
   }
 
@@ -417,16 +465,26 @@ public:
 
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
               std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
-    : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
-      highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {}
+    : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), metrics(node.metrics), registry_(std::move(registry)),
+      highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {
+      metrics->httpConnections.fetch_add(1, std::memory_order_relaxed);
+    }
 
   ~HttpSession() {
+    metrics->httpConnections.fetch_sub(1, std::memory_order_relaxed);
     if (deregister_) deregister_();
     // Publish activity before publishing the transition to zero. The idle
     // timer's acquire load of liveConnections then observes this epoch bump.
     shard_->activityEpoch.fetch_add(1, std::memory_order_release);
     shard_->liveConnections.fetch_sub(1, std::memory_order_release);
   }
+
+  // Records the request's first error; any thread may report it.
+  void metricError(ErrorKind kind = ErrorKind::UNKNOWN) {
+    int none = -1;
+    metricErrorKind.compare_exchange_strong(none, (int)kind, std::memory_order_relaxed);
+  }
+  void metricPause() { metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::HTTP); }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 
@@ -470,6 +528,7 @@ public:
   // the dispatch, so the count never lags the producer.
   int64_t enqueueLine(std::string line, bool last) {
     int64_t bytes = (int64_t)line.size();
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, bytes);
     int64_t queued = queuedBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     uint64_t ticket = lineTickets_.fetch_add(1, std::memory_order_relaxed);
     try {
@@ -591,8 +650,9 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
+    PLUGIN
   };
 
   struct RouteMatch {
@@ -610,6 +670,8 @@ private:
     // omitted body field), so dispatch rejects it before any handler resolves it.
     bool emptyCollection = false;
     bool prettyDefault = false;
+    // Route::PLUGIN: the registered routes for the path and its captures.
+    std::optional<HttpRouteRegistry::Match> plugin;
   };
 
   struct PrettyOpts : glz::opts {
@@ -644,6 +706,8 @@ private:
   std::shared_ptr<HttpIoShard> shard_;
   beast::tcp_stream stream_;
   LuxirNode& node_;
+  // Session destruction can lag server shutdown on a task-arena thread.
+  std::shared_ptr<Metrics> metrics;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
   beast::flat_buffer buffer_;
@@ -668,6 +732,39 @@ private:
   std::string tenant_;
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
+  MetricScope requestMetric;
+  std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
+
+  void startRequestMetric() {
+    metricErrorKind.store(-1, std::memory_order_relaxed);
+    MetricOperation operation = MetricOperation::OTHER;
+    switch (route_.route) {
+      case Route::SEARCH: operation = MetricOperation::SEARCH; break;
+      case Route::UPDATE: operation = MetricOperation::UPDATE; break;
+      case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
+      case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
+      case Route::HEALTH: operation = MetricOperation::HEALTH; break;
+      case Route::TENANT_LIST: case Route::COLLECTION_LIST:
+      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE:
+        operation = MetricOperation::COLLECTIONS; break;
+      case Route::REPLICATION_STATUS: case Route::REPLICATION_WATCH:
+      case Route::REPLICATION_SNAPSHOT: case Route::REPLICATION_FILE:
+      case Route::REPLICATION_INSTALLED: return;
+      default: break;
+    }
+    requestMetric.begin(*metrics, metricActivity(MetricTransport::HTTP, operation));
+  }
+  // A request with a recorded error failed; a failed request counts its error
+  // kind. Untracked (replication) requests count nothing.
+  void finishRequestMetric(MetricOutcome outcome = MetricOutcome::OK) {
+    if (!requestMetric.active()) return;
+    int kind = metricErrorKind.load(std::memory_order_relaxed);
+    if (outcome == MetricOutcome::OK && kind >= 0) outcome = MetricOutcome::ERROR;
+    if (outcome == MetricOutcome::ERROR)
+      metrics->requestError(MetricTransport::HTTP, kind >= 0 ? (ErrorKind)kind : ErrorKind::UNKNOWN);
+    requestMetric.finish(outcome);
+  }
+
   UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
 
@@ -743,8 +840,28 @@ private:
       // The in-flight map owns the batch (and req) until done() has run.
       auto batch = batch_.lock();
       assert(batch != nullptr);
-      batch->decodeDocs();
-      ProtoUpdateMessage::handle(iw);
+      Signal::emit("httpBatchIndexing", (void*)(uintptr_t)ordinal_);
+      try {
+        batch->decodeDocs();
+        ProtoUpdateMessage::handle(iw);
+      } catch (...) {
+        indexed(false);
+        throw;
+      }
+      bool ok = result.ok();
+      if (ok) batch->releaseStaging();
+      indexed(ok);
+    }
+
+    // Hands the batch's admission slot back as soon as it is indexed; done()
+    // follows in stream order.  If the handoff fails, completion frees the slot.
+    void indexed(bool ok) noexcept {
+      try {
+        net::post(session_->stream_.get_executor(),
+            [session = session_, state = state_, ordinal = ordinal_, ok] {
+              session->onStreamBatchIndexed(state, ordinal, ok);
+            });
+      } catch (...) { LOG_ERROR("Streaming update indexed handoff failed"); }
     }
 
     void done(IndexWriter& iw) noexcept override {
@@ -755,11 +872,11 @@ private:
             [session = session_, state = state_, ordinal = ordinal_, result = std::move(result_), completed]() mutable {
               auto entry = state->inFlightBatches.find(ordinal);
               assert(entry != state->inFlightBatches.end());
-              // Preserve the admission slot until visibility completion, but free
-              // the decoded body and message before registering the wait.
-              if (state->resetGroupAfterBatch && entry->second->requestOwner == state->group.request)
+              // Keep the entry until visibility completion folds the result, but
+              // free the batch and message before registering the wait.
+              if (state->resetGroupAfterBatch && entry->second.batch->requestOwner == state->group.request)
                 state->group.request.reset();
-              entry->second.reset();
+              entry->second.batch.reset();
               if (completed->wait) session->watchWaitDisconnect();
               completed->await(session->node_, [session, state, ordinal, waiting = completed->wait.has_value(), result = std::move(result)](auto response) mutable {
                 const auto& resp = response->response;
@@ -822,6 +939,7 @@ private:
     if (const std::string* id = findParam(params, "request_id")) requestId_ = *id;
 
     route_ = matchRoute(target);
+    startRequestMetric();
     // The request's scope is settled with its route, before the buffered and
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
@@ -923,6 +1041,7 @@ private:
     if (ec && !needBuffer) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
     std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
+    metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::HTTP, produced);
     bufferedBody_.append(bodyBuf_.data(), produced);
 
     if (parser_->is_done()) {
@@ -1299,15 +1418,17 @@ private:
       return false;
     }
     if (const std::string* text = findParam(params, "document_format")) {
-      if (*text != "default" && *text != "rows" && *text != "columns") {
-        err = "invalid URL parameter 'document_format': expected default, rows, or columns, got '" +
+      if (*text != "default" && *text != "rows" && *text != "columns" && *text != "adaptive") {
+        err = "invalid URL parameter 'document_format': expected default, rows, columns, or adaptive, got '" +
               *text + "'";
         return false;
       }
       json.string("document_format", *text);
       overlay.hasTopDocs = true;
     }
-    if (!appendBoolParam(params, "get_number", true, json, overlay, err) ||
+    if (!appendIntegerParam<std::int64_t>(params, "count_limit",
+                                         "signed 64-bit decimal integer", true,
+                                         json, overlay, err) ||
         !appendBoolParam(params, "get_scores", true, json, overlay, err)) {
       return false;
     }
@@ -1348,6 +1469,8 @@ private:
     RouteMatch m;
     if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
+    } else if (target == "/metrics") {
+      m.route = Route::METRICS; m.allow = "GET";
     } else if (target == "/collections/_list") {
       // The canonical _list spelling also accepts POST (matching the other
       // _-verb endpoints; any body is ignored - the request has no parameters).
@@ -1378,6 +1501,19 @@ private:
       else if (path == "watch") { m.route = Route::REPLICATION_WATCH; m.allow = "GET"; }
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
       return m;
+    }
+    if (m.route == Route::NONE) {
+      // Built-in routes win; a plugin route answers only paths they do not.
+      if (auto plugin = HttpRouteRegistry::global().match(target)) {
+        m.route = Route::PLUGIN;
+        m.allow = plugin->allow;
+        for (const auto& [key, value] : plugin->params) {
+          if (key == "collection") m.coll = value;
+        }
+        m.emptyCollection = target.starts_with("/collections/") && m.coll.empty();
+        m.plugin = std::move(plugin);
+        return m;
+      }
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
@@ -1422,6 +1558,17 @@ private:
     if (node_.readOnly() && isMutatingRequest(req.method(), target)) {
       respondError(readOnlyError(target));
       return;
+    }
+    const HttpRoute* pluginRoute = nullptr;
+    if (match.route == Route::PLUGIN) {
+      for (const auto* candidate : match.plugin->routes) {
+        if (candidate->method == http::to_string(req.method())) pluginRoute = candidate;
+      }
+      assert(pluginRoute != nullptr);  // methodAllowed checked the same list
+      if (node_.readOnly() && pluginRoute->mutating) {
+        respondError(readOnlyError(target));
+        return;
+      }
     }
 
     if (match.tenantRoute) {
@@ -1509,19 +1656,30 @@ private:
       case Route::UPDATE:
         handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
-      case Route::STATS: {
-        bool includeSegments = false;
-        bool includeMemory = false;
+      case Route::STATS:
+      case Route::METRICS: {
+        // /metrics is the Prometheus scrape of the node: the same stats, with
+        // the collections and system sections on unless the URL turns them off.
+        bool scrape = match.route == Route::METRICS;
+        StatsParams stats{.collections = scrape, .system = scrape};
         std::string err;
-        if (!parseBoolParam(params, "segments", includeSegments, err) ||
-            !parseBoolParam(params, "memory", includeMemory, err)) {
+        const std::string* format = findParam(params, "format");
+        if (format && *format != "json" && *format != "prometheus") {
+          err = "invalid URL parameter 'format': expected json or prometheus, got '" + *format + "'";
+        }
+        if (!err.empty() ||
+            !parseBoolParam(params, "segments", stats.segments, err) ||
+            !parseBoolParam(params, "collections", stats.collections, err) ||
+            !parseBoolParam(params, "files", stats.files, err) ||
+            !parseBoolParam(params, "system", stats.system, err) ||
+            !parseBoolParam(params, "host", stats.host, err)) {
           respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
           return;
         }
+        stats.prometheus = format ? *format == "prometheus" : scrape;
         // /_stats covers every tenant; a tenant route or a collection is scoped.
         handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
-                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(),
-                    includeSegments, includeMemory);
+                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(), stats);
         break;
       }
       case Route::SCHEMA: {
@@ -1552,9 +1710,56 @@ private:
         handleSchemaSet(std::move(req.body()), coll, mode);
         break;
       }
+      case Route::PLUGIN:
+        handlePluginRoute(*pluginRoute, req, target);
+        break;
       case Route::NONE:
         break;
     }
+  }
+
+  // A plugin route runs its handler on the task arena, then answers on the
+  // connection's executor: the handler's body, or the search it asked for.
+  void handlePluginRoute(const HttpRoute& route, http::request<http::string_body>& req, std::string_view target) {
+    struct Call {
+      std::string method;
+      std::string path;
+      std::string body;
+      std::vector<std::pair<std::string, std::string>> pathParams;
+      std::vector<std::pair<std::string, std::string>> queryParams;
+    };
+    auto call = std::make_shared<Call>();
+    call->method = std::string(http::to_string(req.method()));
+    call->path = std::string(target);
+    call->body = std::move(req.body());
+    call->pathParams = route_.plugin->params;
+    for (const auto& param : urlParams_) call->queryParams.emplace_back(param.key, param.value);
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
+      HttpPluginResponse response;
+      std::optional<ErrorInfo> failure;
+      try {
+        HttpPluginRequest request{self->node_, call->method, call->path, tenant, call->body,
+                                  call->pathParams, call->queryParams};
+        route.handler(request, response);
+      } catch (const std::exception& e) {
+        failure = classifyException(e, ErrorKind::INTERNAL);
+      }
+      net::post(self->stream_.get_executor(),
+                [self, shardPin, failure = std::move(failure), response = std::move(response)]() mutable {
+                  if (failure) {
+                    self->respondError(*failure);
+                  } else if (response.searchBody) {
+                    // A search with default URL options: the request's own URL
+                    // parameters belong to the plugin, not to the search.
+                    self->handleSearch(*response.searchBody, response.searchCollection,
+                                       HttpSearchFormat::ENVELOPE, SearchUrlOverlay{});
+                  } else {
+                    self->respondSimple((http::status)response.status, response.contentType,
+                                        std::move(response.body));
+                  }
+                });
+    });
   }
 
   static void setCollectionTarget(std::string_view& collection,
@@ -1646,6 +1851,9 @@ private:
         if (td->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
+        if (td->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
+        }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
         if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
@@ -1653,6 +1861,9 @@ private:
         }
         if (f->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+        if (f->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
         }
       } else {
         return "format=docs requires top_docs or fusion ops";
@@ -1713,7 +1924,7 @@ private:
     // synchronous engine.submit() onto the task arena so this io thread is
     // not occupied for the query's duration; reply() then posts results back
     // here.
-    engine.dispatch(*sreq, sreq->proto.max_parallel);
+    engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
   // Decodes and normalizes a buffered /update body.  Runs on the task arena:
@@ -1764,6 +1975,8 @@ private:
           net::post(target->stream_.get_executor(), [target, guard, result] {
             try {
               std::string out;
+              if (result->response.status == api::UpdateResponse_::Status::ERROR)
+                target->metricError(ProtoUpdateMessage::failureKind(result->response));
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
             } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
@@ -2359,26 +2572,38 @@ private:
     });
   }
 
-  void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments,
-                   bool includeMemory) {
+  struct StatsParams {
+    bool segments = false;
+    bool collections = false;
+    bool files = false;
+    bool system = false;
+    bool host = false;
+    bool prometheus = false;
+  };
+
+  void handleStats(std::optional<std::string> coll, std::string tenant, StatsParams params) {
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments,
-         includeMemory, shardPin] {
+        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), params, shardPin] {
           std::string out;
           std::optional<ErrorInfo> failure;
           try {
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
-            request.segments = includeSegments;
-            request.memory = includeMemory;
+            request.segments = params.segments;
+            request.collections = params.collections;
+            request.files = params.files;
+            request.system = params.system;
+            request.host = params.host;
             request.tenant = tenant;
             if (coll) request.collection = *coll;
 
             luxir::api::StatsResponse response;
             gatherStats(self->node_, request, response, resource);
 
-            if (!luxir::api::write_json(response, out)) {
+            if (params.prometheus) {
+              out = renderPrometheus(response);
+            } else if (!luxir::api::write_json(response, out)) {
               throw std::runtime_error("failed to serialize stats response");
             }
           } catch (const std::exception& e) {
@@ -2386,8 +2611,10 @@ private:
           }
 
           net::post(self->stream_.get_executor(),
-                    [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+                    [self, shardPin, failure = std::move(failure), body = std::move(out),
+                     prometheus = params.prometheus]() mutable {
                       if (failure) self->respondError(*failure);
+                      else if (prometheus) self->respondSimple(http::status::ok, prometheusContentType, std::move(body));
                       else self->respondJson(http::status::ok, std::move(body));
                     });
         });
@@ -2446,6 +2673,7 @@ private:
     if (!match.hint.empty()) message += "; " + std::string(match.hint);
     ErrorInfo info{ErrorKind::INVALID_REQUEST, "method_not_allowed", std::move(message)};
     std::string_view allow = match.allow;
+    metricError(ErrorKind::INVALID_REQUEST);
     auto resp = std::make_shared<http::response<http::string_body>>(
         http::status::method_not_allowed, httpVersion_);
     resp->set(http::field::server, "luxir");
@@ -2453,10 +2681,12 @@ private:
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
     resp->body() = finishJson(renderErrorBody(info, requestId_));
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, resp->body().size());
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
           if (ec) { self->doClose(); return; }
+          self->finishRequestMetric();
           if (resp->keep_alive()) self->doRead();
           else self->doClose();
         });
@@ -2622,11 +2852,10 @@ private:
   // A control record is `{}` or a JSON object whose sole field is "_update_" or
   // "_end_".  Sole-underscore-field records with OBJECT payloads are reserved
   // as the meta/control namespace: "_header_" (emitted by format=docs query
-  // responses, so exported output pipes straight back into /update) is a
-  // recognized no-op, and any other object-valued _name_ is an error rather
-  // than silently indexed as a document (a control-record typo must not become
-  // data).  Scalar-valued sole-underscore fields stay documents - {"_version_":42}
-  // is a legitimate one-field export, and every real control carries an object.
+  // responses) is a recognized no-op, and any other object-valued _name_ is an
+  // error rather than silently indexed as a document (a control-record typo
+  // must not become data). Scalar-valued sole-underscore fields stay documents:
+  // {"_version_":42} reaches document validation, which rejects engine fields.
   // The control payload is decoded as a full UpdateRequest through the canonical JSON
   // codec so the streaming path accepts the same fields as buffered /update.
   static bool extractStreamControl(const luxir::api::Map& map, HttpStreamControl& control,
@@ -2753,7 +2982,9 @@ private:
       return;
     }
 
-    state->framer.commit(state->readSpace - parser_->get().body().size);
+    std::size_t produced = state->readSpace - parser_->get().body().size;
+    metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::HTTP, produced);
+    state->framer.commit(produced);
 
     if (parser_->is_done()) state->bodyDone = true;
     drainStreamRecords();
@@ -2877,6 +3108,7 @@ private:
   // Ends the stream with `failure`: the terminal response line when the
   // chunked response has begun, a plain HTTP error otherwise.
   void failStreamingUpdate(ErrorInfo failure) {
+    metricError(failure.kind);
     auto state = streamUpdate_;
     if (state && state->failed) return;
     std::size_t docsIndexed = state ? state->docsIndexedSoFar : 0;
@@ -2968,7 +3200,7 @@ private:
     assert(state->batch != nullptr);
     assert(state->batchReady);
     if (!barrierSubmission && !state->canAdmit()) return false;
-    assert(state->inFlight < state->maxInFlight);
+    assert(state->indexing < state->maxIndexing);
 
     ErrorInfo err;
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
@@ -2995,11 +3227,13 @@ private:
         &batch->proto, shared_from_this(), state, ordinal, batch);
     message->target = target->collection->getId();
     batch->message = message;
-    auto [entry, inserted] = state->inFlightBatches.emplace(ordinal, batch);
+    auto [entry, inserted] =
+        state->inFlightBatches.emplace(ordinal, HttpStreamUpdateState::InFlightBatch{batch});
     unused(entry);
     assert(inserted);
     unused(inserted);
     state->inFlight++;
+    state->indexing++;
 
     // This handler runs on the session shard. execute enters the node arena
     // only for the immediate try_put and returns without waiting for indexing.
@@ -3064,7 +3298,7 @@ private:
     assert(state->batch != nullptr);
     assert(!state->batchReady);
 
-    accountStreamSubmission(*state->batch, state->batch->records.size(), 0);
+    accountStreamSubmission(*state->batch, state->batch->recordCount(), 0);
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
@@ -3095,7 +3329,7 @@ private:
                            "_update_ inline request exceeds indexing.max-request-body"});
       return false;
     }
-    if (state->batch->records.size() != 0) {
+    if (state->batch->recordCount() != 0) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: inline _update_ encountered a non-empty stream batch"));
       return false;
     }
@@ -3139,7 +3373,7 @@ private:
       commitParams = &*state->group.request->proto.commit;
     }
 
-    if (state->batch->records.size() > 0 || commitParams != nullptr) {
+    if (state->batch->recordCount() > 0 || commitParams != nullptr) {
       state->emitAfterBatch = true;
       state->resetGroupAfterBatch = true;
       bool submitted = submitStreamBatch(commitParams, true);
@@ -3182,7 +3416,7 @@ private:
     assert(control.kind != HttpStreamControlKind::Noop);
 
     if (control.kind == HttpStreamControlKind::Open) {
-      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->records.size() > 0) {
+      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->recordCount() > 0) {
         if (!closeCurrentStreamGroup(nullptr, state->group.open)) {
           state->pendingControl = std::move(control);
           return false;
@@ -3319,7 +3553,7 @@ private:
                               "all_or_none NDJSON group exceeds indexing.max-request-body"});
           return false;
         }
-        if (state->batch->records.size() == 0 &&
+        if (state->batch->recordCount() == 0 &&
             state->batch->sourceBytes >= state->batchTargetBytes) {
           state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
         }
@@ -3339,11 +3573,32 @@ private:
       return true;
     }
     if (state->batch->sourceBytes >= state->batchTargetBytes ||
-        state->batch->records.size() >= state->batchMaxDocs) {
+        state->batch->recordCount() >= state->batchMaxDocs) {
       if (!submitStreamBatch(nullptr)) return false;
       return state->canAdmit();
     }
     return true;
+  }
+
+  // A batch is indexed: its slot admits the next one while its completion
+  // waits for the batches before it.  A failed batch keeps its slot and halts
+  // admission; its completion ends the stream.
+  void onStreamBatchIndexed(const std::shared_ptr<HttpStreamUpdateState>& state,
+                            std::uint64_t ordinal, bool ok) {
+    auto entry = state->inFlightBatches.find(ordinal);
+    if (entry == state->inFlightBatches.end() || !entry->second.indexing) return;
+    if (!ok) {
+      state->admissionHalted = true;
+      return;
+    }
+    entry->second.indexing = false;
+    assert(state->indexing > 0);
+    state->indexing--;
+    if (state->failed || streamUpdate_ != state) return;
+    if (state->batchReady && state->canAdmit()) {
+      if (!submitPreparedStreamBatch()) return;
+    }
+    drainStreamRecords();
   }
 
   void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
@@ -3353,6 +3608,7 @@ private:
     if (entry == state->inFlightBatches.end()) return;
     assert(state->inFlight > 0);
     state->inFlight--;
+    if (entry->second.indexing) state->indexing--;
     state->inFlightBatches.erase(entry);
 
     if (state->failed || streamUpdate_ != state) {
@@ -3406,6 +3662,10 @@ private:
   void foldStreamBatchResult(const HttpStreamBatchResult& result) {
     auto state = streamUpdate_;
     assert(state != nullptr);
+    if (!state->firstFailureKind) {
+      if (result.error) state->firstFailureKind = result.error->kind;
+      else if (!result.errors.empty()) state->firstFailureKind = result.errors.front().error.kind;
+    }
     auto& interval = state->interval;
     interval.lastUpdateVersion = result.updateVersion;
     if (result.commit) { interval.commit = result.commit; interval.replicas = result.replicas; }
@@ -3421,6 +3681,7 @@ private:
     if (result.status != luxir::api::UpdateResponse_::Status::ERROR &&
         (indexedDocs > 0 || result.deleteCount > 0)) {
       interval.anySuccess = true;
+      state->anyApplied = true;
     }
 
     // Ids on a request-level failure are not proof of anything durable.
@@ -3500,6 +3761,8 @@ private:
       return;
     }
 
+    // Like a buffered update, a stream that applied none of its input failed.
+    if (!state->anyApplied && state->firstFailureKind) metricError(*state->firstFailureKind);
     if (streamIntervalHasActivity(*state) || !state->emittedLine) {
       emitCurrentStreamInterval(true, true);
       return;
@@ -3514,6 +3777,7 @@ private:
                        const std::optional<CommitId>& id, std::optional<api::ReplicaResult> replicas,
                        std::optional<ErrorInfo> error) {
     if (streamUpdate_ != state || state->failed) return;
+    if (error) metricError(error->kind);  // the commit covers the whole request
     state->interval.commits[name] = {id ? id->token() : "", replicas, std::move(error)};
     if (--state->urlCommitsPending == 0) {
       stopWaitDisconnect();
@@ -3730,6 +3994,7 @@ private:
   }
 
   void finishResponse() {
+    finishRequestMetric();
     if (keepAlive_) {
       // Reset streaming state and serve the next request on this connection.
       res_.reset();
@@ -3750,6 +4015,8 @@ private:
 
   void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
     stopWaitDisconnect();
+    if ((unsigned)status >= 400) metricError();
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, body.size());
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
@@ -3762,6 +4029,7 @@ private:
         else self->doClose();
         return;
       }
+      self->finishRequestMetric();
       if (resp->keep_alive()) self->doRead();
       else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
       else self->doClose();
@@ -3777,6 +4045,7 @@ private:
   // object an in-band error line carries.
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
+    metricError(info.kind);
     respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
   }
   // An unread body cannot be reused as the next request. Answer, then close.
@@ -3802,6 +4071,7 @@ private:
   }
 
   void doClose() {
+    finishRequestMetric(MetricOutcome::CANCELLED);
     waitCancellation.request_stop();
     replicationStopped_ = true;
     cancelReplicationWatch();
@@ -3810,6 +4080,7 @@ private:
   }
 
   void doTerminalStreamingClose() {
+    finishRequestMetric(MetricOutcome::ERROR);
     waitCancellation.request_stop();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
@@ -3848,6 +4119,7 @@ void HttpSession::run() {
 }
 
 SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
+  if (response.proto.error) session->metricError((ErrorKind)response.proto.error->kind);
   if (format == HttpSearchFormat::DOCS) return replyDocs(response);
   // The line is rendered into an owned string, so once it is enqueued the proto
   // (and its arena) are dead weight - free them eagerly here instead of deferring
@@ -3864,9 +4136,9 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       session->respondErrorFromEngine(httpStatusFor(info), renderErrorBody(info, response.proto.request_id));
     } else {
       int64_t queued = session->enqueueJson(
-          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand), last);
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions), last);
       outputCommitted = true;
-      if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+      if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
     }
   } catch (...) {
     failDelivery(response);
@@ -3903,7 +4175,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       // Document bodies are a pure function of the batch: render them OUTSIDE
       // any lock (this is the expensive part).  Only run framing depends on
       // cross-emitter interleaving.
-      auto runs = renderDocRuns(response.proto);
+      auto runs = renderDocRuns(response.proto, jsonOptions);
 
       // Multi-op requests have one emitter per op replying concurrently: the
       // framing decisions and the queue posts must agree on order, so both
@@ -3917,7 +4189,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       std::vector<std::string> outLines;
       for (auto& run : runs) {
         std::string marker;
-        if (!frameDocRun(run, docsState, warnings, marker)) continue;
+        if (!frameDocRun(run, docsState, warnings, marker, jsonOptions)) continue;
         if (!marker.empty()) outLines.push_back(std::move(marker));
         if (!run.body.empty()) outLines.push_back(std::move(run.body));
       }
@@ -3932,7 +4204,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
         // the queue back, and the error path must then still be free to answer
         // with a plain HTTP error rather than abort a stream that never began.
         outputCommitted = true;
-        if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+        if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
       }
     }
   } catch (...) {
@@ -4088,11 +4360,13 @@ void HttpServer::spawnShard(std::size_t idx) {
 
   shard->thread = std::thread([this, shard, idx] {
     runningShardThreads.fetch_add(1, std::memory_order_relaxed);
+    node.metrics->httpThreads.fetch_add(1, std::memory_order_relaxed);
     char name[16];
     snprintf(name, sizeof(name), "luxir_http_%zu", idx);
     nameThisThread(name);
     shard->ioc.run();
     runningShardThreads.fetch_sub(1, std::memory_order_relaxed);
+    node.metrics->httpThreads.fetch_sub(1, std::memory_order_relaxed);
     net::post(acceptIoc, [this, idx] { shardExited(idx); });
   });
 }

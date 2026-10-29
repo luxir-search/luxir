@@ -11,8 +11,10 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#if !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
@@ -52,8 +54,11 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
 
 struct CollectionRequirements {
   bool needRankedDocs = false;
-  bool needExactCount = false;
+  int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+
+  bool needsCount() const { return countLimit != 0; }
+  bool isBounded() const { return countLimit > 0; }
 };
 
 // --- Response-side (owning) oneof / optional mutators ---
@@ -143,6 +148,7 @@ class SearchOp {
 public:
   SearchRequest& req;
   std::string_view name;
+  uint64_t flags = 0; // effective packed options, set by the parser
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;
@@ -212,6 +218,11 @@ public:
 
   bool canInlineInBucket() { return bucketDomain == nullptr && canInline(); }
 
+  // Whether this op's inline calculator accumulates keyed batches
+  // (InlineCalculator::updateKeyedBatch) from bare column reads alone, so a
+  // low-cardinality facet can fold it into its single ord pass.
+  virtual bool inlinesAsColumnBatch() const { return false; }
+
   // Packed state size belongs to the resolved plan, so scheduling can budget
   // inline buckets without constructing their runtime calculators.
   virtual uint32_t inlineEntryBytes() const { return 0; }
@@ -225,6 +236,9 @@ public:
   virtual size_t facetBucketResidentBytes() const {
     return 0;
   }
+
+  // Unknown dimensions use observed binding bytes for subsequent blocks.
+  virtual bool facetBucketGrows() const { return false; }
 
   // Whether this subtree runs query weights whose per-segment state is
   // released and rebuilt (Weight::hasReleasableSegmentState): bucket bindings
@@ -284,7 +298,13 @@ public:
         if (state == nullptr) return;
         state->wire.kind = "segment";
         state->wire.segment = segnum;
+#if defined(__APPLE__)
+        uint64_t threadId = 0;
+        (void)pthread_threadid_np(nullptr, &threadId);
+        state->wire.thread_id = (int64_t)threadId;
+#else
         state->wire.thread_id = (int64_t)::syscall(SYS_gettid);
+#endif
         started = std::chrono::steady_clock::now();
       }
       ExecutionProfileScope(const ExecutionProfileScope&) = delete;
@@ -317,6 +337,8 @@ public:
     std::vector<DomainHandle> structuralDomains() const;
 
     StructuralConstraint::Finish structuralFinish() const;
+
+    virtual size_t facetBucketObservedBytes() const { return op.facetBucketResidentBytes(); }
 
     virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
       op.releaseSegmentState(segment);
@@ -384,12 +406,15 @@ public:
     //     encode's it and respondRaw(..., more=true), then it is dropped (per-emit
     //     eager-drop). The accumulating/final response is untouched; multiple intermediates
     //     may precede the final, which goes out more=false.
-    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+    luxir::api::Val* getTarget(SearchResponse* resp, SearchOp& sub, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
       resp = resp ? resp : op.req.lastResponse;
-      auto* val = parent->getTargetForSub(resp, this);
+      auto* val = parent->getTargetForSub(resp, sub);
       visitor(*val); // call the visitor with the target Val with mutex held.
       return val;
+    }
+    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+      return getTarget(resp, op, std::forward<decltype(visitor)>(visitor));
     }
     luxir::api::Val* getTarget(SearchResponse* resp) {
       return getTarget(resp, [](luxir::api::Val&){});
@@ -409,10 +434,10 @@ public:
       return arm;
     }
 
-    // Called by a subCalculator on us to get the target for the subCalculator to set.
+    // Resolve a named child, including when another child emits its result.
     // `resp` is non-null (getTarget resolves it). Do not call this without op.req.mutex
     // held to protect the response from concurrent modifications.
-    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) = 0;
+    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) = 0;
 
     SearchOp& getOp() {
       return op;
@@ -473,7 +498,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
@@ -483,6 +508,22 @@ public:
     virtual void rewind() {}
     virtual void insert(void* entry, int32_t docid) = 0;
     virtual void update(void* entry, int32_t docid) = 0;
+    // Keyed batches: the caller holds one entry per key in a dense array,
+    // `states` pointing at key 0's state for this calculator and `stride`
+    // apart. It initializes a key's state (initEntry) before its first batch;
+    // updateKeyedBatch then adds docs[i] to key keys[i] for every i, in doc
+    // order, exactly as update() per document would.
+    virtual bool acceptsKeyedBatches() const { return false; }
+    virtual void initEntry(void* entry) { unused(entry); }
+    virtual void updateKeyedBatch(char* states, size_t stride,
+                                  std::span<const int64_t> keys,
+                                  std::span<const int32_t> docs) {
+      unused(states);
+      unused(stride);
+      unused(keys);
+      unused(docs);
+      assert(false);
+    }
     virtual void merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual void mergeNew(void* target, void* from) = 0;
@@ -537,9 +578,6 @@ class KeyedAggregateTable {
   BigFlatMap<Key, char*, Hash> sparseEntries;
   [[no_unique_address]] Payload payload;
   static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
-  // The entry header counts documents delivered to metrics. Repeated values
-  // add only facet occurrences, without changing compact metric denominators.
-  boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
@@ -828,26 +866,66 @@ public:
     }
   }
 
-  void addOccurrence(char* entry, int64_t count = 1) {
-    assert(loadUnaligned<int64_t>(entry) > 0);
-    auto it = extraOccurrences.find(entry);
-    if (it != extraOccurrences.end()) {
-      it->second += count;
+  // Whether addKeyedBatch applies: a dense table whose calculators all take
+  // keyed batches.
+  bool acceptsKeyedBatches() const {
+    if constexpr (!std::is_same_v<Key, int64_t> || Payload::BYTES != 0) {
+      return false;
     } else {
-      constexpr size_t bytes = 2 * (sizeof(std::pair<char*, int64_t>) + 1);
-      charge(bytes);
-      sparseBytesCharged += bytes;
-      extraOccurrences.emplace(entry, count);
+      return rep == Rep::DENSE && !disableKeyedInlineBatchesForTests
+          && std::ranges::all_of(calcs, [](auto* calc) {
+               return calc->acceptsKeyedBatches();
+             });
     }
   }
 
-  int64_t occurrenceCount(char* entry) const {
-    int64_t count = loadUnaligned<int64_t>(entry);
-    if (!extraOccurrences.empty()) {
-      auto it = extraOccurrences.find(entry);
-      if (it != extraOccurrences.end()) count += it->second;
+  LUXIR_NOINLINE void firstKeyedTouch(int64_t key, char* entry) {
+    ensureTouchedCapacity();
+    touchedKeys.push_back(key);
+    char* ptr = entry + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->initEntry(ptr);
+      ptr += calcEntryBytes[c];
     }
-    return count;
+  }
+
+  // add(keys[i], docs[i]) for every i, in doc order: entry counts first,
+  // then one keyed batch per calculator instead of a call per document.
+  void addKeyedBatch(std::span<const int64_t> keys,
+                     std::span<const int32_t> docs) {
+    assert(acceptsKeyedBatches());
+    assert(keys.size() == docs.size());
+    // Locals, not members: the unaligned entry stores below may alias any
+    // member, which would otherwise be reloaded for every document.
+    char* base = denseEntries.data();
+    size_t entryStride = stride;
+    // One update per run of equal keys when runs are long, else one per
+    // document (a run-detection branch mispredicts on interleaved keys).
+    size_t n = keys.size();
+    size_t changes = 0;
+    for (size_t i = 1; i < n; i++) changes += keys[i] != keys[i - 1];
+    bool runs = 4 * changes < n;
+    for (size_t i = 0; i < n;) {
+      int64_t key = keys[i];
+      assert(key >= 0 && key < keySpaceSize);
+      size_t j = i + 1;
+      if (runs) {
+        while (j < n && keys[j] == key) j++;
+      }
+      char* entry = base + (size_t)key * entryStride;
+      int64_t count = loadUnaligned<int64_t>(entry);
+      if (count == 0) [[unlikely]] firstKeyedTouch(key, entry);
+      storeUnaligned<int64_t>(entry, count + (int64_t)(j - i));
+      i = j;
+    }
+    char* states = denseEntries.data() + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->updateKeyedBatch(states, stride, keys, docs);
+      states += calcEntryBytes[c];
+    }
+    if (stats != nullptr) {
+      stats->keyedBatches.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 
   template <typename RemapKey>
@@ -859,7 +937,6 @@ public:
         stats->mixedMerges.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    const bool carryOccurrences = !other.extraOccurrences.empty();
     other.forEachEntry([&](KeyArg key, char* from) {
       decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
@@ -868,10 +945,6 @@ public:
         mergeNewEntry(target, from, other);
       } else {
         mergeEntry(target, from, other);
-      }
-      if (carryOccurrences) {
-        auto it = other.extraOccurrences.find(from);
-        if (it != other.extraOccurrences.end()) addOccurrence(target, it->second);
       }
     });
   }

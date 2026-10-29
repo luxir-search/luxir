@@ -351,9 +351,7 @@ public:
   }
 
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     PhraseQuery& query;
@@ -669,6 +667,22 @@ public:
           if (minCost < 0 || c < minCost) minCost = c;
         }
         return minCost < 0 ? 0 : minCost;
+      }
+
+      // A two-phase conjunction flattens the phrase into its estimate's
+      // conjunction terms.
+      void approximationCosts(
+          MemPool& planPool, const Query::PlanContext& context,
+          boost::container::small_vector_base<int64_t>& out) override {
+        const EstimateMemo& estimate = estimateMemo(planPool, context);
+        if (!estimate.nonempty || context.disableBooleanTwoPhaseForTests) {
+          out.push_back(cost());
+          return;
+        }
+        for (int32_t ordinal : estimate.conjunctionOrder) {
+          int32_t source = estimate.querySlotSources[(size_t)ordinal];
+          out.push_back(weight.cachedTermInfos[(size_t)source]->docFreq(segment.ord));
+        }
       }
 
       Query::ScorerShape describeScorer(
@@ -1210,10 +1224,10 @@ public:
       for (;;) {
         for (int j = 1; j < conjunctionEnums.size(); j++) {
           if (conjunctionEnums[j]->docId() < target) {
-            int32_t id = conjunctionEnums[j]->advance(target);
+            int32_t id = conjunctionEnums[j]->advanceInline(target);
             assert(id >= target);
             if (id > target) {
-              target = firstEnum->advance(id);
+              target = firstEnum->advanceInline(id);
               goto outer;
             }
           }

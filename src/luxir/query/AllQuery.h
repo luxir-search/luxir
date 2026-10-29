@@ -148,7 +148,7 @@ public:
     MembershipWork membershipWork(int32_t maxDoc) override {
       unused(maxDoc);
       double matches = (double)cost();
-      return {matches, 4 * matches, 0, 32, 64};
+      return {matches, 4 * matches, 0, 32, 64, 0, true};
     }
 
     Query::ScorerShape describeScorer(
@@ -247,11 +247,7 @@ public:
   };
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
-                                 float multiplier = 1.0f) override {
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
-        context, *this, flags, constantWhenScored(flags, multiplier));
-    return weight;
-  }
+                                 float multiplier = 1.0f) override;
 
 };
 

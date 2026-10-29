@@ -26,10 +26,13 @@ public:
 
 class AutomatonQuery final : public MultiTermQuery {
 public:
-  enum class Kind { WILDCARD, REGEX };
+  enum class Kind { WILDCARD, REGEX, MATCH, PREFIX };
 
 private:
+  // Kind distinguishes normalized literals from patterns that fold during
+  // compilation. Both kind and case alternation affect the accepted language.
   Kind automatonKind;
+  bool caseInsensitive;
   std::string_view pattern;
   automaton::ByteDfaView dfa;
   automaton::ByteDfaKind classification;
@@ -41,23 +44,24 @@ private:
   std::optional<TermPolicy> fittedPolicy;
 
 public:
-  AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
+  AutomatonQuery(std::string_view field, Kind kind, bool caseInsensitive, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
                  std::string_view exactOrPrefix, DfaScanPlan scanPlan,
                  std::optional<TermPolicy> fittedPolicy = std::nullopt)
       : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
-        pattern(pattern), dfa(dfa),
+        caseInsensitive(caseInsensitive), pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
-    return automatonKind == rhs.automatonKind && field == rhs.field
-        && pattern == rhs.pattern;
+    return automatonKind == rhs.automatonKind && caseInsensitive == rhs.caseInsensitive
+        && field == rhs.field && pattern == rhs.pattern;
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), automatonKind);
+    value = mixHash(value, caseInsensitive);
     value = mixHash(value, field);
     return mixHash(value, pattern);
   }
@@ -66,26 +70,23 @@ public:
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
     out.appendByte((uint8_t)automatonKind);
+    out.appendByte((uint8_t)caseInsensitive);
     out.appendString(field);
-    out.appendTerm(pattern);
+    // A general pattern is not fitted to the term length a one-byte prefix holds.
+    out.appendString(pattern);
     unused(ctx);
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
-    switch (classification) {
-      case automaton::ByteDfaKind::SINGLE:
-        return pool.make<ExactTermTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::PREFIX:
-      case automaton::ByteDfaKind::ALL:
-        return pool.make<PrefixTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::NORMAL:
-        return pool.make<DfaIntersectEnum>(pool, te, dfa, scanPlan);
-      case automaton::ByteDfaKind::NONE:
-        assert(false);
-    }
-    return nullptr;
-  }
+  // Same scored-clause ceiling as fuzzy. Filters retain the complete union;
+  // scored MATCH rejects overflow rather than silently losing case variants.
+  static constexpr size_t MAX_CASE_VARIANTS = 64;
+  static constexpr float CASE_ALTERNATE_WEIGHT = 0.9f;
+
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override;
+
+  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 

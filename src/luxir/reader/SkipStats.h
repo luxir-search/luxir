@@ -116,6 +116,10 @@ struct SkipStats {
   static inline int64_t mandOptBulkCompactions = 0;
   static inline int64_t mandOptBulkOptDrivenWindows = 0;
   static inline int64_t mandOptBulkScalarFillFallbacks = 0;
+  // Min-score child windows filtered, and candidate scores checked. Bulk
+  // checks are added once per window; pull checks count verifier calls.
+  static inline int64_t minScoreBulkWindows = 0;
+  static inline int64_t minScoreChecks = 0;
   static inline int64_t countBulkFillCalls = 0;
   static inline int64_t countBulkFillBlocks = 0;
   static inline int64_t countBulkFillDocs = 0;
@@ -230,6 +234,7 @@ struct SkipStats {
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
   static inline int64_t constantWindowCaptures = 0;
+  static inline int64_t constantLimitOnlyCollections = 0;
   static inline int64_t fieldSortBlocksSkipped = 0;
   static inline int64_t fieldSortCandidateActivations = 0;
   static inline int64_t fieldSortCandidateTerminations = 0;
@@ -330,7 +335,13 @@ struct SkipStats {
   static inline int64_t numericPredicatePointsArms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  static inline int64_t numericPredicateClassifiedBlocks = 0;
+  static inline int64_t numericPredicateProofIndexes = 0;
   static inline int64_t rangeFacetPointsArms = 0;
+  // Range facet zones (blocks or leaves) counted whole, without a decode.
+  static inline int64_t rangeFacetZoneRuns = 0;
+  // Range facet zones added whole to sub-op bucket domains.
+  static inline int64_t rangeFacetZoneDomainRuns = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
@@ -443,6 +454,8 @@ struct SkipStats {
     mandOptBulkCompactions = 0;
     mandOptBulkOptDrivenWindows = 0;
     mandOptBulkScalarFillFallbacks = 0;
+    minScoreBulkWindows = 0;
+    minScoreChecks = 0;
     countBulkFillCalls = 0;
     countBulkFillBlocks = 0;
     countBulkFillDocs = 0;
@@ -554,6 +567,7 @@ struct SkipStats {
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
     constantWindowCaptures = 0;
+    constantLimitOnlyCollections = 0;
     fieldSortBlocksSkipped = 0;
     fieldSortCandidateActivations = 0;
     fieldSortCandidateTerminations = 0;
@@ -622,7 +636,11 @@ struct SkipStats {
     numericPredicatePointsArms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateClassifiedBlocks = 0;
+    numericPredicateProofIndexes = 0;
     rangeFacetPointsArms = 0;
+    rangeFacetZoneRuns = 0;
+    rangeFacetZoneDomainRuns = 0;
     geoBKDArms = 0;
     geoScanArms = 0;
     geoSparseVerifyArms = 0;

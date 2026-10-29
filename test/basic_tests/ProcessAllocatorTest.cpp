@@ -240,7 +240,6 @@ TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource responseMemory;
   api::StatsRequest request;
-  request.memory = true;
   gatherStats(node, request, response, responseMemory);
   ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
   const auto& jemalloc = *response.memory->jemalloc;
@@ -304,6 +303,7 @@ TEST(ProcessAllocatorTest, abortedFlushAndDestructionFreeArenaMemory) {
       EXPECT_GT(arena.stats()->allocated, start.allocated + 1024 * 1024);
       if (abortFlush) {
         inverter.fail(std::make_exception_ptr(std::runtime_error("aborted indexing")));
+        EXPECT_EQ(0, inverter.retainedDeleteBytes());
         writer.releaseInverter(inverter, true);
         writer.updateGraph->wait_for_all();
         EXPECT_EQ(arena.stats()->allocated, start.allocated);
@@ -378,7 +378,11 @@ TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
   arena.deallocate(reused, size, hugePageSize);
   arena.purge();
   EXPECT_LT(arena.stats()->resident, resident);
+#ifdef __APPLE__
+  std::vector<char> pages(size / (size_t)sysconf(_SC_PAGESIZE));
+#else
   std::vector<unsigned char> pages(size / (size_t)sysconf(_SC_PAGESIZE));
+#endif
   EXPECT_EQ(mincore(reused, size, pages.data()), 0);
   EXPECT_TRUE(std::all_of(pages.begin(), pages.end(), [](auto p) { return !(p & 1); }));
   EXPECT_EQ(mincore(live, size, pages.data()), 0);
@@ -483,7 +487,6 @@ TEST(BigBufferTest, statsReportArena) {
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource memory;
   api::StatsRequest request;
-  request.memory = true;
   gatherStats(node, request, response, memory);
   ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
   const auto& bigBuffer = response.memory->jemalloc->big_buffer;

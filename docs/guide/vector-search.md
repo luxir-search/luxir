@@ -154,6 +154,94 @@ A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
 
+An optional `ann` object chooses how [approximate indexes](#index-settings)
+for the field are built; the defaults suit most embedding models.
+
+### Truncate Matryoshka embeddings
+
+Some embedding models are trained with
+[Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147) (MRL):
+the leading components of their output are themselves a usable, lower
+dimensional embedding. `truncate_dims` keeps only that prefix:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "summary_v": {
+      "type": "vector",
+      "dims": 1024,
+      "truncate_dims": 256,
+      "metric": "cosine"
+    }
+  }
+}
+```
+
+Clients send either the full model output or a vector already truncated to
+`truncate_dims` (for example with the provider's `dimensions` option), for
+documents and for kNN queries. Luxir cuts every vector to its first
+`truncate_dims` components before it is stored or searched, so index and
+query vectors are always truncated the same way. The column, approximate
+indexes and scoring all work on the shorter vector: 256 dimensions here store
+and scan a quarter of the bytes of 1024.
+
+- `dims` is the full input dimension and is required. `truncate_dims` is the
+  stored and searched dimension, and must be less than `dims`.
+- Every indexed and query vector must have exactly `dims` or exactly
+  `truncate_dims` components (`expected dims=1024 or truncate_dims=256, got
+  768`). Once truncated, vectors from different models have the same length,
+  so this check is what keeps most other models' output out of the field. It
+  cannot catch a model whose native size equals `truncate_dims`: with
+  `dims: 3072, truncate_dims: 1536`, vectors from a 1536-dimension model are
+  accepted as already truncated.
+- A vector whose truncated prefix is all zeros has no cosine direction, even
+  when its tail does: it is skipped at index time and rejected as a query.
+- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+  shorter than 1, and MRL models compare renormalized prefixes, so Luxir
+  renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
+  prefix renormalized by the provider score the same. `normalized: true` is
+  rejected, because the stored vectors are no longer the vectors the assertion
+  was about. `normalize_on_write: false` keeps the raw prefix and normalizes
+  at query time, as for any cosine field.
+- Reading the field back returns the stored truncated vector (normalized
+  unless `normalize_on_write: false`), which can be sent back as input.
+- `truncate_dims: 0` turns off truncation inherited from a parent.
+- Approximate indexes are built over the truncated vector, so a positive
+  `ann.pq.m` must divide `truncate_dims`.
+- Changing `truncate_dims` changes the stored dimension, so existing
+  segments must be reindexed, as for a `dims` change.
+
+To compare several sizes from one indexing pass, declare truncated
+[variants](schema.md#field-variants) beside the full vector before indexing.
+Each one indexes the same input, and a query selects one by name, such as
+`summary_v__d256`. A variant added later covers only documents indexed after
+it, like any new variant:
+
+```json
+"summary_v": {
+  "type": "vector", "dims": 1024, "metric": "cosine",
+  "variants": {
+    "d256": { "type": "vector", "dims": 1024, "truncate_dims": 256, "metric": "cosine" }
+  }
+}
+```
+
+Use it only with models trained for it. Models that document MRL truncation
+include OpenAI `text-embedding-3-small` and `-large` (the `dimensions`
+parameter), Google `gemini-embedding-001`, Jina `jina-embeddings-v3`, Nomic
+`nomic-embed-text-v1.5`, and mixedbread `mxbai-embed-large-v1`. Check the
+model card for the dimensions it was trained to support. Truncating an
+embedding from a model *not* trained with MRL discards information the model
+spread across all of its dimensions, and recall drops sharply; this option
+does nothing to compensate.
+
+Some models prescribe extra steps around truncation. Nomic's reference code
+applies a layer norm to the full embedding before cutting it; Luxir does not
+do that, so send full vectors that already have any such pre-truncation step
+applied. Otherwise they will not match vectors the provider truncated.
+
 ## Index vectors
 
 A vector is a bare number array. A multi-valued field takes an array of
@@ -194,9 +282,12 @@ POST /collections/books/_update
 }
 ```
 
-Integer elements are accepted. Every element must be a finite float32: a double
-past float32 range, or a NaN or infinity in any arm (typed gRPC vectors included),
-fails the document.
+Integer elements are accepted. Every element must be a finite float32 with
+magnitude at most 2^40 (about 1.1e12): a double past float32 range, a NaN or
+infinity in any arm (typed gRPC vectors included), or a larger element fails the
+document. The limit keeps every distance computed while indexing and searching
+finite; embeddings sit many orders of magnitude below it. Query vectors follow
+the same rule.
 
 Over gRPC, use the typed `Val.vec` and `Val.arr_vec` arms. In protobuf text,
 a single-valued vector field is:
@@ -357,7 +448,7 @@ has no root shorthand, so both request and response use named `ops`.
 | `weights` | Per-source weights keyed by source name; a source without an entry has weight `1`. |
 | `rrf.k` | The rank-smoothing constant, `>= 0`. Omitted selects `60`, the conventional choice. |
 | `linear.normalization` | Score normalization for [linear fusion](#linear-fusion); `min_max`, the default, is the only one today. |
-| `limit`, `offset`, `fields`, `get_scores`, `get_number`, `document_format` | Response shape, on the fusion, not on a source. |
+| `limit`, `offset`, `fields`, `get_scores`, `count_limit`, `document_format` | Response shape, on the fusion, not on a source. |
 | `ops` | Operations over the fused candidate set, including collapsed `top_docs`. |
 
 A source's `limit` bounds its candidate pool: a document outside a source's
@@ -397,7 +488,7 @@ A source can use `collapse` for diversity: its `limit` then counts groups,
 and its best member documents enter ordinary document fusion; under
 `linear`, the source normalizes its head scores over its group list. Sources
 may use independent keys and missing policies. Source collapse accepts only
-`field` and `missing`; `head_sort`, metric `sort`, `get_number` and `ops` are
+`field` and `missing`; `head_sort`, metric `sort`, `get_count` and `ops` are
 errors. A source's `knn.unit: "groups"` uses that source's collapse key.
 
 `fusion.collapse` groups the fused document list before paging. Groups rank
@@ -425,10 +516,10 @@ groups by default (`count_unit: "docs"` counts documents), and a source's
           }
         },
         "collapse": {
-          "field": "product_s", "head_sort": "price_i asc", "get_number": true,
+          "field": "product_s", "head_sort": "price_i asc", "get_count": true,
           "ops": {"colors": {"field_facet": {"field": "color_s"}}}
         },
-        "limit": 10, "get_scores": true, "get_number": true
+        "limit": 10, "get_scores": true, "count_limit": -1
       }
     }
   }
@@ -536,11 +627,12 @@ after changing source limits.
 ## Approximate search
 
 Exact search costs one pass over the column per query. For large collections,
-a commit can build approximate nearest-neighbor indexes (IVF+PQ, via FAISS)
-as segment overlays. An overlay is built from the vector column, follows its
-segment through later commits and merges, and its candidates are always
-rescored from the full-precision column before they are returned. Building
-an overlay does not reindex documents.
+a commit can build approximate nearest-neighbor indexes as segment overlays:
+an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
+by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
+from the vector column, follows its segment through later commits and
+merges, and its candidates are always rescored from the full-precision column
+before they are returned. Building an overlay does not reindex documents.
 
 ### Build at commit
 
@@ -561,15 +653,102 @@ unpublished and can be retried. Once a segment has an overlay, later commits
 carry it forward and delete-only commits keep it (deleted documents are
 filtered out at query time).
 
-Whether a segment gets an overlay is size based. IVF+PQ is built only when the
-segment has enough vectors to train on and enough scan cost to justify it;
-smaller segments stay on the exact column scan. A single query routinely uses
+Whether a segment gets an overlay is size based. An overlay is built only
+when the segment has enough vectors (8192 for RaBitQ, about 10,000 for PQ,
+which must train its codebooks) and enough scan cost to justify it; smaller
+segments stay on the exact column scan, which is faster than an index at that
+size and exact. A single query routinely uses
 the index for large segments and exact scan for small ones, with the same
 results contract either way. A merged segment gets fresh
 overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
+
+Builds run as indexing tasks, so their parallelism is bounded by the indexing
+arena, sized by `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
+
+### Index settings
+
+A vector field's `ann` object selects the overlay codec and its parameters:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "ann": {"codec": "pq"}
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
+| `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
+| `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
+
+`rabitq` settings require an explicit `"codec":"rabitq"`, for example
+`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
+Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
+`pq` settings alone; a `rabitq` object does not infer the codec. A field
+without `ann` inherits its parent's, and an `ann` object replaces the
+parent's whole definition rather than merging with it.
+
+These rules also apply to inherited ANN settings and vector variants. Use
+automatic `m` when dimensions are inferred from indexed values; an explicit
+positive `m` requires dimensions pinned in the schema.
+
+**RaBitQ** (opt-in) stores each vector as one sign bit per dimension of
+its randomly rotated offset from its IVF list's centroid, plus a few
+correction factors: 104 bytes for a 768-dimension vector, about 1/30 of the
+float vector. Distances estimated from these codes come with a proven error
+bound, and the codec trains nothing beyond the IVF centroids. With `bits`
+above 1 (extended RaBitQ), each dimension gets extra magnitude bits; a scan
+then estimates every vector from its sign bits first and spends the extra bits
+only on vectors whose error bound still overlaps the current top candidates.
+`query_bits: 4` matches the 1-bit-document, 4-bit-query asymmetry other
+engines use and costs no measurable recall against `8`.
+
+**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
+codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
+bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
+over `m=32` at the cost of larger codes and more scan work; see the
+[codec measurements](../design/vector-search.md#codec-measurements).
+L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
+precomputed table at 8 bits; IP/cosine builds its lookup table per query and
+has no such resident table. Fields of up to 256 dimensions and explicit `m`
+settings keep their existing choices. PQ codebooks are retrained for every
+segment build and merge; automatic `m` depends only on dimensions and metric.
+
+PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
+lists. Opt into RaBitQ for its different size/recall tradeoff.
+With 1-bit RaBitQ, recall is usually limited by how many lists are probed
+rather than by the codes, so raise `ivf.nprobe` first; extra `bits` help mainly
+when `refine_candidates` is small.
+
+Overlays record the settings they were built with, so a change applies to
+segments built afterwards: new flushes, merges, and segments without an
+overlay that a later commit selects. A query serves every segment with its own
+overlay's codec, so segments built under different settings mix freely.
+`query_bits` is applied at search time to both document and group searches
+and takes effect for existing RaBitQ overlays immediately, including when the
+current schema selects PQ for future builds. Changing `ann` does not change
+the field's identity: existing values stay searchable.
+
+The [resolved schema view](schema.md#resolved-view) exposes each vector
+representation's effective `ann` settings, including defaults and inherited
+values. It includes only the selected codec's settings. `nlist:0` and `m:0`
+remain automatic policies, rather than sizes chosen for any one segment.
 
 ### Query knobs
 
@@ -594,10 +773,11 @@ every index type.
 | Field | Meaning |
 |---|---|
 | `field` | Vector field. Required. |
-| `query` | Query vector; must match the field's dimension. Required. |
+| `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
+| `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
@@ -618,8 +798,14 @@ Luxir would probe if the field were a single IVF index built with
 `nlist`. That total effort is spread across the current per-segment indexes,
 so a merge does not change the effort a request asks for. An explicit `nprobe`
 pins the effort cap; an adaptive one may deepen when filters or collapse
-underfill the result. Probed lists are always scanned in full; `nprobe` is the
-only work limiter.
+underfill the result. The adaptive default starts at `sqrt(nlist)` of that
+reference index for fields of up to 128 stored dimensions and scales by
+`sqrt(dims / 128)` above that (capped at 4x), where `dims` is the stored
+dimension (`truncate_dims` when set). This effort policy applies to
+both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
+measurements on GIST and Cohere embeddings showed recall@10 rising from
+0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
+the only work limiter.
 
 ### Scoring
 
@@ -627,6 +813,29 @@ L2 scores are `1 / (1 + squared_distance)`. Inner product scores are the dot
 product. Cosine is inner product over normalized vectors. The score
 distribution depends on the embedding model and corpus, so calibrate
 thresholds per deployment.
+
+### Similarity threshold
+
+`similarity` drops the nearest neighbors that are not similar enough, with the
+semantics of Elasticsearch's `knn.similarity`. The value is in the metric's
+space, not the score's:
+
+| Metric | `similarity` means | Hit kept when |
+|---|---|---|
+| `l2` | Maximum L2 distance (not squared); must be `>= 0` | `distance <= similarity` |
+| `ip` | Minimum dot product | `dot >= similarity` |
+| `cosine` | Minimum cosine similarity | `cosine >= similarity` |
+
+```json
+{"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
+```
+
+The threshold trims the `k` nearest documents after the full-precision
+rescore; it does not search past them, so a request can match fewer than `k`
+documents. The comparison uses each document's best vector, before any
+enclosing `boost`. Trimmed documents are not matches: they leave `found`,
+facets, and metrics as well as the returned list, on exact and approximate
+segments and in parallel execution alike.
 
 Cosine fields normalize on write by default (`normalize_on_write: true`), so
 reading the vector column back returns the unit vector rather than the bytes
@@ -651,16 +860,16 @@ POST /collections/books/_search
 
 That is `[0.6, 0.3, 0.1]` at unit length. Set `normalize_on_write: false` to
 keep the raw vectors in the column; candidate rescoring then normalizes at
-query time. Zero and near-zero cosine vectors have no direction and are
-skipped at index time.
+query time. Zero and near-zero cosine vectors have no direction: they are
+skipped at index time, and a kNN query with one is rejected.
 
 ### Measure recall
 
-IVF+PQ is approximate. Higher `ivf.nprobe` and higher `refine_candidates`
-raise recall and latency. Setting `nprobe` to at least the reference
-`sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes the search
-exhaustive over IVF lists, but PQ ordering still decides which candidates are
-rescored.
+Approximate search is approximate. Higher `ivf.nprobe` and higher
+`refine_candidates` raise recall and latency. Setting `nprobe` to at least the
+reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
+the search exhaustive over IVF lists, but the codec's estimated ordering still
+decides which candidates are rescored.
 
 `exact: true` uses a path that guarantees the true top-k and does not
 consult overlays. Everything else about
@@ -673,7 +882,10 @@ bit-identical results to a serial run of the same query.
 
 ## Limits
 
-- IVF+PQ is the only approximate index type. There is no HNSW yet.
+- IVF (with RaBitQ or PQ codes) is the only approximate index type. There is
+  no HNSW yet.
+- An `ann` change does not rebuild existing overlays; only segments built
+  afterwards use it (see [Index settings](#index-settings)).
 - Filters are always applied inside the vector search. There is no cost-based
   choice between filtered approximate search and exact search over the
   filtered set, and no automatic exact fallback when a selective filter still

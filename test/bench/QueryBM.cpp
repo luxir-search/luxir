@@ -290,7 +290,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
       topDocs.matchQuery(qfield, "0");
     }
     topDocs.limit(100)        // higher limit to exercise the priority queues more
-           .getNumber(true)
+           .countLimit()
            .getScores(false)
            .fields({"id"});
     for (auto field : sortFields) qb::sort(topDocs, field, qb::DESC);
@@ -365,7 +365,7 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
         /*required=*/{qb::match(topDocs.mr(), field1, "0"),
                       qb::match(topDocs.mr(), field2, "0")});
     topDocs.limit(10)
-           .getNumber(true)    // count all matches -> iterate the full conjunction
+           .countLimit()    // count all matches -> iterate the full conjunction
            .fields({"id"})
            .getScores(false);
 

@@ -158,7 +158,10 @@ void fillMessage(M& m, std::pmr::memory_resource& mr, int depth) {
   // These fields are value sequences, not arbitrary Val payloads. Keep the generic fixture
   // inside the semantic domain accepted by the parser, and avoid an explicit null Val whose
   // JSON representation is intentionally indistinguishable from an absent optional field.
-  if constexpr (std::is_same_v<M, P::AnyOfQuery>) {
+  if constexpr (std::is_same_v<M, P::SearchRequest> || std::is_same_v<M, P::SearchOp>) {
+    m.flags = 2;
+    m.flags_set = 3;
+  } else if constexpr (std::is_same_v<M, P::AnyOfQuery>) {
     P::Val* values = B::allocMessage<P::Val>(mr);
     auto& strings = values->kind.emplace<P::ArrStr>();
     std::string_view* items = B::allocArray(strings.v, 2, mr);
@@ -280,19 +283,24 @@ void roundTripType(const char* nm) {
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
   X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
+  X(WeightedField) X(PhraseOptions) X(MultiMatchQuery) X(DisMaxQuery)                                         \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
   X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
   X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
-  X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
+  X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVal) X(ColVector) X(MultiVector) X(ColInt) \
   X(ColFloat) X(ColDouble) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats) X(ArenaStats) X(JemallocStats)   \
-  X(FieldMetadataStats) X(MemoryStats) X(StorageRamStats)                                                                \
+  X(FieldMetadataStats) X(MemoryStats) X(ScrubStats) X(StorageRamStats) X(OutcomeStats) X(CollectionActivityStats) \
+  X(HistogramStats) X(ActivityStats) X(TransportStats) X(ServiceStats) X(SystemStats) X(HostStats)             \
+  X(ProcessStats) X(ProcessIoStats) X(CpuTimes) X(HostCpuStats) X(HostMemoryStats) X(NetworkInterfaceStats)        \
+  X(TcpStats) X(DiskStats) X(FilesystemStats) X(PressureStats) X(CgroupStats)                    \
+  X(CgroupMemoryStats) X(CgroupCpuStats) X(CgroupTaskStats)                                       \
   X(CacheControlRequest) X(CacheControlResponse) X(CacheEntryDump)                                \
   X(ShardCacheControl) X(CollectionCacheControl)
 
@@ -302,13 +310,34 @@ TEST(ProtoRoundTrip, AllMessages) {
 #undef RT
 }
 
+TEST(ProtoRoundTrip, CacheBudgetPresence) {
+  for (auto bytes : std::array<std::optional<uint64_t>, 3>{std::nullopt, 0, 17}) {
+    P::CacheControlRequest in;
+    in.max_bytes = bytes;
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(encode(in, wire));
+    std::vector<std::byte> expected;
+    if (bytes) expected = {std::byte{0x40}, (std::byte)*bytes};
+    EXPECT_EQ(expected, wire);
+    std::pmr::monotonic_buffer_resource resource;
+    P::CacheControlRequest out;
+    ASSERT_TRUE(decode(out, P::copyToPaddedInput(std::span<const std::byte>(wire), resource), resource));
+    EXPECT_EQ(bytes, out.max_bytes);
+    std::string json;
+    ASSERT_TRUE(write_json(in, json));
+    P::CacheControlRequest fromJson;
+    ASSERT_TRUE(read_json(fromJson, json, resource));
+    EXPECT_EQ(bytes, fromJson.max_bytes);
+  }
+}
+
 TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
   // An explicit fixture beside the generic fill: ordered distinct filters and
   // string / int / bool / list / object / null params survive binary
   // encode -> decode and come back as the same canonical JSON; an absent
   // tokenizer stays absent.
   constexpr std::string_view canon =
-      R"({"filters":[{"name":"stop","params":{"words":["a","the"],"ignore_case":true,"max":3,"lang":"en","opts":{"k":null}}},"fold"]})";
+      R"({"filters":[{"name":"stop","params":{"words":["a","the"],"ignore_case":true,"max":3,"lang":"en","opts":{"k":null}}},"fold"],"char_filters":["html_strip",{"name":"mapping","params":{"mappings":["- =>"]}}]})";
   std::pmr::monotonic_buffer_resource mr;
   P::AnalyzerDef in;
   std::string err;
@@ -327,6 +356,9 @@ TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
   EXPECT_FALSE(out.tokenizer.has_value());
   ASSERT_EQ(2u, out.filters.size());
   EXPECT_EQ("fold", out.filters[1].name);
+  ASSERT_EQ(2u, out.char_filters.size());
+  EXPECT_EQ("html_strip", out.char_filters[0].name);
+  EXPECT_EQ("mapping", out.char_filters[1].name);
   EXPECT_EQ(3, std::get<std::int64_t>((**out.filters[0].params.find("max")).kind));
 }
 
@@ -578,3 +610,33 @@ TEST(ProtoRoundTrip, BuildByBacking) {
 }
 
 }  // namespace
+
+TEST(ProtoRoundTrip, PackedRequestFlagsWireTags) {
+  std::pmr::monotonic_buffer_resource arena;
+  std::array requestBytes{std::byte{0x58}, std::byte{2}, std::byte{0x60}, std::byte{3}};
+  P::SearchRequest request;
+  ASSERT_TRUE(decode(request, P::copyToPaddedInput(requestBytes, arena), arena));
+  EXPECT_EQ(2u, request.flags);
+  EXPECT_EQ(3u, request.flags_set);
+  std::array opBytes{std::byte{0xa8}, std::byte{1}, std::byte{3}, std::byte{0xb0}, std::byte{1}, std::byte{3}};
+  P::SearchOp op;
+  ASSERT_TRUE(decode(op, P::copyToPaddedInput(opBytes, arena), arena));
+  EXPECT_EQ(3u, op.flags);
+  EXPECT_EQ(3u, op.flags_set);
+}
+
+TEST(ProtoRoundTrip, MatchCaseInsensitiveTag) {
+  P::Match query;
+  query.case_insensitive = true;
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(P::encode(query, wire));
+  EXPECT_EQ((std::vector<std::byte>{std::byte{0x50}, std::byte{1}}), wire);
+}
+
+TEST(ProtoRoundTrip, PrefixCaseInsensitiveTag) {
+  P::PrefixQuery query;
+  query.case_insensitive = true;
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(P::encode(query, wire));
+  EXPECT_EQ((std::vector<std::byte>{std::byte{0x18}, std::byte{1}}), wire);
+}

@@ -69,7 +69,10 @@ every core busy even when work is skewed.
   output streams with no coordination. Tasks are admitted against a
   node-wide indexing-RAM budget: merge memory is predictable up front from
   segment statistics, so heavy fields are priced exactly, scheduled
-  largest-first, and light column merges pack around them.
+  largest-first, and light column merges pack around them. A merge waiting
+  for that budget claims at most half of it from in-progress indexing, so
+  ingest keeps building large segments instead of flushing a small one per
+  batch to make room.
 
 ### Asynchronous network IO
 
@@ -81,15 +84,17 @@ response paths keep connection handling separate from long-running engine work.
   shard with the fewest live connections and the connection stays pinned to
   that shard; an idle shard parks independently and does no per-request work
   for active shards. The gRPC server runs on completion queues.
-- Search work defaults to serial execution inline on the connection thread
-  that received it: cheap queries pay no scheduler handoff, and request rate
-  never wakes idle workers. A request can instead opt onto the shared
-  work-stealing scheduler (`max_parallel: 1`) so an expensive query does
-  not occupy its connection thread, or parallelize (`max_parallel: -1`):
-  it starts on the receiving thread, which enters the scheduler with a slot
-  reserved for transport threads, and idle workers steal its tasks. The gRPC
-  unary update path currently waits for indexing on its completion-queue
-  handler.
+- HTTP search work defaults to serial execution inline on the connection
+  thread that received it: cheap queries pay no scheduler handoff, and
+  request rate never wakes idle workers. A request can instead opt onto the
+  shared work-stealing scheduler (`max_parallel: 1`) so an expensive query
+  does not occupy its connection thread, or parallelize (`max_parallel:
+  -1`): it starts on the receiving thread, which enters the scheduler with
+  a slot reserved for transport threads, and idle workers steal its tasks.
+  gRPC hands every search to the scheduler instead: it offers a
+  connection's new calls to that connection's preferred completion queue
+  first, so inline execution would serialize the calls a client (a gateway,
+  say) multiplexes over one HTTP/2 connection.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
@@ -147,10 +152,12 @@ the same hook without changing dispatch or response assembly.
 Execution adapts to what the request actually consumes. A top-k request
 that does not ask for an exact total runs with block-max pruning: postings
 carry per-block score upper bounds, and a MaxScore-based scorer skips
-blocks and documents that cannot reach the current top k. A request that
-consumes an exact count runs exhaustively, because an exact count requires
-it. The choice is made per request from what the request asks for; there is
-no separate accuracy setting.
+blocks and documents that cannot reach the current top k. An exact count
+requires exhaustive counting unless it is already known. Ranking can still
+prune when completeness is supplied separately, including field-sorted ranking
+whose exact total comes from metadata or a materialized domain. The choice is
+made per request from what the request asks for; there is no separate accuracy
+setting.
 
 Vector search composes the same way. A kNN query is just a query, with a
 scorer that participates in the boolean tree like any term. Filters apply
@@ -168,8 +175,8 @@ is a single term.
 ## Vector search, natively integrated
 
 Vectors are stored as ordinary columns. Exact kNN scans the column;
-approximate search uses per-segment ANN indexes (currently IVF+PQ) built as
-segment overlays, which follow the segment lifecycle and are served
+approximate search uses per-segment ANN indexes (IVF with PQ codes by default,
+or opt-in RaBitQ, chosen per field) built as segment overlays, which follow the segment lifecycle and are served
 zero-copy from memory-mapped files like everything else. Approximate
 candidates are rescored at full precision. Because the ANN index is part of
 the segment, there is no separate vector store to keep in sync with your

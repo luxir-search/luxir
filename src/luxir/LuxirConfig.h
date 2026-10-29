@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
-#include <CLI/CLI.hpp>
 #include <oneapi/tbb/info.h>
+
+namespace CLI { class App; }
 
 namespace luxir {
 
@@ -75,6 +77,14 @@ struct StoreConfig {
   std::string data_dir = "luxir_data";
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Before a collection serves at startup: none trusts the manifest footer and
+  // file sizes; full also reads every file the committed snapshot lists and
+  // checks its size and xxh3, failing only that collection on a mismatch.
+  std::string verify_on_open = "none";   // none, full
+  // Background re-verification of every published snapshot's files; a
+  // mismatch makes the collection unavailable. Zero disables it.
+  uint64_t scrub_interval_s = 0;
+  uint64_t scrub_max_bytes_per_sec = 64ULL * 1024 * 1024; // zero is unthrottled
 };
 
 struct IndexConfig {
@@ -133,10 +143,12 @@ struct IngestConfig {
   int64_t stream_batch_size = 1 * 1024 * 1024;
   int64_t stream_batch_docs = 10000;
 
-  // Maximum number of streaming NDJSON batches submitted by one connection at
-  // once.  0 derives the window from the node's workers (server.workers) plus
-  // two; 1 is strict serial batch submission.  Staging memory grows roughly
-  // with this window, and live inverter memory grows with min(window, workers).
+  // Maximum number of streaming NDJSON batches one connection has decoding or
+  // being indexed at once.  0 derives the window from the node's workers
+  // (server.workers) plus two; 1 indexes one batch at a time.  An indexed batch
+  // frees its slot without waiting for earlier batches to complete.  Staging
+  // memory grows roughly with this window, and live inverter memory grows with
+  // min(window, workers).
   int64_t max_inflight_batches = 0;
 
   // Effective per-record cap: max_record if set, else the buffered-body cap.

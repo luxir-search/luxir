@@ -6,6 +6,8 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/store/CorruptionMarker.h"
+#include "luxir/store/FileVerifier.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
@@ -17,12 +19,25 @@ static constexpr std::string_view DELETING_REASON = "being deleted";
 std::shared_ptr<Collection> Collection::placeholder(CollectionId id, std::string reason) {
   auto collection = std::make_shared<Collection>();
   collection->id = std::move(id);
-  collection->unavailableReason = std::move(reason);
+  collection->fail(reason);
   return collection;
 }
 
+void Collection::fail(const std::string& reason) {
+  {
+    std::lock_guard lock(failureMutex);
+    if (failed.load(std::memory_order_relaxed)) return;
+    failure = reason;
+    failed.store(true, std::memory_order_release);
+  }
+  if (shard && shard->iw) shard->iw->fail(reason);
+}
+
 std::string Collection::getUnavailableReason() const {
-  if (!unavailableReason.empty()) return unavailableReason;
+  if (isFailed()) {
+    std::lock_guard lock(failureMutex);
+    return failure;
+  }
   if (shard && shard->iw) {
     if (auto failure = shard->iw->getFailureReason()) return *failure;
   }
@@ -74,8 +89,10 @@ void Collections::validate(const CollectionId& id) {
 }
 
 Collections::Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
-                         oneapi::tbb::task_arena& arena)
-    : config(config), events(events), indexRamBudget(indexRamBudget), arena(arena) {
+                         oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics)
+    : metrics(std::move(metrics)), config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
+      verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
+  if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   if (config.store.backend == "fs") {
     factory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
   } else {
@@ -142,16 +159,35 @@ bool Collections::reclaimStorage() {
   return true; // A concurrent drop also warrants retrying the allocation.
 }
 
+size_t Collections::cacheBytes(const CollectionId& id) const {
+  auto it = cacheExceptions.find(id);
+  return it == cacheExceptions.end() ? cacheDefaultBytes : it->second;
+}
+
+void Collections::applyCachePolicy(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
+  if (auto shard = collection->getShard()) {
+    if (auto cache = shard->getReaderManager().filterCache) cache->resize(cacheBytes(id));
+  }
+}
+
+void Collections::listCollection(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
+  std::lock_guard lock(listingMutex);
+  listing[id.tenant].insert_or_assign(id.name, collection);
+}
+
 void Collections::registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
   {
-    std::lock_guard lock(listingMutex);
-    listing[id.tenant].insert_or_assign(id.name, collection);
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(id, collection);
+    listCollection(id, collection);
   }
   events.registered(id, collection);
 }
 
 void Collections::removed(const CollectionId& id) {
   {
+    std::lock_guard policyLock(cachePolicyMutex);
+    cacheExceptions.erase(id);
     std::lock_guard lock(listingMutex);
     if (auto tenant = listing.find(id.tenant); tenant != listing.end()) {
       tenant->second.erase(id.name);
@@ -159,6 +195,47 @@ void Collections::removed(const CollectionId& id) {
     }
   }
   events.removed(id);
+}
+
+std::vector<Collections::Entry> Collections::setCacheBytes(
+    std::string_view tenant, std::string_view collection, size_t bytes) {
+  std::vector<Entry> selected;
+  {
+    std::lock_guard policyLock(cachePolicyMutex);
+    {
+      std::lock_guard lock(listingMutex);
+      if (!collection.empty()) {
+        CollectionId id{std::string(tenant.empty() ? CollectionId::kDefaultTenant : tenant),
+                        std::string(collection)};
+        if (auto t = listing.find(id.tenant); t != listing.end()) {
+          if (auto c = t->second.find(id.name); c != t->second.end()) {
+            selected.push_back({id, c->second, {}});
+          }
+        }
+        if (selected.empty()) {
+          validate(id);
+          throw CollectionNotFoundError("collection '" + id.label() + "' does not exist");
+        }
+      } else {
+        for (const auto& [t, collections] : listing) {
+          if (!tenant.empty() && t != tenant) continue;
+          for (const auto& [name, current] : collections) selected.push_back({{t, name}, current, {}});
+        }
+      }
+    }
+    if (tenant.empty() && collection.empty()) {
+      cacheDefaultBytes = bytes;
+      cacheExceptions.clear();
+    } else {
+      for (const auto& entry : selected) {
+        if (bytes == cacheDefaultBytes) cacheExceptions.erase(entry.id);
+        else cacheExceptions.insert_or_assign(entry.id, bytes);
+      }
+    }
+    for (const auto& entry : selected) applyCachePolicy(entry.id, entry.collection);
+  }
+  for (auto& entry : selected) entry.error = entry.collection->getUnavailableReason();
+  return selected;
 }
 
 std::vector<Collections::Entry> Collections::entries() {
@@ -196,8 +273,14 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
   col->id = name;
   col->shard = std::make_shared<Shard>(*col);
   col->shard->dir = std::move(directory);
+  size_t bytes;
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    bytes = cacheBytes(name);
+  }
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
-      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+      FilterCacheConfig{.maxBytes = bytes});
+  col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
   return col;
@@ -210,7 +293,25 @@ void Collections::observe(const CollectionId& name, Collection& collection) {
   };
 }
 
-std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema) {
+std::string Collections::recoverWriter(const CollectionId& name, CollectionStorage& storage, const std::string& selected) {
+  auto manifest = Manifest::load(*storage.open(selected));
+  if (!manifest.bytes || manifest.generation == manifest.highestGeneration) return selected;
+  auto recovered = copySnapshot(storage, selected, manifest);
+  LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
+            name.label(), manifest.generation, manifest.highestGeneration, recovered);
+  storage.select(recovered);
+  return recovered;
+}
+
+// Clears suspect-file markers once their files verified: best effort, and
+// never on a read-only directory.
+static void clearMarkers(const CollectionId& name, Directory& dir) {
+  try { CorruptionMarker::clear(dir); }
+  catch (const ReadOnlyError&) {}
+  catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
+}
+
+std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup) {
   auto storage = factory->collection(name);
   auto selected = CollectionStorage::current(*factory->container(name, true));
   bool creating = !selected;
@@ -218,20 +319,19 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
     if (storage.hasFiles() || !storage.incarnations().empty()) throw std::runtime_error("Collection files exist without CURRENT");
     selected = CommitId::newIncarnation();
   } else {
-    auto manifest = Manifest::load(*storage.open(*selected));
-    if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
-      auto recovered = copySnapshot(storage, *selected, manifest);
-      LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
-                name.label(), manifest.generation, manifest.highestGeneration, recovered);
-      storage.select(recovered);
-      selected = std::move(recovered);
-    }
+    selected = recoverWriter(name, storage, *selected);
   }
   auto col = makeCollection(name, creating ? storage.create(*selected) : storage.open(*selected));
-  if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+  if (!creating) {
+    auto manifest = Manifest::load(*col->shard->dir);
+    if (!manifest.bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+    if (startup) arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen); });
+  }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
     config.index.merge_factor, creating ? *selected : std::string{}, &arena);
+  col->shard->iw->metrics = metrics;
+  col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
@@ -245,12 +345,18 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
 // Read-only and follower collections serve their selected local snapshot.
 std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name, Role role,
                                                         const std::optional<std::string>& selected) {
-  if (role == Role::WRITER) return initWriter(name);
-  if (!selected) throw ReadOnlyError("Collection has no CURRENT");
-  auto col = makeCollection(name, factory->collection(name).open(*selected));
-  col->shard->snapshots->openLocalSnapshot();
-  if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
-  observe(name, *col);
+  std::shared_ptr<Collection> col;
+  if (role == Role::WRITER) {
+    col = initWriter(name, {}, true);
+  } else {
+    if (!selected) throw ReadOnlyError("Collection has no CURRENT");
+    col = makeCollection(name, factory->collection(name).open(*selected));
+    arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
+    if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
+    observe(name, *col);
+  }
+  // Whatever a marker named was verified before this point.
+  clearMarkers(name, *col->shard->dir);
   return col;
 }
 
@@ -259,6 +365,20 @@ std::vector<Collections::Opened> Collections::open(Role role) {
   auto names = factory->collections();
   bool createDefault = names.empty() && role != Role::FOLLOWER;
   if (createDefault) names.push_back(CollectionId::of(kDefaultCollectionName));
+  // Keep the node up and the data: the name resolves to a clear error instead
+  // of "does not exist", and cannot be silently re-created over it.
+  auto failLoad = [&](Opened& row, const std::exception& e) {
+    LOG_ERROR("Failed to load collection '{}': {}", row.id.label(), e.what());
+    row.error = "failed to load: " + std::string(e.what());
+    row.collection = unavailable(row.id, row.error);
+    // Whatever CURRENT selects (or failed to say) is kept until an
+    // installation replaces the copy.
+    if (role == Role::FOLLOWER) try {
+      auto incarnations = factory->collection(row.id).incarnations();
+      std::lock_guard lock(slotsMutex);
+      slots[row.id].retained.insert(incarnations.begin(), incarnations.end());
+    } catch (const std::exception& listing) { LOG_WARN("Cannot list incarnations of '{}': {}", row.id.label(), listing.what()); }
+  };
   for (const auto& name : names) {
     Opened row{name, nullptr, std::nullopt, {}};
     try {
@@ -281,24 +401,18 @@ std::vector<Collections::Opened> Collections::open(Role role) {
           continue;
         }
       }
-      auto collection = openCollection(name, role, row.incarnation);
-      if (!map.insert(name, collection)) throw std::logic_error("collection opened twice");
+      auto collection = openCollection(row.id, role, row.incarnation);
+      {
+        std::lock_guard lock(cachePolicyMutex);
+        applyCachePolicy(row.id, collection);
+        if (!map.insert(row.id, collection)) throw std::logic_error("collection opened twice");
+        listCollection(row.id, collection);
+      }
       row.collection = std::move(collection);
-      registered(name, row.collection);
-      LOG_INFO("Loaded collection: {}", name.label());
+      events.registered(row.id, row.collection);
+      LOG_INFO("Loaded collection: {}", row.id.label());
     } catch (const std::exception& e) {
-      // Keep the node up and the data: the name resolves to a clear error
-      // instead of "does not exist", and cannot be silently re-created over it.
-      LOG_ERROR("Failed to load collection '{}': {}", name.label(), e.what());
-      row.error = "failed to load: " + std::string(e.what());
-      row.collection = unavailable(name, row.error);
-      // Whatever CURRENT selects (or failed to say) is kept until an
-      // installation replaces the copy.
-      if (role == Role::FOLLOWER) try {
-        auto incarnations = factory->collection(name).incarnations();
-        std::lock_guard lock(slotsMutex);
-        slots[name].retained.insert(incarnations.begin(), incarnations.end());
-      } catch (const std::exception& listing) { LOG_WARN("Cannot list incarnations of '{}': {}", name.label(), listing.what()); }
+      failLoad(row, e);
     }
     rows.push_back(std::move(row));
   }
@@ -310,6 +424,31 @@ std::shared_ptr<Collection> Collections::unavailable(const CollectionId& name, s
   if (!map.insert(name, placeholder)) return map.get(name);
   registered(name, placeholder);
   return placeholder;
+}
+
+void Collections::fail(const CollectionId& name, const std::shared_ptr<Collection>& collection, const std::string& reason,
+                       std::span<const std::string> suspects) {
+  if (auto shard = collection->getShard(); shard && !suspects.empty()) {
+    try { CorruptionMarker::write(*shard->dir, suspects, reason); }
+    catch (const ReadOnlyError&) {}
+    catch (const std::exception& e) { LOG_WARN("Cannot record suspect files of '{}': {}", name.label(), e.what()); }
+  }
+  collection->fail(reason);
+  events.updated(name, *collection);
+}
+
+void Collections::unload(const CollectionId& name, const std::shared_ptr<Collection>& expected, std::string reason) {
+  Transition transition(*this, name);
+  auto shard = expected->getShard();
+  auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+  auto placeholder = Collection::placeholder(name, std::move(reason));
+  if (!map.replace(name, expected, placeholder)) throw std::runtime_error("collection '" + name.label() + "' changed before unloading");
+  if (snapshot) {
+    std::lock_guard lock(slotsMutex);
+    slots[name].retained.insert(snapshot->id.incarnation);
+  }
+  registered(name, placeholder);
+  if (shard) shard->snapshots->detach();
 }
 
 std::shared_ptr<Collection> Collections::getOrCreate(const CollectionId& key, bool autoCreate) {
@@ -450,6 +589,8 @@ Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr
     auto opened = registry.readers.prepare(*snapshot);
     registry.commit(std::move(snapshot), std::move(opened));
   }
+  // The caller verified every file the snapshot lists.
+  clearMarkers(candidate.id_, registry.dir);
   return Prepared(std::move(candidate));
 }
 
@@ -477,8 +618,14 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
     throw;
   }
   // The transition owns the name, so the entry is still the expected one.
-  map.replace(name, reserved ? reserved : expected, collection);
-  registered(name, collection);
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(name, collection);
+    Signal::emit("collectionPublishing", collection.get());
+    map.replace(name, reserved ? reserved : expected, collection);
+    listCollection(name, collection);
+  }
+  events.registered(name, collection);
   if (auto shard = expected ? expected->getShard() : nullptr) shard->snapshots->detach();
   {
     std::lock_guard lock(slotsMutex);

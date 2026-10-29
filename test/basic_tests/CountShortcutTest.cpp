@@ -47,14 +47,14 @@ protected:
     for (auto name : {"number", "numbers", "scan", "middle"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::INT;
-      field.multi = std::string_view(name) == "numbers";
+      field.multi = (std::string_view(name) == "numbers") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }
     for (auto name : {"geo", "geos", "geo_scan", "geo_full"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::GEO_POINT;
-      field.multi = std::string_view(name) == "geos";
+      field.multi = (std::string_view(name) == "geos") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "geo_scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }
@@ -244,6 +244,31 @@ TEST_P(CountShortcutTest, booleanBoundsAndSingletonsAgree) {
   }
 }
 
+TEST_P(CountShortcutTest, wholeMatchAllUsesOnlyCachedEffectiveCard) {
+  deleteSome();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  AllQuery query;
+  auto* weight = query.createWeight(context, 0);
+  QueryPrep::WholeMembershipPlan plan(*weight, nullptr, {});
+  auto& segment = reader->segments()[0];
+  RAMBitDocSet domain(segment.maxDoc());
+  domain.mutableBits().set(1);
+  EXPECT_EQ(-1, domain.cachedCard());
+  EXPECT_FALSE(resolveWholeMembershipForTests(plan, *reader, segment, &domain).available);
+  EXPECT_EQ(-1, domain.cachedCard());
+
+  DocSetBuilder builder(segment.maxDoc());
+  builder.add(1);
+  auto effective = builder.build();
+  ASSERT_EQ(1, effective->cachedCard());
+  EXPECT_EQ(Query::CountHow::ITERATE, weight->countShortcut(segment, effective.get()).how);
+  auto result = resolveWholeMembershipForTests(plan, *reader, segment, effective.get());
+  EXPECT_TRUE(result.available);
+  EXPECT_EQ(1, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+}
+
 TEST_P(CountShortcutTest, probesStopBeforeIndexWalks) {
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -314,7 +339,7 @@ TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::range(op.mr(), "number", qb::valI64(op.mr(), -10), nullptr,
                              qb::valI64(op.mr(), 10), nullptr);
       if (shape == 2) {
@@ -346,7 +371,7 @@ TEST_P(CountShortcutTest, topDocsKeepsNumericCountExecutor) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::range(op.mr(), field, qb::valI64(op.mr(), -10), nullptr,
                               qb::valI64(op.mr(), 10), nullptr);
     req->execute(false);
@@ -382,7 +407,7 @@ TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::geoBox(op.mr(), "geo", -bound, bound, -20, 20);
       if (filtered) op.allQuery().filter(query);
       else op.rawQuery() = query;
@@ -431,7 +456,7 @@ TEST_P(CountShortcutTest, pointsEmptyDisjunctionUsesWholeCacheRouting) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::boolean(op.mr(), {},
         {qb::match(op.mr(), "body_w", "alpha"),
          qb::range(op.mr(), "number", qb::valI64(op.mr(), 0), nullptr,
@@ -564,7 +589,7 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       AllQuery all;
       TermQuery term("body_w", "alpha");
       ExistsQuery exists("number");

@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -144,9 +144,9 @@ public:
     if (scored) {
       cur.getScores().limit(pruning ? 10 : numDocs)
           .batchSize(pruning ? 11 : numDocs + 1).fields({"id"});
-      if (!pruning) cur.getNumber();
+      if (!pruning) cur.countLimit();
     } else {
-      cur.getNumber().limit(0);
+      cur.countLimit().limit(0);
     }
     std::string filterTerm = std::string("keep_")
         + (disabled ? "opaque" : "bulk")

@@ -95,6 +95,11 @@ class ConstantScoreQuery final : public luxir::Query {
     float constantScore;
     bool needsScores;
 
+    static Query::PlanContext childContext(Query::PlanContext context) {
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      return context;
+    }
+
     static Query::ScorerShape wrappedShape(
         const Query::ScorerShape& child) {
       return {
@@ -152,24 +157,24 @@ class ConstantScoreQuery final : public luxir::Query {
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      return wrappedShape(childSupplier->describeScorer(buildContext));
+      return wrappedShape(childSupplier->describeScorer(childContext(buildContext)));
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
         const Query::PlanContext& buildContext) const override {
-      return childSupplier->unresolvedScorerCause(buildContext);
+      return childSupplier->unresolvedScorerCause(childContext(buildContext));
     }
 
     bool fillExpansionMemo(
         const Query::PlanContext& buildContext) override {
-      return childSupplier->fillExpansionMemo(buildContext);
+      return childSupplier->fillExpansionMemo(childContext(buildContext));
     }
 
     Query::ScorerPlan* resolve(
         MemPool& planPool,
         const Query::PlanContext& planContext) override {
       Query::ScorerPlan* childPlan =
-          childSupplier->resolve(planPool, planContext);
+          childSupplier->resolve(planPool, childContext(planContext));
       assert(childPlan != nullptr);
       return planPool.make<Plan>(
           *this, planContext, wrappedShape(childPlan->shape()),
@@ -238,10 +243,7 @@ public:
     return child->appendFilterKey(out, ctx);
   }
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
-                                                         multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight = nullptr;
@@ -336,6 +338,7 @@ public:
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }
+
   };
 };
 
