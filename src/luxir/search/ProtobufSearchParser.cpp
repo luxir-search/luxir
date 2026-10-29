@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "luxir/api/RequestFlags.h"
+#include "luxir/search/SearchOpRegistry.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
@@ -138,6 +140,7 @@ struct SearchParserImpl {
     FACET_BUCKET,
     GROUP_BUCKET,
     FUSION,
+    PLUGIN,
   };
 
   struct ParsedFences {
@@ -228,7 +231,7 @@ public:
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
       coerceContext(*req.timeZone),
-      "root", &req.warnings, &fields};
+      "root", &req.warnings, &fields, &req.engine.getNode()};
     parseContext.reader = req.reader.get();
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
@@ -327,7 +330,7 @@ public:
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
       ParseContext context{req.requestPool, *req.schema, req.arena,
           coerceContext(*req.timeZone),
-          currOp.name, &req.warnings, &fields};
+          currOp.name, &req.warnings, &fields, &req.engine.getNode()};
       context.collapse = enclosingCollapse;
       context.reader = req.reader.get();
       auto domains = parseChildDomains(ops, context);
@@ -408,6 +411,9 @@ public:
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
+    if (searchOp.domain && placement == OpsPlacement::PLUGIN) {
+      throw RequestError("domain is not supported under a plugin operation's ops");
+    }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     SearchOp* op = std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
@@ -481,7 +487,7 @@ public:
           ParseContext parseContext{
             req.requestPool, *req.schema, req.arena,
             coerceContext(*req.timeZone),
-            name, &req.warnings, &fields};
+            name, &req.warnings, &fields, &req.engine.getNode()};
           parseContext.collapse = enclosingCollapse;
           parseContext.reader = req.reader.get();
           ProtobufQueryParser parser(parseContext);
@@ -504,6 +510,9 @@ public:
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
+      },
+      [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
+        return parsePluginOp(name, pluginOp, depth);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
@@ -537,6 +546,7 @@ public:
       std::string location = placement == OpsPlacement::REQUEST_ROOT
           ? "request root"
           : placement == OpsPlacement::FUSION ? "Fusion.ops"
+          : placement == OpsPlacement::PLUGIN ? "a plugin operation's ops"
                                               : "nested facet bucket";
       throw std::runtime_error("facet '" + std::string(facetName) + "' at "
           + location
@@ -1563,7 +1573,7 @@ public:
     }
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
@@ -2163,6 +2173,104 @@ public:
     return out;
   }
 
+  // The parser side of a plugin op: query parsing, a planning context of its
+  // own, TopDocs sources and nested ops, all bound to this request.
+  class PluginOpContextImpl final : public PluginOpContext {
+    SearchParserImpl& parser;
+    int depth;
+    ParseContext context;
+    Query::PlanningContext* planningContext = nullptr;
+    Query::Context* executionContext = nullptr;
+
+  public:
+    PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
+      : PluginOpContext(parser.req, name, proto,
+                        ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
+        parser(parser), depth(depth),
+        context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
+                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings,
+                &parser.fields, &parser.req.engine.getNode()) {
+      context.collapse = parser.enclosingCollapse;
+      context.reader = parser.req.reader.get();
+    }
+
+    ParseContext& parseContext() override { return context; }
+
+    Query::PlanningContext& planning() override {
+      if (planningContext == nullptr) {
+        planningContext = luxir::arenaCreate<Query::PlanningContext>(
+            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+      }
+      return *planningContext;
+    }
+
+    Query::Context& weightContext() override {
+      if (executionContext == nullptr) executionContext = Query::Context::create(&req.arena, planning());
+      return *executionContext;
+    }
+
+    Query* parseQuery(const luxir::api::Query& query) override {
+      ProtobufQueryParser queryParser(context);
+      Query* parsed = queryParser.parse(query);
+      parsed->validateLogical(planning());
+      return parsed;
+    }
+
+    Query* parseQuery(const luxir::api::Val& value) override {
+      return parseQuery(*readMessage<luxir::api::Query>(value, "query"));
+    }
+
+    TopDocsReq* parseSource(std::string_view sourceName, const luxir::api::Val& topDocs) override {
+      auto* proto = readMessage<luxir::api::TopDocs>(topDocs, "top_docs source");
+      auto* oldCollapse = parser.enclosingCollapse;
+      auto* oldMeasure = parser.inheritedFacetMeasure;
+      auto restore = scope_guard([&]() noexcept {
+        parser.enclosingCollapse = oldCollapse;
+        parser.inheritedFacetMeasure = oldMeasure;
+      });
+      auto* source = parser.parseTopDocs(sourceName, *proto, TopDocsPlacement::FUSION_SOURCE);
+      source->flags = parser.options.flags;
+      return source;
+    }
+
+    void addSubs(SearchOp& op) override {
+      parser.addSubs(op, proto.ops, depth, OpsPlacement::PLUGIN);
+    }
+
+  private:
+    // A param value read as a request message: the same JSON the message's
+    // own field accepts. The text and the views it yields live in the arena.
+    template <typename M>
+    M* readMessage(const luxir::api::Val& value, std::string_view what) {
+      std::string json;
+      if (!luxir::api::write_json(value, json)) {
+        throw RequestError(params.owner + ": cannot serialize a " + std::string(what) + " param");
+      }
+      ArenaResource mr(&req.arena);
+      std::string_view text = luxir::api::build::arenaStr(mr, json);
+      auto* message = new (mr.allocate(sizeof(M), alignof(M))) M();
+      std::string error;
+      if (!luxir::api::read_json(*message, text, mr, &error)) {
+        throw RequestError(params.owner + ": invalid " + std::string(what) + ": " + error);
+      }
+      return message;
+    }
+  };
+
+  SearchOp* parsePluginOp(std::string_view name, const luxir::api::PluginOp& pluginOp, int depth) {
+    const auto& maker = SearchOpRegistry::global().require(pluginOp.name);
+    PluginOpContextImpl context(*this, name, pluginOp, depth);
+    SearchOp* op;
+    try {
+      op = maker(context);
+    } catch (const ParamError& e) {
+      throw RequestError(e.what());
+    }
+    if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
+    return op;
+  }
+
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
     int64_t countLimit = fusionProto.count_limit.value_or(0);
     if (countLimit < -1) {
@@ -2257,7 +2365,7 @@ public:
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);

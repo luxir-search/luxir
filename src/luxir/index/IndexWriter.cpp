@@ -335,12 +335,23 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // Budget callbacks never take indexMutex or flush inline.  They coalesce on
   // this elevated-priority graph node, whose body rechecks global pressure and
   // claims victims against the budget before changing writer state.
-  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(*updateGraph, 1,
+  pressureCheckNode = std::make_unique<ContinueMultiFunc>(*updateGraph, 1,
     [this](tbb::flow::continue_msg,
-           PressureCheckMultiFunc::output_ports_type& op) {
+           ContinueMultiFunc::output_ports_type& op) {
       unused(op);
       this->pressureCheckBody();
     }, FLUSH_PRIORITY);
+
+  segmentReleaseNode = std::make_unique<ContinueMultiFunc>(*updateGraph, 1,
+    [this](tbb::flow::continue_msg,
+           ContinueMultiFunc::output_ports_type& op) {
+      unused(op);
+      std::vector<std::unique_ptr<SegInfo>> released;
+      {
+        const std::lock_guard lock(retiredMutex);
+        released.swap(retiredSegments);
+      }
+    });
 
   commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
@@ -356,6 +367,9 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       bool dispatchCompletion = true;
       // Delete passes share this serial node with commits, not their metrics.
       MetricScope metric(*metrics, metricActivity(msg->applyOnly ? MetricStage::DELETE_PASS : MetricStage::COMMIT));
+      // Read before the body: a max_segments commit hands msg to the force
+      // merge, which may complete and free it concurrently.
+      bool forceIntent = !msg->applyOnly && !msg->publishOnly && msg->maxSegments > 0;
       try {
         if (msg->applyOnly) this->deletePassBody();
         else dispatchCompletion = this->finishCommitBody(*msg);
@@ -370,6 +384,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         std::runtime_error error("Unknown non-standard exception while committing");
         LOG_ERROR("finishCommitBody Exception Caught: exception={}", error.what());
         msg->result.setException(error);
+      }
+      if (forceIntent) {
+        const std::lock_guard<std::mutex> lock(indexMutex);
+        forceMergeIntents--;
+        _resumePolicyMergesLocked();
       }
 
       metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
@@ -612,9 +631,21 @@ void IndexWriter::completeForceMerge(MergeMessage& msg) {
     assert(activeForceMerge == origin);
     activeForceMerge = nullptr;
     _activateNextForceMergeLocked(completedOrigins);
+    _resumePolicyMergesLocked();
   }
 
   completeForceMergeOrigins(completedOrigins);
+}
+
+// Caller must hold indexMutex.  Flushes that landed while a pending force
+// merge held policy merges off submitted none, so check every level after.
+void IndexWriter::_resumePolicyMergesLocked() {
+  if (_forceMergePendingLocked()) return;
+  try {
+    mergePolicy->_maybeMergeSegments(nullptr);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Policy merge resume failed: exception={}", e.what());
+  }
 }
 
 // Returns true when the merge message itself should be completed by the merge
@@ -1173,6 +1204,9 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
       }
     }
     commitNumber++;
+    // Flushes this commit started complete under indexMutex, so none can
+    // reach the merge policy before the intent is visible.
+    if (msg.maxSegments > 0) forceMergeIntents++;
   } // end mutex protected section
 }
 
@@ -1873,8 +1907,24 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
     snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
-    seg.reset();
   }
+  releaseSegments(segments);
+}
+
+// Hands segments to segmentReleaseNode, which drops their readers off the
+// caller's path.  Once closed, the graph is draining or drained, so they are
+// dropped here.
+void IndexWriter::releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments) {
+  if (!closed.load(std::memory_order_acquire)) {
+    {
+      const std::lock_guard lock(retiredMutex);
+      for (auto& seg : segments) {
+        if (seg) retiredSegments.push_back(std::move(seg));
+      }
+    }
+    segmentReleaseNode->try_put(tbb::flow::continue_msg{});
+  }
+  segments.clear();
 }
 
 // Move a segment from segInfos to segmentsToDelete for deferred deletion

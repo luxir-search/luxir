@@ -7760,7 +7760,8 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
       EXPECT_EQ(fill.bulkType, shape.bulkType);
       EXPECT_EQ(fill.docs, pull.docs);
       EXPECT_GE(fill.pointArms, attached.pointArms);
-      if (fill.pointArms == attached.pointArms) {
+      // A fill that does not produce the range fills its windows.
+      if (fill.pointArms == 0) {
         EXPECT_GT(fill.fillCalls, attached.fillCalls);
       }
     }
