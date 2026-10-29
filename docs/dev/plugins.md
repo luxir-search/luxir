@@ -485,20 +485,20 @@ Rules:
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
-The example plugin registers a `reverse` filter (reverses token bytes, `normalizing`), a
+The example plugin registers an `example_reverse` filter (reverses token bytes, `normalizing`), a
 `strip_x` char filter (removes every `x` through `replace`) and the analyzer `example` =
-`whitespace` + char filter `strip_x` + filters `lowercase`, `reverse`:
+`whitespace` + char filter `strip_x` + filters `lowercase`, `example_reverse`:
 
 ```cpp
 void registerComponents(luxir::Registries& r) override {
-  r.analysis.addFilter("reverse", [](const luxir::api::AnalyzerComponent& def) {
+  r.analysis.addFilter("example_reverse", [](const luxir::api::AnalyzerComponent& def) {
     struct Factory : luxir::TokenFilterFactory {
       std::unique_ptr<luxir::TokenStream> create(std::unique_ptr<luxir::TokenStream> source) const override {
         return std::make_unique<ReverseFilter>(std::move(source));
       }
     };
     auto factory = std::make_unique<Factory>();
-    factory->name = "reverse";
+    factory->name = "example_reverse";
     factory->normalizing = true;
     return std::unique_ptr<luxir::TokenFilterFactory>(std::move(factory));
   });
@@ -518,7 +518,7 @@ void registerComponents(luxir::Registries& r) override {
 ```
 
 A schema then uses the plugin by name (`"analyzer": "example"`) or composes its components
-(`"analyzer": {"tokenizer": "whitespace", "filters": ["reverse"]}`).
+(`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
 
@@ -644,7 +644,7 @@ public:
 };
 
 void registerComponents(luxir::Registries& r) override {
-  r.fieldTypes.add("pair", [](const luxir::PluginParams& params) -> std::unique_ptr<const luxir::PluginFieldType> {
+  r.fieldTypes.add("pair", [](const luxir::ParamReader& params) -> std::unique_ptr<const luxir::PluginFieldType> {
     auto separator = params.getString("separator", ":");  // unread params are refused afterwards
     return std::make_unique<PairType>(/* ... */);
   });
@@ -667,7 +667,7 @@ and defaults do not.
 
 - **Registration.** Names are `[a-z0-9_]+`, not a built-in type name and not `plugin`; a
   duplicate or an add after the freeze throws. The maker reads its params through
-  `PluginParams` (errors name the type and the parameter), and any param it did not read is
+  `ParamReader` (errors name the type and the parameter), and any param it did not read is
   refused after it returns. Makers throw `std::invalid_argument` or `RequestError` with a
   message that teaches; the schema adds the field name.
 - **Derived fields.** `PluginFieldType::fields` declares each `DerivedField`: a `suffix`

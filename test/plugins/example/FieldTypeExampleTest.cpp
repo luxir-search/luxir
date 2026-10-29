@@ -155,7 +155,7 @@ TEST_F(FieldTypeExampleTest, registeredAndFrozen) {
   auto names = types.names();
   EXPECT_NE(names.end(), std::ranges::find(names, std::string("pair")));
   EXPECT_NE(names.end(), std::ranges::find(names, std::string("spot")));
-  auto maker = [](const PluginParams&) -> std::unique_ptr<const PluginFieldType> { return nullptr; };
+  auto maker = [](const ParamReader&) -> std::unique_ptr<const PluginFieldType> { return nullptr; };
   EXPECT_THROW(types.add("late", maker), std::logic_error);
   FieldTypeRegistry fresh;
   EXPECT_THROW(fresh.add("int", maker), std::invalid_argument);
@@ -219,7 +219,7 @@ std::string canonicalOf(FieldTypeRegistry& registry, std::string_view name) {
 TEST_F(FieldTypeExampleTest, canonicalDefinitionAndSuffixLimit) {
   FieldTypeRegistry registry;
   auto add = [&](std::string name, std::string suffix, uint32_t version, std::string params) {
-    registry.add(name, [=](const PluginParams&) -> std::unique_ptr<const PluginFieldType> {
+    registry.add(name, [=](const ParamReader&) -> std::unique_ptr<const PluginFieldType> {
       return std::make_unique<ProbeType>(suffix, version, params);
     });
   };

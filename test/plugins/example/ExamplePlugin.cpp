@@ -391,12 +391,12 @@ public:
   }
 
   static void registerFieldTypes(Registries& r) {
-    r.fieldTypes.add("pair", [](const PluginParams& params) -> std::unique_ptr<const PluginFieldType> {
+    r.fieldTypes.add("pair", [](const ParamReader& params) -> std::unique_ptr<const PluginFieldType> {
       std::string separator(params.getString("separator", ":"));
       if (separator.empty()) params.fail("separator", "must not be empty");
       return std::make_unique<PairType>(std::move(separator), params.getBool("multi", false));
     });
-    r.fieldTypes.add("spot", [](const PluginParams&) -> std::unique_ptr<const PluginFieldType> {
+    r.fieldTypes.add("spot", [](const ParamReader&) -> std::unique_ptr<const PluginFieldType> {
       return std::make_unique<SpotType>();
     });
   }
@@ -404,7 +404,7 @@ public:
   PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
 
   void registerComponents(Registries& r) override {
-    r.analysis.addFilter("reverse", [](const api::AnalyzerComponent& def) {
+    r.analysis.addFilter("example_reverse", [](const api::AnalyzerComponent& def) {
       noParams(def);
       struct Factory : TokenFilterFactory {
         std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
@@ -412,7 +412,7 @@ public:
         }
       };
       auto factory = std::make_unique<Factory>();
-      factory->name = "reverse";
+      factory->name = "example_reverse";
       factory->normalizing = true;
       return std::unique_ptr<TokenFilterFactory>(std::move(factory));
     });
@@ -431,7 +431,7 @@ public:
     whitespace.name = "whitespace";
     stripX.name = "strip_x";
     lowercase.name = "lowercase";
-    reverse.name = "reverse";
+    reverse.name = "example_reverse";
     api::AnalyzerDef example;
     example.tokenizer = whitespace;
     const api::AnalyzerComponent charFilters[] = {stripX};
