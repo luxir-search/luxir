@@ -49,6 +49,7 @@ struct ValueNode {
   // ||). Bind-time proof of invalidity only widens such a node's bounds,
   // because the branch may never run for a document that would fail.
   bool guarded = false;
+  bool columnIndexed = false;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
@@ -100,6 +101,8 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
+  bool structurallyEqual(const ValueProgram& other) const;
+  std::string describeDateSources(uint32_t node) const;
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
                           ValueFieldInfos fields) const;
 };

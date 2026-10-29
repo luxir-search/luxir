@@ -15,6 +15,8 @@
 #include <google/protobuf/arena.h>
 
 #include "luxir/util/proto.h"
+#include "luxir/reader/OrdColReader.h"
+#include "luxir/search/OrdMap.h"
 #include "luxir/value/ValueExpr.h"
 
 namespace luxir {
@@ -87,7 +89,9 @@ struct AggregateConstant {
 
 struct AggregateStateOps {
   using Init = void (*)(void* state,
-                        std::span<const AggregateConstant> arguments);
+                        std::span<const AggregateConstant> arguments,
+                        std::pmr::memory_resource* resource);
+  using Destroy = void (*)(void* state) noexcept;
   using Accumulate = void (*)(void* state, const ValueResult& value,
                               std::span<const AggregateConstant> arguments);
   using AccumulateBatch = void (*)(
@@ -104,6 +108,12 @@ struct AggregateStateOps {
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
       const void* state, std::span<const AggregateConstant> arguments);
+  // accumulateRawPoint(states + keys[i] * stride, raw[i]) for every i: one
+  // call folds a batch whose values belong to different keyed states.
+  using AccumulateKeyedRawBatch = void (*)(
+      void* states, size_t stride, std::span<const int64_t> keys,
+      std::span<const int64_t> raw, FieldType::Type columnType,
+      std::span<const AggregateConstant> arguments);
 
   uint32_t bytes = 0;
   Init init = nullptr;
@@ -113,6 +123,11 @@ struct AggregateStateOps {
   AccumulateRawBatch accumulateRawBatch = nullptr;
   Merge merge = nullptr;
   Finish finish = nullptr;
+  AccumulateKeyedRawBatch accumulateKeyedRawBatch = nullptr;
+  Destroy destroy = nullptr;
+  bool inlineCapable = true;
+  bool replayCapable = true;
+  bool orderSensitive = false;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -121,6 +136,10 @@ struct AggregateStateOps {
 struct DenseFacetStateOps {
   using Init = void (*)(void* state);
   using AccumulateRawPoint = void (*)(void* state, int64_t raw);
+  // accumulateRawPoint(states + keys[i] * stride, raw[i]) for every i.
+  using AccumulateKeyedRawBatch = void (*)(void* states, size_t stride,
+                                           std::span<const int64_t> keys,
+                                           std::span<const int64_t> raw);
   using Fail = void (*)(void* state, AggregateFailure failure);
   using Merge = void (*)(void* target, const void* source);
   using Finish = BucketScalar (*)(const void* state, int64_t count);
@@ -131,6 +150,7 @@ struct DenseFacetStateOps {
   Fail fail = nullptr;
   Merge merge = nullptr;
   Finish finish = nullptr;
+  AccumulateKeyedRawBatch accumulateKeyedRawBatch = nullptr;
 };
 
 struct ResolvedAggregate {
@@ -140,11 +160,21 @@ struct ResolvedAggregate {
   const DenseFacetStateOps* denseFacetState = nullptr;
 };
 
-struct AggregateLeaf {
+struct AggregateFunction;
+
+struct AggregateProducer {
+  const AggregateFunction* function = nullptr;
   ValueProgram* input = nullptr;
   ResolvedAggregate resolved;
   std::span<const AggregateConstant> arguments;
   uint32_t stateOffset = 0;
+
+  bool sameState(const AggregateProducer& other) const;
+};
+
+struct AggregateLeaf {
+  uint32_t producer = 0;
+  std::span<const AggregateConstant> arguments;
 };
 
 enum class AggregateNodeKind : uint8_t {
@@ -175,12 +205,19 @@ class AggregateProgram {
 public:
   ArenaResource resource;
   std::pmr::vector<AggregateNode> nodes;
+  std::pmr::vector<AggregateProducer> producers;
   std::pmr::vector<AggregateLeaf> leaves;
   uint32_t rootNode = 0;
   uint32_t stateBytes = 0;
+  bool hasIndirectStates = false;
 
   explicit AggregateProgram(google::protobuf::Arena& arena)
-      : resource(&arena), nodes(&resource), leaves(&resource) {}
+      : resource(&arena), nodes(&resource), producers(&resource), leaves(&resource) {}
+
+  uint32_t addProducer(AggregateProducer producer, bool sharing = true);
+  // Before binding or creating state; refresh resolved fields after adoption.
+  // Source inputs/arguments must outlive this program; unequal sets are unchanged.
+  bool adoptProducers(const AggregateProgram& source);
 
   uint32_t addNode(AggregateNode node) {
     nodes.push_back(node);
@@ -210,7 +247,7 @@ class AggregateStateView {
 
   AggregateFailure failure() const;
   void setFailure(AggregateFailure reason);
-  void* leafState(const AggregateLeaf& leaf) const;
+  void* producerState(const AggregateProducer& producer) const;
   BucketScalar evaluate(AggregateEvalScratch& scratch) const;
 
 public:
@@ -221,10 +258,13 @@ public:
     return (uint32_t)sizeof(AggregateFailure) + program.stateBytes;
   }
 
-  void init();
-  void add(uint32_t leaf, const ValueResult& value);
-  void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
-  void addRawBatch(uint32_t leaf, std::span<const int64_t> values,
+  // Init rolls back completed producers on failure; each init must itself
+  // leave no resources behind when it throws.
+  void init(std::pmr::memory_resource* resource = nullptr);
+  void destroy() noexcept;
+  void add(uint32_t producer, const ValueResult& value);
+  void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
+  void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
   void fail(AggregateFailure reason);
   bool failed() const { return failure() != AggregateFailure::NONE; }
@@ -241,17 +281,22 @@ public:
   int64_t releaseCount = 0;
 
   AggregateAccumulator() = default;
-  explicit AggregateAccumulator(const AggregateProgram& program);
+  explicit AggregateAccumulator(const AggregateProgram& program,
+      std::pmr::memory_resource* resource = nullptr);
+  ~AggregateAccumulator();
+  AggregateAccumulator(const AggregateAccumulator&) = delete;
+  AggregateAccumulator& operator=(const AggregateAccumulator&) = delete;
 
-  void add(uint32_t leaf, const ValueResult& value);
-  void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
-  void addRawBatch(uint32_t leaf, std::span<const int64_t> values,
+  void add(uint32_t producer, const ValueResult& value);
+  void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
+  void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
   void fail(AggregateFailure reason);
   bool failed() const;
   BucketScalar finish(AggregateEvalScratch& scratch) const;
   BucketScalar finish() const;
 
+  BucketScalar finish(const AggregateProgram& readout, AggregateEvalScratch& scratch) const;
   static AggregateAccumulator* merge(AggregateAccumulator* target,
                                      AggregateAccumulator* source);
 };
@@ -259,16 +304,54 @@ public:
 void writeAggregateValue(api::Val& target, const BucketScalar& value);
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
-  const AggregateLeaf* leaf = nullptr;
+  const AggregateProducer* producer = nullptr;
+  OrdColReader* ordColumn = nullptr;
+  OrdColReader::Iterator* ordIterator = nullptr;
+  OrdMap::SegToGlobal ordMapping;
   IntColReader::BulkIterator* columnIterator = nullptr;
   AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
   std::span<const AggregateConstant> arguments;
-  uint32_t leafStateOffset = 0;
-  uint32_t leafIndex = 0;
+  uint32_t producerStateOffset = 0;
+  uint32_t producerIndex = 0;
   FieldType::Type columnType = FieldType::NONE;
+  bool columnScan = false;
   bool bareColumn = false;
 
+  bool scalar() const {
+    return producer->input->root().type != ValueType::COLUMN_ONLY
+        && !valueArray(producer->input->root().type);
+  }
+
+  template <typename Consume>
+  void forEachValue(int32_t docid, Consume&& consume) {
+    if (producer->input->root().type == ValueType::COLUMN_ONLY) {
+      if (ordIterator == nullptr) return;
+      if (ordIterator->docId() < docid) ordIterator->advance(docid);
+      if (ordIterator->docId() != docid) return;
+      auto add = [&](int32_t stored) {
+        if (stored != 0) consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
+      };
+      if (ordColumn->multiValued()) {
+        auto [start, end] = ordColumn->getStartEndValueRank(ordIterator->rank());
+        for (int64_t i = start; i < end; i++) add(ordIterator->values().valueAt(i));
+      } else {
+        add(ordIterator->value());
+      }
+      return;
+    }
+    ValueResult value = evalPoint(docid);
+    if (!value.valid) return;
+    if (valueArray(value.type)) {
+      for (int64_t i = 0; i < value.array.size; i++) {
+        consume(values->evalArrayElement(value.array, i));
+      }
+    } else {
+      consume(value);
+    }
+  }
+
   bool readRawPoint(int32_t docid, int64_t& raw) {
+    assert(bareColumn && scalar());
     if (columnIterator == nullptr) return false;
     IntColReader::BulkIterator& iterator = *columnIterator;
     if (iterator.docId() < docid) iterator.advance(docid);
@@ -287,35 +370,42 @@ struct BoundAggregateInput {
   }
 
   void accumulatePoint(void* aggregateState, int32_t docid) {
-    void* leafState = static_cast<std::byte*>(aggregateState)
-        + leafStateOffset;
+    assert(scalar());
+    void* producerState = static_cast<std::byte*>(aggregateState)
+        + producerStateOffset;
     if (bareColumn) {
       int64_t raw;
       if (!readRawPoint(docid, raw)) return;
-      accumulateRawPoint(leafState, raw, columnType, arguments);
+      accumulateRawPoint(producerState, raw, columnType, arguments);
       return;
     }
     ValueResult value = values->evalSequentialPoint(docid, 0.0f);
     if (value.valid) {
-      leaf->resolved.state.accumulate(
-          leafState, value, arguments);
+      producer->resolved.state.accumulate(
+          producerState, value, arguments);
     }
   }
 
   void accumulateBatch(void* aggregateState,
                        std::span<const ScalarValueResult> batch) const {
-    void* leafState = static_cast<std::byte*>(aggregateState)
-        + leafStateOffset;
-    leaf->resolved.state.accumulateBatch(leafState, batch, arguments);
+    void* producerState = static_cast<std::byte*>(aggregateState)
+        + producerStateOffset;
+    producer->resolved.state.accumulateBatch(producerState, batch, arguments);
   }
 
 };
 
-std::span<const ValueFieldInfos> resolveAggregateFields(
+struct AggregateFieldInfos {
+  ValueFieldInfos values;
+  // Borrowed from the reader's field cache, pinned by the request reader.
+  const OrdMap* ords = nullptr;
+};
+
+std::span<const AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader);
 
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
-    IndexReader::Segment& segment, std::span<const ValueFieldInfos> fields);
+    IndexReader::Segment& segment, std::span<const AggregateFieldInfos> fields);
 
 } // namespace luxir

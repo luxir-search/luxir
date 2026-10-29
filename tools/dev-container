@@ -23,13 +23,19 @@ HELP
   exit 0
 fi
 
-cache_dir="$repo_dir/build/container-cache/$(id -u)"
-mkdir -p "$cache_dir/home" "$cache_dir/ccache"
+# The home directory stays with the checkout. ccache and the build slot locks
+# live in the shared Luxir cache, so worktrees reuse each other's objects and
+# container builds share the machine-wide job limits with host builds.
+home_dir="$repo_dir/build/container-cache/$(id -u)/home"
+shared_cache=${LUXIR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/luxir}
+mkdir -p "$home_dir" "$shared_cache/container-ccache"
 run_options=(--rm --init -i --cap-add=SYS_PTRACE --user "$(id -u):$(id -g)"
   --mount "type=bind,source=$repo_dir,target=/workspace/luxir"
+  --mount "type=bind,source=$shared_cache,target=/luxir-cache"
   --workdir /workspace/luxir
   --env "HOME=/workspace/luxir/build/container-cache/$(id -u)/home"
-  --env "CCACHE_DIR=/workspace/luxir/build/container-cache/$(id -u)/ccache")
+  --env LUXIR_CACHE_DIR=/luxir-cache
+  --env CCACHE_DIR=/luxir-cache/container-ccache)
 if [[ -t 0 && -t 1 ]]; then
   run_options+=(-t)
 fi

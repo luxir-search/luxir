@@ -41,7 +41,7 @@ POST /collections/main/_search
   },
   "fields": ["id", "title_t", "price_f"],
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "series": {
       "field_facet": {
@@ -122,9 +122,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
   that cannot be competitive. Per-block min/max zone maps enable pruning
   even without a points (BKD) index.
 - **Range pruning:** Numeric ranges and value sets skip irrelevant column
-  blocks, accept fully covered blocks, and decode only blocks requiring
-  closer inspection. The same zone maps enable this without a points (BKD)
-  index.
+  blocks, accept fully covered blocks, and inspect only the values that
+  need it: crossing blocks are split by their 512-value leaf zones, and
+  linear-fit blocks (sorted ramps such as time-ordered timestamps) by the
+  rank intervals their fit bounds, leaving a narrow band at each range edge
+  to decode. The same zone maps enable this without a points (BKD) index.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
@@ -156,7 +158,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Field variants: one input value indexed under several representations
   (`author` for word search, `author__s` for exact facets and sorts), with
   per-operation default bindings so a bare field name does the right thing.
-- Per-field choices: index mode (match, or range acceleration), multi-valued,
+- Per-field choices: index mode (match, or range acceleration),
+  [multi-valued modes](guide/schema.md#multi-valued-modes),
   column-stored (sorting, faceting, analytics), stored source (retrieval, in
   LZ4- or ZSTD-compressed chunks, configurable per stored resource).
 - Numeric, date, and geo fields with `index: "range"` build a points index;
@@ -166,10 +169,13 @@ whole machine. Designed from the start for parallelism on modern hardware.
 
 ## Text analysis
 
+- Ordered character filters before tokenization: `html_strip` for HTML text
+  extraction, `mapping` for character replacements/removal, and `nfkc_cf` for
+  Unicode NFKC case folding.
 - Tokenizers: Unicode word segmentation (UAX#29), whitespace, keyword.
-- Token filters: NFKC case folding, ASCII lowercase, accent and diacritic
-  folding, English possessive removal, and KStem English stemming (the
-  dictionary-based Krovetz stemmer).
+- Token filters: NFKC case folding, Unicode lowercase, accent and diacritic
+  folding, stop-word removal, English possessive removal, and KStem English
+  stemming (the dictionary-based Krovetz stemmer).
 - The default `_t` field applies Unicode words, case folding, accent folding,
   possessive removal, and KStem. `_un` is Unicode text without stemming, `_u`
   keeps case and accents, and `_w`/`_wl` split on whitespace.
@@ -219,7 +225,13 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term), and
   `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
   never outranks the exact term; fuzzy clauses take part in block-max pruning
-  like any other clause).
+  like any other clause). Prefix, wildcard, regex, and TEXT/STRING/ID `match`
+  take an opt-in `case_insensitive` flag. Match scores case variants as one word,
+  with the exact case of the query preferred slightly, weighted term frequency
+  summed before BM25 saturation, and shared statistics. The others keep constant
+  scores. Expansion follows query-time analysis, so case-preserving stemmers
+  can be lopsided (KStem stems lowercase words only). For frequent case-blind
+  TEXT matching, prefer a folding variant (`_t`, `_un`, `_wl`); it is faster.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
   (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
@@ -231,6 +243,19 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `multi_match`: search one text across weighted fields. `combined`
+  (default) scores TEXT fields sharing an analyzer and long-term policy as
+  one field with BM25F; weights scale term frequency and length at every
+  group size. STRING/ID/numeric/date fields form singleton groups with
+  score multipliers. `per_field` multiplies each field's match score, with
+  optional `phrase` matching on TEXT fields. `tie` combines field/group
+  scores (default `1`, sum); `0` keeps the best. Fields whose text cannot
+  coerce are skipped. `*` patterns select indexed TEXT/STRING/ID targets,
+  limited to `64` physical targets after resolving bindings and deduplicating.
+  See [Multi-match](guide/query-reference.md#multi-match).
+- `dis_max`: the best matching query score plus `tie` times the other
+  matching scores. Default `tie: 0` keeps the best; `tie: 1` adds scores like
+  a boolean disjunction. Duplicate queries contribute separately.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).
@@ -262,12 +287,13 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Field projection: named fields, `*` wildcard patterns, or every retrievable
   field when `fields` is omitted. Row- or column-oriented documents per
   request (`document_format`): HTTP defaults to rows (a missing field is an
-  absent key), gRPC to dense columns.
+  absent key), gRPC to dense columns; `adaptive` picks per batch and field
+  whichever encodes more compactly.
 - Any number of named operations in one request over the same index view:
   ranked lists, facets, metrics, and fusion, nested to any depth and executed
   in parallel. HTTP responses preserve their names and nesting under `ops`.
   Root query shorthand returns `found` and `docs` directly in the HTTP envelope.
-- Count-only and analytics-only requests: `limit: 0` with `get_number: true`
+- Count-only and analytics-only requests: `limit: 0` with `count_limit: -1`
   loads no document fields.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
@@ -293,9 +319,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   order with zero counts included, daylight-saving changes handled.
 - Nesting: sub-facets under buckets, metrics per bucket, and a ranked
   `top_docs` (or `fusion`) list per bucket, all in one request.
-- Expression metrics: `avg`, `sum`, `min`, and `max` over value expressions
-  (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per bucket; facets
-  can sort by a named metric.
+- Expression metrics: `avg`, `sum`, `min`, `max`, distinct counts
+  (`cardinality`), `percentile`, and exact `percentile_rank` over value
+  expressions (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per
+  bucket; facets can sort by a named metric.
 - Easy [multi-select navigation](guide/faceting.md#easy-multi-select-with-selected):
   put choices in each facet's `selected` array. Luxir builds the filters and
   automatically counts alternatives with the other facets' selections applied.
@@ -331,9 +358,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
 
 ## Geo
 
-- Geo point fields (`[lon, lat]` arrays in GeoJSON coordinate order,
-  quantized to about a centimeter), single- or multi-valued, with an optional
-  two-dimensional points index.
+- Geo point fields, quantized to about a centimeter, single- or
+  multi-valued, with an optional two-dimensional points index. Points are
+  `[lon, lat]` arrays (GeoJSON order), `{"lat", "lon"}` objects, GeoJSON
+  `Point` objects, `"lat,lon"` strings, WKT `POINT` strings, or geohashes.
+  `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
+  `ignore_z_value`.
 - Bounding-box queries (dateline-aware) and great-circle distance queries,
   usable as the main query, as a non-scoring filter, or as a boolean clause.
 

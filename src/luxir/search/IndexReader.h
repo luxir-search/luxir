@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
+#include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -168,6 +170,7 @@ public:
     const Segment* segments = nullptr;
     FieldSegments(const FieldRecord* record, const Segment* segments)
         : record(record), segments(segments) {}
+    int32_t ordinalAt(size_t segment) const;
     const HeaderTotals& totals() const;
 
   public:
@@ -208,6 +211,8 @@ private:
   struct HeaderTotals {
     Similarity::FieldStats stats;
     FieldType::flag_type flags = 0;
+    FieldType::Type type = FieldType::NONE;
+    uint32_t typeFlags = 0;
   };
 
   // Positive names, header totals and OrdMaps shared by segment sets with the same
@@ -260,7 +265,8 @@ private:
   // Its lazy catalogs and maps never retain a reader or schema.
   struct PhysicalCore {
     std::vector<Segment> segs;
-    std::once_flag projectableOnce;
+    OnceFlag fieldCatalogsOnce;
+    std::vector<std::string_view> physicalNames;
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
@@ -290,7 +296,15 @@ private:
     // The segment `segId`, or null.
     const Segment* segment(uint64_t segId) const;
 
-    std::span<const ProjectableField> projectableFields();
+    void buildFieldCatalogs();
+    std::span<const ProjectableField> projectableFields() {
+      buildFieldCatalogs();
+      return projectable;
+    }
+    std::span<const std::string_view> physicalFieldNames() {
+      buildFieldCatalogs();
+      return physicalNames;
+    }
   };
 
   struct Snapshot {
@@ -304,8 +318,10 @@ private:
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
-  std::once_flag retrievableOnce;
+  OnceFlag retrievableOnce;
   std::vector<RetrievableField> retrievable;
+  OnceFlag searchableOnce;
+  std::vector<std::string> searchable;
 
   // Opens the snapshot `manifest` (the newest durable root when null). Each
   // segment's PostingsReader comes from `published` (the publisher's open
@@ -375,6 +391,8 @@ public:
     return core->coreGeneration;
   }
 
+  // Validate this schema's type against the field's persisted segment types
+  // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
@@ -407,6 +425,12 @@ public:
   // this reader's schema and sorted by name for wildcard prefix traversal.
   // Names and types remain valid while the caller holds the reader.
   std::span<const RetrievableField> retrievableFields();
+
+  // Search selectors for this reader's schema: concrete declarations and
+  // dynamic roots observed in its metadata, including their variants.
+  // Only indexed TEXT/STRING/ID search targets are included. Sorted by name;
+  // built once on first use, independent of storage or column availability.
+  std::span<const std::string> searchableFields();
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the readers its publisher holds open (CommitSnapshot::openReaders).

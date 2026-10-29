@@ -67,23 +67,37 @@ ValueType binaryNumericType(std::span<const ResolvedValue> args) {
   return floating ? ValueType::DOUBLE : ValueType::INT64;
 }
 
+// Parsers normalize date-combining operands to a common unit first.
+ValueNature commonDateNature(std::span<const ResolvedValue> args) {
+  ValueNature nature = ValueNature::NUMBER;
+  for (const ResolvedValue& arg : args) {
+    if (!valueDate(arg.nature)) continue;
+    assert(!valueDate(nature) || nature == arg.nature);
+    nature = arg.nature;
+  }
+  return nature;
+}
+
 ResolvedValue addResolve(std::span<const ResolvedValue> args) {
   ValueType type = binaryNumericType(args);
-  int dates = (int)std::ranges::count(args, ValueNature::DATE,
-                                      &ResolvedValue::nature);
+  ValueNature nature = commonDateNature(args);
+  int dates = (int)std::ranges::count_if(args, [](const ResolvedValue& arg) {
+    return valueDate(arg.nature);
+  });
   if (dates == 2) throw std::runtime_error("cannot add two DATE values");
-  return {type, dates == 1 ? ValueNature::DATE : ValueNature::NUMBER};
+  return {type, nature};
 }
 
 ResolvedValue subResolve(std::span<const ResolvedValue> args) {
+  commonDateNature(args);
   ValueType type = binaryNumericType(args);
   if (args[0].nature == ValueNature::NUMBER
-      && args[1].nature == ValueNature::DATE) {
+      && valueDate(args[1].nature)) {
     throw std::runtime_error("cannot subtract a DATE from a number");
   }
-  if (args[0].nature == ValueNature::DATE
+  if (valueDate(args[0].nature)
       && args[1].nature == ValueNature::NUMBER) {
-    return {type, ValueNature::DATE};
+    return {type, args[0].nature};
   }
   return {type, ValueNature::NUMBER};
 }
@@ -107,14 +121,13 @@ ResolvedValue defResolve(std::span<const ResolvedValue> args) {
   ValueType type = valueArray(args[0].type)
       ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
       : (floating ? ValueType::DOUBLE : ValueType::INT64);
-  ValueNature nature = std::ranges::find(args, ValueNature::DATE,
-                                         &ResolvedValue::nature) != args.end()
-      ? ValueNature::DATE : ValueNature::NUMBER;
+  ValueNature nature = commonDateNature(args);
   return {type, nature};
 }
 
 ResolvedValue minMaxResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
+  commonDateNature(args);
   if (args.size() == 1) {
     if (!valueArray(args[0].type)) {
       throw std::runtime_error("the one-argument form requires an array");
@@ -141,7 +154,7 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   if (!valueArray(args[0].type)) {
     throw std::runtime_error("sum() requires a numeric array");
   }
-  if (args[0].nature == ValueNature::DATE) {
+  if (valueDate(args[0].nature)) {
     throw std::runtime_error("sum() cannot reduce a DATE array");
   }
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
@@ -504,30 +517,27 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
   if (!input.valid || input.array.size == 0) {
     return ValueResult::missing(node.type);
   }
-  int64_t intSum = 0;
-  double doubleSum = 0.0;
+  __int128 intSum = 0;
+  long double doubleSum = 0.0;
   int64_t present = 0;
   for (int64_t i = 0; i < input.array.size; i++) {
     ValueResult value = program.evalArrayElement(input.array, i);
     if (!value.valid) continue;
     if (node.type == ValueType::DOUBLE) {
-      double addend = value.type == ValueType::DOUBLE
-          ? value.doubleValue : (double)value.intValue;
-      double next = doubleSum + addend;
-      if (!std::isfinite(next)) return ValueResult::missing(node.type);
-      doubleSum = next;
+      doubleSum += value.type == ValueType::DOUBLE
+          ? (long double)value.doubleValue : (long double)value.intValue;
     } else {
-      int64_t next;
-      if (__builtin_add_overflow(intSum, value.intValue, &next)) {
-        return ValueResult::missing(node.type);
-      }
-      intSum = next;
+      intSum += (__int128)value.intValue;
     }
     present++;
   }
   if (present == 0) return ValueResult::missing(node.type);
-  return node.type == ValueType::DOUBLE ? ValueResult::floating(doubleSum)
-                                        : ValueResult::integer(intSum);
+  if (node.type == ValueType::DOUBLE) {
+    double out = (double)doubleSum;
+    return std::isfinite(out) ? ValueResult::floating(out) : ValueResult::missing(node.type);
+  }
+  if (intSum < INT64_MIN || intSum > INT64_MAX) return ValueResult::missing(node.type);
+  return ValueResult::integer((int64_t)intSum);
 }
 
 ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
@@ -579,14 +589,29 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     bool reducer = node.childCount == 1;
     if (reducer) {
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
+      if (node.opcode != ValueOpcode::AVG
+          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+          && program.nodes[first.array.node].column->multiSet()) {
+        // A set column holds the doc's values ascending, so min is the
+        // first present element and max the last (a NaN reads as missing).
+        bool fromEnd = node.opcode == ValueOpcode::MAX;
+        for (int64_t i = 0; i < first.array.size; i++) {
+          ValueResult next = program.evalArrayElement(
+              first.array, fromEnd ? first.array.size - 1 - i : i);
+          if (next.valid) return promote(next, node.type);
+        }
+        return ValueResult::missing(node.type);
+      }
       ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
       long double sum = 0.0;
+      __int128 intSum = 0;
       int64_t present = 0;
       for (int64_t i = 0; i < first.array.size; i++) {
         ValueResult next = program.evalArrayElement(first.array, i);
         if (!next.valid) continue;
         if (node.opcode == ValueOpcode::AVG) {
-          sum += next.type == ValueType::DOUBLE ? next.doubleValue : next.intValue;
+          if (next.type == ValueType::DOUBLE) sum += (long double)next.doubleValue;
+          else intSum += (__int128)next.intValue;
         } else if (!aggregate.valid) {
           aggregate = next;
         } else if (node.type == ValueType::DOUBLE) {
@@ -604,7 +629,7 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       }
       if (present == 0) return ValueResult::missing(node.type);
       if (node.opcode == ValueOpcode::AVG) {
-        double out = (double)(sum / present);
+        double out = (double)((sum + (long double)intSum) / present);
         if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
         return ValueResult::floating(out);
       }
@@ -827,13 +852,13 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   }
 
   if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
       || (node.opcode == ValueOpcode::LOG && low <= 0.0)
@@ -1276,13 +1301,13 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, nullptr},
+     propagateBounds, evalFunctionElement, 2, 2, nullptr, true},
     {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
-     evalBucketOperation<ValueOpcode::ADD, 2>},
+     evalBucketOperation<ValueOpcode::ADD, 2>, true},
     {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
-     evalBucketOperation<ValueOpcode::SUB, 2>},
+     evalBucketOperation<ValueOpcode::SUB, 2>, true},
     {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
      evalBucketOperation<ValueOpcode::MUL, 2>},
@@ -1309,10 +1334,10 @@ constexpr ValueFunction FUNCTIONS[] = {
      evalBucketOperation<ValueOpcode::FLOOR, 1>},
     {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2,
-     evalBucketOperation<ValueOpcode::MIN, 2>},
+     evalBucketOperation<ValueOpcode::MIN, 2>, true},
     {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2,
-     evalBucketOperation<ValueOpcode::MAX, 2>},
+     evalBucketOperation<ValueOpcode::MAX, 2>, true},
     {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, nullptr},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
@@ -1442,6 +1467,73 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
     result += "(...)";
   }
   return result;
+}
+
+std::string ValueProgram::describeDateSources(uint32_t node) const {
+  std::string result;
+  std::vector<std::string_view> fields;
+  auto visit = [&](auto&& self, uint32_t index) -> void {
+    const ValueNode& value = nodes[index];
+    if (value.kind == ValueNodeKind::COLUMN && valueDate(value.nature)
+        && std::ranges::find(fields, value.text) == fields.end()) {
+      fields.push_back(value.text);
+      if (!result.empty()) result += ", ";
+      result += fmt::format("'{}' ({})", value.text, valueNatureName(value.nature));
+    }
+    for (uint8_t i = 0; i < value.childCount; i++) self(self, value.children[i]);
+  };
+  visit(visit, node);
+  return result;
+}
+
+bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
+  auto equalNode = [&](auto&& self, uint32_t leftIndex, uint32_t rightIndex) -> bool {
+    const ValueNode& left = nodes[leftIndex];
+    const ValueNode& right = other.nodes[rightIndex];
+    auto kind = [](ValueNodeKind value) {
+      return value == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : value;
+    };
+    if (kind(left.kind) != kind(right.kind)
+        || left.type != right.type || left.nature != right.nature) return false;
+    switch (kind(left.kind)) {
+      case ValueNodeKind::CONSTANT:
+        if (left.type == ValueType::INT64) return left.intValue == right.intValue;
+        if (left.type == ValueType::DOUBLE) {
+          return std::bit_cast<uint64_t>(left.doubleValue)
+              == std::bit_cast<uint64_t>(right.doubleValue);
+        }
+        if (left.arraySize != right.arraySize) return false;
+        for (uint32_t i = 0; i < left.arraySize; i++) {
+          if (left.type == ValueType::INT64_ARRAY) {
+            if (intArrays[left.arrayOffset + i]
+                != other.intArrays[right.arrayOffset + i]) return false;
+          } else if (std::bit_cast<uint64_t>(doubleArrays[left.arrayOffset + i])
+              != std::bit_cast<uint64_t>(other.doubleArrays[right.arrayOffset + i])) {
+            return false;
+          }
+        }
+        return true;
+      case ValueNodeKind::COLUMN:
+        return left.text == right.text && left.columnType == right.columnType
+            && left.columnMultiValued == right.columnMultiValued
+            && left.columnIndexed == right.columnIndexed;
+      case ValueNodeKind::FUNCTION:
+        if (left.function != right.function || left.opcode != right.opcode
+            || left.childCount != right.childCount) return false;
+        for (uint8_t i = 0; i < left.childCount; i++) {
+          if (!self(self, left.children[i], right.children[i])) return false;
+        }
+        return true;
+      case ValueNodeKind::SCORE:
+      case ValueNodeKind::DOCID:
+        return true;
+      case ValueNodeKind::VARIABLE:
+        assert(false);
+        return false;
+    }
+    return false;
+  };
+  return equalNode(equalNode, rootNode, other.rootNode);
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,

@@ -625,7 +625,10 @@ private:
     void reset();
   };
 
-  FilterCacheConfig config;
+  // Immutable policy and explicit-or-zero overrides. config.maxBytes is only
+  // the construction input; all runtime budget reads go through budgetBytes().
+  const FilterCacheConfig config;
+  std::atomic<size_t> budget;
   boost::unordered::concurrent_flat_map<
       FilterKey, std::shared_ptr<FilterEntry>, FilterKeyHash> entries;
   AdmissionRing clauseAdmission;
@@ -697,6 +700,13 @@ private:
       Use& use, ReaderProbe& probe,
       std::vector<std::unique_ptr<DocSet>> liveExact,
       uint32_t buildCostMicros);
+  size_t budgetBytes() const { return budget.load(std::memory_order_relaxed); }
+  size_t lowWatermarkBytes(size_t bytes) const;
+  size_t maxEntryBytes(size_t bytes) const;
+  size_t maxEntryBytes() const { return maxEntryBytes(budgetBytes()); }
+  size_t maxMetadataBytes(size_t bytes) const;
+  size_t lowWatermarkMetadataBytes(size_t bytes) const;
+  void detachEntry(const std::shared_ptr<FilterEntry>& entry);
   void advanceEvictionClock(double priority);
   void maybeSweep();
   void sweepMetadata();
@@ -704,8 +714,21 @@ private:
 public:
   explicit FilterCache(FilterCacheConfig config = {});
 
-  bool enabled() const { return config.maxBytes != 0; }
-  FilterCacheConfig configuration() const { return config; }
+  bool enabled() const {
+    return budgetBytes() != 0;
+  }
+  // The effective configuration, with derived budgets filled in.
+  FilterCacheConfig configuration() const;
+  // Changes the byte budget at runtime. Budgets the original config left at
+  // zero (watermarks, maxEntryBytes, maxMetadataBytes) are rederived from the
+  // new size; explicit ones are kept and clamped as at construction. A
+  // shrink is swept down to the new low watermark, on this thread unless a
+  // sweep is already running (that sweeper then loops with the new limits).
+  // Zero disables the cache and clears its entries. An insertion racing clear
+  // detaches itself if still disabled. Existing request pins remain valid.
+  // Positive grow/repeat calls do not evict; an overlapping zero or earlier
+  // sweep may still evict after a grow. Admission history and policy stay fixed.
+  void resize(size_t maxBytes);
   bool onReaderPublished(uint64_t coreGen,
                          std::span<const SegmentIdentity> segments);
   bool onReaderPublished(uint64_t coreGen, uint64_t readerVersion,

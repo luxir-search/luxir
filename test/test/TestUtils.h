@@ -17,6 +17,13 @@
 
 namespace luxir::test {
 
+inline void writeUnversionedRuns(PostingsWriter& writer) {
+  PostingsWriter::VersionRunsWriter versions(writer);
+  if (writer.getMaxDoc() > 0) versions.add(0, 0);
+  versions.finish();
+}
+
+
 template <class... Values>
 class SearchOverridesGuard {
   std::tuple<Values*...> targets;

@@ -20,6 +20,7 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
 
 #include "GRPCServer.h"
@@ -46,8 +47,7 @@ namespace luxir {
 // #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBufferBytes)
-  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads),
-    arenaEntrants(node, nthreads, "GRPCServer"), requestedPort(port),
+  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -59,7 +59,7 @@ GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBu
 // interface that may help with integration with external event loops.
 
 void luxir::GRPCServer::run() {
-  pthread_setname_np(pthread_self(), "luxir_grpc_main");
+  nameThisThread("luxir_grpc_main");
 
   // Use requestedPort (default 0 for dynamic allocation, or a specific port
   // like 50051).  Dynamic test ports bind localhost; configured ports keep the
@@ -510,7 +510,11 @@ public:
   // allocation failure falls back to running the resume inline.
   void enqueueResume(std::function<void()> resume) {
     try {
-      server.getLuxirNode().getTaskArena().enqueue(resume);  // copies; resume stays valid if this throws
+      // Isolated like the search itself (SearchEngine::enqueueSubmit): a
+      // parallel emitter's batch waits help only with its own tasks.
+      server.getLuxirNode().getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+        oneapi::tbb::this_task_arena::isolate(resume);
+      });
     } catch (...) {
       if (resume) resume();
     }
@@ -725,17 +729,18 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
   }
-  // Route by max_parallel (via dispatch()): the default (0) runs the whole
-  // query serially right here on this completion-queue thread - the cheapest
-  // path, accepting that this cq's other calls wait for the query's duration
-  // (a paused streaming producer parks and returns, so flow control still
-  // advances).  -1 also runs here, entering the task arena so its workers
-  // parallelize the query; 1 runs on the task arena instead, keeping this
-  // cq thread free to process completions.  The call outlives the request
-  // because its outstanding-response count stays positive until the final
-  // reply, and requestActive keeps pipelined requests on this stream ordered.
+  // Every search leaves this completion-queue thread for the task arena (see
+  // SearchEngine::Receiver): gRPC offers a connection's new calls to its
+  // preferred cq first, so a query run here would serialize the concurrent
+  // calls on that connection.  max_parallel keeps its parallelism meaning: 0
+  // (the default) and 1 run serially on a worker, -1 fans out from one.  The
+  // reply and the final response come from that worker: respondRaw() is
+  // thread-safe and Finish is kicked back to this call's cq thread.  The call
+  // outlives the request because its outstanding-response count stays
+  // positive until the final reply, and requestActive keeps pipelined
+  // requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-  engine.dispatch(req, req.proto.max_parallel);
+  engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
 
 
@@ -1019,9 +1024,9 @@ static const MethodEntry* lookupMethod(const std::string& method) {
 
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
-  // linux-only: give threads a nice name for debugging.
+  // Give threads a name for debugging.
   std::string tname = "luxir_grpc_" + std::to_string(threadInfo.threadno);
-  pthread_setname_np(pthread_self(), tname.c_str());
+  nameThisThread(tname.c_str());
 
   // wait for the server to start before trying to use it.
   startLatch.wait();

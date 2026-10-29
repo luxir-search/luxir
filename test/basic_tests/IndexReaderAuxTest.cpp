@@ -174,7 +174,7 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
       auto copied = original;
       copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
       auto aux = VectorAuxReader::open(dir, copied, false);
-      // call_once retries must leave both the wrapper and its children safe.
+      // callOnce retries must leave both the wrapper and its children safe.
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
           aux->getFaissIndex();

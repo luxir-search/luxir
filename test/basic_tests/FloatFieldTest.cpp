@@ -80,7 +80,8 @@ TEST_F(FloatFieldTest, roundTrip) {
   CollectionHelper helper;
 
   // multi-valued float input goes in as vector<double> (vector<float> is
-  // reserved for dense VECTOR fields); values come back as vector<float>.
+  // reserved for dense VECTOR fields); values come back as vector<float>,
+  // ascending per doc.
   helper.index(flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
                        "vals_ds", vec(0.5, -2.75), "vals_fs", vec(7.5, -0.25)),
                UpdateMessage::NO_COMMIT);
@@ -100,7 +101,7 @@ TEST_F(FloatFieldTest, roundTrip) {
   auto docs = req->getDocs();
   ASSERT_EQ(3u, docs.size());
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
-                                    "vals_fs", vec(7.5f, -0.25f), "vals_ds", vec(0.5, -2.75)));
+                                    "vals_fs", vec(-0.25f, 7.5f), "vals_ds", vec(-2.75, 0.5)));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d2", "price_f", 0.25f, "weight_d", 1e100,
                                     "vals_ds", vec(42.0)));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity()));

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "test/TestUtils.h"
 #include "test/DurableIndexInfo.h"
 
 #include <algorithm>
@@ -371,6 +372,7 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
 
   for (auto& stream : streams) stream.reset();
   std::vector<FileDescriptor> descriptors;
+  luxir::test::writeUnversionedRuns(writer);
   writer.finish(nullptr, &descriptors);
   ASSERT_EQ(2u, descriptors.size());
   for (const auto& descriptor : descriptors) {
@@ -429,6 +431,7 @@ TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
     field.columnMetaOff = 1;
     used->write((char) 0x7f);
     used.reset();
+    luxir::test::writeUnversionedRuns(writer);
     writer.finish();
   };
 
@@ -478,6 +481,7 @@ TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
 
   for (auto& stream : streams) stream.reset();
   std::vector<std::string> filenames;
+  luxir::test::writeUnversionedRuns(writer);
   writer.finish(&filenames);
   directory.sync(filenames);
   EXPECT_EQ(0, budget.reservedBytes());
@@ -510,6 +514,7 @@ TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
 
   for (auto& stream : streams) stream.reset();
   std::vector<std::string> filenames;
+  luxir::test::writeUnversionedRuns(writer);
   writer.finish(&filenames);
   directory.sync(filenames);
   EXPECT_EQ(0, budget.reservedBytes());

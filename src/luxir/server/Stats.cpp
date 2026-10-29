@@ -38,6 +38,7 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.indexing_budget.reserved_bytes = (uint64_t)ram.reservedBytes();
   memory.indexing_budget.draining_bytes = (uint64_t)ram.drainingBytesCount();
   memory.indexing_budget.pending_merge_bytes = (uint64_t)ram.pendingMergeDemandBytes();
+  memory.indexing_budget.retained_delete_bytes = (uint64_t)ram.retainedDeleteBytesCount();
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
   memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
   memory.storage_ram.used_bytes = node.storageBytes();
@@ -157,6 +158,7 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.document_errors = errorKinds(counts.documentErrors, resource);
   fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
   fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);
+  fillActivity(dst.delete_pass, counts, metricActivity(MetricStage::DELETE_PASS), resource);
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
@@ -231,6 +233,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     dst.inverters_idle = src.idle;
     dst.inverters_flushing = src.flushing;
     dst.commits = src.commits;
+    dst.retained_delete_bytes = src.retainedDeleteBytes;
   }
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
@@ -394,7 +397,9 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
-  if (!request.collection.empty()) {
+  if (request.max_bytes) {
+    entries =node.collections().setCacheBytes(request.tenant, request.collection, (size_t)*request.max_bytes);
+  } else if (!request.collection.empty()) {
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {

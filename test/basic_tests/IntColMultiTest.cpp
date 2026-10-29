@@ -28,13 +28,13 @@ TEST_F(IntColMultiTest, basic) {
   ASSERT_EQ(0, f.nextDoc());
   std::vector<int64_t> vals;
   f.vals(vals);
-  ASSERT_EQ(vals, vec_i(3, 9, -2));
+  ASSERT_EQ(vals, vec_i(-2, 3, 9));  // ascending per doc
   ASSERT_EQ(2, f.nextDoc());
   f.vals(vals);
   ASSERT_EQ(vals, vec_i(7));
   ASSERT_EQ(3, f.nextDoc());
   f.vals(vals);
-  ASSERT_EQ(vals, vec_i(5, 1));
+  ASSERT_EQ(vals, vec_i(1, 5));
   ASSERT_EQ(-1, f.nextDoc());
 }
 
@@ -56,13 +56,13 @@ TEST_F(IntColMultiTest, segMerge) {
   ASSERT_EQ(0, f.nextDoc());
   std::vector<int64_t> vals;
   f.vals(vals);
-  ASSERT_EQ(vals, vec_i(3, 9, -2));
+  ASSERT_EQ(vals, vec_i(-2, 3, 9));  // ascending per doc
   ASSERT_EQ(2, f.nextDoc());
   f.vals(vals);
   ASSERT_EQ(vals, vec_i(7));
   ASSERT_EQ(3, f.nextDoc());
   f.vals(vals);
-  ASSERT_EQ(vals, vec_i(5, 1));
+  ASSERT_EQ(vals, vec_i(1, 5));
   ASSERT_EQ(-1, f.nextDoc());
 }
 

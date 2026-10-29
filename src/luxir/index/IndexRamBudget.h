@@ -35,15 +35,30 @@ namespace luxir {
 // never takes a client mutex.
 //
 // Merge demand reserves dynamic headroom without statically partitioning the
-// pool.  A draining inverter remains reserved until its memory is destroyed,
-// but is discounted from pressure because that reservation is already on its
-// way out.  The global pressure predicate is therefore:
+// pool. A draining inverter's non-packet bytes remain reserved until freed,
+// but are discounted from pressure because they are on their way out. Retained
+// delete packets stay reserved, and are discounted only once retirable: a pass,
+// or the commit that claimed them, is then taking them out, and shedding
+// inverters for them would only cut segments that make that work slower. A
+// live inverter's delete bytes count twice: once in its reservation and once
+// for the packet it leaves behind, which stays reserved while its successor
+// refills. The pressure predicate is:
 //
-//   reserved + pending merge demand - draining inverter RAM > total
+//   reserved + live inverter delete bytes + min(pending merge demand, total / 2)
+//     - draining inverter RAM - retirable packets > total
 //
-// Demand is capped at total for this predicate: values beyond a whole pool are
-// operationally identical and can arise from zero-stream partition range
-// batches.  The comparison is performed by subtraction to avoid overflow.
+// Shedding against that sum keeps one generation's packets and the next
+// generation's inverters inside the pool together.
+//
+// Demand counts toward pressure only up to half the pool.  Uncapped, a large
+// merge's demand (often more than the whole pool) keeps pressure permanently
+// true while it waits, so every inverter past the shed floor is flushed at
+// the end of its batch: about one tiny segment per bulk, which feeds the
+// merge backlog that produced the demand.  With the cap, inverters keep at
+// least half the pool and merges wait for the rest; demand values beyond the
+// cap (including those from zero-stream partition range batches) are
+// operationally identical.  The comparison is performed by subtraction to
+// avoid overflow.
 //
 // The cap is deliberately soft: forceAcquire() overdraws so a client that has
 // nothing in flight can always make progress (and so a single reservation larger
@@ -55,7 +70,8 @@ namespace luxir {
 // on.  Passing the token without spinning or parking a TBB worker first requires
 // a continuation-owned driver lifetime, not just another registry bit.
 //
-// Current reservation clients are parallel field merges and inverter RAM.
+// Reservation clients include field merges, inverters, retained delete packets
+// and delete-application scratch.
 // Future reclaimable clients, such as vector index builds, can use the same
 // pressure-listener mechanism.
 class IndexRamBudget {
@@ -189,9 +205,16 @@ public:
   };
 
   class Guard {
+  public:
+    enum class Kind { Work, Draining, RetainedDeletes, RetirableDeletes };
+
+  private:
     IndexRamBudget* budget = nullptr;
     int64_t bytes = 0;
-    bool draining = false;
+    int64_t drainingBytes = 0;
+    // Delete bytes within `bytes` that pressure counts again while this is Work.
+    int64_t deleteBytes = 0;
+    Kind kind = Kind::Work;
 
   public:
     Guard() = default;
@@ -200,10 +223,13 @@ public:
     Guard& operator=(const Guard&) = delete;
 
     Guard(Guard&& other) noexcept
-      : budget(other.budget), bytes(other.bytes), draining(other.draining) {
+      : budget(other.budget), bytes(other.bytes), drainingBytes(other.drainingBytes),
+        deleteBytes(other.deleteBytes), kind(other.kind) {
       other.budget = nullptr;
       other.bytes = 0;
-      other.draining = false;
+      other.drainingBytes = 0;
+      other.deleteBytes = 0;
+      other.kind = Kind::Work;
     }
 
     Guard& operator=(Guard&& other) noexcept {
@@ -211,10 +237,14 @@ public:
         release();
         budget = other.budget;
         bytes = other.bytes;
-        draining = other.draining;
+        drainingBytes = other.drainingBytes;
+        deleteBytes = other.deleteBytes;
+        kind = other.kind;
         other.budget = nullptr;
         other.bytes = 0;
-        other.draining = false;
+        other.drainingBytes = 0;
+        other.deleteBytes = 0;
+        other.kind = Kind::Work;
       }
       return *this;
     }
@@ -223,17 +253,19 @@ public:
 
     void release() noexcept {
       if (budget != nullptr) {
-        budget->releaseReservation(bytes, draining);
+        budget->releaseReservation(bytes, drainingBytes, kind, kind == Kind::Work ? deleteBytes : 0);
         budget = nullptr;
         bytes = 0;
-        draining = false;
+        drainingBytes = 0;
+        deleteBytes = 0;
+        kind = Kind::Work;
       }
     }
 
     bool tryResize(int64_t newBytes) {
       assert(newBytes >= 0);
       assert(budget != nullptr);
-      assert(!draining);
+      assert(kind == Kind::Work);
       if (!budget->tryResize(bytes, newBytes)) return false;
       bytes = newBytes;
       return true;
@@ -242,32 +274,52 @@ public:
     // Unconditionally resizes this reservation, overdrawing the cap like
     // forceAcquire.  Returns true when the pool is over its cap afterwards
     // (never when uncapped), so a resync plus the over-budget check costs a
-    // single reservation atomic op.
-    bool forceResize(int64_t newBytes) {
+    // single reservation atomic op.  `newDeleteBytes` is the part of the
+    // reservation a flush would leave behind as a packet.
+    bool forceResize(int64_t newBytes, int64_t newDeleteBytes = 0) {
       assert(newBytes >= 0);
+      assert(newDeleteBytes >= 0 && newDeleteBytes <= newBytes);
       assert(budget != nullptr);
-      assert(!draining);
-      bool over = budget->forceAdjust(newBytes - bytes);
+      assert(kind == Kind::Work);
+      bool over = budget->forceAdjust(newBytes - bytes, newDeleteBytes - deleteBytes);
       bytes = newBytes;
+      deleteBytes = newDeleteBytes;
       return over;
     }
 
-    // Requested and commit flushes are unconditionally draining.  Pressure
+    // Exclude the bytes that a flush retains as a packet. Pressure
     // flushes claim a victim only while global pressure still exists, so
     // concurrent writers cannot all act on the same stale pressure snapshot.
-    void markDraining() {
+    void markDraining(int64_t retainedBytes = 0) {
       assert(budget != nullptr);
-      assert(!draining);
-      budget->markDraining(bytes);
-      draining = true;
+      assert(kind == Kind::Work);
+      assert(retainedBytes >= 0 && retainedBytes <= bytes);
+      budget->markDraining(bytes - retainedBytes, deleteBytes);
+      drainingBytes = bytes - retainedBytes;
+      kind = Kind::Draining;
     }
 
-    bool tryMarkDrainingForPressure() {
+    bool tryMarkDrainingForPressure(int64_t retainedBytes = 0) {
       assert(budget != nullptr);
-      assert(!draining);
-      if (!budget->tryMarkDrainingForPressure(bytes)) return false;
-      draining = true;
+      assert(kind == Kind::Work);
+      assert(retainedBytes >= 0 && retainedBytes <= bytes);
+      if (!budget->tryMarkDrainingForPressure(bytes - retainedBytes, deleteBytes)) return false;
+      drainingBytes = bytes - retainedBytes;
+      kind = Kind::Draining;
       return true;
+    }
+
+    // Transfer existing non-draining bytes, charging any excess as packet growth.
+    Guard transferToRetainedDeletes(int64_t actual) {
+      assert(budget != nullptr && kind == Kind::Draining);
+      assert(actual >= 0 && bytes >= drainingBytes);
+      int64_t transferred = std::min(actual, nonDrainingSize());
+      Guard retained(*budget, actual);
+      retained.kind = Kind::RetainedDeletes;
+      budget->retainedDeleteBytes.fetch_add(actual, std::memory_order_relaxed);
+      bytes -= transferred;
+      if (actual > transferred) budget->forceAdjust(actual - transferred);
+      return retained;
     }
 
     // Grows a draining reservation, e.g. by a flush's transient workspace.
@@ -276,27 +328,44 @@ public:
     // help.  Pressure is unchanged, so nothing is notified.
     void growDraining(int64_t delta) {
       assert(budget != nullptr);
-      assert(draining);
+      assert(kind == Kind::Draining);
       assert(delta >= 0);
       budget->growDraining(delta);
       bytes += delta;
+      drainingBytes += delta;
     }
 
     void clearDraining() noexcept {
       assert(budget != nullptr);
-      assert(draining);
-      budget->clearDraining(bytes);
-      draining = false;
+      assert(kind == Kind::Draining);
+      budget->clearDraining(drainingBytes, deleteBytes);
+      drainingBytes = 0;
+      kind = Kind::Work;
+    }
+
+    // A retained packet that a pass or its commit will retire leaves pressure; idempotent.
+    void markRetirable() noexcept {
+      assert(budget != nullptr);
+      if (kind == Kind::RetirableDeletes) return;
+      assert(kind == Kind::RetainedDeletes);
+      budget->retirableDeleteBytes.fetch_add(bytes, std::memory_order_relaxed);
+      kind = Kind::RetirableDeletes;
     }
 
     int64_t size() const { return bytes; }
-    bool isDraining() const { return draining; }
+    int64_t nonDrainingSize() const { return bytes - drainingBytes; }
+    bool isDraining() const { return kind == Kind::Draining; }
     explicit operator bool() const { return budget != nullptr; }
   };
 
 private:
   std::atomic<int64_t> total = 0;
   std::atomic<int64_t> reserved = 0;
+  std::atomic<int64_t> retainedDeleteBytes = 0;
+  // Sum of Work guards' deleteBytes: packets that live inverters will leave.
+  std::atomic<int64_t> liveDeleteBytes = 0;
+  std::atomic<int64_t> retirableDeleteBytes = 0;
+
   // Relaxed mirror of "any registered demand entry has nonzero bytes",
   // maintained under registryMutex, read lock-free by pressurePossible().
   std::atomic<int32_t> nonzeroDemands = 0;
@@ -319,14 +388,24 @@ private:
     return demand;
   }
 
+  int64_t projectedDeltaLocked() const {
+    return liveDeleteBytes.load(std::memory_order_relaxed)
+        - retirableDeleteBytes.load(std::memory_order_relaxed);
+  }
+
+  // The pressure predicate without merge demand.
+  int64_t liveLocked() const {
+    int64_t current = reserved.load(std::memory_order_relaxed);
+    assert(current >= drainingBytes);
+    return current - drainingBytes + projectedDeltaLocked();
+  }
+
   bool pressureNeededLocked() const {
     int64_t cap = total.load(std::memory_order_relaxed);
     if (cap == 0) return false;
-    int64_t current = reserved.load(std::memory_order_relaxed);
-    assert(current >= drainingBytes);
-    int64_t live = current - drainingBytes;
+    int64_t live = liveLocked();
     if (live > cap) return true;
-    return effectiveDemandLocked(cap) > cap - live;
+    return effectiveDemandLocked(mergeDemandPressureCap(cap)) > cap - live;
   }
 
   void collectAdmissionCallbacksLocked(CallbackList& callbacks) const {
@@ -398,19 +477,21 @@ private:
 
   // Moves reserved by delta unconditionally; true when the pool ends up over
   // its cap (never when uncapped).
-  bool forceAdjust(int64_t delta) {
+  bool forceAdjust(int64_t delta, int64_t deleteDelta = 0) {
+    if (deleteDelta != 0) {
+      [[maybe_unused]] int64_t live = liveDeleteBytes.fetch_add(deleteDelta, std::memory_order_relaxed) + deleteDelta;
+      assert(live >= 0);
+    }
     int64_t now = reserved.fetch_add(delta, std::memory_order_relaxed) + delta;
     assert(now >= 0);
-    if (delta > 0) {
-      notifyAfterReservationGrowth();
-    } else if (delta < 0) {
-      notifyCapacityReleased();
-    }
+    if (delta + deleteDelta > 0) notifyAfterReservationGrowth();
+    if (delta < 0) notifyCapacityReleased();
     int64_t cap = total.load(std::memory_order_relaxed);
     return cap != 0 && now > cap;
   }
 
-  void releaseReservation(int64_t bytes, bool draining) noexcept {
+  void releaseReservation(int64_t bytes, int64_t draining, Guard::Kind kind = Guard::Kind::Work,
+                          int64_t deletes = 0) noexcept {
     CallbackList admissions;
     CallbackList pressure;
     try {
@@ -419,9 +500,19 @@ private:
         [[maybe_unused]] int64_t prev =
             reserved.fetch_sub(bytes, std::memory_order_relaxed);
         assert(prev >= bytes);
-        if (draining) {
-          assert(drainingBytes >= bytes);
-          drainingBytes -= bytes;
+        assert(draining >= 0 && draining <= bytes && drainingBytes >= draining);
+        drainingBytes -= draining;
+        if (deletes != 0) {
+          [[maybe_unused]] int64_t live = liveDeleteBytes.fetch_sub(deletes, std::memory_order_relaxed);
+          assert(live >= deletes);
+        }
+        if (kind == Guard::Kind::RetirableDeletes) {
+          [[maybe_unused]] int64_t retirable = retirableDeleteBytes.fetch_sub(bytes, std::memory_order_relaxed);
+          assert(retirable >= bytes);
+        }
+        if (kind == Guard::Kind::RetainedDeletes || kind == Guard::Kind::RetirableDeletes) {
+          [[maybe_unused]] int64_t retained = retainedDeleteBytes.fetch_sub(bytes, std::memory_order_relaxed);
+          assert(retained >= bytes && draining == 0);
         }
         collectAdmissionCallbacksLocked(admissions);
         if (pressureNeededLocked()) collectPressureCallbacksLocked(pressure);
@@ -432,19 +523,22 @@ private:
     }
   }
 
-  void markDraining(int64_t bytes) {
+  // A draining inverter's packet bytes are plain reservations from here on.
+  void markDraining(int64_t bytes, int64_t deletes) {
     const std::lock_guard<std::mutex> lock(registryMutex);
     assert(bytes >= 0);
     assert(reserved.load(std::memory_order_relaxed) >= drainingBytes + bytes);
     drainingBytes += bytes;
+    liveDeleteBytes.fetch_sub(deletes, std::memory_order_relaxed);
   }
 
-  bool tryMarkDrainingForPressure(int64_t bytes) {
+  bool tryMarkDrainingForPressure(int64_t bytes, int64_t deletes) {
     const std::lock_guard<std::mutex> lock(registryMutex);
     assert(bytes >= 0);
     if (!pressureNeededLocked()) return false;
     assert(reserved.load(std::memory_order_relaxed) >= drainingBytes + bytes);
     drainingBytes += bytes;
+    liveDeleteBytes.fetch_sub(deletes, std::memory_order_relaxed);
     return true;
   }
 
@@ -454,13 +548,14 @@ private:
     drainingBytes += delta;
   }
 
-  void clearDraining(int64_t bytes) noexcept {
+  void clearDraining(int64_t bytes, int64_t deletes) noexcept {
     CallbackList pressure;
     try {
       {
         const std::lock_guard<std::mutex> lock(registryMutex);
         assert(drainingBytes >= bytes);
         drainingBytes -= bytes;
+        liveDeleteBytes.fetch_add(deletes, std::memory_order_relaxed);
         if (pressureNeededLocked()) collectPressureCallbacksLocked(pressure);
       }
       notifyCallbacks(pressure);
@@ -505,6 +600,11 @@ private:
   }
 
 public:
+  // The most pending merge demand that counts toward inverter pressure.
+  static int64_t mergeDemandPressureCap(int64_t totalBytes) {
+    return std::max<int64_t>(1, totalBytes / 2);
+  }
+
   explicit IndexRamBudget(int64_t totalBytes = 0) : total(totalBytes) {
     assert(totalBytes >= 0);
   }
@@ -527,7 +627,7 @@ public:
 
   void release(int64_t bytes) noexcept {
     assert(bytes >= 0);
-    releaseReservation(bytes, false);
+    releaseReservation(bytes, 0);
   }
 
   MergeDemandRegistration registerMergeDemand(std::function<void()>&& callback) {
@@ -568,8 +668,17 @@ public:
     return pressureNeededLocked();
   }
 
+  // True when the predicate's live term exceeds the cap (never when
+  // uncapped): pressure that holds without any merge demand.
+  bool liveOverBudget() const {
+    const std::lock_guard<std::mutex> lock(registryMutex);
+    int64_t cap = total.load(std::memory_order_relaxed);
+    return cap != 0 && liveLocked() > cap;
+  }
+
   // Conservative lock-free pre-check: false only when pressure is provably
-  // absent (reservations within cap and no published merge demand), so callers
+  // absent (reservations plus live delete bytes within cap and no published
+  // merge demand), so callers
   // can skip victim scans and the registry mutex on per-release fast paths.
   // May return true where the locked predicate says no (draining discount,
   // demand under headroom) - it gates the probe, never decides a shed.  Safe
@@ -580,7 +689,7 @@ public:
   bool pressurePossible() const {
     int64_t cap = total.load(std::memory_order_relaxed);
     if (cap == 0) return false;
-    return reserved.load(std::memory_order_relaxed) > cap
+    return reserved.load(std::memory_order_relaxed) + projectedDeltaLocked() > cap
         || nonzeroDemands.load(std::memory_order_relaxed) != 0;
   }
 
@@ -607,6 +716,18 @@ public:
 
   int64_t reservedBytes() const {
     return reserved.load(std::memory_order_relaxed);
+  }
+
+  int64_t retainedDeleteBytesCount() const {
+    return retainedDeleteBytes.load(std::memory_order_relaxed);
+  }
+
+  int64_t liveDeleteBytesCount() const {
+    return liveDeleteBytes.load(std::memory_order_relaxed);
+  }
+
+  int64_t retirableDeleteBytesCount() const {
+    return retirableDeleteBytes.load(std::memory_order_relaxed);
   }
 
   int64_t drainingBytesCount() const {

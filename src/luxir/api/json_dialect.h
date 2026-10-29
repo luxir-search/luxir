@@ -51,10 +51,19 @@
 //   other sugars, writes use the bare string whenever params is empty, so the
 //   common parameterless chain echoes exactly as written; only a component with
 //   params writes the object form.
+// - AnalyzerDef reads accept a bare STRING as named-analyzer sugar: "english" ==
+//   {"name": "english"}. Writes stay canonical (the object form).
 // - SortSpec reads a bare STRING as a clause, "expr", "expr asc", or "expr desc"
 //   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
 //   top-docs `sort` takes one clause or a list of them.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
+// - WeightedField reads a canonical object or a bare STRING, "name" or
+//   "name^weight". Writes stay canonical with field and optional weight.
+// - A Query or SearchOp arm key that names a registered plugin query type or
+//   operation (api/PluginArms.h) reads as the plugin arm: {"<name>": {...}} ==
+//   {"plugin": {"name": "<name>", "params": {...}}}, and for an operation the
+//   object's "ops" member is its nested ops. Writes stay canonical (the
+//   plugin object), which reads back the same way.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
 //   repeated QueryBucket form preserves that object's document order for gRPC parity.
 
@@ -66,7 +75,10 @@
 #include <system_error>
 #include <unordered_set>
 
+#include "luxir/api/PluginArms.h"
+#include "luxir/api/RequestFlags.h"
 #include "luxir/api/sort_clause.h"
+#include "luxir/api/weighted_field.h"
 
 // NOTE: relies on luxir_types_json.hpp having defined the luxir::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
@@ -275,6 +287,8 @@ struct from<JSON, luxir::api::Match> {
             util::from_json<O>(value.operator_, ctx, vit, vend);
           } else if (key == "min_match") {
             util::from_json<O>(value.min_match, ctx, vit, vend);
+          } else if (key == "case_insensitive") {
+            util::from_json<O>(value.case_insensitive, ctx, vit, vend);
           } else {
             // Sugar: one unknown key acts as field+val. Transfer its arena
             // storage so the next option key cannot overwrite the field name.
@@ -485,8 +499,128 @@ struct to<JSON, luxir::api::QueryFacet> {
   }
 };
 
+// Packed option words have one JSON representation at both overriding levels.
+// Keep the generated field metadata for ordinary fields so new request options
+// cannot silently disappear from canonical echo.
+template <auto Opts>
+void readRequestFlags(auto& value, auto& ctx, auto& it, auto& end) {
+  std::span<const std::string_view> names;
+  decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, names);
+  util::parse_repeated<Opts>(false, target, ctx, it, end);
+  if (bool(ctx.error)) return;
+  try {
+    auto flags = luxir::RequestFlags::fromNames(names, luxir::RequestFlags::levelOf(value));
+    value.flags = flags.flags;
+    value.flags_set = flags.flagsSet;
+  } catch (const std::exception& error) {
+    ctx.error = error_code::syntax_error;
+    std::string_view message(error.what());
+    char* stored = (char*)ctx.memory_resource().allocate(message.size(), 1);
+    std::memcpy(stored, message.data(), message.size());
+    ctx.custom_error_message = std::string_view(stored, message.size());
+  }
+}
+
+template <class T>
+struct FlaggedRequestJsonWriter {
+  static constexpr bool can_error = true;
+  template <auto Opts, class B>
+  static void op(const T& value, is_context auto& ctx, B& b, auto& ix) {
+    if (!luxir::RequestFlags::validationError(value.flags, value.flags_set, luxir::RequestFlags::levelOf(value)).empty()) {
+      ctx.error = error_code::syntax_error;
+      return;
+    }
+    dump<'{'>(b, ix);
+    bool first = true;
+    auto emit = [&](std::string_view key, const auto& member) {
+      if (!first) dump<','>(b, ix);
+      first = false;
+      serialize<JSON>::template op<Opts>(key, ctx, b, ix);
+      dump<':'>(b, ix);
+      serialize<JSON>::template op<Opts>(member, ctx, b, ix);
+    };
+    for_each<reflect<T>::size>([&]<size_t I>() {
+      constexpr auto key = get<I>(reflect<T>::keys);
+      if constexpr (key == "flags_set") {
+        return;
+      } else if constexpr (key == "flags") {
+        auto names = luxir::RequestFlags::names(value.flags, value.flags_set);
+        if (!names.empty()) emit(key, names);
+      } else {
+        decltype(auto) member = get_member(value, get<I>(reflect<T>::values));
+        if constexpr (null_t<std::remove_cvref_t<decltype(member)>>) {
+          if (!bool(member)) return;
+        }
+        emit(key, member);
+      }
+    });
+    dump<'}'>(b, ix);
+  }
+};
+
+template <>
+struct to<JSON, luxir::api::SearchOp> : FlaggedRequestJsonWriter<luxir::api::SearchOp> {};
+template <>
+struct to<JSON, luxir::api::SearchRequest> : FlaggedRequestJsonWriter<luxir::api::SearchRequest> {};
+
+// ----- Plugin arms: {"<name>": {...}} for a registered plugin query or op -----
+// Every member of the object becomes a param, except "ops" when `ops` is given
+// (a PluginOp's nested operations). The name and keys are copied: a key can
+// live in a scratch buffer when it was escaped.
+template <auto Opts, typename Ops>
+void readPluginArm(std::string_view name, std::string_view &nameOut,
+                   luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>> &paramsOut,
+                   Ops *ops, hpp_proto::concepts::is_non_owning_context auto &ctx,
+                   auto &it, auto &end) {
+  namespace api = luxir::api;
+  auto copy = [&](std::string_view text) {
+    char *stored = (char *)ctx.memory_resource().allocate(text.size(), 1);
+    std::memcpy(stored, text.data(), text.size());
+    return std::string_view(stored, text.size());
+  };
+  nameOut = copy(name);
+  if constexpr (!check_ws_handled(Opts)) {
+    if (skip_ws<Opts>(ctx, it, end)) return;
+  }
+  if ((char)*it != '{') {
+    ctx.error = error_code::syntax_error;
+    ctx.custom_error_message = "a plugin arm takes an object of parameters";
+    return;
+  }
+  static constexpr auto O = ws_handled<Opts>();
+  static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+  std::string_view key;
+  decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+  decltype(auto) params = ::hpp_proto::detail::as_modifiable(ctx, paramsOut);
+  util::scan_object_fields<O, true>(
+      ctx, it, end, keyTarget, [](auto &, auto &) {},
+      [&](auto &vit, auto &vend) {
+        if constexpr (!std::is_same_v<Ops, std::nullptr_t>) {
+          if (key == "ops") {
+            decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, *ops);
+            glz::util::parse_repeated<V>(true, target, ctx, vit, vend);
+            return bool(ctx.error);
+          }
+        }
+        size_t index = params.size();
+        for (size_t i = 0; i < index; i++) {
+          if (params[i].first == key) {
+            ctx.error = error_code::syntax_error;
+            ctx.custom_error_message = "duplicate plugin parameter";
+            return true;
+          }
+        }
+        auto *val = new (ctx.memory_resource().allocate(sizeof(api::Val), alignof(api::Val))) api::Val();
+        util::from_json<V>(*val, ctx, vit, vend);
+        params.resize(index + 1);
+        params[index] = {copy(key), ::hpp_proto::indirect_view<api::Val>(val)};
+        return bool(ctx.error);
+      },
+      [](auto &, auto &) {});
+}
+
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 8,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -509,9 +643,15 @@ struct from<JSON, luxir::api::SearchOp> {
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
     bool sawArm = false;
     bool sawDomain = false;
+    bool sawFlags = false;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
+          if (key == "flags" && !sawFlags) {
+            sawFlags = true;
+            readRequestFlags<V>(value, ctx, vit, vend);
+            return bool(ctx.error);
+          }
           if (key == "domain" && !sawDomain) {
             sawDomain = true;
             util::from_json<V>(value.domain, ctx, vit, vend);
@@ -537,6 +677,11 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::QueryFacet>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
+          } else if (key == "plugin") {
+            arm(std::in_place_type<api::PluginOp>);
+          } else if (api::isPluginOpArm(key)) {
+            auto &plugin = value.kind.template emplace<api::PluginOp>();
+            readPluginArm<V>(key, plugin.name, plugin.params, &plugin.ops, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -544,6 +689,45 @@ struct from<JSON, luxir::api::SearchOp> {
           return bool(ctx.error);
         },
         [](auto &, auto &) {});
+  }
+};
+
+// ----- WeightedField: canonical object, or name/name^weight string sugar -----
+template <>
+struct from<JSON, luxir::api::WeightedField> {
+  template <auto Opts>
+  static void op(luxir::api::WeightedField& value,
+                 hpp_proto::concepts::is_non_owning_context auto& ctx, auto& it, auto& end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.field, ctx, it, end);
+      // A root string may finish with the successful end_reached marker.
+      if (bool(ctx.error) && ctx.error != error_code::end_reached) return;
+      if (!luxir::api::splitWeightedField(value.field, value.field, value.weight)) {
+        ctx.error = error_code::syntax_error;
+      }
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto&, auto&) {},
+        [&](auto& vit, auto& vend) {
+          if (key == "field") {
+            util::from_json<V>(value.field, ctx, vit, vend);
+          } else if (key == "weight") {
+            util::from_json<V>(value.weight, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto&, auto&) {});
   }
 };
 
@@ -650,6 +834,47 @@ struct to<JSON, luxir::api::NormalizerDef> {
   }
 };
 
+// FieldDef.multi uses booleans for single/default and strings for explicit modes.
+template <>
+struct from<JSON, luxir::api::FieldDef::MultiMode> {
+  template <auto Opts>
+  static void op(luxir::api::FieldDef::MultiMode& value,
+                 hpp_proto::concepts::is_non_owning_context auto& ctx, auto& it, auto& end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    using Mode = luxir::api::FieldDef::MultiMode;
+    if (*it == 't' || *it == 'f') {
+      bool enabled = false;
+      util::from_json<O>(enabled, ctx, it, end);
+      if (ctx.error == error_code::none) value = enabled ? Mode::DEFAULT : Mode::SINGLE;
+    } else if (*it == '"') {
+      std::string_view mode;
+      util::from_json<O>(mode, ctx, it, end);
+      if (ctx.error != error_code::none) return;
+      if (mode == "set") value = Mode::SET;
+      else if (mode == "array") value = Mode::ARRAY;
+      else ctx.error = error_code::syntax_error;
+    } else {
+      ctx.error = error_code::syntax_error;
+    }
+  }
+};
+template <>
+struct to<JSON, luxir::api::FieldDef::MultiMode> {
+  template <auto Opts, class... Args>
+  static void op(luxir::api::FieldDef::MultiMode value, Args&&... args) noexcept {
+    using Mode = luxir::api::FieldDef::MultiMode;
+    if (value == Mode::SINGLE || value == Mode::DEFAULT) {
+      serialize<JSON>::template op<Opts>(value == Mode::DEFAULT, std::forward<Args>(args)...);
+    } else {
+      serialize<JSON>::template op<Opts>(std::string_view(value == Mode::SET ? "set" : "array"),
+                                         std::forward<Args>(args)...);
+    }
+  }
+};
+
 // ----- FieldDef: canonical object, or a bare string (type-only sugar) -----
 template <>
 struct from<JSON, luxir::api::FieldDef> {
@@ -680,10 +905,14 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.index, ctx, vit, vend);
           } else if (key == "long_terms") {
             util::from_json<V>(value.long_terms, ctx, vit, vend);
+          } else if (key == "unit") {
+            util::from_json<V>(value.unit, ctx, vit, vend);
           } else if (key == "column") {
             util::from_json<V>(value.column, ctx, vit, vend);
           } else if (key == "multi") {
-            util::from_json<V>(value.multi, ctx, vit, vend);
+            // The generic enum utility treats every non-string as an integer.
+            from<JSON, luxir::api::FieldDef::MultiMode>::template op<V>(
+                value.multi.emplace(), ctx, vit, vend);
           } else if (key == "analyzer") {
             util::from_json<V>(value.analyzer, ctx, vit, vend);
           } else if (key == "variants") {
@@ -698,6 +927,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.stored_resource, ctx, vit, vend);
           } else if (key == "dims") {
             util::from_json<V>(value.dims, ctx, vit, vend);
+          } else if (key == "truncate_dims") {
+            util::from_json<V>(value.truncate_dims, ctx, vit, vend);
           } else if (key == "metric") {
             util::from_json<V>(value.metric, ctx, vit, vend);
           } else if (key == "normalized") {
@@ -706,6 +937,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
+          } else if (key == "ignore_malformed") {
+            util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
+          } else if (key == "ignore_z_value") {
+            util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -743,6 +978,57 @@ struct from<JSON, luxir::api::AnalyzerComponent> {
           } else if (key == "params") {
             decltype(auto) params = ::hpp_proto::detail::as_modifiable(ctx, value.params);
             glz::util::parse_repeated<V>(true, params, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- AnalyzerDef: canonical object, or a bare string (named-analyzer sugar) -----
+// Reads: "english" == {"name": "english"}. Writes stay the generated canonical form.
+template <>
+struct from<JSON, luxir::api::AnalyzerDef> {
+  template <auto Opts>
+  static void op(luxir::api::AnalyzerDef &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.name, ctx, it, end);
+      if (!bool(ctx.error) && value.name.empty()) {
+        ctx.error = error_code::syntax_error;
+        ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+      }
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "tokenizer") {
+            util::from_json<V>(value.tokenizer, ctx, vit, vend);
+          } else if (key == "filters") {
+            decltype(auto) filters = ::hpp_proto::detail::as_modifiable(ctx, value.filters);
+            glz::util::parse_repeated<V>(false, filters, ctx, vit, vend);
+          } else if (key == "char_filters") {
+            decltype(auto) charFilters = ::hpp_proto::detail::as_modifiable(ctx, value.char_filters);
+            glz::util::parse_repeated<V>(false, charFilters, ctx, vit, vend);
+          } else if (key == "name") {
+            util::from_json<V>(value.name, ctx, vit, vend);
+            if (!bool(ctx.error) && value.name.empty()) {
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+            }
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -878,6 +1164,15 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::RescoreQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
+          } else if (key == "multi_match") {
+            arm(std::in_place_type<api::MultiMatchQuery>);
+          } else if (key == "dis_max") {
+            arm(std::in_place_type<api::DisMaxQuery>);
+          } else if (key == "plugin") {
+            arm(std::in_place_type<api::PluginQuery>);
+          } else if (api::isPluginQueryArm(key)) {
+            auto &plugin = value.kind.template emplace<api::PluginQuery>();
+            readPluginArm<V>(key, plugin.name, plugin.params, (std::nullptr_t *)nullptr, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1069,7 +1364,7 @@ struct from<JSON, luxir::api::Collapse> {
       value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
       value.head_sort = {};
       value.sort = {};
-      value.get_number = false;
+      value.get_count = false;
       value.ops = {};
       readFields(it, end);
       return;
@@ -1081,7 +1376,7 @@ struct from<JSON, luxir::api::Collapse> {
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
-          else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "get_count") util::from_json<O>(value.get_count, ctx, vit, vend);
           else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
@@ -1150,8 +1445,8 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.offset, ctx, vit, vend);
           } else if (key == "limit") {
             util::from_json<O>(value.limit, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(value.get_number, ctx, vit, vend);
+          } else if (key == "count_limit") {
+            util::from_json<O>(value.count_limit, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
           } else if (key == "min_score") {
@@ -1205,8 +1500,8 @@ struct from<JSON, luxir::api::Fusion> {
             util::from_json<O>(value.limit, ctx, vit, vend);
           } else if (key == "offset") {
             util::from_json<O>(value.offset, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(value.get_number, ctx, vit, vend);
+          } else if (key == "count_limit") {
+            util::from_json<O>(value.count_limit, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
           } else if (key == "fields") {
@@ -1386,6 +1681,7 @@ struct from<JSON, luxir::api::SearchRequest> {
     api::SearchOp *shorthandOp = nullptr;
     api::TopDocs *td = nullptr;
     bool reusedShorthand = false;
+    bool sawFlags = false;
     // A second read can overlay shorthand fields onto an already-decoded request.
     // Capture q before scanning so an ordinary shorthand body's root "ops" key
     // remains sub-ops even when that map itself contains an op named q.
@@ -1417,6 +1713,9 @@ struct from<JSON, luxir::api::SearchRequest> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "flags" && !sawFlags) {
+            sawFlags = true;
+            readRequestFlags<O>(value, ctx, vit, vend);
           } else if (key == "freshness_ms") {
             util::from_json<O>(value.freshness_ms, ctx, vit, vend);
           } else if (key == "min_commit") {
@@ -1463,8 +1762,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(shorthand().document_format, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(shorthand().get_number, ctx, vit, vend);
+          } else if (key == "count_limit") {
+            util::from_json<O>(shorthand().count_limit, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
           } else if (key == "min_score") {

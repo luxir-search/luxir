@@ -23,8 +23,14 @@ std::string ReaderManager::resolvedSchema() {
   result["fields"] = Json::object_t{};
   for (const auto& [name, signature] : fields) {
     auto& logical = result["fields"][signature.logicalName];
-    logical["bindings"]["search"] = schema->resolveFor(signature.logicalName, OpClass::SEARCH).physicalName;
-    logical["bindings"]["value"] = schema->resolveFor(signature.logicalName, OpClass::VALUE).physicalName;
+    for (auto [name, op] : {std::pair{"search", OpClass::SEARCH}, {"value", OpClass::VALUE}}) {
+      try {
+        logical["bindings"][name] = schema->resolveFor(signature.logicalName, op).physicalName;
+      } catch (const RequestError& e) {
+        if (e.code != "retrieval_only") throw;
+        logical["bindings"][name] = nullptr;
+      }
+    }
     auto& rep = logical["representations"][signature.label];
     rep["name"] = name;
     for (const auto& [property, value] : signature.properties) {
@@ -34,6 +40,17 @@ std::string ReaderManager::resolvedSchema() {
     auto* type = schema->physical(name);
     rep["stored"] = type->isStored();
     if (type->isStored()) rep["stored_resource"] = type->storedResource_;
+    // Ingest-time options: kept out of the signature, since changing them does
+    // not change what existing segments hold.
+    if (auto* geo = dynamic_cast<const GeoPointFieldType*>(type)) {
+      rep["ignore_malformed"] = geo->ignoreMalformed;
+      rep["ignore_z_value"] = geo->ignoreZValue;
+    }
+    // The analyzer property is always the expanded definition; a named analyzer
+    // additionally reports the name it came from.
+    if (auto* text = dynamic_cast<const TextFieldType*>(type); text && !text->analyzer_->presetName.empty()) {
+      rep["analyzer_preset"] = text->analyzer_->presetName;
+    }
     if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
       const auto& config = vector->ann();
       auto& ann = rep["ann"];

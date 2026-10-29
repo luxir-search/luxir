@@ -324,6 +324,10 @@ public:
       .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
       .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
       .directDocSet = Query::DirectDocSetAccess::SUPPORTED,
+      .membershipConsumption = buildContext.membershipConsumption
+              == Query::MembershipConsumption::CANDIDATES
+          ? Query::MembershipConsumption::CANDIDATES
+          : Query::MembershipConsumption::WINDOWS,
     };
   }
 
@@ -1060,7 +1064,13 @@ public:
            || (size_t)segment.ord < fieldSortCacheRoutes.size());
     bool routed = fieldSortCacheRoutes.empty()
         || fieldSortCacheRoutes[(size_t)segment.ord] != 0;
-    auto shortcut = weight->countShortcut(segment, incomingDomain);
+    // Unlike countShortcut's general domains, incomingDomain is effective:
+    // parent eligibility already includes liveDocs. Match-all can use its
+    // cached card even when it is a bucket rather than canonical liveDocs.
+    int64_t domainCard = incomingDomain == nullptr ? -1 : incomingDomain->cachedCard();
+    auto shortcut = weight->matchesAllDocs() && domainCard >= 0
+        ? Query::CountShortcut{domainCard, Query::CountHow::METADATA}
+        : weight->countShortcut(segment, incomingDomain);
     auto count = resolveCount(shortcut, std::forward<SupplierFor>(supplierFor));
     // Empty effective counts still need raw residency for Weight omission.
     bool cacheZero = cacheUse != nullptr && routed

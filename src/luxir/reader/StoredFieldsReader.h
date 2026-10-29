@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -30,7 +31,7 @@ namespace luxir {
 ///
 /// Callback-lifetime contract (applies to readDoc, readField, readFieldById):
 ///   - The fieldName string_view passed to readDoc points into the reader's
-///     own fieldNames_ storage and is valid for the reader's lifetime.  It is
+///     PostingsReader's cached metadata and is valid for the reader's lifetime. It is
 ///     safe to keep a copy of the string_view for as long as the reader
 ///     exists.
 ///   - The values span (std::span<const std::string_view>) is a view into
@@ -47,16 +48,12 @@ namespace luxir {
 ///
 class StoredFieldsReader {
 private:
+  const StoredFieldsMetadata* metadata;
   InputStream chunkIS;
   int64_t chunksStart = 0;
   int64_t chunksRegionEnd = 0;
   int32_t numChunks_ = 0;
   int32_t maxDoc_ = 0;
-  int64_t maxChunkBytes_ = 0;
-  StoredChunkFormat format_;  // zstdLevel is not recorded and stays the default
-
-  std::vector<std::string_view> fieldNames_;
-
   std::optional<MonoReader> firstDocCol;     // chunkN -> firstDocID
   std::optional<MonoReader> chunkOffsetCol;  // chunkN -> file offset (numChunks+1 entries)
 
@@ -71,39 +68,18 @@ private:
   };
 
 public:
-  StoredFieldsReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-    : maxDoc_(postingsReader.maxDoc())
+  StoredFieldsReader(PostingsReader& postingsReader, const PostingsReader::Field& fieldInfo)
+    : metadata(fieldInfo.stored.get()),
+      maxDoc_(postingsReader.maxDoc())
   {
     assert(fieldInfo.type == FieldType::BIN);
     assert(fieldInfo.numValues > 0);
+    assert(metadata != nullptr);
 
     chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
     chunksStart = (int64_t)fieldInfo.columnLoc.offset();
     chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
     numChunks_ = (int32_t)fieldInfo.numValues;
-
-    // Read metadata block (resource stats, chunk format and field names)
-    // which sits at chunksStart + columnMetaOff.
-    const char* metaPtr = chunkIS.ptr(chunksRegionEnd);
-    const char* end = chunkIS.ptr(chunkIS.size());
-    maxChunkBytes_ = (int64_t)InputStream::readVlong(metaPtr, end);
-    uint8_t codec = (uint8_t)*metaPtr++;
-    if (codec != StoredChunkFormat::LZ4 && codec != StoredChunkFormat::ZSTD) {
-      throw std::runtime_error("StoredFieldsReader: unknown codec " + std::to_string(codec));
-    }
-    format_.codec = (StoredChunkFormat::Codec)codec;
-    format_.chunkTarget = InputStream::readVint(metaPtr, end);
-    format_.maxDocsPerChunk = InputStream::readVint(metaPtr, end);
-    uint32_t numFields = InputStream::readVint(metaPtr, end);
-    fieldNames_.reserve(numFields);
-    for (uint32_t i = 0; i < numFields; i++) {
-      // PackedTerm layout: one-byte length followed by the string bytes.  The
-      // bytes live in the input stream for the reader's lifetime, so a view
-      // is safe.
-      PackedTerm term(const_cast<char*>(metaPtr));
-      fieldNames_.emplace_back(term.data(), term.size());
-      metaPtr += term.memorySize();
-    }
 
     firstDocCol.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, numChunks_);
     chunkOffsetCol.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, numChunks_ + 1);
@@ -147,8 +123,8 @@ public:
     for (uint32_t i = 0; i < numFields; i++) {
       uint32_t fid = InputStream::readVint(p, pend);
       uint32_t numValues = InputStream::readVint(p, pend);
-      assert(fid < fieldNames_.size());
-      std::string_view fieldName = fieldNames_[fid];
+      assert(fid < metadata->fieldNames.size());
+      std::string_view fieldName = metadata->fieldNames[fid];
       valueSpanScratch.resize(0);
       valueSpanScratch.reserve(numValues);
       for (uint32_t v = 0; v < numValues; v++) {
@@ -164,7 +140,7 @@ public:
   // Returns the segment-local field id for fieldName, or -1 if this
   // resource has no entries for that field.  Callers iterating over many
   // docs should resolve the fid once and use readFieldById to avoid a
-  // per-call linear scan over fieldNames_.
+  // per-call linear scan over the field table.
   int32_t fieldId(std::string_view fieldName) const {
     return findFieldId(fieldName);
   }
@@ -176,8 +152,8 @@ public:
 
   // Read only the entries for fieldName in docID.  See readFieldById for
   // the callback signature and semantics; this overload resolves the fid
-  // by name on every call.  Use readFieldById in hot loops to avoid the
-  // per-call linear scan over fieldNames_.
+  // by name on every call. Use readFieldById in hot loops to avoid the
+  // per-call linear scan over the field table.
   template <class Callback>
   bool readField(int32_t docID, std::string_view fieldName, Callback&& callback) {
     int32_t targetFid = findFieldId(fieldName);
@@ -199,7 +175,7 @@ public:
   template <class Callback>
   bool readFieldById(int32_t docID, int32_t targetFid, Callback&& callback) {
     assert(docID >= 0 && docID < maxDoc_);
-    assert(targetFid >= 0 && (size_t)targetFid < fieldNames_.size());
+    assert(targetFid >= 0 && (size_t)targetFid < metadata->fieldNames.size());
 
     auto [chunkNum, firstDocInChunk] = findChunk(docID);
     int32_t firstDocInNext = (chunkNum + 1 < numChunks_)
@@ -247,10 +223,32 @@ public:
   }
 
   int32_t numChunks() const { return numChunks_; }
+
+  // Encoded document views borrow the one decompressed chunk. Returning false
+  // from the callback stops the visit; views expire on the next chunk read.
+  template <class Callback>
+  void readChunkDocs(int32_t chunkNum, Callback&& callback) {
+    assert(chunkNum >= 0 && chunkNum < numChunks_);
+    int32_t first = (int32_t)firstDocCol->valueAt(chunkNum);
+    int32_t end = chunkNum + 1 < numChunks_ ? (int32_t)firstDocCol->valueAt(chunkNum + 1) : maxDoc_;
+    decompressChunk(chunkNum);
+    const int32_t* offsets = (const int32_t*)scratch.data();
+    for (int32_t doc = first; doc < end; doc++) {
+      int32_t start = offsets[doc - first];
+      int32_t limit = doc + 1 < end ? offsets[doc + 1 - first] : (int32_t)scratch.size();
+      if (!callback(doc, std::string_view(scratch.data() + start, (size_t)(limit - start)))) return;
+    }
+  }
+
   int32_t maxDoc() const { return maxDoc_; }
-  int64_t maxChunkBytes() const { return maxChunkBytes_; }
+  int64_t maxChunkBytes() const { return metadata->maxChunkBytes; }
+  // Chunks sealed before reaching the chunk limits (see StoredFieldsWriter).
+  int32_t numDirtyChunks() const { return metadata->numDirtyChunks; }
   // Codec and chunk limits this resource was written with.
-  const StoredChunkFormat& format() const { return format_; }
+  const StoredChunkFormat& format() const { return metadata->format; }
+  // The trained ZSTD dictionary every chunk was compressed with, or empty.
+  // The view stays valid for as long as the PostingsReader is alive.
+  std::string_view dictionary() const { return metadata->dictionary; }
 
   // Every field name this resource holds, in segment-local field-id order.
   // The views point into the resource's metadata in the segment file, so they
@@ -258,7 +256,7 @@ public:
   // alive - beyond this reader object itself.  Merges also use this table to
   // decide whether compressed chunk bodies (which reference these ids) can be
   // copied verbatim.
-  std::span<const std::string_view> fieldNames() const { return fieldNames_; }
+  std::span<const std::string_view> fieldNames() const { return metadata->fieldNames; }
 
   // Raw access to the contiguous chunks region ([int32 uncompressedSize]
   // [compressed bytes] per chunk, metadata excluded), for verbatim copy by
@@ -291,11 +289,11 @@ public:
   }
 
 private:
-  // Linear scan of fieldNames_; typical segments have O(10) stored fields, so
+  // Linear scan of the field table; typical segments have O(10) stored fields, so
   // a map isn't worth the overhead.
   int32_t findFieldId(std::string_view fieldName) const {
-    for (size_t i = 0; i < fieldNames_.size(); i++) {
-      if (fieldNames_[i] == fieldName) return (int32_t)i;
+    for (size_t i = 0; i < metadata->fieldNames.size(); i++) {
+      if (metadata->fieldNames[i] == fieldName) return (int32_t)i;
     }
     return -1;
   }
@@ -354,7 +352,9 @@ private:
     int32_t compressedSize = (int32_t)(nextOff - off) - (int32_t)sizeof(int32_t);
 
     scratch.resize((size_t)uncompressedSize);
-    decompressor.decompress(format_.codec, chunkPtr, (size_t)compressedSize, scratch.data(), scratch.size());
+    decompressor.decompress(metadata->format.codec, metadata->ddict ? &*metadata->ddict : nullptr,
+                            chunkPtr, (size_t)compressedSize,
+                            scratch.data(), scratch.size());
     cachedChunkNum = chunkNum;
   }
 };

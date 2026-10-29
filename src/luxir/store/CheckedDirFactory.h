@@ -5,6 +5,7 @@
 
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "DirectoryFactory.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -72,12 +73,15 @@ public:
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
+    // A non-null test listener result injects a file creation failure.
+    if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
     if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({})", name);
     return delegate_->createFile(name);
   }
 
   std::unique_ptr<File> createFile(
       std::string_view name, FileCreateOptions options) override {
+    if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
     if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({}, ramDelegating={})",
                             name, options.ramDelegating);
     return delegate_->createFile(name, std::move(options));

@@ -11,6 +11,14 @@ option objc_class_prefix = "Luxir";
 
 package luxir;
 
+// Bit positions in the packed request option word, not masks. The two date
+// bits form one field: native=0, iso=1, ms=2, ns=3.
+enum RequestFlagBit {
+  DATE_MODE_LOW_BIT = 0;
+  DATE_MODE_HIGH_BIT = 1;
+  INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
+}
+
 // Top-level search request that can contain multiple search operations.
 message SearchRequest {
   // Optional opaque identifier, echoed in every response to this request.
@@ -42,10 +50,11 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose; 1 runs
-  // serially on the shared executor; -1 permits unlimited parallelism,
-  // starting on the receiving thread with shared workers joining in.
-  // Automatic execution is serial on the receiving thread. Other values
+  // Intra-request parallelism: 0 (default) lets the engine choose, today
+  // serial: over HTTP normally inline on the receiving thread, over gRPC on
+  // the shared executor. 1 runs serially on the shared executor; -1 permits
+  // unlimited parallelism, with shared workers joining in (starting on the
+  // receiving HTTP thread, or on the shared executor over gRPC). Other values
   // are rejected.
   int32 max_parallel = 8;
 
@@ -54,6 +63,18 @@ message SearchRequest {
   string min_commit = 9;
   // Search floor deadline. Absent defaults to 30000; zero checks immediately.
   optional uint64 min_commit_timeout_ms = 10;
+
+  // Packed request options. Effective = (inherited & ~flags_set) |
+  // (flags & flags_set); the request inherits 0. JSON uses lowercase names,
+  // e.g. "flags": ["date_ms"], rather than numeric flags/flags_set.
+  // Date modes control numeric date literal units: ms or ns overrides the
+  // field unit; native and iso use the field unit. Value arithmetic is unchanged.
+  uint64 flags = 11;
+  // Override mask. Set both date-mode bits (3), or neither. Request-only
+  // int64_str (bit 2) quotes JSON int64/uint64 values outside the safe integer
+  // range, +/- (2^53 - 1). Unknown bits are rejected in either word.
+  // Binary gRPC responses retain their integer types.
+  uint64 flags_set = 12;
 }
 
 enum ResponseFormat {
@@ -70,8 +91,31 @@ message SearchOp {
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
+    PluginOp plugin = 16;           // an operation registered by a compiled-in plugin
   }
   Domain domain = 20; // optional override of the incoming document domain
+  // Overrides the parent's packed options, including for this op's domain,
+  // queries and facet literals. Subops inherit this op's effective options.
+  // JSON uses the same lowercase flags name array as SearchRequest.
+  uint64 flags = 21;
+  // Override mask. int64_str is request-only: bit 2 is rejected in both
+  // flags and flags_set, including an attempted clear. Other validation is
+  // the same as SearchRequest.flags_set.
+  // Naming date_native in JSON explicitly replaces an inherited date mode.
+  uint64 flags_set = 22;
+}
+
+// An operation registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_op": {"a": 1, "ops": {...}}} reads as
+// {"plugin": {"name": "my_op", "params": {"a": 1}, "ops": {...}}}.  An
+// unregistered name is a request error that lists the registered operations.
+// The plugin validates params and defines the result shape; nested ops run
+// over the domain the plugin gives them and may not override it.
+message PluginOp {
+  string name = 1;
+  map<string, Val> params = 2;
+  map<string, SearchOp> ops = 3;
 }
 
 // An expression aggregate over the operation's incoming document domain.
@@ -81,16 +125,18 @@ message ExprOp {
   map<string, Val> vars = 2;
 }
 
-// Placement preference for returned document fields: dense columns
-// (DocList.columns) vs per-document maps (DocList.docs).  DEFAULT resolves
-// per transport: HTTP/JSON -> ROWS, gRPC -> COLUMNS.  Under COLUMNS,
-// explicitly named fields are returned as dense columns while discovered
-// fields (empty or wildcard selectors) use docs; under ROWS everything is
-// returned in docs.
+// Placement of returned document fields: dense columns (DocList.columns)
+// or per-document maps (DocList.docs).  A document is the merge of columns
+// row i and docs[i]; a field is never in both.  A missing value is an
+// absent key in docs[i] or the column's missing sentinel.  A field with no
+// value in a batch is left out of that batch, except a named field under
+// COLUMNS, whose column is present in every batch.  DEFAULT resolves per
+// transport: HTTP/JSON -> ROWS, gRPC -> COLUMNS.
 enum DocFormat {
   DEFAULT = 0;
-  ROWS = 1;
-  COLUMNS = 2;
+  ROWS = 1;      // every field in docs
+  COLUMNS = 2;   // every field as a column
+  ADAPTIVE = 3;  // per batch and field, whichever encodes the batch more compactly
 }
 
 // Partition matching documents by an exact, single-valued key.
@@ -103,7 +149,7 @@ message Collapse {
   }
   MissingPolicy missing = 2;
   repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
-  bool get_number = 4; // Count members of each returned group in the finalized match set.
+  bool get_count = 4; // Count members of each returned group in the finalized match set.
   // Per-group operations on matching members; facet count units start at docs.
   // Explicit group units still resolve to this nearest enclosing collapse.
   map<string, SearchOp> ops = 5;
@@ -133,14 +179,18 @@ message TopDocs {
 
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
-  bool get_number = 5;          // return the number of matching documents
+  // Match count: unset or 0 omits found; -1 counts exactly; positive N permits
+  // stopping at N with found_gte. An exact count is also valid for N.
+  // Must be >= -1. Ops, collapse, diversify, field sorts, nested lists and
+  // limit 0 retain exact counting.
+  optional sint64 count_limit = 5;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
   // Fields to return for each document.  Empty returns every retrievable field
   // (stored or column-backed; not vectors or engine fields such as _version_),
-  // discovered from the index and placed in per-document rows (DocList.docs).
+  // discovered from the index; placement follows document_format.
   // A name containing '*' is a pattern expanded the same way: the matching
-  // retrievable fields, in rows; matching nothing is not an error.  Explicitly
+  // retrievable fields; matching nothing is not an error.  Explicitly
   // named fields win on collision and may name anything, vectors and engine
   // fields included.
   repeated string fields = 7;
@@ -150,14 +200,14 @@ message TopDocs {
   // the server caps positive values at 256. More documents produce more
   // batches. Ignored beneath a facet bucket, where all rows return together.
   int32 batch_size = 9;
-  DocFormat document_format = 10;  // rows vs columns placement of returned fields (see DocFormat)
+  DocFormat document_format = 10;  // placement of returned fields: rows, columns, or adaptive (see DocFormat)
 
   Diversify diversify = 12; // Incompatible with collapse; found counts capped documents.
   Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
 
   // Minimum score cut-off. When set, documents whose query score is below
   // this value do not match: they are excluded from the returned documents,
-  // from the get_number count, and from the domain of ops (facets and
+  // from the match count, and from the domain of ops (facets and
   // metrics). The score compared is the query's own relevance score (filters
   // do not score), computed even when the request sorts by fields or does not
   // return scores. Must be finite. As a Fusion source, the cut-off applies to
@@ -171,13 +221,13 @@ message TopDocs {
 // and merge their results into a single ranked list.
 //
 // Per-source response-shape fields (`fields`, `batch_size`, `offset`,
-// `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
+// `get_scores`, `count_limit`, `document_format`) are ignored - Fusion controls
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
 // Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
 // to produce that source's ranked list. A source collapse accepts only field
 // and missing, and its limit counts groups; the head documents enter document fusion.
-// Source collapse head_sort, sort, get_number and ops are errors.
+// Source collapse head_sort, sort, get_count and ops are errors.
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
@@ -204,11 +254,15 @@ message Fusion {
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  bool get_number = 5; // eligible groups with collapse, otherwise distinct source-union documents
+  // Match count: unset or 0 omits found; -1 requests exact; positive N permits
+  // a lower bound. Fusion always supplies an exact count, also valid for N.
+  // Counts eligible groups with collapse, otherwise source-union documents.
+  // Must be >= -1.
+  optional sint64 count_limit = 5;
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8; // same batching rules as TopDocs.batch_size
-  DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
+  DocFormat document_format = 9;  // placement of returned fields: rows, columns, or adaptive (see DocFormat)
 
   // Collapse the fused document list before paging. Source windows never refill.
   // found counts eligible groups; found_docs counts eligible fused documents.
@@ -287,6 +341,9 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    MultiMatchQuery multi_match = 20; // one text over several weighted fields
+    DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
   }
 }
 
@@ -327,7 +384,7 @@ message RescoreQuery {
 // Multi-valued fields return one hit per document using its highest similarity.
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
-  Vector query = 2;        // query vector - must match the field's dims
+  Vector query = 2;        // query vector - dims components, or truncate_dims when set
   int32 k = 3;             // nearest documents (default) or groups to return; must be positive
 
   // Require exact top-k results by scanning stored vectors. Cost is linear
@@ -369,8 +426,8 @@ message KnnQuery {
 // boolean scalar values; numeric and DATE fields accept string or numeric
 // scalars. Null matches nothing. Arrays and structured values are rejected,
 // and GEO_POINT is unsupported. TEXT values are analyzed and scored; use
-// AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for
-// multi-field text.
+// AnyOfQuery for constant-score value sets and MultiMatchQuery, SimpleQuery,
+// or ExprQuery for multi-field text.
 message Match {
   string field = 1;
   Val val = 2;
@@ -384,11 +441,104 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
+  // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
+  // after query analysis/normalization. Indexed case variants score as one word,
+  // with the query's exact case preferred slightly: frequency weight 1.0 for
+  // the analyzed/normalized query token, 0.9 for other variants. Frequencies sum
+  // before BM25 saturation, with shared statistics. Slower than a folding
+  // variant (_t, _un, _wl), recommended for frequent use. Alternates come from
+  // analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems
+  // lowercase only). Numeric and DATE fields ignore it.
+  bool case_insensitive = 10;
+
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
     AND = 2;                   // a doc must match every analyzed term
   }
+}
+
+// One search field and its weight. TEXT weights scale term frequency and
+// length in COMBINED; all other weights multiply the field's score.
+// JSON also accepts a bare field name or "name^weight" as shorthand.
+message WeightedField {
+  string field = 1;
+  // Unset = 1. Must be finite and > 0 in every mode.
+  optional float weight = 2;
+}
+
+// Phrase matching options. A present empty message requests an exact phrase.
+message PhraseOptions {
+  // Maximum spread of query-adjusted positions. Must be >= 0; unset = 0.
+  int32 slop = 1;
+}
+
+// Searches one text across weighted fields. In COMBINED mode, TEXT fields
+// sharing an analyzer and long-term policy form a group scored as one field
+// with BM25F. STRING/ID/numeric/date fields form singleton match groups with
+// multiplicative weights. PER_FIELD scores a match in each field separately.
+// Group or field scores combine as best + tie * (sum - best), defaulting to
+// sum (tie = 1). Values that cannot coerce to a field contribute no clause in
+// either mode, including with phrase options; other errors fail the request.
+// If no field contributes, matches nothing. BM25F follows Lucene's
+// CombinedFieldQuery.
+message MultiMatchQuery {
+  string text = 1; // the text to analyze or coerce
+  // Required and non-empty. Fields resolve through their search bindings.
+  // Field order does not matter; duplicate physical targets keep the larger
+  // weight. Names containing '*' select indexed TEXT/STRING/ID search targets
+  // from concrete declarations and dynamic roots present in reader metadata.
+  // Patterns containing '__' select variants; other patterns select roots
+  // through their search binding. Declared fields and variants of known roots
+  // need not be present in the index. Wildcard lists may resolve to at most 64
+  // distinct physical targets, including explicit selectors; exceeding the
+  // limit is an error.
+  repeated WeightedField fields = 2;
+  // Unset = COMBINED.
+  Mode mode = 3;
+
+  // How analyzed terms combine. Unset = OR. COMBINED applies this within
+  // each group (AND: every term in some field of one group). PER_FIELD
+  // applies it within each field (AND: every term in that field). Must be
+  // unset when phrase is present.
+  Match.Operator operator = 4;
+
+  // Zero uses operator. Positive values override operator and are clamped
+  // to the analyzed term count within each group/field. Must be >= 0, and
+  // must be zero when phrase is present.
+  int32 min_match = 5;
+
+  // Combines matching field/group scores as best + tie * (sum - best).
+  // Unset = 1 in every mode. Must be finite and in [0, 1].
+  optional float tie = 6;
+
+  // Absent = match. Present = a phrase per TEXT field (requires indexed
+  // positions); STRING/ID fields match the whole value, and numeric/date
+  // fields still use match coercion. PER_FIELD only; fields combine by tie,
+  // and each weight multiplies its field's score. Operator must be unset
+  // and min_match must be zero.
+  PhraseOptions phrase = 7;
+
+  enum Mode {
+    // TEXT weights scale term frequency and document length at every group
+    // size. Other fields are singleton groups with multiplicative weights.
+    COMBINED = 0;
+    // One match or phrase per field; each weight multiplies its score.
+    PER_FIELD = 1;
+  }
+}
+
+// Matches documents that match any query and combines their matching scores
+// as best + tie * (sum - best), defaulting to the best score (tie = 0).
+// Duplicate queries are kept as separate scoring contributions. A single
+// query scores as itself; tie = 1 is a boolean disjunction. Filter use shares
+// the equivalent boolean's membership and cache key (Elasticsearch dis_max).
+message DisMaxQuery {
+  repeated Query queries = 1;  // required, non-empty
+
+  // Weight of the non-best matching queries. Unset = 0. Must be finite and
+  // in [0, 1]; 1 adds every score like a boolean disjunction.
+  optional float tie = 2;
 }
 
 // Constant-score exact value-set membership using the field's value binding.
@@ -404,6 +554,19 @@ message AnyOfQuery {
   Val values = 2;
 }
 
+// A query type registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_query": {"a": 1}} reads as
+// {"plugin": {"name": "my_query", "params": {"a": 1}}}, and the expression
+// language calls it as my_query(...) with the arguments the plugin declares.
+// An unregistered name is a request error that lists the registered query
+// types. params are typed JSON values; a nested query is a Query-shaped
+// value the plugin parses.
+message PluginQuery {
+  string name = 1;
+  map<string, Val> params = 2;
+}
+
 // Matches documents whose field value falls in the given range.  All bounds
 // are optional; omit a side for an open-ended range.  Set at most one of
 // gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is
@@ -413,7 +576,7 @@ message AnyOfQuery {
 // Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go
 // through the same value-coercion contract as ingest, so querying a literal
 // finds the documents ingested with it.  DATE accepts ISO-8601 strings or
-// epoch millis, and a partial date names its whole window: bounds include the
+// epoch values in the field's unit, and a partial date names its whole window: bounds include the
 // granule they name ([2024-01 TO 2024-06] covers January through June;
 // exclusive bounds exclude the granule whole).  FLOAT/DOUBLE compare by
 // IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.
@@ -489,6 +652,10 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+
+  // After whole-prefix normalization, also match simple Unicode case
+  // alternates. TEXT fields are supported. Uses a constant-score automaton.
+  bool case_insensitive = 3;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
@@ -499,6 +666,10 @@ message PrefixQuery {
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, also match their simple Unicode
+  // case alternates (lower, upper and title forms).
+  bool case_insensitive = 3;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
@@ -509,6 +680,11 @@ message WildcardQuery {
 message RegexQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, and every member of character
+  // classes and ranges also match their simple Unicode case alternates.
+  // Negated classes exclude all case forms of their members.
+  bool case_insensitive = 3;
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
@@ -688,7 +864,7 @@ message RangeFacet {
   // bound; include intersecting cells below it without excluding larger values.
   Val end = 3;
   oneof gap_kind {
-    Val gap = 4; // positive fixed width in field units; integer milliseconds for DATE
+    Val gap = 4; // positive fixed width in field units; integer field units for DATE
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
   }
   optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
@@ -729,7 +905,7 @@ message RangeFacet {
   // For DATE, origin is a wall-clock phase in the facet zone: 21600000 with
   // gap 86400000 starts days at 06:00 local across DST. This differs from
   // Elasticsearch's UTC-translated offset near transitions. Must be integer
-  // milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE.
+  // field units for DATE, an integer for INT, or a number for FLOAT/DOUBLE.
   Val origin = 16;
 }
 
@@ -869,14 +1045,17 @@ message GroupTable {
 
 // A batch of returned documents.  Document i is the merge of columns row i
 // and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
-// just the degenerate cases.  Which fields land where is a function of the
-// request (see DocFormat), never of the data.
+// just the degenerate cases.  Which fields land where follows the request's
+// DocFormat; under COLUMNS an all-missing discovered column is left out of
+// the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Exact match count when get_number was requested. Counts groups with
+  // Match count when count_limit is nonzero. Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
-  optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
-  optional sint64 found_groups = 8; // Diversify only, with get_number: distinct eligible keys.
+  // True when found is a lower bound; false means the count is exact.
+  bool found_gte = 9;
+  optional sint64 found_docs = 2; // Collapse only, when count_limit is nonzero, after missing=drop.
+  optional sint64 found_groups = 8; // Diversify only, with nonzero count_limit: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
 
   // Dense columns; each has exactly row_count slots.
@@ -983,6 +1162,9 @@ message UpdateRequest {
 
   string collection = 3; // empty selects the default collection, "main"
 
+  // Documents to index. Input fields named _version_ after field mapping are
+  // rejected with a document error: the field is assigned by the engine and
+  // optimistic concurrency is not supported.
   repeated Map docs = 4;
 
   // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
@@ -1178,7 +1360,9 @@ message ColStr {
 
 // One slot per document, including missing values, aligned with DocList rows.
 // Scalar columns use missing_val; multi-valued columns use empty arrays.
-// Vector columns use the missing-value rules described on their fields.
+// Vector and value columns use the missing-value rules described on their
+// fields.  Every returned field type has a column form: a type with no typed
+// arm uses col_val.
 message Column {
   oneof kind {
     ColStr col_s = 1;
@@ -1189,6 +1373,7 @@ message Column {
     ArrArrInt multi_i = 6;
     ArrArrFloat multi_f = 7;
     ArrArrDouble multi_d = 8;
+    ColVal col_val = 9;        // any other value type: one Val per doc; missing = unset kind
 
     ColVector col_vec = 16;    // single-valued vector column: one Vector per doc; missing = unset oneof
     MultiVector multi_vec = 17; // multi-valued vector column: one ArrVector per doc; missing = empty list
@@ -1199,6 +1384,13 @@ message Column {
 // via its empty oneof - no separate missing_val needed.
 message ColVector {
   repeated Vector v = 1;
+}
+
+// Column of a field type that has no typed arm (an object, an interval, a
+// boolean): v[i] holds what document i's row entry would.  An unset kind
+// means missing.
+message ColVal {
+  repeated Val v = 1;
 }
 
 // Multi-valued vector column.  Empty ArrVector means "doc does not have the
@@ -1366,8 +1558,8 @@ message ServiceStats {
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
   repeated double request_duration_bounds = 3;
-  // Upper bounds, in seconds, of the flush, commit, merge, vector build and
-  // reader refresh histograms.
+  // Upper bounds, in seconds, of the flush, commit, delete pass, merge,
+  // vector build and reader refresh histograms.
   repeated double background_duration_bounds = 4;
   TransportStats http = 5;
   TransportStats grpc = 6;
@@ -1388,6 +1580,9 @@ message ServiceStats {
   map<string, uint64> document_errors = 19;
   ActivityStats flush = 14;
   ActivityStats commit = 15;
+  // Delete passes, which apply deletes between commits without flushing,
+  // syncing or publishing.
+  ActivityStats delete_pass = 22;
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
@@ -1785,6 +1980,10 @@ message IndexStats {
   uint64 inverters_idle = 16;
   uint64 inverters_flushing = 17;
   uint64 commits = 18; // writer only: commits since the writer opened
+  // Writer only: resident delete packets held by its pending set or merge
+  // catch-up, deduplicated across owners. Included in the node indexing
+  // reservation.
+  uint64 retained_delete_bytes = 19;
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -1854,6 +2053,9 @@ message IndexRamStats {
   uint64 reserved_bytes = 2;  // may temporarily exceed the soft limit
   uint64 draining_bytes = 3;  // reserved bytes currently draining through flushes
   uint64 pending_merge_bytes = 4; // pending merge demand, capped at the limit when limited
+  // Resident delete packets across all owners, including commit and merge
+  // catch-up references. Included in reserved_bytes; flushing does not free them.
+  uint64 retained_delete_bytes = 5;
 }
 
 // jemalloc's process-wide statistics (stats.*), read at one statistics epoch
@@ -1888,7 +2090,7 @@ message ArenaStats {
 }
 
 // Admin control over the per-collection query cache. Actions compose and
-// apply in this order: flush, reset_admission, reset_counters, then dump.
+// apply in this order: max_bytes, flush, reset_admission, reset_counters, then dump.
 // flush drops resident values and entry metadata; sighting history survives,
 // so a known query can be readmitted and rebuilt immediately.
 // flush + reset_admission also forgets sightings, restarting admission
@@ -1905,6 +2107,12 @@ message CacheControlRequest {
   bool reset_counters = 4;
   bool dump = 5;
   uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+  // Administration only. Sets the selected caches' byte budget before the
+  // other actions; 0 disables caching and drops entries. With collection and
+  // tenant both empty it is also the budget for collections created later.
+  // Lasts for the node session: kept when a collection is replaced, dropped
+  // when it is deleted, back to --query-cache-bytes on restart.
+  optional uint64 max_bytes = 8;
 }
 
 // One resident cache entry. key_text is the printable-byte extraction from
@@ -1946,7 +2154,7 @@ message CacheControlResponse {
 // Schema
 //
 
-// One analysis-chain component - a tokenizer or a token filter - named by its
+// One analysis-chain component - a tokenizer, character filter, or token filter - named by its
 // registry name, plus its parameters.  params values are typed JSON values
 // (string, number, bool, string list), e.g. {"possessive": false} for kstem.
 // A component that takes no parameters rejects any. The JSON dialect accepts a
@@ -1956,9 +2164,17 @@ message AnalyzerComponent {
   map<string, Val> params = 2;
 }
 
+// A text analysis chain: char filters, then one tokenizer, then token filters.
+// Alternatively `name` selects a registered analyzer (a built-in preset such as
+// "english", or one a plugin provides); it excludes tokenizer and filters, and
+// char_filters alongside it replace the preset's char filters.
+// The JSON dialect accepts a bare string for the named form:
+// "english" == {"name": "english"}.
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
-  repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
+  repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
+  repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
+  string name = 4;                         // a registered analyzer name; combines only with char_filters
 }
 
 // Alternate representations of the same input value, keyed by local label.
@@ -2062,7 +2278,7 @@ message FieldDef {
     DOUBLE = 4;
     ID = 6;        // document identifier used for replacement and deletion
     VECTOR = 7;    // dense float vector
-    DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
+    DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
   }
   optional FieldClass type = 2; // required unless inherited from parent
@@ -2081,7 +2297,23 @@ message FieldDef {
   optional IndexMode index = 3;
 
   optional bool column = 4;      // store values in a per-field column
-  optional bool multi = 5;       // multi-valued
+  // SINGLE is one value; DEFAULT enables the type's default multi mode.
+  // SET sorts and deduplicates column values; ARRAY keeps their source order and repeats.
+  // Stored source keeps order and repeats independently of the column mode.
+  // DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING
+  // use SET, TEXT/VECTOR/GEO_POINT use ARRAY. Explicit SET is rejected on
+  // an array-only primary and resolves to ARRAY on an array-only variant.
+  // Explicit ARRAY applies to every representation. ID is reserved for the
+  // single-valued id field. Variants inherit the declared mode and
+  // cannot override it. Schema JSON views echo the declaration.
+  // HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+  enum MultiMode {
+    SINGLE = 0;
+    DEFAULT = 1;
+    SET = 2;
+    ARRAY = 3;
+  }
+  optional MultiMode multi = 5; // unset inherits, falling back to SINGLE
 
   // TEXT only. Unset or empty inherits; a nonempty definition replaces the
   // entire analyzer. Without an inherited analyzer, defaults to whitespace.
@@ -2100,6 +2332,7 @@ message FieldDef {
 
   // Vector dimensionality. Unset inherits, falling back to 0 (infer
   // from the first indexed value). A positive value enforces dimensions at ingest.
+  // With truncate_dims, this is the full input dimension.
   optional int32 dims = 9;
 
   // Vector similarity metric.  Absent means inherit, else NONE (storage-only).
@@ -2132,9 +2365,39 @@ message FieldDef {
   }
   optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
 
+  // VECTOR only. Keep the first truncate_dims components of every indexed
+  // and query vector, for Matryoshka (MRL) embeddings whose prefixes are
+  // usable embeddings. Requires dims (the full input dimension, which must be
+  // larger) and metric COSINE, which renormalizes the prefix; normalized=true
+  // is rejected. Inputs carry dims components, or truncate_dims for a vector
+  // already truncated. The column, ANN overlays and kNN scoring use
+  // truncate_dims. Unset inherits; 0 means no truncation.
+  optional int32 truncate_dims = 19;
+
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
+
+  // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
+  // text is converted to this precision, truncating toward earlier time.
+  // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.
+  // The unit is part of the field signature and cannot change on an existing
+  // date definition. Absent inherits from the parent, falling back to ms.
+  enum DateUnit {
+    MS = 0; // milliseconds
+    NS = 1; // nanoseconds
+  }
+  optional DateUnit unit = 24;
+
+  // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
+  // range, or a z coordinate when ignore_z_value is false) and index the rest
+  // of the document; in a multi-valued field only the bad points are skipped.
+  // Unset inherits, else false: a malformed point fails the document.
+  optional bool ignore_malformed = 28;
+
+  // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
+  // inherits, else true. Set false to reject a point with a z coordinate.
+  optional bool ignore_z_value = 29;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).
@@ -2162,13 +2425,28 @@ message StoredResourceDef {
   // zstd. A chunk closes at whichever of the byte and document limits comes
   // first.
   optional int32 max_docs_per_chunk = 4;
+
+  // Enable one ZSTD dictionary per resource, shared by its segments. The first
+  // merge with at least 100 times the capacity (at most 8 MiB) of live stored
+  // data trains it; earlier segments have none. Helps most with small chunks;
+  // decoding can be slower with large chunks. No automatic retraining: changing
+  // this setting, the capacity or codec clears it for a later merge to retrain.
+  // After restart, use the dictionary from the largest live segment carrying one.
+  // Only valid with codec zstd.
+  optional bool zstd_dictionary = 5;
+
+  // Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536.
+  // Training can produce a smaller dictionary. Only valid with zstd_dictionary.
+  optional int32 zstd_dictionary_bytes = 6;
 }
 
 message SchemaDef {
   // Concrete fields, keyed by field name.  Exact-name lookup consults only this
   // map.  The reserved "id" and "_version_" fields are always materialized: a
   // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or
-  // defining a second ID-class field, is an error.
+  // defining a second ID-class field, is an error. _version_ is fixed and
+  // retrieval-only: it returns the update version of the request that indexed
+  // each document, including allow_dups and documents without an ID.
   map<string, FieldDef> fields = 1;
 
   // Abstract definitions, keyed by template name.  Never directly usable as a

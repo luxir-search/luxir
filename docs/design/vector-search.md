@@ -10,6 +10,18 @@ per-segment aux overlays behind an engine seam. Exact flat KNN, cosine
 raw-column normalization, full-precision rescoring, and creation of missing
 overlays all read or regenerate from the column.
 
+`truncate_dims` (Matryoshka prefix truncation) is applied before the column:
+the index handler validates the input length (`dims`, or `truncate_dims` for
+an already truncated vector), cuts the vector to its prefix, then runs cosine
+normalization, and the query parser cuts the query vector the same way.
+`VectorFieldType::storedDims()` is the stored dimension and `inputDims()` the
+declared input one, so the column, overlays, exact scan and rescoring see
+only the truncated vector and need no special casing; schema `ann` settings
+such as `pq.m` are validated against `storedDims()`. Truncation requires
+`dims`, since stored lengths can no longer tell models apart, and cosine,
+under which a prefix cut here and one renormalized by the provider score the
+same.
+
 ## Overlay Lifecycle
 
 Vector aux indexes are recorded as segment overlays in the commit
@@ -89,7 +101,9 @@ isotropic already); it is kept because the guarantee, not that corpus, is what
 the codec is chosen for.
 
 Each IVF engine slot binds an immutable prepared query: the canonical query
-for PQ, or the cached rotated query for RaBitQ, plus the current schema's
+for PQ, or the cached rotated query for RaBitQ (a Luxir matvec over the
+rotation's rows rather than FAISS's one-column SGEMM, which on x86 OpenBLAS
+takes the full packed GEMM path), plus the current schema's
 query quantization bits. Coarse assignment and both document and group scans
 use that same index-space query. Each scan call owns its selector and FAISS
 search parameters, including `query_bits`, so filtering, deeper rounds, and
@@ -220,6 +234,42 @@ helper with up to two buffers for raw cosine plus rotation, keeping matrix
 multiply input and output disjoint. Untransformed PQ add passes column bytes
 directly to FAISS. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
+
+### Build parallelism
+
+OpenBLAS is built serial (with locking for concurrent callers), and a build
+gets its GEMM parallelism from TBB tasks in the indexing arena instead of a
+BLAS thread pool. A threaded BLAS would reach the query path: every level-3
+call holds a per-variant lock for its duration, so a query's rotation or
+coarse search would queue behind a build's GEMMs, and on x86 OpenBLAS a
+one-column SGEMM still asks for a thread team at 768 dims and up. Measured on
+whole builds, partitioning across tasks was also faster than the thread pool
+and used far less CPU.
+
+The arena observer pins FAISS OpenMP to one thread on every arena entry,
+including masters. All build and query parallelism comes from TBB tasks.
+The build partitions these steps in the indexing arena, isolating the caller
+so it cannot pick up an unrelated merge or flush while waiting:
+
+- Coarse assignment during training. The IVF's actual quantizer is an
+  `IndexFlat` subclass whose searches split rows, covering both k-means and
+  residual-training assignment.
+- Add work for every codec. Each row slice normalizes when needed, rotates
+  for RaBitQ, coarse-assigns with the base `IndexFlat::search`, and calls
+  `encode_vectors` with list numbers. One serial `add_sa_codes` per chunk
+  preserves input order within each inverted list.
+- RaBitQ training-sample rotation, into disjoint row slices of a separate buffer.
+- PQ codebook training, one task per sub-quantizer with its own sub-vector
+  buffer, clustering instance and flat L2 index. This mirrors FAISS's default
+  training path; residual precomputation follows after all tasks finish.
+
+Row partitions have at least `ivfBuildMinRowsPerTask` rows (by default
+`ceil(distance_compute_blas_threshold / dims)` to retain FAISS's BLAS path),
+up to four tasks per compute slot. Add chunks hold the larger of 16 MiB of
+input vectors and four times the arena compute width times that row floor,
+capped by available vectors, so scratch capacity scales with core count.
+The build subclasses serialize through FAISS's `dynamic_cast` dispatch as
+plain `IndexFlat` and `IndexIVFPQ`; readers need no build-specific types.
 
 ## Memory-Mapped Index Layout
 

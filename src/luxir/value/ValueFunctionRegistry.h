@@ -78,6 +78,16 @@ struct ValueFunction {
   uint8_t minArity = 0;
   uint8_t maxArity = 0;
   EvalBucketScalar evalBucketScalar = nullptr;
+  bool combinesDates = false;
+
+  // Normalize only date-combining functions; explicit scaling still uses raw
+  // numbers. Parsers insert the conversion once, before resolving the parent.
+  int dateConversionOperand(std::span<const ResolvedValue> args) const {
+    if (!combinesDates || args.size() != 2
+        || !valueDate(args[0].nature) || !valueDate(args[1].nature)
+        || args[0].nature == args[1].nature) return -1;
+    return args[0].nature == ValueNature::DATE_MS ? 0 : 1;
+  }
 };
 
 class ValueFunctionRegistry {

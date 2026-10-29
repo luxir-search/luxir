@@ -22,7 +22,7 @@ struct CollapsedPageSettings {
   std::span<const std::string_view> fields;
   int32_t batchSize;
   int64_t offset;
-  bool getNumber;
+  bool emitCount;
   bool getScores;
   api::DocFormat documentFormat;
   Query::SegmentSource* members;

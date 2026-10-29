@@ -315,6 +315,7 @@ private:
     node.kind = ValueNodeKind::COLUMN;
     node.columnType = field->type();
     node.columnMultiValued = field->multiValued();
+    node.columnIndexed = field->indexed();
     if (!numeric) {
       node.type = ValueType::COLUMN_ONLY;
     } else {
@@ -323,7 +324,8 @@ private:
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->type() == FieldType::DATE
-          ? ValueNature::DATE : ValueNature::NUMBER;
+          ? dateValueNature(DateFieldType::unitOf(*field))
+          : ValueNature::NUMBER;
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
@@ -381,6 +383,18 @@ private:
     for (uint8_t i = 0; i < count; i++) {
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
+    }
+    int convert = function->dateConversionOperand(
+        std::span<const ResolvedValue>(resolvedArgs.data(), count));
+    if (convert >= 0) {
+      ValueNode scale;
+      scale.intValue = 1000000;
+      scale.sourcePos = pos;
+      uint32_t factor = append(scale);
+      args[convert] = appendFunction(ValueFunctionRegistry::find("mul"), pos,
+                                     {args[convert], factor}, 2);
+      program->nodes[args[convert]].nature = ValueNature::DATE_NS;
+      resolvedArgs[convert].nature = ValueNature::DATE_NS;
     }
 
     ValueNode node;

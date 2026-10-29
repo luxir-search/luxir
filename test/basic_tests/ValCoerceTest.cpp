@@ -146,6 +146,132 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   EXPECT_THROW(dat.coerceColInt64(sval("not a date"), "f"), std::runtime_error);
 }
 
+TEST_F(ValCoerceTest, tryColumnCoercion) {
+  IntFieldType integer("_i");
+  FloatFieldType floating("_f");
+  DoubleFieldType number("_d");
+  DateFieldType date("_dt");
+  const FieldType* types[] = {&integer, &floating, &number, &date};
+  for (const auto* type : types) {
+    EXPECT_FALSE(type->tryCoerceColInt64(sval("dune"), "f"));
+    for (auto text : {"7", "-7", "0"}) {
+      EXPECT_EQ(type->coerceColInt64(sval(text), "f"), type->tryCoerceColInt64(sval(text), "f"));
+    }
+  }
+  EXPECT_EQ(7, integer.tryCoerceColInt64(sval("7.0"), "f"));
+  EXPECT_EQ(1000, integer.tryCoerceColInt64(sval("1e3"), "f"));
+  for (auto text : {"1.5", "1e100", "nan", "inf"}) {
+    EXPECT_FALSE(integer.tryCoerceColInt64(sval(text), "f"));
+  }
+  StrFieldType string("_s");
+  EXPECT_THROW(string.tryCoerceColInt64(sval("7"), "f"), std::runtime_error);
+}
+
+TEST_F(ValCoerceTest, dateFractionsHaveTheSameIngestAndQueryPrecision) {
+  DateFieldType date("_dt");
+  CoerceContext context;
+  context.dateMathNowEpochMillis = 0;
+  for (const auto& [text, expected] : {
+      std::pair{"1970-01-01T00:00:00.123456789123Z", (int64_t)123},
+      std::pair{"1969-12-31T23:59:59.9999999999Z", (int64_t)-1},
+      std::pair{"1969-12-31T23:59:59.9999999999Z||+1MILLI", (int64_t)0},
+  }) {
+    SCOPED_TRACE(text);
+    api::Val value = sval(text);
+    EXPECT_EQ(expected, date.coerceColInt64(value, "f", context));
+    EXPECT_EQ(expected, date.tryCoerceColInt64(value, "f", context));
+    auto range = date.tryCoerceDateRange(value, context);
+    ASSERT_TRUE(range);
+    EXPECT_EQ(expected, range->lo);
+    EXPECT_EQ(expected, range->hi);
+    EXPECT_EQ(range->hi, date.coerceDateRange(value, "f", context).hi);
+  }
+  EXPECT_FALSE(date.tryCoerceDateRange(sval("1970-01-01T00:00:00.Z"), context));
+  EXPECT_THROW(date.coerceDateRange(sval("1970-01-01T00:00:00.Z"), "f", context), RequestError);
+}
+
+TEST_F(ValCoerceTest, dateQueryBoundsAndInputUnitConversion) {
+  for (auto unit : {DateUnit::MILLIS, DateUnit::NANOS}) {
+    DateFieldType date("date", FieldType::COLUMN_STORED, unit);
+    for (int64_t value : {INT64_MIN, (int64_t)-1, (int64_t)0, INT64_MAX}) {
+      auto text = std::to_string(value);
+      for (const auto& literal : {coerce::scalarVal(value), sval(text)}) {
+        auto range = date.coerceDateRange(literal, "f");
+        EXPECT_EQ(value, range.lo);
+        EXPECT_EQ(value, range.hi);
+      }
+    }
+    CoerceContext context;
+    context.dateInputUnit = unit == DateUnit::MILLIS ? DateUnit::NANOS : DateUnit::MILLIS;
+    auto range = date.coerceDateRange(sval("-1"), "f", context);
+    EXPECT_EQ(unit == DateUnit::MILLIS ? -1 : -1000000, range.lo);
+    EXPECT_EQ(-1, range.hi);
+    EXPECT_EQ(range.lo, date.coerceDateInstant(sval("-1"), "f", context));
+  }
+  DateFieldType ns("ns", FieldType::COLUMN_STORED, DateUnit::NANOS);
+  auto math = ns.coerceDateRange(sval("-1||+1MILLI"), "f");
+  EXPECT_EQ(999999, math.lo);
+  EXPECT_EQ(math.lo, math.hi);
+  auto millisecond = ns.coerceDateRange(sval("1970-01-01T00:00:00.001Z"), "f");
+  EXPECT_EQ(1000000, millisecond.lo);
+  EXPECT_EQ(1999999, millisecond.hi);
+  for (auto text : {"1500-01-01", "3000-01-01", "-9223372036854775808", "9223372036854775807"}) {
+    EXPECT_FALSE(ns.coerceDateInstant(sval(text), "f"));
+  }
+  EXPECT_THROW(ns.coerceDateInstant(sval("bad"), "f"), RequestError);
+}
+
+TEST_F(ValCoerceTest, nanosecondCoercionUsesNativeNumbersAndRejectsExtrema) {
+  DateFieldType date("ns", FieldType::COLUMN_STORED, DateUnit::NANOS);
+  CoerceContext context;
+  context.dateMathNowEpochMillis = 0;
+  for (const auto& [text, expected] : {
+      std::pair{"+1", (int64_t)1}, std::pair{"-1", (int64_t)-1},
+      std::pair{"-1||+1MILLI", (int64_t)999999},
+      std::pair{"1970-01-01T00:00:00.123456789123Z", (int64_t)123456789},
+      std::pair{"1677-09-21T00:12:43.145224193Z", INT64_MIN + 1},
+      std::pair{"2262-04-11T23:47:16.854775806Z", INT64_MAX - 1}}) {
+    SCOPED_TRACE(text);
+    EXPECT_EQ(expected, date.tryCoerceColInt64(sval(text), "f", context));
+    EXPECT_EQ(expected, date.coerceColInt64(sval(text), "f", context));
+    EXPECT_EQ(expected, date.coerceColInt64(coerce::scalarVal(expected), "f", context));
+  }
+  for (auto text : {"1677-09-21T00:12:43.145224192Z", "2262-04-11T23:47:16.854775807Z",
+      "1500-01-01", "3000-01-01", "9223372036854775807", "-9223372036854775808"}) {
+    EXPECT_FALSE(date.tryCoerceColInt64(sval(text), "f", context));
+    EXPECT_THROW(date.coerceColInt64(sval(text), "f", context), RequestError);
+  }
+  for (int64_t value : {INT64_MIN, INT64_MAX}) {
+    EXPECT_FALSE(date.tryCoerceColInt64(coerce::scalarVal(value), "f", context));
+    EXPECT_THROW(date.coerceColInt64(coerce::scalarVal(value), "f", context), RequestError);
+  }
+}
+
+TEST_F(ValCoerceTest, dateCoercionErrorsDescribeParsingAndRanges) {
+  auto error = [](const DateFieldType& date, const api::Val& value) -> std::string {
+    try {
+      date.coerceColInt64(value, "f");
+      ADD_FAILURE() << "Expected a date coercion error";
+    } catch (const RequestError& error) {
+      return error.what();
+    }
+    return {};
+  };
+  for (auto unit : {DateUnit::MILLIS, DateUnit::NANOS}) {
+    DateFieldType date("date", FieldType::COLUMN_STORED, unit);
+    EXPECT_EQ(fmt::format(
+        "DATE field 'f': cannot parse 'x' as a date (expected ISO-8601, epoch {}, or date math)",
+        dateUnitName(unit)), error(date, sval("x")));
+    EXPECT_EQ(std::string::npos, error(date, coerce::scalarVal(1.5)).find("date range"));
+  }
+  DateFieldType ns("date", FieldType::COLUMN_STORED, DateUnit::NANOS);
+  for (const auto& value : {coerce::scalarVal(INT64_MIN), coerce::scalarVal(INT64_MAX),
+      sval("1500-01-01"), sval("3000-01-01"), sval("9223372036854775807")}) {
+    EXPECT_NE(std::string::npos, error(ns, value).find("outside the ns date range "
+        "(1677-09-21T00:12:43.145224193Z to 2262-04-11T23:47:16.854775806Z)"));
+  }
+}
+
 TEST_F(ValCoerceTest, fieldTypeDefaultsThrow) {
   IntFieldType it("_i");
   StrFieldType st("_s");
