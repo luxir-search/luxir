@@ -994,6 +994,7 @@ struct DocList {                                                // needs Column 
   int32_t row_count = 0;                                       // align 4
   bool more = false;
   bool found_gte = false;
+  bool found_estimated = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;

@@ -6951,6 +6951,24 @@ public:
     return true;
   }
 
+  // An exhaustive pure disjunction keeps every clause essential, so each
+  // window adds clause scores in `scorers` order. Rescoring in that order
+  // reproduces its sums exactly.
+  bool supportsExactCandidateScoring() const override {
+    return exclusionScorers.empty() && requiredScorers.empty();
+  }
+
+  void scoreCandidatesExact(std::span<int32_t> docs,
+                            std::span<float> scores) override {
+    assert(docs.size() == scores.size());
+    assert(supportsExactCandidateScoring());
+    std::fill(scores.begin(), scores.end(), 0.0f);
+    for (auto* scorer : scorers) {
+      scorer->applyToCandidates(
+          docs.data(), scores.data(), (int32_t) docs.size(), false);
+    }
+  }
+
   bool attachWindowFilter(WindowFilter* filter) override {
     assert(!filter->probes());
     if (filter->probes()) return false;
@@ -11197,6 +11215,12 @@ class BooleanQuery::Weight final : public Query::Weight {
       BulkPlan plan = matchWindowBulkPlan();
       plan.buildState = state;
       plan.windowFilterConsumption = WindowFilterConsumption::FILL;
+      // A pure scored disjunction rescores candidates exactly, which the
+      // exact-count composition needs from its scoring bulk.
+      if (needsScores && use == BulkUse::EXACT_CANDIDATE_SCORING
+          && prohibited.empty() && mandatorySources.empty()) {
+        plan.supportsExactCandidateScoring = BulkAnswer::YES;
+      }
       return plan;
     }
 
@@ -12479,13 +12503,21 @@ public:
         && query.filter[0]->getKind() == QueryKind::TERM) {
       traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
     }
-    bool directTermUnion = mandatoryClauses.empty()
+    bool directUnion = mandatoryClauses.empty()
         && prohibitedClauses.empty() && optionalClauses.size() >= 2
-        && filterClauses.size() <= 1 && minShouldMatch == 1
+        && filterClauses.size() <= 1
+        // An unset minShouldMatch (0) is a disjunction only when no filter
+        // makes the optional clauses pure score adds.
+        && (minShouldMatch == 1
+            || (minShouldMatch == 0 && filterClauses.empty()))
         && std::all_of(
             optionalClauses.begin(), optionalClauses.end(),
             [](Query* clause) {
-              return clause->getKind() == QueryKind::TERM;
+              // A repeated multi_match term arrives boosted (duplicate merge).
+              float boost = 1.0f;
+              return clause->getKind() == QueryKind::TERM
+                  || luxir::peelBoost(clause, boost)->getKind()
+                      == QueryKind::COMBINED_FIELDS;
             });
     bool unfilteredConstantComplement = constant
         && filterWeights.empty() && optionalWeights.empty()
@@ -12493,7 +12525,7 @@ public:
         && mandatoryWeights[0]->matchesAllDocs()
         && !prohibitedWeights.empty();
     if (scorePolicy.kind == ScorePolicy::SUM
-        && (directTermUnion || unfilteredConstantComplement)) {
+        && (directUnion || unfilteredConstantComplement)) {
       traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
     }
     bool sparseFilteredTopKConjunction = !filterWeights.empty()
@@ -12502,6 +12534,12 @@ public:
         && std::all_of(
             mandatoryClauses.begin(), mandatoryClauses.end(),
             sparseFilteredTopKMandatory);
+    bool directTermUnion = directUnion
+        && std::all_of(
+            optionalClauses.begin(), optionalClauses.end(),
+            [](Query* clause) {
+              return clause->getKind() == QueryKind::TERM;
+            });
     sparseFilteredTopKEligible = scorePolicy.kind == ScorePolicy::SUM
         && (sparseFilteredTopKConjunction
             || (directTermUnion && !filterWeights.empty()));

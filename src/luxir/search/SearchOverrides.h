@@ -179,6 +179,15 @@ inline int32_t fieldSortSeedBudgetPerMilleForTests = []() {
 inline bool disableTopKCountComposition =
     std::getenv("LUXIR_DISABLE_TOPK_COUNT_COMPOSITION") != nullptr;
 
+// max_parallel 0 runs a request across segments in parallel when its ops
+// estimate at least this many matching documents from index metadata.
+inline size_t autoParallelMinWork = 1 << 18;
+
+// An unset count_limit on a ranked root list reports an estimated count;
+// this restores the former omission of the count.
+inline bool disableEstimatedCount =
+    std::getenv("LUXIR_DISABLE_ESTIMATED_COUNT") != nullptr;
+
 // Test/bench control (LUXIR_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and
 // measure the crossover thresholds. The FORCE_* modes reuse the selector's own

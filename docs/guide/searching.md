@@ -95,7 +95,7 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
+| `count_limit` | Match count: unset estimates `found` on a plain ranked list (otherwise omits it); `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
@@ -104,11 +104,26 @@ one.
 | `document_format` | `rows`, `columns`, or `adaptive`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
-### Counts are opt-in, exact or bounded
+### Counts are estimated, exact or bounded
 
-`found` is opt-in. Unset or `count_limit: 0` omits the count and permits
-competitive-score skipping. `count_limit: -1` requests an exact count, even
-when only a few documents are returned.
+By default a relevance-ranked top-level list (`limit` above 0, no `ops`,
+`collapse`, `diversify` or field sort) returns an estimated `found` and keeps
+competitive-score skipping. Each segment counts a sample of its documents
+spread across the index and scales the sample's matches up;
+`found_estimated: true` marks a sampled total, which can be above or below the
+exact count. Counts that come from index metadata (an unfiltered term on a
+segment without deletions), small segments and queries with few matches are
+exact, and then `found_estimated` is omitted. Other lists omit `found`
+when `count_limit` is unset. The HTTP `docs` response format, which carries no
+count header unless asked, also omits it.
+
+`count_limit: 0` omits the count. `count_limit: -1` requests an exact count,
+even when only a few documents are returned. An exact count visits every
+match, which costs far more than finding the top documents for common terms.
+
+```json
+{"found": 1830000, "found_estimated": true, "docs": [...]}
+```
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
 list holds competitive-score skipping until N matches have been counted, or
@@ -999,7 +1014,9 @@ beside `ops` in the full form:
   output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
   executes serially on the HTTP io thread that received it, with no
-  scheduler handoff. `1` moves the request onto the
+  scheduler handoff, unless index statistics show the request visits many
+  documents (about 256K or more) across several segments; then it runs like
+  `-1`. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
   not occupy its connection thread. `-1` removes the cap: the request starts
   on the receiving thread and shared workers join in, parallelizing across

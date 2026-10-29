@@ -1404,20 +1404,26 @@ TEST_F(HttpApiTest, ndjsonEndRejectsFieldMap) {
             std::string::npos) << update.body();
 }
 
-// "found" is opt-in: nonzero count_limit requests a count. A default query
-// carries no count, and absence must be omitted rather than rendered as found:0.
-TEST_F(HttpApiTest, foundIsOptInWithCountLimit) {
+// A default ranked query estimates "found" (exact for a small index, so no
+// found_estimated); count_limit 0 omits it rather than rendering found:0.
+TEST_F(HttpApiTest, foundDefaultsToEstimateAndCountLimitZeroOmits) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("f1"), "title_w", std::string("foundtoken alpha")),
     flatdoc("id", std::string("f2"), "title_w", std::string("foundtoken beta")),
   }, UpdateMessage::COMMIT);
 
-  // Default request (no count_limit): "found" omitted, docs still returned.
-  HttpReq noCount(port());
-  noCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).execute();
-  ASSERT_EQ(200, noCount.status()) << noCount.rawResponse();
-  EXPECT_EQ(noCount.rawResponse().find(R"("found")"), std::string::npos) << noCount.rawResponse();
-  EXPECT_EQ((std::size_t)2, noCount.getDocs().size()) << noCount.rawResponse();
+  HttpReq estimated(port());
+  estimated.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, estimated.status()) << estimated.rawResponse();
+  EXPECT_EQ((int64_t)2, estimated.found()) << estimated.rawResponse();
+  EXPECT_EQ(estimated.rawResponse().find("found_estimated"), std::string::npos)
+      << estimated.rawResponse();
+
+  auto noCount = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?query=title_w%3Afoundtoken&fields=id&count_limit=0");
+  ASSERT_EQ(200, noCount.result_int()) << noCount.body();
+  EXPECT_EQ(noCount.body().find(R"("found")"), std::string::npos) << noCount.body();
+  EXPECT_NE(noCount.body().find(R"("f2")"), std::string::npos) << noCount.body();
 
   // With count_limit: "found" present and accurate.
   HttpReq withCount(port());
@@ -2723,7 +2729,7 @@ TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
   for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
     auto res = httpRequest(port(), http::verb::post, target, body);
     ASSERT_EQ(200, res.result_int()) << res.body();
-    EXPECT_EQ(withCommit("{\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
+    EXPECT_EQ(withCommit("{\"found\":1,\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
   }
   for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
                            R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
