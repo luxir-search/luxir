@@ -5,6 +5,7 @@
 #include <charconv>
 #include <map>
 #include "Directory.h"
+#include "SourceFiles.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/util/Signal.h"
@@ -25,7 +26,10 @@ struct Manifest {
   static constexpr std::string_view kPrefix = "commit_";
 
   static bool indexFile(std::string_view name) {
-    return name.starts_with(kPrefix) || (name.starts_with("s") && name.find('_') != std::string_view::npos);
+    // A write that never finished leaves its temporary; it is swept with its kind.
+    if (name.ends_with(".tmp")) name.remove_suffix(4);
+    return name.starts_with(kPrefix) || (name.starts_with("s") && name.find('_') != std::string_view::npos) ||
+           isSourceFile(name);
   }
 
   static std::string name(uint64_t gen) { return std::string(kPrefix) + std::to_string(gen); }

@@ -128,6 +128,7 @@ private:
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
+  std::shared_ptr<Schema> newCollectionSchema(const api::SchemaDef* requested) const;
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false);
   // A writer whose newest root is invalid continues from the newest valid one
   // under a new incarnation. Returns the incarnation to open.

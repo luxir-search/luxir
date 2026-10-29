@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "JsonResponse.h"
+#include "luxir/source/SourceJson.h"
+#include "luxir/util/ApiError.h"
 
 #include <algorithm>
 #include <charconv>
@@ -235,6 +237,12 @@ void val(std::string& out, const luxir::api::Column& col, size_t i) {
   else out += "null";
 }
 void nul(std::string& out, const luxir::api::Column&, size_t) { out += "null"; }
+// The _source column holds each document's JSON text, which is spliced in as is.
+void rawStr(std::string& out, const luxir::api::Column& col, size_t i) {
+  auto& c = std::get<luxir::api::ColStr>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) out.append(c.v[i]);
+  else out += "null";
+}
 } // namespace cell
 
 template <bool Int64Str>
@@ -304,7 +312,8 @@ std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
     if (plan.size() > 1) p.key += ',';
     appendJsonString(p.key, name);
     p.key += ':';
-    p.fn = resolveCellFn<Int64Str>(col);
+    p.fn = name == "_source" && std::holds_alternative<luxir::api::ColStr>(col.kind) ? cell::rawStr
+                                                                                     : resolveCellFn<Int64Str>(col);
     p.col = &col;
   }
   return plan;
@@ -327,7 +336,11 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       first = false;
       appendJsonString(out, name);
       out += ':';
-      appendOpVal<Int64Str>(out, *val);
+      if (name == "_source" && std::holds_alternative<std::string_view>(val->kind)) {
+        out.append(std::get<std::string_view>(val->kind));
+      } else {
+        appendOpVal<Int64Str>(out, *val);
+      }
     }
   }
   if constexpr (Collapsed) {
@@ -671,13 +684,63 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   return out;
 }
 
+// Whether NDJSON ingest would read this stored source (minified JSON) as a
+// control record rather than a document: `{}`, or an object whose only member
+// is a "_name_" key holding an object.
+static bool readsAsControlRecord(std::string_view json) {
+  if (json == "{}") return true;
+  if (!json.starts_with("{\"_")) return false;
+  size_t i = 1;
+  size_t keyStart = i + 1;
+  if (!luxir::source::detail::skipString(json, i)) return false;
+  std::string_view key = json.substr(keyStart, i - 1 - keyStart);
+  if (key.size() < 2 || key.back() != '_') return false;
+  if (i >= json.size() || json[i] != ':') return false;
+  i++;
+  if (i >= json.size() || json[i] != '{') return false;
+  if (!luxir::source::detail::skipValue(json, i)) return false;
+  return i + 1 == json.size() && json[i] == '}';
+}
+
+// Appends one exported source as a line NDJSON ingest reads back as that
+// document: as it is, or wrapped in an inline _update_ when it would otherwise
+// pass for a control record.
+static void appendSourceLine(std::string& out, std::string_view json) {
+  if (readsAsControlRecord(json)) {
+    out += R"({"_update_":{"docs":[)";
+    out.append(json);
+    out += "]}}\n";
+    return;
+  }
+  out.append(json);
+  out += '\n';
+}
+
 template <bool Int64Str>
-std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, bool sourceOnly) {
   std::vector<DocRun> runs;
   for (const auto& [name, val] : resp.ops) {
     if (const auto* dl = std::get_if<luxir::api::DocList>(&val->kind)) {
       auto& run = runs.emplace_back(DocRun{name, dl, {}});
-      if (dl->row_count > 0) {
+      if (dl->row_count > 0 && sourceOnly) {
+        // Placed in a dense column, or in the row maps (the docs format's default).
+        const luxir::api::ColStr* strings = nullptr;
+        for (const auto& [key, col] : dl->columns) {
+          if (key == "_source") strings = std::get_if<luxir::api::ColStr>(&col.kind);
+        }
+        for (size_t i = 0; i < (size_t)dl->row_count; i++) {
+          // The engine fails a source=true request whose hit has no stored
+          // source (SearchRequest::requireSource), so every row has one here.
+          if (strings && i < strings->v.size() && strings->v[i] != strings->missing_val) {
+            appendSourceLine(run.body, strings->v[i]);
+          } else if (i < dl->docs.size()) {
+            for (const auto& [key, val] : dl->docs[i].fields) {
+              if (key != "_source") continue;
+              if (const auto* text = std::get_if<std::string_view>(&val->kind)) appendSourceLine(run.body, *text);
+            }
+          }
+        }
+      } else if (dl->row_count > 0) {
         auto plan = buildColPlan<Int64Str>(*dl);
         auto appendRows = [&]<bool Collapsed>() {
           for (size_t i = 0; i < (size_t)dl->row_count; i++) {
@@ -767,8 +830,9 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
                           : renderSearchResponseBody<false>(resp, shorthand);
 }
 
-std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, JsonResponseOptions options) {
-  return options.int64Str ? renderDocRuns<true>(resp) : renderDocRuns<false>(resp);
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, bool sourceOnly,
+                                  JsonResponseOptions options) {
+  return options.int64Str ? renderDocRuns<true>(resp, sourceOnly) : renderDocRuns<false>(resp, sourceOnly);
 }
 
 bool frameDocRun(const DocRun& run, DocLinesState& state,

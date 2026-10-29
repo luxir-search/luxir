@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <string>
 #include <mutex>
@@ -53,6 +54,7 @@ public:
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t sourceGen = 0;  // generation of the segment's source map, or 0 if its documents keep no source.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint32_t preparationPins = 0; // protected by indexMutex
@@ -92,6 +94,16 @@ public:
     // Populated by PostingsWriter::finish() and drained at commit time.
     std::vector<std::string> unsyncedFiles;
     std::vector<FileDescriptor> files;
+    // The files in `files` that are not under this segment's name prefix: files
+    // held by reference (today the source files, "v<seq>"), which a merge output
+    // inherits from its inputs instead of copying. Their lifetime follows the
+    // segments listing them, not a name: a committed one is retired when no
+    // segment of the next snapshot lists it (the commit's set difference), and
+    // one a never-committed segment held is retired when that segment dies
+    // without passing it on (unreferencedSharedFilesLocked). Set once, when the
+    // segment is flushed, loaded or merged, and never changed after, so a merge
+    // may read it while a commit rewrites `files` and `unsyncedFiles`.
+    std::vector<FileDescriptor> sharedFiles;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -330,6 +342,7 @@ public:
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
+  std::atomic_uint64_t nextSourceSeq{0};  // names the next source file ("v<seq>"); never reused
 
   CommitSnapshotRegistry& snapshots;
   CommitId openingCommit; // Captured before this writer becomes externally visible.
@@ -864,6 +877,9 @@ private:
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
+  void mergeSourceFiles(const std::vector<SegInfo*>& segs, const std::function<int32_t(size_t, int32_t)>& docMap,
+                        const Schema& schema, SegInfo& out, std::string& relocatedFile);
+  std::vector<std::string> unreferencedSharedFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead);
 
 public:
   /// THIS SECTION ONLY FOR TEST CODE!

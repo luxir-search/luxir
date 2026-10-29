@@ -55,6 +55,7 @@ are:
 | `commit` | Make changes visible, with optional commit controls. |
 | `field_map` | Rename input document keys onto schema fields for this request. |
 | `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
+| `source_includes` / `source_excludes` | Keep only (or all but) these paths in the stored source of this request's docs, replacing the collection's lists; see [Documents](documents.md#keeping-only-part-of-the-source). |
 
 Built-in field templates give `title_t` its text type and `year_i` its integer
 type. You can also define fields explicitly or add templates for new groups
@@ -105,7 +106,8 @@ Three record forms make up a stream:
 - `{"_update_": {...}}` opens a group. The inner object is the HTTP JSON form
   of the protobuf [`UpdateRequest`](../reference/protobuf.md#message-luxir.updaterequest) message,
   with options such as `request_id`, `allow_dups`, `all_or_none`, `return_ids`,
-  `field_map`, `drop_unmapped`, or a collection override.
+  `field_map`, `drop_unmapped`, `source_includes` / `source_excludes`, or a
+  collection override.
 - `{"_end_": {...}}` closes the group and may commit. An empty object is a
   checkpoint that closes and reports the current group without ending the
   HTTP stream.

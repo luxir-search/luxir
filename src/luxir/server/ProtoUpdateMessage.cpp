@@ -7,10 +7,15 @@
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/ValCoerce.h"
+#include "luxir/source/SourceFilter.h"
+#include "luxir/source/SourceJson.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <memory_resource>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 
 namespace luxir {
@@ -63,9 +68,12 @@ static void validateFieldMap(const luxir::api::UpdateRequest& req) {
 }
 
 
-// The value of the doc's unique id field, or empty if not present.
-// "id" is the schema-defined name for the unique id field.
-static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fieldMap) {
+// The value of the doc's unique id field as the index sees it, or empty if not
+// present. "id" is the schema-defined name for the unique id field. A numeric
+// id renders canonically into `buf`, the same text IdHandler indexes, so
+// {"id": 123} names the document "123" here too.
+static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fieldMap, const FieldType& idType,
+                              std::span<char> buf) {
   std::string_view result;
   for (const auto& [name, valView] : doc.fields) {
     if (fieldMap.resolve(name) != std::string_view("id")) {
@@ -76,8 +84,10 @@ static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fi
       result = *s;
     } else if (const auto* bin = std::get_if<BytesView>(&val.kind)) {
       result = std::string_view((const char*)bin->data(), bin->size());
-    } else {
+    } else if (coerce::isNull(val)) {
       result = {};
+    } else {
+      result = idType.coerceTerm(val, "id", buf);
     }
   }
   return result;  // last "id" wins (protobuf map dedup semantics)
@@ -89,6 +99,9 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
+  const FieldType& idType = *inverter.schema->getFieldTypeEx("id");
+  char idBuf[coerce::TEXT_BUF_SIZE];
+  auto idOf = [&](const luxir::api::Map& doc) { return docId(doc, fieldMap, idType, idBuf); };
   // Handlers cached by raw field position: a request's docs usually share a shape,
   // so a hit costs one name compare.
   std::vector<Inverter::InputHandler*> handlers;
@@ -97,6 +110,26 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
+
+  // Collections that store their source keep each document as it was submitted:
+  // the JSON bytes the transport retained, else the document as a serialized Map.
+  // Source includes/excludes (the request's, else the collection's) narrow it.
+  const bool keepSource = inverter.schema->source.enabled;
+  const bool rawAligned = msg.rawDocs.size() == request.docs.size();
+  std::optional<source::SourceFilter> requestFilter;
+  if (!request.source_includes.empty() || !request.source_excludes.empty()) {
+    try {
+      requestFilter.emplace(request.source_includes, request.source_excludes);
+    } catch (const std::invalid_argument& e) {
+      throw RequestError(e.what());
+    }
+  }
+  const source::SourceFilter* sourceFilter = requestFilter ? &*requestFilter : &inverter.schema->source.filter;
+  if (sourceFilter->empty()) sourceFilter = nullptr;
+  std::string sourceJson;
+  std::string filteredJson;
+  std::vector<std::byte> sourceMap;
+  std::pmr::monotonic_buffer_resource filterArena;
 
   int32_t failed = 0;
   int32_t docIndex = -1;
@@ -111,6 +144,37 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     inverter.startDoc();
 
     try {
+      if (keepSource) {
+        uint8_t flags = request.allow_dups ? source::kFlagAllowDups : 0;
+        std::string_view body;
+        bool asJson = rawAligned;
+        if (asJson) {
+          sourceJson.clear();
+          source::minifyJson(msg.rawDocs[(size_t)docIndex], sourceJson);
+          body = sourceJson;
+          if (sourceFilter) {
+            filteredJson.clear();
+            asJson = sourceFilter->filterJson(sourceJson, filteredJson);
+            body = filteredJson;
+          }
+        }
+        if (asJson) {
+          flags |= source::kFlagMinifiedJson;
+        } else {
+          const luxir::api::Map* kept = &doc;
+          luxir::api::Map filtered;
+          if (sourceFilter) {
+            filterArena.release();
+            filtered = sourceFilter->filterMap(doc, filterArena);
+            kept = &filtered;
+          }
+          sourceMap.clear();
+          if (!luxir::api::encode(*kept, sourceMap)) throw std::runtime_error("failed to serialize document source");
+          body = std::string_view((const char*)sourceMap.data(), sourceMap.size());
+          flags |= source::kFlagProtoMap;
+        }
+        inverter.addSource(idOf(doc), body, msg.updateVersion, flags);
+      }
       // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
       // handler is a name's identity, so its claim finds an earlier occurrence without
       // a per-doc map; a repeat replaces the value at the first occurrence's position.
@@ -154,12 +218,11 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
-                  info.message);
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, idOf(doc), info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), idOf(doc));
       err.index = docIndex;
       err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
@@ -184,7 +247,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.addId(docId(doc, fieldMap));
+      msg.addId(idOf(doc));
     }
   }
 

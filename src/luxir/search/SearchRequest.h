@@ -100,6 +100,9 @@ public:
   // An explain is prepared but never dispatched, so it does not count.
   std::chrono::steady_clock::time_point submitted;
   bool counting = false;
+  // Every returned document must have a stored _source (an export): one without
+  // fails the request instead of coming back null.
+  bool requireSource = false;
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;

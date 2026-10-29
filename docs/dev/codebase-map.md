@@ -129,6 +129,12 @@ locations, browse `src/luxir/<area>/`.
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
      handle: CURRENT selects one of its incarnation directories
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
+   - The optional `_source_` store (`docs/design/source-store.md`): `src/luxir/source/` holds the
+     schema-free file format (`SourceFormat`), the per-segment map (`SourceMap`), the
+     includes/excludes filter (`SourceFilter`) and the JSON byte helpers; `index/SourceWriter`
+     writes a flush's file, `index/SourceMerge` is the merge layout over a relocation seam,
+     `reader/SourceReader` fetches lazily, and `store/SourceFiles.h` names the files
+     (`v<seq>`, `s<seg>__S<gen>`) that `SegInfo::sharedFiles` holds by reference.
 
 8. **Schema** (`src/luxir/schema/`)
    - `LogicalField`: Primary, variants, and search/value bindings;

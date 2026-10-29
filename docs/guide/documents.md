@@ -272,6 +272,70 @@ Column retrieval follows each representation's
 [multi-valued mode](schema.md#multi-valued-modes). Stored-source retrieval
 keeps source order and repeats independently of that mode.
 
+### Keeping documents as submitted (`_source`)
+
+Typed fields normalize what they index, so a collection cannot always give back
+what was sent. Declare the `_source_` stored resource to keep each document
+exactly as it was submitted (key order, duplicate keys, number spelling; only
+whitespace outside strings is dropped):
+
+```
+POST /collections/_create
+{"name": "articles", "schema": {"stored_resources": {"_source_": {}}}}
+```
+
+It is off by default and experimental. `--indexing.source-default` declares it
+in every new collection whose schema does not (`"_source_": {"enabled": false}`
+opts a collection out); the entry is stored in the collection's schema, so
+changing the flag never alters an existing collection. Enabling it applies to
+documents indexed afterwards. The settings are listed under
+[Schema](schema.md#the-_source_-resource-experimental).
+
+Request `"fields": ["_source"]` to get a document back as raw JSON. `_source` is
+never part of the default or wildcard projection. A document without a stored
+source comes back as `null` in column output (adaptive and columns placement,
+gRPC's default); in row format (`document_format` `rows`, HTTP's default) its
+row has no `_source` key, like any other missing field. To export the original
+documents, add `?format=docs&source=true`: each line is one stored document,
+and the output pipes straight back into `_update`. The export fails if any hit has no readable
+source, so it never loses documents silently; a stored source that ingest would
+read as a control record (`{}`, or a lone `_name_` object) is emitted wrapped in
+an inline `_update_` so it comes back as a document.
+
+```
+POST /collections/articles/_search?format=docs&source=true
+{"query": {"all": true}, "fields": ["_source"], "limit": -1}
+```
+
+#### Keeping only part of the source
+
+`_source_.includes` keeps only the listed paths of each document's source;
+`_source_.excludes` keeps everything but them. Set at most one. The document is
+still indexed in full: only the stored copy loses the paths.
+
+```
+POST /collections/_create
+{"name": "users", "schema": {"stored_resources": {"_source_": {"excludes": ["password_s", "profile.ssn_s"]}}}}
+```
+
+A path joins object keys with `.` (`profile.ssn_s`) and names the keys as
+submitted, before `field_map`. Arrays add no step: `items.price_d` reaches the
+objects inside `items`. `*` matches any run of characters, dots included
+(`*_secret`, `profile.*`). A matching path keeps (includes) or drops (excludes)
+its whole value; with includes, an object or array left with nothing is dropped
+too.
+
+One update request can override the collection's lists for its own documents,
+in the body (`"source_includes": [...]` or `"source_excludes": [...]`) or the
+URL (`?source_includes=id,title_t`, comma separated, repeatable), or an NDJSON
+`_update_` group (which wins over the URL). Setting either replaces both of the collection's
+lists. A collection that does not store sources ignores them.
+
+Source files are separate from the index, are never read by a search, and are
+copied by merges only when mostly deleted or small. See
+[the design](../design/source-store.md) and the `_source_` settings in
+[Schema](schema.md#the-_source_-resource-experimental).
+
 ### Multi-valued text and phrases
 
 A multi-valued text field analyzes each input value separately and inserts a

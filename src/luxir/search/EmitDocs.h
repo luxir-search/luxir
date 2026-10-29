@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <format>
 #include <functional>
 #include <memory>
 #include <memory_resource>
@@ -34,6 +35,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -313,6 +315,52 @@ inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                        starget, mtarget, pendingCols, mr);
   loadStrColWithTargets(req, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr);
+}
+
+// The _source pseudo-field: each document as it was submitted, from the
+// segment's source store. A string column holding raw JSON text (the JSON
+// response splices it in unquoted); docs without a stored source stay missing,
+// or fail the request when it requires every hit's source (an export).
+inline void loadSource(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
+                       luxir::api::Column& fieldCol, FieldLoaders* loaders, PendingCols& pendingCols,
+                       std::pmr::memory_resource& mr)
+{
+  auto columnSize = segDocs.size();
+  if (columnSize == 0) return;
+  std::span<std::string_view> starget;
+  std::span<luxir::api::ArrStr> mtarget;
+  uint8_t* present = allocStringColumn(fieldCol, columnSize, false, starget, mtarget, pendingCols, mr);
+  addFieldLoader(loaders, runs, [&req, segDocs, starget, present, &mr](std::span<RowIndex> idxSpan) {
+    const auto& segment = req.reader->segments()[segDocs[idxSpan[0]].segment()];
+    auto* source = segment.source();
+    auto missing = [&](RowIndex idx, const char* why) {
+      if (!req.requireSource) return;
+      throw RequestError(std::format("document {} of segment {} has {} stored source; source=true needs every "
+                                     "hit stored (fetch _source without it to get null for such documents)",
+                                     segDocs[idx].docId(), segment.segInfo.seg_id, why), "missing_source");
+    };
+    if (!source) {
+      missing(idxSpan[0], "no");
+      return;
+    }
+    SourceReader::Cursor cursor;
+    source::Record record;
+    std::string json;
+    // idxSpan is in doc order, so consecutive docs share a decompressed block.
+    for (RowIndex idx : idxSpan) {
+      auto status = source->fetch(segDocs[idx].docId(), cursor, record);
+      if (status != SourceReader::Status::OK) {
+        missing(idx, status == SourceReader::Status::NONE ? "no" : "an unreadable");
+        continue;
+      }
+      if (!SourceReader::renderJson(record, json)) {
+        missing(idx, "an undecodable");
+        continue;
+      }
+      starget[idx] = build::arenaStr(mr, json);
+      present[idx] = 1;
+    }
+  });
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -712,7 +760,8 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; kind selects the physical, synthetic, or extra source.
+// per-batch schema lookups; kind selects the physical, score, version, extra, or _source
+// (the document as submitted, as raw JSON) source.
 // discovered: from an empty or wildcard selector (COLUMNS leaves such a column
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
@@ -727,7 +776,7 @@ struct ExtraColumn {
 };
 
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, SOURCE };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -819,7 +868,10 @@ inline size_t missingSlotBytes(const luxir::api::Column& col) {
 // Settle one batch's placement after finishPendingCols.  columnFields[i] is
 // the ReturnField behind response column i and columnPresent[i] its slot
 // tracker (null when untracked, see forEachPresent); later columns (_score_)
-// always stay.  ROWS moves every column to docs.  COLUMNS leaves out a
+// always stay.  ROWS moves every column to docs, _source included, so a
+// document without a stored source has no _source key in its row.  Under
+// ADAPTIVE and COLUMNS a requested _source is never dropped or moved: it stays
+// a column and a missing one renders as null.  COLUMNS leaves out a
 // discovered column with no present value; a named one is always present.
 // ADAPTIVE leaves out every column with no present value and moves a column
 // to docs when its missing slots cost more than per-document entries for its
@@ -848,6 +900,9 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
     const ReturnField& rf = *columnFields[i];
     if (placement == luxir::api::DocFormat::ROWS) {
       fate[i] = MOVE;
+    } else if (rf.kind == ReturnField::Kind::SOURCE) {
+      // A requested _source stays a column under ADAPTIVE and COLUMNS, so a
+      // missing one renders as null; only ROWS moves it into docs with the rest.
     } else if (placement == luxir::api::DocFormat::ADAPTIVE || rf.discovered) {
       size_t p = 0;
       forEachPresent(arr[i].second, columnPresent[i], [&p](size_t) { p++; });
@@ -1150,6 +1205,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           registerColumn();
           continue;
+        case ReturnField::Kind::SOURCE:
+          loadSource(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          registerColumn();
+          continue;
         case ReturnField::Kind::EXTRA: {
           auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
           luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
@@ -1403,6 +1462,17 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
+      return;
+    }
+    if (f == "_source") {
+      // Segments written while the store was on keep serving it after it is turned off.
+      bool stored = req.schema->source.enabled || std::ranges::any_of(req.reader->segments(),
+          [](const Segment& segment) { return segment.source() != nullptr; });
+      if (!stored) {
+        throw RequestError("_source is not stored: declare the _source_ stored resource in the collection's schema",
+                           "invalid_field");
+      }
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SOURCE, false});
       return;
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
