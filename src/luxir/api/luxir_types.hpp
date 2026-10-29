@@ -817,7 +817,12 @@ struct KnnQuery {                                                // needs Vector
   std::string_view unit;
 };
 namespace SchemaDef_ {
-struct IndexSort { std::string_view field; };
+namespace IndexSort_ { enum class Order { ASC = 0, DESC = 1 }; }
+struct IndexSort {
+  using Order = luxir::api::SchemaDef_::IndexSort_::Order;
+  std::string_view field;
+  Order order = Order::ASC;
+};
 } // namespace SchemaDef_
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;

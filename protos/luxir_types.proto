@@ -2479,19 +2479,27 @@ message SchemaDef {
   // any field/template may name one as parent.  A name in both maps is an error.
   map<string, FieldDef> templates = 2;
 
-  // Merge source order. Absent in a SET request keeps the current setting;
-  // present with an empty field clears it. Changes affect future merges only.
+  // The order merges write documents in. Absent in a SET request keeps the
+  // current setting; present with an empty field clears it. Changes affect
+  // future merges only.
   IndexSort index_sort = 3;
 
-  // A merge concatenates its source segments in ascending order of each
-  // source's minimum value of this field instead of segment creation order.
-  // Documents within a source keep their arrival order. When segments are
-  // flushed out of time order, this keeps a merged segment roughly sorted by
-  // time, so column zones stay tight for range pruning and descending time
-  // sorts. Sources without values for the field go last.
+  // A merge writes its documents in this field's order: postings, columns,
+  // stored fields, norms and points all follow the new doc ids, so a merged
+  // segment is exactly sorted. Ties keep merge source order, and sources are
+  // concatenated by their minimum (ascending) or maximum (descending) value.
+  // Documents without a value go last. A multi-valued document sorts by its
+  // minimum value ascending, its maximum descending. Flushed segments keep
+  // arrival order.
   message IndexSort {
     // A concrete field or template instance of type int or date with a column.
     string field = 1;
+
+    enum Order {
+      ASC = 0;
+      DESC = 1;
+    }
+    Order order = 2;  // unset selects ASC
   }
 
   // Stored-field groups, keyed by the name fields use as stored_resource. A

@@ -45,6 +45,7 @@ public:
   Directory& underlying() override { return delegate.underlying(); }
   void linkFile(Directory& source, std::string_view name) override { delegate.linkFile(source, name); }
   Capabilities capabilities() const override { return delegate.capabilities(); }
+  std::string scratchPath() const override { return delegate.scratchPath(); }
 };
 
 }

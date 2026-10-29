@@ -2272,35 +2272,39 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   }
 }
 
-void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const std::string& indexSortField) {
+void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const Schema& schema) {
+  const std::string& indexSortField = schema.indexSortField;
   if (indexSortField.empty()) {
     std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
       return a->segId < b->segId;
     });
     return;
   }
-  // Sources without int/date column values for the field (never set, or an
-  // older generation typed it differently) sort last.
+  // Ascending sorts concatenate by source minimum, descending by source
+  // maximum (largest first). Sources without int/date column values for the
+  // field (never set, or an older generation typed it differently) sort last.
+  bool descending = schema.indexSortOrder == api::SchemaDef::IndexSort::Order::DESC;
   struct Keyed {
     SegInfo* seg;
-    std::optional<int64_t> min;
+    std::optional<int64_t> key;
   };
   std::vector<Keyed> keyed;
   keyed.reserve(segs.size());
   for (SegInfo* seg : segs) {
     auto postingsReader = getSegmentPostingsReader(*seg);
-    std::optional<int64_t> min;
+    std::optional<int64_t> key;
     if (const auto* info = postingsReader->fieldInfo(indexSortField)) {
       if ((info->type == FieldType::INT || info->type == FieldType::DATE) &&
           (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
-        min = IntColReader(*postingsReader, *info).getMin();
+        IntColReader reader(*postingsReader, *info);
+        key = descending ? reader.getMax() : reader.getMin();
       }
     }
-    keyed.push_back({seg, min});
+    keyed.push_back({seg, key});
   }
-  std::sort(keyed.begin(), keyed.end(), [](const Keyed& a, const Keyed& b) {
-    if (a.min.has_value() != b.min.has_value()) return a.min.has_value();
-    if (a.min != b.min) return *a.min < *b.min;
+  std::sort(keyed.begin(), keyed.end(), [&](const Keyed& a, const Keyed& b) {
+    if (a.key.has_value() != b.key.has_value()) return a.key.has_value();
+    if (a.key != b.key) return descending ? *a.key > *b.key : *a.key < *b.key;
     return a.seg->segId < b.seg->segId;
   });
   for (size_t i = 0; i < segs.size(); i++) segs[i] = keyed[i].seg;
@@ -2741,7 +2745,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // creation (segId) order; with an index sort, order sources by their
     // minimum value of the sort field so a merge of segments flushed out of
     // time order stays roughly time-ordered.
-    sortMergeSources(segs, getSchema()->indexSortField);
+    // One schema snapshot orders the sources and drives the merge.
+    auto mergeSchema = getSchema();
+    sortMergeSources(segs, *mergeSchema);
     // Report sources in concatenation order.
     for (size_t i = 0; i < segs.size(); i++) sourceSegIds[i] = segs[i]->segId;
     failure.sourceSegIds = sourceSegIds;
@@ -2790,8 +2796,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
-      // resource's output format.
-      auto mergeSchema = getSchema();
+      // resource's output format and the index sort's document order.
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);

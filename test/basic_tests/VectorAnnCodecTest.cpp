@@ -21,6 +21,8 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -259,6 +261,51 @@ TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
   EXPECT_EQ(aux[0]->getRaBitQBits(), 2);
   EXPECT_EQ(aux[0]->getFaissIndex()->ntotal, 2000);
   EXPECT_GE(recallVsExact(h), 0.9);
+}
+
+// An index-sorting merge rebuilds the overlay over the merged doc ids: the
+// ANN path recalls the exact neighbors as well as without the sort.
+TEST_F(VectorAnnCodecTest, reorderingMergeRebuildsOverlayOverNewDocIds) {
+  IvfTestGuard guard;
+  bool reordered = false;
+  Signal::listen("mergeIndexSort", [&](void* merged, void*, void*) -> void* {
+    reordered |= *(bool*)merged;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeIndexSort"); });
+  std::array<double, 2> recall{};
+  for (bool sorted : {false, true}) {
+    CollectionHelper h("main");
+    h.clear();
+    h.collection().setSchema(Schema::createDefaultSchema());
+    SchemaBuilder b;
+    auto& f = b.field("emb_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.dims = DIMS;
+    f.metric = api::VectorMetric::L2;
+    f.ann = rabitqAnn(0, 2);
+    if (sorted) b.indexSort("k_i");
+    b.set(h.collection());
+    for (int64_t first : {0, 1000}) {
+      std::vector<Doc> docs;
+      for (int64_t i = first; i < first + 1000; i++) {
+        docs.push_back(flatdoc("id", "d" + std::to_string(i), "emb_v", clustered(i, (int32_t)(i % CLUSTERS)),
+                               "k_i", (int64_t)((i * 7919) % 2000)));
+      }
+      h.indexAll(docs);
+      h.commit({"*"});
+    }
+    h.getIndexWriter()->mergeSegments();
+    std::shared_ptr<IndexReader> reader;
+    auto aux = overlays(h, reader);
+    ASSERT_EQ(aux.size(), 1u);
+    ASSERT_NE(aux[0], nullptr);
+    EXPECT_EQ(aux[0]->getFaissIndex()->ntotal, 2000);
+    recall[sorted] = recallVsExact(h);
+  }
+  EXPECT_TRUE(reordered);
+  EXPECT_GE(recall[1], 0.9);
+  EXPECT_GE(recall[1], recall[0] - 0.05);
 }
 
 // A codec change applies to overlays built afterwards; existing segments keep

@@ -111,6 +111,10 @@ locations, browse `src/luxir/<area>/`.
    - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
      optional points indexes at flush; `SegmentMerger` carries 1-D points
      forward by run-merging and rebuilds geo BKDs from the merged column.
+   - `SegmentMerger` with a schema `index_sort`: `planIndexSort` builds the
+     merged-doc permutation (`newToOld`, absolute per-source remaps) and every
+     per-doc writer emits in that order through its `reorder` path; an
+     identity permutation takes the ordinary concatenating merge.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
