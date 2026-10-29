@@ -1522,4 +1522,45 @@ inline DomainHandle materializeEffectiveIntersection(
   return DomainHandle(DocSet::intersect(ptrs));
 }
 
+/// The PrepareContext::domainKey for the domains materializeEffectiveIntersection
+/// builds from `sources` over ctx's domains, or nullopt when they have no
+/// request-independent name.  Named only when every source is a segment- or
+/// core-stable filter whose prepared output is query canonical (its raw
+/// per-segment membership depends on the segment alone), and the incoming
+/// domains are themselves named or are the canonical live sets (null or the
+/// segment's liveDocs).  The key is the length-prefixed concatenation of the
+/// incoming key and the sources' filter keys, in clause order.
+inline std::optional<FilterKey> stableDomainKey(
+    std::span<const PreparedSource> sources, const Query::Weight::PrepareContext& ctx) {
+  if (sources.empty()) return std::nullopt;
+  if (ctx.domainKey == nullptr && !ctx.domainPerSeg.empty()) {
+    auto segments = ctx.reader.segments();
+    for (size_t i = 0; i < ctx.domainPerSeg.size() && i < segments.size(); i++) {
+      DocSet* domain = ctx.domainPerSeg[i];
+      auto* live = segments[i].liveDocs();
+      if (domain != nullptr && (live == nullptr || domain != &live->docset())) return std::nullopt;
+    }
+  }
+  std::vector<std::byte> bytes;
+  auto append = [&bytes](const std::vector<std::byte>& part) {
+    uint64_t size = part.size();
+    auto* sizeBytes = reinterpret_cast<const std::byte*>(&size);
+    bytes.insert(bytes.end(), sizeBytes, sizeBytes + sizeof(size));
+    bytes.insert(bytes.end(), part.begin(), part.end());
+  };
+  if (ctx.domainKey != nullptr) append(ctx.domainKey->bytes());
+  for (const auto& source : sources) {
+    if (source.cacheUse == nullptr
+        || source.domainDependence != PreparedDomainDependence::QUERY_CANONICAL) {
+      return std::nullopt;
+    }
+    FilterKeyScope scope = source.cacheUse->scope();
+    if (scope != FilterKeyScope::SEGMENT_STABLE && scope != FilterKeyScope::CORE_STABLE) {
+      return std::nullopt;
+    }
+    append(source.cacheUse->filterKey().bytes());
+  }
+  return FilterKey(std::move(bytes));
+}
+
 } // namespace luxir::QueryPrep

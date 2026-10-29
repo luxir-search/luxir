@@ -12577,8 +12577,14 @@ public:
     std::vector<DomainHandle> filterDomains(
         ctx.reader.segments().size());
     std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
+    // Names the child domains for caches keyed by segment liveness (see
+    // PrepareContext::domainKey); without filters they are ctx's own.
+    std::optional<FilterKey> childDomainKey;
+    const FilterKey* childKey = ctx.domainKey;
 
     if (!filterSources.empty()) {
+      childDomainKey = QueryPrep::stableDomainKey(QueryPrep::preparedSpan(filterSources), ctx);
+      childKey = childDomainKey ? &*childDomainKey : nullptr;
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
         filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
@@ -12597,7 +12603,7 @@ public:
     Query::Weight::PrepareContext childCtx{
       ctx.reader,
       std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-      ctx.parallel, ctx.warnings};
+      ctx.parallel, ctx.warnings, childKey};
     auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
     auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
     auto prohibitedSources = QueryPrep::prepareFilterSources(

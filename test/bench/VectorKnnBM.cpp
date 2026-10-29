@@ -625,6 +625,159 @@ void BM_VectorKnnRecallParallel(benchmark::State& state) {
   BM_VectorKnnRecallBody(state, /*parallelExec=*/true);
 }
 
+// ---------------------------------------------------------------------------
+// Filtered kNN benchmark.
+//
+// Clustered corpus with two filter fields, both a bucket in [0, 1000) so
+// `bucket < permille` selects that fraction of the docs:
+//   - fu_i (uniform): a hash of the doc, independent of its vector;
+//   - fc_i (correlated): ten buckets per vector cluster, so a selective filter
+//     keeps a few clusters and its members concentrate in a few IVF lists.
+// sparseField drops the vector from one doc in four (the has-field bitset
+// maps ranks to docs instead of identity). aux=0 leaves the segments without
+// an overlay, so the flat column scan serves them. Recall is against the
+// exact filtered top-k, measured outside the timed loop.
+int64_t filterBucket(int64_t docId, bool correlated, int32_t nClusters) {
+  SplitMix64 rng((uint64_t)docId * 0x94d049bb133111ebULL + 0x2545f4914f6cdd1dULL);
+  int64_t hash = rng.rint((int64_t)1000);
+  if (!correlated) return hash;
+  // Cluster c of nClusters owns ten buckets starting at 10 * (c * 100 / nClusters).
+  int64_t cluster = (docId % nClusters) * 100 / nClusters;
+  return cluster * 10 + hash % 10;
+}
+
+void buildFilteredVectorIndex(CollectionHelper& helper, int32_t dims, int32_t nClusters,
+                              std::span<const int32_t> docsPerSeg, bool aux, bool sparseField) {
+  helper.clear();
+  SchemaBuilder b;
+  auto& v = b.templ("_v");
+  v.type = api::FieldDef_::FieldClass::VECTOR;
+  v.column = true;
+  v.dims = dims;
+  v.metric = api::VectorMetric::L2;
+  setBenchAnn(v, dims, RABITQ1);
+  for (const char* name : {"fu_i", "fc_i"}) {
+    auto& f = b.field(name);
+    f.type = api::FieldDef::FieldClass::INT;
+    f.index = api::FieldDef::IndexMode::RANGE;
+  }
+  b.set(helper.collection());
+
+  constexpr int64_t batchSize = 256;
+  std::vector<Doc> docs;
+  docs.reserve((size_t)batchSize);
+  int64_t docId = 0;
+  for (int32_t segDocs : docsPerSeg) {
+    for (int32_t i = 0; i < segDocs; i++, docId++) {
+      std::string id = "d" + std::to_string(docId);
+      int64_t uniform = filterBucket(docId, false, nClusters);
+      int64_t correlated = filterBucket(docId, true, nClusters);
+      docs.push_back(sparseField && docId % 4 == 3
+          ? flatdoc("id", id, "fu_i", uniform, "fc_i", correlated)
+          : flatdoc("id", id, "fu_i", uniform, "fc_i", correlated,
+                    "bench_v", makeClusteredVector(docId, dims, nClusters)));
+      if ((int64_t)docs.size() == batchSize) {
+        helper.indexAll(docs);
+        docs.clear();
+      }
+    }
+    if (!docs.empty()) {
+      helper.indexAll(docs);
+      docs.clear();
+    }
+    helper.commit();
+  }
+  if (aux) {
+    IvfBenchGuard guard;
+    helper.commit({"vec.bench_v"});
+  }
+}
+
+LocalReq* makeFilteredKnnReq(SearchEngine& engine, const std::vector<float>& queryVec,
+                             int32_t k, bool correlated, int32_t permille, bool exact) {
+  auto* req = LocalReq::create(engine);
+  req->collection("main").requestId("vector-filter-bench");
+  auto& cur = req->topDocs();
+  cur.limit(k).countLimit().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), "bench_v", queryVec, k, /*nprobe=*/0, exact,
+                           /*refineCandidates=*/0);
+  cur.filter(qb::range(cur.mr(), correlated ? "fc_i" : "fu_i", nullptr, nullptr, nullptr,
+                       qb::valI64(cur.mr(), permille)));
+  return req;
+}
+
+void BM_VectorKnnFiltered(benchmark::State& state) {
+  int32_t permille = (int32_t)state.range(0);
+  bool correlated = state.range(1) != 0;
+  bool aux = state.range(2) != 0;
+  bool sparseField = state.range(3) != 0;
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestDimension(480, 2) : 200'000;
+  int32_t dims = luxir::unit_tests ? 16 : 64;
+  int32_t nClusters = luxir::unit_tests ? 8 : 100;
+  int32_t nQueries = luxir::unit_tests ? 2 : 16;
+  int32_t k = 10;
+
+  CollectionHelper helper("main");
+  std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs);
+  // Consecutive instances share one index per (aux, sparseField).
+  static int64_t builtShape = -1;
+  int64_t shape = (aux ? 1 : 0) + (sparseField ? 2 : 0) + nDocs * 4;
+  bool reused = builtShape == shape && helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    buildFilteredVectorIndex(helper, dims, nClusters, docsPerSeg, aux, sparseField);
+    builtShape = shape;
+  }
+  std::vector<std::vector<float>> queries;
+  for (int32_t q = 0; q < nQueries; q++) queries.push_back(makeClusteredQuery(q, dims, nClusters));
+
+  auto run = [&](int32_t q, bool exact, std::vector<std::string>& ids) {
+    auto* req = makeFilteredKnnReq(helper.getSearchEngine(), queries[(size_t)q], k,
+                                   correlated, permille, exact);
+    req->execute(false);
+    std::string error;
+    bool ok = responseIds(*req, ids, error);
+    req->done();
+    if (!ok) state.SkipWithError(error.c_str());
+    return ok;
+  };
+
+  KnnQuery::Stats stats;
+  double recallSum = 0;
+  {
+    SearchOverridesGuard<KnnQuery::Stats*> statsGuard(KnnQuery::statsForTests);
+    for (int32_t q = 0; q < nQueries; q++) {
+      std::vector<std::string> truth, ids;
+      KnnQuery::statsForTests = nullptr;
+      if (!run(q, true, truth)) return;
+      KnnQuery::statsForTests = &stats;
+      if (!run(q, false, ids)) return;
+      int32_t hits = 0;
+      for (const auto& id : ids) {
+        if (std::find(truth.begin(), truth.end(), id) != truth.end()) hits++;
+      }
+      recallSum += truth.empty() ? 1.0 : (double)hits / (double)truth.size();
+    }
+  }
+
+  int32_t queryOrd = 0;
+  for (auto _ : state) {
+    std::vector<std::string> ids;
+    if (!run(queryOrd, false, ids)) break;
+    queryOrd = (queryOrd + 1) % nQueries;
+    benchmark::DoNotOptimize(ids);
+  }
+
+  state.counters["recall"] = recallSum / (double)nQueries;
+  state.counters["lists"] = (double)stats.lists.load() / nQueries;
+  state.counters["vectors"] = (double)stats.vectors.load() / nQueries;
+  state.counters["rounds"] = (double)stats.rounds.load() / nQueries;
+  state.counters["permille"] = permille;
+  state.counters["reused"] = reused ? 1.0 : 0.0;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  state.SetLabel(std::string(aux ? "ivf" : "flat") + (correlated ? "/correlated" : "/uniform")
+                 + (sparseField ? "/sparse" : "/dense"));
+}
+
 // Throughput wrapper: same benchmark at the production defaults, run on
 // 1..32 concurrent closed-loop threads.  rate = aggregate QPS.  Registered
 // as a separate function so the thread sweep does not multiply the full
@@ -1035,3 +1188,19 @@ LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_parallel, true, true)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, rabitq_groups, false, false, true)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, RABITQ1});
+
+// Filtered kNN at 0.1%, 1%, 10%, 50% and 90% selectivity. Grouped by index
+// shape (aux, sparse) so consecutive instances reuse one built index.
+static void filteredSweep(benchmark::Benchmark* b, int64_t aux, int64_t sparseField) {
+  for (int64_t correlated : {0, 1}) {
+    if (!aux && correlated) continue;  // the flat scan does not see list layout
+    for (int64_t permille : {1, 10, 100, 500, 900}) b->Args({permille, correlated, aux, sparseField});
+  }
+}
+LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"permille", "correlated", "aux", "sparse"})
+    ->Apply([](benchmark::Benchmark* b) {
+      filteredSweep(b, 1, 0);
+      filteredSweep(b, 1, 1);
+      filteredSweep(b, 0, 0);
+      filteredSweep(b, 0, 1);
+    });

@@ -303,34 +303,92 @@ explicit build succeeds.
 
 `KnnQuery` creates one vector engine per segment. A segment uses its
 `vec.<field>` FAISS overlay when present, or scans the vector column exactly
-when no overlay exists. FAISS ids are segment-local vector value ranks, so the
-query path maps each returned value rank back through that segment's vector
-column metadata before liveDocs, filters, scoring, and multi-valued collapse.
+when no overlay exists. FAISS ids are segment-local vector value ranks.
+Liveness and filters are tested in rank space (below); returned ranks map back
+to documents through that segment's vector column metadata for scoring and
+multi-valued collapse.
 
 IndexReader opens and pins overlay files eagerly when it opens an index
 version, so cleanup can unlink old files without breaking existing readers.
 The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
+### Eligibility in rank space
+
+The query domain (liveDocs, intersected with any enclosing filter clauses)
+arrives per segment as a docId set. Before any engine runs, `KnnQuery`
+converts it once per segment into a rank-space bitmap: bit `r` is set when
+the document owning vector rank `r` is in the domain. The doc-to-rank mapping
+is identity for a dense single-valued field (a bitset domain is copied word
+for word), the document's rank among the docs with the field for a sparse
+field, and the document's value range for a multi-valued field. The build is
+proportional to `vectors / 64` plus the domain's members; no engine ever
+resolves a rank to a document to test eligibility.
+
+- With no deletes and no filter there is no bitmap: FAISS gets no selector and
+  the column scan visits every rank.
+- With deletes and no filter the bitmap is the segment's liveness bitmap,
+  cached on the overlay per delete generation and rebuilt in time proportional
+  to the deleted docs (for a dense single-valued field it borrows the liveDocs
+  bits).
+- With a filter the bitmap has liveness folded in. When the filter clauses are
+  segment-stable cache keys (the `PrepareContext::domainKey` a Boolean filter
+  sets for its children), it is cached on the overlay per (filter key, delete
+  generation) in a small LRU, together with its per-list eligible counts.
+  Filters without a stable key, and segments without an overlay, build it per
+  query.
+
+FAISS consumes the bitmap through `faiss::IDSelectorBitmap` (one bit probe
+per scanned id). The column scan walks its 64-bit words: all-zero words are
+skipped whole and all-ones words score their 64 rows without testing a bit.
+
+### Planning from the eligible count
+
+The bitmap's popcount is the segment's eligible vector count, and it drives
+the plan:
+
+- A segment with no eligible vector gets no engine and no share of the IVF
+  budget.
+- A filtered IVF segment is scored exactly over its eligible rows when that
+  reads at most `r` times the bytes its IVF search would: `eligible *
+  row_bytes <= r * (nlist * row_bytes + p * (vectors * id_bytes + eligible *
+  code_bytes))`, where `p` is the round-1 scan fraction. The terms are the
+  coarse centroid ranking, the probed lists' ids (each tested against the
+  bitmap), and the eligible codes scored. This is the Lucene and
+  Elasticsearch rule (exact when the filter matches no more documents than
+  the approximate search would visit) priced per byte, so one full-precision
+  row counts as many cheap codes. The bytes leave out the IVF path's per-list
+  and per-id work, the terminal rescore and deepen rounds, all of which favor
+  exact; `r = 8` is calibrated on `BM_VectorKnnFiltered` (200k 64-d vectors,
+  4 segments, RaBitQ-1): exact was faster up to 5% selectivity, where the
+  byte ratio is about 6, and slower from 10%, where it is about 13. At 1%
+  the IVF path was 2-5x slower than exact and, for a filter correlated with
+  the vector clusters, recalled only a third to a half of the true top 10:
+  the eligible vectors sit in a few lists far from the query, where 1-bit
+  codes cannot order them. Unfiltered segments keep the approximate path.
+- The doc target and the candidate cap are bounded by the eligible count, so a
+  filter matching fewer documents than the target stops once they are pooled.
+
 Internally, an `ivf.nprobe` request becomes a scan fraction
-`nprobe / sqrt(live_vector_count)` applied across the current per-segment
-indexes; that is what makes the knob merge-stable. Engine-specific knobs are
-grouped under a per-engine sub-message on the wire (`ivf` today) so a second
-engine adds a sibling with its own units instead of overloading these; the
-host-side knobs (`k`, `refine_candidates`, `exact`) stay at the top level.
+`nprobe / sqrt(eligible_vector_count)` applied across the current per-segment
+indexes, where the eligible count is the live vector count for an unfiltered
+query; that is what makes the knob merge-stable. The adaptive default is
+`1 / sqrt(sqrt(eligible_vector_count))` (times the dimension factor): the
+effort a single IVF index built over just the eligible vectors would spend by
+its own default, so a filter of selectivity `s` raises the default fraction by
+`s^-1/4`. Engine-specific knobs are grouped under a per-engine sub-message on
+the wire (`ivf` today) so a second engine adds a sibling with its own units
+instead of overloading these; the host-side knobs (`k`, `refine_candidates`,
+`exact`) stay at the top level.
 
 For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan
-fraction is reached. List cost is based on that list's live vector count
-divided by the field's live vector count. This handles uneven list sizes and
-avoids applying equal work to every segment. For an IVF segment with deletions
-the live count is exact: it rides along with the segment's cached
-rank-liveness bitmap, which is rebuilt per delete generation in time
-proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
-cheap upper bound instead (exact counting there would scan the field per
-query); the bound only errs toward slightly leaner initial effort, which
-auto-deepening recovers.
+fraction is reached. List cost is that list's eligible vector count divided
+by the field's eligible vector count, and lists without an eligible member
+are passed over unscanned. This handles uneven list sizes and filter skew and
+avoids applying equal work to every segment. Per-list eligible counts are
+counted from the bitmap on first use and kept with it, so a cached bitmap
+prices lists without rereading their ids.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
@@ -338,16 +396,20 @@ arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
 work limiter.
 
 Candidates are unioned across deepen rounds using approximate scores for the
-widen decision. From the first deepen round on, already-pooled vectors are
-excluded from every engine's scan: the pooled set is folded into per-query
-copies of the segments' liveness bitmaps (all-ones where a segment has no
-deletions) and handed to the scanners as an eligibility filter, so each
-round's result heap is spent entirely on new candidates and each round
-requests only the projected shortfall rather than re-requesting the whole
-pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
-the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+widen decision. A depth round projects the candidates needed from the
+observed docs-per-candidate yield. A breadth round projects the breadth needed
+from the observed yield too (pooled docs per breadth scanned), growing at most
+8x per round, so a selective filter reaches its breadth in a few rounds
+instead of one reference list per round. From the first deepen round on,
+already-pooled vectors are excluded from every engine's scan: the pooled set
+is folded into per-query copies of the segments' domain bitmaps (all-ones
+where a segment has no deletions and no filter) and handed to the scanners as
+the eligibility bitmap, so each round's result heap is spent entirely on new
+candidates and each round requests only the projected shortfall rather than
+re-requesting the whole pool. The shared per-segment caches are never
+modified by queries. Once widening finishes, the final candidate pool is
+rescanned from the full-precision column, sorted by exact score, and
+collapsed to one hit per document.
 
 ## Parallel Execution
 

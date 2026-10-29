@@ -344,6 +344,15 @@ later filter would have discarded. With an approximate index, the search
 deepens its breadth automatically when a filter or multi-value collapse leaves
 too few documents.
 
+The filter's selectivity shapes the search. Segments with no matching vector
+are skipped, IVF lists with no matching vector are not scanned, and a segment
+whose matching vectors are few enough that scoring them all exactly costs
+no more than its index search would (in the benchmarks, up to about 5% of
+the segment's vectors) is scored exactly instead, so a selective filter
+returns the exact filtered top-k. A filter that matches
+fewer than `k` documents returns all of them without scanning the rest of the
+index. Repeated filters reuse a per-segment cached form of the filter.
+
 The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket.
@@ -780,7 +789,7 @@ every index type.
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
-| `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
+| `ivf.min_scan_fraction` | A floor on the fraction of eligible vector values scanned (live, and matching the filter), in `[0,1]`; `0.001` means 0.1%. |
 
 `refine_candidates` sizes the candidate-document pool in both units, whichever
 index produced the candidates. When unset, the pool is affine
@@ -806,6 +815,13 @@ both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
 measurements on GIST and Cohere embeddings showed recall@10 rising from
 0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
 the only work limiter.
+
+With a filter, the reference index is the matching vectors:
+`nlist = sqrt(eligible_vector_count)`, where eligible means live and matching
+the filter, and list effort is counted in matching vectors. The adaptive
+default then spends what an IVF index built over just the matching vectors
+would by its own default, which for a filter matching a fraction `s` of the
+vectors is `s^-1/4` times the unfiltered fraction (about 5.6x at 0.1%).
 
 ### Scoring
 
@@ -886,11 +902,11 @@ bit-identical results to a serial run of the same query.
   no HNSW yet.
 - An `ann` change does not rebuild existing overlays; only segments built
   afterwards use it (see [Index settings](#index-settings)).
-- Filters are always applied inside the vector search. There is no cost-based
-  choice between filtered approximate search and exact search over the
-  filtered set, and no automatic exact fallback when a selective filter still
-  starves the approximate search after breadth deepening. Use `exact: true`
-  when exact filtered top-k is the required contract.
+- Filters are always applied inside the vector search. The choice between
+  approximate search and exact search over the filtered set is made per
+  segment from the filter's matching vector count, before the search; there
+  is no switch to exact search after deepening has started. Use
+  `exact: true` when exact filtered top-k is the required contract.
 - There is no public command to remove or rebuild an overlay that a segment
   already has. New and merged segments build from their columns, and a segment
   without an overlay can receive one through a later selected commit.

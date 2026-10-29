@@ -84,16 +84,26 @@ namespace luxir {
 /// approximate pool size (host-side, engine-agnostic); exact = bypass ANN
 /// entirely (column scan contract).
 ///
-/// The active query domain is pushed into the engine as the COMPLETE
-/// eligibility predicate: per the PrepareContext contract it is already
-/// live-filtered (liveDocs intersected with any enclosing filter clauses),
-/// and a null domain means no deletes and no filters.  The column engine
-/// checks it directly while scanning docs.  FAISS aux engines pick the
-/// cheapest selector per segment: none at all when the domain is null (the
-/// scanner's per-vector check compiles out), a cached rank-space liveness
-/// bitmap when the domain is exactly liveDocs (built once per liveDocs
-/// generation, shared across queries), or a resolve-based IDSelector for
-/// per-query filtered domains.
+/// The active query domain is the COMPLETE eligibility predicate: per the
+/// PrepareContext contract it is already live-filtered (liveDocs
+/// intersected with any enclosing filter clauses), and a null domain means
+/// no deletes and no filters.  prepare() converts it once per segment into a
+/// rank-space bitmap (RankBitmap: bit r = vector rank r eligible), so no
+/// engine resolves ranks to docs to test eligibility:
+///   - null domain: no bitmap; FAISS gets no selector (its per-vector check
+///     compiles out) and the column scan visits every rank.
+///   - domain == liveDocs: the segment's liveness bitmap, cached on the
+///     overlay per liveDocs generation.
+///   - filtered: the filter's bitmap, cached on the overlay per (filter key,
+///     liveDocs generation) when the domain has a stable name
+///     (PrepareContext::domainKey), else built for this query.
+/// FAISS always consumes it through faiss::IDSelectorBitmap, and the column
+/// scan walks its set bits word by word.  Its popcount is the segment's
+/// eligible vector count, which drives the plan: zero-eligible segments get
+/// no engine, low-eligible IVF segments are scored exactly from the column
+/// (exactCheaperThanIvf), IVF effort is denominated in eligible vectors (the
+/// reference index is the eligible set; zero-eligible lists are skipped),
+/// and the doc target is capped by the eligible count.
 ///
 /// Multi-valued vector fields are supported via the segment's persisted
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
@@ -228,6 +238,74 @@ public:
                     std::sqrt((double)dims / (double)defaultAnnBreadthReferenceDims));
   }
 
+  /// IVF scan fraction for a breadth (reference-index lists; 0 = adaptive
+  /// default) against a reference index of referenceBreadth lists, floored
+  /// by minScanFraction.  The fraction is of the ELIGIBLE vectors: the
+  /// reference index is nlist = sqrt(eligible), so an unfiltered query sees
+  /// the merge-stable sqrt(live) reference, and a filter scales the default
+  /// effort up by selectivity^-1/4 - the effort an IVF index built over just
+  /// the eligible vectors would spend by its own default.
+  ///
+  /// The nprobe=0 default probes sqrt(nlist) lists of the reference index,
+  /// times the dimension factor (defaultAnnBreadthDimFactor): as a fraction
+  /// sqrt(referenceBreadth) / referenceBreadth = 1 / sqrt(referenceBreadth)
+  /// (= N^-0.25 for referenceBreadth = sqrt(N)).  It depends only on the
+  /// eligible count, so it is MERGE-STABLE: repartitioning the same vectors
+  /// into more or fewer segments does not move it.  Host auto-deepening grows
+  /// breadth from this lean start when too few distinct live docs come back.
+  /// A per-segment sum was rejected: sum_s sqrt(N_s) / sqrt(N) =
+  /// sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
+  /// per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
+  /// keeps an S-dependent term that drifts on merges.
+  static double scanFraction(int32_t breadth, int32_t referenceBreadth, int32_t dims,
+                             float minScanFraction) {
+    double p = breadth > 0
+      ? (double)breadth / (double)std::max(1, referenceBreadth)
+      : defaultAnnBreadthDimFactor(dims) / std::sqrt((double)std::max(1, referenceBreadth));
+    p = std::max(p, (double)minScanFraction);
+    return std::clamp(p, 0.0, 1.0);
+  }
+
+  // Exact fallback for filtered IVF segments.  A filtered IVF segment is
+  // scored exactly over its eligible rows when that reads no more than
+  // exactFallbackCostRatio times what its IVF search would (see
+  // exactCheaperThanIvf).  0 disables the fallback.  Mutable for tests.
+  // Calibrated on BM_VectorKnnFiltered (200k 64-d vectors, RaBitQ-1, 4
+  // segments): per byte a scored row is ~8x cheaper than the IVF path's
+  // per-list and per-id work, so exact wins up to ~5% selectivity (ratio
+  // ~6 there) and loses from 10% (ratio ~13).  At 1% IVF was 2-5x slower
+  // than exact and lost recall on cluster-correlated filters.
+  static inline double exactFallbackCostRatio = 8.0;
+
+  /// Whether scoring a filtered segment's eligible rows from the column is
+  /// cheaper than its IVF search, in bytes read weighted by
+  /// exactFallbackCostRatio:
+  ///   exact = eligible * rowBytes
+  ///   ivf   = nlist * rowBytes                    (coarse centroid ranking)
+  ///         + p * (vectors * idBytes              (probed lists' ids, each
+  ///                                                tested against the bitmap)
+  ///            + eligible * codeBytes)            (eligible codes scored)
+  /// with p the round-1 scan fraction of eligible vectors.  This is the
+  /// Lucene / Elasticsearch rule (exact when the filter matches no more
+  /// documents than the approximate search would visit) priced per byte, so
+  /// a full-precision row counts as many cheap codes.  It ignores the
+  /// terminal rescore (paid by IVF only) and later deepen rounds, both of
+  /// which only favor exact more, and IVF's per-list and per-id overheads,
+  /// which the ratio prices.  Only filtered segments are considered:
+  /// unfiltered IVF segments are large by construction (the build threshold)
+  /// and keep their merge-stable effort.
+  static bool exactCheaperThanIvf(int64_t eligible, int64_t vectors, int32_t nlist,
+                                  size_t codeBytes, int32_t dims, double p) {
+    if (exactFallbackCostRatio <= 0.0) return false;
+    double rowBytes = (double)dims * (double)sizeof(float);
+    double ivfBytes = (double)nlist * rowBytes
+      + p * ((double)vectors * (double)sizeof(faiss::idx_t) + (double)eligible * (double)codeBytes);
+    return (double)eligible * rowBytes <= exactFallbackCostRatio * ivfBytes;
+  }
+
+  // Cap on the breadth growth of one deepen round (see projectedBreadth).
+  static constexpr double MAX_BREADTH_GROWTH = 8.0;
+
   // Test seam: when set, prepare() wraps the production flat engine and runs
   // the host deepen loop against the wrapper instead.  Lets tests drive the
   // loop with non-flat engine behaviors (breadth rounds, approximate scores)
@@ -245,6 +323,10 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  // Rank-space filter-domain builds (cache misses and uncached filters), and
+  // IVF segments a query routed to exact eligible-row scoring.
+  static inline std::atomic<int64_t> filterRankBitmapBuildsForTests{0};
+  static inline std::atomic<int64_t> exactFallbackSegmentsForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
@@ -560,6 +642,7 @@ public:
     out.appendInt32(defaultAnnRefineCount);
     out.appendInt32(defaultAnnRefineRatio);
     out.appendInt32(defaultAnnBreadthReferenceDims);
+    out.appendInt64(std::bit_cast<int64_t>(exactFallbackCostRatio));
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract. Production engines are deterministic for a pinned reader.
     return engineWrapperForTests || groups != nullptr ? FilterKeyScope::UNCACHEABLE
@@ -679,7 +762,9 @@ public:
     template <bool Groups> struct EngineSlot {
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
-      int64_t liveVectorCount = 0;
+      // Vectors the domain admits (exact: the domain bitmap's popcount, or
+      // every vector when the segment has no deletes and no filter).
+      int64_t eligibleVectorCount = 0;
       SegmentFaissVectorEngine<Groups>* ivfEngine = nullptr;
     };
 
@@ -715,22 +800,32 @@ public:
       // sparse single-valued, and the column's reverse map for multi-valued.
       std::vector<SegV2D> v2dPerSeg(numSegs);
       std::vector<int64_t> segVectorCounts(numSegs, 0);
-      std::vector<int64_t> segLiveVectorCounts(numSegs, 0);
+      // Per segment: vectors the domain admits, an upper bound on the docs
+      // owning them, whether the domain is a real filter (not just
+      // liveness), and its rank-space bitmap (null: every rank eligible).
+      std::vector<int64_t> segEligibleCounts(numSegs, 0);
+      std::vector<int64_t> segEligibleDocs(numSegs, 0);
+      std::vector<char> segFiltered(numSegs, 0);
+      std::vector<std::shared_ptr<const RankBitmap>> domainBitsPerSeg(numSegs);
+      // vauxPerSeg: overlays that serve this query (none when exact);
+      // cachePerSeg: overlays that cache its rank bitmaps (any query).
       std::vector<VectorAuxReader*> vauxPerSeg(numSegs, nullptr);
+      std::vector<const VectorAuxReader*> cachePerSeg(numSegs, nullptr);
       std::string auxName("vec.");
       auxName.append(query.getField());
-      if (!query.getExact()) {
-        for (size_t i = 0; i < numSegs; i++) {
-          auto aux = reader.segments()[i].getAuxReader(auxName);
-          if (!aux) continue;
-          auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
-          if (!vaux) {
-            throw std::runtime_error(std::format(
-              "KnnQuery: segment overlay '{}' is not a vector index (kind={})",
-              auxName, aux->getKind()));
-          }
-          vauxPerSeg[i] = vaux;
+      std::vector<std::shared_ptr<AuxReader>> auxHolders(numSegs);
+      for (size_t i = 0; i < numSegs; i++) {
+        auxHolders[i] = reader.segments()[i].getAuxReader(auxName);
+        if (!auxHolders[i]) continue;
+        auto* vaux = dynamic_cast<VectorAuxReader*>(auxHolders[i].get());
+        if (!vaux) {
+          if (query.getExact()) continue;
+          throw std::runtime_error(std::format(
+            "KnnQuery: segment overlay '{}' is not a vector index (kind={})",
+            auxName, auxHolders[i]->getKind()));
         }
+        cachePerSeg[i] = vaux;
+        if (!query.getExact()) vauxPerSeg[i] = vaux;
       }
 
       // Holds the multi-valued segments' valueRank->docId MonoReaders alive through
@@ -738,7 +833,6 @@ public:
       // just pointers into the segment mmap (valid for the whole query), so copying it
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
-      std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
@@ -789,22 +883,40 @@ public:
                 v2dPerSeg[i].sel = makeValueDocSelector(scratch, dr.bitset());
               }
             }
+            // Domain -> rank-space bitmap, built here while the scratch
+            // column readers it walks are alive.  Cached on the segment's
+            // overlay when there is one (also for exact queries, which
+            // share it with later approximate ones).
             IndexReader::Segment& seg = reader.segments()[i];
-            if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
-              // Rank-space liveness bitmap, cached on the aux reader per
-              // liveDocs generation; fetched here so a (rare) rebuild runs
-              // while the scratch column readers it walks are alive.
-              // liveListSize accounting always reads it, for an unfiltered
-              // query (domain == the liveDocs docset) it doubles as the
-              // whole FAISS eligibility selector, and it carries this
-              // segment's EXACT live vector count.
-              rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(
-                seg.segInfo.live_gen, [&]() {
-                  return buildRankLiveBitmap(seg, vr, segCount);
-                });
-              segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
+            DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+            // Domain contract (Query.h): a present domain is live-filtered
+            // and is the complete eligibility predicate; null means no
+            // deletes and no filters.
+            assert(domain != nullptr || seg.liveDocs() == nullptr);
+            LiveDocs* live = seg.liveDocs();
+            const VectorAuxReader* cache = cachePerSeg[i];
+            int32_t lists = cache != nullptr ? cache->getNList() : 0;
+            uint64_t liveGen = seg.segInfo.live_gen;
+            if (domain == nullptr) {
+              segEligibleCounts[i] = segCount;
+              segEligibleDocs[i] = vr.docsWithValue();
             } else {
-              segLiveVectorCounts[i] = liveVectorUpperBound(seg, vr);
+              if (live != nullptr && domain == &live->docset()) {
+                auto build = [&]() { return buildRankLiveBitmap(seg, vr, segCount, lists); };
+                domainBitsPerSeg[i] = cache != nullptr
+                  ? cache->rankLiveBitmap(liveGen, build)
+                  : std::make_shared<const RankBitmap>(build());
+              } else {
+                segFiltered[i] = 1;
+                auto build = [&]() { return buildDomainRankBitmap(vr, segCount, *domain, lists); };
+                domainBitsPerSeg[i] = cache != nullptr && ctx.domainKey != nullptr
+                  ? cache->filterRankBitmap(*ctx.domainKey, liveGen, build)
+                  : std::make_shared<const RankBitmap>(build());
+              }
+              const RankBitmap& bits = *domainBitsPerSeg[i];
+              segEligibleCounts[i] = bits.count;
+              segEligibleDocs[i] = bits.docs >= 0 ? bits.docs
+                : std::min<int64_t>(bits.count, live != nullptr ? live->numLive() : bits.count);
             }
           }
         }
@@ -814,9 +926,14 @@ public:
       if (ntotal == 0) {
         return emptyResult();
       }
-      int64_t liveNTotal = 0;
-      for (int64_t n : segLiveVectorCounts) liveNTotal += n;
-      if (liveNTotal == 0) {
+      // Eligible vectors and an upper bound on eligible docs, over all
+      // segments: the effort denominator and the doc-target cap.
+      int64_t eligibleTotal = 0, eligibleDocsTotal = 0;
+      for (size_t i = 0; i < numSegs; i++) {
+        eligibleTotal += segEligibleCounts[i];
+        eligibleDocsTotal += segEligibleDocs[i];
+      }
+      if (eligibleTotal == 0) {
         return emptyResult();
       }
 
@@ -835,12 +952,17 @@ public:
       std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
 
       int64_t kDocs = query.getK();
-      int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
+      // No round can pool more vectors than the domain admits.
+      int64_t cap = std::min(eligibleTotal, std::max((int64_t)1, maxKnnCandidates));
       // exact is a contract: the maxKnnCandidates host heuristic must not
-      // silently truncate the requested k (the explicit knob wins).  ntotal
-      // still bounds it - fewer stored docs than k is not a violation, the
-      // true top-k is simply all of them.
-      if (query.getExact()) cap = std::min(ntotal, std::max(cap, kDocs));
+      // silently truncate the requested k (the explicit knob wins).  The
+      // eligible count still bounds it - fewer eligible docs than k is not a
+      // violation, the true top-k is simply all of them.
+      if (query.getExact()) cap = std::min(eligibleTotal, std::max(cap, kDocs));
+      // Round-1 IVF scan fraction, for the exact-fallback cost model.  The
+      // composite engine derives the same value from the same inputs.
+      double firstScanFraction = scanFraction(query.getNProbe(), defaultIvfNList(eligibleTotal),
+                                              dims, query.getMinScanFraction());
       std::vector<EngineSlot<Groups>> slots;
       slots.reserve(numSegs);
       bool approximateEngine = false;
@@ -863,14 +985,23 @@ public:
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
         if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
+        // Nothing eligible: no engine, no share of the IVF budget.
+        if (segEligibleCounts[i] <= 0) continue;
         IndexReader::Segment& seg = reader.segments()[i];
         DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
-        // Domain contract (Query.h): a present domain is live-filtered and
-        // is the complete eligibility predicate; null means no deletes and
-        // no filters.  The engines rely on it - they never re-check
-        // liveDocs.
-        assert(domain != nullptr || seg.liveDocs() == nullptr);
         VectorAuxReader* vaux = vauxPerSeg[i];
+        if (vaux != nullptr && segFiltered[i]) {
+          // Few eligible rows: score them exactly from the column instead
+          // of probing the overlay (exactCheaperThanIvf).
+          auto* ivf = dynamic_cast<faiss::IndexIVF*>(vaux->getFaissIndex());
+          if (ivf != nullptr && exactCheaperThanIvf(segEligibleCounts[i], segCount, vaux->getNList(),
+                                                    ivf->code_size, dims, firstScanFraction)) {
+            exactFallbackSegmentsForTests.fetch_add(1, std::memory_order_relaxed);
+            normalizeColumnOnCosineRescore =
+              normalizeColumnOnCosineRescore || vaux->shouldNormalizeColumnOnCosineRescore();
+            vaux = nullptr;
+          }
+        }
         if (vaux != nullptr) {
           if (vaux->getDims() != dims) {
             throw std::runtime_error(std::format(
@@ -899,11 +1030,10 @@ public:
           const float* indexQuery = vaux->getRotation() != nullptr
             ? rotatedQuery(vaux->getRotation())
             : queryPtr;
-          // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
-          // loop's foldSeen() seeds the eligible bitmaps from it.
+          // domainBitsPerSeg[i] is shared with the engine, NOT moved: the
+          // widen loop's foldSeen() seeds the eligible bitmaps from it.
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine<Groups>>(
-            *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
-            rankLivePerSeg[i],
+            *idx, (int32_t)i, domainBitsPerSeg[i],
             metric, vaux->scoresAreExact(), isIvf,
             vaux->getNList(), query.groups, v2dSpan,
             PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits});
@@ -911,16 +1041,16 @@ public:
           slots.push_back({
             .engine = std::move(faissEngine),
             .vectorCount = segCount,
-            .liveVectorCount = segLiveVectorCounts[i],
+            .eligibleVectorCount = segEligibleCounts[i],
             .ivfEngine = ivfEngine,
           });
         } else {
           slots.push_back({
             .engine = std::make_unique<SegmentFlatColumnVectorEngine<Groups>>(
-              (int32_t)i, seg, segInfos.at(i), v2dPerSeg[i], domain,
+              (int32_t)i, seg, segInfos.at(i), v2dPerSeg[i], domain, domainBitsPerSeg[i].get(),
               dims, metric, normalizeColumnOnCosineRescore, query.groups, v2dSpan),
             .vectorCount = segCount,
-            .liveVectorCount = segLiveVectorCounts[i],
+            .eligibleVectorCount = segEligibleCounts[i],
             .ivfEngine = nullptr,
           });
         }
@@ -950,8 +1080,11 @@ public:
       }
       int64_t kReq = Groups ? std::min(baseReq, cap) : mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return emptyResult();
+      // Capped by the eligible docs: a filter matching fewer docs than the
+      // target stops widening once they are pooled instead of deepening
+      // until every list is scanned.
       int64_t targetDocReq = approximateEngine
-        ? std::min<int64_t>(liveNTotal, std::max(kDocs, baseReq))
+        ? std::min<int64_t>(eligibleDocsTotal, std::max(kDocs, baseReq))
         : kDocs;
 
       std::vector<VectorEngineHit> candidateHits;
@@ -978,7 +1111,7 @@ public:
       if constexpr (!Groups) seenDocs.reserve(maxDocHits);
 
       std::unique_ptr<VectorEngine> baseEngine =
-        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ntotal, liveNTotal, kDocs,
+        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ntotal, eligibleTotal, kDocs,
                                                 metric, ctx.parallel, query.groups, v2dSpan);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
@@ -1003,7 +1136,7 @@ public:
       // common only round) uses the small seenVectors hash set and passes no
       // eligible bitmaps.  The FIRST deepen of either axis folds the seen set
       // into per-segment rank-space "eligible" bitmaps (init: the segment's
-      // cached rank-live bitmap when it has one, else all-ones; pooled ranks
+      // domain bitmap when it has one, else all-ones; pooled ranks
       // cleared), which then serve double duty: the host's dedup structure
       // (O(1) bit test instead of a hash probe, and bounded at numVectors/8
       // bytes where the hash set would grow toward the candidate cap), and
@@ -1029,14 +1162,14 @@ public:
           int64_t n = segVectorCounts[i];
           if (n <= 0) continue;
           auto& bits = eligibleStore[i];
-          if (rankLivePerSeg[i] != nullptr) {
+          if (domainBitsPerSeg[i] != nullptr) {
+            // Seeded from the domain bitmap, so the domain (filter and
+            // liveness) rides along in the one bitmap FAISS probes.
             size_t numBytes = ((size_t)n + 7) / 8;
-            assert(rankLivePerSeg[i]->numBytes == numBytes);
-            bits.assign(rankLivePerSeg[i]->bits, rankLivePerSeg[i]->bits + numBytes);
+            assert(domainBitsPerSeg[i]->numBytes == numBytes);
+            bits.assign(domainBitsPerSeg[i]->bits, domainBitsPerSeg[i]->bits + numBytes);
           } else {
-            // No cached liveness (no deletes, or a flat slot): not-pooled
-            // only.  Flat engines filter the domain themselves, so for them
-            // the bit means just "not pooled yet" - same dedup semantics.
+            // No domain (no deletes, no filter): not-pooled only.
             fillAllRanksSet(bits, n);
           }
         }
@@ -1047,11 +1180,11 @@ public:
           cleared[seg] = 1;
         }
         // Hand engines a span only where it can exclude something: a
-        // liveness seed or at least one pooled rank. An all-ones span would
+        // domain seed or at least one pooled rank. An all-ones span would
         // demote a selector-free scan to a per-vector always-true probe.
         for (size_t i = 0; i < numSegs; i++) {
           if (!eligibleStore[i].empty()
-              && (rankLivePerSeg[i] != nullptr || cleared[i])) {
+              && (domainBitsPerSeg[i] != nullptr || cleared[i])) {
             eligibleSpans[i] = eligibleStore[i];
           }
         }
@@ -1191,8 +1324,14 @@ public:
           continue;
         }
 
+        // BREADTH: at least the engine's next-list hint, and geometric from
+        // the observed yield (pooled docs per breadth scanned so far), so a
+        // selective filter reaches the breadth its yield needs in a few
+        // rounds instead of one reference list per round.
         if (result.poolExhausted && !result.breadthExhausted && breadth < maxBreadth) {
           int32_t nextBreadth = result.nextBreadth > breadth ? result.nextBreadth : breadth + 1;
+          nextBreadth = std::max(nextBreadth,
+              projectedBreadth(result.scannedBreadth, pooled, targetDocReq));
           breadth = std::min(nextBreadth, maxBreadth);
           foldSeen();
           continue;
@@ -1295,7 +1434,7 @@ public:
     ///
     /// IVF indexes do not drive themselves: the CompositeVectorEngine's global
     /// allocator calls coarseRun() (full sorted centroid ranking) and
-    /// liveListSize() to pick lists across ALL segments, then hands the chosen
+    /// eligibleListSize() to pick lists across ALL segments, then hands the chosen
     /// lists back through searchSelectedLists().  The plain search() override
     /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
     /// exists today (both codecs are IVF), so it is reserved seam
@@ -1304,57 +1443,14 @@ public:
       const CollapsePlan* groupPlan;
       std::span<const SegV2D> groupV2d;
 
-      /// Resolve-based eligibility selector over the live-filtered query
-      /// domain (the PrepareContext contract: a present domain already
-      /// includes liveDocs, so there is no separate liveness check).  FAISS
-      /// consults the selector per scanned vector, before the distance, so
-      /// this is the slow path - it is only used for per-query (filtered)
-      /// domains; the unfiltered-with-deletes case uses the cached
-      /// rank-space bitmap via faiss::IDSelectorBitmap instead, and the
-      /// no-deletes no-filter case passes no selector at all (the scanner's
-      /// per-vector check compiles out).
-      class LocalDomainSelector final : public faiss::IDSelector {
-        const SegV2D& v2d;
-        DocSet* domain;
-        // Optional rank-space eligibility bits (request.eligible): tested
-        // before the resolve so already-pooled ranks cost one bit probe, no
-        // doc resolution.  Out-of-range ids are rejected, mirroring
-        // faiss::IDSelectorBitmap's byte-bound guard, so a corrupt id from
-        // the zero-copy mmapped lists cannot read past the bitmap.  Empty
-        // when the host has not folded yet.
-        std::span<const uint8_t> eligible;
-
-      public:
-        LocalDomainSelector(const SegV2D& v2d, DocSet* domain,
-                            std::span<const uint8_t> eligible = {}) noexcept
-          : v2d(v2d), domain(domain), eligible(eligible) {}
-
-        bool is_member(faiss::idx_t id) const final {
-          if (id < 0) return false;
-          uint64_t r = (uint64_t)id;
-          if (!eligible.empty()) {
-            if ((r >> 3) >= eligible.size()) return false;
-            if (((eligible[r >> 3] >> (r & 7)) & 1) == 0) return false;
-          }
-          return domain->get(v2d.resolve((int64_t)id));
-        }
-      };
-
       faiss::Index& index;
       faiss::IndexIVF* ivf;
       int32_t segOrd;
-      const SegV2D& v2d;
-      LiveDocs* liveDocs;
-      // Rank-space liveness bitmap, present iff the segment has deletes
-      // (shared from the VectorAuxReader's per-liveGen cache).  liveListSize
-      // always reads it; RoundSelector hands it to FAISS as the eligibility
-      // bitmap when the domain is exactly liveDocs (unfiltered query).
-      std::shared_ptr<const RankLiveBitmap> rankLive;
-      // The query domain per the live-filtered contract; domainIsLive marks
-      // the unfiltered case (domain == the liveDocs docset) where rank-space
-      // bitmaps can stand in for the resolve-based check.
-      DocSet* domain;
-      bool domainIsLive;
+      // The domain in rank space (liveness, or a filter with liveness folded
+      // in), shared from the overlay's cache or built for this query; null
+      // when the segment has no deletes and no filter.  The selector and the
+      // allocator's per-list eligible counts both read it.
+      std::shared_ptr<const RankBitmap> domainBits;
       int32_t metric;
       bool exactScores;
       bool isIvf;
@@ -1362,24 +1458,20 @@ public:
       // Owned by prepareUnit(): canonical for PQ, rotated for RaBitQ.
       const PreparedQuery preparedQuery;
 
-      /// The ONLY selector policy: built per scan call from (domain,
-      /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
-      /// rounds cannot drift apart.  Cheapest selector wins:
-      ///   no domain, no eligible      -> null (FAISS compiles the per-vector
-      ///                                  check out)
-      ///   domain == liveDocs          -> IDSelectorBitmap over rankLive, or
-      ///                                  over eligible once present (it is
-      ///                                  seeded from rankLive, so liveness
-      ///                                  rides along - one bit probe)
-      ///   filtered domain             -> LocalDomainSelector, composing the
-      ///                                  eligible bit test (when present)
-      ///                                  with the resolve-based check
-      /// Per-call construction is two stores; owns the selector storage, so
-      /// keep it alive across the FAISS call (copy/move deleted to enforce
-      /// that selPtr never outlives the optionals it points into).
+      /// The ONLY selector policy: built per scan call from (domainBits,
+      /// request.eligible), so round 1 and deepen rounds cannot drift apart.
+      /// Always a bitmap, one bit probe per scanned id:
+      ///   eligible present -> IDSelectorBitmap over it (it is seeded from
+      ///                       domainBits, so the domain rides along)
+      ///   domainBits       -> IDSelectorBitmap over it
+      ///   neither          -> null (FAISS compiles the per-vector check out)
+      /// IDSelectorBitmap rejects ids past its bytes, so a corrupt id from the
+      /// zero-copy mmapped lists cannot read past the bitmap.  Per-call
+      /// construction is two stores; owns the selector storage, so keep it
+      /// alive across the FAISS call (copy/move deleted to enforce that
+      /// selPtr never outlives the optional it points into).
       class RoundSelector {
         std::optional<faiss::IDSelectorBitmap> bitmap;
-        std::optional<LocalDomainSelector> domainSel;
         const faiss::IDSelector* selPtr = nullptr;
 
       public:
@@ -1389,14 +1481,11 @@ public:
             (size_t)eng.segOrd < request.eligible.size()
               ? request.eligible[(size_t)eng.segOrd]
               : std::span<const uint8_t>{};
-          if (eng.domain != nullptr && !eng.domainIsLive) {
-            domainSel.emplace(eng.v2d, eng.domain, elig);
-            selPtr = &*domainSel;
-          } else if (!elig.empty()) {
+          if (!elig.empty()) {
             bitmap.emplace(elig.size(), elig.data());
             selPtr = &*bitmap;
-          } else if (eng.domainIsLive) {
-            bitmap.emplace(eng.rankLive->numBytes, eng.rankLive->bits);
+          } else if (eng.domainBits != nullptr) {
+            bitmap.emplace(eng.domainBits->numBytes, eng.domainBits->bits);
             selPtr = &*bitmap;
           }
         }
@@ -1468,10 +1557,7 @@ public:
     public:
       SegmentFaissVectorEngine(faiss::Index& index,
                                int32_t segOrd,
-                               IndexReader::Segment& seg,
-                               const SegV2D& v2d,
-                               DocSet* domain,
-                               std::shared_ptr<const RankLiveBitmap> rankLive,
+                               std::shared_ptr<const RankBitmap> domainBits,
                                int32_t metric,
                                bool exactScores,
                                bool isIvf,
@@ -1481,12 +1567,7 @@ public:
         : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
-          v2d(v2d),
-          liveDocs(seg.liveDocs()),
-          rankLive(std::move(rankLive)),
-          domain(domain),
-          domainIsLive(domain != nullptr && liveDocs != nullptr
-                       && domain == &liveDocs->docset()),
+          domainBits(std::move(domainBits)),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
@@ -1496,7 +1577,6 @@ public:
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
-        assert((liveDocs != nullptr) == (this->rankLive != nullptr));
       }
 
       int32_t getNList() const noexcept { return nlist; }
@@ -1514,40 +1594,31 @@ public:
         ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
       }
 
-      /// Live vector count of one IVF list - the unit the global allocator
-      /// charges against the scan-fraction budget (cost = liveListSize / N).
-      /// Uses the ACTUAL invlist length so list imbalance prices correctly
-      /// (full selection always sums to ~N).  Under deletes this reads the
-      /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
-      /// liveness only (not the query domain), matching the live-N
-      /// denominator.
-      int64_t liveListSize(faiss::idx_t listId) const {
+      /// Eligible vector count of one IVF list - the unit the global
+      /// allocator charges against the scan-fraction budget (cost =
+      /// eligibleListSize / eligible N) and the test that skips a list
+      /// outright when it is zero.  Uses the ACTUAL list contents so list
+      /// imbalance and filter skew price correctly (full selection always
+      /// sums to the eligible N).  With a domain bitmap the count is read
+      /// from its per-list cache, counted on first use by testing each id's
+      /// bit (no rank -> doc resolve).
+      int64_t eligibleListSize(faiss::idx_t listId) const {
         assert(ivf != nullptr);
         if (listId < 0 || listId >= nlist) return 0;
-        size_t rawSize = ivf->invlists->list_size((size_t)listId);
-        if (rawSize == 0) return 0;
-        if (liveDocs == nullptr) return (int64_t)rawSize;
-
-        const uint8_t* bits = rankLive->bits;
-        int64_t liveSize = 0;
-        const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
-        for (size_t i = 0; i < rawSize; i++) {
-          uint64_t r = (uint64_t)listIds[i];
-          liveSize += (bits[r >> 3] >> (r & 7)) & 1;
-        }
-        ivf->invlists->release_ids((size_t)listId, listIds);
-        return liveSize;
+        if (domainBits == nullptr) return (int64_t)ivf->invlists->list_size((size_t)listId);
+        return domainBits->listCount(*ivf->invlists, listId);
       }
 
       /// Scan a contiguous run of pre-selected IVF lists.  const and
       /// thread-safe: the composite engine runs several disjoint list-ranges
       /// of one segment as concurrent tasks, so all scratch is local and the
-      /// shared state (index, selector, v2d) is read-only.  rangeLiveVectors
-      /// is the live count of exactly the lists in listIds.
+      /// shared state (index, selector bitmap) is read-only.
+      /// rangeEligibleVectors is the eligible count of exactly the lists in
+      /// listIds.
       VectorSearchResult searchSelectedLists(const VectorSearchRequest& request,
                                              std::span<const faiss::idx_t> listIds,
                                              std::span<const float> centroidDists,
-                                             int64_t rangeLiveVectors) const {
+                                             int64_t rangeEligibleVectors) const {
         assert(ivf != nullptr);
         assert(request.query != nullptr);
         assert(request.dims == index.d);
@@ -1628,7 +1699,7 @@ public:
         // accumulator derives the ROUND's poolExhausted from per-chunk
         // counters (foldPart), so this flag only describes this list range.
         result.poolExhausted = liveHits < request.candidates
-          || rangeLiveVectors <= request.candidates;
+          || rangeEligibleVectors <= request.candidates;
         return result;
       }
 
@@ -1703,7 +1774,11 @@ public:
       IndexReader::Segment& seg;
       const SegFieldInfo* segInfo;
       const SegV2D& v2d;
+      // The domain DocSet feeds only the group key walk; eligibility is
+      // domainBits, its rank-space form (null when the domain is null: no
+      // deletes, no filter).  Owned by prepareUnit(), which outlives this.
       DocSet* domain;
+      const RankBitmap* domainBits;
       int32_t dims;
       int32_t metric;
       bool normalizeColumnOnCosineRescore;
@@ -1714,6 +1789,7 @@ public:
                                     const SegFieldInfo* segInfo,
                                     const SegV2D& v2d,
                                     DocSet* domain,
+                                    const RankBitmap* domainBits,
                                     int32_t dims,
                                     int32_t metric,
                                     bool normalizeColumnOnCosineRescore, const CollapsePlan* groupPlan,
@@ -1723,6 +1799,7 @@ public:
           segInfo(segInfo),
           v2d(v2d),
           domain(domain),
+          domainBits(domainBits),
           dims(dims),
           metric(metric),
           normalizeColumnOnCosineRescore(normalizeColumnOnCosineRescore) {}
@@ -1778,76 +1855,108 @@ public:
           }
           return false;
         };
+        assert(domainBits == nullptr || domainBits->numBytes == ((size_t)numVals + 7) / 8);
+        const uint8_t* domBytes = domainBits != nullptr ? domainBits->bits : nullptr;
+        size_t domNumBytes = domainBits != nullptr ? domainBits->numBytes : 0;
+        // 64 ranks of the domain AND the not-pooled bits.
+        auto eligibleWord = [&](size_t w) LUXIR_INLINE {
+          uint64_t word = domBytes != nullptr ? rankbits::loadWord(domBytes, domNumBytes, w) : ~0ULL;
+          if (!elig.empty()) word &= rankbits::loadWord(elig.data(), elig.size(), w);
+          return word;
+        };
 
         // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
-        // of eligible docs, resolved through its own valDoc cursor (windows
-        // ascend).  Reads that cursor causes count as the window's cold pages,
-        // which only leans toward staying on.
+        // of eligible ranks, one bit test each.
         StrColReader& col = vr.strColReader();
         RowReadAhead::Gate gate;
         RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
                            (size_t)col.fixedValueSize(), numVals);
-        std::optional<MonoReader::BulkValues> aheadValDoc;
-        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
-        int32_t aheadDoc = -1;
-        bool aheadEligible = false;
-        auto eligibleRank = [&](int64_t r) {
-          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
-          if (doc != aheadDoc) {
-            aheadDoc = doc;
-            aheadEligible = docEligible(doc);
-          }
-          return aheadEligible;
+        auto rankEligible = [&](int64_t r) {
+          return ((eligibleWord((size_t)(r >> 6)) >> (r & 63)) & 1) != 0;
         };
         auto readAhead = [&](int64_t rank) LUXIR_INLINE {
-          if (domain == nullptr) ahead.scanAt(rank);
-          else ahead.scanAt(rank, eligibleRank);
+          if (domBytes == nullptr && elig.empty()) ahead.scanAt(rank);
+          else ahead.scanAt(rank, rankEligible);
         };
 
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
-        // pass.  liveDocs/domain are applied as a per-run predicate.
+        // pass.  Eligibility comes from the rank bitmaps, never a per-row
+        // domain lookup: all-zero words are skipped whole and all-ones words
+        // score their 64 rows without testing a bit.
         auto scan = [&](auto emit) {
           if (v2d.mono != nullptr) {
-            MonoReader::BulkValues valDoc(*v2d.mono);
-            int64_t idx = valDoc.next();
-            int64_t rank = 0;
-            while (rank < numVals) {
-              int32_t docId = (int32_t)valDoc.value();
-              int64_t end = rank;
-              do {
-                end++;
-                idx = valDoc.next();
-              } while (end < numVals && (int32_t)valDoc.value() == docId);
-              unused(idx);
+            auto emitRun = [&](int32_t docId, int64_t rank, int64_t end) LUXIR_INLINE {
               readAhead(rank);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
-                eligibleDocs++;
-                emit(docId, [&]() LUXIR_INLINE {
-                  if constexpr (Groups) scanned += end - rank;
-                  auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
-                    return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                      normalizeColumnOnCosineRescore, 0.0f);
-                  });
-                  return VectorEngineHit{bestScore, segOrd, bestRank};
+              if (pooledInRun(rank, end)) return;
+              eligibleDocs++;
+              emit(docId, [&]() LUXIR_INLINE {
+                if constexpr (Groups) scanned += end - rank;
+                auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
+                  return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                    normalizeColumnOnCosineRescore, 0.0f);
                 });
+                return VectorEngineHit{bestScore, segOrd, bestRank};
+              });
+            };
+            MonoReader::BulkValues valDoc(*v2d.mono);
+            if (domBytes == nullptr) {
+              int64_t idx = valDoc.next();
+              int64_t rank = 0;
+              while (rank < numVals) {
+                int32_t docId = (int32_t)valDoc.value();
+                int64_t end = rank;
+                do {
+                  end++;
+                  idx = valDoc.next();
+                } while (end < numVals && (int32_t)valDoc.value() == docId);
+                unused(idx);
+                emitRun(docId, rank, end);
+                rank = end;
               }
-              rank = end;
+            } else {
+              // The domain is doc level, so an eligible doc's run is all set
+              // bits; jump between set bits and walk each run's extent.
+              int64_t rank = rankbits::nextSet(domBytes, domNumBytes, numVals, 0);
+              while (rank < numVals) {
+                int32_t docId = (int32_t)valDoc.valueAt(rank);
+                int64_t end = rank + 1;
+                while (end < numVals && domainBits->test(end)
+                       && (int32_t)valDoc.valueAt(end) == docId) {
+                  end++;
+                }
+                emitRun(docId, rank, end);
+                rank = rankbits::nextSet(domBytes, domNumBytes, numVals, end);
+              }
             }
           } else {
-            // Single-valued (dense identity or sparse select): one-vector runs.
-            for (int64_t rank = 0; rank < numVals; rank++) {
+            // Single-valued (dense identity or sparse select): one-vector
+            // runs.  Docs mode never needs the docId; groups resolve it.
+            auto visit = [&](int64_t rank) LUXIR_INLINE {
               readAhead(rank);
-              if (pooledInRun(rank, rank + 1)) continue;
-              int32_t docId = v2d.resolve(rank);
-              if (!docEligible(docId)) continue;
               eligibleDocs++;
+              int32_t docId = Groups ? v2d.resolve(rank) : -1;
               emit(docId, [&]() LUXIR_INLINE {
                 if constexpr (Groups) scanned++;
                 return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
                     normalizeColumnOnCosineRescore, 0.0f), segOrd, rank};
               });
+            };
+            size_t numWords = ((size_t)numVals + 63) / 64;
+            for (size_t w = 0; w < numWords; w++) {
+              uint64_t word = eligibleWord(w);
+              int64_t base = (int64_t)(w * 64);
+              if (numVals - base < 64) word &= (1ULL << (numVals - base)) - 1;
+              if (word == 0) continue;
+              if (word == ~0ULL) {
+                for (int64_t rank = base; rank < base + 64; rank++) visit(rank);
+                continue;
+              }
+              do {
+                visit(base + std::countr_zero(word));
+                word &= word - 1;
+              } while (word != 0);
             }
           }
         };
@@ -1879,29 +1988,24 @@ public:
         else result.poolExhausted = eligibleDocs <= request.candidates;
         return result;
       }
-
-    private:
-      // The domain, when present, is live-filtered and is the complete
-      // eligibility predicate (PrepareContext contract); null means the
-      // segment has no deletes and no filters.
-      bool docEligible(int32_t docId) const {
-        return domain == nullptr || domain->get(docId);
-      }
     };
 
     /// One VectorEngine over all per-segment slots.  Owns the cross-segment
     /// policy so individual segments never self-allocate effort:
     ///
     ///   - Budget: request.breadth (nprobe in reference-index units) becomes
-    ///     a scan fraction P = breadth / defaultIvfNList(liveN), floored by
-    ///     min_scan_fraction.  Denominating effort in fraction-of-index makes
-    ///     it MERGE-STABLE: a raw per-segment list count would scan ~sqrt(2)x
-    ///     more before a merge than after, so a tuned query would degrade on
-    ///     the next merge through no data change.
+    ///     a scan fraction P = breadth / defaultIvfNList(eligibleN), floored
+    ///     by min_scan_fraction (scanFraction).  Denominating effort in
+    ///     fraction-of-index makes it MERGE-STABLE: a raw per-segment list
+    ///     count would scan ~sqrt(2)x more before a merge than after, so a
+    ///     tuned query would degrade on the next merge through no data
+    ///     change.  eligibleN is the live vectors for an unfiltered query and
+    ///     the filter's eligible vectors otherwise.
     ///   - Allocation: every IVF segment contributes its full centroid-sorted
     ///     list ranking; a lazy k-way merge pops the globally best list and
-    ///     charges its live size / liveN until P is spent.  Small segments
-    ///     thus get small (or zero) shares instead of equal work.
+    ///     charges its eligible size / eligibleN until P is spent.  Small
+    ///     segments thus get small (or zero) shares instead of equal work, and
+    ///     lists without an eligible member are passed over unscanned.
     ///   - Deepening: the merge heap and per-slot cursors persist across
     ///     search() calls; a breadth round just keeps popping where the last
     ///     round stopped.  Flat (column / non-IVF) slots ignore breadth.
@@ -1925,7 +2029,7 @@ public:
 
       std::vector<EngineSlot<Groups>> slots;
       int64_t totalVectors;
-      int64_t liveTotalVectors;
+      int64_t eligibleTotalVectors;
       int64_t kDocs;
       int32_t metric;
       bool parallel;
@@ -2013,7 +2117,7 @@ public:
       void ensureCoarseReady(const VectorSearchRequest& request) {
         if (coarseReady) return;
         coarseReady = true;
-        referenceBreadth = defaultIvfNList(liveTotalVectors);
+        referenceBreadth = defaultIvfNList(eligibleTotalVectors);
         runs.resize(slots.size());
         cursors.assign(slots.size(), 0);
         heads.resize(slots.size());
@@ -2026,7 +2130,7 @@ public:
 
         for (size_t i = 0; i < slots.size(); i++) {
           auto* ivf = slots[i].ivfEngine;
-          if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
+          if (ivf == nullptr || slots[i].eligibleVectorCount <= 0 || ivf->getNList() <= 0) continue;
           ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
           while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
             cursors[i]++;
@@ -2039,31 +2143,9 @@ public:
         heapSize = (int32_t)heapIndexes.size();
       }
 
-      double defaultBudget(int32_t dims) const {
-        // nprobe=0 default: probe as many lists as a SINGLE IVF index of
-        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist),
-        // times the dimension factor (defaultAnnBreadthDimFactor).  As
-        // a scan fraction that is sqrt(referenceBreadth) / referenceBreadth =
-        // 1 / sqrt(referenceBreadth) (= N^-0.25 for referenceBreadth=sqrt(N)).
-        // This depends only on the total live vector count, so it is
-        // MERGE-STABLE: repartitioning the same vectors into more or fewer
-        // segments does not move it.  Host auto-deepening grows breadth from
-        // this lean start when too few distinct live docs come back.
-        //
-        // A per-segment sum was rejected: sum_s sqrt(N_s) / sqrt(N) =
-        // sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
-        // per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
-        // keeps an S-dependent term that drifts on merges.
-        return defaultAnnBreadthDimFactor(dims)
-          / std::sqrt((double)std::max(1, referenceBreadth));
-      }
-
+      // See scanFraction for the default and its merge stability.
       double budgetForRequest(const VectorSearchRequest& request) const {
-        double p = request.breadth > 0
-          ? (double)request.breadth / (double)std::max(1, referenceBreadth)
-          : defaultBudget(request.dims);
-        p = std::max(p, (double)request.minScanFraction);
-        return std::clamp(p, 0.0, 1.0);
+        return scanFraction(request.breadth, referenceBreadth, request.dims, request.minScanFraction);
       }
 
       int32_t breadthForBudget(double p) const {
@@ -2075,49 +2157,67 @@ public:
         return std::max(1, (int32_t)breadth);
       }
 
+      using CoarsePQ = IndexedPQ<CoarseHead, CoarseHeadLess, int32_t>;
+
+      CoarsePQ coarsePQ() {
+        return CoarsePQ(std::span<CoarseHead>(heads.data(), heads.size()),
+                        std::span<int32_t>(heapIndexes.data(), heapIndexes.size()), heapSize);
+      }
+
+      // Advance the top slot's cursor past its head list (replace-top, one
+      // sift), dropping the slot once its ranking is spent.
+      void popHead(CoarsePQ& pq) {
+        int32_t slotOrd = pq.indexOfTop();
+        auto& cursor = cursors[(size_t)slotOrd];
+        const auto& run = runs[(size_t)slotOrd];
+        cursor++;
+        while (cursor < run.listIds.size() && run.listIds[cursor] < 0) cursor++;
+        if (cursor < run.listIds.size()) {
+          pq.top() = makeHead(slotOrd);
+          pq.updateTop();
+        } else {
+          pq.removeTopIndex();
+        }
+      }
+
+      // Pass over lists with no eligible member: they cost nothing, add
+      // nothing, and must not be scanned.  Run before every head is used, so
+      // the next-list hint and breadthExhausted see only useful lists.
+      void skipEmptyHeads(CoarsePQ& pq) {
+        while (pq.size() > 0
+               && slots[(size_t)pq.indexOfTop()].ivfEngine->eligibleListSize(pq.top().listId) == 0) {
+          popHead(pq);
+        }
+      }
+
       // Extend the global allocation until the requested scan fraction is
       // covered.  Lazy k-way merge over all slots' centroid-sorted runs: pop
-      // the globally closest list, charge its live size / liveN, advance that
-      // slot's cursor (replace-top, one sift), repeat.  Resumable: cursors
-      // and allocatedCost persist, so a deepen round allocates only the
-      // increment.  The epsilon absorbs float accumulation when a fraction
-      // boundary lands exactly on a list edge.
+      // the globally closest list, charge its eligible size / eligibleN,
+      // advance that slot's cursor (replace-top, one sift), repeat.
+      // Resumable: cursors and allocatedCost persist, so a deepen round
+      // allocates only the increment.  The epsilon absorbs float accumulation
+      // when a fraction boundary lands exactly on a list edge.
       void allocateToBudget(const VectorSearchRequest& request) {
         ensureCoarseReady(request);
         if (!hasIvfSlots || heapSize <= 0) return;
 
         double target = budgetForRequest(request);
-        if (allocatedCost + 1.0e-15 >= target) return;
-
-        IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
-          std::span<CoarseHead>(heads.data(), heads.size()),
-          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
-          heapSize);
+        CoarsePQ pq = coarsePQ();
+        skipEmptyHeads(pq);
         while (pq.size() > 0 && allocatedCost + 1.0e-15 < target) {
           int32_t slotOrd = pq.indexOfTop();
-          auto& head = pq.top();
-          faiss::idx_t listId = head.listId;
-          int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(listId);
+          faiss::idx_t listId = pq.top().listId;
+          int64_t eligibleSize = slots[(size_t)slotOrd].ivfEngine->eligibleListSize(listId);
 
           selectedListIds[(size_t)slotOrd].push_back(listId);
           selectedCentroidDists[(size_t)slotOrd].push_back(
             runs[(size_t)slotOrd].centroidDists[cursors[(size_t)slotOrd]]);
-          selectedListLiveSizes[(size_t)slotOrd].push_back(liveSize);
-          if (liveTotalVectors > 0) {
-            allocatedCost += (double)liveSize / (double)liveTotalVectors;
+          selectedListLiveSizes[(size_t)slotOrd].push_back(eligibleSize);
+          if (eligibleTotalVectors > 0) {
+            allocatedCost += (double)eligibleSize / (double)eligibleTotalVectors;
           }
-
-          cursors[(size_t)slotOrd]++;
-          while (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()
-                 && runs[(size_t)slotOrd].listIds[cursors[(size_t)slotOrd]] < 0) {
-            cursors[(size_t)slotOrd]++;
-          }
-          if (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()) {
-            head = makeHead(slotOrd);
-            pq.updateTop();
-          } else {
-            pq.removeTopIndex();
-          }
+          popHead(pq);
+          skipEmptyHeads(pq);
         }
         heapSize = (int32_t)pq.size();
       }
@@ -2129,14 +2229,11 @@ public:
       // makes progress even for tiny or empty lists.
       int32_t nextBreadth(const VectorSearchRequest& request) {
         if (!hasIvfSlots || heapSize <= 0) return 0;
-        IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
-          std::span<CoarseHead>(heads.data(), heads.size()),
-          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
-          heapSize);
+        CoarsePQ pq = coarsePQ();
         int32_t slotOrd = pq.indexOfTop();
-        int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(pq.top().listId);
-        double nextCost = liveTotalVectors > 0
-          ? (double)liveSize / (double)liveTotalVectors
+        int64_t eligibleSize = slots[(size_t)slotOrd].ivfEngine->eligibleListSize(pq.top().listId);
+        double nextCost = eligibleTotalVectors > 0
+          ? (double)eligibleSize / (double)eligibleTotalVectors
           : 0.0;
         double minStep = 1.0 / (double)std::max(1, referenceBreadth);
         int32_t next = breadthForBudget(std::min(1.0, allocatedCost + std::max(nextCost, minStep)));
@@ -2243,12 +2340,12 @@ public:
 
     public:
       CompositeVectorEngine(std::vector<EngineSlot<Groups>>&& slots, int64_t totalVectors,
-                            int64_t liveTotalVectors, int64_t kDocs, int32_t metric,
+                            int64_t eligibleTotalVectors, int64_t kDocs, int32_t metric,
                             bool parallel, const CollapsePlan* groupPlan,
                             std::span<const SegV2D> groupV2d) noexcept
         : groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
           totalVectors(totalVectors),
-          liveTotalVectors(liveTotalVectors),
+          eligibleTotalVectors(eligibleTotalVectors),
           kDocs(kDocs),
           metric(metric),
           parallel(parallel) {}
@@ -2352,7 +2449,7 @@ public:
           } else {
             int64_t candidates = candidatesForSlot(request.candidates, slot.vectorCount);
             if (candidates <= 0) continue;
-            units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount, candidates, false});
+            units.push_back({(int32_t)i, 0, 0, slot.eligibleVectorCount, candidates, false});
           }
         }
 
@@ -2417,6 +2514,7 @@ public:
           merged.breadthExhausted = heapSize <= 0;
           if (!merged.breadthExhausted) {
             merged.nextBreadth = nextBreadth(request);
+            merged.scannedBreadth = std::max(request.breadth, breadthForBudget(allocatedCost));
           }
         }
         return merged;
@@ -2471,7 +2569,7 @@ private:
   /// Fill `bits` with the all-set pattern for n ranks: ceil(n/8) 0xFF bytes
   /// with the tail bits past n cleared.  Every rank bitmap in this file
   /// keeps that tail invariant, so popcount(bits) == set ranks (see
-  /// RankLiveBitmap); build them through here so the mask lives once.
+  /// RankBitmap); build them through here so the mask lives once.
   static void fillAllRanksSet(std::vector<uint8_t>& bits, int64_t n) {
     bits.assign(((size_t)n + 7) / 8, (uint8_t)0xFF);
     if (n & 7) {
@@ -2479,9 +2577,10 @@ private:
     }
   }
 
-  /// Build the RankLiveBitmap (rank-space liveness + exact live vector
+  /// Build the liveness RankBitmap (rank-space liveness + exact live vector
   /// count) for one segment's vector field.  Run once per liveDocs
-  /// generation (cached on the VectorAuxReader), and sized by the segment's
+  /// generation (cached on the VectorAuxReader; per query for a segment
+  /// without an overlay), and sized by the segment's
   /// DELETED docs rather than its vectors: start all-live, walk the zero
   /// bits of liveDocs, and clear each deleted doc's rank(s), resolving
   /// doc -> rank through the has-field bitset (advance + rank) and, for
@@ -2490,9 +2589,9 @@ private:
   /// needs no walk at all: valueRank == docId, so the liveDocs words
   /// themselves are the bitmap (borrowed and pinned via backing) and the
   /// segment's cached live count is the cardinality.
-  static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
-                                            VectorReader& vr,
-                                            int64_t numVectors) {
+  static RankBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
+                                        VectorReader& vr,
+                                        int64_t numVectors, int32_t lists) {
     rankLiveBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
     LiveDocs& live = *seg.liveDocs();
     const screaming::FixedBitSet& liveBits = live.bitset();
@@ -2504,8 +2603,14 @@ private:
       static_assert(std::endian::native == std::endian::little,
                     "liveDocs words double as the LSB-first byte bitmap");
       assert((int64_t)live.size() == numVectors);
-      return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
-              seg.liveDocsShared()};
+      RankBitmap result;
+      result.bits = (const uint8_t*)liveBits.words;
+      result.numBytes = numBytes;
+      result.count = (int64_t)live.numLive();
+      result.docs = result.count;
+      result.backing = seg.liveDocsShared();
+      if (lists > 0) result.enableListCounts(lists);
+      return result;
     }
 
     auto owned = std::make_shared<std::vector<uint8_t>>();
@@ -2545,34 +2650,99 @@ private:
         clearRanks(begin, end);
       });
     }
-    const uint8_t* data = bits.data();
-    return {data, numBytes, numVectors - cleared, std::move(owned)};
+    RankBitmap result;
+    result.bits = bits.data();
+    result.numBytes = numBytes;
+    result.count = numVectors - cleared;
+    result.backing = std::move(owned);
+    if (lists > 0) result.enableListCounts(lists);
+    return result;
   }
 
-  /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
-  /// denominator (referenceBreadth, list-cost normalization) and the
-  /// targetDocReq cap for segments with no cached exact count: flat
-  /// (aux-less) segments under deletes.  FAISS segments under deletes use
-  /// the exact cardinality the cached RankLiveBitmap carries instead - the
-  /// count is amortized into the per-liveGen bitmap build, where computing
-  /// it here would re-walk the field on EVERY query, O(N_seg) bookkeeping
-  /// to budget a search that examines ~N^0.75 vectors at the default.  An
-  /// upper bound is the safe direction to relax: overestimating only makes
-  /// the scan fraction leaner and targetDocReq higher, and host deepening
-  /// compensates (the same stance as cost accounting ignoring the domain
-  /// filter).  UNDERestimating is not safe: targetDocReq = min(liveTotal,
-  /// ...) would stop the widen loop before K achievable docs.  Exact for
-  /// no-deletes and for dense single-valued (identity mapping => live count
-  /// == numLive).
-  static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
-                                      VectorReader& vr) {
-    LiveDocs* live = segment.liveDocs();
-    if (live == nullptr) return vr.numVectors();
-    if (!vr.isMultiValued()) {
-      // Each live doc holds at most one vector.
-      return std::min<int64_t>(vr.numVectors(), live->numLive());
+  /// Visit the members of a doc set in ascending order.
+  template <typename F>
+  static void forEachDoc(DocSet& docs, F&& f) {
+    if (docs.type == DocSet::BITSET) {
+      const auto& bits = ((const BitDocSet&)docs).bits();
+      int32_t size = bits.size();
+      screaming::FixedBitSet::visitOnes(bits.words,
+          (int32_t)screaming::FixedBitSet::sizeInWords(size), [&](int32_t d) {
+        if (d < size) f(d);
+      });
+    } else {
+      for (int32_t d : ((const ArrDocSet&)docs).docs()) f(d);
     }
-    return vr.numVectors();
+  }
+
+  /// Build the rank-space form of a filtered (live-folded) domain for one
+  /// segment's vector field: bit r is set iff the doc owning rank r is in
+  /// the domain, plus its eligible vector and doc counts.  Run once per
+  /// (filter key, liveDocs generation) when cached on the overlay, else once
+  /// per query.  The doc -> rank mapping mirrors buildRankLiveBitmap:
+  ///   - dense single-valued: identity; a bitset domain is copied word for
+  ///     word, an array domain sets its docs' bits;
+  ///   - sparse (has-field bitset): the doc's rank among docs with the
+  ///     field.  A domain far smaller than the field drives the walk
+  ///     (advance + rank per member); otherwise the field's docs are walked
+  ///     in order (rank is the walk position) and probed against the domain;
+  ///   - multi-valued: each member's [start, end) value-rank range, set a
+  ///     word at a time.
+  /// Cost is O(numVectors / 64 + members), not a per-rank lookup.
+  static RankBitmap buildDomainRankBitmap(VectorReader& vr, int64_t numVectors, DocSet& domain,
+                                          int32_t lists) {
+    filterRankBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
+    auto owned = rankbits::zeroWords(numVectors);
+    uint64_t* words = owned->data();
+    size_t numWords = owned->size();
+    StrColReader& col = vr.strColReader();
+    const bool multi = vr.isMultiValued();
+    auto& dr = col.docsReader();
+    int64_t docs = 0;
+    auto addDoc = [&](int32_t docRank) LUXIR_INLINE {
+      docs++;
+      if (multi) {
+        auto [begin, end] = col.getStartEndValueRank(docRank);
+        rankbits::setRange(words, begin, end);
+      } else {
+        words[(size_t)docRank >> 6] |= 1ULL << (docRank & 63);
+      }
+    };
+    if (!dr.hasBitset()) {
+      // Every doc has the field: docRank == docId.
+      int32_t fieldDocs = vr.docsWithValue();
+      if (!multi && domain.type == DocSet::BITSET) {
+        const auto& bits = ((const BitDocSet&)domain).bits();
+        size_t copyWords = std::min(numWords, (size_t)screaming::FixedBitSet::sizeInWords(bits.size()));
+        std::memcpy(words, bits.words, copyWords * sizeof(uint64_t));
+        if (numVectors & 63) words[numWords - 1] &= (1ULL << (numVectors & 63)) - 1;
+        docs = rankbits::popcount(words, numWords);
+      } else {
+        forEachDoc(domain, [&](int32_t d) { if (d < fieldDocs) addDoc(d); });
+      }
+    } else {
+      screaming::BitSet::Iterator fieldIt(dr.bitset());
+      if ((int64_t)domain.card() * 8 < (int64_t)vr.docsWithValue()) {
+        int32_t fieldDoc = -1;  // last doc-with-field landed on (END once drained)
+        forEachDoc(domain, [&](int32_t d) {
+          if (fieldDoc < d) fieldDoc = fieldIt.advance(d);
+          if (fieldDoc == d) addDoc(fieldIt.rank());
+        });
+      } else {
+        DocSetProbe probe(&domain);
+        int32_t rank = 0;
+        for (int32_t d = fieldIt.next(); d != screaming::BitSet::END; d = fieldIt.next(), rank++) {
+          if (probe.get(d)) addDoc(rank);
+        }
+      }
+    }
+    RankBitmap result;
+    result.bits = (const uint8_t*)words;
+    result.numBytes = ((size_t)numVectors + 7) / 8;
+    result.count = multi ? rankbits::popcount(words, numWords) : docs;
+    result.docs = docs;
+    result.backing = std::move(owned);
+    if (lists > 0) result.enableListCounts(lists);
+    return result;
   }
 
   /// Max-sim collapse of one doc's run of doc-ordered vector positions: scores
@@ -2896,6 +3066,21 @@ private:
     double want = std::ceil((double)kReq * (double)kDocs / (double)denom * 1.3);
     if (want >= (double)cap) return cap;
     return (int64_t)want;
+  }
+
+  /// Breadth projection for a breadth round, the breadth analog of
+  /// projectedKReq: scanned breadth * (target docs / pooled docs) plus the
+  /// same slack, growing at least 1x and at most MAX_BREADTH_GROWTH per round
+  /// (the cap when nothing is pooled yet).  A pure function of
+  /// counts, so serial and parallel runs deepen identically.  0 when the
+  /// engine reports no scanned breadth (no IVF slots).
+  static int32_t projectedBreadth(int32_t scannedBreadth, int64_t pooled, int64_t target) {
+    if (scannedBreadth <= 0) return 0;
+    double growth = pooled > 0 ? (double)target / (double)pooled * 1.3 : MAX_BREADTH_GROWTH;
+    growth = std::clamp(growth, 1.0, MAX_BREADTH_GROWTH);
+    double want = std::ceil((double)scannedBreadth * growth);
+    if (want >= (double)std::numeric_limits<int32_t>::max()) return std::numeric_limits<int32_t>::max();
+    return (int32_t)want;
   }
 
 };

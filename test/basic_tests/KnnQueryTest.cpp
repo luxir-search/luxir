@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -1888,11 +1889,10 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
 }
 
 // Filtered query on an IVF segment with deletes: the domain is filter
-// intersect liveDocs (NOT the liveDocs docset itself), so eligibility goes
-// through the resolve-based selector while the allocator's live accounting
-// reads the cached bitmap.  Per the live-filtered domain contract the
-// engines never re-check liveDocs - a violation would surface the deleted
-// doc here.
+// intersect liveDocs (NOT the liveDocs docset itself), so eligibility is the
+// filter's rank bitmap, which must carry the liveness the domain folded in.
+// Per the live-filtered domain contract the engines never re-check liveDocs -
+// a violation would surface the deleted doc here.
 TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
@@ -2632,10 +2632,19 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
     return req;
   };
 
+  // The red list holds no eligible vector, so it is skipped rather than
+  // charged against nprobe: nprobe=1 probes the nearest list holding a blue
+  // vector, and the cap still holds it to that one list.
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  KnnQuery::exactFallbackCostRatio = 0.0;
+  KnnQuery::Stats stats;
+  SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
   auto* capped = buildBlue(/*nprobe=*/1);
   capped->execute();
-  EXPECT_EQ(capped->getMatchCount(), 0)
-      << "request nprobe=1 should cap breadth and not broaden into the blue list";
+  KnnQuery::statsForTests = nullptr;
+  EXPECT_EQ(capped->getMatchCount(), 3);
+  EXPECT_EQ(stats.lists.load(), 1) << "request nprobe=1 caps breadth at one eligible list";
   capped->done();
 
   auto* broaden = buildBlue(/*nprobe=*/0);
@@ -3106,4 +3115,306 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     EXPECT_TRUE(a.equals(c));
     EXPECT_EQ(a.hash(), c.hash());
   }
+}
+
+// Filtered kNN: the filter domain becomes a rank-space bitmap that drives
+// FAISS (IDSelectorBitmap), the column scan, the per-list eligible counts and
+// the plan (zero-eligible segments and lists skipped, exact fallback, targets
+// capped by the eligible count).
+class KnnFilterTest : public KnnQueryTest {
+protected:
+  struct Run {
+    std::vector<std::string> ids;
+    std::vector<float> scores;
+  };
+
+  static Run runFiltered(LuxirNode& node, std::string_view field, std::vector<float> query,
+                         int32_t k, std::string_view color, bool exact,
+                         float minScanFraction = 0.0f, bool parallel = false) {
+    auto* req = LocalReq::create(node.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, field, query, k, /*nprobe=*/0, /*refineCandidates=*/exact ? 0 : 400,
+              exact, minScanFraction);
+    addMatchFilter(cur, "color_s", color);
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->toString();
+    Run run{resultIds(*req), resultScores(*req)};
+    req->done();
+    return run;
+  }
+
+  // Doc i of a segment: x = offset + i, red when red(i).  Sparse fields drop
+  // the vector from every fifth doc; multi-valued docs hold two vectors.
+  enum class Shape { DENSE, SPARSE, MULTI };
+
+  static void indexSegment(CollectionHelper& h, Shape shape, std::string_view prefix, int count,
+                           float offset, const std::function<bool(int)>& red) {
+    for (int i = 0; i < count; i++) {
+      std::string id = std::string(prefix) + std::to_string(i);
+      std::string color = red(i) ? "red" : "blue";
+      float x = offset + (float)i;
+      if (shape == Shape::MULTI) {
+        h.index(flatdoc("id", id, "color_s", color, "emb_vs",
+                        std::vector<std::vector<float>>{{x, 0.0f, 0.0f, 0.0f}, {x, 1.0f, 0.0f, 0.0f}}));
+      } else if (shape == Shape::SPARSE && i % 5 == 4) {
+        h.index(flatdoc("id", id, "color_s", color));
+      } else {
+        h.index(flatdoc("id", id, "color_s", color, "emb_v", std::vector<float>{x, 0.0f, 0.0f, 0.0f}));
+      }
+    }
+  }
+};
+
+// Every field shape over an IVF segment, an IVF segment the filter excludes
+// entirely, and a flat segment, with a delete: the exhaustive approximate
+// search matches the exact contract with the IVF path forced and with the
+// exact fallback, for an array-sized and a bitset-sized filter, and parallel
+// runs are bit-identical to serial ones.
+TEST_F(KnnFilterTest, filteredMatchesExactAcrossFieldShapes) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  CollectionHelper h("main");
+  for (Shape shape : {Shape::DENSE, Shape::SPARSE, Shape::MULTI}) {
+    h.clear();
+    std::string field = shape == Shape::MULTI ? "emb_vs" : "emb_v";
+    if (shape == Shape::MULTI) installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    else installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    indexSegment(h, shape, "a", 220, 0.0f, [](int i) { return i % 3 == 0; });
+    h.commit({"*"});
+    indexSegment(h, shape, "b", 220, 0.25f, [](int) { return false; });
+    h.commit({"*"});
+    indexSegment(h, shape, "c", 30, 60.5f, [](int i) { return i % 2 == 0; });
+    h.commit();
+    {
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(reader->segments().size(), 3u);
+      ASSERT_NE(reader->segments()[0].getAuxReader("vec." + field), nullptr);
+      ASSERT_NE(reader->segments()[1].getAuxReader("vec." + field), nullptr);
+      ASSERT_EQ(reader->segments()[2].getAuxReader("vec." + field), nullptr);
+    }
+    std::vector<std::string> dels{"a60"};
+    h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+    std::vector<float> query{60.2f, 0.0f, 0.0f, 0.0f};
+    for (std::string_view color : {"red", "blue"}) {
+      auto exact = runFiltered(*luxirNode, field, query, 8, color, true);
+      ASSERT_EQ(exact.ids.size(), 8u);
+      for (double ratio : {0.0, 1.0}) {
+        KnnQuery::exactFallbackCostRatio = ratio;
+        auto serial = runFiltered(*luxirNode, field, query, 8, color, false, 1.0f, false);
+        auto parallel = runFiltered(*luxirNode, field, query, 8, color, false, 1.0f, true);
+        EXPECT_EQ(serial.ids, exact.ids) << color << " ratio " << ratio;
+        EXPECT_EQ(serial.scores, exact.scores) << color << " ratio " << ratio;
+        EXPECT_EQ(parallel.ids, serial.ids);
+        EXPECT_EQ(parallel.scores, serial.scores);
+        EXPECT_EQ(std::find(serial.ids.begin(), serial.ids.end(), "a60"), serial.ids.end());
+        if (color == "red") {
+          for (const auto& id : serial.ids) EXPECT_NE(id[0], 'b') << "segment b has no red docs";
+        }
+      }
+    }
+  }
+}
+
+// The default exact-fallback ratio, at the shapes it was calibrated on
+// (50k 64-d vectors per segment, 223 lists, 16-byte RaBitQ-1 codes, the
+// round-1 scan fraction of each eligible total): 1% and 5% filters score
+// exactly, a 10% filter keeps the IVF path.
+TEST_F(KnnFilterTest, defaultExactFallbackCoversFivePercentFilters) {
+  EXPECT_TRUE(KnnQuery::exactCheaperThanIvf(500, 50'000, 223, 16, 64, 0.1508));
+  EXPECT_TRUE(KnnQuery::exactCheaperThanIvf(2'500, 50'000, 223, 16, 64, 0.1008));
+  EXPECT_FALSE(KnnQuery::exactCheaperThanIvf(5'000, 50'000, 223, 16, 64, 0.0842));
+}
+
+// A filter matching fewer docs than k returns exactly those docs: the doc
+// target is capped by the eligible count, so the IVF path stops once they are
+// pooled instead of deepening through every list, and with the fallback on
+// the few eligible rows are scored exactly instead.
+TEST_F(KnnFilterTest, selectiveFilterReturnsAllMatchesInFewRounds) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 640, 0.0f, [](int i) { return i % 211 == 7; });
+  h.commit({"*"});
+  auto exact = runFiltered(*luxirNode, "emb_v", {300.0f, 0.0f, 0.0f, 0.0f}, 10, "red", true);
+  ASSERT_EQ(exact.ids.size(), 3u);  // a7, a218, a429
+
+  for (double ratio : {0.0, 1.0}) {
+    KnnQuery::exactFallbackCostRatio = ratio;
+    int64_t fallbacks = KnnQuery::exactFallbackSegmentsForTests.load();
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto run = runFiltered(*luxirNode, "emb_v", {300.0f, 0.0f, 0.0f, 0.0f}, 10, "red", false);
+    KnnQuery::statsForTests = nullptr;
+    EXPECT_EQ(run.ids, exact.ids) << ratio;
+    EXPECT_LE(stats.rounds.load(), 2) << ratio;
+    EXPECT_EQ(KnnQuery::exactFallbackSegmentsForTests.load() > fallbacks, ratio > 0.0);
+  }
+}
+
+// A filter correlated with the vectors keeps its members in a few IVF lists;
+// even an exhaustive scan visits only lists holding an eligible vector.  A
+// uniform 5% filter reaches its eligible docs in a few breadth rounds: breadth
+// grows from the observed yield, not one reference list per round.
+TEST_F(KnnFilterTest, filterSkipsEmptyListsAndGrowsBreadthByYield) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  KnnQuery::exactFallbackCostRatio = 0.0;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
+  auto measure = [&](std::vector<float> query, float minScanFraction, KnnQuery::Stats& stats) {
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    return runFiltered(*luxirNode, "emb_v", query, 10, "red", false, minScanFraction).ids;
+  };
+  std::vector<float> query{20.0f, 0.0f, 0.0f, 0.0f};
+
+  indexSegment(h, Shape::DENSE, "a", 640, 0.0f, [](int i) { return i < 40; });
+  h.commit({"*"});
+  KnnQuery::Stats all, filtered;
+  {
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &all;
+    auto* req = makeKnnReq(*luxirNode, "emb_v", query, 10, 0, 400, false, 1.0f);
+    req->execute();
+    req->done();
+  }
+  auto ids = measure(query, 1.0f, filtered);
+  EXPECT_EQ(ids, runFiltered(*luxirNode, "emb_v", query, 10, "red", true).ids);
+  EXPECT_GT(all.lists.load(), filtered.lists.load()) << "lists without red vectors are skipped";
+
+  h.clear();
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 640, 0.0f, [](int i) { return i % 20 == 3; });
+  h.commit({"*"});
+  KnnQuery::Stats deep;
+  ids = measure(query, 0.0f, deep);
+  EXPECT_EQ(ids, runFiltered(*luxirNode, "emb_v", query, 10, "red", true).ids);
+  EXPECT_LE(deep.rounds.load(), 3);
+}
+
+// The rank-space filter domain is built once per (filter, liveDocs
+// generation) and cached on the overlay: a repeat query reuses it, a delete
+// or a different filter builds anew.
+TEST_F(KnnFilterTest, filterRankBitmapCachedPerFilterAndLiveGen) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 200, 0.0f, [](int i) { return i % 2 == 0; });
+  h.commit({"*"});
+  std::vector<float> query{50.2f, 0.0f, 0.0f, 0.0f};
+  auto builds = [] { return KnnQuery::filterRankBitmapBuildsForTests.load(); };
+
+  int64_t start = builds();
+  auto first = runFiltered(*luxirNode, "emb_v", query, 5, "red", false);
+  EXPECT_EQ(builds(), start + 1);
+  EXPECT_EQ(runFiltered(*luxirNode, "emb_v", query, 5, "red", false).ids, first.ids);
+  EXPECT_EQ(builds(), start + 1) << "repeat filter reuses the cached bitmap";
+  runFiltered(*luxirNode, "emb_v", query, 5, "blue", false);
+  EXPECT_EQ(builds(), start + 2) << "another filter builds its own";
+
+  std::vector<std::string> dels{first.ids[0]};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  auto after = runFiltered(*luxirNode, "emb_v", query, 5, "red", false);
+  EXPECT_EQ(builds(), start + 3) << "a new liveDocs generation rebuilds";
+  EXPECT_EQ(std::find(after.ids.begin(), after.ids.end(), first.ids[0]), after.ids.end());
+  EXPECT_EQ(after.ids, runFiltered(*luxirNode, "emb_v", query, 5, "red", true).ids);
+}
+
+// Edge cardinalities of the rank-space filter, in every field shape: no
+// eligible doc (no engine, no hits, nothing scanned), exactly one eligible doc
+// (that doc, with its exact score), and a filter admitting every doc (equal to
+// the unfiltered exact search, with the approximate path forced).
+TEST_F(KnnFilterTest, filterEdgeCardinalitiesMatchExact) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  CollectionHelper h("main");
+  std::vector<float> query{120.0f, 0.0f, 0.0f, 0.0f};
+  for (Shape shape : {Shape::DENSE, Shape::SPARSE, Shape::MULTI}) {
+    h.clear();
+    std::string field = shape == Shape::MULTI ? "emb_vs" : "emb_v";
+    if (shape == Shape::MULTI) installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    else installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    indexSegment(h, shape, "a", 300, 0.0f, [](int i) { return i == 133; });
+    indexSegment(h, shape, "b", 300, 300.0f, [](int) { return false; });
+    h.commit({"*"});
+    for (double ratio : {0.0, 1.0}) {
+      KnnQuery::exactFallbackCostRatio = ratio;
+      KnnQuery::Stats stats;
+      SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+      KnnQuery::statsForTests = &stats;
+      auto none = runFiltered(*luxirNode, field, query, 5, "green", false);
+      KnnQuery::statsForTests = nullptr;
+      EXPECT_TRUE(none.ids.empty());
+      EXPECT_EQ(stats.lists.load() + stats.vectors.load(), 0);
+
+      auto one = runFiltered(*luxirNode, field, query, 5, "red", false);
+      EXPECT_EQ(one.ids, std::vector<std::string>{"a133"}) << ratio;
+      EXPECT_EQ(one.ids, runFiltered(*luxirNode, field, query, 5, "red", true).ids);
+    }
+    // Every doc of segment b is blue: its filtered top-k is the unfiltered one.
+    std::vector<float> farQuery{600.0f, 0.0f, 0.0f, 0.0f};
+    auto* req = makeKnnReq(*luxirNode, field, farQuery, 8, 0, 0, true);
+    req->execute();
+    auto exact = resultIds(*req);
+    req->done();
+    KnnQuery::exactFallbackCostRatio = 0.0;
+    auto every = runFiltered(*luxirNode, field, farQuery, 8, "blue", false, 1.0f);
+    EXPECT_EQ(every.ids, exact);
+  }
+}
+
+// A filter bitmap cached for one segment set stays correct after a commit adds
+// a segment whose nearest red docs beat the cached ones, and after a delete of
+// one of them: each query equals the exact filtered top-k.
+TEST_F(KnnFilterTest, cachedFilterStaysExactAcrossCommits) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 240, 0.0f, [](int i) { return i % 2 == 0; });
+  h.commit({"*"});
+  std::vector<float> query{100.2f, 0.0f, 0.0f, 0.0f};
+  auto check = [&](std::string_view when) {
+    auto approx = runFiltered(*luxirNode, "emb_v", query, 6, "red", false);
+    EXPECT_EQ(approx.ids, runFiltered(*luxirNode, "emb_v", query, 6, "red", true).ids) << when;
+    return approx;
+  };
+  auto before = check("first");
+  EXPECT_EQ(check("repeat").ids, before.ids);
+
+  indexSegment(h, Shape::DENSE, "b", 40, 100.0f, [](int i) { return i % 3 == 0; });
+  h.commit({"*"});
+  auto after = check("after commit");
+  EXPECT_NE(after.ids, before.ids);
+
+  std::vector<std::string> dels{after.ids[0]};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  auto deleted = check("after delete");
+  EXPECT_EQ(std::find(deleted.ids.begin(), deleted.ids.end(), after.ids[0]), deleted.ids.end());
+}
+
+// Deleting the only doc a filter admits leaves an empty eligible set: the
+// liveness folded into the filter domain is what empties it, so the query
+// returns nothing and scans nothing, with or without a cached filter bitmap.
+TEST_F(KnnFilterTest, deletingLastEligibleDocEmptiesFilter) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 200, 0.0f, [](int i) { return i == 77; });
+  h.commit({"*"});
+  std::vector<float> query{77.2f, 0.0f, 0.0f, 0.0f};
+  EXPECT_EQ(runFiltered(*luxirNode, "emb_v", query, 5, "red", false).ids, std::vector<std::string>{"a77"});
+
+  std::vector<std::string> dels{"a77"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  KnnQuery::Stats stats;
+  SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
+  EXPECT_TRUE(runFiltered(*luxirNode, "emb_v", query, 5, "red", false).ids.empty());
+  EXPECT_TRUE(runFiltered(*luxirNode, "emb_v", query, 5, "red", true).ids.empty());
+  EXPECT_EQ(stats.lists.load() + stats.vectors.load(), 0);
 }

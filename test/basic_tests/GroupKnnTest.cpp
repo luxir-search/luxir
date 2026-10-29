@@ -209,6 +209,9 @@ TEST_F(GroupKnnTest, reportsExhaustionAndCapsAndRejectsMissingScope) {
 }
 
 TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
+  // The filtered query below exercises the IVF path, not the exact fallback.
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  KnnQuery::exactFallbackCostRatio = 0.0;
   CollectionHelper helper;
   for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4)}) {
     helper.clear();
@@ -255,6 +258,9 @@ TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
 
 TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
   IvfTestGuard ivf;
+  // Filtered rounds must probe the overlay, not take the exact fallback.
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  KnnQuery::exactFallbackCostRatio = 0.0;
   CollectionHelper helper;
   constexpr int dims = 16;
   schema(helper, api::VectorMetric::IP, rabitqAnn(4, 4), dims);

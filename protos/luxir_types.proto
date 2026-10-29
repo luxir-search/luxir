@@ -413,11 +413,11 @@ message KnnQuery {
 
   // Search effort for IVF indexes.
   message Ivf {
-    // Merge-stable IVF effort: lists to probe if this field were one IVF index
-    // with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap
-    // search effort.
+    // Merge-stable IVF effort: lists to probe if the eligible vectors (live,
+    // and matching any filter) were one IVF index with nlist=sqrt(eligible
+    // vectors). 0 = adaptive default; positive values cap search effort.
     int32 nprobe = 1;
-    // Minimum fraction of live vectors to scan, in [0,1]. 0 = no floor.
+    // Minimum fraction of eligible vectors to scan, in [0,1]. 0 = no floor.
     float min_scan_fraction = 2;
   }
 }

@@ -33,7 +33,8 @@ struct VectorSearchRequest {
   // Domain filtering is supplied by engine construction today.  Flat FAISS
   // receives it through SearchParameters::sel instead of per request state.
   int32_t breadth = 0;
-  // Floor on the fraction of live vectors the engine examines, in [0,1];
+  // Floor on the fraction of eligible vectors (live, admitted by the
+  // domain) the engine examines, in [0,1];
   // raises the effective breadth when breadth maps below it.  1.0 forces a
   // full scan.  Exact engines satisfy it trivially.
   float minScanFraction = 0.0f;
@@ -101,6 +102,9 @@ struct VectorSearchResult {
   // Engine's hint for the next useful breadth value (the smallest one that
   // adds work).  0 = no hint; the host then steps breadth by 1.
   int32_t nextBreadth = 0;
+  // The breadth (same units) that the effort allocated so far amounts to,
+  // for the host's yield-based breadth projection.  0 = unknown.
+  int32_t scannedBreadth = 0;
 };
 
 /// Seam between the host widen/refine loop (KnnQuery::Weight::prepare) and a

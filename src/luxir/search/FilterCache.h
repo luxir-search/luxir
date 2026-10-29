@@ -434,6 +434,7 @@ public:
     bool wasAdmitted() const { return admitted; }
     bool hasAcceptedExisting() const { return existingAccepted; }
     FilterKeyScope scope() const { return scope_; }
+    const FilterKey& filterKey() const { return key; }
     const void* entryIdentityForTest() const { return entry.get(); }
     size_t ownedBytesForTest();
   };

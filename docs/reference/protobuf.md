@@ -1460,8 +1460,8 @@ Search effort for IVF indexes.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if this field were one IVF index with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap search effort. |
-| <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of live vectors to scan, in \[0,1\]. 0 = no floor. |
+| <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if the eligible vectors (live, and matching any filter) were one IVF index with nlist=sqrt(eligible vectors). 0 = adaptive default; positive values cap search effort. |
+| <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of eligible vectors to scan, in \[0,1\]. 0 = no floor. |
 
 <a id="message-luxir.linearfusion"></a>
 

@@ -27,7 +27,9 @@
 #include <vector>
 
 #include "AuxReader.h"
+#include "RankBitmap.h"
 #include "luxir/api/luxir_index.hpp"
+#include "luxir/search/FilterKey.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
@@ -256,22 +258,6 @@ public:
   }
 };
 
-/// Rank-space liveness for one segment's vector field, cached per liveDocs
-/// generation: bit r is set iff the doc owning vector rank r is live, in the
-/// LSB-first byte layout faiss::IDSelectorBitmap consumes, plus the exact
-/// live vector cardinality so consumers never recount it.  Bits past
-/// numVectors in the final byte are zero, so popcount(bits) == liveVectors.
-/// `bits` points either into bytes owned by `backing` or directly at the
-/// segment's liveDocs words (dense single-valued fields: valueRank == docId,
-/// and the little-endian byte view of the words IS this layout); either way
-/// `backing` pins the storage for as long as a query holds the bitmap.
-struct RankLiveBitmap {
-  const uint8_t* bits;
-  size_t numBytes;
-  int64_t liveVectors;
-  std::shared_ptr<const void> backing;
-};
-
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
 /// lazily decoded from the single eagerly-opened file referenced by
 /// AuxIndexInfo.files(0), plus the VectorAuxMeta decoded out of
@@ -297,7 +283,7 @@ class VectorAuxReader : public AuxReader {
   // (shared across overlays by internVectorRotation); null otherwise.
   mutable std::shared_ptr<const faiss::LinearTransform> rotation;
   VectorAuxMeta meta;
-  // Cached RankLiveBitmap (built by KnnQuery).  Built once per liveDocs
+  // Cached rank-space liveness (built by KnnQuery).  Built once per liveDocs
   // generation - in time proportional to the segment's DELETED docs, not its
   // vectors - and shared by every query against this (segment, field): the
   // FAISS eligibility selector for unfiltered queries and the allocator's
@@ -307,7 +293,20 @@ class VectorAuxReader : public AuxReader {
   // version with newer deletes rebuilds.
   mutable std::mutex rankLiveMutex;
   mutable uint64_t rankLiveGen = 0;
-  mutable std::shared_ptr<const RankLiveBitmap> rankLive;
+  mutable std::shared_ptr<const RankBitmap> rankLive;
+  // Cached rank-space filter domains (liveness folded in), keyed by the
+  // filter's segment-stable key and the liveDocs generation, with their
+  // per-list eligible counts.  A small LRU: repeated filters (a tenant, a
+  // category) hit; one-off filters age out.
+  struct FilterRankEntry {
+    FilterKey key;
+    uint64_t liveGen;
+    std::shared_ptr<const RankBitmap> bitmap;
+    uint64_t used;
+  };
+  mutable std::mutex filterRankMutex;
+  mutable std::vector<FilterRankEntry> filterRanks;
+  mutable uint64_t filterRankClock = 0;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -445,20 +444,67 @@ public:
     return faissIndex.get();
   }
 
-  /// Get-or-build the RankLiveBitmap for the given liveDocs generation.
+  /// Get-or-build the liveness RankBitmap for the given liveDocs generation.
   /// build() runs at most once per generation (under the lock; concurrent
   /// first callers wait rather than duplicate the walk) and returns a
-  /// RankLiveBitmap whose backing keeps the bits valid for as long as any
-  /// query holds the shared_ptr.
+  /// RankBitmap whose backing keeps the bits valid for as long as any query
+  /// holds the shared_ptr.
   template <typename Build>
-  std::shared_ptr<const RankLiveBitmap> rankLiveBitmap(uint64_t liveGen,
-                                                       Build&& build) const {
+  std::shared_ptr<const RankBitmap> rankLiveBitmap(uint64_t liveGen,
+                                                   Build&& build) const {
     std::lock_guard<std::mutex> lock(rankLiveMutex);
     if (rankLive == nullptr || rankLiveGen != liveGen) {
-      rankLive = std::make_shared<const RankLiveBitmap>(build());
+      rankLive = std::make_shared<const RankBitmap>(build());
       rankLiveGen = liveGen;
     }
     return rankLive;
+  }
+
+  /// Entries the filter-domain cache keeps per (segment, field).  Each holds
+  /// numVectors / 8 bytes plus 8 bytes per IVF list.  Mutable for tests.
+  static inline size_t filterRankCacheEntries = 8;
+
+  /// Get-or-build the rank-space filter domain named by key (a segment-stable
+  /// filter key, see PrepareContext::domainKey) at the given liveDocs
+  /// generation.  Builds run outside the lock, so a concurrent first miss may
+  /// build twice; both results are equal and the later insert is dropped.
+  template <typename Build>
+  std::shared_ptr<const RankBitmap> filterRankBitmap(const FilterKey& key, uint64_t liveGen,
+                                                     Build&& build) const {
+    {
+      std::lock_guard<std::mutex> lock(filterRankMutex);
+      for (auto& entry : filterRanks) {
+        if (entry.liveGen == liveGen && entry.key == key) {
+          entry.used = ++filterRankClock;
+          return entry.bitmap;
+        }
+      }
+    }
+    auto built = std::make_shared<const RankBitmap>(build());
+    if (filterRankCacheEntries == 0) return built;
+    std::lock_guard<std::mutex> lock(filterRankMutex);
+    for (auto& entry : filterRanks) {
+      if (entry.liveGen == liveGen && entry.key == key) return entry.bitmap;
+    }
+    // Entries of an older generation are dead for new readers; evict them
+    // first, then the least recently used.
+    if (filterRanks.size() >= filterRankCacheEntries) {
+      auto victim = std::min_element(filterRanks.begin(), filterRanks.end(),
+          [liveGen](const FilterRankEntry& a, const FilterRankEntry& b) {
+            bool aStale = a.liveGen != liveGen, bStale = b.liveGen != liveGen;
+            if (aStale != bStale) return aStale;
+            return a.used < b.used;
+          });
+      *victim = FilterRankEntry{key, liveGen, built, ++filterRankClock};
+    } else {
+      filterRanks.push_back(FilterRankEntry{key, liveGen, built, ++filterRankClock});
+    }
+    return built;
+  }
+
+  size_t filterRankCacheSizeForTests() const {
+    std::lock_guard<std::mutex> lock(filterRankMutex);
+    return filterRanks.size();
   }
 
   /// Open the FAISS index referenced by `info`.  Returns nullptr when the

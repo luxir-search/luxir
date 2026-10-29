@@ -1618,15 +1618,27 @@ public:
     /// prepare() implementation may then spawn internal worker tasks, provided
     /// they are joined before prepare() returns.  false means the request is
     /// serial and prepare() must not spawn tasks.
+    ///
+    /// domainKey, when set, names the domains for caches that outlive the
+    /// request: every segment's domain is exactly that segment's liveDocs
+    /// intersected with the segment-stable filter the key bytes identify, so
+    /// (key, segment, liveDocs generation) determines the membership.  Null
+    /// means no such name (the usual case; consumers then must not cache
+    /// derived state).  Only a producer that builds the domains sets it, and a
+    /// context with new domains must not inherit it; the constructor default
+    /// makes dropping it the safe omission.
     struct PrepareContext {
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
       bool parallel;
       ExecutionWarnings* warnings;
+      const FilterKey* domainKey;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel, ExecutionWarnings* warnings) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings) {}
+                     bool parallel, ExecutionWarnings* warnings,
+                     const FilterKey* domainKey = nullptr) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings),
+          domainKey(domainKey) {}
     };
 
     /// Immutable result of prepare() for segment-scorer creation after
