@@ -811,6 +811,9 @@ TEST_F(OrdColFormatTest, indexedStringModesPreserveValuesAndSelectExtrema) {
 TEST_F(OrdColFormatTest, indexedStringMixedModesMergeKeepsSurvivingSequences) {
   CollectionHelper helper;
   auto setMode = [&](bool array) {
+    // Multi mode changes are rejected on a live field: drop it, then re-declare.
+    SchemaBuilder removed;
+    removed.replaceAll(helper.collection());
     SchemaBuilder schema;
     auto& f = schema.field("value");
     f.type = api::FieldDef::FieldClass::STRING;

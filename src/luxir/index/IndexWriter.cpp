@@ -694,12 +694,33 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   for (const auto& [name, signature] : schema->signatures(true)) {
     auto old = before.find(name);
     if (old == before.end()) continue;
-    auto oldUnit = old->second.properties.find("unit");
-    auto newUnit = signature.properties.find("unit");
-    if (oldUnit != old->second.properties.end() && newUnit != signature.properties.end()
-        && oldUnit->second != newUnit->second) {
-      throw SchemaError(std::format("Cannot change unit of existing date field '{}': {} -> {}",
-          name, oldUnit->second, newUnit->second));
+    // Templates are patterns, not fields: a template change only affects names resolved from it
+    // later, and the schema history tracks it per generation.
+    if (!name.empty() && name[0] == '_') continue;
+    // Mirrors what merge enforces (SegFieldInfo::requireCompatibleType): anything that
+    // changes the persisted type or its parameters would fail later at merge time.
+    // Only long term handling and write-time vector normalization may change freely.
+    const auto& oldProps = old->second.properties;
+    const auto& newProps = signature.properties;
+    for (const char* key : {"type", "multi", "index", "column", "posting_flags", "unit", "dims",
+                            "truncate_dims", "metric", "normalized", "analyzer", "normalizer"}) {
+      // Vector dims of 0 mean "not configured" (a bare template default): no vectors can be
+      // written under it, so moving to or from it is not a data-affecting change.
+      bool vectorKey = std::string_view(key) == "dims" || std::string_view(key) == "truncate_dims"
+          || std::string_view(key) == "metric" || std::string_view(key) == "normalized";
+      if (vectorKey) {
+        auto oldDims = oldProps.find("dims");
+        auto newDims = newProps.find("dims");
+        if ((oldDims != oldProps.end() && oldDims->second == "0")
+            || (newDims != newProps.end() && newDims->second == "0")) continue;
+      }
+      auto o = oldProps.find(key);
+      auto n = newProps.find(key);
+      std::string_view ov = o == oldProps.end() ? "none" : std::string_view(o->second);
+      std::string_view nv = n == newProps.end() ? "none" : std::string_view(n->second);
+      if (ov == nv) continue;
+      throw SchemaError(std::format("Cannot change {} of existing field '{}': {} -> {}",
+          key, name, ov, nv));
     }
   }
   std::pmr::monotonic_buffer_resource arena;

@@ -1222,6 +1222,9 @@ TEST_F(StrColTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {
   field.multi = api::FieldDef::MultiMode::ARRAY;
   schema.set(helper.collection());
   helper.index(flatdoc("id", "a", "value", vecs("m", "z", "a", "m")), UpdateMessage::COMMIT);
+  // Multi mode changes are rejected on a live field: drop it, then re-declare.
+  SchemaBuilder removed;
+  removed.replaceAll(helper.collection());
   field.multi = api::FieldDef::MultiMode::SET;
   schema.set(helper.collection());
   helper.index(flatdoc("id", "b", "value", vecs("y", "b", "x")), UpdateMessage::COMMIT);

@@ -15,7 +15,11 @@
 namespace luxir::test {
 namespace {
 
+// Re-declaring a type on a live field is rejected, so drop it first. Segments written
+// before the drop keep the old type, which is the mismatch these tests need.
 void setValueType(CollectionHelper& helper, api::FieldDef::FieldClass type) {
+  SchemaBuilder removed;
+  removed.replaceAll(helper.collection());
   SchemaBuilder schema;
   schema.field("value").type = type;
   schema.set(helper.collection());

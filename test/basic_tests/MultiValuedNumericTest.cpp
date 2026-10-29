@@ -147,6 +147,14 @@ TEST_F(MultiValuedNumericTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {
   field.multi = api::FieldDef::MultiMode::ARRAY;
   b.set(helper.collection());
   helper.index(flatdoc("id_s", "a", "n_is", vec_i(9, -4, 9, 0), "d_ds", vec(2.5)), UpdateMessage::COMMIT);
+  // Multi mode changes are rejected on a live field: drop it, then re-declare. Keep the
+  // dynamic templates the test queries through (id_s, d_ds).
+  SchemaBuilder removed;
+  removed.templ("_s").type = api::FieldDef::FieldClass::STRING;
+  auto& ds = removed.templ("_ds");
+  ds.type = api::FieldDef::FieldClass::DOUBLE;
+  ds.multi = api::FieldDef::MultiMode::SET;
+  removed.replaceAll(helper.collection());
   field.multi = api::FieldDef::MultiMode::SET;
   b.set(helper.collection());
   helper.index(flatdoc("id_s", "b", "n_is", vec_i(8, 7), "d_ds", vec(1.0)), UpdateMessage::COMMIT);

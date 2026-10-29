@@ -2133,6 +2133,195 @@ TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
   EXPECT_TRUE(manifest->segments.empty());
 }
 
+TEST_F(SchemaTest, incompatibleChangeToExistingFieldRejected) {
+  LuxirNode node{LuxirConfig{}};
+  test::CollectionHelper h(node, "main");
+  auto set = [&](auto&& configure) {
+    SchemaBuilder b;
+    configure(b);
+    h.collection().setSchema(b.build(h.collection().getSchema().get()));
+  };
+  auto rejects = [&](auto&& configure, const char* name) {
+    try {
+      set(configure);
+      FAIL() << "expected rejection of " << name;
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string(e.what()).find(std::string("'") + name + "'"), std::string::npos) << e.what();
+      EXPECT_NE(std::string(e.what()).find("->"), std::string::npos) << e.what();
+    }
+  };
+  set([](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "whitespace");
+    auto& n = b.field("n");
+    n.type = FieldClass::INT;
+    n.column = true;
+  });
+  auto sameTitle = [](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "whitespace");
+  };
+  set(sameTitle);  // identical re-set is a no-op
+  rejects([](SchemaBuilder& b) { b.field("n").type = FieldClass::STRING; }, "n");
+  rejects([](SchemaBuilder& b) { b.field("title").type = FieldClass::STRING; }, "title");
+  rejects([](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "unicode_word");
+  }, "title");
+  rejects([](SchemaBuilder& b) {
+    auto& n = b.field("n");
+    n.type = FieldClass::INT;
+    n.column = false;
+  }, "n");
+  // Additions stay allowed
+  set([](SchemaBuilder& b) {
+    auto& p = b.field("price");
+    p.type = FieldClass::INT;
+    p.column = true;
+  });
+  EXPECT_NE(nullptr, h.collection().getSchema()->getFieldTypePtr("price"));
+}
+
+static LuxirConfig ramConfig() {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  return config;
+}
+
+static void applySchemaJson(Collection& c, std::string_view json, api::SchemaRequest_::Mode mode) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  std::string error;
+  if (!api::read_json(def, json, arena, &error)) throw std::runtime_error(error);
+  c.updateSchema(def, mode);
+}
+
+TEST_F(SchemaTest, schemaCompatRejectsEachPropertyWithExactMessage) {
+  struct Case { const char* prop; const char* before; const char* after; const char* values; };
+  const Case cases[] = {
+    {"type", R"({"type":"int"})", R"({"type":"float"})", R"("int" -> "float")"},
+    {"multi", R"({"type":"int"})", R"({"type":"int","multi":"set"})", "false -> true"},
+    {"index", R"({"type":"int","column":true})", R"({"type":"int","column":true,"index":"range"})",
+     R"("none" -> "range")"},
+    {"column", R"({"type":"int","column":true})", R"({"type":"int","column":false})", "true -> false"},
+    {"unit", R"({"type":"date"})", R"({"type":"date","unit":"ns"})", R"("ms" -> "ns")"},
+    {"dims", R"({"type":"vector","dims":4})", R"({"type":"vector","dims":8})", "4 -> 8"},
+    {"truncate_dims", R"({"type":"vector","dims":8,"metric":"cosine","truncate_dims":4})",
+     R"({"type":"vector","dims":8,"metric":"cosine"})", "4 -> none"},
+    {"metric", R"({"type":"vector","dims":4,"metric":"l2"})", R"({"type":"vector","dims":4,"metric":"ip"})",
+     R"("l2" -> "ip")"},
+    {"normalized", R"({"type":"vector","dims":4,"metric":"cosine"})",
+     R"({"type":"vector","dims":4,"metric":"cosine","normalized":true})", "false -> true"},
+    {"analyzer", R"({"type":"text","index":"match"})",
+     R"({"type":"text","index":"match","analyzer":{"tokenizer":{"name":"unicode_word"}}})", ""},
+    {"normalizer", R"({"type":"string"})", R"({"type":"string","normalizer":["fold"]})", ""},
+  };
+  for (const auto& c : cases) {
+    for (auto mode : {api::SchemaRequest_::Mode::SET, api::SchemaRequest_::Mode::REPLACE_ALL}) {
+      SCOPED_TRACE(c.prop);
+      LuxirNode node(ramConfig());
+      CollectionHelper helper(node);
+      applySchemaJson(helper.collection(), std::string(R"({"fields":{"f":)") + c.before + "}}",
+                      api::SchemaRequest_::Mode::SET);
+      auto before = authoredJson(*helper.collection().getSchema());
+      std::string prefix = std::string("Cannot change ") + c.prop + " of existing field 'f': ";
+      try {
+        applySchemaJson(helper.collection(), std::string(R"({"fields":{"f":)") + c.after + "}}", mode);
+        ADD_FAILURE() << "expected rejection";
+      } catch (const SchemaError& e) {
+        std::string what = e.what();
+        EXPECT_EQ(0u, what.rfind(prefix, 0)) << what;
+        if (*c.values) {
+          EXPECT_EQ(prefix + c.values, what);
+        }
+      }
+      EXPECT_EQ(before, authoredJson(*helper.collection().getSchema()));
+      EXPECT_TRUE(helper.index(flatdoc("id", "one"), UpdateMessage::COMMIT).success);
+    }
+  }
+}
+
+TEST_F(SchemaTest, schemaCompatAllowsNonDataChanges) {
+  struct Case { const char* before; const char* after; };
+  const Case cases[] = {
+    {R"({"fields":{"f":{"type":"int"}}})", R"({"fields":{"f":{"type":"int"},"g":{"type":"float"}}})"},
+    {R"({"templates":{"_i":{"type":"int"}}})", R"({"templates":{"_i":{"type":"float"}}})"},
+    {R"({"fields":{"f":{"type":"text","long_terms":"truncate"}}})",
+     R"({"fields":{"f":{"type":"text","long_terms":"hash128"}}})"},
+    {R"({"fields":{"f":{"type":"vector","dims":4,"metric":"cosine"}}})",
+     R"({"fields":{"f":{"type":"vector","dims":4,"metric":"cosine","normalize_on_write":false}}})"},
+    {R"({"fields":{"f":{"type":"vector"}}})", R"({"fields":{"f":{"type":"vector","dims":4}}})"},
+    {R"({"fields":{"f":{"type":"vector","dims":4}}})", R"({"fields":{"f":{"type":"vector","dims":0}}})"},
+  };
+  for (const auto& c : cases) {
+    for (auto mode : {api::SchemaRequest_::Mode::SET, api::SchemaRequest_::Mode::REPLACE_ALL}) {
+      SCOPED_TRACE(c.after);
+      LuxirNode node(ramConfig());
+      CollectionHelper helper(node);
+      applySchemaJson(helper.collection(), c.before, api::SchemaRequest_::Mode::SET);
+      EXPECT_NO_THROW(applySchemaJson(helper.collection(), c.after, mode));
+    }
+  }
+}
+
+TEST_F(SchemaTest, schemaCompatChecksVariantOnlyFields) {
+  LuxirNode node(ramConfig());
+  CollectionHelper helper(node);
+  applySchemaJson(helper.collection(), R"({"fields":{"a":{"type":"text","variants":{"n":"int"}}}})",
+                  api::SchemaRequest_::Mode::SET);
+  EXPECT_THROW(applySchemaJson(helper.collection(),
+                               R"({"fields":{"a":{"type":"text","variants":{"n":"float"}}}})",
+                               api::SchemaRequest_::Mode::SET), SchemaError);
+  EXPECT_NO_THROW(applySchemaJson(helper.collection(),
+                                  R"({"fields":{"a":{"type":"text","variants":{"n":"int"}}}})",
+                                  api::SchemaRequest_::Mode::SET));
+}
+
+TEST_F(SchemaTest, schemaCompatRejectedUpdateLeavesSchemaAndIndexingIntact) {
+  LuxirNode node(ramConfig());
+  CollectionHelper helper(node);
+  applySchemaJson(helper.collection(), R"({"fields":{"f":{"type":"int","column":true}}})",
+                  api::SchemaRequest_::Mode::SET);
+  ASSERT_TRUE(helper.index(flatdoc("id", "one", "f", 1), UpdateMessage::COMMIT).success);
+  auto before = authoredJson(*helper.collection().getSchema());
+  EXPECT_THROW(applySchemaJson(helper.collection(),
+                               R"({"fields":{"f":{"type":"float","column":true},"g":{"type":"int"}}})",
+                               api::SchemaRequest_::Mode::SET), SchemaError);
+  EXPECT_EQ(before, authoredJson(*helper.collection().getSchema()));
+  EXPECT_EQ(nullptr, helper.collection().getSchema()->getFieldTypePtr("g"));
+  EXPECT_EQ(FieldType::INT, helper.collection().getSchema()->getFieldTypePtr("f")->type());
+  EXPECT_TRUE(helper.index(flatdoc("id", "two", "f", 2), UpdateMessage::COMMIT).success);
+}
+
+TEST_F(SchemaTest, schemaCompatRejectsAfterRestart) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
+  SchemaBuilder b;
+  auto& f = b.field("f");
+  f.type = FieldClass::INT;
+  f.column = true;
+  b.set(ch.collection());
+  ASSERT_TRUE(ch.index(flatdoc("id", "one", "f", 1)).success);
+  ch.commit();
+  ch.getIndexWriter()->close();
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
+  SchemaBuilder change;
+  auto& changed = change.field("f");
+  changed.type = FieldClass::FLOAT;
+  changed.column = true;
+  EXPECT_THROW(reopened.updateSchema([&](const Schema* base) { return change.build(base); }), SchemaError);
+  EXPECT_EQ(FieldType::INT, reopened.getSchema()->getFieldTypePtr("f")->type());
+}
+
 // The resolved view reports the expanded analyzer (never just a name) and, for a
 // named analyzer, the name it came from; the authored schema keeps the name.
 TEST_F(SchemaTest, namedAnalyzerResolvedView) {
