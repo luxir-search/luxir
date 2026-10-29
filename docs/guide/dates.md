@@ -197,6 +197,30 @@ is anchored at UTC midnight even if later queries use a zone. When the same
 text must mean the same instant on both paths, write it with `Z` or an
 explicit offset.
 
+## Calendar dates (local_date)
+
+A `date` is an instant, so a zone moves the day it falls on: a birthday
+ingested as `1990-06-25` is UTC midnight, which is the evening of June 24 in
+New York. For values that are calendar dates rather than instants (birthdays,
+invoice and due dates), use the `local_date` type, or the `_ld` template
+(`_lds` for multiple dates). It is stored exactly like `date` (epoch
+milliseconds of UTC midnight, in the same column) and is returned the same
+way; sorting, collapsing, and value expressions treat it as a date.
+
+What differs is that the day never shifts:
+
+- Ingest accepts only a whole day: `2024-06-25`, `2024-06` (its first day),
+  epoch milliseconds that are a multiple of 86400000, or an instant that is
+  exactly UTC midnight (`2024-06-25T00:00:00Z`). Any time of day is rejected
+  rather than truncated, so a value such as `2024-06-25T23:30-05:00`, which
+  is June 26 in UTC, fails the document instead of landing on a surprising
+  day.
+- Query literals and date math resolve in UTC, ignoring the request's
+  `time_zone`: `birthday_ld:2024-06-25` is that date for every caller, and
+  `NOW/DAY` is the current UTC date.
+- Range facets bucket in the UTC calendar, ignoring both the request and
+  the facet `time_zone`; `day` and `week` calendar gaps are fixed-width.
+
 ## Date histograms
 
 Range facets bucket DATE fields with either a fixed gap in field units or a

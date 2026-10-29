@@ -1120,8 +1120,10 @@ public:
   // window end, so [2024-01 TO 2024-06] covers January through June inclusive
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
-  // the whole day.  A bound from unrounded NOW math restricts filter reuse
-  // to this request, keeping it out of shared-cache admission history.
+  // the whole day.  A local date's literals resolve in UTC whatever the
+  // request time_zone (DateFieldType::frame).  A bound from unrounded NOW
+  // math restricts filter reuse to this request, keeping it out of
+  // shared-cache admission history.
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to

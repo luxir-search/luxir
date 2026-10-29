@@ -1869,7 +1869,7 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
 | <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.rangefacet.ops"></a>[`ops`](#field-luxir.rangefacet.ops) | 8 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
-| <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only |
+| <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only; LOCAL\_DATE ignores it |
 | <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. Not supported with DATA bounds. |
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
@@ -2721,6 +2721,7 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.local_date"></a>[`LOCAL_DATE`](#value-luxir.fielddef.fieldclass.local_date) | 10 | calendar date with no time of day (birthday, invoice date), stored like DATE as the epoch millis of UTC midnight. Ingest rejects any other instant; query literals, date math and range facets resolve in UTC and ignore time\_zone, so a date never shifts into a neighbouring day. |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 

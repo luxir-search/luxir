@@ -665,7 +665,7 @@ float, double, or date field:
 | `missing` | Also return the count of documents with no value. |
 | `ops` | Per-bucket metrics, nested facets, or `top_docs`. |
 | `selected` | Lower fences of buckets that refine the result set. EXPLICIT only. See [Multi-select navigation](#multi-select-navigation). |
-| `time_zone` | DATE time zone for offset-less bounds and fixed or calendar stepping; empty inherits the request's. |
+| `time_zone` | DATE time zone for offset-less bounds and fixed or calendar stepping; empty inherits the request's. Ignored for `local_date` fields, which bucket in the UTC calendar. |
 
 Buckets return in lower-bound order; the default `mincount: 0` includes zero
 counts. With EXPLICIT bounds, the first fence is `start` and the last is
