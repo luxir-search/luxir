@@ -51,12 +51,19 @@
 //   other sugars, writes use the bare string whenever params is empty, so the
 //   common parameterless chain echoes exactly as written; only a component with
 //   params writes the object form.
+// - AnalyzerDef reads accept a bare STRING as named-analyzer sugar: "english" ==
+//   {"name": "english"}. Writes stay canonical (the object form).
 // - SortSpec reads a bare STRING as a clause, "expr", "expr asc", or "expr desc"
 //   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
 //   top-docs `sort` takes one clause or a list of them.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
 // - WeightedField reads a canonical object or a bare STRING, "name" or
 //   "name^weight". Writes stay canonical with field and optional weight.
+// - A Query or SearchOp arm key that names a registered plugin query type or
+//   operation (api/PluginArms.h) reads as the plugin arm: {"<name>": {...}} ==
+//   {"plugin": {"name": "<name>", "params": {...}}}, and for an operation the
+//   object's "ops" member is its nested ops. Writes stay canonical (the
+//   plugin object), which reads back the same way.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
 //   repeated QueryBucket form preserves that object's document order for gRPC parity.
 
@@ -68,6 +75,7 @@
 #include <system_error>
 #include <unordered_set>
 
+#include "luxir/api/PluginArms.h"
 #include "luxir/api/RequestFlags.h"
 #include "luxir/api/sort_clause.h"
 #include "luxir/api/weighted_field.h"
@@ -555,8 +563,64 @@ struct to<JSON, luxir::api::SearchOp> : FlaggedRequestJsonWriter<luxir::api::Sea
 template <>
 struct to<JSON, luxir::api::SearchRequest> : FlaggedRequestJsonWriter<luxir::api::SearchRequest> {};
 
+// ----- Plugin arms: {"<name>": {...}} for a registered plugin query or op -----
+// Every member of the object becomes a param, except "ops" when `ops` is given
+// (a PluginOp's nested operations). The name and keys are copied: a key can
+// live in a scratch buffer when it was escaped.
+template <auto Opts, typename Ops>
+void readPluginArm(std::string_view name, std::string_view &nameOut,
+                   luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>> &paramsOut,
+                   Ops *ops, hpp_proto::concepts::is_non_owning_context auto &ctx,
+                   auto &it, auto &end) {
+  namespace api = luxir::api;
+  auto copy = [&](std::string_view text) {
+    char *stored = (char *)ctx.memory_resource().allocate(text.size(), 1);
+    std::memcpy(stored, text.data(), text.size());
+    return std::string_view(stored, text.size());
+  };
+  nameOut = copy(name);
+  if constexpr (!check_ws_handled(Opts)) {
+    if (skip_ws<Opts>(ctx, it, end)) return;
+  }
+  if ((char)*it != '{') {
+    ctx.error = error_code::syntax_error;
+    ctx.custom_error_message = "a plugin arm takes an object of parameters";
+    return;
+  }
+  static constexpr auto O = ws_handled<Opts>();
+  static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+  std::string_view key;
+  decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+  decltype(auto) params = ::hpp_proto::detail::as_modifiable(ctx, paramsOut);
+  util::scan_object_fields<O, true>(
+      ctx, it, end, keyTarget, [](auto &, auto &) {},
+      [&](auto &vit, auto &vend) {
+        if constexpr (!std::is_same_v<Ops, std::nullptr_t>) {
+          if (key == "ops") {
+            decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, *ops);
+            glz::util::parse_repeated<V>(true, target, ctx, vit, vend);
+            return bool(ctx.error);
+          }
+        }
+        size_t index = params.size();
+        for (size_t i = 0; i < index; i++) {
+          if (params[i].first == key) {
+            ctx.error = error_code::syntax_error;
+            ctx.custom_error_message = "duplicate plugin parameter";
+            return true;
+          }
+        }
+        auto *val = new (ctx.memory_resource().allocate(sizeof(api::Val), alignof(api::Val))) api::Val();
+        util::from_json<V>(*val, ctx, vit, vend);
+        params.resize(index + 1);
+        params[index] = {copy(key), ::hpp_proto::indirect_view<api::Val>(val)};
+        return bool(ctx.error);
+      },
+      [](auto &, auto &) {});
+}
+
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 8,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -613,6 +677,11 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::QueryFacet>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
+          } else if (key == "plugin") {
+            arm(std::in_place_type<api::PluginOp>);
+          } else if (api::isPluginOpArm(key)) {
+            auto &plugin = value.kind.template emplace<api::PluginOp>();
+            readPluginArm<V>(key, plugin.name, plugin.params, &plugin.ops, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -919,6 +988,57 @@ struct from<JSON, luxir::api::AnalyzerComponent> {
   }
 };
 
+// ----- AnalyzerDef: canonical object, or a bare string (named-analyzer sugar) -----
+// Reads: "english" == {"name": "english"}. Writes stay the generated canonical form.
+template <>
+struct from<JSON, luxir::api::AnalyzerDef> {
+  template <auto Opts>
+  static void op(luxir::api::AnalyzerDef &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.name, ctx, it, end);
+      if (!bool(ctx.error) && value.name.empty()) {
+        ctx.error = error_code::syntax_error;
+        ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+      }
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "tokenizer") {
+            util::from_json<V>(value.tokenizer, ctx, vit, vend);
+          } else if (key == "filters") {
+            decltype(auto) filters = ::hpp_proto::detail::as_modifiable(ctx, value.filters);
+            glz::util::parse_repeated<V>(false, filters, ctx, vit, vend);
+          } else if (key == "char_filters") {
+            decltype(auto) charFilters = ::hpp_proto::detail::as_modifiable(ctx, value.char_filters);
+            glz::util::parse_repeated<V>(false, charFilters, ctx, vit, vend);
+          } else if (key == "name") {
+            util::from_json<V>(value.name, ctx, vit, vend);
+            if (!bool(ctx.error) && value.name.empty()) {
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+            }
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
 // Writes: the bare name for a parameterless component, else {"name", "params"}.
 template <>
 struct to<JSON, luxir::api::AnalyzerComponent> {
@@ -1048,6 +1168,11 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::MultiMatchQuery>);
           } else if (key == "dis_max") {
             arm(std::in_place_type<api::DisMaxQuery>);
+          } else if (key == "plugin") {
+            arm(std::in_place_type<api::PluginQuery>);
+          } else if (api::isPluginQueryArm(key)) {
+            auto &plugin = value.kind.template emplace<api::PluginQuery>();
+            readPluginArm<V>(key, plugin.name, plugin.params, (std::nullptr_t *)nullptr, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

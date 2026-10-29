@@ -12,8 +12,7 @@ class LuxirNode;
 class RootOp;
 struct SearchConfig;
 
-/// The SearchEngine is a singleton owned by the LuxirNode object and is responsible for
-/// executing search requests.  It is the main entry point for the search subsystem.
+/// Each LuxirNode owns a SearchEngine, the main entry point for search requests.
 //
 class SearchEngine {
   LuxirNode& node;
@@ -31,6 +30,7 @@ public:
   }
 
   const SearchConfig& searchConfig() const;
+  LuxirNode& getNode() const { return node; }
   Metrics& metrics() const;
 
   // Prepare through the ordinary parser/planner, without running calculators.

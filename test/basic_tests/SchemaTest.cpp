@@ -18,6 +18,7 @@
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
+#include <glaze/glaze.hpp>
 #include <memory_resource>
 #include <span>
 #include <tuple>
@@ -2130,4 +2131,65 @@ TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
   auto stored = Schema::fromStored(*manifest->schema, manifest->schema_gen);
   EXPECT_EQ(schema->introducedGen, stored->introducedGen);
   EXPECT_TRUE(manifest->segments.empty());
+}
+
+// The resolved view reports the expanded analyzer (never just a name) and, for a
+// named analyzer, the name it came from; the authored schema keeps the name.
+TEST_F(SchemaTest, namedAnalyzerResolvedView) {
+  CollectionHelper helper;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  std::string error;
+  ASSERT_TRUE(api::read_json(def, R"({"fields":{
+    "named":{"type":"text","analyzer":"english"},
+    "ex":{"type":"text","analyzer":{"name":"example"}},
+    "authored":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold","kstem"]}}
+  }})", arena, &error)) << error;
+  auto schema = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
+
+  glz::generic_sorted_u64 json;
+  ASSERT_FALSE(glz::read_json(json, helper.getIndexWriter()->snapshots.readers.resolvedSchema()));
+  auto self = [&](std::string_view field, std::string_view property) {
+    return glz::write_json(json["fields"][field]["representations"]["self"][property]).value();
+  };
+  constexpr std::string_view english =
+      R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})";
+  EXPECT_EQ(english, self("named", "analyzer"));
+  EXPECT_EQ(R"("english")", self("named", "analyzer_preset"));
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+            self("ex", "analyzer"));
+  EXPECT_EQ(R"("example")", self("ex", "analyzer_preset"));
+  // an authored equivalent shows the same expansion and no preset
+  EXPECT_EQ(english, self("authored", "analyzer"));
+  auto* namedAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("named"))->analyzer_.get();
+  auto* authoredAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("authored"))->analyzer_.get();
+  EXPECT_EQ(namedAnalyzer->canonical, authoredAnalyzer->canonical);
+  auto signatures = schema->signatures();
+  EXPECT_EQ(signatures.at("named").properties, signatures.at("authored").properties);
+  EXPECT_FALSE(json["fields"]["authored"]["representations"]["self"].get<glz::generic_sorted_u64::object_t>()
+                   .contains("analyzer_preset"));
+
+  // the sparse authored view keeps what was written
+  EXPECT_NE(std::string::npos, authoredJson(*schema).find(R"("analyzer":{"name":"english"})"));
+  // a named analyzer is a field-level unit for inheritance like any other analyzer
+  auto inherited = schemaJson(R"({"templates":{"_e":{"type":"text","analyzer":"english"}},"fields":{"a":{"parent":"_e"}}})");
+  EXPECT_EQ("english", ((TextFieldType*)inherited->getFieldTypePtr("a"))->analyzer_->presetName);
+  // char filters alone keep the inherited named analyzer, replacing its char filters
+  auto cleaned = schemaJson(R"({"templates":{"_e":{"type":"text","analyzer":"english"}},
+    "fields":{"a":{"parent":"_e","analyzer":{"char_filters":["html_strip"]}}}})");
+  auto* cleanedAnalyzer = ((TextFieldType*)cleaned->getFieldTypePtr("a"))->analyzer_.get();
+  EXPECT_EQ("english", cleanedAnalyzer->presetName);
+  EXPECT_EQ(std::string(english).replace(16, 2, R"(["html_strip"])"), cleanedAnalyzer->canonical);
+  // a named analyzer on a non-text field is rejected like any analyzer
+  EXPECT_THROW(schemaJson(R"({"fields":{"n":{"type":"int","analyzer":"english"}}})"), SchemaError);
+  // unknown names and mixed forms fail with the teaching message and the field
+  try {
+    schemaJson(R"({"fields":{"t":{"type":"text","analyzer":"klingon"}}})");
+    FAIL() << "unknown analyzer accepted";
+  } catch (const SchemaError& e) {
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("unknown analyzer 'klingon'; valid analyzers: ")) << e.what();
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("(field: t)")) << e.what();
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"t":{"type":"text","analyzer":{"name":"english","filters":["fold"]}}}})"),
+               SchemaError);
 }

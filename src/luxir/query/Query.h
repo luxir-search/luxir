@@ -67,6 +67,9 @@ enum class QueryKind : uint8_t {
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
+  // Every query a plugin query type builds (QueryRegistry). Shape questions
+  // get the conservative answers, as for TEST.
+  PLUGIN,
   TEST,
 };
 
@@ -365,6 +368,9 @@ protected:
 
   explicit Query(QueryKind kind) : kind(kind) {}
   Query() = delete;
+  // Queries live in pools (MemPool::make needs them trivially destructible),
+  // so the destructor is non-virtual; protecting it rejects delete via Query*.
+  ~Query() = default;
 
 private:
   // Structural hash, computed once by hash(). Only planning reaches it, and
@@ -541,10 +547,41 @@ public:
     RAW_MEMBERSHIP,
   };
 
+  // Producers and consumers price membership work in one unit, the point
+  // emission: decoding one point into a bitset, about 0.8 ns on hugin. A
+  // producer quotes its arms in it (NumericPredicateQuery's and GeoQuery's
+  // prices; PointsMaterialize prices materialization and verification) and a
+  // consumer the work that producing would spare it (Demand::sparedWork).
   struct Demand {
     int64_t candidates = std::numeric_limits<int64_t>::max();
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
+    // The candidates expected to reach this clause, or -1 when not supplied:
+    // the conjunction yield of a window entry's entries ahead, a pull
+    // clause's other approximations, or a filtered body's matches.
+    // candidates stays the lead's opportunity count.
+    double expectedCandidates = -1;
+    // The consumer's own work, in point emissions, that producing this entry
+    // would spare in proportion to the candidates it rejects: siblings it
+    // would align or advance and lead emissions it would skip. A verifier
+    // cannot spare it, because it is confirmed after that work.
+    double sparedWork = 0;
+
+    // Child opportunities precede sibling rejection. Scale a child's own
+    // full-domain estimate by the original consumer exposure, not final K.
+    // The consumer's expected candidates and spared work are full-domain too
+    // and arrive within the exposure, so they scale with it.
+    Demand exposedTo(int64_t expectedSpan, int32_t maxDoc) const {
+      if (expectedSpan >= maxDoc) return *this;
+      double fraction = (double)std::max<int64_t>(0, expectedSpan)
+          / std::max(1, maxDoc);
+      Demand exposed = *this;
+      exposed.candidates = (int64_t)std::ceil(std::min(candidates, (int64_t)maxDoc) * fraction);
+      exposed.span = std::min(span, expectedSpan);
+      if (expectedCandidates >= 0) exposed.expectedCandidates = expectedCandidates * fraction;
+      exposed.sparedWork = sparedWork * fraction;
+      return exposed;
+    }
 
     static Demand fromCandidatesAndSpan(
         int64_t candidates, int64_t span,
@@ -578,6 +615,8 @@ public:
     };
 
     Demand demand;
+    // Retained across nested resolution; local demand has already been priced.
+    int64_t expectedSpan = std::numeric_limits<int64_t>::max();
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
     MultiTermScorerMode multiTermScorerModeForTests =
         MultiTermScorerMode::AUTO;
@@ -780,6 +819,13 @@ public:
       return use == BulkUse::MATCH_WINDOWS || use == BulkUse::COUNT_WINDOWS;
     }
 
+    // Whether a WINDOWS consumer fills windows over an explicit exposure; any
+    // other one pulls the candidates of its lead.
+    static bool fillsExposedWindows(const PlanContext& context) noexcept {
+      return isMembershipWindowUse(context.demand.horizon)
+          && context.expectedSpan != std::numeric_limits<int64_t>::max();
+    }
+
     enum class BulkAnswer : uint8_t {
       YES,
       NO,
@@ -802,6 +848,9 @@ public:
       // Ask this same planner only for an exact scalar count arm. This never
       // authorizes a bulk build whose output would then be discarded.
       bool requireConstantCount = false;
+      // Economics only: total expected consumption, including disjoint windows
+      // and revisits. Never limits the scorer's membership or exhaustion.
+      Demand expectedConsumption{};
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };
@@ -861,7 +910,7 @@ public:
     virtual int64_t cost() = 0;
 
     // Cold membership economics, separate from reset availability and from
-    // cost(), whose upper bound serves lead selection. Instructions are used
+    // cost(), whose cardinality heuristic serves lead selection. Instructions are used
     // here so the linear L1 prefix walk is priced in the same units as fills.
     struct MembershipWork {
       double matches = 0;
@@ -873,6 +922,13 @@ public:
       // routes earn no production credit; a parent cannot sum child credits
       // because candidate-driven execution may never produce their full dfs.
       double savedProduce = 0;
+      // Whether matches estimates the supplier's yield. Otherwise it is only
+      // an opportunity bound (a phrase's cheapest term, a capped threshold).
+      bool knownMatches = false;
+      // Fraction of the docid space the matches can occupy: everything but
+      // the docid runs that hold no match. A conjunction leapfrogging a
+      // produced supplier skips its siblings' documents in those runs.
+      double hull = 1;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -888,12 +944,36 @@ public:
       }
     };
 
+    // Appends the costs of the approximations a conjunction iterates for this
+    // supplier resolved under `context`: one, its cost(), unless its scorer
+    // exposes approximation enums that the conjunction flattens in its place.
+    virtual void approximationCosts(
+        MemPool& planPool, const PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) {
+      unused(planPool, context);
+      out.push_back(cost());
+    }
+
     virtual MembershipWork membershipWork(int32_t maxDoc) {
       double matches = (double)std::min<int64_t>(cost(), maxDoc);
       // Unknown producers get a conservative scalar-verification price.
       // Materialized membership has no verifier or postings-prefix restart.
-      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
+      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64, 0, true};
       return {matches, 128.0 * maxDoc, 0, 1024, 256};
+    }
+
+    struct MembershipQuote {
+      double matches;
+      double work;
+    };
+
+    // Pure contextual instruction estimate, with no construction, allocation,
+    // or cursor movement. WINDOWS quotes segment yield and full production;
+    // CANDIDATES quotes survivors and verification after rejection proofs.
+    virtual std::optional<MembershipQuote> quoteMembership(
+        const PlanContext& context) const {
+      unused(context);
+      return std::nullopt;
     }
 
     /// Pure description of the scorer returned by resolve() for this exact build
@@ -1947,6 +2027,70 @@ public:
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
+  // Metadata-only rejection, independent of exact/scoring cursor state. A
+  // possible run is a superset of matches; [target, begin) is proven empty.
+  class MembershipProof {
+  protected:
+    struct Range { int32_t begin, end; };
+
+  private:
+    Range possible{0, 0};
+    int32_t knownFrom = 0;
+
+    [[gnu::noinline]] int32_t seekPossible(int32_t target) {
+      if (target == PostingsReader::END) return target;
+      if (target >= knownFrom && target < possible.begin) return possible.begin;
+      possible = nextRange(target);
+      knownFrom = target;
+      assert(possible.begin >= target && possible.end >= possible.begin);
+      assert(possible.end > target);
+      return possible.begin;
+    }
+
+  protected:
+    // Targets can move backward when a prepared window is intersected.
+    virtual Range nextRange(int32_t target) = 0;
+
+  public:
+    virtual void reset() { possible = {0, 0}; knownFrom = 0; }
+
+    [[gnu::always_inline]] int32_t nextPossible(int32_t target) {
+      assert(target >= 0);
+      if (target >= possible.begin && target < possible.end) return target;
+      return seekPossible(target);
+    }
+
+    // After nextPossible(base) == base, [base, possibleEnd()) needs no mask.
+    int32_t possibleEnd() const { return possible.end; }
+
+    [[gnu::noinline]] void intersect(std::span<uint64_t> words, int32_t base) {
+      int32_t end = (int32_t)std::min<int64_t>(PostingsReader::END,
+          (int64_t)base + (int64_t)words.size() * 64);
+      if (base >= possible.begin && end <= possible.end) return;
+      for (int32_t doc = base; doc < end;) {
+        int32_t next = nextPossible(doc);
+        int32_t stop = std::min(next, end);
+        if (doc < stop) {
+          int32_t first = doc - base;
+          int32_t last = stop - base - 1;
+          int32_t firstWord = first >> 6;
+          int32_t lastWord = last >> 6;
+          uint64_t firstMask = ~0ULL << (first & 63);
+          uint64_t lastMask = ~0ULL >> (63 - (last & 63));
+          if (firstWord == lastWord) {
+            words[(size_t)firstWord] &= ~(firstMask & lastMask);
+          } else {
+            words[(size_t)firstWord] &= ~firstMask;
+            std::fill(words.begin() + firstWord + 1, words.begin() + lastWord, 0);
+            words[(size_t)lastWord] &= ~lastMask;
+          }
+        }
+        if (next >= end) break;
+        doc = std::min(possible.end, end);
+      }
+    }
+  };
+
   /// A segment-pool-owned, single-consumption scorer construction token.
   /// Resolving records the exact shape, demand, and supplier cost before any
   /// scorer is built. A parent may retain the token, but must consume it at
@@ -1999,12 +2143,22 @@ public:
 
     const ScorerShape& shape() const noexcept { return recordedShape; }
     const Demand& demand() const noexcept { return planContext.demand; }
+    // What the built scorer iterates as a conjunction lead: its matches, or
+    // for a two-phase scorer its approximation, which the supplier's match
+    // estimate can understate. Conjunctions order their clauses by it.
     int64_t cost() const noexcept { return resolvedCost; }
     // Inspect the resolved graph only when reuse is requested. Computing
     // this recursively during construction taxes ordinary forward searches.
     // Like build(), this borrows the originating supplier graph; keep that
     // graph alive while consulting the plan, including after consumption.
     [[gnu::cold]] virtual bool supportsReset() const noexcept { return false; }
+
+    // An optional independent resource. Only consumers that schedule from
+    // proofs build it; constructing a scorer does not change its protocols.
+    virtual MembershipProof* buildMembershipProof(MemPool& targetPool) {
+      unused(targetPool);
+      return nullptr;
+    }
 
     Scorer* build(MemPool& targetPool) {
       consume();

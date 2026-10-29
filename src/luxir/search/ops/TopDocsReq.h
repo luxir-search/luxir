@@ -2141,9 +2141,6 @@ public:
                   sortSourceCost);
               bool usedBulk = false;
               int64_t fieldHitsBefore = fieldCollector->hitCount;
-              // A MATCH_WINDOWS plan taken by a declined arm is retained here
-              // so the ordinary bulk arm never re-plans the same context.
-              std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
               Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
               // Group proof: gathered leaves admit by exact identity before
               // truncation. A leaf loses on a worse bound, or on an equal
@@ -2242,13 +2239,18 @@ public:
               // external filter only the filter's share of it. Seeding prices
               // the same work; leaf descent the same domain.
               std::optional<Query::ScorerSupplier::MembershipWork> walkWork;
+              std::optional<ExactDomainSortCosts::Rest> walkRest;
               if (!usedBulk && supplier != nullptr && maySkipNoncompetitiveDocs
                   && fieldCollector->topCount > 0
                   && fieldCollector->primaryKeys.has_value()) {
                 walkWork = walkMembershipWork(*supplier, collectorFilter,
                                               seg.maxDoc());
-                fieldCollector->setWalkCard(
-                    (int64_t)std::max(1.0, walkWork->matches));
+                int64_t card = (int64_t)std::max(1.0, walkWork->matches);
+                fieldCollector->setWalkCard(card);
+                walkRest = fieldCollector->segmentRest(card,
+                    fieldCollector->predictedVisitFloor(card), 0, seg.maxDoc() - 1);
+                matchWindowsContext.expectedConsumption = fieldCollector->expectedWindowDemand(
+                    *walkRest, supplier->cost(), seg.maxDoc());
               }
               // Group seeding changes only visit order. The visited-leaf mask
               // prevents duplicates, and the sweep covers every unvisited
@@ -2273,7 +2275,7 @@ public:
                   const auto& work = *walkWork;
                   auto& seedCollector = *fieldCollector;
                   int64_t jointCard = (int64_t)std::max(1.0, work.matches);
-                  int64_t leafFloor = seedCollector.predictedVisitFloor(jointCard);
+                  int64_t leafFloor = walkRest->floor;
                   int64_t seedBudget = seedCollector.predictedVisitFloor(
                       jointCard, seedDepth(seedCollector.topCount));
                   bool startable = leafFloor > 0 && seedBudget > 0;
@@ -2286,8 +2288,7 @@ public:
                     int64_t head = seedCollector.headLeaf(leafFloor);
                     seedCosts.emplace(QueryDrivenSeedCosts{
                         work,
-                        seedCollector.segmentRest(jointCard, leafFloor, 0,
-                                                   seg.maxDoc() - 1),
+                        *walkRest,
                         head >= 0 && 2 * head >= seedCollector.primaryKeys->leafCount(),
                         plan.leafSize, trend});
                   }
@@ -2296,10 +2297,12 @@ public:
                   bool profitable = startable
                       && seedCosts->worth(0, 0, seedBudget, 1, leafFloor, work.matches);
                   if (profitable || forceFieldSortSeeding) {
-                    matchWindowsPlan = supplier->planBulk(
+                    auto seedContext = matchWindowsContext;
+                    seedContext.expectedConsumption = fieldCollector->expectedWindowDemand(
+                        *walkRest, supplier->cost(), seg.maxDoc(), seedBudget);
+                    auto bulkPlan = supplier->planBulk(
                         Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                        matchWindowsContext);
-                    auto& bulkPlan = *matchWindowsPlan;
+                        seedContext);
                     if (bulkPlan.available
                             == Query::ScorerSupplier::BulkAnswer::YES
                         && bulkPlan.supportsMatchWindows
@@ -2308,7 +2311,6 @@ public:
                             == Query::ScorerSupplier::BulkAnswer::YES
                         && !bulkPlan.hasConstantCount()) {
                       auto* bulk = supplier->buildBulk(poolGuard.pool(), bulkPlan);
-                      matchWindowsPlan.reset();  // consumed by the build
                       if (bulk != nullptr) {
                         if (fieldSortSeedBudgetPerMilleForTests > 0) {
                           seedBudget = std::max<int64_t>(
@@ -2329,11 +2331,9 @@ public:
               if (!usedBulk && supplier != nullptr && !captureSharedRaw
                   && !disableFieldSortBulk
                   && !fieldCollector->needsScores) {
-                auto plan = matchWindowsPlan.has_value()
-                    ? *matchWindowsPlan
-                    : supplier->planBulk(
-                          Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                          matchWindowsContext);
+                auto plan = supplier->planBulk(
+                    Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                    matchWindowsContext);
                 bool plannedNo =
                     plan.available != Query::ScorerSupplier::BulkAnswer::YES
                     || plan.supportsMatchWindows
@@ -2362,8 +2362,9 @@ public:
                 }
               }
               if (!usedBulk && supplier != nullptr) {
-                Query::ScorerPlan* pullPlan = resolvePullScorer(
-                    poolGuard.pool(), *supplier);
+                auto pullContext = supplier->makePlanContext(Query::Demand{});
+                pullContext.expectedSpan = matchWindowsContext.expectedConsumption.span;
+                Query::ScorerPlan* pullPlan = supplier->resolve(poolGuard.pool(), pullContext);
                 Query::ReportedTwoPhase reportedTwoPhase =
                     pullPlan->shape().reportedTwoPhase;
                 auto* scorer = pullPlan->build(poolGuard.pool());

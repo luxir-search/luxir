@@ -91,6 +91,7 @@ message SearchOp {
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
+    PluginOp plugin = 16;           // an operation registered by a compiled-in plugin
   }
   Domain domain = 20; // optional override of the incoming document domain
   // Overrides the parent's packed options, including for this op's domain,
@@ -102,6 +103,19 @@ message SearchOp {
   // the same as SearchRequest.flags_set.
   // Naming date_native in JSON explicitly replaces an inherited date mode.
   uint64 flags_set = 22;
+}
+
+// An operation registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_op": {"a": 1, "ops": {...}}} reads as
+// {"plugin": {"name": "my_op", "params": {"a": 1}, "ops": {...}}}.  An
+// unregistered name is a request error that lists the registered operations.
+// The plugin validates params and defines the result shape; nested ops run
+// over the domain the plugin gives them and may not override it.
+message PluginOp {
+  string name = 1;
+  map<string, Val> params = 2;
+  map<string, SearchOp> ops = 3;
 }
 
 // An expression aggregate over the operation's incoming document domain.
@@ -331,6 +345,7 @@ message Query {
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
   }
 }
 
@@ -539,6 +554,19 @@ message AnyOfQuery {
   // Required scalar or array of scalars. Null and nested arrays are errors.
   // An empty array matches nothing; duplicate values are ignored.
   Val values = 2;
+}
+
+// A query type registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_query": {"a": 1}} reads as
+// {"plugin": {"name": "my_query", "params": {"a": 1}}}, and the expression
+// language calls it as my_query(...) with the arguments the plugin declares.
+// An unregistered name is a request error that lists the registered query
+// types. params are typed JSON values; a nested query is a Query-shaped
+// value the plugin parses.
+message PluginQuery {
+  string name = 1;
+  map<string, Val> params = 2;
 }
 
 // Matches documents whose field value falls in the given range.  All bounds
@@ -2142,10 +2170,17 @@ message AnalyzerComponent {
   map<string, Val> params = 2;
 }
 
+// A text analysis chain: char filters, then one tokenizer, then token filters.
+// Alternatively `name` selects a registered analyzer (a built-in preset such as
+// "english", or one a plugin provides); it excludes tokenizer and filters, and
+// char_filters alongside it replace the preset's char filters.
+// The JSON dialect accepts a bare string for the named form:
+// "english" == {"name": "english"}.
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
   repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
   repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
+  string name = 4;                         // a registered analyzer name; combines only with char_filters
 }
 
 // Alternate representations of the same input value, keyed by local label.
