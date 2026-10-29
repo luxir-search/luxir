@@ -580,10 +580,10 @@ The HTTP request limits distinguish bounded material from streams:
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
 - `max-inflight-batches` bounds the number of internal batches one connection
-  can submit concurrently. `0` (the default) uses the worker count
-  (`--server.workers`) plus two; `1` makes batch submission serial. Reads pause when the limit is
-  reached and resume as batches complete. A larger limit uses more staging
-  memory.
+  has decoding or indexing at once. `0` (the default) uses the worker count
+  (`--server.workers`) plus two; `1` indexes one batch at a time. Reads pause
+  when the limit is reached and resume as batches are indexed, without waiting
+  for earlier batches to complete. A larger limit uses more staging memory.
 
 gRPC has one request limit, on the size of each received message (a unary
 request or one message of a stream):

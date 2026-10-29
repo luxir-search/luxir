@@ -657,6 +657,17 @@ public:
       DocsEnumMeta::L1_DOCS;
   static inline int64_t windowFillSpanScaleForTests =
       WINDOW_FILL_SPAN_SCALE;
+
+  // Flat exhaustive conjunctions only. Entry ordinals precede cost sorting.
+  struct ConjunctionControlForTests {
+    std::span<const size_t> order;
+    std::span<const MembershipConsumption> consumption;
+    bool proofs = true;
+    // Original ordinal, consumption stage, and position within that stage.
+    std::function<void(size_t, MembershipConsumption, size_t, ScorerSupplier&,
+                       const PlanContext&, const ScorerShape&)> observe;
+  };
+  static inline const ConjunctionControlForTests* conjunctionControlForTests = nullptr;
   // A cached DocSet has a cheap mask route, so a term may own the candidate
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.

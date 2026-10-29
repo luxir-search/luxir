@@ -94,6 +94,8 @@ state, and commits are crash-safe on immutable segments.
   compiler and dependency environment, including ASan.
 - [Building a release](dev/releases.md) covers branches, tags, CPU tiers,
   validation, and binary packaging.
+- [Plugins](dev/plugins.md) explains the compiled-in plugin model and how to
+  build an engine with out-of-tree plugins.
 - [Documentation](dev/documentation.md) covers editing the guides and
   regenerating the API reference.
 

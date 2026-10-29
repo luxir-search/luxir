@@ -151,12 +151,13 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
 
 // An authored analyzer that says something: a tokenizer component (which must
 // then name a tokenizer - params-only input is an error, not a silent default)
-// or any filter. {} inherits; token filters alone replace the whole parent
-// analyzer and get the whitespace tokenizer; char filters alone keep its chain.
+// or any filter, or a named analyzer. {} inherits; token filters alone replace
+// the whole parent analyzer and get the whitespace tokenizer; char filters alone
+// keep its chain.
 static bool analyzerSet(const luxir::api::FieldDef& def) {
   return def.analyzer.has_value() &&
          (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty() ||
-          !def.analyzer->char_filters.empty());
+          !def.analyzer->char_filters.empty() || !def.analyzer->name.empty());
 }
 
 // Intern merged views until all physical fields have been compiled. Their
@@ -168,7 +169,7 @@ struct AnalyzerDefinitions {
   const api::AnalyzerDef* resolve(const api::FieldDef& def, const api::AnalyzerDef* parent) {
     if (!analyzerSet(def)) return parent;
     const auto& own = *def.analyzer;
-    if (own.tokenizer || !own.filters.empty() || !parent) return &own;
+    if (own.tokenizer || !own.filters.empty() || !own.name.empty() || !parent) return &own;
     auto [it, inserted] = merged.try_emplace({parent, &own}, *parent);
     if (inserted) it->second.char_filters = own.char_filters;
     return &it->second;

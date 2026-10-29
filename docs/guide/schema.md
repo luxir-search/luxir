@@ -274,7 +274,7 @@ publication advances the schema generation.
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
-| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`; see [Text analysis](#text-analysis) |
+| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`, or the name of a registered analyzer such as `"english"`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
@@ -289,11 +289,12 @@ Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
-An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer or
-listing any token filter replaces the whole chain, including character filters
-(token filters alone get the `whitespace` tokenizer). Setting only `char_filters`
-keeps the parent's tokenizer and token filters, replacing its character filters.
-Without a parent analyzer, the base is `whitespace` with no token filters.
+An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer,
+listing any token filter, or naming a registered analyzer replaces the whole
+chain, including character filters (token filters alone get the `whitespace`
+tokenizer). Setting only `char_filters` keeps the parent's tokenizer and token
+filters, replacing its character filters. Without a parent analyzer, the base
+is `whitespace` with no token filters.
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,
@@ -609,6 +610,35 @@ accent folding without possessive removal or stemming. Neither
 
 For Unicode text without English stemming, use `_un`, or configure
 `unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
+
+### Named analyzers
+
+An analyzer can be a registered name instead of a definition. A bare string is
+shorthand for the object form:
+
+```json
+{"fields": {"body": {"type": "text", "analyzer": "english"}}}
+{"fields": {"body": {"type": "text", "analyzer": {"name": "english"}}}}
+```
+
+A named analyzer takes no tokenizer or filters alongside the name.
+`char_filters` next to the name replace the analyzer's own character filters,
+just as setting only `char_filters` does under an inherited analyzer. Built in:
+
+| Name | Expands to |
+|---|---|
+| `standard` | `unicode_word` + `["nfkc_cf"]` |
+| `english` | `unicode_word` + `["nfkc_cf", "fold", "kstem"]`, the same chain as `_t`, with kstem's default `possessive=true` |
+
+Plugins can register more (a language bundle, for example). The schema stores
+the name, and expands it through the registry each time the collection loads,
+so a changed registration applies at the next load, to queries and new
+documents alike. Reindex after such a change so existing segments match. The
+[resolved view](#resolved-view) reports the current expansion in `analyzer` and
+the name in `analyzer_preset`. A schema naming an analyzer or component that this build
+does not have is rejected on write; a collection already holding such a schema
+fails to load with that message while the node keeps serving its other
+collections.
 
 ## Field variants
 
@@ -936,7 +966,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
-| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
+| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer` (always the expanded definition; `analyzer_preset` adds the registered name when one was used), `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
 | `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |

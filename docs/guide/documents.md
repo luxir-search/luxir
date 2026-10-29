@@ -245,7 +245,7 @@ a field at ingest can be used to match or bound that field later.
   [Point formats](geo-search.md#point-formats). Vectors have array shapes
   described in their guide; neither is a generic numeric multi-value field. A vector is a
   number array; integer elements are accepted, and every element must be a
-  finite float32.
+  finite float32 with magnitude at most 2^40.
 
 Numeric primaries return their typed column; `stored` is ignored for them.
 Each variant converts the submitted value independently. For example, an
