@@ -917,6 +917,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
     newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
     state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
+    state->response.warnings = newSchema->schema->responseWarnings(state->arena);
     respondPublished(call, state, collection->getId(), newSchema->id, request.proto.wait_for_replicas,
                      request.proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING,
                      call.waitCancellation.get_token());

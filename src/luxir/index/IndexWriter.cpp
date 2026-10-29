@@ -19,6 +19,7 @@
 #include "luxir/schema/Schema.h"
 
 #include "luxir/index/AuxInfo.h"
+#include "luxir/reader/IntColReader.h"
 #include <memory_resource>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -2271,6 +2272,40 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   }
 }
 
+void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const std::string& indexSortField) {
+  if (indexSortField.empty()) {
+    std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
+      return a->segId < b->segId;
+    });
+    return;
+  }
+  // Sources without int/date column values for the field (never set, or an
+  // older generation typed it differently) sort last.
+  struct Keyed {
+    SegInfo* seg;
+    std::optional<int64_t> min;
+  };
+  std::vector<Keyed> keyed;
+  keyed.reserve(segs.size());
+  for (SegInfo* seg : segs) {
+    auto postingsReader = getSegmentPostingsReader(*seg);
+    std::optional<int64_t> min;
+    if (const auto* info = postingsReader->fieldInfo(indexSortField)) {
+      if ((info->type == FieldType::INT || info->type == FieldType::DATE) &&
+          (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
+        min = IntColReader(*postingsReader, *info).getMin();
+      }
+    }
+    keyed.push_back({seg, min});
+  }
+  std::sort(keyed.begin(), keyed.end(), [](const Keyed& a, const Keyed& b) {
+    if (a.min.has_value() != b.min.has_value()) return a.min.has_value();
+    if (a.min != b.min) return *a.min < *b.min;
+    return a.seg->segId < b.seg->segId;
+  });
+  for (size_t i = 0; i < segs.size(); i++) segs[i] = keyed[i].seg;
+}
+
 // Caller holds publicationMutex (or is constructing this writer).
 void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena, std::shared_ptr<Schema> schema) {
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
@@ -2692,15 +2727,26 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       try {
         luxir::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
 
-    phase = "sort_sources";
-    // Sort the list of segments by the segId.
-    // Some tests rely on not reordering segments.
-    std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-      return a->segId < b->segId;
-    });
-
     phase = "open_source_readers";
-    // grab or open all the postings readers
+    // Ordering by the index sort field reads each source's column trailer;
+    // open (and cache in the slots) every reader first so a failure reports
+    // under this phase.
+    for (auto segInfo : segs) getSegmentPostingsReader(*segInfo);
+
+    phase = "sort_sources";
+    // Source order is not needed for correctness: deletes resolve by
+    // _version_, the merger remaps doc ids per source, and the manifest keeps
+    // its own order. It decides the merged doc order, and with it the order
+    // of tied hits and how tight the merged column zones are. By default keep
+    // creation (segId) order; with an index sort, order sources by their
+    // minimum value of the sort field so a merge of segments flushed out of
+    // time order stays roughly time-ordered.
+    sortMergeSources(segs, getSchema()->indexSortField);
+    // Report sources in concatenation order.
+    for (size_t i = 0; i < segs.size(); i++) sourceSegIds[i] = segs[i]->segId;
+    failure.sourceSegIds = sourceSegIds;
+
+    // grab the postings readers, in source order
     std::vector<std::shared_ptr<PostingsReader>> preaders;
     preaders.reserve(segs.size());
     for (auto segInfo : segs) {
@@ -2931,9 +2977,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // Keep pinned ancestors pointing at the latest output even if an
         // intermediate output is reclaimed before their application finishes.
         for (auto& retired : segmentsToDelete) {
-          auto it = std::lower_bound(segs.begin(), segs.end(), retired->mergedIntoSegId,
-                                    [](const SegInfo* seg, uint64_t id) { return seg->segId < id; });
-          if (it != segs.end() && (*it)->segId == retired->mergedIntoSegId) {
+          // segs is in merge source order, not necessarily segId order.
+          auto it = std::find_if(segs.begin(), segs.end(), [&](const SegInfo* seg) {
+            return seg->segId == retired->mergedIntoSegId;
+          });
+          if (it != segs.end()) {
             retired->mergedIntoSegId = outputSegId;
           }
         }

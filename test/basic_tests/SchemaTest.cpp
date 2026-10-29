@@ -1388,6 +1388,76 @@ TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
   EXPECT_NO_THROW(schemaJson(R"({"fields":{"body":{"type":"text","index":"none","long_terms":"reject"}}})"));
 }
 
+TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
+  auto s = schemaJson(R"({"templates":{"_i":"int"},"fields":{"ts":"date","name":"string","price":"float"},
+    "index_sort":{"field":"ts"}})");
+  EXPECT_EQ("ts", s->indexSortField);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find(R"("index_sort":{"field":"ts"})"));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  EXPECT_EQ("ts", Schema::fromStored(s->storedInfo(arena), 1)->indexSortField);
+
+  // A SET without index_sort keeps it, a template instance is accepted, and
+  // an empty field clears it.
+  EXPECT_EQ("ts", schemaJson(R"({"fields":{"n":"int"}})", s.get())->indexSortField);
+  EXPECT_EQ("n_i", schemaJson(R"({"index_sort":{"field":"n_i"}})", s.get())->indexSortField);
+  auto cleared = schemaJson(R"({"index_sort":{}})", s.get());
+  EXPECT_EQ("", cleared->indexSortField);
+  EXPECT_EQ(std::string::npos, authoredJson(*cleared).find("index_sort"));
+  EXPECT_EQ("", schemaJson(R"({"fields":{"n":"int"}})", cleared.get())->indexSortField);
+
+  for (auto field : {"missing", "_i", "name", "price"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::format(R"({{"index_sort":{{"field":"{}"}}}})", field), s.get()), SchemaError);
+  }
+  // Retyping the sort field away from an int/date column must also clear or
+  // move the index sort; int <-> date stays valid.
+  EXPECT_THROW(schemaJson(R"({"fields":{"ts":"string"}})", s.get()), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"ts":{"type":"date","column":false}}})", s.get()), SchemaError);
+  EXPECT_EQ("ts", schemaJson(R"({"fields":{"ts":"int"}})", s.get())->indexSortField);
+  // REPLACE_ALL compiles without a base, so an omitted index_sort is cleared.
+  EXPECT_EQ("", schemaJson(R"({"fields":{"ts":"date"}})")->indexSortField);
+}
+
+TEST_F(SchemaTest, indexSortSurvivesRestart) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
+  SchemaBuilder b;
+  b.indexSort("ts_dt");
+  b.set(ch.collection());
+  ch.index(flatdoc("id", "1", "ts_dt", (int64_t)1000));
+  ch.commit();
+
+  ch.getIndexWriter()->close();
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
+  EXPECT_EQ("ts_dt", reopened.getSchema()->indexSortField);
+}
+
+// REPLACE_ALL rebuilds the schema from the request: leaving index_sort out
+// clears it, and the update's response carries a warning saying so.
+TEST_F(SchemaTest, replaceAllWithoutIndexSortWarns) {
+  CollectionHelper ch("schema_replace_sort");
+  ch.clear();
+  auto replace = [&](std::string_view json) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    EXPECT_TRUE(api::read_json(def, json, arena));
+    auto snapshot = ch.collection().updateSchema(def, api::SchemaRequest_::Mode::REPLACE_ALL);
+    std::vector<std::string> codes;
+    for (const auto& warning : snapshot->schema->responseWarnings(arena)) codes.emplace_back(warning.code);
+    return codes;
+  };
+  EXPECT_TRUE(replace(R"({"fields":{"ts":"int"},"index_sort":{"field":"ts"}})").empty());
+  EXPECT_TRUE(replace(R"({"fields":{"ts":"int"},"index_sort":{"field":"ts"}})").empty());
+  EXPECT_EQ((std::vector<std::string>{"index_sort_cleared"}), replace(R"({"fields":{"ts":"int"}})"));
+  EXPECT_EQ("", ch.collection().getSchema()->indexSortField);
+  EXPECT_TRUE(replace(R"({"fields":{"ts":"int"}})").empty());  // nothing left to clear
+}
+
 static const StoredFieldType& storedType(const Schema& s, std::string_view name) {
   auto* type = dynamic_cast<const StoredFieldType*>(s.getFieldTypePtr(name));
   if (!type) throw std::runtime_error("no stored resource " + std::string(name));
