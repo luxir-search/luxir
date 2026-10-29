@@ -32,9 +32,11 @@ struct RangeRun {
   std::vector<int32_t> fullScan;
   std::vector<int32_t> sparseVerify;
   std::vector<int32_t> bulk;
+  std::vector<int32_t> zoneMap;
   int64_t count = -1;
   int64_t cost = -1;
   bool zoneBulkAvailable = false;
+  Query::MatchState matchState = Query::MatchState::UNKNOWN;
 };
 
 std::vector<int32_t> collect(Query::Scorer* scorer) {
@@ -47,11 +49,9 @@ std::vector<int32_t> collect(Query::Scorer* scorer) {
   return docs;
 }
 
-RangeRun runRange(IndexReader& reader, std::string_view field,
-                  int64_t lo, int64_t hi) {
+RangeRun runQuery(IndexReader& reader, NumericPredicateQuery& query) {
   MemPool pool;
   Query::Context context(pool, reader);
-  NumericPredicateQuery query(field, lo, hi);
   auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   auto& segment = reader.segments()[0];
@@ -59,6 +59,7 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
   RangeRun run;
   run.fullScan = collect(weight->createFullScanScorerForTests(pool, segment));
   run.pruned = collect(weight->createScorer(pool, segment));
+  run.zoneMap = collect(weight->createZoneMapScorerForTests(pool, segment));
 
   auto* sparseSupplier = weight->scorerSupplier(pool, segment);
   if (sparseSupplier != nullptr) {
@@ -66,8 +67,12 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
     run.zoneBulkAvailable = sparseSupplier->bulkScorer(pool) != nullptr;
     auto* sparsePlan = resolveScorerPlanForTests(pool, *sparseSupplier, 0);
     auto* sparse = sparsePlan->build(pool);
-    EXPECT_EQ(Query::ReportedTwoPhase::YES,
-              sparsePlan->shape().reportedTwoPhase);
+    run.matchState = sparsePlan->shape().matchState;
+    // A segment proven empty needs no verification phase.
+    if (run.matchState != Query::MatchState::EMPTY) {
+      EXPECT_EQ(Query::ReportedTwoPhase::YES,
+                sparsePlan->shape().reportedTwoPhase);
+    }
     run.sparseVerify = collect(sparse);
   }
 
@@ -79,6 +84,12 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
   EXPECT_TRUE(count.has_value());
   run.count = count.value_or(-1);
   return run;
+}
+
+RangeRun runRange(IndexReader& reader, std::string_view field,
+                  int64_t lo, int64_t hi) {
+  NumericPredicateQuery query(field, lo, hi);
+  return runQuery(reader, query);
 }
 
 std::vector<int32_t> oracle(const std::vector<std::vector<int64_t>>& values,
@@ -116,6 +127,7 @@ void expectRun(const RangeRun& run, const std::vector<int32_t>& expected) {
   EXPECT_EQ(run.pruned, expected);
   EXPECT_EQ(run.sparseVerify, expected);
   EXPECT_EQ(run.bulk, expected);
+  EXPECT_EQ(run.zoneMap, expected);
   EXPECT_EQ(run.count, (int64_t)expected.size());
 }
 
@@ -269,6 +281,19 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
               oracle(extremeGcd, endpoint, endpoint));
   }
 
+  // Ranges strictly between lattice points cross a leaf's zone but hold no
+  // representable value. Execution still settles the blocks OUTSIDE; cheap
+  // supplier estimates need not discover their residual lattice gaps.
+  for (auto [field, values, lo, hi] : std::array<std::tuple<std::string_view,
+           const std::vector<std::vector<int64_t>>*, int64_t, int64_t>, 2>{{
+           {"dense_i", &dense, -119'999, -119'995},
+           {"extreme_gcd_i", &extremeGcd, std::numeric_limits<int64_t>::min() + 1,
+            std::numeric_limits<int64_t>::max() - 1}}}) {
+    auto run = runRange(*index.reader, field, lo, hi);
+    expectRun(run, oracle(*values, lo, hi));
+    EXPECT_NE(Query::MatchState::NONEMPTY, run.matchState) << field;
+  }
+
   // A selective correlated range must advertise its selective estimate.
   auto selective = runRange(*index.reader, "dense_i", -120'000, -119'800);
   EXPECT_GT(selective.cost, 0);
@@ -313,7 +338,7 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  auto& topDocs = req->topDocs("q").countLimit().limit(0);
   topDocs.rawQuery() = qb::range(
       topDocs.mr(), "deleted_only_i", qb::valI64(topDocs.mr(), 10),
       nullptr, qb::valI64(topDocs.mr(), 10), nullptr);
@@ -353,9 +378,9 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   index.flush();
   index.initReader();
 
-  auto makeFilter = [&](MemPool& pool) {
-    Query::Context context(pool, *index.reader);
-    NumericPredicateQuery query("window_i", 1, 1);
+  // Scorers classify blocks lazily, so the query and context must outlive them.
+  NumericPredicateQuery query("window_i", 1, 1);
+  auto makeFilter = [&](MemPool& pool, Query::Context& context) {
     auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
@@ -369,7 +394,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   };
 
   MemPool fillPool;
-  WindowFilter fill(fillPool, makeFilter(fillPool));
+  Query::Context fillContext(fillPool, *index.reader);
+  WindowFilter fill(fillPool, makeFilter(fillPool, fillContext));
   int32_t start = IntColReader::BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
   int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
@@ -378,7 +404,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   }
 
   MemPool probePool;
-  WindowFilter probe(probePool, makeFilter(probePool), true);
+  Query::Context probeContext(probePool, *index.reader);
+  WindowFilter probe(probePool, makeFilter(probePool, probeContext), true);
   for (int32_t doc = 0; doc < nDocs; doc += 7) {
     EXPECT_EQ(probe.acceptsProbe(doc), expected(doc)) << "doc=" << doc;
   }
@@ -505,7 +532,7 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
   const auto& info = *fields;
   IntColReader column(segment.postingsReader(), info);
   ASSERT_EQ(column.numBlocks(), 1);
-  EXPECT_NE(column.blockInfo(0).scaledSlope, 0);
+  EXPECT_TRUE(column.blockInfo(0).linearFit());
 
   int64_t target = values[(size_t)OUTLIER][0];
   auto expected = oracle(values, target, target);
@@ -519,4 +546,190 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
       query.createWeight(context, 0));
   EXPECT_EQ(collect(weight->createZoneMapScorerForTests(pool, segment)),
             expected);
+}
+
+namespace {
+
+#ifndef NDEBUG
+thread_local int64_t verifications = 0;
+void countVerification(const NumericPredicateQuery&, int32_t) { verifications++; }
+#endif
+
+// Docs the zone-map scorer verifies value by value for [lo, hi], or -1
+// where the observer is compiled out.
+int64_t zoneVerifications(IndexReader& reader, std::string_view field,
+                          int64_t lo, int64_t hi) {
+#ifndef NDEBUG
+  MemPool pool;
+  Query::Context context(pool, reader);
+  NumericPredicateQuery query(field, lo, hi);
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
+      query.createWeight(context, 0));
+  auto& segment = reader.segments()[0];
+  auto* scorer = weight->createZoneMapScorerForTests(pool, segment);
+  std::vector<uint64_t> words((size_t)(segment.maxDoc() + 63) / 64);
+  verifications = 0;
+  NumericPredicateQuery::verificationObserver = countVerification;
+  scorer->fillWindowBits(words, 0, segment.maxDoc());
+  NumericPredicateQuery::verificationObserver = nullptr;
+  return verifications;
+#else
+  unused(reader, field, lo, hi);
+  return -1;
+#endif
+}
+
+} // namespace
+
+// Linear-fit blocks (sorted ramps, the shape time-sorted timestamps get)
+// resolve crossing blocks to rank runs; every bound placement and slope sign
+// must stay exact, through the full signed domain.
+TEST_F(NumericRangeZoneMapTest, linearFitBlocksResolveRankRuns) {
+  constexpr int32_t N = 5 * IntColReader::BLOCK_SIZE + 700;
+  constexpr int64_t WIDE_STEP = 1LL << 47;
+  struct FieldCase {
+    std::string_view name;
+    std::vector<std::vector<int64_t>> values;
+  };
+  std::array<FieldCase, 5> fields = {{
+      {"jitter_i", {}}, {"down_i", {}}, {"gcd_slope_i", {}},
+      {"wide_up_i", {}}, {"wide_down_i", {}},
+  }};
+  SplitMix64 rng(0x11eaf17);
+  for (int32_t doc = 0; doc < N; doc++) {
+    int64_t jitter = (int64_t)rng.rint(50);
+    fields[0].values.push_back({1'000'000 + (int64_t)doc * 7 + jitter});
+    fields[1].values.push_back({5'000'000 - (int64_t)doc * 13 + jitter});
+    fields[2].values.push_back({((int64_t)doc * 3 + jitter % 5) * 1000});
+    uint64_t wide = ((uint64_t)doc * 4 + (uint64_t)(jitter % 4))
+        * (uint64_t)WIDE_STEP;
+    fields[3].values.push_back(
+        {(int64_t)((uint64_t)std::numeric_limits<int64_t>::min() + wide)});
+    fields[4].values.push_back(
+        {(int64_t)((uint64_t)std::numeric_limits<int64_t>::max() - wide)});
+  }
+
+  TestIndex index;
+  Inverter& inverter = index.getInverter();
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    for (auto& field : fields) {
+      inverter.getIndexHandler(field.name)
+          .index(inverter, field.values[(size_t)doc][0]);
+    }
+    inverter.finishDoc();
+  }
+  index.flush();
+  index.initReader();
+  auto& segment = index.reader->segments()[0];
+
+  constexpr int64_t MIN = std::numeric_limits<int64_t>::min();
+  constexpr int64_t MAX = std::numeric_limits<int64_t>::max();
+  for (const auto& field : fields) {
+    IntColReader column(segment.postingsReader(),
+                        *segment.postingsReader().fieldInfo(field.name));
+    for (int64_t block = 0; block < column.numBlocks(); block++) {
+      EXPECT_TRUE(column.blockInfo(block).linearFit()) << field.name;
+    }
+
+    // Bounds on, just before and just after block and leaf edges.
+    std::vector<int64_t> bounds = {MIN, MAX};
+    for (int32_t rank = 0; rank < N;
+         rank += (int32_t)NumColumnFormat::LEAF_ZONE_SIZE) {
+      int64_t value = field.values[(size_t)rank][0];
+      for (int64_t delta : {-1, 0, 1}) {
+        if ((delta < 0 && value == MIN) || (delta > 0 && value == MAX)) {
+          continue;
+        }
+        bounds.push_back(value + delta);
+      }
+    }
+    for (int32_t i = 0; i < (int32_t)scaleTestWork(40); i++) {
+      int64_t a = bounds[(size_t)rng.rint((int32_t)bounds.size())];
+      int64_t b = bounds[(size_t)rng.rint((int32_t)bounds.size())];
+      int64_t lo = std::min(a, b);
+      int64_t hi = std::max(a, b);
+      expectRun(runRange(*index.reader, field.name, lo, hi),
+                oracle(field.values, lo, hi));
+    }
+    for (int64_t bound : bounds) {
+      expectRun(runRange(*index.reader, field.name, MIN, bound),
+                oracle(field.values, MIN, bound));
+      expectRun(runRange(*index.reader, field.name, bound, MAX),
+                oracle(field.values, bound, MAX));
+    }
+
+    // Exact sets bound their envelope, never claim inside runs.
+    std::array<int64_t, 3> members = {
+        field.values[100][0], field.values[N / 2][0], field.values[N - 1][0]};
+    std::sort(members.begin(), members.end());
+    std::array<PointsReader::ValueRange, 3> intervals;
+    for (size_t i = 0; i < members.size(); i++) {
+      intervals[i] = {members[i], members[i]};
+    }
+    NumericPredicateQuery exact(field.name, std::span<const int64_t>(members),
+                                std::span<const PointsReader::ValueRange>(
+                                    intervals));
+    std::vector<int32_t> expected;
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (std::ranges::binary_search(members, field.values[(size_t)doc][0])) {
+        expected.push_back(doc);
+      }
+    }
+    expectRun(runQuery(*index.reader, exact), expected);
+  }
+
+  // A range whose ends cross two blocks checks only the bands the jitter
+  // leaves undecided, not the blocks or their leaves.
+  int64_t verified = zoneVerifications(
+      *index.reader, "jitter_i", fields[0].values[5000][0],
+      fields[0].values[10'000][0]);
+  if (verified >= 0) {
+    EXPECT_LT(verified, 64);
+  }
+}
+
+// Leaf zones settle crossing blocks of any encoding: leaves whose zone
+// misses or is covered by the range need no per-value check.
+TEST_F(NumericRangeZoneMapTest, leafZonesResolveCrossingBlocks) {
+  constexpr int32_t N = 2 * IntColReader::BLOCK_SIZE;
+  constexpr int32_t LEAF = NumColumnFormat::LEAF_ZONE_SIZE;
+  // Leaves visit value bands out of order, which defeats a linear fit.
+  constexpr std::array<int64_t, 8> BANDS = {0, 7, 1, 6, 2, 5, 3, 4};
+  std::vector<std::vector<int64_t>> values((size_t)N);
+  TestIndex index;
+  Inverter& inverter = index.getInverter();
+  auto& field = inverter.getIndexHandler("leaf_bands_i");
+  SplitMix64 rng(0xb4d5);
+  for (int32_t doc = 0; doc < N; doc++) {
+    int64_t band = BANDS[(size_t)(doc / LEAF % 8)];
+    int64_t value = band * 1000 + (int64_t)rng.rint(1000);
+    values[(size_t)doc].push_back(value);
+    inverter.startDoc();
+    field.index(inverter, value);
+    inverter.finishDoc();
+  }
+  index.flush();
+  index.initReader();
+  auto& segment = index.reader->segments()[0];
+  IntColReader column(segment.postingsReader(),
+                      *segment.postingsReader().fieldInfo("leaf_bands_i"));
+  EXPECT_FALSE(column.blockInfo(0).linearFit());
+
+  for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 5>{{
+           {7000, 7999}, {2500, 2600}, {1000, 2999}, {3999, 4000},
+           {-5, 8005}}}) {
+    expectRun(runRange(*index.reader, "leaf_bands_i", lo, hi),
+              oracle(values, lo, hi));
+  }
+  // Two leaves (one per block) cross; covered leaves are emitted whole.
+  int64_t verified = zoneVerifications(*index.reader, "leaf_bands_i",
+                                       7500, 7999);
+  if (verified >= 0) {
+    EXPECT_EQ(verified, 2 * LEAF);
+  }
+  verified = zoneVerifications(*index.reader, "leaf_bands_i", 1000, 2999);
+  if (verified >= 0) {
+    EXPECT_EQ(verified, 0);
+  }
 }

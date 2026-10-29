@@ -242,4 +242,23 @@ void OrdValueBatches::fillRank(Batch& batch) {
   }
 }
 
+bool DistinctOrdValueBatches::next(OrdValueBatches::Batch& batch) {
+  while (values.next(batch)) {
+    int32_t out = 0;
+    for (int32_t i = 0; i < batch.size; i++) {
+      if (batch.docs[i] != lastDoc) {
+        seen.clear();
+        lastDoc = batch.docs[i];
+      }
+      if (!seen.insert(batch.ords[i]).second) continue;
+      batch.docs[out] = batch.docs[i];
+      batch.ords[out] = batch.ords[i];
+      out++;
+    }
+    batch.size = out;
+    if (out != 0) return true;
+  }
+  return false;
+}
+
 } // namespace luxir

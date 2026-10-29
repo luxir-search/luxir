@@ -84,6 +84,24 @@ inline api::Query regex(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+inline api::Query multiMatch(std::pmr::memory_resource& mr, std::string_view text,
+                             std::initializer_list<api::WeightedField> fields,
+                             api::MultiMatchQuery_::Mode mode = api::MultiMatchQuery_::Mode::COMBINED,
+                             MatchOp op = MatchOp::OPERATOR_UNSPECIFIED) {
+  api::Query q;
+  auto& arm = q.kind.emplace<api::MultiMatchQuery>();
+  arm.text = build::arenaStr(mr, text);
+  auto* arr = build::allocArray(arm.fields, fields.size(), mr);
+  size_t i = 0;
+  for (auto field : fields) {
+    field.field = build::arenaStr(mr, field.field);
+    arr[i++] = field;
+  }
+  arm.mode = mode;
+  arm.operator_ = op;
+  return q;
+}
+
 inline api::Query exists(std::pmr::memory_resource& mr, std::string_view field) {
   api::Query q;
   auto& e = q.kind.emplace<api::ExistsQuery>();
@@ -208,9 +226,10 @@ inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
 }
 inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
                       std::initializer_list<float> vec, int k, int nprobe = 0,
-                      bool exact = false, int refineCandidates = 0, float minScanFraction = 0) {
+                      bool exact = false, int refineCandidates = 0, float minScanFraction = 0,
+                      std::optional<float> similarity = std::nullopt) {
   return knn(mr, field, std::span<const float>(vec.begin(), vec.size()), k, nprobe, exact,
-             refineCandidates, minScanFraction);
+             refineCandidates, minScanFraction, similarity);
 }
 
 inline api::Query constantScore(std::pmr::memory_resource& mr, const api::Query& inner,
@@ -276,6 +295,16 @@ inline api::Query boolean(std::pmr::memory_resource& mr,
                  std::span<const api::Query>(optional.begin(), optional.size()),
                  std::span<const api::Query>(prohibited.begin(), prohibited.size()),
                  std::span<const api::Query>(filter.begin(), filter.size()), minMatch);
+}
+
+// dis_max: the best-scoring query plus tie times the others.
+inline api::Query disMax(std::pmr::memory_resource& mr, std::initializer_list<api::Query> queries,
+                         std::optional<float> tie = std::nullopt) {
+  api::Query q;
+  auto& d = q.kind.emplace<api::DisMaxQuery>();
+  setSpan(d.queries, mr, std::span<const api::Query>(queries.begin(), queries.size()));
+  d.tie = tie;
+  return q;
 }
 
 // ---- TopDocs / facet field setters via an OpCursor ----

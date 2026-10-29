@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "test/TestUtils.h"
 
 #include <algorithm>
 #include <bit>
@@ -231,6 +232,7 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
     }
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   reader = std::make_unique<PostingsReader>(dir, 0);
@@ -288,6 +290,7 @@ void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
     tableOut->write(&header, sizeof(header));
     tableOut->write(rows, sizeof(rows));
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   reader = std::make_unique<PostingsReader>(dir, 0);

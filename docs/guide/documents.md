@@ -101,7 +101,7 @@ POST /collections/authors/_search
   "fields": ["title_t", "author_name"],
   "sort": "id",
   "limit": 3,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "authors": {
       "field_facet": {
@@ -178,8 +178,15 @@ are known to be new and unique, see
 
 An ID is not required. A document with an absent or null ID can be searched,
 but it cannot be overwritten or deleted by ID and has no useful external
-identity.  `_version_` is reserved for internal overwrite ordering and is not
-an application field.
+identity.
+
+`_version_` is the update version of the request that indexed the document,
+including `allow_dups` and documents without an ID. It is assigned by the engine
+and is retrieval-only: name it explicitly in the returned fields (`fl`) to read
+it. Sorting, filtering, faceting, functions, collapse and value statistics on
+`_version_` are not supported. Default and wildcard projections exclude it.
+Documents that supply it, directly or through field mapping, are rejected
+with a document error. Optimistic concurrency is not supported.
 
 ## Multi-valued fields
 
@@ -195,10 +202,12 @@ The outer JSON shape follows the schema:
 ```
 
 String, text, numeric, and date multi-fields use an array of scalar values.
-A multi-geo field uses an array of `[lon,lat]` points. A multi-vector field
+A multi-geo field uses an array of points in any
+[point form](geo-search.md#point-formats); an array of numbers alone is one
+point. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
-one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
-`_fs`, `_ds`, `_dts`, `_lds`, and `_vs` default suffixes already are.
+one-vector list. Enable a [multi-valued mode](schema.md#multi-valued-modes);
+the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, `_lds`, `_ps`, and `_vs` suffixes already do.
 
 ## What is returned
 
@@ -231,10 +240,12 @@ a field at ingest can be used to match or bound that field later.
 - Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
   date math. Update messages interpret offset-less date text in UTC; search
   requests may supply a query time zone. See [Dates](dates.md).
-- Geo points and vectors have array shapes described in their dedicated
-  guides; they are not generic numeric multi-value fields. A vector is a
+- Geo points take `[lon, lat]` arrays, `{"lat", "lon"}` objects, GeoJSON
+  points, `"lat,lon"` and WKT strings, and geohashes; see
+  [Point formats](geo-search.md#point-formats). Vectors have array shapes
+  described in their guide; neither is a generic numeric multi-value field. A vector is a
   number array; integer elements are accepted, and every element must be a
-  finite float32.
+  finite float32 with magnitude at most 2^40.
 
 Numeric primaries return their typed column; `stored` is ignored for them.
 Each variant converts the submitted value independently. For example, an
@@ -257,8 +268,9 @@ Patterns without `__` never expand variants; `author__*` or `*__s` discovers
 variants that have a column. HTTP row format omits missing fields; HTTP
 column format includes the requested key with `null`.
 
-For a multi-valued field, stored values keep source order and duplicates;
-a string column is a sorted, deduplicated set.
+Column retrieval follows each representation's
+[multi-valued mode](schema.md#multi-valued-modes). Stored-source retrieval
+keeps source order and repeats independently of that mode.
 
 ### Multi-valued text and phrases
 

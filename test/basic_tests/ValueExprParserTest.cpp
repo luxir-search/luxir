@@ -141,19 +141,19 @@ TEST(ValueExprParserTest, logicalDateRules) {
   ValueExprOptions options{schema.get(), {}};
   ValueExprParser parser(options, *memory.arena);
 
-  EXPECT_EQ(ValueNature::DATE, parser.parse("when_dt")->root().nature);
-  EXPECT_EQ(ValueNature::DATE, parser.parse("birthday_ld")->root().nature);
+  EXPECT_EQ(ValueNature::DATE_MS, parser.parse("when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::DATE_MS, parser.parse("birthday_ld")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("when_dt - birthday_ld")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("when_dt + 1000")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("when_dt - when_dt")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("avg(stamps_dts)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("count(stamps_dts)")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("def(when_dt,0)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("2 * when_dt")->root().nature);
@@ -283,4 +283,58 @@ TEST(ValueExprParserTest, registryEntriesAreComplete) {
   EXPECT_NE(count->evalPoint, avg->evalPoint);
   EXPECT_NE(sum->evalPoint, count->evalPoint);
   EXPECT_NE(sum->evalElement, count->evalElement);
+}
+
+TEST(ValueExprParserTest, dateUnitsPreserveIdentityAndSameUnitTrees) {
+  TestArena memory;
+  auto base = Schema::createDefaultSchema();
+  ValueProgram* millisColumn = nullptr;
+  for (bool nanos : {false, true}) {
+    SchemaBuilder builder;
+    auto& field = builder.field("stamp");
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = nanos ? api::FieldDef::DateUnit::NS : api::FieldDef::DateUnit::MS;
+    auto& array = builder.field("stamps");
+    array.parent = "stamp";
+    array.multi = api::FieldDef::MultiMode::DEFAULT;
+    auto schema = builder.build(base.get());
+    ValueExprOptions options{schema.get(), {}};
+    ValueExprParser parser(options, *memory.arena);
+    ValueProgram* column = parser.parse("stamp");
+    ValueNature nature = dateValueNature(nanos ? DateUnit::NANOS : DateUnit::MILLIS);
+    EXPECT_EQ(nature, column->root().nature);
+    EXPECT_EQ(nanos ? DateUnit::NANOS : DateUnit::MILLIS, valueDateUnit(nature));
+    if (!nanos) millisColumn = column;
+    else EXPECT_FALSE(column->structurallyEqual(*millisColumn));
+
+    // Build the unconverted binary form independently, using just the column
+    // leaf and registry entry. Same-unit resolution must add no wrapper nodes.
+    for (auto name : {"sub", "def", "min", "max", "add"}) {
+      bool offset = std::string_view(name) == "add";
+      auto* expected = arenaCreate<ValueProgram>(*memory.arena, *memory.arena);
+      expected->addNode(column->root());
+      ValueNode rhs = column->root();
+      if (offset) {
+        rhs = ValueNode{};
+        rhs.intValue = 1;
+      }
+      expected->addNode(rhs);
+      ValueNode root;
+      root.kind = ValueNodeKind::FUNCTION;
+      root.function = ValueFunctionRegistry::find(name);
+      root.opcode = root.function->opcode;
+      root.children = {0, 1};
+      root.childCount = 2;
+      root.nature = std::string_view(name) == "sub" ? ValueNature::NUMBER : nature;
+      expected->addNode(root);
+      auto* parsed = parser.parse(std::string(name) + "(stamp," + (offset ? "1)" : "stamp)"));
+      EXPECT_EQ(3u, parsed->nodes.size());
+      EXPECT_TRUE(parsed->structurallyEqual(*expected)) << name;
+    }
+    for (auto expression : {"stamp-1", "def(stamp,0)", "avg(stamps)", "min(stamps)"}) {
+      EXPECT_EQ(nature, parser.parse(expression)->root().nature) << expression;
+    }
+    expectParseError(parser, "sum(stamps)", "cannot reduce a DATE array");
+    expectParseError(parser, "stamp+when_dt", "cannot add two DATE");
+  }
 }

@@ -9,6 +9,7 @@
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/OrdCollector.h"
+#include "luxir/index/ArrayOrdValues.h"
 #include "luxir/index/OrdColWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/TermValHash.h"
@@ -17,14 +18,22 @@
 using namespace luxir;
 namespace luxir::handler {
 
-/// Single-valued string field (indexed and column-stored)
+/// String field (indexed and column-stored)
 /// The column has ords stored for each doc.  Retrieving the corresponding term is done via TermsEnum.
+template <bool Array = false>
 class StrHandler final : public Inverter::IndexHandler {
   friend Inverter;
   StringValue stringValue;
 
   // TODO: for unique fields like "id", this could be TermValHash<int32_t>
-  TermValHash<DocStream> termsHash; // the set of terms contained in this field
+  LUXIR_UNALIGNED_START
+  struct ArrayTerm : DocStream {
+    uint32_t id = 0;
+    explicit ArrayTerm(MemPool& pool) : DocStream(pool) {}
+  } LUXIR_UNALIGNED_END;
+  struct NoArrayValues { explicit NoArrayValues(MemPool&) {} };
+  [[no_unique_address]] std::conditional_t<Array, ArrayOrdValues, NoArrayValues> arrayValues;
+  TermValHash<std::conditional_t<Array, ArrayTerm, DocStream>> termsHash; // the set of terms contained in this field
 
   // Postings store a field-rank (the doc's rank among docs-with-value) rather than a
   // docid, so the ord collector at flush is sized to docsWithField, not maxDoc.
@@ -37,7 +46,7 @@ class StrHandler final : public Inverter::IndexHandler {
 public:
   StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      stringValue(*fieldType), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
+      stringValue(*fieldType), arrayValues(inverter.pool), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
   }
 
   ~StrHandler() override = default;
@@ -98,10 +107,16 @@ public:
       // to equal inverter.pool.
       docsWithField.addDoc(termsHash.getMemPool(), doc);
       nDocsWithField++;
+      if constexpr (Array) arrayValues.startDoc(inverter.pool);
     }
     int32_t rank = nDocsWithField - 1;
     auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
-    unused(inserted);
+    if constexpr (Array) {
+      if (inserted) entry->val().id = (uint32_t)termsHash.size();
+      arrayValues.add(inverter.pool, entry->val().id);
+    } else {
+      unused(inserted);
+    }
     // don't record duplicates for the same doc (postings are keyed by rank).
     if (entry->val().getLastDoc() != rank) {
       entry->val().addDoc(termsHash.getMemPool(), rank);
@@ -147,6 +162,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
 
     // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
     // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table
@@ -159,7 +175,15 @@ public:
       docsWithField.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
     }
 
-    OrdCollector ords(guard.pool(), nDocsWithField);
+    std::conditional_t<Array, std::vector<uint32_t>, std::monostate> termToOrd;
+    if constexpr (Array) {
+      arrayValues.finish(inverter.pool);
+      termToOrd.resize((size_t)uniqueVals + 1);
+    }
+    auto ords = [&]() {
+      if constexpr (Array) return ArrayOrdValues::Mapped(arrayValues, inverter.pool, termToOrd);
+      else return OrdCollector(guard.pool(), nDocsWithField);
+    }();
     size_t poolStart = guard.pool().size();
 
     textWriter.startField(&fieldInfo);
@@ -167,11 +191,12 @@ public:
       auto term = terms[tnum];
       int64_t ord = textWriter.startTerm(term);
       assert(ord <= INT32_MAX);
+      if constexpr (Array) termToOrd[term.val().id] = (uint32_t)ord;
       // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
       term.val().forEachDoc(termsHash.getMemPool(), [&](int rank) {
         int32_t docid = full ? rank : rankToDoc[rank];
         textWriter.addDoc(docid, 1);  // DOCS-only field: record the doc, no freq/position stored
-        ords.add(rank, (uint32_t)ord);
+        if constexpr (!Array) ords.add(rank, (uint32_t)ord);
       });
       textWriter.endTerm(term);
     }
@@ -179,10 +204,13 @@ public:
     termsHash.free();
     // Ord workspace at its peak; the pool's growth counts the spilled
     // multi-valued ords to within a block.
-    inverter.noteFlushWorkspace(ords.slotBytes() + rankToDoc.capacity() * sizeof(int32_t)
+    size_t collectorBytes;
+    if constexpr (Array) collectorBytes = termToOrd.capacity() * sizeof(uint32_t);
+    else collectorBytes = ords.slotBytes();
+    inverter.noteFlushWorkspace(collectorBytes + rankToDoc.capacity() * sizeof(int32_t)
                                 + (guard.pool().size() - poolStart));
 
-    OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
+    BasicOrdColWriter<decltype(ords)> ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
     ordsWriter.finish(rankToDoc);
   }
 

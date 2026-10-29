@@ -27,7 +27,7 @@ TEST_F(InverterMemSizeTest, textTermHashAccounted) {
   f.startIndexing();
   Inverter& inv = idx.getInverter();
   ASSERT_EQ(0u, inv.extraRamBytes);
-  ASSERT_EQ(inv.pool.size(), inv.memSize());
+  ASSERT_EQ(inv.pool.size() + inv.versionRuns.allocatedBytes(), inv.memSize());
 
   for (int i = 0; i < 4000; i++) {
     f.add(i, "term" + std::to_string(i) + " shared common words here");
@@ -35,7 +35,7 @@ TEST_F(InverterMemSizeTest, textTermHashAccounted) {
 
   EXPECT_GT(inv.extraRamBytes, 0u) << "term-hash table not accounted";
   EXPECT_GT(inv.memSize(), inv.pool.size());
-  EXPECT_EQ(inv.pool.size() + inv.extraRamBytes, inv.memSize());
+  EXPECT_EQ(inv.pool.size() + inv.extraRamBytes + inv.versionRuns.allocatedBytes(), inv.memSize());
 }
 
 // IdHandler owns a private idPool (not inverter.pool); indexing many ids must

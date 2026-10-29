@@ -24,7 +24,7 @@
 namespace luxir {
 
 // Page-member traversal overrides affect work, never membership.
-enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN };
+enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN_WALK };
 inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;
 struct CollapseMemberStats {
   std::atomic<int64_t> keySegments{0}, domainSegments{0}, candidates{0}, members{0};
@@ -100,9 +100,19 @@ struct InlineFacetEntryStats {
   std::atomic<size_t> mixedMerges{0};
   std::atomic<size_t> denseFallbacks{0};
   std::atomic<size_t> entryStride{0};
+  // Ord batches accumulated through the keyed batch path.
+  std::atomic<size_t> keyedBatches{0};
 };
 inline InlineFacetEntryStats* inlineFacetEntryStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
+inline bool disableAggregateSharingForTests = false;
+struct AggregateExecutionStats {
+  std::atomic<size_t> followers{0}, producerStates{0}, finishedStateBytes{0}, retainedStateBytes{0};
+};
+inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
+// A/B toggle: inline facet metrics take the per-document calculator calls
+// instead of keyed ord batches.
+inline bool disableKeyedInlineBatchesForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE

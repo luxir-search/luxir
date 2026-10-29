@@ -1,9 +1,11 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <latch>
+#include <memory_resource>
 #include <string>
 #include <thread>
 #include <utility>
@@ -12,6 +14,7 @@
 #include <oneapi/tbb/task_group.h>
 
 #include "luxir/reader/FieldMetadataMemory.h"
+#include "luxir/search/EmitDocs.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
@@ -152,7 +155,7 @@ protected:
       }
       return nullptr;
     });
-    helper.getSearchEngine().dispatch(*req.get(), -1);
+    helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
     Signal::unlisten(signal);
     Signal::unlisten("searchRootChildStart");
     ASSERT_GE(waits.load(), 1);
@@ -164,6 +167,39 @@ protected:
     assertError(*req.get());
   }
 };
+
+TEST_F(EmitDocsTest, invalidExtraNamesFailBeforeEmission) {
+  CollectionHelper helper;
+  auto req = localReq(helper.getSearchEngine());
+  api::DocList list;
+  bool started = false;
+  std::span<const std::string_view> fields;
+  auto emit = [&](std::span<const ExtraColumn> extras) {
+    emitDocsResponse(*req.get(), 0, [&](SearchResponse*) -> api::DocList& {
+      started = true;
+      return list;
+    }, 1, [](int64_t) { return segdoc(0, 0); }, [](int64_t) { return 0.0f; },
+    1, fields, 0, 0, false, false, api::DocFormat::COLUMNS, DocEmission::FINAL_RESPONSE, {}, false, extras);
+  };
+  ExtraColumn extra{"_rank", [](int64_t, api::Val& out, std::pmr::memory_resource&) { out.kind = (int64_t)1; }};
+  ExtraColumn duplicates[] = {extra, extra};
+  EXPECT_THROW(emit(duplicates), std::logic_error);
+  for (auto name : {"_score_", "_version_"}) {
+    extra.name = name;
+    EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  }
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "price_i", 17)}, UpdateMessage::COMMIT).success);
+  req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  req->schema = req->reader->schema();
+  extra.name = "price_i";
+  EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  std::string_view wildcard = "*";
+  fields = std::span<const std::string_view>(&wildcard, 1);
+  EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  EXPECT_FALSE(started);
+  EXPECT_TRUE(list.columns.empty());
+  EXPECT_TRUE(req->responses.empty());
+}
 
 TEST_F(EmitDocsTest, siblingFailureDuringColumnLoads) {
   for (bool onCaller : {false, true}) {
@@ -224,7 +260,7 @@ TEST_F(EmitDocsTest, countOnlyResponsesSkipReturnFieldMetadata) {
   auto names = [] { return (int64_t)fieldMetadataMemory.names.load(); };
   int64_t before = names();
   auto count = localReq(helper.getSearchEngine());
-  count->collection("main").topDocs("q").allQuery().limit(0).getNumber(true);
+  count->collection("main").topDocs("q").allQuery().limit(0).countLimit();
   count->execute(0);
   ASSERT_OK(count);
   EXPECT_LT(names() - before, FIELDS);
@@ -261,7 +297,7 @@ TEST_F(EmitDocsTest, siblingFailureWhilePausedPreservesOriginalError) {
     paused->parked.wait();
     throw RequestError("sibling failure", "invalid_request");
   });
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   Signal::unlisten("searchRootChildStart");
   ASSERT_EQ(1u, req->responses.size());
   ASSERT_TRUE(req->responses[0]->proto.more);
@@ -281,7 +317,7 @@ TEST_F(EmitDocsTest, resumedLoadsIgnoreUnrelatedContextCancellation) {
   auto req = LocalReqHandle(paused);
   req->collection(helper.collection().getId().name);
   addDocsOp(*req.get(), "q", 5);
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   ASSERT_EQ(1u, req->responses.size());
   auto resume = std::move(paused->resume);
   ASSERT_TRUE(resume);
@@ -297,6 +333,55 @@ TEST_F(EmitDocsTest, resumedLoadsIgnoreUnrelatedContextCancellation) {
     assertBatch(*response, "q");
   }
   EXPECT_TRUE(req->responses.back()->last);
+}
+
+
+// A col_val column (a type with no typed arm) follows the same placement as
+// typed columns: an unset slot is missing, ROWS scatters the set values,
+// ADAPTIVE keeps a dense one, COLUMNS leaves out an all-missing discovered one.
+TEST(EmitDocsPlacement, valueColumnPlacement) {
+  using Pair = std::pair<std::string_view, api::Column>;
+  std::pmr::monotonic_buffer_resource mr;
+  api::Val vals[3];
+  vals[0].kind = true;
+  vals[2].kind = false;
+  ReturnField rf{"flag_b", "flag_b", nullptr, ReturnField::Kind::PHYSICAL, true, {}, {}};
+  std::array<const ReturnField*, 1> fields{&rf};
+  std::array<const uint8_t*, 1> present{nullptr};
+  std::vector<uint8_t> fate;
+  std::vector<uint32_t> rowCaps;
+  auto place = [&](api::DocFormat format, std::span<const api::Val> v, api::DocList& docList) {
+    auto* column = (Pair*)mr.allocate(sizeof(Pair), alignof(Pair));
+    new (column) Pair{"flag_b", {}};
+    column->second.kind = api::ColVal{v};
+    SearchResponse::ColumnsType columns(std::span<const Pair>(column, 1)), moved;
+    placeBatchColumns(format, fields, present, columns, moved, v.size(), false, fate, rowCaps, mr);
+    if (!rowCaps.empty()) scatterColumnsToRows(moved, docList, v.size(), rowCaps, mr);
+    docList.columns = columns;
+  };
+
+  api::DocList rows;
+  place(api::DocFormat::ROWS, vals, rows);
+  EXPECT_TRUE(rows.columns.empty());
+  EXPECT_EQ((std::vector<uint32_t>{1, 0, 1}), rowCaps);
+  ASSERT_EQ(3u, rows.docs.size());
+  for (size_t i : {0, 2}) {
+    const auto* flag = rows.docs[i].fields.find("flag_b");
+    ASSERT_NE(nullptr, flag);
+    EXPECT_EQ(i == 0, std::get<bool>((**flag).kind));
+  }
+  EXPECT_TRUE(rows.docs[1].fields.empty());
+
+  api::DocList adaptive;
+  place(api::DocFormat::ADAPTIVE, vals, adaptive);
+  EXPECT_TRUE(adaptive.docs.empty());
+  EXPECT_NE(nullptr, adaptive.columns.find("flag_b"));
+
+  api::Val unset[3];
+  api::DocList columns;
+  place(api::DocFormat::COLUMNS, unset, columns);
+  EXPECT_TRUE(columns.columns.empty());
+  EXPECT_TRUE(columns.docs.empty());
 }
 
 }

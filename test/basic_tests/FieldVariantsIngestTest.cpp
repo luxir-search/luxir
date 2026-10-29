@@ -20,7 +20,7 @@ protected:
     SchemaBuilder b;
     auto& author = b.field("author");
     author.type = FieldClass::TEXT;
-    author.multi = multi;
+    author.multi = (multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
     auto& s = b.variant(author, "s");
     s.type = FieldClass::STRING;
     if (reject) s.long_terms = api::FieldDef::LongTerms::REJECT;
@@ -234,7 +234,7 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     SchemaBuilder b;
     auto& value = b.field("value");
     value.type = FieldClass::STRING;
-    value.multi = true;
+    value.multi = api::FieldDef::MultiMode::DEFAULT;
     value.index = indexed ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
     if (indexed) value.long_terms = api::FieldDef::LongTerms::REJECT;
     b.normalizer(value, {"nfkc_cf", "fold"});
@@ -261,7 +261,7 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     auto docs = req->getDocs();
     ASSERT_EQ(1u, docs.size());
     auto expected = std::vector<std::string>{"cafe", std::string(128, 'e'), std::string(255, 'x'), std::string(254, 'x') + "i"};
-    if (indexed) std::sort(expected.begin(), expected.end());
+    std::sort(expected.begin(), expected.end());
     EXPECT_TRUE(containsDoc(docs, flatdoc("id", "good", "value", expected)));
     helper.clear();
   }
@@ -424,8 +424,8 @@ TEST_F(FieldVariantsIngestTest, hash128UsesCompleteNormalizedValueAndLeavesColum
 // A stored ID and a stored indexed STRING are retrieved from their columns;
 // only rows whose term may have been fitted (MIN_FITTED_LEN bytes or more)
 // come from the stored chunk.  Every length around the boundary, in two
-// segments, must round-trip its source, including two values that share one
-// truncated term.
+// segments, must round-trip its source, including STRING values that share one
+// truncated term. IDs remain distinct after fitting.
 TEST_F(FieldVariantsIngestTest, columnBackedRetrievalReturnsSourceForLongValues) {
   for (auto policy : {api::FieldDef::LongTerms::HASH128, api::FieldDef::LongTerms::TRUNCATE}) {
     SCOPED_TRACE((int)policy);
@@ -441,9 +441,11 @@ TEST_F(FieldVariantsIngestTest, columnBackedRetrievalReturnsSourceForLongValues)
     std::vector<Doc> docs;
     for (size_t len : {1u, 10u, 251u, 252u, 254u, 255u, 256u, 300u, 5000u}) {
       std::string value(len - 1, 'x');
-      docs.push_back(flatdoc("id", value + "i", "s", value + "s"));
+      std::string id = value + "i";
+      id[0] = (char)('a' + docs.size());
+      docs.push_back(flatdoc("id", id, "s", value + "s"));
     }
-    docs.push_back(flatdoc("id", std::string(300, 'x') + "a", "s", std::string(300, 'x') + "b"));
+    docs.push_back(flatdoc("id", std::string(300, 'y') + "a", "s", std::string(300, 'x') + "b"));
     size_t half = docs.size() / 2;
     ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(0, half), UpdateMessage::COMMIT).success);
     ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(half), UpdateMessage::COMMIT).success);
@@ -462,7 +464,7 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
   SchemaBuilder b;
   auto& a = b.field("a");
   a.type = FieldClass::TEXT;
-  a.multi = true;
+  a.multi = api::FieldDef::MultiMode::DEFAULT;
   b.variant(a, "s").type = FieldClass::STRING;
   auto& col = b.variant(a, "col");
   col.type = FieldClass::STRING;
@@ -471,7 +473,7 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
   b.field("aB").type = FieldClass::INT; // sorts between the primary and its variants
   auto& point = b.field("point");
   point.type = FieldClass::GEO_POINT;
-  point.multi = true;
+  point.multi = api::FieldDef::MultiMode::DEFAULT;
   b.variant(point, "copy").type = FieldClass::GEO_POINT;
   b.set(helper.collection());
   auto writer = helper.getIndexWriter();
@@ -497,8 +499,8 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
     else geo.index(inv, 10.0, 20.0);
     inv.finishDoc();
   }
-  EXPECT_TRUE(inv.inputHandlers.contains("_version_"));
-  EXPECT_TRUE(inv.indexHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.inputHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.indexHandlers.contains("_version_"));
   EXPECT_FALSE(inv.inputHandlers.contains("a__s"));
   writer->releaseInverter(inv, true);
   helper.commit();
@@ -614,4 +616,25 @@ TEST_F(FieldVariantsIngestTest, vectorBranchesFinishTheirRawColumns) {
   req->collection("main").topDocs("q").allQuery().fields({"vec", "vec__copy"});
   req->execute();
   EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("vec", values, "vec__copy", values)));
+}
+
+TEST_F(FieldVariantsIngestTest, declaredArrayPreservesIndexedStringVariantSequence) {
+  CollectionHelper helper;
+  SchemaBuilder b;
+  auto& text = b.field("author");
+  text.type = FieldClass::TEXT;
+  text.multi = api::FieldDef::MultiMode::ARRAY;
+  auto& exact = b.variant(text, "s");
+  exact.type = FieldClass::STRING;
+  b.normalizer(exact, {"nfkc_cf"});
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", vecs("Z", "B", "b", "A")), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"author__s"});
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& values = std::get<api::ArrArrStr>(req->docList("q")->columns.at("author__s").kind).v;
+  ASSERT_EQ(1u, values.size());
+  EXPECT_EQ((std::vector<std::string>{"z", "b", "b", "a"}), std::vector<std::string>(values[0].v.begin(), values[0].v.end()));
+  EXPECT_EQ(1u, match(helper, "author__s", "b").size());
 }

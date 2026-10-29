@@ -14,7 +14,8 @@ This fetches pinned sources and installs normal and ASan dependencies
 sequentially into /opt/vcpkg/installed-native and installed-native-asan.
 An optional first argument selects another vcpkg checkout; adjust the CMake
 presets' toolchain and install paths accordingly. VCPKG_MAX_CONCURRENCY defaults
-to 12. Sources and binary caches are shared; completed build trees are cleaned.
+to the jobs the cores and memory allow (../tools/build-jobs). Sources and
+binary caches are shared; completed build trees are cleaned.
 
 Triplets
 --------
@@ -23,6 +24,11 @@ triplets/x64-linux-luxir-native*.cmake use -march=native -mtune=native for C and
 C++. The setup script records the compilers' effective CPU options in the
 binary-cache ABI, preventing reuse across incompatible native CPU settings.
 triplets/x64-linux-luxir-v2*.cmake provide the container's x86-64-v2 baseline.
+triplets/arm64-osx-luxir-m1*.cmake serve macOS: a fixed apple-m1 and macOS 14
+baseline rather than the host CPU, so no fingerprint is needed and one install
+serves local builds and binaries for other Macs. They define _DARWIN_C_SOURCE
+for C++: libstdc++ declares C library functions that the SDK otherwise hides
+from ports selecting a POSIX level, which g++ on Linux avoids via _GNU_SOURCE.
 The common fragments select static libraries and disable the IPO configuration
 unsupported by static oneTBB. ASan variants instrument all target dependencies;
 host code generators run unsanitized. Native ASan uses the Release-only
@@ -49,7 +55,9 @@ Libraries
   static archive, so each executable exports malloc/free and operator new/delete.
   See ports/jemalloc/portfile.cmake for the version and embedded configuration.
 - The FAISS overlay enables runtime SIMD dispatch (FAISS_OPT_LEVEL=dd) and
-  checks the CPU features required by each dispatched kernel.
+  checks the CPU features required by each dispatched kernel. Apple silicon
+  has no SVE to dispatch to, so macOS uses the NEON-only generic level and
+  omits the Metal GPU backend.
 - OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler
   or runtime is needed. BLAS is single-threaded with locking for concurrent
   callers; CPU-specific kernels are selected at runtime. ASan disables the
@@ -57,6 +65,8 @@ Libraries
   The overlay preserves caller CPU flags for common code and C LAPACK; upstream
   otherwise strips -march=native as a workaround for older GCC versions.
 - The lapack overlay directs FAISS to the LAPACK routines inside OpenBLAS.
+  On macOS, vcpkg's blas port selects Apple's Accelerate, so the overlay uses
+  Accelerate for LAPACK too and OpenBLAS is not built.
 
 For dependency changes, rerun make_deps.sh, then rebuild and test Luxir. Old
 classic installs under /opt/vcpkg/installed and /opt/vcpkg_asan are not used by

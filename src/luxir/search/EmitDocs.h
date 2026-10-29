@@ -27,6 +27,7 @@
 #include <numeric>
 #include <ranges>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -40,11 +41,12 @@
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/DateOutput.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/screaming.h"
+#include "luxir/schema/FieldPattern.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 
@@ -358,12 +360,22 @@ struct DoubleColEmit {
   static int64_t encHi() { return doubleToSortableInt64(std::numeric_limits<double>::infinity()); }
 };
 
-// The caller finishes the batch and waits before releasing loader resources.
+struct DateStrColEmit {
+  using value_type = std::string_view;
+  using arr_type = luxir::api::ArrStr;
+};
+
 template <typename Emit>
+struct ColumnDecode {
+  auto operator()(int64_t raw) const { return Emit::decode(raw); }
+};
+
+// The caller finishes the batch and waits before releasing loader resources.
+template <typename Emit, typename Decode = ColumnDecode<Emit>>
 inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
-                       FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr)
+                       FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr, Decode decode = {})
 {
   std::span<typename Emit::value_type> starget; // single valued target
   std::span<typename Emit::arr_type> mtarget;   // multi-valued target
@@ -374,7 +386,10 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     return;
   }
 
-  if (!fieldType.multiValued()) {
+  if constexpr (std::is_same_v<typename Emit::value_type, std::string_view>) {
+    present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
+                                starget, mtarget, pendingCols, mr);
+  } else if (!fieldType.multiValued()) {
     auto& numCol = Emit::singleCol(fieldCol);
     starget = std::span<typename Emit::value_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
 
@@ -394,7 +409,7 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     auto& numCol = Emit::multiCol(fieldCol);
     mtarget = std::span<typename Emit::arr_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
   }
-  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr, decode](std::span<RowIndex> idxSpan) {
     auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
@@ -408,7 +423,7 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     if (!fieldType.multiValued()) {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        starget[idxSpan[idx]] = Emit::decode(val);
+        starget[idxSpan[idx]] = decode(val);
         present[idxSpan[idx]] = 1;
       };
       IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
@@ -419,10 +434,27 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
         if (valIdx == 0) {
           build::allocArray(target.v, numVals, mr);
         }
-        const_cast<typename Emit::value_type*>(target.v.data())[valIdx] = Emit::decode(val);
+        const_cast<typename Emit::value_type*>(target.v.data())[valIdx] = decode(val);
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
+  });
+}
+
+inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
+                            luxir::api::Column& fieldCol, FieldLoaders* loaders,
+                            PendingCols& pendingCols, std::pmr::memory_resource& mr) {
+  auto& col = fieldCol.kind.emplace<luxir::api::ColInt>();
+  auto* target = build::allocArray(col.v, segDocs.size(), mr);
+  auto& pending = pendingCols.emplace_back();
+  pending.present.assign(segDocs.size(), 1);
+  pending.finish = [&col](std::span<const uint8_t> present) {
+    col.missing_val = pickMissingVal<IntColEmit>(col.v, present);
+  };
+  addFieldLoader(loaders, runs, [&req, segDocs, target](std::span<RowIndex> indices) {
+    auto segment = segDocs[indices[0]].segment();
+    VersionRuns::Cursor cursor(req.reader->segments()[segment].postingsReader().versionRuns());
+    for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
   });
 }
 
@@ -614,29 +646,27 @@ inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments info
   });
 }
 
-// Row placement: scatter loaded columns into per-doc field maps
-// (DocList.docs).  The loaders always fill column-shaped storage (pre-sized
-// spans, filled in parallel per segment); for row-placed fields that storage
-// is arena scratch never attached to the response, and this post-wait pass
-// moves the values into rows.  Presence uses the exact per-column contracts the COLUMNS wire shape
-// already guarantees: single-valued sentinel (missing_val, exact after
-// finishPendingCols), multi-valued empty array, vector unset f32.  Missing =
-// key absent; no sentinels in rows.  Values share the arena-backed spans and
-// string views with the scratch columns - nothing is copied.
+// Row placement: scatter columns into per-doc field maps (DocList.docs).
+// The loaders always fill column-shaped storage (pre-sized spans, filled in
+// parallel per segment); placeBatchColumns takes the columns that belong in
+// rows out of the response, and this pass moves their values into rows.
+// Presence follows the column contracts (see forEachPresent).  Missing = key
+// absent; no sentinels in rows.  Values share the arena-backed spans and
+// string views with the moved columns - nothing is copied.
 //
 // Returns the mutable row array so the caller can add pseudo-fields
-// (_score_).  fieldCap is each row map's slot capacity (distinct field
-// names, including pseudo-fields the caller will add).
+// (_score_).  rowCaps[i] is row i's exact map capacity: its present values
+// plus the pseudo-fields the caller will add.
 inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& cols,
                                              luxir::api::DocList& docListProto,
-                                             size_t numDocs, size_t fieldCap,
+                                             size_t numDocs, std::span<const uint32_t> rowCaps,
                                              std::pmr::memory_resource& mr)
 {
   using luxir::api::Val;
   luxir::api::Map* rows = build::allocArray(docListProto.docs, numDocs, mr);
   for (const auto& [field, col] : cols) {
     auto slot = [&](size_t i) -> Val& {
-      return *build::mapSlot<Val>(rows[i].fields, fieldCap, field, mr);
+      return *build::mapSlot<Val>(rows[i].fields, rowCaps[i], field, mr);
     };
     if (auto* c = std::get_if<luxir::api::ColStr>(&col.kind)) {
       for (size_t i = 0; i < numDocs; i++)
@@ -662,6 +692,9 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
     } else if (auto* c = std::get_if<luxir::api::ArrArrDouble>(&col.kind)) {
       for (size_t i = 0; i < numDocs; i++)
         if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<luxir::api::ColVal>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].isNull()) slot(i) = c->v[i];
     } else if (auto* c = std::get_if<luxir::api::ColVector>(&col.kind)) {
       for (size_t i = 0; i < numDocs; i++)
         if (c->v[i].f32.has_value()) slot(i).kind = c->v[i];
@@ -679,25 +712,37 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; null marks the _score_ pseudo-field.  rows: the
-// field's values go to per-document maps (DocList.docs) instead of a dense
-// column - set for discovered names (empty / wildcard selectors), and for
-// every entry under ROWS format.  infos and storedInfos are bound with the
+// per-batch schema lookups; kind selects the physical, synthetic, or extra source.
+// discovered: from an empty or wildcard selector (COLUMNS leaves such a column
+// out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
 // looks them up.
+// A per-document value the caller computes, returned beside the fields (an
+// operation's synthetic output such as a hop count). value(i, out, mr) fills
+// the value of ranked document i (absolute rank, like getDoc) and leaves out
+// unset for none; mr backs any strings or arrays it allocates.
+struct ExtraColumn {
+  std::string_view name;
+  std::function<void(int64_t i, luxir::api::Val& out, std::pmr::memory_resource& mr)> value;
+};
+
 struct ReturnField {
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA };
+
   std::string_view outputKey;
   std::string_view physicalName;
   FieldType* fieldType;
-  bool rows;
+  Kind kind;
+  bool discovered;
   IndexReader::FieldSegments infos;
   IndexReader::FieldSegments storedInfos;
+  const ExtraColumn* extra = nullptr;  // Kind::EXTRA only
 };
 
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
   boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
   for (auto& rf : fields) {
-    if (!rf.fieldType) continue;
+    if (rf.kind != ReturnField::Kind::PHYSICAL) continue;
     if (rf.fieldType->type() != FieldType::TEXT) rf.infos = reader.field(rf.physicalName);
     if (rf.fieldType->isStored()) {
       auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
@@ -705,6 +750,137 @@ inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnFiel
       rf.storedInfos = it->second;
     }
   }
+}
+
+// Calls f(i) for each slot i of col that holds a value: single-valued
+// columns by missing_val (exact after finishPendingCols), multi-valued ones
+// by a non-empty array, vector and value columns by a set oneof.  present,
+// when non-null, is the column's PendingCol slot tracker (1 = filled), which
+// finishPendingCols makes equivalent; scanning it skips the value compares.
+template <typename F>
+inline void forEachPresent(const luxir::api::Column& col, const uint8_t* present, F&& f) {
+  using namespace luxir::api;
+  std::visit([&](const auto& c) {
+    using T = std::decay_t<decltype(c)>;
+    if constexpr (std::is_same_v<T, std::monostate>) {
+      return;
+    } else {
+      for (size_t i = 0; i < c.v.size(); i++) {
+        bool has;
+        if constexpr (std::is_same_v<T, ColStr> || std::is_same_v<T, ColInt>
+                      || std::is_same_v<T, ColFloat> || std::is_same_v<T, ColDouble>) {
+          has = present != nullptr ? present[i] != 0 : c.v[i] != c.missing_val;
+        } else if constexpr (std::is_same_v<T, ColVal>) {
+          has = !c.v[i].isNull();
+        } else if constexpr (std::is_same_v<T, ColVector>) {
+          has = c.v[i].f32.has_value();
+        } else {
+          has = !c.v[i].v.empty();
+        }
+        if (has) f(i);
+      }
+    }
+  }, col.kind);
+}
+
+// Wire size of v as a protobuf varint.
+inline size_t varintSize(uint64_t v) {
+  size_t n = 1;
+  while (v >= 0x80) {
+    v >>= 7;
+    n++;
+  }
+  return n;
+}
+
+// The wire bytes one missing slot of col costs: zigzag varint of missing_val
+// for packed sint64, 4/8 for packed float/double, tag + varint(len) + len of
+// missing_val for repeated string, and tag + zero length for an element
+// message (multi-valued, vector and value columns).
+inline size_t missingSlotBytes(const luxir::api::Column& col) {
+  using namespace luxir::api;
+  return std::visit([](const auto& c) -> size_t {
+    using T = std::decay_t<decltype(c)>;
+    if constexpr (std::is_same_v<T, ColStr>) {
+      return 1 + varintSize(c.missing_val.size()) + c.missing_val.size();
+    } else if constexpr (std::is_same_v<T, ColInt>) {
+      int64_t m = (int64_t)c.missing_val;
+      return varintSize(((uint64_t)m << 1) ^ (uint64_t)(m >> 63));
+    } else if constexpr (std::is_same_v<T, ColFloat>) {
+      return 4;
+    } else if constexpr (std::is_same_v<T, ColDouble>) {
+      return 8;
+    } else {
+      return 2;
+    }
+  }, col.kind);
+}
+
+// Settle one batch's placement after finishPendingCols.  columnFields[i] is
+// the ReturnField behind response column i and columnPresent[i] its slot
+// tracker (null when untracked, see forEachPresent); later columns (_score_)
+// always stay.  ROWS moves every column to docs.  COLUMNS leaves out a
+// discovered column with no present value; a named one is always present.
+// ADAPTIVE leaves out every column with no present value and moves a column
+// to docs when its missing slots cost more than per-document entries for its
+// present values would ((n - p) * missingSlotBytes > p * (key + 4)).  The
+// response column map is compacted in place and the moved columns land in
+// moved (exact capacity) for scatterColumnsToRows.  rowCaps receives each
+// row's map capacity: its moved values plus one for a row-placed _score_
+// (scoreRows); it is left empty when no row map is needed.  fate is
+// caller-owned scratch reused across batches.
+inline void placeBatchColumns(luxir::api::DocFormat placement,
+                              std::span<const ReturnField* const> columnFields,
+                              std::span<const uint8_t* const> columnPresent,
+                              SearchResponse::ColumnsType& columns,
+                              SearchResponse::ColumnsType& moved,
+                              size_t numDocs, bool scoreRows, std::vector<uint8_t>& fate,
+                              std::vector<uint32_t>& rowCaps,
+                              std::pmr::memory_resource& mr)
+{
+  enum : uint8_t { KEEP, DROP, MOVE };
+  using Pair = std::pair<std::string_view, luxir::api::Column>;
+  auto* arr = const_cast<Pair*>(columns.data());
+  size_t count = std::min(columns.size(), columnFields.size());
+  fate.assign(columns.size(), KEEP);
+  size_t changed = 0, numMoved = 0;
+  for (size_t i = 0; i < count; i++) {
+    const ReturnField& rf = *columnFields[i];
+    if (placement == luxir::api::DocFormat::ROWS) {
+      fate[i] = MOVE;
+    } else if (placement == luxir::api::DocFormat::ADAPTIVE || rf.discovered) {
+      size_t p = 0;
+      forEachPresent(arr[i].second, columnPresent[i], [&p](size_t) { p++; });
+      if (p == 0) {
+        fate[i] = DROP;
+      } else if (placement == luxir::api::DocFormat::ADAPTIVE
+                 && (numDocs - p) * missingSlotBytes(arr[i].second) > p * (rf.outputKey.size() + 4)) {
+        fate[i] = MOVE;
+      }
+    }
+    if (fate[i] != KEEP) changed++;
+    if (fate[i] == MOVE) numMoved++;
+  }
+  rowCaps.clear();
+  if (numMoved > 0 || scoreRows) rowCaps.assign(numDocs, scoreRows ? 1 : 0);
+  if (changed == 0) return;
+  Pair* out = nullptr;
+  if (numMoved > 0) {
+    out = (Pair*)mr.allocate(sizeof(Pair) * numMoved, alignof(Pair));
+    std::uninitialized_value_construct_n(out, numMoved);
+  }
+  size_t kept = 0, m = 0;
+  for (size_t i = 0; i < columns.size(); i++) {
+    if (fate[i] == MOVE) {
+      forEachPresent(arr[i].second, columnPresent[i], [&rowCaps](size_t row) { rowCaps[row]++; });
+      out[m++] = std::move(arr[i]);
+    } else if (fate[i] == KEEP) {
+      if (kept != i) arr[kept] = std::move(arr[i]);
+      kept++;
+    }
+  }
+  columns = SearchResponse::ColumnsType(std::span<const Pair>(arr, kept));
+  moved = SearchResponse::ColumnsType(std::span<const Pair>(out, numMoved));
 }
 
 // Streams a final ranked list of (segdoc, score) pairs back to the client as
@@ -744,39 +920,49 @@ template <typename GetDocList, typename GetDoc, typename GetScore>
 class DocEmitterImpl final : public DocEmitter {
 public:
   SearchRequest& req;
+  uint64_t flags;
   GetDocList getDocList;
   GetDoc getDoc;
   GetScore getScore;
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
-  std::span<ReturnField> fields;  // resolved selectors, each carrying its placement
+  std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
-  bool getNumber;
+  bool emitCount;
+  bool foundGte;
   bool getScores;
-  // scoresInRows: the synthetic _score_ goes into the per-document maps;
-  // otherwise it is a dense column even when fields land in rows (discovered
-  // fields in rows beside a score column).
-  bool scoresInRows;
+  // Resolved DocFormat: ROWS, COLUMNS or ADAPTIVE.  Every field loads as a
+  // column; placeBatchColumns settles each batch's placement.  The synthetic
+  // _score_ is written per row under ROWS and is a column otherwise.
+  luxir::api::DocFormat placement;
   // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
   // dangle by the time a resumed emitter runs.
   bool parallel;
-  size_t colCap;  // dense response columns map capacity (column-placed fields + _score_)
-  size_t rowCap;  // scratch columns map capacity (row-placed fields)
+  size_t colCap;  // response columns map capacity (fields + _score_)
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
   bool fieldMetadataResolved = false;
+  // Per-batch placement scratch, reused across batches: columnFields maps
+  // response columns to their ReturnField, columnPresent to their PendingCol
+  // slot tracker (or null); columnFate and rowCaps belong to
+  // placeBatchColumns.
+  std::vector<const ReturnField*> columnFields;
+  std::vector<const uint8_t*> columnPresent;
+  std::vector<uint8_t> columnFate;
+  std::vector<uint32_t> rowCaps;
 
-  DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
+  DocEmitterImpl(SearchRequest& req, uint64_t flags, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
-                 int64_t offset, bool getNumber, bool getScores,
-                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap, DocBatchMetadata metadata)
-      : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
+                 int64_t offset, bool emitCount, bool foundGte, bool getScores,
+                 luxir::api::DocFormat placement, bool parallel, size_t colCap,
+                 DocBatchMetadata metadata)
+      : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
-        getScores(getScores), scoresInRows(scoresInRows),
-        parallel(parallel), colCap(colCap), rowCap(rowCap),
+        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
+        foundGte(foundGte), getScores(getScores), placement(placement),
+        parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
@@ -844,8 +1030,9 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       response.proto.more = true;  // also set at the response level for easier client handling.
     }
 
-    if (getNumber) {
+    if (emitCount) {
       docListProto.found = totalHits;
+      docListProto.found_gte = foundGte;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -898,11 +1085,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       start += length;
     }
 
-    // Row-placed fields (ReturnField::rows) load into arena scratch columns
-    // that are never attached to the response; the post-wait scatter pass
-    // moves the values into docListProto.docs.  The loaders themselves are
+    // Columns placeBatchColumns takes out of the response for the post-wait
+    // scatter into docListProto.docs.  The loaders themselves are
     // placement-blind.
-    SearchResponse::ColumnsType scratchColumns;
+    SearchResponse::ColumnsType rowColumns;
 
     // Single-valued columns register here so the post-wait finish pass can
     // pick each column's exact missing_val and fill the missing slots.
@@ -937,19 +1123,45 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     } tgJoin{tg};
 
+    // Response column i comes from columnFields[i]: fields add the first
+    // columns, _score_ the last.
+    assert(docListProto.columns.empty());
+    columnFields.clear();
+    columnPresent.clear();
     for (const ReturnField& rf : fields) {
-      // should we allow _scores_ as a field name?
-      if (rf.fieldType == nullptr) {  // the _score_ pseudo-field
-        returnScores = true;
-        continue;
+      size_t columnsBefore = docListProto.columns.size();
+      size_t pendingBefore = pendingCols.size();
+      auto outputColumn = [&]() -> luxir::api::Column& {
+        return build::columnSlot(docListProto.columns, colCap, rf.outputKey, mr);
+      };
+      auto registerColumn = [&] {
+        if (docListProto.columns.size() > columnsBefore) {
+          // A field registers at most one PendingCol, for its own column.
+          columnFields.push_back(&rf);
+          columnPresent.push_back(pendingCols.size() > pendingBefore ? pendingCols.back().present.data() : nullptr);
+        }
+      };
+
+      switch (rf.kind) {
+        case ReturnField::Kind::SCORE:
+          returnScores = true;
+          continue;
+        case ReturnField::Kind::VERSION:
+          loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          registerColumn();
+          continue;
+        case ReturnField::Kind::EXTRA: {
+          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+          luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+          for (int i = 0; i < columnSize; i++) rf.extra->value(batchStart + i, values[i], mr);
+          registerColumn();
+          continue;
+        }
+        case ReturnField::Kind::PHYSICAL:
+          break;
       }
       std::string_view field = rf.physicalName;
       FieldType& fieldType = *rf.fieldType;
-      auto& target = rf.rows ? scratchColumns : docListProto.columns;
-      size_t targetCap = rf.rows ? rowCap : colCap;
-      auto outputColumn = [&]() -> luxir::api::Column& {
-        return build::columnSlot(target, targetCap, rf.outputKey, mr);
-      };
 
       // Group stored fields by resource. The group can use columns only
       // when every column preserves the source value; otherwise decompress
@@ -979,10 +1191,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           break;
         }
         case FieldType::Type::DATE: {
-          // DATE is epoch millis in the int column; emit the raw millis as
-          // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
-          // concern, not the typed gRPC column.
-          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          auto nature = dateValueNature(DateFieldType::unitOf(fieldType));
+          withDateOutput(nature, flags, mr, [field] { return field; }, [&](auto output) {
+            using Emit = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
+                                            DateStrColEmit, IntColEmit>;
+            loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
+                             pendingLoaders, pendingCols, mr, output);
+          });
           break;
         }
         case FieldType::Type::ID:
@@ -1009,6 +1224,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         default:
           break;
       }
+      registerColumn();
     }
 
     for (auto& [resourceName, group] : storedByResource) {
@@ -1016,8 +1232,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       // A single-valued STRING or ID column holds the source value except
       // where a normalizer rewrote it (every row) or the term was fitted to
       // the term space (rows recognizable by length, re-read from the chunk
-      // after the loads).  Multi-valued columns are sorted sets and TEXT has
-      // no column, so any such member sends the whole group to the chunk.
+      // after the loads). Multi-valued columns can differ from stored source,
+      // and TEXT has no column, so such members send the group to the chunk.
       bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
         if (r.multi || !r.fieldType->hasColumn()) return false;
         switch (r.fieldType->type()) {
@@ -1038,7 +1254,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     }
 
-    if (returnScores && !scoresInRows) {
+    bool scoreRows = returnScores && placement == luxir::api::DocFormat::ROWS;
+    if (returnScores && !scoreRows) {
       auto& scoresProto = build::columnSlot(docListProto.columns, colCap, "_score_", mr);
       auto& floatColProto = scoresProto.kind.template emplace<luxir::api::ColFloat>();
       float* scores = build::allocArray(floatColProto.v, columnSize, mr);
@@ -1093,17 +1310,17 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // missing_val and fill its missing slots.  (ROWS mode relies on the
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+    placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
+                      (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
 
-    // Scores bypass the scratch column: every doc has one, and a direct
+    // Scores bypass the row columns: every doc has one, and a direct
     // write avoids the all-present column's sentinel ambiguity (a real
     // 0.0 score would collide with ColFloat's default missing_val).
-    bool scoreRows = returnScores && scoresInRows;
-    if ((scratchColumns.size() > 0 || scoreRows) && columnSize > 0) {
-      size_t fieldCap = scratchColumns.size() + (scoreRows ? 1 : 0);
-      auto* rows = scatterColumnsToRows(scratchColumns, docListProto, (size_t)columnSize, fieldCap, mr);
+    if (!rowCaps.empty() && columnSize > 0) {
+      auto* rows = scatterColumnsToRows(rowColumns, docListProto, (size_t)columnSize, rowCaps, mr);
       if (scoreRows) {
         for (int i = 0; i < columnSize; i++) {
-          build::mapSlot<luxir::api::Val>(rows[i].fields, fieldCap, "_score_", mr)->kind =
+          build::mapSlot<luxir::api::Val>(rows[i].fields, rowCaps[i], "_score_", mr)->kind =
               getScore(batchStart + i);
         }
       }
@@ -1128,29 +1345,6 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
   return true;
 }
 
-// Returned-fields selector match: '*' matches any (possibly empty) run of
-// bytes, every other byte is literal.  Iterative single-star backtracking.
-inline bool globMatch(std::string_view pattern, std::string_view name) {
-  size_t p = 0, n = 0;
-  size_t starP = std::string_view::npos, starN = 0;
-  while (n < name.size()) {
-    if (p < pattern.size() && pattern[p] == '*') {
-      starP = p++;
-      starN = n;
-    } else if (p < pattern.size() && pattern[p] == name[n]) {
-      p++;
-      n++;
-    } else if (starP != std::string_view::npos) {
-      p = starP + 1;
-      n = ++starN;
-    } else {
-      return false;
-    }
-  }
-  while (p < pattern.size() && pattern[p] == '*') p++;
-  return p == pattern.size();
-}
-
 // Resolve the request's returned-field selectors.  An empty list projects the
 // default set: every logical root in the reader's retrievable catalog, "id"
 // first, the rest in name order.  A selector containing '*' is a pattern: it
@@ -1166,27 +1360,49 @@ inline bool globMatch(std::string_view pattern, std::string_view name) {
 // pattern, a name matched by several patterns is kept once, at its first
 // match, and a repeated explicit name collapses to its first occurrence (a
 // repeat would re-emplace the same output Column and orphan the earlier
-// stored-field target).  Discovered entries are marked rows=true - the
-// response's column set is a property of the request, never of what the index
-// holds.  The plan is allocated from the protobuf request arena: emission
+// stored-field target).  Entries from patterns or an empty list are marked
+// discovered. Extra columns are always returned; explicit selectors naming one
+// select the extra even if a physical field has the same name. Discovered fields
+// must not collide with extras, and synthetic output names are reserved.
+// The plan is allocated from the protobuf request arena: emission
 // starts on task-group threads and concurrent ops must not race (protobuf
 // Arena allocation is thread-safe; the request MemPool is not).  The names
 // are reader-catalog or request-proto views; generated read names are copied
 // into the request arena. The reader and schema are pinned for the request.
 inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
-                                                  std::span<const std::string_view> fields) {
+                                                  std::span<const std::string_view> fields,
+                                                  std::span<const ExtraColumn> extraColumns = {}) {
+  boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> extraNames;
+  for (const auto& extra : extraColumns) {
+    if (!extraNames.insert(extra.name).second) {
+      throw std::logic_error("Duplicate extra column '" + std::string(extra.name) + "'; extra column names must be unique");
+    }
+  }
+  // The emitter synthesizes scores; retrieval also exposes virtual versions.
+  for (std::string_view reserved : {"_score_", "_version_"}) {
+    if (extraNames.contains(reserved)) {
+      throw RequestError("Extra column '" + std::string(reserved)
+                         + "' conflicts with a reserved output name; choose a different extra column name");
+    }
+  }
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
-    picked.push_back({field.name, field.name, field.type, true});
+    if (extraNames.contains(field.name)) {
+      throw RequestError("Extra column '" + std::string(field.name)
+                         + "' conflicts with a returned field; use an explicit field list to omit the physical field"
+                           " or select the extra by name");
+    }
+    picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
   };
   auto pushExplicit = [&](std::string_view f) {
+    if (extraNames.contains(f)) return;  // extras are appended after the physical fields
     for (auto& rf : picked) {
       if (rf.outputKey == f) return;  // explicit lists are small; linear scan
     }
     if (f == "_score_") {
-      picked.push_back({f, {}, nullptr, false});
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
@@ -1202,7 +1418,8 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       }
       throw RequestError(message, "invalid_field");
     }
-    picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, false});
+    auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+    picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
   };
   if (fields.empty()) {
     auto catalog = req.reader->retrievableFields();
@@ -1226,18 +1443,21 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
         pushExplicit(f);
         continue;
       }
-      bool derived = f.find("__") != std::string_view::npos;
-      // The catalog is sorted: gallop to the pattern's literal prefix and
-      // stop as soon as the prefix no longer holds.
-      std::string_view prefix = f.substr(0, f.find('*'));
-      int64_t start = screaming::gallopLowerBound(0, (int64_t)catalog.size(), prefix,
-          [&](int64_t i) { return catalog[i].name; });
-      for (size_t i = (size_t)start; i < catalog.size() && catalog[i].name.starts_with(prefix); ++i) {
-        const auto& field = catalog[i];
-        if (field.derived == derived && globMatch(f, field.name) && taken.insert(field.name).second) {
-          pushDiscovered(field);
-        }
-      }
+      forEachFieldPattern(catalog, f, [](const auto& field) { return field.name; },
+          [](const auto& field) { return field.derived; }, [&](const auto& field) {
+            if (taken.insert(field.name).second) pushDiscovered(field);
+          });
+    }
+  }
+  if (!extraColumns.empty()) {
+    // A paused emitter can outlive the caller's frame, so callbacks live in
+    // the request arena. Copy them only after the whole projection is valid.
+    auto* extras = luxir::arenaCreate<std::vector<ExtraColumn>>(
+        req.arena, extraColumns.begin(), extraColumns.end());
+    for (const auto& extra : *extras) {
+      ReturnField rf{extra.name, {}, nullptr, ReturnField::Kind::EXTRA, false};
+      rf.extra = &extra;
+      picked.push_back(rf);
     }
   }
   if (picked.empty()) return {};
@@ -1251,7 +1471,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
 // emitter and produces batches until done or paused.  See DocEmitter above for
 // the resumable-emission contract.
 template <typename GetDocList, typename GetDoc, typename GetScore>
-void emitDocsResponse(SearchRequest& req,
+void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       GetDocList&& getDocList,
                       int64_t numCollected,
                       GetDoc&& getDoc,
@@ -1260,11 +1480,13 @@ void emitDocsResponse(SearchRequest& req,
                       std::span<const std::string_view> fields,
                       int32_t batchSize,
                       int64_t offset,
-                      bool getNumber,
+                      bool emitCount,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
-                      DocBatchMetadata metadata = {})
+                      DocBatchMetadata metadata = {},
+                      bool foundGte = false,
+                      std::span<const ExtraColumn> extraColumns = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1280,44 +1502,37 @@ void emitDocsResponse(SearchRequest& req,
   }
 
   // Resolve selectors: empty projects the default set, '*' entries expand
-  // against the reader's catalog (see resolveReturnFields).  Placement is
-  // per field: explicitly requested -> dense columns, discovered -> docs[i]
-  // (the column set is a property of the request, never of what the index
-  // happens to hold) - except under ROWS format, where everything goes to
-  // rows.  _score_ (asked for by get_scores) always keeps the format's
-  // placement - a column under columns format, beside any rows.
-  std::span<ReturnField> rfields = resolveReturnFields(req, fields);
+  // against the reader's catalog (see resolveReturnFields).  Every field
+  // loads as a column and placeBatchColumns settles each batch: ROWS puts
+  // every field in docs, COLUMNS leaves out all-missing discovered columns,
+  // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
+  // get_scores) is a column except under ROWS.
+  std::span<ReturnField> rfields = resolveReturnFields(req, fields, extraColumns);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
-  bool formatRows = docFormat == luxir::api::DocFormat::ROWS
-                    || (docFormat != luxir::api::DocFormat::COLUMNS
-                        && req.docFormatDefault == luxir::api::DocFormat::ROWS);
-  if (formatRows) {
-    for (auto& rf : rfields) rf.rows = true;
+  luxir::api::DocFormat placement = docFormat;
+  if (placement != luxir::api::DocFormat::ROWS && placement != luxir::api::DocFormat::COLUMNS
+      && placement != luxir::api::DocFormat::ADAPTIVE) {
+    placement = req.docFormatDefault == luxir::api::DocFormat::ROWS
+        ? luxir::api::DocFormat::ROWS : luxir::api::DocFormat::COLUMNS;
   }
-  bool scoresInRows = formatRows;
 
-  // Capacities for the two column maps (columnSlot allocates the whole
-  // backing array on first insertion, so each cap is paid per batch): the
-  // dense response map holds the column-placed fields plus the synthetic
-  // _score_; the scratch map holds the row-placed fields (_score_ bypasses
-  // scratch and is written per row directly).  Split so ["id", "*"] over a
-  // large dynamic-field catalog does not reserve a catalog-sized array for
-  // the one-entry dense map, and vice versa.
-  size_t colCap = 1, rowCap = 0;
+  // Response columns map capacity (columnSlot allocates the whole backing
+  // array on first insertion, so the cap is paid per batch): every field
+  // plus the synthetic _score_.
+  size_t colCap = 1;
   for (const auto& rf : rfields) {
-    if (rf.fieldType == nullptr) continue;  // _score_ pseudo-field
-    (rf.rows ? rowCap : colCap)++;
+    if (rf.kind != ReturnField::Kind::SCORE) colCap++;
   }
 
   using Impl = DocEmitterImpl<std::decay_t<GetDocList>, std::decay_t<GetDoc>,
                               std::decay_t<GetScore>>;
-  auto* emitter = luxir::arenaCreate<Impl>(req.arena, req,
+  auto* emitter = luxir::arenaCreate<Impl>(req.arena, req, flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
-      maxBatchSize, offset, getNumber, getScores, scoresInRows,
-      /*parallel=*/req.tg != nullptr, colCap, rowCap, std::move(metadata));
+      maxBatchSize, offset, emitCount, foundGte, getScores, placement,
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();
 }

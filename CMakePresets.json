@@ -74,8 +74,7 @@
         "CMAKE_CXX_COMPILER": "g++-16",
         "VCPKG_MANIFEST_MODE": "OFF",
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native",
-        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-native",
-        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-native",
+        "LUXIR_NATIVE_DEPS": "native",
         "LUXIR_CPU_TARGET": "native"
       }
     },
@@ -85,8 +84,7 @@
       "inherits": "features-asan",
       "cacheVariables": {
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native-asan",
-        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-native-asan",
-        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-native-host"
+        "LUXIR_NATIVE_DEPS": "native-asan"
       }
     },
     {
@@ -119,7 +117,7 @@
       "name": "arm64-release",
       "inherits": "base-release",
       "displayName": "Linux ARM64 release",
-      "toolchainFile": "${sourceDir}/build/arm64-vcpkg-src/scripts/buildsystems/vcpkg.cmake",
+      "toolchainFile": "${sourceDir}/build/arm64-vcpkg-root/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "VCPKG_MANIFEST_MODE": "OFF",
         "VCPKG_INSTALLED_DIR": "${sourceDir}/build/arm64-deps",

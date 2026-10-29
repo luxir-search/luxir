@@ -111,7 +111,7 @@ protected:
     auto cout = std::cout.rdbuf(output.rdbuf()), cerr = std::cerr.rdbuf(output.rdbuf());
     auto level = spdlog::get_level();
     auto restore = scope_guard([&] { std::cout.rdbuf(cout); std::cerr.rdbuf(cerr); spdlog::set_level(level); });
-    int code = luxir_main((int)argv.size(), argv.data());
+    int code = luxir_main((int)argv.size(), argv.data(), luxir::addConfiguredPlugins);
     return {code, output.str()};
   }
   std::pair<int, std::string> pull(std::string url = {}) {
@@ -663,7 +663,7 @@ TEST_F(ReplicationFollowerTest, barriersCountFsAndRamAndReadYourWrite) {
     EXPECT_GE(outcome["replicas"]["serving"].get<double>(), wanted == "1" ? 1 : 2);
     auto token = outcome["commit"].get<std::string>();
     auto search = httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:" + wanted + "&min_commit=" + token + "&get_number=true");
+        "/collections/main/_search?query=id:" + wanted + "&min_commit=" + token + "&count_limit=-1");
     EXPECT_EQ(200, search.result_int()) << search.body();
     EXPECT_NE(std::string::npos, search.body().find("\"found\":1"));
   }
@@ -705,7 +705,7 @@ TEST_F(ReplicationFollowerTest, slowBarrierDoesNotHoldLaterCommitAndFloorWaits) 
   Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked = true; return nullptr; });
   auto search = std::async(std::launch::async, [&] {
     return httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:new&get_number=true&min_commit=" + token + "&min_commit_timeout_ms=5000&freshness_ms=60000");
+        "/collections/main/_search?query=id:new&count_limit=-1&min_commit=" + token + "&min_commit_timeout_ms=5000&freshness_ms=60000");
   });
   ASSERT_TRUE(until([&] { return parked.load(); }));
   resume.count_down();
@@ -1080,7 +1080,7 @@ TEST_P(ReplicationMatrixTest, snapshotsBarriersAndRestarts) {
     EXPECT_EQ(wanted, result["replicas"]["serving"].get<double>());
     EXPECT_EQ("satisfied", result["replicas"]["outcome"].get<std::string>());
     auto search = httpRequest(followerServer->getPort(), http::verb::get,
-        "/collections/main/_search?query=id:" + id + "&get_number=true&min_commit=" + result["commit"].get<std::string>());
+        "/collections/main/_search?query=id:" + id + "&count_limit=-1&min_commit=" + result["commit"].get<std::string>());
     EXPECT_EQ(200, search.result_int());
     EXPECT_NE(std::string::npos, search.body().find("\"found\":1"));
   };

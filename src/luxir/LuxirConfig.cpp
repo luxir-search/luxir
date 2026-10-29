@@ -6,6 +6,9 @@
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -13,6 +16,7 @@
 
 namespace luxir {
 
+#ifndef __APPLE__
 namespace {
 
 // Single integer from a one-line file; 0 if it is missing or not a number
@@ -25,8 +29,16 @@ int64_t readInt64File(const char* path) {
 }
 
 }  // namespace
+#endif
 
 int64_t systemRamBytes() {
+#ifdef __APPLE__
+  uint64_t bytes = 0;
+  size_t size = sizeof(bytes);
+  if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0
+      || bytes > (uint64_t)std::numeric_limits<int64_t>::max()) return 0;
+  return (int64_t)bytes;
+#else
   long pages = sysconf(_SC_PHYS_PAGES);
   long pageSize = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || pageSize <= 0) return 0;
@@ -41,6 +53,7 @@ int64_t systemRamBytes() {
     if (limit > 0 && limit < bytes) bytes = limit;
   }
   return bytes;
+#endif
 }
 
 /*
@@ -220,7 +233,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
+                 "Streaming NDJSON: batches decoding or indexing at once per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",

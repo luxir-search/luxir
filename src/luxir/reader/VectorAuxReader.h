@@ -11,6 +11,7 @@
 #include <faiss/impl/io.h>
 #include <faiss/index_io.h>
 #include <faiss/invlists/InvertedLists.h>
+#include <faiss/utils/distances.h>
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include "luxir/store/InputStream.h"
 #include "luxir/util/log.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/util/Once.h"
 
 namespace luxir {
 
@@ -97,6 +99,20 @@ inline int32_t defaultIvfNList(int64_t n) {
 
 static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
               "VectorAuxMeta layout is an on-disk contract");
+
+/// y = rotation(x) for one vector.  FAISS's LinearTransform::apply_noalloc
+/// is an SGEMM with one column.  On x86 OpenBLAS that takes the packed GEMM
+/// path wherever no small-matrix kernel applies: about a matvec's cost at
+/// d=768 on AVX-512 kernels, several times it at d=1536 or on AVX2 kernels.
+/// Same layout as apply_noalloc: output i is the dot of row i of A (d_in
+/// floats) with x, plus the bias.
+inline void rotateVector(const faiss::LinearTransform& rotation, const float* x, float* y) {
+  const float* A = rotation.A.data();
+  for (int i = 0; i < rotation.d_out; i++) {
+    y[i] = faiss::fvec_inner_product(A + (size_t)i * rotation.d_in, x, (size_t)rotation.d_in)
+         + (rotation.have_bias ? rotation.b[i] : 0.0f);
+  }
+}
 
 /// Process-wide dedup of RaBitQ rotation matrices.  Every RaBitQ overlay of
 /// a given dims is built with the same fixed seed, so their d x d matrices
@@ -272,7 +288,7 @@ class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
   std::shared_ptr<InputFile> file;
-  mutable std::once_flag loadOnce;
+  mutable OnceFlag loadOnce;
   // Declared before faissIndex so the index is destroyed first; the index
   // never owns the lists (replace_invlists own=false).
   mutable std::unique_ptr<MmapInvertedLists> mmapLists;
@@ -332,7 +348,7 @@ public:
   // payloads are served zero-copy from the file's memory view via
   // MmapInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
-    std::call_once(loadOnce, [this]() {
+    callOnce(loadOnce, [this]() {
       InputStream is = file->getInputStream();
       const char* base = is.ptr();
       size_t fileBytes = (size_t)is.left();

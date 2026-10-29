@@ -33,32 +33,14 @@ int64_t civilFit(__int128 value) {
   return (int64_t)value;
 }
 
-// sys_info's open-ended seconds endpoints cannot be cast directly to millis.
-int64_t beginMillis(const sys_info& info) {
-  return (int64_t)std::max((__int128)dd::kMinEpochMs,
-      (__int128)info.begin.time_since_epoch().count() * 1000);
-}
-
-int64_t endMillis(const sys_info& info) {
-  return (int64_t)std::min((__int128)dd::kMaxEpochMs + 1,
-      (__int128)info.end.time_since_epoch().count() * 1000);
-}
-
-sys_info infoAt(const TimeZone& zone, int64_t instant) {
-  // Compare in seconds without converting open-ended sys_info endpoints to
-  // milliseconds (that conversion can overflow).
-  auto value = std::chrono::floor<seconds>(sys_time<milliseconds>{milliseconds{instant}});
-  auto info = zone.ianaZone()->get_info(value);
-  // Some tzdb implementations return their final interval even for values
-  // at/after its end (libstdc++ at 32767-12-31). Traversal must not treat that
-  // non-advancing endpoint as another transition and spin indefinitely.
-  if (value < info.begin || value >= info.end) {
-    throw RequestError("range fence is outside the time-zone database's supported interval");
+ZoneInterval infoAt(const TimeZone& zone, int64_t instant) {
+  if (instant < dd::kMinEpochMs || instant > dd::kMaxEpochMs) {
+    throw RequestError("range fence is outside the supported civil range");
   }
-  return info;
+  return zone.ianaZone()->intervalAt(instant);
 }
 
-int64_t offsetMillis(const sys_info& info) {
+int64_t offsetMillis(const ZoneInterval& info) {
   return duration_cast<milliseconds>(info.offset).count();
 }
 
@@ -90,36 +72,36 @@ void RangeFacetGrid::visitCalendarFences(
     }
     return civilCalendarAt(anchor, fit(((__int128)index + 1) * n), unit);
   };
+  // Resolve one label ahead: a label whose fence equals its successor's has
+  // a zero-width cell (the label itself does not exist) and is skipped, not
+  // visited.
   auto followingCivil = after();
-  std::optional<int64_t> shifted;
+  auto followingInstant = followingCivil ? resolver.resolve(*followingCivil) : std::nullopt;
   for (;;) {
-    if (!followingCivil) {
+    if (!followingCivil || !followingInstant) {
       throw RequestError("calendar fence is outside the supported civil range");
     }
     int64_t previousCivil = civil;
     civil = *followingCivil;
+    int64_t instantMillis = *followingInstant;
+    int64_t instant = toKey(instantMillis, subMillis);
     // Calendar indices are bounded by the supported civil range.
     ++index;
     followingCivil = after();
-    bool substituted = shifted.has_value();
-    auto instant = substituted ? shifted : resolver.resolve(civil);
-    shifted.reset();
-    if (!instant) {
-      throw RequestError("calendar fence is outside the supported civil range");
-    }
-    if (!substituted && followingCivil
-        && resolver.intervalSkipped(civil, *followingCivil)) {
+    followingInstant = followingCivil ? resolver.resolve(*followingCivil) : std::nullopt;
+    if (followingInstant && *followingInstant == instantMillis) {
       if (skippedCivil) skippedCivil->push_back(civil);
-      shifted = instant;
       continue;
     }
-    if (*instant < previous) throw RequestError("calendar fences are not increasing");
-    if (*instant == previous) {
+    if (previous == INT64_MAX) throw RequestError("no range fence after int64 maximum");
+    if (instant < previous) throw RequestError("calendar fences are not increasing");
+    if (instant == previous) {
+      // The starting cell itself was zero-width.
       if (skippedCivil) skippedCivil->push_back(previousCivil);
       continue;
     }
-    if (!visit(Cell{*instant, index})) return;
-    previous = *instant;
+    if (!visit(Cell{instant, index})) return;
+    previous = instant;
   }
 }
 
@@ -127,14 +109,25 @@ RangeFacetGrid::RangeFacetGrid(Kind kind, FieldType::Type type, TimeZone zone)
     : kind(kind), type(type), zone(zone) {}
 
 RangeFacetGrid RangeFacetGrid::fixed(FieldType::Type type, int64_t gap, int64_t origin,
-                                    TimeZone zone) {
+                                    TimeZone zone, DateUnit dateUnit, std::optional<int64_t> start) {
   if (type != FieldType::Type::INT && type != FieldType::Type::DATE) {
     throw RequestError("integer grid requires INT or DATE");
   }
   if (gap <= 0) throw RequestError("range gap must be > 0");
   RangeFacetGrid result(Kind::FIXED, type, type == FieldType::Type::DATE ? zone : TimeZone::utc());
+  result.dateUnit = type == FieldType::DATE ? dateUnit : DateUnit::MILLIS;
   result.gap = gap;
   result.origin = origin;
+  if (start) {
+    if (type == FieldType::DATE) {
+      auto civil = civilFromInstant(result.toMillis(*start), zone);
+      if (!civil) throw RequestError("range bounds are outside the supported civil range");
+      // Only the phase matters. Reduce before narrowing a civil origin that
+      // can cross an int64 edge after applying the zone offset.
+      result.origin = (int64_t)(((__int128)*start
+          + (__int128)duration_cast<milliseconds>(civil->offset).count() * result.unitsPerMillis()) % gap);
+    } else result.origin = *start;
+  }
   return result;
 }
 
@@ -152,17 +145,20 @@ RangeFacetGrid RangeFacetGrid::floating(FieldType::Type type, double gap, double
 }
 
 RangeFacetGrid RangeFacetGrid::calendar(CalendarUnit unit, int64_t n, TimeZone zone,
-                                       std::optional<int64_t> start) {
+                                       std::optional<int64_t> start, DateUnit dateUnit) {
   if (n <= 0 || unit < CalendarUnit::DAY || unit > CalendarUnit::YEAR) {
     throw RequestError("calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
   }
   RangeFacetGrid result(Kind::CALENDAR, FieldType::Type::DATE, zone);
   result.unit = unit;
+  result.dateUnit = dateUnit;
   result.n = n;
   if (start) {
-    auto civil = civilFromInstant(*start, zone);
+    auto millis = result.toMillis(*start);
+    auto civil = civilFromInstant(millis, zone);
     if (!civil) throw RequestError("calendar bounds are outside the supported civil range");
     result.anchor = civil->millis;
+    result.subMillis = (int64_t)((__int128)*start - (__int128)millis * result.unitsPerMillis());
     result.preferredOffset = civil->offset;
   } else {
     // The phase is civil, not the offset in force at an arbitrary source value.
@@ -197,25 +193,20 @@ int64_t RangeFacetGrid::calendarCivil(int64_t index) const {
   return *civil;
 }
 
+// A label is skipped when its cell is zero-width: the next label resolves to
+// the same fence.
 bool RangeFacetGrid::calendarSkipped(int64_t index) const {
   if (!zone.isIana()) return false;
-  int64_t civil = calendarCivil(index);
   auto next = civilCalendarAt(anchor, fit(((__int128)index + 1) * n), unit);
-  return next && civilIntervalSkipped(civil, *next, zone);
+  auto following = next ? instantFromCivil(*next, zone, preferredOffset) : std::nullopt;
+  auto current = instantFromCivil(calendarCivil(index), zone, preferredOffset);
+  return following && current && *following == *current;
 }
 
 RangeFacetGrid::Cell RangeFacetGrid::calendarCell(int64_t index) const {
-  int64_t civil = calendarCivil(index);
-  // Preserve the skipped-day normalization used by calendar facets. On some
-  // text tzdb versions the next civil label resolves an hour late; the skipped
-  // label's shifted instant is the surviving next label's correct fence.
-  if (zone.isIana()) {
-    auto previous = civilCalendarAt(anchor, fit(((__int128)index - 1) * n), unit);
-    if (previous && civilIntervalSkipped(*previous, civil, zone)) civil = *previous;
-  }
-  auto instant = instantFromCivil(civil, zone, preferredOffset);
+  auto instant = instantFromCivil(calendarCivil(index), zone, preferredOffset);
   if (!instant) throw RequestError("calendar fence is outside the supported civil range");
-  return {*instant, index};
+  return {toKey(*instant, subMillis), index};
 }
 
 bool RangeFacetGrid::gapFence(int64_t transition, int64_t before, int64_t after) const {
@@ -226,45 +217,50 @@ bool RangeFacetGrid::gapFence(int64_t transition, int64_t before, int64_t after)
   return (__int128)origin + k * gap < hi;
 }
 
+int64_t RangeFacetGrid::dateFit(__int128 key) const {
+  return dateUnit == DateUnit::NANOS ? clampDateUnits(key) : civilFit(key);
+}
+
 RangeFacetGrid::Cell RangeFacetGrid::dateFloor(int64_t value) const {
-  civilFit(value);
+  civilFit(toMillis(value));
   int64_t probe = value;
   for (;;) {
-    auto info = infoAt(zone, probe);
-    int64_t begin = beginMillis(info);
-    int64_t offset = offsetMillis(info);
+    auto info = infoAt(zone, toMillis(probe));
+    int64_t begin = toKey(info.begin);
+    int64_t offset = offsetMillis(info) * unitsPerMillis();
     __int128 candidate = (__int128)origin
         + floorDiv((__int128)probe + offset - origin, gap) * gap - offset;
-    if (candidate >= begin) return {civilFit(candidate)};
-    if (begin == dd::kMinEpochMs) return {civilFit(candidate)};
-    auto previous = infoAt(zone, begin - 1);
-    if (gapFence(begin, offsetMillis(previous), offset)) return {begin};
+    if (candidate >= begin || begin == INT64_MIN || info.begin == dd::kMinEpochMs) {
+      return {dateFit(candidate)};
+    }
+    auto previous = infoAt(zone, info.begin - 1);
+    if (gapFence(begin, offsetMillis(previous) * unitsPerMillis(), offset)) return {begin};
     probe = begin - 1;
   }
 }
 
 RangeFacetGrid::Cell RangeFacetGrid::dateNext(Cell cell, int64_t limit) const {
-  civilFit(cell.key);
+  civilFit(toMillis(cell.key));
   int64_t probe = cell.key;
   for (;;) {
-    auto info = infoAt(zone, probe);
-    int64_t end = endMillis(info);
-    int64_t offset = offsetMillis(info);
+    auto info = infoAt(zone, toMillis(probe));
+    int64_t end = toKey(info.end);
+    int64_t offset = offsetMillis(info) * unitsPerMillis();
     __int128 candidate = (__int128)origin
         + (floorDiv((__int128)probe + offset - origin, gap) + 1) * gap - offset;
-    if (candidate < end) return {candidate >= limit ? limit : civilFit(candidate)};
+    if (candidate < end) return {candidate >= limit ? limit : dateFit(candidate)};
     if (end >= limit) return {limit};
-    if (end > dd::kMaxEpochMs) return {civilFit(candidate)};
-    auto following = infoAt(zone, end);
-    if (gapFence(end, offset, offsetMillis(following))) return {end};
-    // Include a regular fence at the transition, including the later fold.
+    if (info.end > dd::kMaxEpochMs) return {dateFit(candidate)};
+    auto following = infoAt(zone, info.end);
+    if (gapFence(end, offset, offsetMillis(following) * unitsPerMillis())) return {end};
     probe = end;
-    int64_t nextOffset = offsetMillis(following);
+    int64_t nextOffset = offsetMillis(following) * unitsPerMillis();
     if (((__int128)probe + nextOffset - origin) % gap == 0) return {probe};
   }
 }
 
 RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
+  if (dateUnit == DateUnit::NANOS && value == INT64_MAX) --value;
   if (kind == Kind::FLOATING) {
     double decoded = type == FieldType::Type::FLOAT ? (double)sortableInt32ToFloat((int32_t)value)
                                         : sortableInt64ToDouble(value);
@@ -293,7 +289,7 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
     }
   }
   if (kind == Kind::CALENDAR) {
-    auto civil = civilFromInstant(value, zone);
+    auto civil = civilFromInstant(toMillis(value), zone);
     if (!civil) throw RequestError("calendar bounds are outside the supported civil range");
     __int128 index;
     if (gap) {
@@ -317,12 +313,13 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
     return cell;
   }
   if (type == FieldType::Type::DATE && zone.isIana()) return dateFloor(value);
-  int64_t offset = zone.isFixed() ? (int64_t)zone.offsetMinutes() * 60000 : 0;
-  return {fit((__int128)origin
-      + floorDiv((__int128)value + offset - origin, gap) * gap - offset)};
+  int64_t offset = zone.isFixed() ? (int64_t)zone.offsetMinutes() * 60000 * unitsPerMillis() : 0;
+  __int128 key = (__int128)origin + floorDiv((__int128)value + offset - origin, gap) * gap - offset;
+  return {dateUnit == DateUnit::NANOS ? clampDateUnits(key) : fit(key)};
 }
 
 RangeFacetGrid::Cell RangeFacetGrid::next(Cell cell, std::vector<int64_t>* skippedCivil) const {
+  if (cell.key == INT64_MAX) throw RequestError("no range fence after int64 maximum");
   if (kind == Kind::FLOATING) {
     Cell result = floatingCell(fit((__int128)cell.index + 1));
     if (result.key <= cell.key) {
@@ -339,23 +336,40 @@ RangeFacetGrid::Cell RangeFacetGrid::next(Cell cell, std::vector<int64_t>* skipp
     return cell;
   }
   if (type == FieldType::Type::DATE && zone.isIana()) {
-    return {civilFit(dateNext(cell, dd::kMaxEpochMs + 1).key)};
+    return {dateFit(dateNext(cell, dateUnit == DateUnit::NANOS ? INT64_MAX : dd::kMaxEpochMs + 1).key)};
+  }
+  if (dateUnit == DateUnit::NANOS) {
+    int64_t offset = zone.isFixed() ? (int64_t)zone.offsetMinutes() * 60000 * unitsPerMillis() : 0;
+    return {clampDateUnits((__int128)origin
+        + (floorDiv((__int128)cell.key + offset - origin, gap) + 1) * gap - offset)};
   }
   return {fit((__int128)cell.key + gap)};
 }
 
 std::optional<int64_t> RangeFacetGrid::affineGap(int64_t start, int64_t end) const {
   if (kind == Kind::FLOATING || (kind == Kind::CALENDAR && (!gap || zone.isIana()))) return std::nullopt;
-  if (floor(start).key != start) return std::nullopt;
-  if (!zone.isIana()) return gap;
+  auto first = floor(start);
+  if (first.key != start) return std::nullopt;
+  __int128 stride = (__int128)gap * (kind == Kind::CALENDAR ? unitsPerMillis() : 1);
+  if (stride > INT64_MAX) return std::nullopt;
+  if (!zone.isIana()) {
+    if (kind == Kind::CALENDAR) {
+      if ((__int128)next(first).key - start != stride) return std::nullopt;
+    } else {
+      int64_t offset = zone.isFixed() ? (int64_t)zone.offsetMinutes() * 60000 * unitsPerMillis() : 0;
+      if (((__int128)start + offset - origin) % gap != 0) return std::nullopt;
+    }
+    return (int64_t)stride;
+  }
   int64_t probe = start;
   for (;;) {
-    auto info = infoAt(zone, probe);
-    if (((__int128)start + offsetMillis(info) - origin) % gap != 0) return std::nullopt;
-    int64_t transition = endMillis(info);
+    auto info = infoAt(zone, toMillis(probe));
+    int64_t offset = offsetMillis(info) * unitsPerMillis();
+    if (((__int128)start + offset - origin) % gap != 0) return std::nullopt;
+    int64_t transition = toKey(info.end);
     if (transition >= end) return gap;
-    auto following = infoAt(zone, transition);
-    if (gapFence(transition, offsetMillis(info), offsetMillis(following))
+    auto following = infoAt(zone, info.end);
+    if (gapFence(transition, offset, offsetMillis(following) * unitsPerMillis())
         && ((__int128)transition - start) % gap != 0) return std::nullopt;
     probe = transition;
   }
@@ -380,25 +394,31 @@ std::pmr::vector<RangeFacetRun> RangeFacetGrid::runs(std::span<const int64_t> fe
 std::vector<int64_t> RangeFacetGrid::skippedCalendarCells(int64_t lo, int64_t end) const {
   std::vector<int64_t> skipped;
   if (kind != Kind::CALENDAR || !zone.isIana()) return skipped;
-  int64_t probe = lo;
+  int64_t probe = toMillis(lo);
   for (;;) {
     auto info = infoAt(zone, probe);
-    int64_t transition = endMillis(info);
-    if (transition > end || transition > dd::kMaxEpochMs) return skipped;
-    auto following = infoAt(zone, transition);
-    // The local resolver owns skipped-label normalization, including text
-    // tzdb discrepancies between system and civil transition endpoints.
+    int64_t transition = toKey(info.end);
+    if ((__int128)info.end * unitsPerMillis() > end || info.end > dd::kMaxEpochMs) return skipped;
+    auto following = infoAt(zone, info.end);
     if (offsetMillis(following) > offsetMillis(info)) {
-      // The normalized surviving boundary can precede the sys_info jump
-      // (Apia's text-tzdb endpoint differs by an hour). Step back from the
-      // canonical boundary itself, not from the raw transition instant.
-      auto boundary = floor(transition);
-      if (boundary.key > lo) {
-        auto previous = floor(boundary.key - 1);
-        if (previous.key >= lo) next(previous, &skipped);
+      // A label inside the gap shares the fence of the first label after it,
+      // at or after the jump. Walk from the cell before the one containing the
+      // jump to the first fence past it; the visitor reports labels it skips.
+      auto cell = floor(transition);
+      if (cell.key > lo) {
+        auto previous = floor(cell.key - 1);
+        if (previous.key >= lo) cell = previous;
+      }
+      while (cell.key <= transition) {
+        std::vector<int64_t> passed;
+        cell = next(cell, &passed);
+        if (cell.key > end) break;
+        for (int64_t civil : passed) {
+          if (skipped.empty() || skipped.back() != civil) skipped.push_back(civil);
+        }
       }
     }
-    probe = transition;
+    probe = info.end;
   }
 }
 
@@ -437,7 +457,8 @@ RangeFacetGrid::Fences RangeFacetGrid::fences(int64_t lo, int64_t hi, bool clip,
   Cell cell = first;
   for (;;) {
     // Clip without forming an overflowing next fence for bounded integer spans.
-    if (kind == Kind::FIXED && !zone.isIana() && (__int128)cell.key + gap >= end) {
+    if (kind == Kind::FIXED && !zone.isIana() && dateUnit != DateUnit::NANOS
+        && (__int128)cell.key + gap >= end) {
       append(Cell{end});
       return result;
     }

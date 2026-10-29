@@ -21,10 +21,14 @@ runtimes. The script uses vcpkg's downloaded CMake 4.4.3;
 ./tools/build-arm64
 ```
 
-The first run builds all dependencies. Set `LUXIR_BUILD_JOBS=4` on machines
-with less memory. Stage logs are in `build/arm64-logs/`, and errors include
-the failed log's tail. Downloaded tools, sources, dependencies, and compiler
-caches stay under `build/`.
+The first run on a machine builds all dependencies. The compiler, vcpkg
+checkout, downloads, and binary packages are kept in the shared Luxir cache
+(`LUXIR_CACHE_DIR`, default `~/.cache/luxir`), so later runs from any checkout
+or worktree install packages from that cache instead of rebuilding them.
+Dependency and Luxir build jobs are sized from the cores and memory; set
+`LUXIR_BUILD_JOBS=N` to fix both. Stage logs are in `build/arm64-logs/`, and
+errors include the failed log's tail. The dependency install, host generator,
+and Luxir build stay under the checkout's `build/`.
 
 The native hpp-proto generator uses `g++-16`; `CXX` can override it with an
 equivalent C++26-capable GCC executable. vcpkg selects the host compiler for
@@ -42,7 +46,10 @@ automatic selection of a faster host linker.
 
 The vcpkg manifest and overlay ports are shared with native builds. The ARM64
 triplet builds Release libraries only; native protobuf/gRPC tools have a
-separate host triplet. `protoc-gen-hpp` is compiled with the native compiler.
+separate host triplet. Like vcpkg's own Linux toolchain, the triplet compiles
+dependencies with `-fPIC`. Luxir itself keeps the compiler's default PIE code,
+as on x86-64: with GCC, `-fPIC` assumes symbols may be interposed and stops
+inlining of non-inline global functions. `protoc-gen-hpp` is compiled with the native compiler.
 OpenBLAS uses an ARMV8 baseline with runtime dispatch to supported NEON/SVE
 kernels. FAISS also selects its ARM NEON/SVE implementation at runtime.
 
@@ -55,7 +62,7 @@ the ARMv8-A baseline. Set `LUXIR_QEMU_AARCH64` to use an emulator at another pat
 Run the tests on a compatible ARM64 Linux host or under QEMU:
 
 ```bash
-arm64_sysroot="$PWD/build/arm64-toolchain/compiler/gcc-16.1.0/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot"
+arm64_sysroot="${LUXIR_CACHE_DIR:-$HOME/.cache/luxir}/arm64-toolchain/compiler/gcc-16.1.0/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot"
 qemu-aarch64 -cpu cortex-a53 -L "$arm64_sysroot" \
   build/arm64-release/bin/luxir --version
 qemu-aarch64 -cpu cortex-a53 -L "$arm64_sysroot" \

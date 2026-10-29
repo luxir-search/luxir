@@ -113,7 +113,7 @@ TEST_F(DiversifyTest, exhaustiveOracle) {
     }
     for (std::string sort : {"score desc", "rank_i asc", "key_s desc"}) {
       std::string base = R"({"query":"body_w:alpha","fields":["id","key_s","key_i","rank_i"],)"
-          + std::string(R"("get_number":true,"get_scores":true,"document_format":"rows","sort":")")
+          + std::string(R"("count_limit":-1,"get_scores":true,"document_format":"rows","sort":")")
           + sort + '"';
       auto full = run(collection, base + R"(,"limit":-1})");
       for (const std::vector<std::string>& fields : {
@@ -134,7 +134,7 @@ TEST_F(DiversifyTest, exhaustiveOracle) {
             auto last = expected.rows.begin() + std::min<size_t>(10, expected.rows.size());
             EXPECT_EQ((std::vector<std::string>{first, last}), ids(*page));
             auto pruningBody = body;
-            pruningBody.replace(pruningBody.find("\"get_number\":true"), 17, "\"get_number\":false");
+            pruningBody.replace(pruningBody.find("\"count_limit\":-1"), 16, "\"count_limit\":0");
             auto pruned = run(collection, pruningBody + R"(,"offset":3,"limit":7})", parallel);
             EXPECT_EQ((std::vector<std::string>{first, last}), ids(*pruned));
             EXPECT_FALSE(pruned->docList()->found_groups);
@@ -172,12 +172,12 @@ TEST_F(DiversifyTest, pruningOpsScopeAndNestedLists) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   for (int parallel : {1, -1}) for (bool count : {false, true}) {
     auto actual = run("main", R"({"sort":"rank_i desc","limit":5,"fields":["id"],
-        "document_format":"rows","diversify":{"field":"key_s","max_per_key":2},"get_number":)"
-        + std::string(count ? "true" : "false") + R"(,"ops":{
+        "document_format":"rows","diversify":{"field":"key_s","max_per_key":2},"count_limit":)"
+        + std::string(count ? "-1" : "0") + R"(,"ops":{
         "all":{"field_facet":{"field":"key_s"}},
         "nested":{"field_facet":{"field":"bucket_s","ops":{
           "rows":{"top_docs":{"sort":"rank_i desc","limit":-1,"fields":["id"],
-            "document_format":"rows","get_number":true,
+            "document_format":"rows","count_limit":-1,
             "diversify":{"field":"key_s","max_per_key":2}}}
         }}}
       }})", parallel);
@@ -214,7 +214,7 @@ TEST_F(DiversifyTest, fusionSourceAndValidation) {
   for (int parallel : {1, -1}) {
     auto fused = run("main", R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"source":{
       "sort":"rank_i desc","limit":3,"diversify":{"field":"key_s","max_per_key":2}}},
-      "fields":["id"],"document_format":"rows","get_number":true,"limit":-1}}}})", parallel);
+      "fields":["id"],"document_format":"rows","count_limit":-1,"limit":-1}}}})", parallel);
     ASSERT_TRUE(fused->ok());
     EXPECT_EQ((std::vector<std::string>{"a", "b", "d"}), ids(*fused, "f"));
     EXPECT_EQ(3, fused->responses.back()->proto.ops.at("f")->docList()->found);
@@ -235,7 +235,7 @@ TEST_F(DiversifyTest, fusionSourceAndValidation) {
     }
   }
   auto docsKnn = run("main", R"({"fields":["id"],"document_format":"rows","limit":-1,
-    "get_number":true,"query":{"knn":{"field":"v_v","query":[0,0],"k":3,"exact":true}},
+    "count_limit":-1,"query":{"knn":{"field":"v_v","query":[0,0],"k":3,"exact":true}},
     "diversify":{"field":"key_s","max_per_key":1}})");
   EXPECT_EQ((std::vector<std::string>{"a"}), ids(*docsKnn));
   EXPECT_EQ(1, docsKnn->docList()->found);
@@ -248,7 +248,7 @@ TEST_F(DiversifyTest, fusionSourceAndValidation) {
   EXPECT_EQ("a", child.docs[0].fields.at("id")->asString());
   EXPECT_EQ("d", child.docs[1].fields.at("id")->asString());
   CollectionHelper empty("empty_diverse");
-  auto result = run("empty_diverse", R"({"get_number":true,
+  auto result = run("empty_diverse", R"({"count_limit":-1,
       "diversify":{"field":"key_s","max_per_key":2}})");
   EXPECT_EQ(0, result->docList()->found);
   EXPECT_EQ(0, result->docList()->found_groups);
@@ -310,7 +310,7 @@ TEST_F(DiversifyTest, wireRenderingAndTotalsBudget) {
       "key_s", "p" + std::to_string(i / 4)));
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   auto full = run("main", R"({"fields":["id"],"document_format":"rows","limit":5,
-      "batch_size":2,"get_number":true,"diversify":{"field":"key_s","max_per_key":2}})");
+      "batch_size":2,"count_limit":-1,"diversify":{"field":"key_s","max_per_key":2}})");
   auto expected = ids(*full);
   EXPECT_EQ(40, full->docList()->found);
   EXPECT_EQ(20, full->docList()->found_groups);
@@ -351,7 +351,7 @@ TEST_F(DiversifyTest, wireRenderingAndTotalsBudget) {
   forcedRequestMemoryMaxBytes = 1;
   for (int parallel : {1, -1}) {
     auto req = localReq(luxirNode->getSearchEngine());
-    parseQueryRequest(R"({"collection":"main","get_number":true,"limit":0,
+    parseQueryRequest(R"({"collection":"main","count_limit":-1,"limit":0,
         "diversify":{"field":"key_s","max_per_key":2}})", req->rawRequest(), req->mr);
     req->execute(parallel);
     EXPECT_FALSE(req->ok());
@@ -369,14 +369,14 @@ TEST_F(DiversifyTest, routedAndResetDomains) {
     auto req = run("main", R"({"query":"id:a","limit":0,"ops":{
       "buckets":{"field_facet":{"field":"key_s","ops":{
         "reset":{"top_docs":{"sort":"rank_i desc","limit":-1,"fields":["id"],
-          "document_format":"rows","get_number":true,
+          "document_format":"rows","count_limit":-1,
           "diversify":{"field":"key_s","max_per_key":2}},"domain":{"query":"*:*"}}
       }}},
       "routed":{"top_docs":{"limit":-1,"sort":"rank_i desc","fields":["id"],
-        "document_format":"rows","get_number":true,
+        "document_format":"rows","count_limit":-1,
         "filter":[{"query":"rank_i:>1","except_ops":["all"]}],
         "diversify":{"field":"key_s","max_per_key":2},
-        "ops":{"all":{"top_docs":{"limit":0,"get_number":true}}}
+        "ops":{"all":{"top_docs":{"limit":0,"count_limit":-1}}}
       },"domain":{"query":"*:*"}}
     }})", parallel);
     ASSERT_TRUE(req->ok());

@@ -83,11 +83,11 @@ public:
   OpCursor& fields(std::initializer_list<std::string> fieldNames);
   OpCursor& fields(std::span<const std::string> fieldNames);
   OpCursor& batchSize(int32_t n);
-  OpCursor& getNumber(bool v = true);
+  OpCursor& countLimit(int64_t n = -1);
   OpCursor& getScores(bool v = true);
   OpCursor& minScore(float v);
   OpCursor& documentFormat(luxir::api::DocFormat v);
-  OpCursor& withStats() { return getNumber().getScores(); }
+  OpCursor& withStats() { return countLimit().getScores(); }
 
   // --- configure a facet op ---
   OpCursor& limit(int64_t n);     // TopDocs / Fusion / FieldFacet, by op kind
@@ -333,6 +333,44 @@ private:
     return p ? &**p : nullptr;
   }
 
+  // Append one row-map value (or col_val slot) to doc.
+  static void appendVal(Doc& doc, std::string_view name, const luxir::api::Val& val) {
+    if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
+      doc.push_back({std::string(name), std::string(*s)});
+    } else if (const auto* n = std::get_if<int64_t>(&val.kind)) {
+      doc.push_back({std::string(name), *n});
+    } else if (const auto* f = std::get_if<float>(&val.kind)) {
+      doc.push_back({std::string(name), *f});
+    } else if (const auto* d = std::get_if<double>(&val.kind)) {
+      doc.push_back({std::string(name), *d});
+    } else if (const auto* b = std::get_if<bool>(&val.kind)) {
+      doc.push_back({std::string(name), *b});
+    } else if (const auto* a = std::get_if<luxir::api::ArrStr>(&val.kind)) {
+      std::vector<std::string> vals(a->v.begin(), a->v.end());
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* a = std::get_if<luxir::api::ArrInt>(&val.kind)) {
+      std::vector<int64_t> vals(a->v.begin(), a->v.end());
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* a = std::get_if<luxir::api::ArrFloat>(&val.kind)) {
+      std::vector<float> vals(a->v.begin(), a->v.end());
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* a = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
+      std::vector<double> vals(a->v.begin(), a->v.end());
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* v = std::get_if<luxir::api::Vector>(&val.kind)) {
+      if (v->f32) {
+        std::vector<float> vals(v->f32->v.begin(), v->f32->v.end());
+        doc.push_back({std::string(name), std::move(vals)});
+      }
+    } else if (const auto* av = std::get_if<luxir::api::ArrVector>(&val.kind)) {
+      std::vector<std::vector<float>> vals;
+      for (const auto& vec : av->v) {
+        if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
+      }
+      doc.push_back({std::string(name), std::move(vals)});
+    }
+  }
+
   // Convert a DocList result back to Doc rows: document i is the merge of
   // columns row i and docs[i], with per-column missing slots and absent row
   // keys skipped.  This is the reference client decode loop for the flat
@@ -389,6 +427,8 @@ private:
             std::vector<double> vals(c->v[i].v.begin(), c->v[i].v.end());
             results[i].push_back({std::string(fieldName), std::move(vals)});
           }
+        } else if (const auto* c = std::get_if<luxir::api::ColVal>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].isNull()) appendVal(results[i], fieldName, c->v[i]);
         } else if (const auto* c = std::get_if<luxir::api::ColVector>(&column.kind)) {
           if (i < c->v.size() && c->v[i].f32) {
             std::vector<float> vals(c->v[i].f32->v.begin(), c->v[i].f32->v.end());
@@ -410,41 +450,7 @@ private:
     for (size_t i = 0; i < docs.docs.size(); i++) {
       for (const auto& [name, valPtr] : docs.docs[i].fields) {
         if (name == "_score_") continue;  // parity with the _score_ column skip above
-        const auto& val = *valPtr;
-        if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
-          results[i].push_back({std::string(name), std::string(*s)});
-        } else if (const auto* n = std::get_if<int64_t>(&val.kind)) {
-          results[i].push_back({std::string(name), *n});
-        } else if (const auto* f = std::get_if<float>(&val.kind)) {
-          results[i].push_back({std::string(name), *f});
-        } else if (const auto* d = std::get_if<double>(&val.kind)) {
-          results[i].push_back({std::string(name), *d});
-        } else if (const auto* b = std::get_if<bool>(&val.kind)) {
-          results[i].push_back({std::string(name), *b});
-        } else if (const auto* a = std::get_if<luxir::api::ArrStr>(&val.kind)) {
-          std::vector<std::string> vals(a->v.begin(), a->v.end());
-          results[i].push_back({std::string(name), std::move(vals)});
-        } else if (const auto* a = std::get_if<luxir::api::ArrInt>(&val.kind)) {
-          std::vector<int64_t> vals(a->v.begin(), a->v.end());
-          results[i].push_back({std::string(name), std::move(vals)});
-        } else if (const auto* a = std::get_if<luxir::api::ArrFloat>(&val.kind)) {
-          std::vector<float> vals(a->v.begin(), a->v.end());
-          results[i].push_back({std::string(name), std::move(vals)});
-        } else if (const auto* a = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
-          std::vector<double> vals(a->v.begin(), a->v.end());
-          results[i].push_back({std::string(name), std::move(vals)});
-        } else if (const auto* v = std::get_if<luxir::api::Vector>(&val.kind)) {
-          if (v->f32) {
-            std::vector<float> vals(v->f32->v.begin(), v->f32->v.end());
-            results[i].push_back({std::string(name), std::move(vals)});
-          }
-        } else if (const auto* av = std::get_if<luxir::api::ArrVector>(&val.kind)) {
-          std::vector<std::vector<float>> vals;
-          for (const auto& vec : av->v) {
-            if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
-          }
-          results[i].push_back({std::string(name), std::move(vals)});
-        }
+        appendVal(results[i], name, *valPtr);
       }
     }
     return results;
@@ -637,7 +643,7 @@ inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
   return *this;
 }
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
-inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
+inline OpCursor& OpCursor::countLimit(int64_t n) { asTopDocs().count_limit = n; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
 inline OpCursor& OpCursor::minScore(float v) { asTopDocs().min_score = v; return *this; }
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }

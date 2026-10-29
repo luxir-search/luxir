@@ -10,6 +10,7 @@
 #include "luxir/schema/Schema.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 
 #include <array>
 #include <algorithm>
@@ -372,6 +373,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
     writer.endTerm(term);
     writer.endField();
   }
+  writeUnversionedRuns(sourcePostings);
   sourcePostings.finish();
 
   PostingsReader sourceReader(sourceDir, 0);
@@ -410,6 +412,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
     writer.endTerm(term);
     writer.endField();
   }
+  writeUnversionedRuns(targetPostings);
   targetPostings.finish();
 
   PostingsReader targetReader(targetDir, 1);

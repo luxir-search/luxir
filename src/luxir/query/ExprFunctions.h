@@ -8,6 +8,9 @@
 #include <utility>
 #include <variant>
 
+#include <boost/describe/enumerators.hpp>
+#include <boost/mp11/algorithm.hpp>
+
 #include <glaze/reflection/get_name.hpp>
 #include <glaze/reflection/to_tuple.hpp>
 #include <glaze/tuplet/tuple.hpp>
@@ -32,7 +35,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 23> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -53,6 +56,9 @@ inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
     "any_of",         // AnyOfQuery - exact scalar/list input
+    "multi_match",    // MultiMatchQuery
+    "dis_max",        // DisMaxQuery
+    "plugin",         // PluginQuery - called by the plugin's own name (QueryRegistry)
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -76,11 +82,29 @@ inline constexpr std::string_view mainValueArg(std::string_view fn) {
   if (fn == "constant_score") return "query";
   if (fn == "boost") return "query";
   if (fn == "rescore") return "query";
+  if (fn == "multi_match") return "text";
   return {};
 }
 
 inline constexpr std::string_view valueExprArg(std::string_view fn) {
   return fn == "rescore" ? "expr" : std::string_view{};
+}
+
+// Enum arguments accept JSON's lowercase spelling and the C++ enum spelling.
+inline bool enumNameMatches(std::string_view text, std::string_view name) {
+  if (text.size() != name.size()) return false;
+  for (size_t i = 0; i < text.size(); i++) {
+    char c = text[i];
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c != name[i]) return false;
+  }
+  return true;
+}
+
+template <typename E, typename F>
+void forEachEnumValue(F&& f) {
+  boost::mp11::mp_for_each<boost::describe::describe_enumerators<E>>(
+      [&](auto entry) { f(std::string_view(entry.name), entry.value); });
 }
 
 // The JSON/proto name of a C++ member: strip the trailing '_' some members
@@ -110,6 +134,8 @@ bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
                   std::is_same_v<Arm, api::RegexQuery> ||
                   std::is_same_v<Arm, api::FuzzyQuery> ||
                   std::is_same_v<Arm, api::SimpleQuery> ||
+                  std::is_same_v<Arm, api::MultiMatchQuery> ||
+                  std::is_same_v<Arm, api::DisMaxQuery> ||
                   std::is_same_v<Arm, api::RangeQuery> ||
                   std::is_same_v<Arm, api::BoostQuery> ||
                   std::is_same_v<Arm, api::RescoreQuery>) {

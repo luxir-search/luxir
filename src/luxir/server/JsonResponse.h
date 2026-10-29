@@ -10,6 +10,10 @@
 
 namespace luxir {
 
+struct JsonResponseOptions {
+  bool int64Str = false;
+};
+
 // Render one luxir::api::SearchResponse as a compact JSON object without a trailing
 // newline; the HTTP transport owns framing. Columnar DocList and FacetResult values are
 // flattened to row-major JSON; missing and non-finite slots render as JSON null.
@@ -27,7 +31,7 @@ namespace luxir {
 //   {"request_id": "...", "error": {"kind": ..., "code": ..., "message": ...},
 //    "warnings": [...]}
 std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp,
-                                    bool shorthand = false);
+                                    bool shorthand = false, JsonResponseOptions options = {});
 
 // The JSON error body (no trailing newline) for a failure answered with an
 // HTTP error status - the same {request_id, error} shape as an in-band error
@@ -57,7 +61,7 @@ struct DocRun {
 
 // Render every DocList op in `resp` into a DocRun.  Intermediate responses
 // carry one op's batch; the final response carries every op's tail.
-std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, JsonResponseOptions options = {});
 
 // Decide a run's framing and update `state` (the ONLY stateful step - callers
 // with concurrent producers serialize calls, paired with their queue posts).
@@ -67,7 +71,7 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
 //
 // Single-op requests: pure document lines; a marker precedes them only when
 // there is content to carry - found (set exactly when the request asked
-// get_number), warnings (degraded execution must not be silent), or the
+// nonzero count_limit), warnings (degraded execution must not be silent), or the
 // request_id (correlation must not be silent either):
 //   {"_header_":{"request_id":"...","found":N,"warnings":[...]}}
 //
@@ -83,6 +87,7 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
 // /update unchanged.  The caller handles error responses (errors have no
 // in-band form in this shape); resp must not carry an error.
 bool frameDocRun(const DocRun& run, DocLinesState& state,
-                 std::span<const luxir::api::Warning> warnings, std::string& marker);
+                 std::span<const luxir::api::Warning> warnings, std::string& marker,
+                 JsonResponseOptions options = {});
 
 } // namespace luxir
