@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/Cursor.h"
 #include "luxir/query/ExprFunctions.h"
+#include "luxir/query/QueryRegistry.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/schema/Schema.h"
@@ -1038,8 +1039,104 @@ private:
             arm.vars = opts.vars;
           }
         });
-    if (!known) fail(name.pos, fmt::format("unknown query function '{}'", name.text));
+    if (!known) {
+      const auto* plugin = QueryRegistry::global().find(name.text);
+      if (plugin == nullptr) fail(name.pos, fmt::format("unknown query function '{}'", name.text));
+      if (plugin->exprArgs.empty()) {
+        fail(name.pos, fmt::format("{}() is not callable in expr; use the structured form", name.text));
+      }
+      q->kind = parsePluginArgs(name.text, *plugin);
+    }
     return q;
+  }
+
+  // A plugin query call: each argument parses by the kind its definition
+  // declares (see PluginQueryArg) and becomes one PluginQuery param. A QUERY
+  // argument is a sub-expression, carried as its Query JSON.
+  api::PluginQuery parsePluginArgs(std::string_view fn, const PluginQueryDef& def) {
+    using Kind = PluginQueryArg::Kind;
+    using Entry = std::pair<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+    std::pmr::vector<Entry> entries(&mr);
+    auto parseValue = [&](const PluginQueryArg& arg, bool positional) -> api::Val* {
+      switch (arg.kind) {
+        case Kind::STRING:
+          return allocVal(positional ? parseRawText(fn) : parseStringValue(arg.name));
+        case Kind::NUMBER: {
+          double d = parseNumberValue<double>(arg.name);
+          auto* v = allocVal({});
+          if (d == std::trunc(d) && std::abs(d) < 9.0e15) v->kind = (int64_t)d;
+          else v->kind = d;
+          return v;
+        }
+        case Kind::BOOL: {
+          auto* v = allocVal({});
+          v->kind = parseBoolValue(arg.name);
+          return v;
+        }
+        case Kind::STRING_LIST: {
+          auto* v = allocVal({});
+          v->kind = api::ArrStr{parseStringList(arg.name)};
+          return v;
+        }
+        case Kind::QUERY: {
+          const api::Query* sub = parseQueryValue(arg.name, ",)");
+          std::string json;
+          if (!api::write_json(*sub, json)) fail(cur.position(), fmt::format("{}(): cannot carry '{}'", fn, arg.name));
+          auto* v = allocVal({});
+          std::string_view text = arenaStr(json);
+          if (!api::read_json(*v, text, mr)) fail(cur.position(), fmt::format("{}(): cannot carry '{}'", fn, arg.name));
+          return v;
+        }
+      }
+      return nullptr;
+    };
+    auto findArg = [&](std::string_view argName) -> const PluginQueryArg* {
+      for (const auto& arg : def.exprArgs) {
+        if (arg.name == argName) return &arg;
+      }
+      return nullptr;
+    };
+    cur.skipWs();
+    if (!cur.consume(')')) {
+      bool sawNamed = false;
+      int positionalCount = 0;
+      for (;;) {
+        cur.skipWs();
+        size_t argPos = cur.position();
+        if (cur.atEnd()) fail(argPos, fmt::format("unterminated {}(...) call", fn));
+        std::string_view argName = tryNamedArg();
+        const PluginQueryArg* arg;
+        if (!argName.empty()) {
+          sawNamed = true;
+          arg = findArg(argName);
+          if (arg == nullptr) fail(argPos, fmt::format("unknown argument '{}' for {}()", argName, fn));
+        } else {
+          if (sawNamed) fail(argPos, "positional argument after named arguments");
+          if (def.positionalArg.empty()) fail(argPos, fmt::format("{}() takes only named arguments (name=value)", fn));
+          if (positionalCount++ != 0) fail(argPos, fmt::format("{}() takes one positional argument; name the others", fn));
+          arg = findArg(def.positionalArg);
+        }
+        for (const auto& [key, val] : entries) {
+          if (key == arg->name) fail(argPos, fmt::format("duplicate argument '{}'", arg->name));
+        }
+        api::Val* value = parseValue(*arg, argName.empty());
+        entries.emplace_back(arenaStr(arg->name), ::hpp_proto::indirect_view<api::Val>(value));
+        cur.skipWs();
+        auto separator = value::lex::consumeListSeparator(cur);
+        if (separator == value::lex::ListSeparator::CLOSE) break;
+        if (separator != value::lex::ListSeparator::COMMA) {
+          fail(cur.position(), fmt::format("expected ',' or ')' in {}(...)", fn));
+        }
+      }
+    }
+    api::PluginQuery plugin;
+    plugin.name = arenaStr(fn);
+    if (!entries.empty()) {
+      auto* stored = (Entry*)mr.allocate(sizeof(Entry) * entries.size(), alignof(Entry));
+      std::uninitialized_copy(entries.begin(), entries.end(), stored);
+      plugin.params = std::span<const Entry>(stored, entries.size());
+    }
+    return plugin;
   }
 
   template <typename Arm>

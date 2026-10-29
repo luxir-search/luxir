@@ -483,6 +483,10 @@ public:
 
   // Squared norm at or below which a cosine vector has no direction.
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+  // Largest accepted element magnitude.  Squared norms stay below dims * 2^80,
+  // far enough under float32 range that every distance FAISS computes while
+  // training, assigning, and encoding, and every exact score, stays finite.
+  static constexpr float MAX_ELEMENT_MAGNITUDE = 0x1p40f;
 
   int32_t inputDims_;
   int32_t truncateDims_;
@@ -523,7 +527,8 @@ public:
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
-  // (or truncateDims() for an already truncated vector), all finite.  Returns
+  // (or truncateDims() for an already truncated vector), all finite with
+  // magnitude at most MAX_ELEMENT_MAGNITUDE.  Returns
   // the error text, or empty when vec is valid.  A valid vec is stored and
   // searched as its first storedSize(vec.size()) components.
   std::string inputError(std::span<const float> vec) const;

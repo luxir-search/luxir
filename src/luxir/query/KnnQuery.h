@@ -295,8 +295,9 @@ public:
   /// asc.  Being total makes every bounded top-N cut deterministic regardless
   /// of scan or merge order - the property the parallel scan accumulator
   /// relies on for parallel == serial results.  Totality requires non-NaN
-  /// scores: the query vector is validated finite up front, and finiteScore
-  /// maps any NaN arising from stored vectors to the worst finite score.
+  /// scores: query and stored vectors share VectorFieldType::inputError's
+  /// bounds, which keep distances finite, and finiteScore maps any NaN that
+  /// still arises to the worst finite score.
   static bool betterHit(const VectorEngineHit& a, const VectorEngineHit& b) noexcept {
     if (a.score != b.score) return a.score > b.score;
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
@@ -853,7 +854,7 @@ public:
           if (rot == rotation) return buf.data();
         }
         auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
-        rotation->apply_noalloc(1, queryPtr, entry.second.data());
+        rotateVector(*rotation, queryPtr, entry.second.data());
         return entry.second.data();
       };
       // RaBitQ query quantization is a search-time knob: the current
@@ -2782,12 +2783,11 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
+  // Query and stored vectors share inputError's element bound, which keeps
+  // every exact and FAISS distance finite.  A NaN score would break the
+  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
+  // cuts deterministic and std::sort defined, so any NaN that slips past the
+  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
   // minCompetitiveVal starts at lowest() and admits only strictly greater
   // scores, and a kNN hit must rank last, not be counted in matches yet
   // vanish from the returned docs.
