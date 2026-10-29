@@ -18,6 +18,7 @@
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
+#include <glaze/glaze.hpp>
 #include <memory_resource>
 #include <span>
 #include <tuple>
@@ -882,7 +883,7 @@ TEST_F(SchemaTest, geoPointRoundTripsAndSurvivesMergeReconstruction) {
   auto& loc = b.field("location");
   loc.type = FieldClass::GEO_POINT;
   loc.index = IndexMode::RANGE;
-  loc.multi = true;
+  loc.multi = api::FieldDef::MultiMode::DEFAULT;
 
   auto schema = b.build();
   FieldType* location = schema->getFieldTypePtr("location");
@@ -1145,6 +1146,177 @@ static std::string authoredJson(const Schema& schema) {
   return json;
 }
 
+TEST_F(SchemaTest, multiModesJsonBinaryAndViews) {
+  auto schema = schemaJson(R"({"templates":{
+    "_array":{"type":"int","multi":"array","variants":{"d":"double"}}
+  },"fields":{
+    "n":{"type":"int","multi":"set"}, "a":{"parent":"_array"},
+    "t":{"type":"text","multi":true,"variants":{"n":"int"}},
+    "f":{"type":"float","multi":true}, "dt":{"type":"date","multi":"array"},
+    "s":{"type":"string","multi":true},
+    "indexed_array":{"type":"string","multi":"array"},
+    "text_array":{"type":"text","multi":"array","variants":{"s":"string"}},
+    "c":{"type":"string","index":"none","multi":"array"},
+    "v":{"type":"vector","multi":"array"}, "g":{"type":"geo_point","multi":true},
+    "one":{"type":"double","multi":false}
+  }})");
+  for (auto name : {"n", "f", "s", "t__n"}) EXPECT_TRUE(schema->physical(name)->multiSet()) << name;
+  for (auto name : {"a", "a__d", "t", "dt", "c", "v", "g", "indexed_array", "text_array", "text_array__s"}) {
+    EXPECT_TRUE(schema->physical(name)->multiArray()) << name;
+  }
+  EXPECT_FALSE(schema->physical("one")->multiValued());
+  EXPECT_TRUE(schema->physical("x_array__d")->multiArray());
+  auto json = authoredJson(*schema);
+  EXPECT_NE(std::string::npos, json.find(R"("multi":"set")"));
+  auto sameProperties = [&](const Schema& copy) {
+    auto before = schema->signatures(true), after = copy.signatures(true);
+    ASSERT_EQ(before.size(), after.size());
+    for (const auto& [name, sig] : before) EXPECT_EQ(sig.properties, after.at(name).properties) << name;
+  };
+  sameProperties(*schemaJson(json));
+  EXPECT_EQ(schema->sourceDef_, schemaJson(json)->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  sameProperties(*Schema::fromStored(schema->storedInfo(arena), schema->gen_));
+  EXPECT_EQ("true", schema->signatures().at("n").properties.at("multi"));
+  EXPECT_EQ("true", schema->signatures().at("t").properties.at("multi"));
+  EXPECT_EQ("true", schema->signatures().at("t__n").properties.at("multi"));
+  auto defaults = Schema::createDefaultSchema();
+  for (auto suffix : {"x_is", "x_fs", "x_ds", "x_dts", "x_ss"}) {
+    EXPECT_TRUE(defaults->physical(suffix)->multiSet()) << suffix;
+  }
+  EXPECT_TRUE(defaults->physical("x_vs")->multiArray());
+  EXPECT_TRUE(defaults->physical("author_names")->multiArray());
+  EXPECT_TRUE(defaults->physical("author_names__s")->multiSet());
+  EXPECT_EQ(defaults->sourceDef_, schemaJson(authoredJson(*defaults))->sourceDef_);
+}
+
+TEST_F(SchemaTest, declaredModesSurviveTypeChangingInheritance) {
+  auto original = schemaJson(R"({"templates":{
+    "_default":{"type":"text","multi":true,"variants":{"s":"string"}},
+    "_set":{"type":"int","multi":"set","variants":{"t":"text"}},
+    "_array":{"type":"text","multi":"array"}
+  },"fields":{
+    "n":{"parent":"_default","type":"int"},
+    "s":{"parent":"_set","type":"string"},
+    "a":{"parent":"_array","type":"double"}
+  }})");
+  auto json = authoredJson(*original);
+  auto copy = schemaJson(json);
+  EXPECT_EQ(original->sourceDef_, copy->sourceDef_);
+  for (auto name : {"n", "n__s", "s"}) EXPECT_TRUE(copy->physical(name)->multiSet()) << name;
+  for (auto name : {"s__t", "a"}) EXPECT_TRUE(copy->physical(name)->multiArray()) << name;
+  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"parent":"_set","type":"text"}}})", copy.get()), SchemaError);
+  EXPECT_TRUE(schemaJson(R"({"fields":{"s":{"parent":"_array","type":"string"}}})", copy.get())->physical("s")->multiArray());
+}
+
+TEST_F(SchemaTest, multiModeValidationAndHistory) {
+  for (auto type : {"text", "vector", "geo_point"}) {
+    EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"{}","multi":"set"}}}}}})", type)), SchemaError);
+  }
+  EXPECT_TRUE(schemaJson(R"({"fields":{"s":{"type":"string","multi":"array"}}})")->physical("s")->multiArray());
+  EXPECT_TRUE(schemaJson(R"({"fields":{"n":{"type":"int","multi":"set","variants":{"t":"text"}}}})")->physical("n__t")->multiArray());
+  for (auto value : {"null", "1", "{}", R"("default")", R"("unknown")"}) {
+    EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"int","multi":{}}}}}}})", value)), std::runtime_error);
+  }
+  SchemaBuilder invalid;
+  invalid.field("f").type = FieldClass::INT;
+  auto& bad = invalid.field("bad");
+  bad.multi = (api::FieldDef::MultiMode)99;
+  bad.type = FieldClass::INT;
+  EXPECT_THROW(invalid.build(), SchemaError);
+  auto before = schemaJson(R"({"fields":{"f":{"type":"int","multi":true,"variants":{"d":"double"}}}})")->withHistory(10, nullptr);
+  auto same = schemaJson(R"({"fields":{"f":{"type":"int","multi":"set","variants":{"d":"double"}}}})")->withHistory(11, before.get());
+  EXPECT_EQ(10u, same->introduction("f"));
+  auto after = schemaJson(R"({"fields":{"f":{"type":"int","multi":"array","variants":{"d":"double"}}}})")->withHistory(12, same.get());
+  EXPECT_EQ(12u, after->introduction("f"));
+  EXPECT_EQ(12u, after->introduction("f__d"));
+}
+
+TEST_F(SchemaTest, dateUnitsInheritanceAndWirePresence) {
+  auto schema = schemaJson(R"({"templates":{
+    "_ns":{"type":"date","unit":"ns"}, "_child":{"parent":"_ns"}
+  },"fields":{
+    "plain":"date", "inherited":{"parent":"_child"},
+    "millis":{"parent":"_ns","unit":"ms"},
+    "with_variant":{"type":"date","variants":{"ns":{"parent":"_ns"}}}
+  }})");
+  for (auto name : {"inherited", "dynamic_child", "with_variant__ns"}) {
+    EXPECT_EQ(DateUnit::NANOS, ((DateFieldType*)schema->physical(name))->unit) << name;
+  }
+  for (auto name : {"plain", "millis", "with_variant"}) {
+    EXPECT_EQ(DateUnit::MILLIS, ((DateFieldType*)schema->physical(name))->unit) << name;
+  }
+  auto signatures = schema->signatures(true);
+  EXPECT_EQ("\"ms\"", signatures.at("plain").properties.at("unit"));
+  EXPECT_EQ("\"ns\"", signatures.at("inherited").properties.at("unit"));
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef source;
+  schema->toProto(&source, arena);
+  EXPECT_FALSE(source.fields.at("inherited")->unit);
+  EXPECT_EQ(api::FieldDef::DateUnit::MS, source.fields.at("millis")->unit);
+  EXPECT_EQ(api::FieldDef::DateUnit::NS, source.templates.at("_ns")->unit);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(source, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  EXPECT_EQ(schema->sourceDef_, Schema::fromProto(decoded)->sourceDef_);
+  auto json = authoredJson(*schema);
+  EXPECT_NE(std::string::npos, json.find("\"unit\":\"ns\""));
+  EXPECT_NE(std::string::npos, json.find("\"unit\":\"ms\""));
+  EXPECT_EQ(schema->sourceDef_, schemaJson(json)->sourceDef_);
+}
+
+TEST_F(SchemaTest, dateUnitRequiresDateAndKnownUnit) {
+  for (auto json : {
+      R"({"fields":{"bad":{"type":"int","unit":"ms"}}})",
+      R"({"fields":{"bad":{"type":"date","unit":77}}})",
+      R"({"fields":{"bad":{"type":"date","unit":"us"}}})"}) {
+    EXPECT_THROW(schemaJson(json), std::exception) << json;
+  }
+  SchemaBuilder invalid;
+  auto& field = invalid.field("bad");
+  field.type = FieldClass::DATE;
+  field.unit = (api::FieldDef::DateUnit)77;
+  EXPECT_THROW(invalid.build(), SchemaError);
+}
+
+TEST_F(SchemaTest, dateUnitChangesAreRejectedWithoutInspectingData) {
+  CollectionHelper helper;
+  SchemaBuilder original;
+  auto& parent = original.templ("_ns");
+  parent.type = FieldClass::DATE;
+  parent.unit = api::FieldDef::DateUnit::NS;
+  auto& owner = original.field("when_dt");
+  owner.parent = "_ns";
+  original.variant(owner, "copy").parent = "_ns";
+  original.set(helper.collection()); // new declaration can replace a suffix-template instance
+  for (bool withData : {false, true}) {
+    if (withData) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "one", "when_dt", 1), UpdateMessage::COMMIT).success);
+    }
+    SchemaBuilder change;
+    auto& inherited = change.templ("_ns");
+    inherited.type = FieldClass::DATE;
+    inherited.unit = api::FieldDef::DateUnit::MS;
+    EXPECT_THROW(change.set(helper.collection()), SchemaError);
+    SchemaBuilder direct;
+    auto& field = direct.field("when_dt");
+    field.type = FieldClass::DATE;
+    field.unit = api::FieldDef::DateUnit::MS;
+    EXPECT_THROW(direct.set(helper.collection()), SchemaError);
+    EXPECT_THROW(direct.replaceAll(helper.collection()), SchemaError);
+    EXPECT_EQ(DateUnit::NANOS, ((DateFieldType*)helper.collection().getSchema()->physical("when_dt"))->unit);
+  }
+  SchemaBuilder variantChange;
+  auto& sameOwner = variantChange.field("when_dt");
+  sameOwner.parent = "_ns";
+  auto& variant = variantChange.variant(sameOwner, "copy");
+  variant.type = FieldClass::DATE;
+  variant.unit = api::FieldDef::DateUnit::MS;
+  EXPECT_THROW(variantChange.set(helper.collection()), SchemaError);
+  EXPECT_NO_THROW(original.set(helper.collection()));
+}
+
 TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   auto s = schemaJson(R"({"templates":{
     "_strict":{"type":"string","long_terms":"reject"},
@@ -1247,6 +1419,12 @@ TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
   EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 65536, 1024}), storedType(*set, "_stored_").format_);
   EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
   EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
+
+  auto dict = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true},
+    "_stored_small_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":16384}}})");
+  EXPECT_EQ(65536u, storedType(*dict, "_stored_").format_.dictionaryBytes);
+  EXPECT_EQ(16384u, storedType(*dict, "_stored_small_").format_.dictionaryBytes);
+  EXPECT_EQ(dict->sourceDef_, schemaJson(authoredJson(*dict))->sourceDef_);
 }
 
 TEST_F(SchemaTest, storedResourcesValidation) {
@@ -1258,6 +1436,10 @@ TEST_F(SchemaTest, storedResourcesValidation) {
       R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
+      R"({"stored_resources":{"_stored_":{"zstd_dictionary":true}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary_bytes":4096}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":1023}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":262145}}})",
       R"({"stored_resources":{"bad-name":{}}})",
       // Names must be '_name_': neither a field name nor a suffix template.
       R"({"stored_resources":{"cold":{}}})",
@@ -1537,7 +1719,8 @@ TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
 }
 
 TEST_F(SchemaTest, variantOwnershipAndDepthErrors) {
-  for (auto property : {R"("multi":false)", R"("multi":true)", R"("stored":false)",
+  for (auto property : {R"("multi":false)", R"("multi":true)", R"("multi":"set")",
+                        R"("multi":"array")", R"("stored":false)",
                         R"("stored":true)", R"("stored_resource":"cold")", R"("stored_resource":"")",
                         R"("variants":{})", R"("variants":{"nested":"string"})", R"("defaults":{})",
                         R"("defaults":{"value":"self"})"}) {
@@ -1948,4 +2131,65 @@ TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
   auto stored = Schema::fromStored(*manifest->schema, manifest->schema_gen);
   EXPECT_EQ(schema->introducedGen, stored->introducedGen);
   EXPECT_TRUE(manifest->segments.empty());
+}
+
+// The resolved view reports the expanded analyzer (never just a name) and, for a
+// named analyzer, the name it came from; the authored schema keeps the name.
+TEST_F(SchemaTest, namedAnalyzerResolvedView) {
+  CollectionHelper helper;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  std::string error;
+  ASSERT_TRUE(api::read_json(def, R"({"fields":{
+    "named":{"type":"text","analyzer":"english"},
+    "ex":{"type":"text","analyzer":{"name":"example"}},
+    "authored":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold","kstem"]}}
+  }})", arena, &error)) << error;
+  auto schema = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
+
+  glz::generic_sorted_u64 json;
+  ASSERT_FALSE(glz::read_json(json, helper.getIndexWriter()->snapshots.readers.resolvedSchema()));
+  auto self = [&](std::string_view field, std::string_view property) {
+    return glz::write_json(json["fields"][field]["representations"]["self"][property]).value();
+  };
+  constexpr std::string_view english =
+      R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})";
+  EXPECT_EQ(english, self("named", "analyzer"));
+  EXPECT_EQ(R"("english")", self("named", "analyzer_preset"));
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+            self("ex", "analyzer"));
+  EXPECT_EQ(R"("example")", self("ex", "analyzer_preset"));
+  // an authored equivalent shows the same expansion and no preset
+  EXPECT_EQ(english, self("authored", "analyzer"));
+  auto* namedAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("named"))->analyzer_.get();
+  auto* authoredAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("authored"))->analyzer_.get();
+  EXPECT_EQ(namedAnalyzer->canonical, authoredAnalyzer->canonical);
+  auto signatures = schema->signatures();
+  EXPECT_EQ(signatures.at("named").properties, signatures.at("authored").properties);
+  EXPECT_FALSE(json["fields"]["authored"]["representations"]["self"].get<glz::generic_sorted_u64::object_t>()
+                   .contains("analyzer_preset"));
+
+  // the sparse authored view keeps what was written
+  EXPECT_NE(std::string::npos, authoredJson(*schema).find(R"("analyzer":{"name":"english"})"));
+  // a named analyzer is a field-level unit for inheritance like any other analyzer
+  auto inherited = schemaJson(R"({"templates":{"_e":{"type":"text","analyzer":"english"}},"fields":{"a":{"parent":"_e"}}})");
+  EXPECT_EQ("english", ((TextFieldType*)inherited->getFieldTypePtr("a"))->analyzer_->presetName);
+  // char filters alone keep the inherited named analyzer, replacing its char filters
+  auto cleaned = schemaJson(R"({"templates":{"_e":{"type":"text","analyzer":"english"}},
+    "fields":{"a":{"parent":"_e","analyzer":{"char_filters":["html_strip"]}}}})");
+  auto* cleanedAnalyzer = ((TextFieldType*)cleaned->getFieldTypePtr("a"))->analyzer_.get();
+  EXPECT_EQ("english", cleanedAnalyzer->presetName);
+  EXPECT_EQ(std::string(english).replace(16, 2, R"(["html_strip"])"), cleanedAnalyzer->canonical);
+  // a named analyzer on a non-text field is rejected like any analyzer
+  EXPECT_THROW(schemaJson(R"({"fields":{"n":{"type":"int","analyzer":"english"}}})"), SchemaError);
+  // unknown names and mixed forms fail with the teaching message and the field
+  try {
+    schemaJson(R"({"fields":{"t":{"type":"text","analyzer":"klingon"}}})");
+    FAIL() << "unknown analyzer accepted";
+  } catch (const SchemaError& e) {
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("unknown analyzer 'klingon'; valid analyzers: ")) << e.what();
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("(field: t)")) << e.what();
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"t":{"type":"text","analyzer":{"name":"english","filters":["fold"]}}}})"),
+               SchemaError);
 }

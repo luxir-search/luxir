@@ -180,19 +180,32 @@ endif()
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below). Apply it in
 # the launcher rather than relying on each developer's global ccache config.
+# tools/ccache-launch also deletes a stale .gch before the PCH compile, without
+# which ccache never caches a rebuilt PCH.
 # LUXIR_CCACHE_RELATIVE_PATHS shares objects between checkouts and worktrees at different
 # paths: CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes
-# the debug info's compilation directory relative to the checkout. It is off by default
-# because compiler diagnostics and __FILE__ then name sources relative to the build
-# directory, and debuggers resolve sources from the checkout root.
+# the debug info's compilation directory relative to the checkout. PWD gives ccache the
+# build directory as configured (Ninja runs every compile there, and ccache ignores a PWD
+# naming another directory), so the prefix map still applies to a checkout reached through
+# a symlink. Relative paths only match between checkouts when the build directory is
+# physically inside its checkout. It is off by default because compiler diagnostics and
+# __FILE__ then name sources relative to the build directory, and debuggers resolve
+# sources from the checkout root.
 option(LUXIR_CCACHE_RELATIVE_PATHS "Use checkout-relative paths so ccache shares objects across checkouts" OFF)
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env CCACHE_SLOPPINESS=pch_defines,time_macros)
+  list(APPEND _luxir_compile_launcher "${CMAKE_SOURCE_DIR}/tools/ccache-launch" CCACHE_SLOPPINESS=pch_defines,time_macros)
   if(LUXIR_CCACHE_RELATIVE_PATHS)
-    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}")
+    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}" "PWD=${CMAKE_BINARY_DIR}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    endif()
+    file(REAL_PATH "${CMAKE_SOURCE_DIR}" _luxir_real_source)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _luxir_real_binary)
+    cmake_path(IS_PREFIX _luxir_real_source "${_luxir_real_binary}" _luxir_binary_inside)
+    if(NOT _luxir_binary_inside)
+      message(WARNING "Luxir: build directory ${_luxir_real_binary} is not inside ${_luxir_real_source}, "
+                      "so ccache cannot share its objects with other checkouts")
     endif()
   endif()
   list(APPEND _luxir_compile_launcher "${CCACHE_PROGRAM}")
@@ -251,6 +264,14 @@ elseif(CMAKE_CROSSCOMPILING)
   message(STATUS "Luxir: using the cross-toolchain linker")
 else()
   message(STATUS "Luxir: using default system linker (no faster linker usable)")
+endif()
+
+# A Mach-O executable exports every external symbol, and GCC makes each inline
+# function and template instance a weak one, so dyld coalesced about 200k weak
+# definitions at every launch (0.5 s for luxir). Export only main, as an ELF
+# executable does without -rdynamic. Unstripped stack traces keep their names.
+if(APPLE)
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,-exported_symbol,_main")
 endif()
 
 # Thin static archives: the project's libraries only feed this build's own
@@ -407,7 +428,7 @@ target_compile_definitions(luxir_lib PUBLIC
   LUXIR_PROBE_WRAPPER_TRIMS=$<BOOL:${LUXIR_PROBE_WRAPPER_TRIMS}>)
 
 add_executable(luxir src/luxir/main.cpp)
-target_link_libraries(luxir luxir_lib)
+target_link_libraries(luxir PRIVATE luxir_lib)
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -447,6 +468,21 @@ include(cmake/hpp_proto.cmake)
 
 add_subdirectory(protos)
 add_subdirectory(test)
+
+# Compiled-in plugins (docs/dev/plugins.md). LUXIR_PLUGIN_DIRS lists directories whose
+# CMakeLists.txt call luxir_add_plugin; the in-tree test-only example is always added.
+set(LUXIR_PLUGIN_DIRS "" CACHE STRING "Semicolon-separated plugin directories compiled into the engine")
+include(cmake/LuxirPlugins.cmake)
+# Binary dirs carry the list index so two plugin dirs with one basename do not collide.
+set(_plugin_index 0)
+foreach(_plugin_dir IN LISTS LUXIR_PLUGIN_DIRS)
+  cmake_path(ABSOLUTE_PATH _plugin_dir BASE_DIRECTORY "${CMAKE_SOURCE_DIR}" NORMALIZE)
+  cmake_path(GET _plugin_dir FILENAME _plugin_base)
+  math(EXPR _plugin_index "${_plugin_index} + 1")
+  add_subdirectory("${_plugin_dir}" "${CMAKE_BINARY_DIR}/plugins/${_plugin_index}_${_plugin_base}")
+endforeach()
+add_subdirectory(test/plugins/example "${CMAKE_BINARY_DIR}/plugins/example")
+luxir_finalize_plugins()
 
 # luxir_descriptors.cpp #include "luxir_fds_data.h" (generated descriptor set); order its
 # compile after generation. The PCH no longer force-includes any generated proto header.

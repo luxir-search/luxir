@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/opt/vcpkg/downloads \
       --overlay-ports=/opt/luxir-deps/ports --overlay-triplets=/opt/luxir-deps/triplets \
       --clean-buildtrees-after-build --clean-packages-after-build
 
-COPY .devcontainer/check-lapack.cpp /opt/luxir-checks/
+COPY test/blas_lapack_test.cpp /opt/luxir-checks/check-lapack.cpp
 RUN g++ -std=c++26 -O2 /opt/luxir-checks/check-lapack.cpp \
       /opt/vcpkg/installed/x64-linux-luxir-v2/lib/libopenblas.a \
       -lm -pthread -static-libstdc++ -static-libgcc -o /tmp/check-lapack \

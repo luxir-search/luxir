@@ -101,16 +101,17 @@ TEST(IndexRamBudgetTest, MergeDemandAggregatesCapsAndUnregisters) {
   });
   auto first = budget.registerMergeDemand([]() {});
   auto second = budget.registerMergeDemand([]() {});
-  auto guard = budget.tryAcquireGuard(2);
+  auto guard = budget.tryAcquireGuard(6);
   ASSERT_TRUE(guard.has_value());
 
-  first.publish(7);
-  EXPECT_EQ(7, budget.pendingMergeDemandBytes());
+  first.publish(3);
+  EXPECT_EQ(3, budget.pendingMergeDemandBytes());
   EXPECT_FALSE(budget.pressureNeeded());
 
   second.publish(8);
   EXPECT_EQ(10, budget.pendingMergeDemandBytes());
   EXPECT_TRUE(budget.pressureNeeded());
+  EXPECT_FALSE(budget.liveOverBudget());
   EXPECT_GT(pressurePings.load(std::memory_order_relaxed), 0);
 
   first.reset();
@@ -118,6 +119,22 @@ TEST(IndexRamBudgetTest, MergeDemandAggregatesCapsAndUnregisters) {
   second.publish(0);
   EXPECT_EQ(0, budget.pendingMergeDemandBytes());
   EXPECT_FALSE(budget.pressureNeeded());
+}
+
+// Demand claims at most half the pool from inverters: a whole-pool demand
+// sheds them only once they hold more than the other half.
+TEST(IndexRamBudgetTest, MergeDemandPressureCappedAtHalfBudget) {
+  IndexRamBudget budget(10);
+  auto demand = budget.registerMergeDemand([]() {});
+  demand.publish(100);
+  auto guard = budget.tryAcquireGuard(5);
+  ASSERT_TRUE(guard.has_value());
+  EXPECT_FALSE(budget.pressureNeeded());
+  EXPECT_TRUE(guard->tryResize(6));
+  EXPECT_TRUE(budget.pressureNeeded());
+  EXPECT_FALSE(budget.liveOverBudget());
+  guard->forceResize(11);
+  EXPECT_TRUE(budget.liveOverBudget());
 }
 
 TEST(IndexRamBudgetTest, DrainingDiscountsPressureUntilReservationRelease) {
@@ -214,4 +231,45 @@ TEST(IndexRamBudgetTest, RetainedDeleteTransferSizeMismatch) {
     EXPECT_EQ(0, budget.reservedBytes());
     EXPECT_EQ(0, budget.retainedDeleteBytesCount());
   }
+}
+
+TEST(IndexRamBudgetTest, liveDeleteBytesCountTwiceForPressure) {
+  IndexRamBudget budget(100);
+  auto inverter = budget.forceAcquire(0);
+  inverter.forceResize(60, 30);
+  EXPECT_EQ(60, budget.reservedBytes());
+  EXPECT_EQ(30, budget.liveDeleteBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+  inverter.forceResize(80, 30);
+  EXPECT_FALSE(budget.overBudget());
+  EXPECT_TRUE(budget.pressureNeeded());
+
+  // Draining hands the packet to plain reservations, so it counts once.
+  EXPECT_TRUE(inverter.tryMarkDrainingForPressure(30));
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+  inverter.clearDraining();
+  EXPECT_EQ(30, budget.liveDeleteBytesCount());
+  inverter.release();
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  EXPECT_EQ(0, budget.reservedBytes());
+}
+
+TEST(IndexRamBudgetTest, retirablePacketsLeavePressureNotAdmission) {
+  IndexRamBudget budget(100);
+  auto inverter = budget.forceAcquire(80);
+  inverter.markDraining(80);
+  auto packet = inverter.transferToRetainedDeletes(80);
+  inverter.release();
+  auto other = budget.forceAcquire(40);
+  EXPECT_TRUE(budget.pressureNeeded());
+  packet.markRetirable();
+  packet.markRetirable();
+  EXPECT_EQ(80, budget.retirableDeleteBytesCount());
+  EXPECT_TRUE(budget.overBudget());
+  EXPECT_FALSE(budget.pressureNeeded());
+  packet.release();
+  EXPECT_EQ(0, budget.retirableDeleteBytesCount());
+  EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+  EXPECT_EQ(40, budget.reservedBytes());
 }

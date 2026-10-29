@@ -472,8 +472,7 @@ class SimpleNumericFieldComparator : public FieldComparator,
         keys[i] = missingValueSubstitute;
         continue;
       }
-      int64_t valueRank = reader->getStartValueRank(rank);
-      keys[i] = transformPresent(pointValues->valueAt(valueRank));
+      keys[i] = transformPresent(reader->selectedValue(rank, sortMultiplier < 0, *pointValues));
     }
   }
 
@@ -660,7 +659,7 @@ public:
     return out;
   }
 
-  int64_t getDocValue(int32_t docid) {
+  LUXIR_INLINE int64_t getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueSubstitute;
     }
@@ -673,12 +672,9 @@ public:
       if (iter->docId() > docid) return missingValueSubstitute;
       rank = iter->rank();
     }
-    // Multi-valued numeric columns store per-doc values unsorted, so the
-    // cheap deterministic sort key is the FIRST stored value (storage order).
-    // min/max over unsorted values would scan every value per doc; callers
-    // that want that spell it explicitly (min(f)/max(f) sort expressions).
+    // Min ascending, max descending: sets read an edge, arrays scan.
     int64_t value = multiValued
-        ? iter->values().valueAt(reader->getStartValueRank(rank))
+        ? reader->selectedValue(rank, sortMultiplier < 0, iter->values())
         : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier
@@ -750,10 +746,12 @@ public:
 // A comparator for string fields that uses global ordinals for efficient cross-segment comparison
 // Selected segment ord for sorting: single-valued docs read their one ord;
 // multi-valued docs sort by their smallest ord ascending and largest ord
-// descending (min/max term semantics). Returns 0 for missing.
-inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
-                               bool descending) {
+// descending (min/max term semantics). Returns 0 for missing. Forced inline:
+// the comparators' hot paths depend on it folding into their callers.
+LUXIR_INLINE inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
+                                            bool descending) {
   if (!reader.multiValued()) return reader.ordAt(docid);
+  if (reader.multiArray()) return reader.selectedArrayOrdAt(docid, descending);
   if (!descending) return reader.firstOrdAt(docid);
   const DocsReader& docs = reader.docsReader();
   int32_t docRank;
@@ -865,7 +863,7 @@ public:
     return OrdIntervalStatus::READY;
   }
 
-  int64_t getGlobalOrd(int32_t docid) {
+  LUXIR_INLINE int64_t getGlobalOrd(int32_t docid) {
     if (!reader.has_value()) {
       return missingOrd;
     }
@@ -1000,7 +998,7 @@ class SegmentOrdComparator : public FieldComparator {
     slot.length = (uint32_t)value.size();
   }
 
-  int32_t selectedOrd(int32_t docid) const {
+  LUXIR_INLINE int32_t selectedOrd(int32_t docid) const {
     if (!reader.has_value()) return 0;
     return selectedSortOrd(*reader, docid, sortMultiplier < 0);
   }
@@ -1192,105 +1190,116 @@ public:
 class StrColComparator : public FieldComparator {
   std::optional<StrColReader> reader;
   std::optional<StrColReader::Iterator> iter;
+  std::optional<StrColReader::DocValues> docValues;
+  bool multiValued = false;
   std::vector<std::string> values; // Storage for string values
+  // Missing is tracked apart from the value: any string, "" included, is a
+  // real value that must not tie with a missing one.
+  std::vector<uint8_t> missing;
   int sortMultiplier; // 1 for ascending, -1 for descending
-  std::string missingValueStr;
-  
+  int missingCmp; // missing vs present, in final order (direction applied)
+
 public:
   StrColComparator(bool reversed, MissingValue missingValue, IndexReader::FieldSegments fields)
     : FieldComparator(fields),
-      sortMultiplier(reversed ? -1 : 1) {
-    
-    // For missing values, use empty string for MISSING_FIRST in ASC (sorts before all others)
-    // or a very high value string for MISSING_LAST in ASC
-    if (missingValue == MISSING_FIRST) {
-      missingValueStr = reversed ? "\xFF\xFF\xFF\xFF" : "";
-    } else {
-      missingValueStr = reversed ? "" : "\xFF\xFF\xFF\xFF";
-    }
-  }
-  
+      sortMultiplier(reversed ? -1 : 1),
+      missingCmp(missingValue == MISSING_FIRST ? -1 : 1) {}
+
   void setSegment(const IndexReader::Segment& segment) override {
     auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
-    reader.reset();
+    docValues.reset();
     iter.reset();
+    reader.reset();
+    multiValued = false;
 
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
+        multiValued = reader->isMultiValued();
+        if (multiValued) docValues.emplace(*reader);
       }
     }
   }
 
   void growSlots(int32_t capacity) override {
-    if ((size_t)capacity > values.size()) resizeExact(values, (size_t)capacity);
+    if ((size_t)capacity > values.size()) {
+      resizeExact(values, (size_t)capacity);
+      resizeExact(missing, (size_t)capacity);
+    }
   }
 
-  std::string_view getDocValue(int32_t docid) {
+  std::optional<std::string_view> getDocValue(int32_t docid) {
     if (!iter.has_value()) {
-      return missingValueStr;
+      return std::nullopt;
     }
-    
+
     // Advance iterator to docid if needed
     if (iter->docId() < docid) {
       int32_t foundDoc = iter->advance(docid);
       if (foundDoc == StrColReader::Iterator::ENDDOC || foundDoc > docid) {
-        return missingValueStr;
+        return std::nullopt;
       }
     } else if (iter->docId() > docid) {
-      return missingValueStr;
+      return std::nullopt;
     }
-    
-    return iter->value();
+
+    return multiValued
+        ? reader->selectedValue(iter->rank(), sortMultiplier < 0, *docValues)
+        : iter->value();
   }
-  
+
+  int compareValues(bool missingA, std::string_view valA,
+                    bool missingB, std::string_view valB) const {
+    if (missingA || missingB) {
+      return missingA == missingB ? 0 : missingA ? missingCmp : -missingCmp;
+    }
+    return sortMultiplier * valA.compare(valB);
+  }
+
   int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) override {
     assert(slotA >= 0 && slotA < (int32_t)values.size());
     assert(slotB >= 0 && slotB < (int32_t)values.size());
-    const auto& valA = values[slotA];
-    const auto& valB = values[slotB];
-    int cmp = valA.compare(valB);
-    return sortMultiplier * cmp;
+    return compareValues(missing[slotA], values[slotA], missing[slotB], values[slotB]);
   }
-  
+
   // NOINLINE: see SimpleNumericFieldComparator::compareBottom.
   LUXIR_NOINLINE int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
     assert(bottomSlot >= 0 && bottomSlot < (int32_t)values.size());
-    const auto& bottomVal = values[bottomSlot];
-    std::string_view newVal = getDocValue(newDoc.docId());
-    int cmp = bottomVal.compare(newVal);
-    return sortMultiplier * cmp;
+    auto newVal = getDocValue(newDoc.docId());
+    return compareValues(missing[bottomSlot], values[bottomSlot],
+                         !newVal.has_value(), newVal.value_or(std::string_view()));
   }
-  
+
   void copy(int32_t slot, segdoc doc) override {
     assert(slot >= 0 && slot < (int32_t)values.size());
-    values[slot] = std::string(getDocValue(doc.docId()));
+    auto value = getDocValue(doc.docId());
+    values[slot] = std::string(value.value_or(std::string_view()));
+    missing[slot] = !value.has_value();
   }
-  
+
   int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
     assert(dynamic_cast<StrColComparator*>(&other) != nullptr);
     auto* otherStr = static_cast<StrColComparator*>(&other);
-    
+
     assert(slotA >= 0 && slotA < (int32_t)values.size());
     assert(slotB >= 0 && slotB < (int32_t)otherStr->values.size());
-    const auto& valA = values[slotA];
-    const auto& valB = otherStr->values[slotB];
-    int cmp = valA.compare(valB);
-    return sortMultiplier * cmp;
+    return compareValues(missing[slotA], values[slotA],
+                         otherStr->missing[slotB], otherStr->values[slotB]);
   }
-  
+
   void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) override {
     assert(dynamic_cast<StrColComparator*>(&other) != nullptr);
     auto* otherStr = static_cast<StrColComparator*>(&other);
-    
+
     assert(slot >= 0 && slot < (int32_t)values.size());
     assert(otherSlot >= 0 && otherSlot < (int32_t)otherStr->values.size());
     values[slot] = otherStr->values[otherSlot];
+    missing[slot] = otherStr->missing[otherSlot];
   }
-  
+
   // Retained variable-width payload; fixed slot arrays are accounted by the
   // owning collection route. Ordinary top-k never calls this accessor.
   size_t retainedSlotBytes(int32_t slot) const;

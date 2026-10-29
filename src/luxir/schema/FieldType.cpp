@@ -5,11 +5,56 @@
 
 #include "luxir/api/luxir_types.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <format>
 
 namespace luxir {
+
+std::string_view FieldType::typeName(Type type) {
+  static constexpr std::string_view names[] = {
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
+  };
+  return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
+}
+
+uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
+  switch (type) {
+    case DATE:
+      DateFieldType::unitFromTypeFlags(typeFlags);
+      return typeFlags;
+    case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
+    case DOUBLE: case ID: case VECTOR: case GEO_POINT:
+      if (typeFlags == 0) return 0;
+      throw std::runtime_error(std::format(
+          "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
+  }
+  throw std::runtime_error(std::format("Unknown persisted field type {}", (int)type));
+}
+
+std::string FieldType::describeType(Type type, uint32_t typeFlags) {
+  if (type == DATE) {
+    return std::format("type 'date' unit '{}'", dateUnitName(DateFieldType::unitFromTypeFlags(typeFlags)));
+  }
+  typeParameters(type, typeFlags);
+  return std::format("type '{}'", typeName(type));
+}
+
+uint32_t DateFieldType::typeFlagsForUnit(DateUnit unit) {
+  switch (unit) {
+    case DateUnit::MILLIS: return 0;
+    case DateUnit::NANOS: return 1;
+  }
+  throw std::invalid_argument("Unknown date unit");
+}
+
+DateUnit DateFieldType::unitFromTypeFlags(uint32_t typeFlags) {
+  if (typeFlags & ~1u) {
+    throw std::runtime_error(std::format("Unknown type flags 0x{:x} for persisted field type 'date'", typeFlags));
+  }
+  return typeFlags & 1u ? DateUnit::NANOS : DateUnit::MILLIS;
+}
 
 void StrFieldType::normalize(std::string& value) const {
   if (normalizer) normalizer->createChain()->normalizeTerm(value);
@@ -33,14 +78,21 @@ std::string VectorFieldType::inputError(std::span<const float> vec) const {
         ? std::format("expected dims={}, got {}", inputDims_, n)
         : std::format("expected dims={} or truncate_dims={}, got {}", inputDims_, truncateDims_, n);
   }
-  // Every element, including a tail truncation drops, must be finite. One
-  // branch-free pass over the exponent bits; only a failure goes back for the
-  // first bad index.
-  uint32_t nonFinite = 0;
-  for (float x : vec) nonFinite |= (uint32_t)((std::bit_cast<uint32_t>(x) & 0x7f800000u) == 0x7f800000u);
-  if (nonFinite) [[unlikely]] {
+  // Every element, including a tail truncation drops, must be finite and at
+  // most MAX_ELEMENT_MAGNITUDE in magnitude. Without the sign bit, float bits
+  // order like magnitudes, with infinity and NaN above every finite value, so
+  // one branch-free max checks both; only a failure goes back for the first
+  // bad index.
+  constexpr uint32_t limitBits = std::bit_cast<uint32_t>(MAX_ELEMENT_MAGNITUDE);
+  uint32_t maxBits = 0;
+  for (float x : vec) maxBits = std::max(maxBits, std::bit_cast<uint32_t>(x) & 0x7fffffffu);
+  if (maxBits > limitBits) [[unlikely]] {
     for (size_t i = 0; i < n; i++) {
       if (!std::isfinite(vec[i])) return std::format("element {} is not a finite float32", i);
+      if (std::fabs(vec[i]) > MAX_ELEMENT_MAGNITUDE) {
+        return std::format("element {} ({}) exceeds the magnitude limit 2^{}", i, vec[i],
+                           std::ilogb(MAX_ELEMENT_MAGNITUDE));
+      }
     }
   }
   return {};

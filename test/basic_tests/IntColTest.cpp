@@ -295,6 +295,122 @@ TEST_F(IntColTest, wideRangeBlock) {
   }
 }
 
+TEST_F(IntColTest, linearRankBoundsProofs) {
+  constexpr int64_t MIN = std::numeric_limits<int64_t>::min();
+  constexpr int64_t MAX = std::numeric_limits<int64_t>::max();
+  auto check = [&](std::vector<int64_t> values) {
+    for (bool descending : {false, true}) {
+      if (descending) std::reverse(values.begin(), values.end());
+      std::vector<uint64_t> quotients;
+      auto plan = NumColumnFormat::planBlock(values, quotients);
+      plan.info.setPayload(0, plan.bits);
+      ASSERT_TRUE(plan.info.linearFit());
+      SCOPED_TRACE(::testing::Message() << "count=" << values.size()
+          << " descending=" << descending << " gcd=" << plan.info.gcd
+          << " min=" << plan.zone.min);
+      std::vector<int64_t> edges = {MIN, MAX};
+      for (size_t rank : {(size_t)0, values.size() / 2, values.size() - 1}) {
+        int64_t value = values[rank];
+        edges.push_back(value);
+        if (value != MIN) edges.push_back(value - 1);
+        if (value != MAX) edges.push_back(value + 1);
+      }
+      bool sawInside = false;
+      bool sawOutside = false;
+      for (int64_t edge : edges) {
+        for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 4>{{
+                 {edge, edge}, {MIN, edge}, {edge, MAX}, {MAX, MIN}}}) {
+          auto bounds = NumColumnFormat::linearRankBounds(
+              plan.info, values.front(), (uint32_t)values.size(), lo, hi);
+          ASSERT_TRUE(bounds);
+          ASSERT_LE(bounds->checkBegin, bounds->insideBegin);
+          ASSERT_LE(bounds->insideBegin, bounds->insideEnd);
+          ASSERT_LE(bounds->insideEnd, bounds->checkEnd);
+          ASSERT_LE(bounds->checkEnd, values.size());
+          for (uint32_t rank = 0; rank < values.size(); rank++) {
+            bool match = lo <= values[rank] && values[rank] <= hi;
+            bool inside = bounds->insideBegin <= rank && rank < bounds->insideEnd;
+            bool outside = rank < bounds->checkBegin || rank >= bounds->checkEnd;
+            ASSERT_FALSE(match && outside) << "rank=" << rank << " lo=" << lo << " hi=" << hi;
+            ASSERT_FALSE(inside && !match) << "rank=" << rank << " lo=" << lo << " hi=" << hi;
+            sawInside |= inside;
+            sawOutside |= outside && lo <= hi;
+          }
+        }
+      }
+      EXPECT_TRUE(sawInside);
+      EXPECT_TRUE(sawOutside);
+    }
+  };
+  check({0, 10, 20, 30, 40});  // zero residual width
+  check({MIN, MIN, MIN + 2, MIN + 3});  // wrapped base
+  for (uint32_t count : {4u, 127u, 129u, 513u, NumColumnFormat::BLOCK_SIZE}) {
+    for (uint64_t gcd : {1ULL, 1000ULL, 1ULL << 47}) {
+      int64_t span = (int64_t)(gcd * ((count - 1) * 15 / 2 + (count - 1) % 3));
+      for (int64_t base : {MIN, (int64_t)0, MAX - span}) {
+        std::vector<int64_t> values(count);
+        for (uint32_t rank = 0; rank < count; rank++) {
+          values[rank] = (int64_t)((__int128)base
+              + (__int128)gcd * (rank * 15 / 2 + rank % 3));
+        }
+        check(std::move(values));
+      }
+    }
+  }
+}
+
+TEST_F(IntColTest, residualBoundsProofs) {
+  constexpr int64_t MIN = std::numeric_limits<int64_t>::min();
+  constexpr int64_t MAX = std::numeric_limits<int64_t>::max();
+  auto check = [&](std::span<const int64_t> values) {
+    std::vector<uint64_t> quotients;
+    auto plan = NumColumnFormat::planBlock(values, quotients);
+    plan.info.setPayload(0, plan.bits);
+    ASSERT_TRUE(plan.info.residualComparable());
+    EXPECT_FALSE(plan.info.linearFit());
+    std::vector<int64_t> edges = {MIN, MAX};
+    for (int64_t value : values) {
+      edges.push_back(value);
+      if (value != MIN) edges.push_back(value - 1);
+      if (value != MAX) edges.push_back(value + 1);
+    }
+    for (int64_t edge : edges) {
+      for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 4>{{
+               {edge, edge}, {MIN, edge}, {edge, MAX}, {MAX, MIN}}}) {
+        auto bounds = NumColumnFormat::residualBounds(plan.info, lo, hi);
+        for (size_t rank = 0; rank < values.size(); rank++) {
+          EXPECT_EQ(lo <= values[rank] && values[rank] <= hi,
+                    bounds.lower <= quotients[rank] && quotients[rank] <= bounds.upper)
+              << "rank=" << rank << " lo=" << lo << " hi=" << hi;
+        }
+      }
+    }
+  };
+  for (uint8_t bits : {0, 1, 32}) {
+    for (uint64_t gcd : {1ULL, 1000ULL, 1ULL << 32}) {
+      __int128 span = (__int128)gcd * ((1ULL << bits) - 1);
+      for (int64_t base : {MIN, (int64_t)((__int128)MAX - span)}) {
+        int64_t last = (int64_t)((__int128)base + span);
+        int64_t middle = bits == 0 ? base : (int64_t)((__int128)base + gcd);
+        check(std::array<int64_t, 5>{base, last, middle, last, base});
+      }
+    }
+  }
+  check(std::array<int64_t, 3>{MIN, MAX, MIN});  // gcd == UINT64_MAX
+  NumBlockInfo info;
+  for (uint8_t bits : {(uint8_t)33, NumBlockInfo::MAX_PACKED_BITS, NumBlockInfo::RAW_BITS}) {
+    info.setPayload(0, bits);
+    EXPECT_FALSE(info.residualComparable());
+    EXPECT_EQ(bits <= NumBlockInfo::MAX_PACKED_BITS, info.forPacked());
+    EXPECT_FALSE(NumColumnFormat::linearRankBounds(info, 0, 1, MIN, MAX));
+  }
+  info.scaledSlope = 1;
+  EXPECT_FALSE(info.linearFit());
+  info.setPayload(0, NumBlockInfo::MAX_PACKED_BITS);
+  info.gcd = std::numeric_limits<uint64_t>::max();
+  EXPECT_FALSE(NumColumnFormat::linearRankBounds(info, 0, 1, MIN, MAX));
+}
+
 TEST_F(IntColTest, linearPackFormatCorners) {
   auto check = [](std::span<const int64_t> expected) {
     RAMDir dir;

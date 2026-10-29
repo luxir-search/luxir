@@ -15,11 +15,14 @@
 #include "luxir/index/OrdColWriter.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/ops/DomainIter.h"
+#include "luxir/search/SortField.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
+#include "test/SchemaBuilder.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -33,6 +36,13 @@ public:
   explicit OrdFormatGuard(OrdColWriter::FormatOverride value)
       : saved(OrdColWriter::setFormatOverrideForTests(value)) {}
   ~OrdFormatGuard() { OrdColWriter::setFormatOverrideForTests(saved); }
+};
+
+class OrdSortModeGuard {
+  StringSortMode saved;
+public:
+  explicit OrdSortModeGuard(StringSortMode mode) : saved(SortField::setStringSortModeForTests(mode)) {}
+  ~OrdSortModeGuard() { SortField::setStringSortModeForTests(saved); }
 };
 
 class OrdBulkMinHitsGuard {
@@ -465,8 +475,9 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
           };
           if (complement) {
             DomainView view(domain, maxDoc);
+            RequestMemTracker tracker(SIZE_MAX);
             forEachComplementOrdValue(view, index.pool, reader, missing,
-                                      collect);
+                                      tracker, "ord walk", collect);
           } else {
             forEachOrdValue(domain, reader, OrdMap::SegToGlobal::identity(),
                             maxDoc, missing, collect);
@@ -513,7 +524,7 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatch) {
     helper.indexAll(docs, UpdateMessage::COMMIT);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery();
+    auto& top = req->topDocs("q").countLimit().allQuery();
     auto& facet = top.facet("f", field).limit(-1);
     std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
@@ -575,7 +586,7 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatchAcrossBlocksAndSparseDomai
     EXPECT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).limit(10);
+    auto& top = req->topDocs("q").countLimit().limit(10);
     top.rawQuery() = qb::match(top.mr(), "gate_s", "yes");
     auto& facet = top.facet("f", "cat_s").limit(-1);
     std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
@@ -646,7 +657,7 @@ TEST_F(OrdColFormatTest, stringSortMissingLastAcrossSegmentsBothDirections) {
   auto sortedIds = [&](qb::SortDir direction) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(10)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(10)
         .fields({"id_s", "name_s"});
     qb::sort(top, "name_s", direction);
     req->execute(false);
@@ -684,7 +695,7 @@ TEST_F(OrdColFormatTest, predictedInputSegmentsMergeWithFacetAndSortParity) {
   auto snapshot = [&]() {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(100)
         .fields({"id_s", "sort_s"});
     qb::sort(top, "sort_s", qb::ASC);
     auto& facet = top.facet("f", "cat_s").limit(-1);
@@ -711,4 +722,169 @@ TEST_F(OrdColFormatTest, predictedInputSegmentsMergeWithFacetAndSortParity) {
   request.commit(true, 1);
   ASSERT_TRUE(helper.submit(request).success);
   EXPECT_EQ(before, snapshot());
+}
+
+TEST_F(OrdColFormatTest, indexedStringModesPreserveValuesAndSelectExtrema) {
+  for (auto format : {OrdColWriter::FormatOverride::DIRECT, OrdColWriter::FormatOverride::PREDICTED}) {
+    OrdFormatGuard guard(format);
+    for (bool array : {false, true}) {
+      CollectionHelper helper;
+      helper.clear();
+      SchemaBuilder schema;
+      auto& field = schema.field("value");
+      field.type = api::FieldDef::FieldClass::STRING;
+      field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+      schema.normalizer(field, {"nfkc_cf"});
+      schema.set(helper.collection());
+      ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", vecs("Z", "b", "B", "", "a"),
+                                      "ref_ss", vecs("z", "b", "", "a")), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "gone", "value", vecs("zz", "zz"), "ref_ss", vecs("zz")), UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", vecs("y", "m", "y"),
+                                      "ref_ss", vecs("y", "m")), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "c", "value", "q", "ref_ss", "q"), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "d", "value", vecs()), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "e"), UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+      for (int merge = 0; merge < 2; merge++) {
+        auto req = localReq(helper.getSearchEngine());
+        auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+        qb::sort(top, "id", qb::ASC);
+        req->execute(false);
+        ASSERT_OK(req);
+        const auto& rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+        ASSERT_EQ(5u, rows.size());
+        EXPECT_EQ(array ? (std::vector<std::string>{"z", "b", "b", "", "a"})
+                        : (std::vector<std::string>{"", "a", "b", "z"}),
+                  std::vector<std::string>(rows[0].v.begin(), rows[0].v.end()));
+        EXPECT_EQ(array ? (std::vector<std::string>{"y", "m", "y"})
+                        : (std::vector<std::string>{"m", "y"}),
+                  std::vector<std::string>(rows[1].v.begin(), rows[1].v.end()));
+        EXPECT_EQ("q", rows[2].v[0]);
+        EXPECT_TRUE(rows[3].v.empty());
+        EXPECT_TRUE(rows[4].v.empty());
+        for (auto sortMode : {StringSortMode::SEGMENT, StringSortMode::GLOBAL})
+        for (bool parallel : {false, true}) for (auto dir : {qb::ASC, qb::DESC}) for (int limit : {2, -1}) {
+          OrdSortModeGuard sortGuard(sortMode);
+          auto run = [&](std::string_view name) {
+            auto sorted = localReq(helper.getSearchEngine());
+            auto& docs = sorted->collection("main").topDocs("q").allQuery().limit(limit).fields({"id"});
+            qb::sort(docs, name, dir);
+            sorted->execute(parallel);
+            EXPECT_TRUE(sorted->ok()) << sorted->errorMsg();
+            auto ids = std::get<api::ColStr>(sorted->docList("q")->columns.at("id").kind).v;
+            return std::vector<std::string>(ids.begin(), ids.end());
+          };
+          EXPECT_EQ(run("ref_ss"), run("value"));
+        }
+        auto match = localReq(helper.getSearchEngine());
+        match->collection("main").topDocs("q").matchQuery("value", "b").countLimit();
+        match->topDocs("exists").existsQuery("value").countLimit();
+        match->execute(false);
+        ASSERT_OK(match);
+        EXPECT_EQ(1, match->getMatchCount("q"));
+        EXPECT_EQ(3, match->getMatchCount("exists"));
+        auto scores = localReq(helper.getSearchEngine());
+        scores->collection("main").topDocs("value").matchQuery("value", "b").getScores();
+        scores->topDocs("reference").matchQuery("ref_ss", "b").getScores();
+        scores->execute(false);
+        ASSERT_OK(scores);
+        auto scoreOf = [&](std::string_view op) {
+          return std::get<api::ColFloat>(scores->docList(op)->columns.at("_score_").kind).v[0];
+        };
+        EXPECT_FLOAT_EQ(scoreOf("reference"), scoreOf("value"));
+        auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+        for (auto& segment : reader->segments()) if (auto* info = segment.postingsReader().fieldInfo("value")) {
+          EXPECT_EQ(array, (info->flags & FieldType::MULTI_ARRAY) != 0);
+          EXPECT_EQ(format == OrdColWriter::FormatOverride::DIRECT ? SegFieldInfo::ORD_DIRECT : SegFieldInfo::ORD_PREDICTED,
+                    info->ordFormat);
+        }
+        if (!merge) {
+          CollectionHelper::UpdateBuilder update;
+          update.commit(true, 1);
+          ASSERT_TRUE(helper.submit(update).success);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(OrdColFormatTest, indexedStringMixedModesMergeKeepsSurvivingSequences) {
+  CollectionHelper helper;
+  auto setMode = [&](bool array) {
+    SchemaBuilder schema;
+    auto& f = schema.field("value");
+    f.type = api::FieldDef::FieldClass::STRING;
+    f.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+  };
+  setMode(true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", vecs("z", "a", "z")), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "gone", "value", vecs("x", "b", "x")), UpdateMessage::COMMIT).success);
+  setMode(false);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", vecs("y", "b", "y")), UpdateMessage::COMMIT).success);
+  setMode(true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "missing"), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c", "value", ""), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+  for (int merge = 0; merge < 2; merge++) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& docs = req->collection("main").topDocs("q").allQuery().fields({"id", "value"});
+    qb::sort(docs, "id", qb::ASC);
+    req->execute(false);
+    ASSERT_OK(req);
+    const auto& rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+    ASSERT_EQ(4u, rows.size());
+    EXPECT_EQ((std::vector<std::string>{"z", "a", "z"}), std::vector<std::string>(rows[0].v.begin(), rows[0].v.end()));
+    EXPECT_EQ((std::vector<std::string>{"b", "y"}), std::vector<std::string>(rows[1].v.begin(), rows[1].v.end()));
+    ASSERT_EQ(1u, rows[2].v.size());
+    EXPECT_EQ("", rows[2].v[0]);
+    EXPECT_TRUE(rows[3].v.empty());
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_NE(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
+}
+
+TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("values");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  std::vector<std::string> values;
+  for (int i = 0; i < 256; i++) values.push_back(std::to_string(i));
+  auto repeats = values;
+  values.insert(values.end(), repeats.begin(), repeats.end());
+  ASSERT_TRUE(helper.indexAll({flatdoc("values", values), flatdoc("values", values)}, UpdateMessage::COMMIT).success);
+  auto index = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = index->segments()[0];
+  OrdColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("values"));
+  for (size_t ceiling : {SIZE_MAX, size_t{1}}) {
+    RequestMemTracker tracker(ceiling);
+    {
+      OrdValueBatches values(nullptr, column, OrdMap::SegToGlobal::identity(), segment.maxDoc(), false, nullptr);
+      DistinctOrdValueBatches distinct(values, tracker, "values");
+      OrdValueBatches::Batch batch;
+      if (ceiling == 1) {
+        EXPECT_THROW(distinct.next(batch), ResourceExhaustedError);
+      } else {
+        size_t peak = 0;
+        int count = 0;
+        while (distinct.next(batch)) {
+          count += batch.size;
+          EXPECT_GT(tracker.bytes(), 0u);
+          if (peak == 0) peak = tracker.peak();
+          EXPECT_EQ(peak, tracker.peak());
+        }
+        EXPECT_EQ(512, count);
+      }
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
 }

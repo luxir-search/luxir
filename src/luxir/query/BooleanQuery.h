@@ -40,6 +40,12 @@ public:
   // Test hook: keep score-only optional clauses in unscored plans.
   static inline bool disableUnscoredOptionalDropForTests = false;
 
+  struct ScorePolicy {
+    enum Kind { SUM, DISMAX };
+    Kind kind = SUM;
+    float tie = 1.0f;
+  };
+
   enum NormalizeRule : uint32_t {
     R1_REQUIRED_INLINE = 1u << 0,
     R2_DISJUNCTION_FLATTEN = 1u << 1,
@@ -651,6 +657,17 @@ public:
       DocsEnumMeta::L1_DOCS;
   static inline int64_t windowFillSpanScaleForTests =
       WINDOW_FILL_SPAN_SCALE;
+
+  // Flat exhaustive conjunctions only. Entry ordinals precede cost sorting.
+  struct ConjunctionControlForTests {
+    std::span<const size_t> order;
+    std::span<const MembershipConsumption> consumption;
+    bool proofs = true;
+    // Original ordinal, consumption stage, and position within that stage.
+    std::function<void(size_t, MembershipConsumption, size_t, ScorerSupplier&,
+                       const PlanContext&, const ScorerShape&)> observe;
+  };
+  static inline const ConjunctionControlForTests* conjunctionControlForTests = nullptr;
   // A cached DocSet has a cheap mask route, so a term may own the candidate
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.
@@ -682,6 +699,43 @@ public:
     bounds.hi = optionalUpperBound(bounds.hi);
     return bounds;
   }
+  // best and sum are over clamped upper bounds, not signed scores.
+  static float disMaxUpperBound(double best, double sum, float tie, double factor) {
+    if (tie == 0.0f) return (float) best;
+    // score() adds in float before applying tie. Even when the weighted
+    // result would fit, an overflowing sum makes that score infinite.
+    if (sum * factor > (double) std::numeric_limits<float>::max()) {
+      return std::numeric_limits<float>::infinity();
+    }
+    double upper = ((1.0 - (double) tie) * best + (double) tie * sum) * factor;
+    if (upper == 0.0) return 0.0f;
+    // Outward rounding also covers subnormal products in score().
+    return std::nextafter((float) upper, std::numeric_limits<float>::infinity());
+  }
+  struct DisMaxBounds {
+    double sum = 0.0;
+    float best = 0.0f;
+    float lo = 0.0f;
+    bool any = false;
+
+    void add(float upper) {
+      upper = optionalUpperBound(upper);
+      sum += (double) upper;
+      best = std::max(best, upper);
+    }
+    void add(ScoreBounds bounds) {
+      bounds = optionalScoreBounds(bounds);
+      lo = any ? addScoreBound(lo, bounds.lo, false) : bounds.lo;
+      any = true;
+      add(bounds.hi);
+    }
+    float upper(float tie, double factor) const {
+      return disMaxUpperBound(best, sum, tie, factor);
+    }
+    ScoreBounds bounds(float tie, double factor) const {
+      return {lo, upper(tie, factor)};
+    }
+  };
   static float addScoreBound(float left, float right, bool upper) {
     float sum = left + right;
     if (std::isnan(sum)) {
@@ -1072,6 +1126,25 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  // A scored disjunction with its own logical owner. Preserve the original
+  // clauses, including duplicates, rather than normalizing a BooleanQuery.
+  static Query::Weight* makeDisjunctionWeight(
+      Context& context, const Query& owner, std::span<Query*> clauses,
+      ScorePolicy policy, int32_t flags, float multiplier);
+
+  // The route selected at construction/admission time. Runtime sampling
+  // may later latch a candidate route back to dense execution.
+  enum class ConjunctionRoute : uint8_t {
+    GENERIC,
+    CANDIDATE_DOC_SET_FILTER,
+    CANDIDATE_POSTINGS_FILTER,
+    CANDIDATE_SCORING_TERM,
+    COUNT_EXACT_DOCS_ONLY,
+    COUNT_POSTINGS_SAMPLE,
+    COUNT_DENSE,
+    COUNT_DOC_SET_SPARSE,
+  };
+
   struct ConjunctionClauseLayout {
     Query::ClauseShape windowFillKind = Query::ClauseShape::NONE;
     std::span<Query::Scorer*> denseMembers;
@@ -1092,8 +1165,12 @@ public:
   struct PostingsCandidateBatch;
   class ExactDocsOnlyTermConjunctionBulkScorer;
   class ConjunctionBulkScorer;
-  class DisjunctionScorer;
-  class MaxScoreDisjunctionScorer;
+  struct SumScorePolicy {};
+  struct DisjunctionTestFlags;
+  template<bool DISMAX> class DisjunctionScorerT;
+  template<bool DISMAX> class MaxScoreDisjunctionScorerT;
+  using DisjunctionScorer = DisjunctionScorerT<false>;
+  using MaxScoreDisjunctionScorer = MaxScoreDisjunctionScorerT<false>;
   class FilteredDisjunctionBulkScorer;
   class MaxScoreBulkScorer;
   class MinShouldMatchWandScorer;

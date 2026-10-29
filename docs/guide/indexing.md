@@ -146,9 +146,8 @@ A malformed document record also ends the stream, with error code
 they are read, so the failure is reported when the internal batch carrying the
 record is processed: earlier batches stay indexed, the batch holding the bad
 record indexes nothing and runs no commit it carried (an `_end_` commit, for
-example), and batches the connection had already submitted behind it (at most
-`--indexing.max-inflight-batches`) are still processed, so they are normally
-indexed. The error line's `docs_indexed_so_far` counts what was. Inside an
+example), and batches the connection had already submitted behind it are
+still processed, so they are normally indexed. The error line's `docs_indexed_so_far` counts what was. Inside an
 `all_or_none` group the whole group fails. Control records are decoded in stream order as
 they arrive, so a malformed control record fails before anything after it is
 submitted.
@@ -368,8 +367,8 @@ The relevant server controls are:
 - `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for
   internal non-atomic handoff granularity.
 - `--indexing.max-inflight-batches` for the number of internal batches a
-  connection can submit concurrently (`0` selects the worker count plus two;
-  `1` makes batch submission serial).
+  connection can have decoding or indexing at once (`0` selects the worker
+  count plus two; `1` indexes one batch at a time).
 
 ## Limits
 

@@ -78,7 +78,7 @@ void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetr
   auto& v = b.templ("_vs");
   v.type = api::FieldDef::FieldClass::VECTOR;
   v.column = true;
-  v.multi = true;
+  v.multi = api::FieldDef::MultiMode::DEFAULT;
   v.dims = dims;
   v.metric = metric;
   v.ann = ann;
@@ -91,7 +91,7 @@ protected:
   auto run(std::string_view collection, std::string_view body, int32_t parallel = 1, bool ok = true) {
     auto request = localReq(luxirNode->getSearchEngine());
     std::string json = R"({"collection":")" + std::string(collection)
-        + R"(","get_scores":true,"get_number":true,"document_format":"rows","batch_size":10000,)"
+        + R"(","get_scores":true,"count_limit":-1,"document_format":"rows","batch_size":10000,)"
         + std::string(body) + '}';
     if (!api::read_json(request->rawRequest(), json, request->mr)) throw std::runtime_error(json);
     request->execute(parallel);
@@ -524,7 +524,7 @@ TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
       UpdateMessage::COMMIT).success);
   for (bool groups : {false, true}) for (int parallel : {1, -1}) {
     auto actual = run("main", R"("limit":-1,"fields":["id"],"query":)" + knn(3, groups)
-        + R"(,"collapse":{"field":"key_s","get_number":true,"head_sort":"price_i asc","ops":{"members":{"top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}}}})", parallel);
+        + R"(,"collapse":{"field":"key_s","get_count":true,"head_sort":"price_i asc","ops":{"members":{"top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}}}})", parallel);
     ASSERT_TRUE(actual->ok()) << actual->errorMsg();
     auto result = rows(*actual);
     ASSERT_EQ(2u, result.size());
@@ -626,7 +626,7 @@ TEST_F(GroupKnnTest, selectionBucketsReevaluateAndResetQueriesUseTheirScope) {
     std::string domain = filter ? R"("query":"*:*","filter":[)" + knn(2, false) + ']'
         : R"("query":)" + knn(2, false);
     auto actual = run("main", R"("fields":["id"],"query":)" + knn(1, groups)
-        + R"(,"collapse":{"field":"key_s","get_number":true,"ops":{"members":{
+        + R"(,"collapse":{"field":"key_s","get_count":true,"ops":{"members":{
         "top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}
         ,"domain":{)"
         + domain + R"(}},"inherited":{"top_docs":{"limit":-1,"fields":["id"]}
@@ -757,9 +757,9 @@ TEST_F(GroupKnnTest, resetAllExtraKeepsItsScopedOwner) {
   for (int parallel : {1, -1}) {
     auto actual = run("main", R"("limit":0,"ops":{"f":{"query_facet":{"buckets":{"all":"*:*"},
       "ops":{"t":{"top_docs":{"query":)" + knn(2, false) + R"(,"filter":["id:*"],"limit":0,
-        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},
+        "ops":{"n":{"top_docs":{"limit":0,"count_limit":-1},
           "domain":{"query":"*:*","filter":["*:*"],"apply_parent_filters":true}},
-          "near":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":)"
+          "near":{"top_docs":{"limit":0,"count_limit":-1},"domain":{"query":)"
         + knn(1, false) + R"(}}}}}}}}})", parallel);
     ASSERT_TRUE(actual->ok()) << actual->errorMsg();
     const auto& facet = *actual->docList()->ops.at("f")->facetResult();

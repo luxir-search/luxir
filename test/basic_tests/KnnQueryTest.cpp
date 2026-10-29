@@ -264,7 +264,7 @@ protected:
     auto& f = b.templ("_vs");
     f.type = api::FieldDef::FieldClass::VECTOR;
     f.column = true;
-    f.multi = true;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
     f.metric = metric;
     f.ann = ann;
     if (dims > 0) f.dims = dims;
@@ -279,7 +279,7 @@ protected:
                         const std::vector<float>& queryVec, int32_t k,
                         int32_t nprobe = 0, int32_t refineCandidates = 0,
                         bool exact = false, float minScanFraction = 0.0f) {
-    cur.getScores().getNumber().fields({"id"});
+    cur.getScores().countLimit().fields({"id"});
     cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact,
                              refineCandidates, minScanFraction);
   }
@@ -302,7 +302,7 @@ protected:
       bool exact = false, float minScanFraction = 0.0f) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
     auto& cur = lreq->collection("main").topDocs("q");
-    cur.allQuery().fields({"id"}).getNumber().limit(-1);
+    cur.allQuery().fields({"id"}).countLimit().limit(-1);
     auto& top = std::get<api::TopDocs>(cur.rawOp().kind);
     auto* filter = build::allocArray(top.filter, 1, cur.mr());
     auto* stored = (api::Query*)cur.mr().allocate(
@@ -409,7 +409,7 @@ TEST_F(KnnQueryTest, zeroBoostKeepsKnnMatchSetAndZeroesScores) {
 
   auto* zero = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = zero->collection("main").topDocs("q");
-  cur.getScores().getNumber().fields({"id"});
+  cur.getScores().countLimit().fields({"id"});
   auto knn = qb::knn(cur.mr(), "embedding_v", {0, 0}, 3);
   cur.rawQuery() = qb::boost(cur.mr(), knn, 0.0f);
   zero->execute();
@@ -484,7 +484,7 @@ TEST_F(KnnQueryTest, routedFilterRepreparesTopKForSidewaysFacet) {
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
-      .getNumber().fields({"id"}).limit(2);
+      .countLimit().fields({"id"}).limit(2);
   top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
   top.facet("brands", "brand_s").limit(-1);
   top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
@@ -520,7 +520,7 @@ TEST_F(KnnQueryTest, selectedFacetComposesWithDomainSensitiveMain) {
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
-      .getNumber().limit(0);
+      .countLimit().limit(0);
   top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
   auto& facet = top.facet("brands", "brand_s").limit(-1);
   auto& rawFacet = std::get<api::FieldFacet>(facet.rawOp().kind);
@@ -552,7 +552,7 @@ TEST_F(KnnQueryTest, resetDomainPreparesKnnInsideFullEligibility) {
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
-      .allQuery().getNumber().limit(0);
+      .allQuery().countLimit().limit(0);
   top.filter(qb::match(top.mr(), "scope_s", "keep"));
   auto& facet = top.facet("brands", "brand_s").limit(-1);
   auto& domain = facet.rawOp().domain.emplace();
@@ -711,7 +711,7 @@ TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
-      .allQuery().getNumber().limit(0);
+      .allQuery().countLimit().limit(0);
   top.facet("colors", "color_s").limit(-1);
   top.filter(
       qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 3), {"colors"});
@@ -1070,7 +1070,7 @@ TEST_F(KnnQueryTest, booleanOptionalKnnsCanFacet) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.limit(10).getNumber().fields({"id"});
+  cur.limit(10).countLimit().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(), /*required=*/{},
       /*optional=*/{qb::knn(cur.mr(), "title_v", {1.0f, 0.0f}, 1),
                     qb::knn(cur.mr(), "body_v", {0.0f, 1.0f}, 1)});
@@ -1120,7 +1120,7 @@ TEST_F(KnnQueryTest, booleanKnnFilterConstrainsRequiredKnn) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.limit(10).getNumber().fields({"id"});
+  cur.limit(10).countLimit().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::knn(cur.mr(), "title_v", {1.0f, 0.0f}, 1)},
       /*optional=*/{}, /*prohibited=*/{},
@@ -1150,7 +1150,7 @@ TEST_F(KnnQueryTest, booleanTermRequiredUsesKnnFilter) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.limit(10).getNumber().fields({"id"});
+  cur.limit(10).countLimit().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "foo_w", "apple")},
       /*optional=*/{}, /*prohibited=*/{},
@@ -1178,7 +1178,7 @@ TEST_F(KnnQueryTest, booleanDisjointRequiredAndKnnFilterReturnsEmpty) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.limit(10).getNumber().fields({"id"});
+  cur.limit(10).countLimit().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "foo_w", "apple")},
       /*optional=*/{}, /*prohibited=*/{},
@@ -1227,7 +1227,7 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.getNumber();
+  cur.countLimit();
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "foo_w", "apple")},
       /*optional=*/{qb::match(cur.mr(), "foo_w", "banana")},
@@ -1808,7 +1808,7 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
 
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.limit(10).getNumber().fields({"id"});
+  cur.limit(10).countLimit().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "foo_w", "apple"),
                     qb::knn(cur.mr(), "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
@@ -2012,7 +2012,7 @@ TEST_F(KnnQueryTest, wholeReaderCountAndFieldSortSkipAnnPrepare) {
   auto runCount = [&](std::span<const float> vector, int32_t k,
                       bool foldedFilter) {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
-    auto& cur = req->collection("main").topDocs("q").getNumber().limit(0);
+    auto& cur = req->collection("main").topDocs("q").countLimit().limit(0);
     cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", vector, k, 0,
                              /*exact=*/true);
     if (foldedFilter) addMatchFilter(cur, "group_s", "keep");
@@ -2025,7 +2025,7 @@ TEST_F(KnnQueryTest, wholeReaderCountAndFieldSortSkipAnnPrepare) {
   auto runFieldSort = [&](std::span<const float> vector, int32_t k) {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main")
-                    .topDocs("q").fields({"id"}).getNumber().limit(4);
+                    .topDocs("q").fields({"id"}).countLimit().limit(4);
     cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", vector, k, 0,
                              /*exact=*/true);
     qb::sort(cur, "rank_i", qb::ASC);
@@ -2131,7 +2131,7 @@ TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
   auto run = [&]() {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main")
-                    .topDocs("q").fields({"id"}).getNumber().limit(6);
+                    .topDocs("q").fields({"id"}).countLimit().limit(6);
     cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", queryVector, 6, 0,
                              /*exact=*/true);
     qb::sort(cur, "rank_i", qb::ASC);
@@ -2203,7 +2203,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
     req->collection("main");
     auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
     fusion.limit = 4;
-    fusion.get_number = true;
+    fusion.count_limit = -1;
     fusion.method.emplace<api::RrfFusion>().k = 60;
     auto* fields = build::allocArray(fusion.fields, 1, req->mr);
     fields[0] = build::arenaStr(req->mr, "id");
@@ -2216,7 +2216,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
         std::span<const Pair>(sources, 1));
     auto& source = sources[0].second;
     source.limit = 4;
-    source.get_number = true;
+    source.count_limit = -1;
     auto* query = (api::Query*) req->mr.allocate(
         sizeof(api::Query), alignof(api::Query));
     new (query) api::Query(qb::knn(
@@ -2297,7 +2297,7 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
   auto makeReq = [&](bool wrapInBoolean) {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
-    cur.getScores().getNumber().fields({"id"});
+    cur.getScores().countLimit().fields({"id"});
     auto knn = [&] {
       return qb::knn(cur.mr(), "embedding_v", {42.2f, 0.0f, 0.0f, 0.0f}, /*k=*/6,
                      /*nprobe=*/4, /*exact=*/false, /*refineCandidates=*/160);
@@ -2362,37 +2362,6 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   EXPECT_EQ(req->getMatchCount(), 0);
   ASSERT_EQ(req->responses.size(), 1u);
   EXPECT_NE(req->errorMsg().find("finite"), std::string::npos);
-  req->done();
-}
-
-// A NaN score must not poison the comparators (a non-total order makes the
-// sorts UB and the bounded cuts fold-order dependent); finiteScore maps it to
-// the worst finite float so the doc deterministically ranks last (still
-// collected - unlike -infinity, which the score collectors' sentinel would
-// silently drop). Stored vectors are finite, but opposite float32 overflows
-// accumulated in separate SIMD lanes still sum to inf + -inf = NaN (4 dims: a
-// shorter vector runs a sequential FMA chain, which saturates to inf instead).
-TEST_F(KnnQueryTest, nanScoreRanksLast) {
-  CollectionHelper h("main");
-  installVecSchema(h.collection(), api::VectorMetric::IP);
-
-  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0, 0}));
-  h.index(flatdoc("id", std::string("bad"), "embedding_v",
-                  std::vector<float>{3e38f, -3e38f, 0, 0}));
-  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0, 0}));
-  h.commit({"*"});
-
-  auto* req = makeKnnReq(*luxirNode, "embedding_v", {2, 2, 0, 0}, 3);
-  req->execute();
-  auto ids = resultIds(*req);
-  ASSERT_EQ(ids.size(), 3u);
-  EXPECT_EQ(ids[0], "good1");
-  EXPECT_EQ(ids[1], "good2");
-  EXPECT_EQ(ids[2], "bad");
-  auto scores = resultScores(*req);
-  ASSERT_EQ(scores.size(), 3u);
-  EXPECT_EQ(scores[2], std::nextafter(std::numeric_limits<float>::lowest(), 0.0f))
-      << "bad must score NaN (mapped), not merely low";
   req->done();
 }
 

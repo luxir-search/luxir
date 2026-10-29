@@ -207,6 +207,7 @@ void RangeFacetCellWindow<T>::rebuild(int64_t lo, int64_t hi, bool left,
     keys.insert(keys.begin(), prefix.rbegin(), prefix.rend());
   }
   for (size_t i = 0; i < after; i++) {
+    if (cell.key == INT64_MAX) break;
     try { if (!advance(other == nullptr)) break; }
     catch (const std::runtime_error&) { break; }
     keys.push_back(cell.key);
