@@ -820,8 +820,11 @@ public:
     }
 
     // Separate functions keep each loop's per-value work inlined and its
-    // registers independent of the other loop.
-    LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
+    // registers independent of the other loop. Pin the start alignment: zone
+    // fills dominate column-only range filters, and a 16-byte shift from
+    // unrelated edits cost frange2 r01_old10 TOP_10 11-18% more cycles at
+    // identical instruction counts (hugin, 2026-10-29).
+    [[gnu::aligned(64)]] LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
                                    int32_t max) {
       auto [doc, rank] = firstDocRank(min);
       int64_t nvals = reader.numValues();
