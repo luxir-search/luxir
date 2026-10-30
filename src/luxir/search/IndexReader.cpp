@@ -461,6 +461,12 @@ const IndexReader::FieldRecord* IndexReader::FieldRecords::insert(std::unique_pt
   return kept;
 }
 
+Bm25Params IndexReader::bm25(std::string_view name) const {
+  if (!sharedSchema) return {};
+  auto* type = sharedSchema->getFieldTypePtr(name);
+  return type ? type->bm25 : Bm25Params{};
+}
+
 IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
   const FieldRecord* record = core->fields->find(name, hash);

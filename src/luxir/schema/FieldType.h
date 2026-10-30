@@ -5,6 +5,7 @@
 
 #include "luxir/analysis/Analyzer.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/search/Similarity.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
 
@@ -96,6 +97,8 @@ public:
   flag_type flags_;
   // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
+  // BM25 scoring parameters; read at query time, so changes need no reindex.
+  Bm25Params bm25;
   // When STORED is set, raw values are routed to the stored-fields resource
   // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by
   // TEXT, STRING, and ID.  Ignored by field types that don't support STORED.

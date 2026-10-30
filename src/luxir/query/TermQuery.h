@@ -140,7 +140,7 @@ public:
             }
           }
           simScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
-              luxir::Similarity().getScorer(
+              luxir::Similarity(cachedFieldInfo->bm25).getScorer(
                   1.0f, cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo),
                   hasNorms));
           if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;

@@ -303,6 +303,8 @@ struct FieldDef {
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
   std::optional<DateUnit> unit;                                // align 4 (enum)
+  std::optional<float> k1;                                      // align 4
+  std::optional<float> b;                                       // align 4
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)

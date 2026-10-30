@@ -2401,6 +2401,18 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // TEXT, STRING and ID fields. BM25 term frequency saturation: a larger k1
+  // lets repeated terms keep adding score, 0 scores presence only. Must be
+  // finite and >= 0. Unset inherits, else 1.2. Read at query time, so a change
+  // applies to existing segments without reindexing.
+  optional float k1 = 30;
+
+  // TEXT only. BM25 length normalization: 0 ignores field length, 1 scales
+  // fully by length relative to the field average. Must be in [0, 1]. Unset
+  // inherits, else 0.75. Read at query time like k1. Fields that are combined
+  // by a multi_match in combined mode must share k1 and b to share a group.
+  optional float b = 31;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).
