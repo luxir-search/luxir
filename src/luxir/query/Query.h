@@ -656,6 +656,10 @@ public:
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
+    // Point emissions (see Demand) of one two-phase check, when the arm knows
+    // it. A parent choosing where verification runs prices the checks a
+    // schedule adds with it.
+    std::optional<double> verificationPoints;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -931,6 +935,12 @@ public:
       // the docid runs that hold no match. A conjunction leapfrogging a
       // produced supplier skips its siblings' documents in those runs.
       double hull = 1;
+      // Whether hull estimates where the matches lie, which yield knowledge
+      // does not imply (an exact doc set knows its count, not its spread):
+      // for a dense single-valued numeric column, the share of documents in
+      // leaves that can match. Pricing that relies on the matches' support
+      // requires it.
+      bool knownHull = false;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;

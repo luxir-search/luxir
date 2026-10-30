@@ -1604,7 +1604,7 @@ public:
       }
 
       static Query::ScorerShape shapeFor(
-          Selection selection, Query::MatchState matchState) {
+          Selection selection, Query::MatchState matchState, bool pricedCheck) {
         ScorerArm arm = selection.arm;
         bool twoPhase = arm == ScorerArm::SPARSE_VERIFY;
         return {
@@ -1620,6 +1620,10 @@ public:
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
           .membershipConsumption = selection.consumption,
+          // The sparse verifier's check of one value against one interval, the
+          // case VERIFY_POINTS was fitted on; other predicates do not quote.
+          .verificationPoints = twoPhase && pricedCheck
+              ? std::optional<double>(PointsMaterialize::VERIFY_POINTS) : std::nullopt,
         };
       }
 
@@ -1766,6 +1770,13 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
+      // Whether a sparse verifier's check is the calibrated one: a single
+      // value against one interval.
+      bool pricedCheck() const {
+        return !reader.multiValued() && !weight.query.isExactSet()
+            && weight.query.intervals().size() == 1;
+      }
+
       MembershipWork membershipWork(int32_t maxDoc) override {
         unused(maxDoc);
         // A sparse verifier can touch every value in its requested span.
@@ -1775,7 +1786,10 @@ public:
         // bounded demand. Only a resolved materialized supplier can claim the
         // cheaper retained-set price; this prior must cover either arm.
         double production = 64.0 * reader.numValues();
-        return {estimatedMatches(), production, 0, 64, 192, 0, true, hull()};
+        // A dense single-valued column's leaf summary places the matches'
+        // docids; sparse columns' value-less documents need not spread evenly.
+        return {estimatedMatches(), production, 0, 64, 192, 0, true, hull(),
+                !reader.multiValued() && reader.docsWithValue() == segment.maxDoc()};
       }
 
       std::optional<MembershipQuote> quoteMembership(
@@ -1810,7 +1824,7 @@ public:
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.numericPredicateDisableShapesForTests) return {};
-        return shapeFor(selectScorer(buildContext), matchState);
+        return shapeFor(selectScorer(buildContext), matchState, pricedCheck());
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -1841,7 +1855,7 @@ public:
         int64_t iterated = arm == ScorerArm::SPARSE_VERIFY
             ? std::max(cost(), (int64_t)reader.docsWithValue()) : cost();
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(selection, matchState), iterated, arm,
+            *this, planContext, shapeFor(selection, matchState, pricedCheck()), iterated, arm,
             complement);
       }
 

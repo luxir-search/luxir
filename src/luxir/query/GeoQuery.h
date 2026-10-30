@@ -236,7 +236,7 @@ public:
       return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
     }
 
-    static Query::ScorerShape shapeFor(ScorerArm arm) {
+    static Query::ScorerShape shapeFor(ScorerArm arm, bool pricedCheck) {
       bool bkdArm = arm == ScorerArm::BKD;
       return {
         .matchState = Query::MatchState::NONEMPTY,
@@ -254,6 +254,11 @@ public:
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
         // Candidate consumption requires a bounded verifier before opting in.
         .membershipConsumption = Query::MembershipConsumption::WINDOWS,
+        // The sparse verifier's check of one point against a box, the case
+        // VERIFY_POINTS was fitted on; scans, multivalued fields and other
+        // relations do not quote.
+        .verificationPoints = arm == ScorerArm::SPARSE_VERIFY && pricedCheck
+            ? std::optional<double>(PointsMaterialize::VERIFY_POINTS) : std::nullopt,
       };
     }
 
@@ -310,9 +315,13 @@ public:
 
     int64_t cost() override { return estimatedCost; }
 
+    bool pricedCheck() const {
+      return !reader.multiValued() && std::is_same_v<Relation, BKDBoxRelation>;
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      return shapeFor(selectScorerArm(buildContext));
+      return shapeFor(selectScorerArm(buildContext), pricedCheck());
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -329,7 +338,7 @@ public:
       int64_t iterated = arm == ScorerArm::BKD ? cost()
           : std::max(cost(), (int64_t)reader.docsWithValue());
       return planPool.make<Plan>(
-          *this, planContext, shapeFor(arm), iterated, arm);
+          *this, planContext, shapeFor(arm, pricedCheck()), iterated, arm);
     }
 
     BulkPlan planBulk(
