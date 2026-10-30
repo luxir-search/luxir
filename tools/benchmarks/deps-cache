@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Move vcpkg cache mounts between BuildKit and an Actions-cache directory.
+set -euo pipefail
+# A unique ARG reruns the copy without --no-cache, which resets cache mounts.
+mode=${1:?usage: deps-cache import\|export DIRECTORY}
+cache_dir=${2:?usage: deps-cache import\|export DIRECTORY}
+mkdir -p "$cache_dir"
+cache_dir=$(cd "$cache_dir" && pwd)
+case "$mode" in
+  import)
+    mkdir -p "$cache_dir/binary" "$cache_dir/downloads"
+    docker buildx build --build-arg "CACHE_NONCE=$(date +%s%N)-$RANDOM" --progress=plain -f - "$cache_dir" <<'DOCKERFILE'
+FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7
+ARG CACHE_NONCE
+RUN --mount=type=bind,source=.,target=/seed \
+    --mount=type=cache,target=/var/cache/vcpkg \
+    --mount=type=cache,target=/opt/vcpkg/downloads \
+    test -n "$CACHE_NONCE" && cp -a /seed/binary/. /var/cache/vcpkg/ && cp -a /seed/downloads/. /opt/vcpkg/downloads/
+DOCKERFILE
+    ;;
+  export)
+    # Export beside the restored directory: it must not be a Docker context.
+    output=$(mktemp -d)
+    trap 'rm -rf -- "$output"' EXIT
+    docker buildx build --build-arg "CACHE_NONCE=$(date +%s%N)-$RANDOM" --progress=plain --output "type=local,dest=$output" -f - "$output" <<'DOCKERFILE'
+FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7 AS snapshot
+ARG CACHE_NONCE
+RUN --mount=type=cache,target=/var/cache/vcpkg \
+    --mount=type=cache,target=/opt/vcpkg/downloads \
+    test -n "$CACHE_NONCE" && mkdir -p /out/binary /out/downloads && \
+    cp -a /var/cache/vcpkg/. /out/binary/ && cp -a /opt/vcpkg/downloads/. /out/downloads/
+FROM scratch
+COPY --from=snapshot /out/ /
+DOCKERFILE
+    rm -rf -- "$cache_dir/binary" "$cache_dir/downloads"
+    cp -a "$output/binary" "$output/downloads" "$cache_dir/"
+    du -sh "$cache_dir/binary" "$cache_dir/downloads"
+    ;;
+  *) echo 'expected import or export' >&2; exit 2 ;;
+esac

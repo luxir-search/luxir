@@ -1,0 +1,98 @@
+name: Dependency image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.devcontainer/**'
+      - 'deps/vcpkg.json'
+      - 'deps/vcpkg-configuration.json'
+      - 'deps/ports/**'
+      - 'deps/triplets/**'
+      - 'test/blas_lapack_test.cpp'
+      - 'tools/benchmarks/deps-key.py'
+      - 'tools/benchmarks/deps-cache'
+      - '.github/workflows/deps-image.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
+      DOCKER_CONFIG: /tmp/deps-docker-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test key contract
+        run: python3 -m unittest discover -s tools/benchmarks -p 'test_deps_key.py'
+      - name: Sign in to registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Compute key and check existing tag
+        id: image
+        run: |
+          set -euo pipefail
+          key=$(python3 tools/benchmarks/deps-key.py .)
+          image="${REGISTRY,,}:$key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if timeout 60 docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+          printf 'Source: %s\nDependency image: %s\n' "$(git rev-parse HEAD)" "$image" >> "$GITHUB_STEP_SUMMARY"
+      - name: Restore completed packages and downloads
+        if: steps.image.outputs.exists != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ steps.image.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Fall back to the newest cache from any key: vcpkg reuses a package only
+          # when its ABI hash matches, so unchanged dependencies are not rebuilt.
+          restore-keys: |
+            vcpkg-${{ steps.image.outputs.key }}-
+            vcpkg-
+      - name: Import cache mounts
+        id: cache
+        if: steps.image.outputs.exists != 'true'
+        run: tools/benchmarks/deps-cache import "$RUNNER_TEMP/vcpkg-cache"
+      - name: Build and publish development image
+        timeout-minutes: 300
+        if: steps.image.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          timeout --signal=TERM --kill-after=30 290m docker build --progress=plain -f .devcontainer/Dockerfile \
+            --target dev --build-arg "BUILD_JOBS=$(./tools/build-jobs 3000)" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            -t "$IMAGE" .
+          docker push "$IMAGE"
+      - name: Export cache mounts even after a failed build
+        id: snapshot
+        if: always() && steps.cache.outcome == 'success'
+        timeout-minutes: 20
+        run: tools/benchmarks/deps-cache export "$RUNNER_TEMP/vcpkg-cache"
+      - name: Save progress for the next attempt
+        if: always() && steps.snapshot.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ steps.image.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Remove registry credentials
+        if: always()
+        run: rm -rf -- "$DOCKER_CONFIG"

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Build public source refs using prebuilt dependencies, then compare over HTTP.
+set -euo pipefail
+harness=$(cd "$(dirname "$0")" && pwd)
+: "${BASE_REPO:?owner/repository required}"
+: "${BASE_REF:?base ref required}"
+: "${CANDIDATE_REPO:?owner/repository required}"
+: "${CANDIDATE_REF:?candidate ref required}"
+: "${DEPS_REGISTRY:?dependency image repository required}"
+: "${WORK_DIR:?fresh work directory required}"
+python=${BENCH_PYTHON:-python3}
+settings=${CANDIDATE_FIELD_SETTINGS:-'{}'}
+mkdir "$WORK_DIR"
+cd "$WORK_DIR"
+mkdir evidence
+for variant in base candidate; do
+  if [[ $variant == base ]]; then
+    repo=$BASE_REPO ref=$BASE_REF
+  else
+    repo=$CANDIDATE_REPO ref=$CANDIDATE_REF
+  fi
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+  [[ $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+  git init -q "$variant"
+  git -C "$variant" remote add origin "https://github.com/$repo.git"
+  git -C "$variant" fetch --depth 1 origin "$ref"
+  git -C "$variant" checkout -q --detach FETCH_HEAD
+  git -C "$variant" rev-parse HEAD > "evidence/$variant-revision.txt"
+  key=$("$python" "$harness/deps-key.py" "$variant")
+  echo "$key" > "evidence/$variant-deps-key.txt"
+  image="${DEPS_REGISTRY,,}:$key"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! timeout 60 docker manifest inspect "$image" >/dev/null; then
+      echo "Missing $image. Publish reviewed dependency inputs with deps-image.yml first." >&2
+      exit 1
+    fi
+  fi
+done
+sort -u evidence/*-deps-key.txt | while read -r key; do
+  image="${DEPS_REGISTRY,,}:$key"
+  docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+done
+lscpu > evidence/lscpu.txt
+for variant in base candidate; do
+  cd "$WORK_DIR/$variant"
+  LUXIR_DEV_IMAGE="${DEPS_REGISTRY,,}:$(cat "$WORK_DIR/evidence/$variant-deps-key.txt")"
+  export LUXIR_DEV_IMAGE
+  git submodule update --init
+  ./deps/fetch_sources.sh
+  jobs=${BUILD_JOBS:-$(./tools/build-jobs 3000)}
+  ./tools/dev-container ccache --max-size 2G
+  # The inner bash receives the compile job count as its first argument.
+  # shellcheck disable=SC2016
+  /usr/bin/time -v -o "$WORK_DIR/evidence/$variant-build-time.txt" \
+    ./tools/dev-container bash -e -c \
+    'cmake --preset container-release -DLUXIR_COMPILE_JOBS="$1" && cmake --build --preset container-release --target luxir' bash "$jobs"
+done
+cd "$WORK_DIR"
+"$python" "$harness/vector-compare.py" \
+  --base-binary base/build/container-release/bin/luxir \
+  --candidate-binary candidate/build/container-release/bin/luxir \
+  --base-revision "$(cat evidence/base-revision.txt)" \
+  --candidate-revision "$(cat evidence/candidate-revision.txt)" \
+  --candidate-field-settings "$settings" \
+  --dataset "${DATASET:-dbpedia-openai3-1536-100k}" \
+  --cache "${DATASET_CACHE:-$WORK_DIR/dataset}" \
+  --label "${BENCH_LABEL:-local}" --output evidence/benchmark
