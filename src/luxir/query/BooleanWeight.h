@@ -11913,6 +11913,22 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (!retryFill) break;
         probe = false;
       }
+      // The sparsest filter first: a fill stops at the first empty
+      // intersection and a probe at the first rejecting filter. A stable
+      // insertion sort over costs read once (cost() is not always a field
+      // read): a query carries few filters, and it allocates nothing.
+      if (filters.size() > 1) {
+        boost::container::small_vector<int64_t, 16> costs;
+        for (const auto& filter : filters) costs.push_back(filter.supplier->cost());
+        for (size_t i = 1; i < filters.size(); i++) {
+          size_t j = i;
+          while (j > 0 && costs[j - 1] > costs[i]) j--;
+          std::rotate(filters.begin() + j, filters.begin() + i,
+                      filters.begin() + i + 1);
+          std::rotate(costs.begin() + j, costs.begin() + i,
+                      costs.begin() + i + 1);
+        }
+      }
       auto* state = pool.make<FilteredBodyPlan>();
       state->owner = this;
       state->bodySupplier = bodySupplier;

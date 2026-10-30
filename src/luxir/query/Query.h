@@ -1920,6 +1920,10 @@ public:
       }
       return filled;
     }
+    /// OR this scorer's matches in [windowStart, windowEnd) into windowBits,
+    /// bit i for doc windowStart + i; no bit at or past windowEnd - windowStart
+    /// is set. Windows arrive forward only but need not be contiguous: a
+    /// consumer may skip windows, and the next fill resumes at its own start.
     virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                                 int32_t windowEnd) {
       skipCount(SkipStats::countBulkFillCalls);
@@ -2306,6 +2310,16 @@ private:
     std::fill(currentBits.begin(), currentBits.end(), 0);
     fill(scorers[0], currentBits);
     for (size_t i = 1; i < scorers.size(); i++) {
+      // A membership intersection stops at its first empty result; the
+      // skipped filters resume at a later window, and only the window's
+      // words hold bits (fillWindowBits). OR them without branching, so
+      // where the first set word lands steers no branch.
+      if constexpr (!scored) {
+        uint64_t live = 0;
+        size_t words = (size_t) (end - start + 63) >> 6;
+        for (size_t word = 0; word < words; word++) live |= currentBits[word];
+        if (live == 0) return 0;
+      }
       std::fill(scratchBits.begin(), scratchBits.end(), 0);
       fill(scorers[i], scratchBits);
       for (size_t word = 0; word < currentBits.size(); word++) {
