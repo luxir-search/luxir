@@ -1038,7 +1038,8 @@ public:
           if (groups[group].target->fieldType->type() != FieldType::TEXT) continue;
           auto* other = (TextFieldType*)groups[group].target->fieldType;
           if (type->analyzer_.get() == other->analyzer_.get()
-              && type->longTerms == other->longTerms) break;
+              && type->longTerms == other->longTerms
+              && type->bm25.k1 == other->bm25.k1 && type->bm25.b == other->bm25.b) break;
         }
       }
       if (group == numGroups) groups[numGroups++] = {&target, {}, {}, 0};
