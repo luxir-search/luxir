@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "luxir/store/Manifest.h"
 #include <array>
 #include <atomic>
@@ -1019,7 +1020,7 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   localServer.shutdown();
 
-  EXPECT_FALSE(std::filesystem::exists(base / "t" / "t0" / "unsafe"));
+  EXPECT_TRUE(test::catalogIncarnations(base, "unsafe").empty());
   EXPECT_FALSE(std::filesystem::exists(absolute));
   std::filesystem::remove_all(base);
 }
@@ -1046,9 +1047,8 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  FSDirectory container(base / "t" / "t0" / "bad");
-  auto incarnation = *CollectionStorage::current(container);
-  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "bad" / incarnation)) {
+  auto incarnation = test::selectedIncarnation(base, "bad");
+  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "i" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";

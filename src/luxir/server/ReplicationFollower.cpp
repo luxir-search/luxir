@@ -238,7 +238,7 @@ struct ReplicationFollower::Impl {
     bool busy = false, waiting = false, remove = false, unavailable = false;
     std::string seenBoot;
     bool replaceEmpty = true;
-    // The local copy could not be opened; CURRENT, if it could be read, selects
+    // The local copy could not be opened; the catalog, if it could be read, selects
     // this incarnation ("" otherwise). It is retained until an install replaces it.
     std::optional<std::string> unreadable;
     std::shared_ptr<const Repair> corrupt; // a failed copy or a replacement sharing its suspects
@@ -287,19 +287,16 @@ struct ReplicationFollower::Impl {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
-    bool fs = node.getConfig().store.backend == "fs";
-    metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.getConfig().store.data_dir))
-                  : std::make_shared<RAMDir>();
+    metadata = node.collections().storage().directory(StorageRoot::NODE_PRIVATE, "");
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
       existing.source = binding.source;
       binding = std::move(existing);
     } else {
-      if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
-        auto name = entry.path().filename().string();
-        if (name == "write.lock" || FSDirectory::isPublishTemp(name)) continue;
-        if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
-        throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
+      auto& storage = node.collections().storage();
+      if (!TenantCatalog::empty(storage)) throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
+      for (const auto& entry : storage.children(StorageRoot::NODE_PRIVATE, "")) {
+        if (entry.name != "write.lock") throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
       binding.write(*metadata);
     }
@@ -320,7 +317,7 @@ struct ReplicationFollower::Impl {
 
   void seed(const std::vector<Collections::Opened>& opened) {
     for (const auto& row : opened) {
-      // A collection without CURRENT keeps verified candidate files for a
+      // A collection without an active catalog entry keeps verified candidate files for a
       // restarted download; the next successful install sweeps them.
       if (!row.collection) continue;
       auto& state = states[row.id];

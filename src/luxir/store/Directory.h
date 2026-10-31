@@ -58,6 +58,22 @@ public:
 class Directory {
 public:
   enum class PublishMode { CREATE_ONLY, REPLACE };
+  // Backend-defined value, compared only for equality.
+  using PublicationVersion = std::string;
+  struct PublishCondition {
+    PublishMode mode;
+    std::optional<PublicationVersion> version;
+    PublishCondition(PublishMode mode) : mode(mode) {}
+    static PublishCondition match(PublicationVersion version) {
+      PublishCondition result(PublishMode::REPLACE);
+      result.version = std::move(version);
+      return result;
+    }
+  };
+  struct Publication {
+    std::string bytes;
+    PublicationVersion version;
+  };
 
   struct FileCreateOptions {
     std::function<void(int64_t)> ramBytesChanged;
@@ -116,10 +132,13 @@ public:
   // owning Directory.
   virtual void finishFile(File &file) = 0;
 
-  // Atomically installs complete bytes, durable with their name on success.
-  // False means CREATE_ONLY found an existing name and changed nothing.
+  // Installs bytes atomically and durably, returning a fresh version even for identical bytes.
+  // An empty result means the condition failed and nothing changed.
   // A throw leaves the outcome unknown: publication may have taken place.
-  virtual bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) = 0;
+  virtual std::optional<PublicationVersion> publishFile(
+      std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) = 0;
+  // Bytes and version from one observation. Only absence returns nullopt.
+  virtual std::optional<Publication> readPublished(std::string_view name) = 0;
 
   // Makes the named files' bytes AND directory entries durable. RAM is volatile.
   virtual void sync(std::span<const std::string> names) = 0;
@@ -192,24 +211,32 @@ public:
 
 private:
   std::shared_ptr<StorageMemory> memory;
-  gtl::btree_map<std::string, InputReferenceType> files;
+  struct Entry {
+    InputReferenceType file;
+    uint64_t version;
+  };
+  gtl::btree_map<std::string, Entry> files;
+  inline static std::atomic<uint64_t> nextVersion{0};
+  std::atomic<bool> materialized{false};
   std::mutex mutex;
 
 public:
   explicit RAMDir(std::shared_ptr<StorageMemory> memory = std::make_shared<StorageMemory>()) : memory(std::move(memory)) {}
   uint64_t storageBytes() const { return memory->bytes(); }
+  bool exists() const { return materialized.load(std::memory_order_acquire); }
 
   // Only used by tests to clear (e.g. dir = RAMDir())
   void operator=(RAMDir&& other) {
     std::lock_guard<std::mutex> lock(mutex);
     files = std::move(other.files);
+    materialized.store(other.exists(), std::memory_order_release);
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
     std::lock_guard<std::mutex> lock(mutex);
     target.reserve(target.size() + files.size());
     for (const auto&[name, ifile] : files) {
-      target.push_back({name, (uint64_t)ifile->size()});
+      target.push_back({name, (uint64_t)ifile.file->size()});
     }
   }
 
@@ -221,8 +248,8 @@ public:
     if (find != files.end()) {
       // redefine DEBUG to TRACE level which shouldn't currently be logged!
       // #define INDEX_DEBUG LOG_TRACE
-      DIR_DEBUG("DIR openFile: found file {} size={}", name, find->second->size());
-      return find->second;
+      DIR_DEBUG("DIR openFile: found file {} size={}", name, find->second.file->size());
+      return find->second.file;
     } else {
       DIR_DEBUG("DIR openFile: file {} not found", name);
       return {};
@@ -310,14 +337,15 @@ public:
 
       // overwrite existing entries.
       // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
-      files[file.name()] = std::move(inputFile);
+      files[file.name()] = {std::move(inputFile), ++nextVersion};
+      materialized.store(true, std::memory_order_release);
     }
   }
 
-  bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) override {
-    if (mode == PublishMode::CREATE_ONLY) {
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    if (condition.mode == PublishMode::CREATE_ONLY) {
       std::lock_guard lock(mutex);
-      if (files.contains(name)) return false;
+      if (files.contains(name)) return {};
     }
     StorageCharge charge(memory, bytes.size());
     auto buffer = std::make_unique_for_overwrite<char[]>(bytes.size());
@@ -326,9 +354,19 @@ public:
     Signal::emit("publishWritten", this, &name);
     Signal::emit("publishSynced", this, &name);
     std::lock_guard lock(mutex);
-    if (mode == PublishMode::CREATE_ONLY && files.contains(name)) return false;
-    files[std::string(name)] = std::move(input);
-    return true;
+    if (condition.mode == PublishMode::CREATE_ONLY && files.contains(name)) return {};
+    if (condition.version && (!files.contains(name) || PublicationVersion(std::to_string(files.find(name)->second.version)) != *condition.version)) return {};
+    auto version = ++nextVersion;
+    files[std::string(name)] = {std::move(input), version};
+    materialized.store(true, std::memory_order_release);
+    return std::to_string(version);
+  }
+
+  std::optional<Publication> readPublished(std::string_view name) override {
+    std::lock_guard lock(mutex);
+    auto it = files.find(name);
+    if (it == files.end()) return {};
+    return Publication{std::string(it->second.file->read()), std::to_string(files.find(name)->second.version)};
   }
 
   void sync(std::span<const std::string> names) override { unused(names); }
@@ -342,7 +380,8 @@ public:
     auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
     if (!input) throw std::runtime_error("RAM link source missing or incompatible");
     std::lock_guard lock(mutex);
-    files[std::string(name)] = std::move(input);
+    files[std::string(name)] = {std::move(input), ++nextVersion};
+    materialized.store(true, std::memory_order_release);
   }
 
   void clear() override {

@@ -3169,8 +3169,8 @@ void IndexWriter::testDeleteAllData() {
     // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
     // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
-    indexGen = 0;
-    incarnation = CommitId::newIncarnation();
+    // Keep the directory identity and manifest generations: publication observers
+    // must never see a commit token reused. testReset revoked the old pins.
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
@@ -3186,7 +3186,6 @@ void IndexWriter::testDeleteAllData() {
     completedCommitVersion = 0;
     deletePassBackoff = {};
     deletePassHeld = false;
-    nextManifestGen = 0;
     manifestNames.clear();
 
     lastCommitTime = 0;

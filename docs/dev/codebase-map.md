@@ -127,8 +127,9 @@ locations, browse `src/luxir/<area>/`.
      `Directory::openChecksum` (pread, optional O_DIRECT; never mmap): verify-on-open, scrub
    - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
-     (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
-     handle: CURRENT selects one of its incarnation directories
+     (`CheckedDirFactory`, `ReadOnlyDirFactory`); opens path views under authoritative
+     and node-private roots. `server/TenantCatalog` owns names, timestamp incarnation
+     allocation, and reservation/activation/retirement through catalog CAS
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
@@ -162,7 +163,7 @@ locations, browse `src/luxir/<area>/`.
 ## Data Organization
 
 - **Collection**: Logical document group with schema; its storage is a sequence of
-  incarnations (identities), one selected by CURRENT
+  incarnations (identities), one active in the tenant catalog
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
   - Flush records the pinned schema generation; merge records the minimum input

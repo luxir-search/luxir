@@ -38,9 +38,11 @@ public:
   bool deleteFile(std::string_view name) override { return delegate.deleteFile(name); }
   void deletePrefix(std::string_view prefix) override { delegate.deletePrefix(prefix); }
   void finishFile(File& file) override { delegate.finishFile(file); }
-  bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) override {
-    return delegate.publishFile(name, bytes, mode);
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    return delegate.publishFile(name, bytes, condition);
   }
+  std::optional<Publication> readPublished(std::string_view name) override { return delegate.readPublished(name); }
+
   void deleteDurably(std::span<const std::string> names) override { delegate.deleteDurably(names); }
   void sync(std::span<const std::string> names) override { delegate.sync(names); }
   void clear() override { delegate.clear(); }

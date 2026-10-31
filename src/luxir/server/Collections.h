@@ -15,7 +15,7 @@
 #include "CollectionEvents.h"
 #include "luxir/LuxirConfig.h"
 #include "luxir/index/IndexRamBudget.h"
-#include "luxir/store/DirectoryFactory.h"
+#include "TenantCatalog.h"
 #include "luxir/util/SharedLazyMap.h"
 
 namespace luxir {
@@ -44,12 +44,12 @@ public:
     std::shared_ptr<Collection> collection;
     std::string error;
   };
-  // A startup row. A follower collection without CURRENT has neither a
+  // A startup row. A follower collection without an active catalog entry has neither a
   // collection nor an error: its incarnations are retained download candidates.
   struct Opened {
     CollectionId id;
     std::shared_ptr<Collection> collection; // null for a staged-only follower collection
-    std::optional<std::string> incarnation; // CURRENT, when it could be read
+    std::optional<std::string> incarnation; // active incarnation, when it could be read
     std::string error;
   };
 
@@ -114,6 +114,8 @@ private:
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
   bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
+  std::mutex catalogsMutex;
+  std::map<std::string, std::unique_ptr<TenantCatalog>, std::less<>> catalogs;
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
   std::map<CollectionId, Slot> slots;
@@ -128,10 +130,10 @@ private:
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
-  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false);
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false, std::optional<std::string> reserved = {});
   // A writer whose newest root is invalid continues from the newest valid one
   // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;
@@ -155,6 +157,8 @@ public:
   static void validateName(std::string_view name, std::string_view kind = "collection");
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
+  TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
+  uint64_t storageBytes(const CollectionId& id) { return catalog(id.tenant).bytes(id.name); }
 
   // The single startup discovery path. Writers recover identities, remove
   // unselected leftovers and create the default collection; read-only nodes
@@ -188,7 +192,7 @@ public:
   // candidate stays staged.
   Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot);
   // Activates a prepared candidate in place of `expected` (null: absent):
-  // CURRENT durably selects it, the map points at it, the events feed
+  // the catalog durably selects it, the map points at it, the events feed
   // announces it, and incarnations nothing else needs are retired.
   std::shared_ptr<Collection> install(Prepared prepared, const std::shared_ptr<Collection>& expected);
   // Closes an abandoned candidate and removes its directory unless something

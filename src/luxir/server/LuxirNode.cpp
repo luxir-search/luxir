@@ -144,7 +144,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     // A follower directory becomes a writer only through offline promotion,
     // which completes for every collection before any writer opens one.
     if (!this->config.read_only && this->config.store.backend == "fs"
-        && std::filesystem::exists(std::filesystem::path(this->config.store.data_dir) / "replication.json")) {
+        && collections_->storage().directory(StorageRoot::NODE_PRIVATE, "")->openFile("replication.json")) {
       throw std::runtime_error("Follower data directory: run 'luxir promote " + this->config.store.data_dir + "' to make it a writer");
     }
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);

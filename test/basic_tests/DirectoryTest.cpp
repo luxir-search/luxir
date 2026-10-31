@@ -460,31 +460,39 @@ TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
   ASSERT_NO_THROW(dir.openFile("pre_existing", true));
 }
 
-TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
+TEST_F(DirectoryTest, pathViewsOpenWithoutCreating) {
   auto path = getTempDir();
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   FSDirFactory factory(path);
-  auto storage = factory.collection(CollectionId::of("main"));
-  EXPECT_THROW(storage.open("first"), std::runtime_error);
-  EXPECT_THROW(storage.current(), std::runtime_error);
-  EXPECT_TRUE(factory.collections().empty());
-  storage.create("first");
-  EXPECT_EQ(std::vector<CollectionId>{CollectionId::of("main")}, factory.collections());
-  EXPECT_EQ(std::vector<std::string>{"first"}, storage.incarnations());
-  EXPECT_FALSE(storage.current());
-  storage.select("first");
-  EXPECT_EQ("first", storage.current());
-  EXPECT_THROW(storage.createExclusive(), std::filesystem::filesystem_error);
-  std::filesystem::remove_all(path);
+  auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "missing/nested");
+  EXPECT_FALSE(std::filesystem::exists(path / "missing"));
+  EXPECT_EQ(nullptr, dir->openFile("absent"));
+  EXPECT_TRUE(factory.children(StorageRoot::AUTHORITATIVE, "").empty());
+  for (auto invalid : {"../outside", "/absolute", "node/private", "a/../b"}) {
+    EXPECT_THROW(factory.directory(StorageRoot::AUTHORITATIVE, invalid), std::invalid_argument);
+  }
+  std::filesystem::create_directory_symlink(path.parent_path(), path / "escape");
+  EXPECT_THROW(factory.directory(StorageRoot::AUTHORITATIVE, "escape"), std::invalid_argument);
+  std::filesystem::create_directory_symlink(path / "node", path / "private_alias");
+  EXPECT_THROW(factory.directory(StorageRoot::AUTHORITATIVE, "private_alias"), std::invalid_argument);
+  addFile(*dir, "data", "bytes");
+  std::array<std::string, 1> names{"data"};
+  dir->sync(names);
+  EXPECT_TRUE(std::filesystem::exists(path / "missing/nested/data"));
+  std::filesystem::create_directory_symlink(path / "missing", path / "alias");
+  factory.removeTree(StorageRoot::AUTHORITATIVE, "alias");
+  EXPECT_FALSE(std::filesystem::exists(path / "alias"));
+  EXPECT_TRUE(std::filesystem::exists(path / "missing/nested/data"));
 }
 
 TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
   CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
-  auto storage = factory.collection(CollectionId::of("main"));
-  addFile(*storage.create("first"), "data", "bytes");
-  EXPECT_THROW(storage.open("first")->openFile("data", true), std::runtime_error);
+  auto open = [&] { return factory.directory(StorageRoot::AUTHORITATIVE, "first"); };
+  addFile(*open(), "data", "bytes");
+  EXPECT_THROW(open()->openFile("data", true), std::runtime_error);
   std::array<std::string, 1> names{"data"};
-  storage.open("first")->sync(names);
-  EXPECT_NE(nullptr, storage.open("first")->openFile("data", true));
+  open()->sync(names);
+  EXPECT_NE(nullptr, open()->openFile("data", true));
 }
 
 TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
@@ -494,8 +502,10 @@ TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
   std::filesystem::permissions(path / "secret", std::filesystem::perms::none);
   if (::access((path / "secret").c_str(), R_OK) != 0) { // not as root
     EXPECT_THROW(dir.openFile("secret"), FileIOException);
+    EXPECT_THROW(dir.readPublished("secret"), FileIOException);
   }
   EXPECT_EQ(nullptr, dir.openFile("absent"));
+  EXPECT_FALSE(dir.readPublished("absent"));
   std::filesystem::remove_all(path);
 }
 
@@ -525,9 +535,20 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     if (checked) dir = std::make_shared<CheckedDirectory>(dir, CheckedDirMode::THROW);
     auto first = std::as_bytes(std::span("first", 5));
     auto next = std::as_bytes(std::span("next", 4));
-    EXPECT_EQ(nullptr, dir->openFile("root"));
+    EXPECT_FALSE(dir->readPublished("root"));
     ASSERT_TRUE(dir->publishFile("root", first, Directory::PublishMode::CREATE_ONLY));
     EXPECT_FALSE(dir->publishFile("root", next, Directory::PublishMode::CREATE_ONLY));
+    auto published = dir->readPublished("root");
+    ASSERT_TRUE(published);
+    EXPECT_EQ("first", published->bytes);
+    auto changed = dir->publishFile("root", first, Directory::PublishCondition::match(published->version));
+    ASSERT_TRUE(changed);
+    EXPECT_NE(published->version, *changed);
+    EXPECT_EQ(*changed, dir->readPublished("root")->version);
+    auto repeated = dir->publishFile("root", first, Directory::PublishMode::REPLACE);
+    ASSERT_TRUE(repeated);
+    EXPECT_NE(*changed, *repeated);
+    EXPECT_FALSE(dir->publishFile("root", next, Directory::PublishCondition::match(published->version)));
     EXPECT_EQ("first", dir->openFile("root", true)->read());
     std::array<FileDescriptor, 1> expected{FileDescriptor{"root", 5, 0}};
     EXPECT_NO_THROW(dir->expectSynced(expected));
@@ -564,8 +585,8 @@ TEST_F(DirectoryTest, publicationFailureBeforeInstallKeepsOriginal) {
   }
 }
 
-TEST_F(DirectoryTest, concurrentCreateOnlyPublishesOneFile) {
-  for (bool fs : {false, true}) {
+TEST_F(DirectoryTest, concurrentPublicationsHaveOneWinner) {
+  for (bool fs : {false, true}) for (bool match : {false, true}) {
     auto path = getTempDir();
     auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
     std::shared_ptr<Directory> first, second;
@@ -573,24 +594,72 @@ TEST_F(DirectoryTest, concurrentCreateOnlyPublishesOneFile) {
       first = std::make_shared<FSDirectory>(path);
       second = std::make_shared<FSDirectory>(path);
     } else first = second = std::make_shared<RAMDir>();
+    auto condition = Directory::PublishCondition(Directory::PublishMode::CREATE_ONLY);
+    if (match) condition = Directory::PublishCondition::match(*first->publishFile("root", {}, condition));
     std::latch ready(2);
     Signal::listen("publishSynced", [&](void*, void*, void*) -> void* {
       ready.count_down(); ready.wait();
       return nullptr;
     });
     auto unlisten = scope_guard([] { Signal::unlisten("publishSynced"); });
-    auto publish = [](Directory& dir, std::string_view text) {
-      return dir.publishFile("root", std::as_bytes(std::span(text)), Directory::PublishMode::CREATE_ONLY);
+    auto publish = [&](Directory& dir, std::string_view text) {
+      return dir.publishFile("root", std::as_bytes(std::span(text)), condition);
     };
     auto a = std::async(std::launch::async, [&] { return publish(*first, "first"); });
     auto b = std::async(std::launch::async, [&] { return publish(*second, "second"); });
-    bool won = a.get();
-    EXPECT_NE(won, b.get());
+    bool won = a.get().has_value();
+    EXPECT_NE(won, b.get().has_value());
     EXPECT_EQ(won ? "first" : "second", first->openFile("root")->read());
     if (fs) {
       for (const auto& entry : std::filesystem::directory_iterator(path)) EXPECT_EQ("root", entry.path().filename());
     }
   }
+}
+
+TEST_F(DirectoryTest, replacePublicationsDoNotWaitForOtherDirectoriesSyncs) {
+  auto path = getTempDir();
+  auto root = std::filesystem::weakly_canonical(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirFactory factory(path);
+  auto first = factory.directory(StorageRoot::AUTHORITATIVE, "first/leaf");
+  auto second = factory.directory(StorageRoot::AUTHORITATIVE, "second/leaf");
+  std::promise<void> blocked, resume;
+  auto resumed = resume.get_future().share();
+  Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
+    if (!file && *(std::filesystem::path*)directory == root / "first") {
+      blocked.set_value();
+      resumed.wait();
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("fsSynced"); });
+  auto pending = std::async(std::launch::async, [&] { return first->publishFile("root", {}, Directory::PublishMode::REPLACE); });
+  {
+    std::future<std::optional<Directory::PublicationVersion>> other;
+    auto unblock = scope_guard([&] { resume.set_value(); });
+    ASSERT_EQ(std::future_status::ready, blocked.get_future().wait_for(std::chrono::seconds(5)));
+    other = std::async(std::launch::async, [&] { return second->publishFile("root", {}, Directory::PublishMode::REPLACE); });
+    auto status = other.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, status);
+    if (status == std::future_status::ready) { EXPECT_TRUE(other.get()); }
+  }
+  EXPECT_TRUE(pending.get());
+}
+
+TEST_F(DirectoryTest, publicationVersionIncludesContent) {
+  auto path = getTempDir();
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirectory dir(path);
+  auto first = dir.publishFile("root", std::as_bytes(std::span("first", 5)), Directory::PublishMode::CREATE_ONLY);
+  auto modified = std::filesystem::last_write_time(path / "root");
+  std::ofstream(path / "root") << "other"; // same inode, size, and restored mtime
+  std::filesystem::last_write_time(path / "root", modified);
+  auto current = dir.readPublished("root");
+  ASSERT_TRUE(current);
+  EXPECT_EQ("other", current->bytes);
+  EXPECT_NE(*first, current->version);
+  EXPECT_FALSE(dir.publishFile("root", {}, Directory::PublishCondition::match(*first)));
+  EXPECT_TRUE(dir.publishFile("root", {}, Directory::PublishCondition::match(current->version)));
 }
 
 TEST_F(DirectoryTest, durableOperationsSyncDirectoryLast) {
@@ -600,7 +669,8 @@ TEST_F(DirectoryTest, durableOperationsSyncDirectoryLast) {
   addFile(dir, "a", "first");
   addFile(dir, "b", "second");
   std::vector<std::string> synced;
-  Signal::listen("fsSynced", [&](void*, void* file, void*) -> void* {
+  Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
+    if (*(std::filesystem::path*)directory != path) return nullptr;
     synced.push_back(file ? *(std::string*)file : "directory");
     return nullptr;
   });
@@ -649,4 +719,30 @@ TEST_F(DirectoryTest, publicationTempsAreHiddenAndLeftAlone) {
   dir.listFiles(files);
   ASSERT_EQ(1, files.size());
   EXPECT_EQ("root", files[0].name);
+}
+
+TEST_F(DirectoryTest, publicationPersistsNewAncestors) {
+  auto path = getTempDir();
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirFactory factory(path);
+  auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "a/b");
+  std::vector<std::filesystem::path> synced;
+  Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
+    if (!file) synced.push_back(*(std::filesystem::path*)directory);
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("fsSynced"); });
+  dir->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY);
+  auto root = std::filesystem::weakly_canonical(path);
+  EXPECT_EQ((std::vector<std::filesystem::path>{root / "a/b", root / "a", root}), synced);
+  synced.clear();
+  auto reopened = factory.directory(StorageRoot::AUTHORITATIVE, "a/b");
+  reopened->publishFile("root", {}, Directory::PublishMode::REPLACE);
+  EXPECT_EQ((std::vector<std::filesystem::path>{root / "a/b"}), synced);
+
+  factory.removeTree(StorageRoot::AUTHORITATIVE, "a");
+  synced.clear();
+  reopened = factory.directory(StorageRoot::AUTHORITATIVE, "a/b");
+  reopened->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY);
+  EXPECT_EQ((std::vector<std::filesystem::path>{root / "a/b", root / "a", root}), synced);
 }

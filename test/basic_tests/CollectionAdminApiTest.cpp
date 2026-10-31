@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "luxir/store/Manifest.h"
 #include <atomic>
 #include <chrono>
@@ -109,7 +110,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   auto deleted = httpRequest(port, http::verb::post, "/collections/_delete",
                              R"({"name":"admin_lifecycle"})");
   ASSERT_EQ(200, deleted.result_int()) << deleted.body();
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_lifecycle"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "admin_lifecycle").empty());
 
   HttpReq missingSearch(port);
   missingSearch.collection("admin_lifecycle").matchQuery("title_w", "old").withStats().execute();
@@ -125,7 +126,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   auto deleteMain = httpRequest(port, http::verb::post, "/collections/_delete",
                                 R"({"name":"main"})");
   EXPECT_EQ(200, deleteMain.result_int()) << deleteMain.body();
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "main"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "main").empty());
 
   server.shutdown();
 }
@@ -244,7 +245,7 @@ TEST_F(CollectionAdminApiTest, deleteWhileIndexingRejectsRacingBatchesCleanly) {
   ASSERT_EQ(200, deleted.result_int()) << deleted.body();
   EXPECT_TRUE(sawFailure.load());
   EXPECT_EQ(0, unexpectedStatus.load());
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_race"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "admin_race").empty());
   server.shutdown();
 }
 
@@ -263,7 +264,7 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
   node.deleteCollection("admin_held_reader");
 
   EXPECT_THROW(writer->snapshots.readers.getReader(), ApiError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_held_reader"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "admin_held_reader").empty());
 
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -290,7 +291,7 @@ TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash
     CollectionHelper helper(node, "admin_restart");
     ASSERT_TRUE(helper.index(flatdoc("id", "restart"), UpdateMessage::COMMIT).success);
     node.deleteCollection("admin_restart");
-    EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_restart"));
+    EXPECT_TRUE(test::catalogIncarnations(data.path(), "admin_restart").empty());
   }
 
 
@@ -311,9 +312,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
-  FSDirectory container(data.path() / "t" / "t0" / "admin_corrupt");
-  auto incarnation = *CollectionStorage::current(container);
-  auto indexPath = data.path() / "t" / "t0" / "admin_corrupt" / incarnation;
+  auto indexPath = test::incarnationPath(data.path(), "admin_corrupt");
   for (const auto& file : std::filesystem::directory_iterator(indexPath)) {
     if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
   }
@@ -324,7 +323,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
   LuxirNode node(config);
   EXPECT_THROW(node.getCollection("admin_corrupt"), CollectionUnavailableError);
   EXPECT_NO_THROW(node.deleteCollection("admin_corrupt"));
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_corrupt"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "admin_corrupt").empty());
 }
 
 } // namespace luxir::test
@@ -415,41 +414,37 @@ TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
 } // namespace luxir::test
 
 namespace luxir::test {
-TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
+TEST_F(CollectionAdminApiTest, createPreservesReservedStorage) {
   CollectionAdminDataDir data("luxir_collection_admin_existing");
   LuxirNode node(fsConfig(data));
-  FSDirectory existing(data.path() / "t" / "t0" / "unregistered");
-  std::string incarnation;
+  auto& catalog = node.collections().catalog();
+  auto incarnation = catalog.reserve("unregistered");
+  auto existing = catalog.directory("unregistered", incarnation);
   {
-    CommitSnapshotRegistry writerSnapshots(existing);
-    IndexWriter writer(writerSnapshots);
-    incarnation = test::readDurableIndexInfo(existing)->incarnation;
+    CommitSnapshotRegistry snapshots(*existing);
+    IndexWriter writer(snapshots, {}, nullptr, 10, incarnation);
   }
-  EXPECT_THROW(node.createCollection("unregistered"), std::filesystem::filesystem_error);
-  EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
+  EXPECT_THROW(node.createCollection("unregistered"), CollectionExistsError);
+  EXPECT_EQ(incarnation, test::readDurableIndexInfo(*existing)->incarnation);
 }
 
-TEST_F(CollectionAdminApiTest, missingCurrentDiscardsUnselectedIncarnations) {
+TEST_F(CollectionAdminApiTest, startupDiscardsAbandonedReservations) {
   CollectionAdminDataDir data("luxir_collection_unselected");
   auto config = fsConfig(data);
   std::string incarnation;
   {
     LuxirNode node(config);
-    incarnation = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation;
+    auto& catalog = node.collections().catalog();
+    incarnation = catalog.reserve("orphan");
+    auto dir = catalog.directory("orphan", incarnation);
+    dir->publishFile("partial", {}, Directory::PublishMode::CREATE_ONLY);
+    catalog.reserve("gone"); // crashed before writing its first file
   }
-  std::filesystem::remove(data.path() / "t" / "t0" / "main" / "CURRENT");
   LuxirNode reopened(config);
-  EXPECT_THROW(reopened.getCollection("main"), CollectionNotFoundError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "main"));
-}
-
-TEST_F(CollectionAdminApiTest, emptyUnselectedCollectionIsNotRecreatedAtStartup) {
-  CollectionAdminDataDir data("luxir_collection_interrupted_delete");
-  { LuxirNode first(fsConfig(data)); }
-  FSDirectory empty(data.path() / "t" / "t0" / "gone");
-  LuxirNode node(fsConfig(data));
-  EXPECT_THROW(node.getCollection("gone"), CollectionNotFoundError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "gone" / "CURRENT"));
+  EXPECT_THROW(reopened.getCollection("orphan"), CollectionNotFoundError);
+  EXPECT_THROW(reopened.getCollection("gone"), CollectionNotFoundError);
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "i" / incarnation));
+  EXPECT_TRUE(reopened.collections().catalog().incarnations("gone").empty());
 }
 
 TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
@@ -465,7 +460,7 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
 
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"zeta"})").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").first);
-  EXPECT_TRUE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
+  EXPECT_TRUE(std::filesystem::exists(test::incarnationPath(data.path(), "docs", "acme")));
   EXPECT_EQ(400, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"more","tenant":"other"})").first);
   EXPECT_EQ(400, body(http::verb::post, "/tenants/Bad/collections/_create", R"({"name":"docs"})").first);
   EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
@@ -483,7 +478,7 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);
   EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
+  EXPECT_TRUE(test::catalogIncarnations(data.path(), "docs", "acme").empty());
   EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
   // A tenant is listed while it has a collection.
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"zeta"})").first);

@@ -317,7 +317,11 @@ TEST_F(SegmentSharingTest, newIncarnationSharesNothing) {
   rerooted.reset();
   writer->dir.deleteFile(Manifest::name(root.info.index_gen));
 
-  helper->clear();
+  node->deleteCollection("share");
+  writer.reset();
+  helper = std::make_unique<CollectionHelper>(*node, "share");
+  writer = helper->getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
   nextId = 0;
   addSegment(900);
   auto snapshot = writer->snapshots.snapshot();

@@ -65,9 +65,11 @@ public:
     reject(std::string("finishFile(") + std::string(file.name()) + ")");
   }
 
-  bool publishFile(std::string_view name, std::span<const std::byte>, PublishMode) override {
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte>, PublishCondition) override {
     reject(std::string("publishFile(") + std::string(name) + ")");
   }
+
+  std::optional<Publication> readPublished(std::string_view name) override { return delegate_->readPublished(name); }
 
   void deleteDurably(std::span<const std::string>) override { reject("deleteDurably"); }
 
@@ -89,40 +91,19 @@ public:
 ///
 /// Pair it with a backend factory opened read-only (see FSDirFactory), which
 /// suppresses the open-time side effects a wrapper cannot reach: taking
-/// write.lock, creating the data directory, resetting trash/.
+/// write.lock, creating the data directory, and cleaning publication temps.
 class ReadOnlyDirFactory : public DirectoryFactory {
   std::unique_ptr<DirectoryFactory> delegate_;
 
-  [[noreturn]] static void refuse(std::string_view what, const CollectionId& id) {
-    throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + id.label() + "'");
-  }
-
 public:
-  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate)
-      : delegate_(std::move(delegate)) {}
+  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate) : delegate_(std::move(delegate)) {}
+  std::shared_ptr<StorageMemory> memory() override { return delegate_->memory(); }
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    return std::make_shared<ReadOnlyDirectory>(delegate_->directory(root, path, std::move(options)), std::string(path));
+  }
+  std::vector<Child> children(StorageRoot root, std::string_view path) override { return delegate_->children(root, path); }
+  void removeTree(StorageRoot, std::string_view) override { throw ReadOnlyError("read-only data directory: cannot remove a subtree"); }
 
-  uint64_t storageBytes() override { return delegate_->storageBytes(); }
-  uint64_t collectionBytes(const CollectionId& id) override { return delegate_->collectionBytes(id); }
-  std::vector<CollectionId> collections() override { return delegate_->collections(); }
-
-  // Every namespace mutation is refused before it reaches the backend, and
-  // opening never creates.
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
-    if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->container(id, false), id.label());
-  }
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
-    if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->incarnation(id, incarnation, false),
-                                               id.label() + "/" + std::string(incarnation));
-  }
-  void createCollection(const CollectionId& id) override { refuse("create collection", id); }
-  std::vector<std::string> incarnations(const CollectionId& id) override { return delegate_->incarnations(id); }
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
-    unused(incarnation);
-    refuse("remove an incarnation of", id);
-  }
-  void remove(const CollectionId& id) override { refuse("remove collection", id); }
 };
 
 } // namespace luxir

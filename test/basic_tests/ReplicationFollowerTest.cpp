@@ -129,7 +129,7 @@ protected:
   std::filesystem::path makeLocalUnreadable() {
     auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
     stopFollower();
-    auto dir = path / "follower" / "t" / "t0" / "main" / id.incarnation;
+    auto dir = path / "follower" / "t" / "t0" / "i" / id.incarnation;
     auto root = dir / Manifest::name(id.index_gen);
     std::filesystem::rename(root, root.string() + ".saved");
     // ELOOP is independent of the test process's filesystem privileges.
@@ -441,7 +441,7 @@ TEST_F(ReplicationFollowerTest, deleteWhileDownloadIsPendingCannotResurrectColle
   resume.count_down();
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
   stopFollower();
-  EXPECT_TRUE(std::filesystem::is_empty(path / "follower" / "t" / "t0"));
+  EXPECT_TRUE(std::filesystem::is_empty(path / "follower" / "t" / "t0" / "i"));
 }
 
 TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
@@ -465,8 +465,8 @@ TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
     CollectionHelper h(writer, "main");
     auto promoted = h.collection().getShard()->getSnapshots().snapshot()->id;
     EXPECT_NE(id.incarnation, promoted.incarnation);
-    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "replication.json"));
-    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "t" / "t0" / "main" / id.incarnation));
+    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "node" / "replication.json"));
+    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "t" / "t0" / "i" / id.incarnation));
     EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
     ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
     EXPECT_EQ(2, h.collection().getReaderManager().getReader()->liveDocs());
@@ -486,7 +486,7 @@ TEST_F(ReplicationFollowerTest, unavailableSourceKeepsReplica) {
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
-TEST_F(ReplicationFollowerTest, rootBeforeCurrentCrashKeepsOldIncarnation) {
+TEST_F(ReplicationFollowerTest, rootBeforeActivationCrashKeepsOldIncarnation) {
   sourceConfig.store.backend = "ram";
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
@@ -494,7 +494,7 @@ TEST_F(ReplicationFollowerTest, rootBeforeCurrentCrashKeepsOldIncarnation) {
   auto old = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
-  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted before CURRENT"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted before catalog activation"); });
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
   stopFollower(); stopSource();
@@ -512,7 +512,7 @@ TEST_F(ReplicationFollowerTest, corruptLocalCollectionIsFetchedAgain) {
   ASSERT_TRUE(caughtUp());
   auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   stopFollower();
-  std::filesystem::remove(path / "follower" / "t" / "t0" / "main" / id.incarnation / Manifest::name(id.index_gen));
+  std::filesystem::remove(path / "follower" / "t" / "t0" / "i" / id.incarnation / Manifest::name(id.index_gen));
   startFollower();
   ASSERT_TRUE(caughtUp());
 }
@@ -841,8 +841,8 @@ TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
   bool parentSynced = false, recorded = false;
   Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
     auto& dir = *(std::filesystem::path*)directory;
-    if (dir == path / "follower" / "t" / "t0" / "main" && !file) parentSynced = true;
-    if (dir == path / "follower" && file && *(std::string*)file == "replication.json") {
+    if (dir == path / "follower" / "t" / "t0" / "i" && !file) parentSynced = true;
+    if (dir == path / "follower" / "node" && file && *(std::string*)file == "replication.json") {
       EXPECT_TRUE(parentSynced);
       recorded = true;
     }
@@ -862,13 +862,18 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
   for (auto damage : {"missing", "empty", "corrupt", "wrong_incarnation"}) {
     followerConfig.store.data_dir = (path / damage).string();
     ASSERT_EQ(0, pull().first);
-    FSDirectory metadata(followerConfig.store.data_dir);
+    FSDirectory metadata(std::filesystem::path(followerConfig.store.data_dir) / "node");
     auto state = ReplicationState::read(*metadata.openFile("replication.json"));
-    auto target = newUuid();
+    std::string target;
+    {
+      FSDirFactory factory(followerConfig.store.data_dir);
+      target = TenantCatalog(factory).reserve("main");
+    }
     state.collection(CollectionId::of("main")).promoted = target;
     state.write(metadata);
     if (std::string_view(damage) != "missing") {
-      FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "t" / "t0" / "main" / target);
+      FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "t" / "t0" / "i" / target);
+      dir.sync({});
       auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
       if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->id.index_gen, *snapshot->bytes);
       if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {});
@@ -901,14 +906,14 @@ TEST_F(ReplicationFollowerTest, promotionRetriesOnlyUnpromotedCollections) {
   EXPECT_NE(0, first.first);
   EXPECT_NE(std::string::npos, first.second.find("broken ERROR: transient promotion failure")) << first.second;
   // No writer opens any collection until every one is promoted.
-  ASSERT_TRUE(std::filesystem::exists(path / "follower" / "replication.json"));
+  ASSERT_TRUE(std::filesystem::exists(path / "follower" / "node" / "replication.json"));
   EXPECT_THROW(LuxirNode writer(config), std::runtime_error);
-  FSDirectory metadata(followerConfig.store.data_dir);
+  FSDirectory metadata(std::filesystem::path(followerConfig.store.data_dir) / "node");
   auto target = ReplicationState::read(*metadata.openFile("replication.json")).collection(CollectionId::of("main")).promoted;
   ASSERT_FALSE(target.empty());
   fail = false;
   ASSERT_EQ(0, promote().first);
-  EXPECT_FALSE(std::filesystem::exists(path / "follower" / "replication.json"));
+  EXPECT_FALSE(std::filesystem::exists(path / "follower" / "node" / "replication.json"));
   EXPECT_NE(0, promote().first); // no longer a follower directory
   LuxirNode promoted(config);
   EXPECT_EQ(target, promoted.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);
@@ -1372,7 +1377,7 @@ TEST_F(ReplicationFollowerTest, watchOnlyFollowersDoNotCountForAll) {
 TEST_F(ReplicationFollowerTest, restartReusesVerifiedCandidateFiles) {
   startSource();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
-  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("stop before CURRENT"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("stop before catalog activation"); });
   startFollower();
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
   stopFollower(); Signal::unlisten("snapshotRootDurable");
@@ -1454,7 +1459,7 @@ TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
     catch (const CollectionResolutionError&) { return false; }
   })) << status();
   EXPECT_EQ(1, follower->getCollection(docs)->getReaderManager().getReader()->liveDocs());
-  EXPECT_TRUE(std::filesystem::exists(path / "follower" / "t" / "acme" / "docs" / target.incarnation));
+  EXPECT_TRUE(std::filesystem::exists(path / "follower" / "t" / "acme" / "i" / target.incarnation));
   EXPECT_NE(std::string::npos, status().find("\"tenant\":\"acme\""));
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [&](const auto& row) { return row.collection == docs; });
@@ -1540,7 +1545,7 @@ TEST_F(ReplicationFollowerTest, narrowerRestartOrphansCopiesAndDropsBarrierMembe
   api::ReplicationStatus stats;
   follower->getFollower()->stats(stats, arena);
   EXPECT_FALSE(std::ranges::any_of(stats.collections, [](const auto& row) { return row.tenant == "beta"; }));
-  FSDirectory dir(followerConfig.store.data_dir);
+  FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "node");
   EXPECT_FALSE(ReplicationState::read(*dir.openFile("replication.json")).tenants.contains("beta"));
 }
 
@@ -1550,7 +1555,7 @@ TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
   { CollectionHelper h(*source, beta); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
   startFollower(); ASSERT_TRUE(caughtUp(beta));
   auto saved = [&] {
-    FSDirectory dir(followerConfig.store.data_dir);
+    FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "node");
     return ReplicationState::read(*dir.openFile("replication.json")).collection(beta);
   };
   ASSERT_TRUE(until([&] { return !saved().boot.empty(); }));
@@ -1668,7 +1673,7 @@ TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
   auto largest = std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
   {
     // Same size, different bytes: the peer still offers it by identity.
-    std::fstream file(path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / largest->name,
+    std::fstream file(path / "follower" / "t" / "t0" / "i" / installed->id.incarnation / largest->name,
                       std::ios::in | std::ios::out | std::ios::binary);
     char byte = 0;
     file.read(&byte, 1);
@@ -1701,7 +1706,7 @@ TEST_F(ReplicationFollowerTest, corruptLocalFilesAreRefetchedAndNeverPromoted) {
   auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
   auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
   auto flip = [&] {
-    std::fstream file(path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / largest.name,
+    std::fstream file(path / "follower" / "t" / "t0" / "i" / installed->id.incarnation / largest.name,
                       std::ios::in | std::ios::out | std::ios::binary);
     char byte = 0;
     file.read(&byte, 1);
@@ -1739,7 +1744,7 @@ TEST_F(ReplicationFollowerTest, scrubHitIsRepairedByTheNextSync) {
   ASSERT_TRUE(caughtUp());
   auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
   auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
-  auto dir = path / "follower" / "t" / "t0" / "main" / installed->id.incarnation;
+  auto dir = path / "follower" / "t" / "t0" / "i" / installed->id.incarnation;
   {
     std::fstream file(dir / largest.name, std::ios::in | std::ios::out | std::ios::binary);
     char byte = 0;
@@ -1829,9 +1834,9 @@ TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacem
   stopSource();
   {
     FSDirFactory factory(sourceConfig.store.data_dir);
-    auto storage = factory.collection(CollectionId::of("main"));
-    auto selected = *storage.current();
-    storage.select(copySnapshot(storage, selected, Manifest::load(*storage.open(selected))));
+    TenantCatalog storage(factory);
+    auto selected = *storage.current("main");
+    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory("main", selected))));
   }
   startSource();
   ASSERT_TRUE(caughtUp());
@@ -1864,10 +1869,10 @@ TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
   ASSERT_TRUE(caughtUp());
   auto snapshot = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
   auto suspect = *std::ranges::max_element(snapshot->files, {}, &FileDescriptor::size);
-  auto dir = path / "follower" / "t" / "t0" / "main" / snapshot->id.incarnation;
+  auto dir = path / "follower" / "t" / "t0" / "i" / snapshot->id.incarnation;
   stopFollower(); stopSource();
   {
-    FSDirectory sourceDir(dir, false);
+    FSDirectory sourceDir(dir);
     std::array<std::string, 2> suspects{suspect.name, "s0_absent"};
     CorruptionMarker::write(sourceDir, suspects, "pending scrub hit");
     std::fstream file(dir / suspect.name, std::ios::in | std::ios::out | std::ios::binary);
@@ -1878,11 +1883,11 @@ TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
   ASSERT_EQ(0, code) << output;
   {
     FSDirFactory factory(followerConfig.store.data_dir);
-    auto storage = factory.collection(CollectionId::of("main"));
-    auto selected = storage.current();
+    TenantCatalog storage(factory);
+    auto selected = storage.current("main");
     ASSERT_TRUE(selected);
     EXPECT_NE(snapshot->id.incarnation, *selected);
-    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.open(*selected)));
+    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory("main", *selected)));
   }
   auto writerConfig = followerConfig;
   writerConfig.replication.source.clear();

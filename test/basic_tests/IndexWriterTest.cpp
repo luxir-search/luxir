@@ -3308,7 +3308,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   EXPECT_EQ(visible->incarnation, next->incarnation);
 }
 
-TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetChangesIdentity) {
+TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetKeepsIncarnation) {
   RAMDir dir;
   auto schema = Schema::createDefaultSchema();
   CommitSnapshotRegistry writerSnapshots(dir);
@@ -3318,8 +3318,8 @@ TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetChangesIdentity) {
   EXPECT_EQ(1u, before->index_gen);
   writer.testDeleteAllData();
   auto after = test::readDurableIndexInfo(dir);
-  EXPECT_NE(before->incarnation, after->incarnation);
-  EXPECT_EQ(1u, after->index_gen);
+  EXPECT_EQ(before->incarnation, after->incarnation);
+  EXPECT_GT(after->index_gen, before->index_gen);
   writer.close();
   EXPECT_THROW(IndexWriter(writerSnapshots, schema), std::invalid_argument);
   CommitSnapshotRegistry reopenedSnapshots(dir);

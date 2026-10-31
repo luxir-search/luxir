@@ -170,7 +170,7 @@ TEST_F(ReadOnlyNodeTest, grpcRefusesMutatingMethods) {
   serverThread.join();
 }
 
-// A read-only node writes nothing at startup: no data dir, no lock file, no trash.
+// A read-only node writes nothing at startup, including node-private state.
 TEST_F(ReadOnlyNodeTest, startupTouchesNothing) {
   DataDir data("luxir_read_only_startup");
 
@@ -178,13 +178,11 @@ TEST_F(ReadOnlyNodeTest, startupTouchesNothing) {
   EXPECT_FALSE(std::filesystem::exists(data.path()));
 
   { LuxirNode writer(fsConfig(data)); }
-  ASSERT_TRUE(std::filesystem::exists(data.path() / "write.lock"));
-  std::filesystem::remove(data.path() / "write.lock");
-  std::filesystem::remove_all(data.path() / "trash");
+  ASSERT_TRUE(std::filesystem::exists(data.path() / "node" / "write.lock"));
+  std::filesystem::remove_all(data.path() / "node");
 
   { LuxirNode reader(fsConfig(data, /*readOnly=*/true)); }
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "write.lock"));
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "trash"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "node"));
 }
 
 // There is no existing data directory to serve without the fs backend.

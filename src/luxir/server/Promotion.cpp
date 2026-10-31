@@ -10,10 +10,10 @@
 
 namespace luxir {
 
-std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest, bool verify) {
-  auto old = storage.open(from);
-  auto incarnation = CommitId::newIncarnation();
-  auto next = storage.create(incarnation);
+std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest, bool verify) {
+  auto old = storage.directory(name, from);
+  auto incarnation = storage.reserve(name);
+  auto next = storage.directory(name, incarnation);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
@@ -47,11 +47,11 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
 }
 
 namespace {
-bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
+bool validTarget(TenantCatalog& storage, std::string_view name, const std::string& incarnation) {
   try {
-    auto incarnations = storage.incarnations();
+    auto incarnations = storage.incarnations(name);
     if (!CommitId::validIncarnation(incarnation) || std::ranges::find(incarnations, incarnation) == incarnations.end()) return false;
-    auto target = Manifest::load(*storage.open(incarnation));
+    auto target = Manifest::load(*storage.directory(name, incarnation));
     if (!target.bytes) return false;
     std::pmr::monotonic_buffer_resource arena;
     auto info = Manifest::decode(target.bytes, arena);
@@ -62,37 +62,38 @@ bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
     }
     return true;
   } catch (const std::exception& e) {
-    LOG_WARN("Cannot validate promotion target for '{}': {}", storage.id().label(), e.what());
+    LOG_WARN("Cannot validate promotion target for '{}': {}", name, e.what());
     return false;
   }
 }
 }
 
 bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool verify) {
-  if (!std::filesystem::exists(dataDir / "replication.json")) {
+  if (!std::filesystem::exists(dataDir / "node" / "replication.json")) {
     output << "Promote failed: " << dataDir.string() << " is not a follower data directory\n";
     return false;
   }
   FSDirFactory factory(dataDir);
-  FSDirectory metadata(dataDir);
-  auto state = ReplicationState::read(*metadata.openFile("replication.json"));
+  TenantCatalog::initialize(factory, true);
+  auto metadata = factory.directory(StorageRoot::NODE_PRIVATE, "");
+  auto state = ReplicationState::read(*metadata->openFile("replication.json"));
   size_t promotedCount = 0, failed = 0;
-  for (const auto& id : factory.collections()) {
+  for (const auto& id : TenantCatalog::collections(factory)) {
     try {
-      auto storage = factory.collection(id);
-      auto selected = storage.current();
+      TenantCatalog storage(factory, id.tenant);
+      auto selected = storage.current(id.name);
       if (!selected) continue;
       auto& promoted = state.collection(id).promoted;
-      if (!promoted.empty() && !validTarget(storage, promoted)) promoted.clear();
+      if (!promoted.empty() && !validTarget(storage, id.name, promoted)) promoted.clear();
       if (promoted.empty()) {
         Signal::emit("replicationPromotingCollection", (void*)&id.name);
-        promoted = copySnapshot(storage, *selected, Manifest::load(*storage.open(*selected)), verify);
-        state.write(metadata);
+        promoted = copySnapshot(storage, id.name, *selected, Manifest::load(*storage.directory(id.name, *selected)), verify);
+        state.write(*metadata);
       }
-      // Re-select even if CURRENT already names the target: an earlier attempt
+      // Re-select even if the catalog already names the target: an earlier attempt
       // may have installed it without making it durable.
-      storage.select(promoted);
-      storage.retainOnly(promoted);
+      storage.activate(id.name, promoted);
+      for (const auto& other : storage.incarnations(id.name)) if (other != promoted) storage.removeIncarnation(other);
       promotedCount++;
       output << id.label() << ' ' << promoted << '\n';
     } catch (const std::exception& e) {
@@ -102,7 +103,7 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
   }
   if (!failed) {
     std::array<std::string, 1> names{"replication.json"};
-    metadata.deleteDurably(names);
+    metadata->deleteDurably(names);
   }
   output << "Promote: " << promotedCount << " promoted, " << failed << " failed";
   if (!failed) output << "; promoted from follower of " << state.source;

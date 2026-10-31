@@ -105,9 +105,17 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
   }
   // Outermost, so a mutation is refused before any wrapper does bookkeeping for it.
   if (config.read_only) factory = std::make_unique<ReadOnlyDirFactory>(std::move(factory));
+  TenantCatalog::initialize(*factory, !config.read_only);
 }
 
 Collections::~Collections() = default;
+
+TenantCatalog& Collections::catalog(std::string_view tenant) {
+  std::lock_guard lock(catalogsMutex);
+  auto it = catalogs.find(tenant);
+  if (it == catalogs.end()) it = catalogs.emplace(std::string(tenant), std::make_unique<TenantCatalog>(*factory, tenant)).first;
+  return *it->second;
+}
 
 Collections::Transition::Transition(Collections& owner, CollectionId name) : owner(owner), name(std::move(name)) {
   std::lock_guard lock(owner.slotsMutex);
@@ -133,8 +141,8 @@ void Collections::release(const CollectionId& name, const std::string& incarnati
 
 void Collections::retire(const CollectionId& name, const std::string& selected) noexcept {
   try {
-    auto storage = factory->collection(name);
-    for (const auto& incarnation : storage.incarnations()) {
+    auto& storage = catalog(name.tenant);
+    for (const auto& incarnation : storage.incarnations(name.name)) {
       if (incarnation == selected) continue;
       {
         std::lock_guard lock(slotsMutex);
@@ -293,13 +301,13 @@ void Collections::observe(const CollectionId& name, Collection& collection) {
   };
 }
 
-std::string Collections::recoverWriter(const CollectionId& name, CollectionStorage& storage, const std::string& selected) {
-  auto manifest = Manifest::load(*storage.open(selected));
+std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& storage, const std::string& selected) {
+  auto manifest = Manifest::load(*storage.directory(name.name, selected));
   if (!manifest.bytes || manifest.generation == manifest.highestGeneration) return selected;
-  auto recovered = copySnapshot(storage, selected, manifest);
+  auto recovered = copySnapshot(storage, name.name, selected, manifest);
   LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
             name.label(), manifest.generation, manifest.highestGeneration, recovered);
-  storage.select(recovered);
+  storage.activate(name.name, recovered);
   return recovered;
 }
 
@@ -311,20 +319,19 @@ static void clearMarkers(const CollectionId& name, Directory& dir) {
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
 
-std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup) {
-  auto storage = factory->collection(name);
-  auto selected = CollectionStorage::current(*factory->container(name, true));
+std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup, std::optional<std::string> reserved) {
+  auto& storage = catalog(name.tenant);
+  auto selected = storage.current(name.name);
   bool creating = !selected;
   if (creating) {
-    if (storage.hasFiles() || !storage.incarnations().empty()) throw std::runtime_error("Collection files exist without CURRENT");
-    selected = CommitId::newIncarnation();
+    selected = reserved ? std::move(reserved) : std::optional(storage.reserve(name.name, {}, true));
   } else {
     selected = recoverWriter(name, storage, *selected);
   }
-  auto col = makeCollection(name, creating ? storage.create(*selected) : storage.open(*selected));
+  auto col = makeCollection(name, storage.directory(name.name, *selected));
   if (!creating) {
     auto manifest = Manifest::load(*col->shard->dir);
-    if (!manifest.bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+    if (!manifest.bytes) throw std::runtime_error("catalog selects an empty index directory");
     if (startup) arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen); });
   }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
@@ -334,8 +341,8 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
-  if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
-  if (creating) storage.select(*selected);
+  if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
+  if (creating) storage.activate(name.name, *selected);
   retire(name, *selected);
   observe(name, *col);
   Signal::emit("collectionInitialized", col.get());
@@ -349,10 +356,10 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
   if (role == Role::WRITER) {
     col = initWriter(name, {}, true);
   } else {
-    if (!selected) throw ReadOnlyError("Collection has no CURRENT");
-    col = makeCollection(name, factory->collection(name).open(*selected));
+    if (!selected) throw ReadOnlyError("Collection has no catalog selection");
+    col = makeCollection(name, catalog(name.tenant).directory(name.name, *selected));
     arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
-    if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
+    if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
     observe(name, *col);
   }
   // Whatever a marker named was verified before this point.
@@ -362,7 +369,8 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
 
 std::vector<Collections::Opened> Collections::open(Role role) {
   std::vector<Opened> rows;
-  auto names = factory->collections();
+  if (role != Role::READ_ONLY) TenantCatalog::recover(*factory, role == Role::FOLLOWER);
+  auto names = TenantCatalog::collections(*factory);
   bool createDefault = names.empty() && role != Role::FOLLOWER;
   if (createDefault) names.push_back(CollectionId::of(kDefaultCollectionName));
   // Keep the node up and the data: the name resolves to a clear error instead
@@ -371,10 +379,10 @@ std::vector<Collections::Opened> Collections::open(Role role) {
     LOG_ERROR("Failed to load collection '{}': {}", row.id.label(), e.what());
     row.error = "failed to load: " + std::string(e.what());
     row.collection = unavailable(row.id, row.error);
-    // Whatever CURRENT selects (or failed to say) is kept until an
+    // Whatever the catalog selects (or failed to say) is kept until an
     // installation replaces the copy.
     if (role == Role::FOLLOWER) try {
-      auto incarnations = factory->collection(row.id).incarnations();
+      auto incarnations = catalog(row.id.tenant).incarnations(row.id.name);
       std::lock_guard lock(slotsMutex);
       slots[row.id].retained.insert(incarnations.begin(), incarnations.end());
     } catch (const std::exception& listing) { LOG_WARN("Cannot list incarnations of '{}': {}", row.id.label(), listing.what()); }
@@ -383,21 +391,12 @@ std::vector<Collections::Opened> Collections::open(Role role) {
     Opened row{name, nullptr, std::nullopt, {}};
     try {
       validate(name);
-      auto storage = factory->collection(name);
+      auto& storage = catalog(name.tenant);
       if (!createDefault) {
-        row.incarnation = storage.current();
-        if (row.incarnation && !CommitId::validIncarnation(*row.incarnation)) throw std::runtime_error("CURRENT selects an invalid incarnation");
+        row.incarnation = storage.current(name.name);
+        if (row.incarnation && !CommitId::validIncarnation(*row.incarnation)) throw std::runtime_error("catalog selects an invalid incarnation");
         if (!row.incarnation && role == Role::FOLLOWER) {
-          if (storage.hasFiles()) throw std::runtime_error("Collection has files without CURRENT");
-          for (const auto& incarnation : storage.incarnations()) {
-            if (!CommitId::validIncarnation(incarnation)) throw std::runtime_error("Collection has an invalid incarnation directory");
-          }
-          rows.push_back(std::move(row)); // completed candidate files survive a restarted download
-          continue;
-        }
-        if (!row.incarnation && role == Role::WRITER && !storage.hasFiles() && std::ranges::all_of(storage.incarnations(), CommitId::validIncarnation)) {
-          storage.remove();
-          LOG_INFO("Removed unselected collection: {}", name.label());
+          rows.push_back(std::move(row)); // reserved files survive a restarted download
           continue;
         }
       }
@@ -482,9 +481,9 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
     try {
       auto initialSchema = Schema::createDefaultSchema();
       if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
-      factory->collection(key).createExclusive();
+      auto reserved = catalog(key.tenant).reserve(key.name, {}, true);
       stored = true;
-      created = initWriter(key, std::move(initialSchema));
+      created = initWriter(key, std::move(initialSchema), false, std::move(reserved));
       LOG_INFO("Created collection: {}", key.label());
       registered(key, created);
       return created;
@@ -493,7 +492,7 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
       std::shared_ptr<Collection> failed;
       try {
         if (created && created->shard && created->shard->iw) created->shard->iw->close();
-        if (stored) factory->collection(key).remove();
+        if (stored) catalog(key.tenant).remove(key.name);
       } catch (const std::exception& e) {
         failed = Collection::placeholder(key, "create failed and cleanup failed: " + std::string(e.what()));
       } catch (...) {
@@ -514,10 +513,8 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   // Empty means the request never named a collection - a malformed request,
   // not a missing collection.
   if (key.name.empty()) throw InvalidCollectionNameError("collection name is empty");
-  // Otherwise lookup-only, no name validation: every map key is
-  // filesystem-safe (from a validated create or a startup directory listing),
-  // and a tombstoned legacy-named collection must stay deletable.
-  auto storage = factory->collection(key);
+  // Otherwise lookup-only: every map key came from a validated create or catalog.
+  auto& storage = catalog(key.tenant);
   Transition transition(*this, key);
   {
     std::lock_guard lock(slotsMutex);
@@ -529,7 +526,7 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
       validate(key);
       throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
     }
-    storage.remove();
+    storage.remove(key.name);
     return;
   }
   // The placeholder answers resolution while the transition holds the name.
@@ -547,7 +544,7 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
       if (shard->iw) shard->iw->close();
       shard->snapshots->close();
     }
-    storage.remove();
+    storage.remove(key.name);
   } catch (const std::exception& e) {
     fail(e.what());
     throw;
@@ -576,7 +573,9 @@ Collections::Candidate Collections::stage(const CollectionId& key, std::string_v
     slot.leased.insert(lease->incarnation);
     lease->active = true;
   }
-  auto collection = makeCollection(key, factory->collection(key).create(incarnation));
+  auto& tenant = catalog(key.tenant);
+  tenant.reserve(key.name, incarnation);
+  auto collection = makeCollection(key, tenant.directory(key.name, incarnation));
   return Candidate(key, std::string(incarnation), std::move(collection), std::move(lease));
 }
 
@@ -599,7 +598,7 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
   const auto& name = candidate.id_;
   const auto& incarnation = candidate.incarnation_;
   auto collection = candidate.collection_;
-  auto storage = factory->collection(name);
+  auto& storage = catalog(name.tenant);
   Transition transition(*this, name);
   if (map.get(name) != expected) throw std::runtime_error("collection changed during installation");
   // Allocate what registration needs before the commit point.
@@ -609,10 +608,9 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
     reserved = Collection::placeholder(name, "being installed");
     if (!map.insert(name, reserved)) throw std::runtime_error("collection changed during installation");
   }
-  // The commit point. Selection is rewritten and synced even if CURRENT
-  // already names the candidate: an earlier attempt may have renamed it into
-  // place without making it durable. On failure nothing is retired.
-  try { storage.select(incarnation); }
+  // The catalog activation is the commit point. A repeated activation re-syncs
+  // an earlier uncertain publication. On failure nothing is retired.
+  try { storage.activate(name.name, incarnation); }
   catch (...) {
     if (reserved) map.erase(name, reserved);
     throw;
@@ -639,7 +637,7 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
 void Collections::retainSelected(const CollectionId& name) noexcept {
   try {
     Transition transition(*this, name);
-    if (auto selected = factory->collection(name).current()) retire(name, *selected);
+    if (auto selected = catalog(name.tenant).current(name.name)) retire(name, *selected);
   } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' skipped: {}", name.label(), e.what()); }
 }
 
@@ -650,9 +648,9 @@ void Collections::discard(Candidate& candidate) noexcept {
   candidate.lease.reset();
   try {
     Transition transition(*this, candidate.id_);
-    auto storage = factory->collection(candidate.id_);
-    // An unreadable CURRENT keeps the directory: it may be the selected one.
-    if (storage.current() == candidate.incarnation_) return;
+    auto& storage = catalog(candidate.id_.tenant);
+    // An unreadable catalog selection keeps the directory: it may be the selected one.
+    if (storage.current(candidate.id_.name) == candidate.incarnation_) return;
     {
       std::lock_guard lock(slotsMutex);
       auto it = slots.find(candidate.id_);

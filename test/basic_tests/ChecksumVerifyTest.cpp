@@ -46,7 +46,7 @@ protected:
   }
   static std::filesystem::path dirOf(LuxirNode& node, const std::string& collection) {
     auto incarnation = node.getCollection(collection)->getShard()->getSnapshots().snapshot()->id.incarnation;
-    return std::filesystem::path(node.getConfig().store.data_dir) / "t" / "t0" / collection / incarnation;
+    return std::filesystem::path(node.getConfig().store.data_dir) / "t" / "t0" / "i" / incarnation;
   }
   // Flips one byte in the middle of the collection's largest file; same size.
   // Flipping it again restores the file.
@@ -131,7 +131,7 @@ TEST_F(ChecksumVerifyTest, readOnlyVerifiesMagicBeforeParsing) {
     LuxirNode reader(config);
     expectUnavailable(reader, "main", damaged);
   }
-  FSDirectory marked(dir, false);
+  FSDirectory marked(dir);
   std::array<std::string, 1> suspects{damaged.name};
   CorruptionMarker::write(marked, suspects, "damaged magic header");
   config.store.verify_on_open = "none";
@@ -228,7 +228,7 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
     EXPECT_EQ(1u, count(dir, CorruptionMarker::kPrefix));
   }
   {
-    FSDirectory marked(dir, false);
+    FSDirectory marked(dir);
     EXPECT_EQ(std::vector<std::string>{damaged.name}, CorruptionMarker::read(marked));
     // Default policy: only the recorded file is checked, and it still fails.
     LuxirNode node(config);
@@ -252,7 +252,7 @@ TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
     suspect = *std::ranges::max_element(node.getCollection("main")->getShard()->getSnapshots().snapshot()->files, {}, &FileDescriptor::size);
   }
   {
-    FSDirectory old(dir, false);
+    FSDirectory old(dir);
     auto manifest = Manifest::load(old);
     auto torn = old.createFile(Manifest::name(manifest.generation + 1));
     OutputStream out(torn.get()); out.write((char)0); out.close(); old.finishFile(*torn);
@@ -262,11 +262,11 @@ TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
   }
   LuxirNode node(config);
   expectUnavailable(node, "main", suspect);
-  auto storage = node.collections().storage().collection(CollectionId::of("main"));
-  auto selected = storage.current();
+  auto& storage = node.collections().catalog();
+  auto selected = storage.current("main");
   ASSERT_TRUE(selected);
   EXPECT_NE(dir.filename().string(), *selected);
-  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.open(*selected)));
+  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory("main", *selected)));
   EXPECT_NO_THROW(node.getCollection("other"));
 }
 

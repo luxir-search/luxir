@@ -23,13 +23,13 @@ protected:
   LuxirNode node;
   CollectionHelper h{node, "main"};
   Collections& collections = node.collections();
-  CollectionStorage storage = collections.storage().collection(CollectionId::of("main"));
+  TenantCatalog& storage = collections.catalog();
   std::string selected, copy;
 
   void SetUp() override {
     ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
-    selected = *storage.current();
-    copy = copySnapshot(storage, selected, Manifest::load(*storage.open(selected)));
+    selected = *storage.current("main");
+    copy = copySnapshot(storage, "main", selected, Manifest::load(*storage.directory("main", selected)));
   }
   Collections::Prepared prepared() {
     auto candidate = collections.stage(CollectionId::of("main"), copy);
@@ -38,41 +38,45 @@ protected:
 };
 
 TEST_F(CollectionsTest, installActivatesOnlyOverTheExpectedEntry) {
-  // A changed map is detected before CURRENT moves.
+  // A changed map is detected before the catalog moves.
   EXPECT_THROW(collections.install(prepared(), nullptr), std::runtime_error);
-  EXPECT_EQ(selected, storage.current());
+  EXPECT_EQ(selected, storage.current("main"));
 
   auto installed = collections.install(prepared(), collections.get(CollectionId::of("main")));
   EXPECT_EQ(installed, collections.get(CollectionId::of("main")));
-  EXPECT_EQ(copy, storage.current());
-  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations());
+  EXPECT_EQ(copy, storage.current("main"));
+  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations("main"));
   EXPECT_EQ(1, installed->getReaderManager().getReader()->liveDocs());
 
   // Abandoning a candidate never removes the selected incarnation.
   auto again = collections.stage(CollectionId::of("main"), copy);
   collections.discard(again);
-  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations());
+  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations("main"));
 }
 
-TEST_F(CollectionsTest, installReplacesUnreadableSelection) {
-  auto container = collections.storage().container(CollectionId::of("main"), false);
-  container->deleteFile("CURRENT");
-  auto file = container->createFile("CURRENT");
-  OutputStream out(file.get()); out.write("{", 1); out.close();
-  container->finishFile(*file);
-  EXPECT_THROW(storage.current(), std::runtime_error);
-  collections.install(prepared(), collections.get(CollectionId::of("main")));
-  EXPECT_EQ(copy, storage.current());
+TEST_F(CollectionsTest, ownsOneCatalogPerTenant) {
+  EXPECT_EQ(&storage, &collections.catalog());
+  auto& other = collections.catalog("other");
+  EXPECT_NE(&storage, &other);
+  EXPECT_EQ(&other, &collections.catalog("other"));
+}
+
+TEST_F(CollectionsTest, installPreservesAnUnreadableCatalog) {
+  auto container = collections.storage().directory(StorageRoot::AUTHORITATIVE, "t/t0");
+  container->publishFile("CATALOG", std::as_bytes(std::span("{", 1)), Directory::PublishMode::REPLACE);
+  EXPECT_THROW(storage.current("main"), std::runtime_error);
+  EXPECT_THROW(collections.install(prepared(), collections.get(CollectionId::of("main"))), std::runtime_error);
+  EXPECT_EQ("{", container->openFile("CATALOG")->read());
 }
 
 TEST_F(CollectionsTest, stagedCandidatesSurviveRetirementAndBlockRemoval) {
-  auto staged = collections.stage(CollectionId::of("main"), "pending");
+  auto staged = collections.stage(CollectionId::of("main"), "00000000001");
   EXPECT_THROW(collections.remove(CollectionId::of("main")), CollectionUnavailableError);
   collections.install(prepared(), collections.get(CollectionId::of("main")));
-  auto incarnations = storage.incarnations();
-  EXPECT_EQ((std::set<std::string>{copy, "pending"}), std::set<std::string>(incarnations.begin(), incarnations.end()));
+  auto incarnations = storage.incarnations("main");
+  EXPECT_EQ((std::set<std::string>{copy, "00000000001"}), std::set<std::string>(incarnations.begin(), incarnations.end()));
   collections.discard(staged);
-  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations());
+  EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations("main"));
   collections.remove(CollectionId::of("main"));
   EXPECT_FALSE(collections.get(CollectionId::of("main")));
 }
@@ -87,7 +91,7 @@ TEST_F(CollectionsTest, creationOwnsItsNameUntilAnnounced) {
   auto creation = std::async(std::launch::async, [&] { return collections.create(CollectionId::of("other")); });
   initialized.get_future().wait();
   EXPECT_THROW(collections.remove(CollectionId::of("other")), CollectionUnavailableError);
-  EXPECT_THROW(collections.stage(CollectionId::of("other"), "pending"), CollectionUnavailableError);
+  EXPECT_THROW(collections.stage(CollectionId::of("other"), "00000000001"), CollectionUnavailableError);
   resume.set_value();
   auto created = creation.get();
   ASSERT_TRUE(created->getShard());
@@ -162,7 +166,7 @@ TEST_F(CollectionsTest, cachePolicyUnknownNamesAndDeletion) {
   auto created = collections.create(CollectionId::of("unknown"));
   EXPECT_EQ(8192u, created->getReaderManager().filterCache->configuration().maxBytes);
   collections.setCacheBytes("", "main", 0);
-  auto candidate = collections.stage(CollectionId::of("main"), "pending");
+  auto candidate = collections.stage(CollectionId::of("main"), "00000000001");
   EXPECT_THROW(collections.remove(CollectionId::of("main")), CollectionUnavailableError);
   collections.discard(candidate);
   auto installed = collections.install(prepared(), collections.get(CollectionId::of("main")));

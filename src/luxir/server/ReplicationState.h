@@ -9,13 +9,13 @@
 
 namespace luxir {
 
-// Node-local follower discovery history. CURRENT only selects data.
+// Node-local follower discovery history. The tenant catalog selects data.
 struct ReplicationState {
   struct Collection {
     std::string advertised;
     std::string boot;
     bool replace_empty = true;
-    // Durable promotion target, recorded before switching CURRENT. A restart
+    // Durable promotion target, recorded before catalog activation. A restart
     // finishes that switch instead of minting another incarnation.
     std::string promoted;
   };

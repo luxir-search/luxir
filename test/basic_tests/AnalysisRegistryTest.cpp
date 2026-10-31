@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -284,8 +285,7 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
     }
   }
   // Rewrite the committed schema of "bad" as if a plugin's filter were absent.
-  FSDirectory container(path / "t" / "t0" / "bad");
-  FSDirectory dir(path / "t" / "t0" / "bad" / *CollectionStorage::current(container));
+  FSDirectory dir(test::incarnationPath(path, "bad"));
   auto loaded = readDurableIndexInfo(dir);
   api::SchemaDef missing;
   std::string error;

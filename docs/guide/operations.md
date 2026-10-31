@@ -39,7 +39,7 @@ Do not restore a raw directory copy over an existing writer identity.
 
 ## Read-only nodes
 
-A data directory has exactly one writer, which holds `write.lock` from startup
+A data directory has exactly one writer, which holds `node/write.lock` from startup
 until exit.
 
 `--read-only` opens an existing data directory without that lock:
@@ -86,14 +86,17 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend collections use
-`t/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
-file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant
-`t0`, so the default collection lives in `t/t0/main/`. An incarnation is 16 hex
-digits. `t/LAYOUT` names this layout; a data directory written in another layout
-is refused at startup and must be reindexed. Deletion removes and
-syncs `CURRENT` before removing the directory tree, so an interrupted deletion
-cannot reopen the partially deleted index. If
+On the filesystem backend, incarnations live at `t/<tenant>/i/<id>/`.
+A tenant's `CATALOG` maps collection names to active incarnations and records
+reservations and retirements. Single-tenant deployments use tenant `t0`.
+Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
+monotonically by the catalog. The root `LAYOUT` marker identifies this format;
+older layouts are refused at startup and must be reindexed. Node-private state,
+including `write.lock` and `replication.json`, lives under `node/`.
+
+Deletion marks the incarnation retiring in the catalog before removing its
+directory, then removes its entry. Writer startup finishes interrupted retirements
+and discards abandoned reservations; followers preserve reserved downloads. If
 deletion fails partway (for example an I/O error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
@@ -175,10 +178,9 @@ index files using the directory listing, without reading their contents. If
 startup falls back below the highest manifest generation, it logs an error and
 skips this sweep, preserving newer files for recovery.
 
-Publication scratch files use the reserved `.luxir-publish-` prefix. They are
-hidden from index listings and left alone when a directory opens, since another
-view may still be publishing. Crash leftovers can be removed while the node is
-stopped.
+Publication scratch files use the reserved `.luxir-publish-` prefix and are
+hidden from index listings. An owned filesystem view removes scratch files from
+other processes when it opens; the current process's publishers are left alone.
 
 Removals are not directory-synced: a crash may restore obsolete names, but the
 newest durable manifest does not reference them. Failed publication candidates

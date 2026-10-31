@@ -4,7 +4,8 @@
 #include "CommitSnapshot.h"
 #include <charconv>
 #include <format>
-#include <random>
+#include <atomic>
+#include <chrono>
 #include "luxir/api/index_files.h"
 #include "luxir/store/Manifest.h"
 
@@ -35,12 +36,16 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
 }
 
 std::string CommitId::newIncarnation() {
-  std::random_device random;
-  return std::format("{:016x}", ((uint64_t)random() << 32) | (uint32_t)random());
+  static std::atomic<uint64_t> last{0};
+  auto now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  auto previous = last.load(std::memory_order_relaxed);
+  uint64_t next;
+  do { next = std::max(now, previous + 1); } while (!last.compare_exchange_weak(previous, next, std::memory_order_relaxed));
+  return std::format("{:011x}", next);
 }
 
 bool CommitId::validIncarnation(std::string_view value) {
-  return value.size() == 16 && std::ranges::all_of(value, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+  return value.size() == 11 && std::ranges::all_of(value, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
 std::string CommitSnapshot::digestText(uint64_t digest) { return std::format("{:016x}", digest); }

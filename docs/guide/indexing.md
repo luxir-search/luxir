@@ -170,8 +170,8 @@ An empty commit object commits immediately and the response waits for
 publication. A request that fails as a whole (`status: "error"`) runs no
 immediate commit, though a positive `commit_within_ms` it set may still
 publish other updates. The response's optional `commit` field identifies the resulting
-snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
-incarnation is 16 hex digits). The
+snapshot as the token `"19a38a9f000:42"` (`incarnation:index_gen`, where the
+incarnation is an 11-digit hexadecimal millisecond timestamp). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
 snapshot's id. An NDJSON URL EOF commit always returns
