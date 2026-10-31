@@ -60,6 +60,10 @@ public:
 
   static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
 
+  // The shared immutable empty set: the domain of a segment an op's query
+  // provably cannot match (QueryPruning).
+  static DocSet& emptyInstance();
+
   /// Union two or more DocSets into a single new DocSet.  All BITSET inputs
   /// must share a size (caller's responsibility - typically all from the same
   /// segment's maxDoc).  Result is BITSET if any input is BITSET, otherwise
@@ -162,6 +166,9 @@ public:
 
   DocSet* get() const { return docs; }
   bool isDeliverable() const { return docs == nullptr || lifetime != nullptr; }
+
+  // A deliverable handle on DocSet::emptyInstance(), which lives forever.
+  static DomainHandle empty();
 };
 
 /// non-owning BitDocSet
@@ -930,5 +937,18 @@ inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
   return std::make_unique<ArrDocSet>(std::move(*current));
 }
 
+
+inline DocSet& DocSet::emptyInstance() {
+  static ArrDocSet instance(std::vector<int32_t>{});
+  return instance;
+}
+
+inline DomainHandle DomainHandle::empty() {
+  // A non-owning pin: the static set needs no lifetime, and the alias keeps
+  // ownsStorage() false.
+  static const char tag = 0;
+  static const std::shared_ptr<const void> pin(std::shared_ptr<const void>{}, &tag);
+  return DomainHandle(&DocSet::emptyInstance(), pin);
+}
 
 }

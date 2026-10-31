@@ -11,6 +11,7 @@
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/geo.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -61,6 +62,12 @@ public:
   double getCenterLongitude() const { return centerLongitude; }
   double getRadiusMeters() const { return radiusMeters; }
   bool isEmpty() const { return false; }
+
+  // The circle's bounding box against the summary box.
+  MatchState mayMatch(const SummaryView& view) const override {
+    BKDDistanceRelation relation(centerLatitude, centerLongitude, radiusMeters);
+    return summary::geoMatch(view, field, relation.latMin, relation.latMax, relation.lonMin, relation.lonMax);
+  }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

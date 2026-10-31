@@ -14,6 +14,7 @@
 #include "Query.h"
 #include "TermQuery.h"
 #include "luxir/reader/NormsReader.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -91,6 +92,17 @@ public:
   std::span<const std::string_view> getFields() const { return fields; }
   std::span<const float> getWeights() const { return weights; }
   std::span<const Term> getTerms() const { return terms; }
+
+  // Any field/term entry may match: every entry must be proven absent.
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (terms.empty()) return MatchState::UNKNOWN;
+    for (const auto& term : terms) {
+      if (summary::termMatch(view, fields[term.field], term.text) != MatchState::EMPTY) {
+        return MatchState::UNKNOWN;
+      }
+    }
+    return MatchState::EMPTY;
+  }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const CombinedFieldQuery&>(other);

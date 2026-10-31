@@ -439,6 +439,11 @@ public:
     child->validateLogical(context, 1.0f);
   }
 
+  // Rescoring reorders matches; the inner query decides membership.
+  MatchState mayMatch(const SummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
