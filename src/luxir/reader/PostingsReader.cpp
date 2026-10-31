@@ -19,15 +19,24 @@ namespace luxir {
 
 namespace {
 
+// Open-time reads go through ranges: a lazy file fetches only these bytes.
 void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
-  InputStream is = file.getInputStream();
   std::string_view header = Postings::LUXIR_HEADER;
-  if (is.size() < (int64_t) header.size()
-      || std::memcmp(is.ptr(0), header.data(), header.size()) != 0) {
+  if (file.size() < header.size()) {
     throw std::runtime_error(std::format(
         "Segment file '{}' has invalid Luxir magic; expected '{}'",
         fileName, header));
   }
+  InputStream is = file.rangeStream(0, header.size());
+  if (std::memcmp(is.ptr(), header.data(), header.size()) != 0) {
+    throw std::runtime_error(std::format(
+        "Segment file '{}' has invalid Luxir magic; expected '{}'",
+        fileName, header));
+  }
+}
+
+[[noreturn]] void invalidSegment(std::string_view fileName, std::string_view what) {
+  throw std::runtime_error(std::format("Segment file '{}' is corrupt: {}", fileName, what));
 }
 
 } // namespace
@@ -77,6 +86,18 @@ struct PostingsReader::FieldPage {
   }
 };
 
+InputStream PostingsReader::materializeStream(uint32_t fnum) {
+  StreamSlot& slot = streams[fnum];
+  std::lock_guard lock(slot.mutex);  // other files materialize in parallel
+  if (!slot.ready.load(std::memory_order_relaxed)) {
+    // May fetch the whole file and throw; the slot stays unready then and the
+    // next caller retries.
+    slot.stream = files[fnum]->getInputStream();
+    slot.ready.store(true, std::memory_order_release);
+  }
+  return slot.stream;
+}
+
 // Initialize from files, returns false if missing files and missingFileOK=true
 bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
   std::string segStr = Postings::getSortableString(segId);
@@ -93,15 +114,18 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   }
   validateSegmentFileHeader(*files.back(), segInfoFile);
 
-  inputStreams.emplace_back(files[0]->getInputStream());
-  InputStream firstIS = inputStreams[0];
-
-  // seek to the end of firstIs and read the size of the segmentInfo
-  // See PostingsWriter.writeSegmentInfo
-  firstIS.seek(firstIS.size() - sizeof(int32_t));
-  auto segInfoSize = firstIS.readInt();
-  segInfoOffset = firstIS.size() - sizeof(int32_t) - segInfoSize;
-  firstIS.seek(segInfoOffset);
+  // File 0 ends with: ... field metadata, offsets table, field count, segment
+  // info, segment info size. See PostingsWriter::writeSegmentInfo.
+  InputFile& first = *files[0];
+  const int64_t firstSize = (int64_t)first.size();
+  const int64_t headerSize = (int64_t)Postings::LUXIR_HEADER.size();
+  if (firstSize < headerSize + (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no segment info");
+  auto segInfoSize = first.rangeStream((uint64_t)firstSize - sizeof(int32_t), sizeof(int32_t)).readInt();
+  if (segInfoSize < 0 || segInfoSize > firstSize - headerSize - (int64_t)sizeof(int32_t)) {
+    invalidSegment(segInfoFile, "invalid segment info size");
+  }
+  segInfoOffset = firstSize - sizeof(int32_t) - segInfoSize;
+  InputStream firstIS = first.rangeStream((uint64_t)segInfoOffset, (uint64_t)segInfoSize);
   maxdoc = firstIS.readVint();
   uint32_t physicalFileCount = firstIS.readVint();
   if (physicalFileCount == 0) {
@@ -122,7 +146,7 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   auto versionsLoc = seg_location::read(firstIS);
   uint32_t versionCount = firstIS.readVint();
   files.resize((size_t) physicalFileNums.back() + 1);
-  inputStreams.resize((size_t) physicalFileNums.back() + 1);
+  streams = std::make_unique<StreamSlot[]>(files.size());
 
   for (size_t i = 1; i < physicalFileNums.size(); i++) {
     uint32_t fileNum = physicalFileNums[i];
@@ -137,23 +161,56 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
     validateSegmentFileHeader(*files[fileNum], fileName);
-    inputStreams[fileNum] = files[fileNum]->getInputStream();
   }
+  // A file that is already resident publishes its stream now; a lazy file's
+  // stream is made by its first bulk reader.
+  for (size_t fileNum = 0; fileNum < files.size(); fileNum++) {
+    if (files[fileNum] && !files[fileNum]->lazy()) {
+      streams[fileNum].stream = files[fileNum]->getInputStream();
+      streams[fileNum].ready.store(true, std::memory_order_relaxed);
+    }
+  }
+
   if (maxdoc > 0) {
     uint32_t fileNum = versionsLoc.filenum();
-    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= inputStreams.size() || !files[fileNum]) {
+    if (versionCount == 0 || versionsLoc.isNull() || fileNum >= files.size() || !files[fileNum]) {
       throw std::runtime_error("Segment has invalid request birth versions");
     }
-    const auto& input = inputStreams[fileNum];
-    versions = VersionRuns(input.ptr(0), input.size(), versionsLoc.offset(), versionCount, maxdoc);
+    // The run directory ends at the header; the blocks precede it. Both are
+    // validated and then read lazily through pointers, so make them resident.
+    InputFile& file = *files[fileNum];
+    uint64_t fileSize = file.size(), offset = versionsLoc.offset();
+    if (offset > fileSize || fileSize - offset < sizeof(VersionRunsHeader)) {
+      throw std::runtime_error("Invalid request-version run coverage or encoding");
+    }
+    InputStream headerIS = file.rangeStream(offset, sizeof(VersionRunsHeader));
+    const char* fileBase = headerIS.ptr() - offset;
+    VersionRunsHeader header;
+    std::memcpy(&header, headerIS.ptr(), sizeof(header));
+    if (header.bytes > offset + sizeof(VersionRunsHeader)) {
+      throw std::runtime_error("Invalid request-version run coverage or encoding");
+    }
+    file.rangeStream(offset + sizeof(VersionRunsHeader) - header.bytes, header.bytes);
+    versions = VersionRuns(fileBase, fileSize, offset, versionCount, maxdoc);
   } else if (maxdoc != 0 || versionCount != 0 || !versionsLoc.isNull()) {
     throw std::runtime_error("Segment has invalid request birth versions");
   }
-  auto fields = inputStreams[0];
-  fields.seek(segInfoOffset - sizeof(int32_t));
-  auto count = fields.readInt();
+
+  // Field count, offsets table, then the catalog they point into.
+  if (segInfoOffset < headerSize + (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no field index");
+  auto count = first.rangeStream((uint64_t)segInfoOffset - sizeof(int32_t), sizeof(int32_t)).readInt();
+  if (count < 0 || (int64_t)count * (int64_t)sizeof(uint32_t) > segInfoOffset - headerSize - (int64_t)sizeof(int32_t)) {
+    invalidSegment(segInfoFile, "invalid field count");
+  }
   fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - (int64_t)count * sizeof(uint32_t);
-  fieldOffsets = (const uint32_t*)fields.ptr(fieldOffsetsLoc);
+  fieldOffsets = (const uint32_t*)first.rangeStream((uint64_t)fieldOffsetsLoc, (uint64_t)count * sizeof(uint32_t)).ptr();
+  catalogStart = fieldOffsetsLoc;
+  for (int32_t i = 0; i < count; i++) {
+    // Field entries precede the table; the largest offset is the first entry.
+    if ((int64_t)fieldOffsets[i] > fieldOffsetsLoc - headerSize) invalidSegment(segInfoFile, "invalid field offset");
+    catalogStart = std::min(catalogStart, fieldOffsetsLoc - (int64_t)fieldOffsets[i]);
+  }
+  catalog = first.rangeStream((uint64_t)catalogStart, (uint64_t)(firstSize - catalogStart));
   fieldPages = std::make_unique<std::atomic<FieldPage*>[]>(
       ((size_t)count + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE);
   nFields = count;
@@ -195,12 +252,13 @@ PostingsReader::~PostingsReader() {
 }
 
 int32_t PostingsReader::findOrdinal(std::string_view name) const {
-  const auto& input = inputStreams[0];
+  const auto& input = catalog;
+  const int64_t tableLoc = fieldOffsetsLoc - catalogStart;
   auto* end = fieldOffsets + nFields;
   auto* found = std::lower_bound(fieldOffsets, end, name, [&](uint32_t offset, std::string_view key) {
-    return input.readPackedTerm(fieldOffsetsLoc - offset) < key;
+    return input.readPackedTerm(tableLoc - offset) < key;
   });
-  return found != end && input.readPackedTerm(fieldOffsetsLoc - *found) == name
+  return found != end && input.readPackedTerm(tableLoc - *found) == name
       ? (int32_t)(found - fieldOffsets) : -1;
 }
 

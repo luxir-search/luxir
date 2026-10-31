@@ -75,7 +75,7 @@ struct CheckedDirConfig {
 };
 
 struct StoreConfig {
-  std::string backend = "ram";           // built in: ram, fs; plugins may add more
+  std::string backend = "ram";           // built in: ram, fs, ram_object; plugins may add more
   std::string data_dir = "luxir_data";
   // Layers wrapped around the backend, innermost first, inside checked_dir and read_only.
   std::vector<std::string> layers;

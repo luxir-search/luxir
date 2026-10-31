@@ -72,7 +72,7 @@ public:
   void freeze() { isFrozen = true; }
 };
 
-// Registers the built-in backends: ram and fs. Called when the global registry is built.
+// Registers the built-in backends: ram, fs and ram_object. Called when the global registry is built.
 void registerBuiltinStorage(StorageRegistry& registry);
 
 // Read-only access to the node-wide registry.

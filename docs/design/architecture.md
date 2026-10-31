@@ -114,6 +114,11 @@ deserialization step and no buffer copies between the page cache and query
 execution. The OS page cache is the caching layer - a hot index is served
 from memory, a cold one faults in on demand.
 
+The same read path serves segments kept in an object store: a file is fetched by
+byte range on first touch, and opening a segment costs a few small requests
+because each segment carries a hotcache of what opening it reads. See
+[storage tiers](storage-tiers.md).
+
 ### SIMD and branch discipline
 
 - Postings and numeric data are compressed with SIMD codecs (FastPFOR-based

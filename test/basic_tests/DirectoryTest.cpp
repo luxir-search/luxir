@@ -11,6 +11,7 @@
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/ObjectStoreDirectory.h"
 #include "luxir/util/Signal.h"
 #include <unistd.h>
 #include "test/LuxirTest.h"
@@ -228,6 +229,14 @@ protected:
     EXPECT_EQ(std::string("before") + middle + "after", input->read());
   }
 
+  // Tiny chunks, so lazy reads cross chunk boundaries even in small files.
+  static ObjectStoreDirectory::Options chunky(std::string stagingDir = {}) {
+    ObjectStoreDirectory::Options options;
+    options.chunkBytes = 8;
+    options.stagingDir = std::move(stagingDir);
+    return options;
+  }
+
   std::filesystem::path getTempDir() {
     std::string tmpl = (std::filesystem::temp_directory_path() / "luxir_test_XXXXXX").string();
     if (mkdtemp(tmpl.data()) == nullptr) {
@@ -337,6 +346,39 @@ TEST_F(DirectoryTest, fsdirPersistence) {
   std::filesystem::remove_all(path);
 }
 
+
+// --- ObjectStoreDirectory: the same contract over a RamObjectStore ---
+
+TEST_F(DirectoryTest, objectStoreDir) {
+  ObjectStoreDirectory dir(std::make_shared<RamObjectStore>(), "d/", chunky());
+  doDir(dir);
+}
+
+TEST_F(DirectoryTest, objectStoreDirThreads) {
+  ObjectStoreDirectory dir(std::make_shared<RamObjectStore>(), "d/", chunky());
+  doDirThreaded(dir);
+}
+
+TEST_F(DirectoryTest, objectStoreDirDataTypes) {
+  ObjectStoreDirectory dir(std::make_shared<RamObjectStore>(), "d/", chunky());
+  doDataTypes(dir);
+}
+
+TEST_F(DirectoryTest, objectStoreDirAppendFile) {
+  ObjectStoreDirectory dir(std::make_shared<RamObjectStore>(), "d/", chunky());
+  doAppendFile(dir);
+}
+
+TEST_F(DirectoryTest, objectStoreDirWithFilesystemStaging) {
+  auto path = getTempDir();
+  {
+    ObjectStoreDirectory dir(std::make_shared<RamObjectStore>(), "d/", chunky(path.string()));
+    doDir(dir);
+    doDirThreaded(dir);
+  }
+  EXPECT_TRUE(std::filesystem::is_empty(path));  // the staging directory is removed with the directory
+  std::filesystem::remove_all(path);
+}
 
 // --- CheckedDirectory tests ---
 

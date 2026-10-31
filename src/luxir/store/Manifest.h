@@ -113,6 +113,8 @@ struct Manifest {
         result.bytes = std::move(bytes);
         result.generation = generations[i];
         result.listing = std::move(listing);
+        // The chosen root names every committed file with its size.
+        dir.knownFiles(files(result.bytes));
         return result;
       }
       // Publication can retire a root after this scan, before read() opens it.
