@@ -221,10 +221,13 @@ class FSDirFactory : public DirectoryFactory {
   static constexpr std::string_view kLayout = "tenant/collection/incarnation 1\n";
   void checkLayout() {
     auto marker = collectionsPath_ / kLayoutFile;
-    if (std::filesystem::exists(marker)) {
+    auto validate = [&] {
       std::ifstream in(marker, std::ios::binary);
       std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
       if (text != kLayout) throw std::runtime_error("unsupported data directory layout in " + marker.string() + "; reindex it");
+    };
+    if (std::filesystem::exists(marker)) {
+      validate();
       return;
     }
     if (!holdsNoCollections(collectionsPath_) || std::filesystem::exists(basePath_ / "c")) {
@@ -232,15 +235,7 @@ class FSDirFactory : public DirectoryFactory {
     }
     if (unowned) return;
     FSDirectory collections(collectionsPath_, false);
-    auto pending = std::string(kLayoutFile) + ".pending";
-    auto file = collections.createFile(pending);
-    OutputStream out(file.get());
-    out.write(kLayout.data(), kLayout.size()); out.close();
-    collections.finishFile(*file);
-    std::array<std::string, 1> written{pending};
-    collections.sync(written);
-    collections.renameFile(pending, std::string(kLayoutFile));
-    syncDirectory(collectionsPath_);
+    if (!collections.publishFile(kLayoutFile, std::as_bytes(std::span(kLayout)), Directory::PublishMode::CREATE_ONLY)) validate();
   }
 
 public:
@@ -275,11 +270,11 @@ public:
     checkLayout();
   }
 
-  // An empty collections directory, apart from its layout marker and what an
-  // interrupted marker write leaves behind (LAYOUT.pending and its staging).
+  // An empty collections directory, apart from its marker and publication temps.
   static bool holdsNoCollections(const std::filesystem::path& collections) {
     for (const auto& entry : std::filesystem::directory_iterator(collections)) {
-      if (!entry.is_regular_file() || !entry.path().filename().string().starts_with(kLayoutFile)) return false;
+      auto name = entry.path().filename().string();
+      if (!entry.is_regular_file() || (name != kLayoutFile && !FSDirectory::isPublishTemp(name))) return false;
     }
     return true;
   }
@@ -341,8 +336,7 @@ public:
 
 private:
   static void syncDirectory(const std::filesystem::path& path) {
-    std::array<std::string, 1> directory{"."};
-    FSDirectory(path, false).sync(directory);
+    FSDirectory(path, false).syncDirectory();
   }
   // Creates `path` if missing and makes its entry in the parent durable. The
   // parent is synced even for an existing entry: an earlier creation may have

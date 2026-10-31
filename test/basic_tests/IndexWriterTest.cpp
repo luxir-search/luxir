@@ -3339,8 +3339,8 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {
   test::CollectionHelper helper(node, "main");
   auto writer = helper.getIndexWriter();
   writer->mergePolicy->setMergeFactor(100);
-  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
-    if (source == writer.get()) {
+  Signal::listen("publishWritten", [&](void* source, void*, void*) -> void* {
+    if (source == &writer->dir.underlying()) {
       auto manifest = test::readDurableIndexInfo(writer->dir);
       for (const auto& file : test::manifestFiles(*manifest)) {
         EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
@@ -3348,7 +3348,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {
     }
     return nullptr;
   });
-  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishWritten"); });
   ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "keep"), test::flatdoc("id", "replace")},
                            UpdateMessage::COMMIT).success);
   for (int i = 0; i < 3; i++) {
@@ -3479,6 +3479,7 @@ TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
 }
 
 TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
+  if (!std::filesystem::exists("/dev/full")) GTEST_SKIP() << "/dev/full is unavailable";
   auto path = std::filesystem::temp_directory_path() / "luxir-manifest-enospc";
   std::filesystem::remove_all(path);
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
@@ -3487,9 +3488,19 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
   CommitSnapshotRegistry writerSnapshots(dir);
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
-  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".pending.tmp"));
+  Signal::listen("publishOpened", [&](void* source, void*, void* file) -> void* {
+    if (source == fs.get()) {
+      int full = ::open("/dev/full", O_WRONLY);
+      if (full < 0) throw FileIOException("cannot open /dev/full");
+      auto close = scope_guard([&] { ::close(full); });
+      if (::dup2(full, *(int*)file) < 0) throw FileIOException("cannot inject ENOSPC");
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishOpened"); });
   addDoc(writer);
   EXPECT_THROW(writer.commit(), std::runtime_error);
+  Signal::unlisten("publishOpened");
   EXPECT_FALSE(writer.isClosed());
   EXPECT_EQ(before->index_gen, test::readDurableIndexInfo(dir)->index_gen);
   EXPECT_EQ(0, writer.snapshots.readers.getReader()->liveDocs());
@@ -3499,7 +3510,7 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
 }
 
 TEST_F(IndexWriterTest, failuresBeforeDurabilityLeaveWriterUsable) {
-  for (auto signal : {"commitDataSync", "manifestWritten", "manifestSynced"}) {
+  for (auto signal : {"commitDataSync", "publishWritten", "publishSynced"}) {
     RAMDir dir;
     CommitSnapshotRegistry writerSnapshots(dir);
     IndexWriter writer(writerSnapshots);
@@ -3518,7 +3529,7 @@ TEST_F(IndexWriterTest, failuresBeforeDurabilityLeaveWriterUsable) {
 }
 
 TEST_F(IndexWriterTest, readersAndSchemaDoNotWaitForDataSync) {
-  for (auto signal : {"commitDataSync", "manifestWritten"}) {
+  for (auto signal : {"commitDataSync", "publishWritten"}) {
     RAMDir dir;
     CommitSnapshotRegistry writerSnapshots(dir);
     IndexWriter writer(writerSnapshots);

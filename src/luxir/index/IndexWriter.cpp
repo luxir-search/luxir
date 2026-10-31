@@ -1750,8 +1750,6 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   Signal::emit("commitDataSync", this);
   if (!filesToSync.empty()) {
     dir.sync(filesToSync);
-    std::array<std::string, 1> syncDirectory = {"."};
-    dir.sync(syncDirectory);
   }
   // Only manifest assembly and publication serialize with schema changes.
   // The schema may have advanced while these segments/overlays were built.
@@ -2354,7 +2352,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   auto failure = std::make_shared<const std::string>("snapshot publication failed");
   bool durable = false;
   try {
-    Manifest::commit(dir, info.index_gen, *snapshot->bytes, this);
+    Manifest::commit(dir, info.index_gen, *snapshot->bytes);
     durable = true;
     Signal::emit("manifestDurable", this);
     {
@@ -2405,10 +2403,8 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       // are durable, so even a crash during cleanup is recoverable. Never reuse
       // its generation; a later successful publication also cleans its names.
       try {
-        dir.deleteFile(Manifest::name(info.index_gen));
-        dir.deleteFile(Manifest::name(info.index_gen) + ".tmp");
-        std::array<std::string, 1> syncDirectory = {"."};
-        dir.sync(syncDirectory);
+        std::array<std::string, 1> names{Manifest::name(info.index_gen)};
+        dir.deleteDurably(names);
       } catch (const std::exception& e) {
         LOG_WARN("Failed snapshot cleanup: {}", e.what());
       } catch (...) {

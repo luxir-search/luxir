@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <charconv>
 #include <map>
 #include "Directory.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
-#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -122,14 +122,10 @@ struct Manifest {
     }
   }
 
-  // A root is durable only after its file and directory entry are synced. It
-  // is written and synced under a pending name and renamed into place, so a failure
-  // never leaves a partial root and never removes one that already existed; an
-  // identical existing root (an interrupted earlier commit) is only re-synced.
-  // After a failure the root's durability is unknown. `source` identifies the
-  // committer to failure-injection signals. Every file the root references
-  // must already be synced (Directory::expectSynced).
-  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, void* source = nullptr) {
+  // Publication atomically installs a durable root; an identical existing root
+  // from an interrupted commit is only re-synced. After a failure its durability
+  // is unknown. Every referenced file must already be synced.
+  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
     {
       std::pmr::monotonic_buffer_resource arena;
       api::IndexInfo info;
@@ -140,33 +136,27 @@ struct Manifest {
     catch (const FileIOException&) {} // an unreadable root is what a repair replaces
     std::array<std::string, 1> root{name(gen)};
     if (!existing || *existing != bytes) {
-      auto pending = name(gen) + ".pending";
-      try {
-        write(dir, pending, bytes);
-        Signal::emit("manifestWritten", source);
-        std::array<std::string, 1> written{pending};
-        dir.sync(written);
-        Signal::emit("manifestSynced", source);
-        dir.renameFile(pending, root[0]);
-      } catch (...) {
-        try { dir.deleteFile(pending); } catch (...) {}
-        throw;
-      }
+      dir.publishFile(root[0], withFooter(bytes), Directory::PublishMode::REPLACE);
     } else dir.sync(root);
-    std::array<std::string, 1> directory{"."};
-    dir.sync(directory);
+  }
+
+  static std::vector<std::byte> withFooter(const std::vector<std::byte>& bytes) {
+    std::vector<std::byte> result(bytes);
+    std::array<uint64_t, 2> footer{bytes.size(), XXH3_64bits(bytes.data(), bytes.size())};
+    auto encoded = std::as_bytes(std::span(footer));
+    result.insert(result.end(), encoded.begin(), encoded.end());
+    return result;
   }
 
   static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
     write(dir, name(gen), bytes);
   }
   static void write(Directory& dir, const std::string& fileName, const std::vector<std::byte>& bytes) {
-    Directory::FileCreateOptions options; options.expectedSize = bytes.size() + 16;
+    auto contents = withFooter(bytes);
+    Directory::FileCreateOptions options; options.expectedSize = contents.size();
     auto file = dir.createFile(fileName, options);
     OutputStream out(file.get());
-    out.write(bytes.data(), bytes.size());
-    out.writeLong(bytes.size());
-    out.writeLong(XXH3_64bits(bytes.data(), bytes.size()));
+    out.write(contents.data(), contents.size());
     out.close();
     dir.finishFile(*file);
   }

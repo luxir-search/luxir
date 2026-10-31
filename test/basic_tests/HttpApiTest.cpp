@@ -4506,11 +4506,11 @@ TEST_F(HttpApiTest, ndjsonEofKeepsAllCommitOutcomesOnFailure) {
   CollectionHelper other(*luxirNode, "eof_failure_other");
   auto cleanup = scope_guard([&] { luxirNode->deleteCollection("eof_failure_other"); });
   auto writer = helper.getIndexWriter();
-  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
-    if (source == writer.get()) throw FileIOException("commit failed");
+  Signal::listen("publishWritten", [&](void* source, void*, void*) -> void* {
+    if (source == &writer->dir.underlying()) throw FileIOException("commit failed");
     return nullptr;
   });
-  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishWritten"); });
   for (bool multiple : {false, true}) {
     std::string body = "{\"id\":\"first\"}\n";
     if (multiple) body += "{\"_update_\":{\"collection\":\"eof_failure_other\"}}\n{\"id\":\"second\"}\n";

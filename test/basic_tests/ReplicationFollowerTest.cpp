@@ -396,7 +396,7 @@ TEST_P(ReplicationMatrixTest, corruptDownloadLeavesOldReaderServing) {
   auto write = [&](const std::string& bytes) {
     auto output = dir.createFile(name); OutputStream stream(output.get());
     stream.write(bytes.data(), bytes.size()); stream.close(); dir.finishFile(*output);
-    std::array<std::string, 2> names{name, "."}; dir.sync(names);
+    std::array<std::string, 1> names{name}; dir.sync(names);
   };
   Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
     std::lock_guard lock(mutex);
@@ -841,9 +841,8 @@ TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
   bool parentSynced = false, recorded = false;
   Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
     auto& dir = *(std::filesystem::path*)directory;
-    auto& name = *(std::string*)file;
-    if (dir == path / "follower" / "t" / "t0" / "main" && name == ".") parentSynced = true;
-    if (dir == path / "follower" && name == "replication.json.pending") {
+    if (dir == path / "follower" / "t" / "t0" / "main" && !file) parentSynced = true;
+    if (dir == path / "follower" && file && *(std::string*)file == "replication.json") {
       EXPECT_TRUE(parentSynced);
       recorded = true;
     }
@@ -1402,7 +1401,7 @@ TEST_F(ReplicationFollowerTest, fallbackWriterChangesIncarnation) {
   Manifest::write(*dir, old.generation, *old.bytes);
   auto file = dir->createFile(Manifest::name(newer.generation));
   OutputStream out(file.get()); out.write((char)0); out.close(); dir->finishFile(*file);
-  std::array<std::string, 3> names{Manifest::name(old.generation), Manifest::name(newer.generation), "."};
+  std::array<std::string, 2> names{Manifest::name(old.generation), Manifest::name(newer.generation)};
   dir->sync(names);
   startSource(); ASSERT_TRUE(caughtUp());
   EXPECT_NE(before.incarnation, source->getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);

@@ -34,8 +34,9 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
     auto present = std::ranges::find_if(listing, [&](const auto& entry) { return entry.name == file.name; });
     if (present == listing.end() || present->size != file.size) throw std::runtime_error("snapshot copy is missing " + file.name);
   }
-  std::array<std::string, 1> directory{"."};
-  next->sync(directory);
+  std::vector<std::string> names;
+  for (const auto& file : files) names.push_back(file.name);
+  next->sync(names);
   info.incarnation = incarnation;
   info.index_gen = manifest.highestGeneration + 1;
   info.commit_time++;
@@ -89,7 +90,7 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
         state.write(metadata);
       }
       // Re-select even if CURRENT already names the target: an earlier attempt
-      // may have renamed it into place without making it durable.
+      // may have installed it without making it durable.
       storage.select(promoted);
       storage.retainOnly(promoted);
       promotedCount++;
@@ -100,9 +101,8 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
     }
   }
   if (!failed) {
-    metadata.deleteFile("replication.json");
-    std::array<std::string, 1> directory{"."};
-    metadata.sync(directory);
+    std::array<std::string, 1> names{"replication.json"};
+    metadata.deleteDurably(names);
   }
   output << "Promote: " << promotedCount << " promoted, " << failed << " failed";
   if (!failed) output << "; promoted from follower of " << state.source;

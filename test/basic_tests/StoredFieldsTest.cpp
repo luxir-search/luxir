@@ -1417,7 +1417,7 @@ TEST_F(StoredFieldsTest, registryPreparedDictionariesSharedBySettings) {
 
 TEST_F(StoredFieldsTest, registryUnchangedOnFailedSchemaPublication) {
   auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
-  for (auto signal : {"manifestSynced", "manifestDurable"}) {
+  for (auto signal : {"publishSynced", "manifestDurable"}) {
     SCOPED_TRACE(signal);
     RAMDir dir;
     CommitSnapshotRegistry snapshots(dir);
@@ -1426,7 +1426,7 @@ TEST_F(StoredFieldsTest, registryUnchangedOnFailedSchemaPublication) {
     auto before = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
     auto pinned = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
     Signal::listen(signal, [&](void* source, void*, void*) -> void* {
-      if (source == &iw) throw std::runtime_error("injected schema publication failure");
+      if (source == &iw || source == &dir) throw std::runtime_error("injected schema publication failure");
       return nullptr;
     });
     auto cleanup = scope_guard([&] { Signal::unlisten(signal); });

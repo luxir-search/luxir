@@ -106,10 +106,11 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   EXPECT_THROW(dir->createFile("other"), ReadOnlyError);
   EXPECT_THROW(dir->deleteFile("hello"), ReadOnlyError);
   EXPECT_THROW(dir->deletePrefix("hel"), ReadOnlyError);
-  EXPECT_THROW(dir->renameFile("hello", "other"), ReadOnlyError);
+  EXPECT_THROW(dir->publishFile("hello", {}, Directory::PublishMode::REPLACE), ReadOnlyError);
   EXPECT_THROW(dir->clear(), ReadOnlyError);
   std::vector<std::string> syncNames{"hello"};
   EXPECT_THROW(dir->sync(syncNames), ReadOnlyError);
+  EXPECT_THROW(dir->deleteDurably(syncNames), ReadOnlyError);
   EXPECT_THROW(reader.remove(CollectionId::of("main")), ReadOnlyError);
   EXPECT_THROW(reader.container(CollectionId::of("absent"), true), ReadOnlyError);
   EXPECT_THROW(reader.collection(CollectionId::of("main")).create("incarnation"), ReadOnlyError);
@@ -149,7 +150,7 @@ TEST(DirLockTest, refusesDataFromAnotherLayout) {
 TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "t");
-  std::ofstream(tempDir.path() / "t" / "LAYOUT.pending") << "partial";
+  std::ofstream(tempDir.path() / "t" / ".luxir-publish-0-0") << "partial";
   { FSDirFactory writer(tempDir.path()); }
   EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "t" / "LAYOUT"));
   EXPECT_NO_THROW({ FSDirFactory writer(tempDir.path()); });

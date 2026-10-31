@@ -330,7 +330,7 @@ TEST_F(ReplicationHttpTest, snapshotJsonHeadAndEmptyFile) {
   OutputStream out(file.get());
   out.close();
   registry.dir.finishFile(*file);
-  std::array<std::string, 2> names{"zero", "."};
+  std::array<std::string, 1> names{"zero"};
   registry.dir.sync(names);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(registry.snapshot()->bytes, arena);

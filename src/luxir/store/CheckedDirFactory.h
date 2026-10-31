@@ -120,13 +120,26 @@ public:
     if (verbose_) LOG_DEBUG("CheckedDirectory: finishFile({}) size={}", file.name(), file.size());
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    delegate_->renameFile(from, to);
+  bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) override {
+    bool applied;
+    try { applied = delegate_->publishFile(name, bytes, mode); }
+    catch (...) {
+      std::lock_guard lock(mu_);
+      unsyncedFiles_.insert(std::string(name)); // installation may have preceded the failure
+      throw;
+    }
+    if (applied) {
+      std::lock_guard lock(mu_);
+      unsyncedFiles_.erase(std::string(name));
+    }
+    if (verbose_) LOG_DEBUG("CheckedDirectory: publishFile({}, applied={})", name, applied);
+    return applied;
+  }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    delegate_->deleteDurably(names);
     std::lock_guard lock(mu_);
-    bool unsynced = unsyncedFiles_.erase(std::string(from));
-    unsyncedFiles_.erase(std::string(to));
-    if (unsynced) unsyncedFiles_.insert(std::string(to));
-    if (verbose_) LOG_DEBUG("CheckedDirectory: renameFile({} -> {})", from, to);
+    for (const auto& name : names) unsyncedFiles_.erase(name);
   }
 
   void sync(std::span<const std::string> filenames) override {

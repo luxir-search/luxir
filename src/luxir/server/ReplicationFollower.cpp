@@ -44,10 +44,6 @@ std::string escape(std::string_view value) {
 void validateIncarnation(std::string_view value) {
   if (!CommitId::validIncarnation(value)) throw std::invalid_argument("invalid source incarnation");
 }
-void syncDir(Directory& dir) {
-  std::array<std::string, 1> names{"."};
-  dir.sync(names);
-}
 
 struct Source {
   std::string host, port, authority;
@@ -301,7 +297,7 @@ struct ReplicationFollower::Impl {
     } else {
       if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
         auto name = entry.path().filename().string();
-        if (name == "write.lock" || name == "replication.json.pending") continue;
+        if (name == "write.lock" || FSDirectory::isPublishTemp(name)) continue;
         if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
@@ -701,7 +697,7 @@ struct ReplicationFollower::Impl {
       // may have been verified but not synced before their pin vanished.
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
-    dir.sync(names); syncDir(dir);
+    dir.sync(names);
   }
 
   void sync(Clients& clients, const CollectionId& name) {

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <optional>
@@ -16,6 +17,7 @@
 #include <xxhash.h>
 #include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
+#include "luxir/util/Signal.h"
 #include "OutputStream.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -55,6 +57,8 @@ public:
 // Implementations of Directory are thread safe.
 class Directory {
 public:
+  enum class PublishMode { CREATE_ONLY, REPLACE };
+
   struct FileCreateOptions {
     std::function<void(int64_t)> ramBytesChanged;
     size_t ramSpillBytes = 0;
@@ -94,6 +98,9 @@ public:
   // Returns true if file was found and deleted, false if not found.
   virtual bool deleteFile(const std::string_view name) = 0;
 
+  // Removes the named files durably. Missing names are allowed.
+  virtual void deleteDurably(std::span<const std::string> names) = 0;
+
   virtual void deletePrefix(const std::string_view prefix) {
     std::vector<FileInfo> files;
     listFiles(files);
@@ -109,15 +116,13 @@ public:
   // owning Directory.
   virtual void finishFile(File &file) = 0;
 
-  // Atomically replace `to` with the already-finished file `from` when the
-  // backing store supports it. Offline derivative builders use this only
-  // after reopening and validating the unique source name.
-  virtual void renameFile(std::string_view from, std::string_view to) = 0;
+  // Atomically installs complete bytes, durable with their name on success.
+  // False means CREATE_ONLY found an existing name and changed nothing.
+  // A throw leaves the outcome unknown: publication may have taken place.
+  virtual bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) = 0;
 
-  // Fsync the given files to ensure durability.
-  // Use "." to fsync the directory itself (to persist renames/creates).
-  // The default implementation is a no-op (e.g. for RAMDir).
-  virtual void sync(std::span<const std::string> filenames) { unused(filenames); }
+  // Makes the named files' bytes AND directory entries durable. RAM is volatile.
+  virtual void sync(std::span<const std::string> names) = 0;
 
   // remove all files from the directory
   virtual void clear() = 0;
@@ -309,15 +314,28 @@ public:
     }
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = files.find(from);
-    if (it == files.end()) {
-      throw std::runtime_error("RAMDir::renameFile: source not found");
+  bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) override {
+    if (mode == PublishMode::CREATE_ONLY) {
+      std::lock_guard lock(mutex);
+      if (files.contains(name)) return false;
     }
-    auto value = std::move(it->second);
-    files.erase(it);
-    files[std::string(to)] = std::move(value);
+    StorageCharge charge(memory, bytes.size());
+    auto buffer = std::make_unique_for_overwrite<char[]>(bytes.size());
+    if (!bytes.empty()) std::memcpy(buffer.get(), bytes.data(), bytes.size());
+    auto input = std::make_shared<RAMInputFile>(std::move(buffer), bytes.size(), std::move(charge));
+    Signal::emit("publishWritten", this, &name);
+    Signal::emit("publishSynced", this, &name);
+    std::lock_guard lock(mutex);
+    if (mode == PublishMode::CREATE_ONLY && files.contains(name)) return false;
+    files[std::string(name)] = std::move(input);
+    return true;
+  }
+
+  void sync(std::span<const std::string> names) override { unused(names); }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    std::lock_guard lock(mutex);
+    for (const auto& name : names) files.erase(name);
   }
 
   void linkFile(Directory& source, std::string_view name) override {

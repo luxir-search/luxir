@@ -4,8 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
+#include <limits>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -490,12 +493,18 @@ public:
 /// Filesystem-backed Directory using mmap for reads and buffered writes.
 class FSDirectory : public Directory {
   std::filesystem::path basePath_;
+  inline static std::atomic<uint64_t> nextPublishTemp{0};
+  static constexpr std::string_view publishTempPrefix = ".luxir-publish-";
 
   std::filesystem::path filePath(std::string_view name) const {
     return basePath_ / name;
   }
 
 public:
+  // Reserved publication scratch files are hidden, not removed on open: a
+  // second view may open while another publisher is still using its temp.
+  static bool isPublishTemp(std::string_view name) { return name.starts_with(publishTempPrefix); }
+
   void linkFile(Directory& source, std::string_view name) override {
     auto& fs = dynamic_cast<FSDirectory&>(source.underlying());
     std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
@@ -514,6 +523,7 @@ public:
   void listFiles(std::vector<FileInfo>& target) override {
     auto startIdx = target.size();
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      if (isPublishTemp(entry.path().filename().string())) continue;
       // A file may be deleted between readdir and stat; skip on any error.
       std::error_code ec;
       if (!entry.is_regular_file(ec) || ec) {
@@ -601,20 +611,59 @@ public:
     std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    std::filesystem::rename(filePath(from), filePath(to));
+  bool publishFile(std::string_view name, std::span<const std::byte> bytes, PublishMode mode) override {
+    if (isPublishTemp(name)) throw std::invalid_argument("reserved publication temp name");
+    auto target = filePath(name);
+    std::filesystem::path temp;
+    int fd;
+    for (;;) {
+      temp = filePath(std::format("{}{}-{}", publishTempPrefix, getpid(),
+          nextPublishTemp.fetch_add(1, std::memory_order_relaxed)));
+      fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+      if (fd >= 0) break;
+      if (errno != EEXIST) throw FileIOException("Cannot create publication temp: " + temp.string() + ": " + strerror(errno));
+    }
+    auto cleanup = scope_guard([&] { ::close(fd); ::unlink(temp.c_str()); });
+    // The open hook exposes the fd for real I/O failure injection in tests.
+    Signal::emit("publishOpened", this, &name, &fd);
+    size_t written = 0;
+    while (written < bytes.size()) {
+      auto count = ::write(fd, bytes.data() + written,
+          std::min(bytes.size() - written, (size_t)std::numeric_limits<ssize_t>::max()));
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) throw FileIOException("Publication write failed: " + temp.string() + ": " + (count ? strerror(errno) : "zero write"));
+      written += (size_t)count;
+    }
+    Signal::emit("publishWritten", this, &name);
+    if (::fsync(fd) < 0) throw FileIOException("Publication fsync failed: " + temp.string() + ": " + strerror(errno));
+    std::string syncedName(name);
+    Signal::emit("fsSynced", &basePath_, &syncedName);
+    Signal::emit("publishSynced", this, &name);
+    if (mode == PublishMode::CREATE_ONLY) {
+      if (::link(temp.c_str(), target.c_str()) < 0) {
+        if (errno == EEXIST) return false;
+        throw FileIOException("Publication link failed: " + target.string() + ": " + strerror(errno));
+      }
+      if (::unlink(temp.c_str()) < 0) throw FileIOException("Publication temp removal failed: " + temp.string() + ": " + strerror(errno));
+    } else if (::rename(temp.c_str(), target.c_str()) < 0) {
+      throw FileIOException("Publication rename failed: " + target.string() + ": " + strerror(errno));
+    }
+    syncDirectory();
+    return true;
   }
 
-  // Fsync the given files.  Use "." to fsync the directory itself
-  // (to ensure renames/creates are durable).
+  // Also used by FSDirFactory to persist directory creation and removal.
+  void syncDirectory() {
+    int fd = ::open(basePath_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) throw FileIOException("Cannot open directory for fsync: " + basePath_.string() + ": " + strerror(errno));
+    auto close = scope_guard([&] { ::close(fd); });
+    if (::fsync(fd) < 0) throw FileIOException("Directory fsync failed: " + basePath_.string() + ": " + strerror(errno));
+    Signal::emit("fsSynced", &basePath_); // null file denotes the directory itself
+  }
+
   void sync(std::span<const std::string> filenames) override {
     for (auto& name : filenames) {
-      int fd;
-      if (name == ".") {
-        fd = ::open(basePath_.c_str(), O_RDONLY);
-      } else {
-        fd = ::open(filePath(name).c_str(), O_RDONLY);
-      }
+      int fd = ::open(filePath(name).c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
         throw std::runtime_error("FSDirectory::sync: failed to open " + name + ": " + strerror(errno));
       }
@@ -625,6 +674,16 @@ public:
       ::close(fd);
       Signal::emit("fsSynced", &basePath_, (void*)&name);
     }
+    syncDirectory();
+  }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    for (const auto& name : names) {
+      if (::unlink(filePath(name).c_str()) < 0 && errno != ENOENT) {
+        throw FileIOException("Cannot delete file: " + std::string(name) + ": " + strerror(errno));
+      }
+    }
+    syncDirectory();
   }
 
   void clear() override {

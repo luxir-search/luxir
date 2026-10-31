@@ -65,9 +65,11 @@ public:
     reject(std::string("finishFile(") + std::string(file.name()) + ")");
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    reject(std::string("renameFile(") + std::string(from) + " -> " + std::string(to) + ")");
+  bool publishFile(std::string_view name, std::span<const std::byte>, PublishMode) override {
+    reject(std::string("publishFile(") + std::string(name) + ")");
   }
+
+  void deleteDurably(std::span<const std::string>) override { reject("deleteDurably"); }
 
   void sync(std::span<const std::string> filenames) override {
     unused(filenames);

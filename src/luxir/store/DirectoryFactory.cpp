@@ -22,16 +22,7 @@ std::optional<std::string> CollectionStorage::current(Directory& container) {
 void CollectionStorage::select(std::string_view incarnation) {
   auto container = factory->container(id_, false);
   auto bytes = glz::write_json(Selection{std::string(incarnation)}).value();
-  Directory::FileCreateOptions options; options.expectedSize = bytes.size();
-  auto file = container->createFile("CURRENT.pending", options);
-  OutputStream out(file.get());
-  out.write(bytes.data(), bytes.size()); out.close();
-  container->finishFile(*file);
-  std::array<std::string, 1> pending{"CURRENT.pending"};
-  container->sync(pending);
-  container->renameFile("CURRENT.pending", "CURRENT");
-  std::array<std::string, 1> directory{"."};
-  container->sync(directory);
+  container->publishFile("CURRENT", std::as_bytes(std::span(bytes)), Directory::PublishMode::REPLACE);
 }
 
 } // namespace luxir

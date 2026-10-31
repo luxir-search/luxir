@@ -175,6 +175,11 @@ index files using the directory listing, without reading their contents. If
 startup falls back below the highest manifest generation, it logs an error and
 skips this sweep, preserving newer files for recovery.
 
+Publication scratch files use the reserved `.luxir-publish-` prefix. They are
+hidden from index listings and left alone when a directory opens, since another
+view may still be publishing. Crash leftovers can be removed while the node is
+stopped.
+
 Removals are not directory-synced: a crash may restore obsolete names, but the
 newest durable manifest does not reference them. Failed publication candidates
 are removed and the directory is synced best-effort. An error response does not
