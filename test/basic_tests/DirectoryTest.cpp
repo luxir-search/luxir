@@ -749,3 +749,35 @@ TEST_F(DirectoryTest, publicationPersistsNewAncestors) {
   reopened->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY);
   EXPECT_EQ((std::vector<std::filesystem::path>{root / "a/b", root / "a", root}), synced);
 }
+
+TEST_F(DirectoryTest, deletionSerializesWithMatchedPublication) {
+  for (bool durable : {false, true}) {
+    auto path = getTempDir();
+    auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+    FSDirectory dir(path), other(path);
+    auto version = dir.publishFile("root", {}, Directory::PublishMode::CREATE_ONLY).value();
+    std::promise<void> matched, deleting;
+    std::latch resume(1);
+    Signal::listen("publishMatched", [&](void*, void*, void*) -> void* {
+      matched.set_value(); resume.wait(); return nullptr;
+    });
+    auto unlisten = scope_guard([] { Signal::unlisten("publishMatched"); });
+    auto publication = std::async(std::launch::async, [&] {
+      return dir.publishFile("root", {}, Directory::PublishCondition::match(version));
+    });
+    matched.get_future().wait();
+    auto removal = std::async(std::launch::async, [&] {
+      deleting.set_value();
+      if (durable) {
+        std::array<std::string, 1> names{"root"};
+        other.deleteDurably(names);
+      } else EXPECT_TRUE(other.deleteFile("root"));
+    });
+    deleting.get_future().wait();
+    EXPECT_EQ(std::future_status::timeout, removal.wait_for(std::chrono::milliseconds(20)));
+    resume.count_down();
+    EXPECT_TRUE(publication.get());
+    removal.get();
+    EXPECT_FALSE(dir.readPublished("root"));
+  }
+}

@@ -13,6 +13,15 @@ namespace luxir {
 namespace {
 constexpr auto authoritative = StorageRoot::AUTHORITATIVE;
 constexpr std::string_view layout = "tenant/catalog/incarnation 2\n";
+std::vector<std::string> catalogTenants(DirectoryFactory& factory) {
+  std::vector<std::string> names;
+  for (const auto& child : factory.children(authoritative, "t")) if (child.directory) {
+    try { Collections::validateName(child.name, "tenant"); }
+    catch (const InvalidCollectionNameError&) { continue; }
+    names.push_back(child.name);
+  }
+  return names;
+}
 }
 
 TenantCatalog::TenantCatalog(DirectoryFactory& factory, std::string_view tenant)
@@ -218,15 +227,15 @@ void TenantCatalog::cleanup(bool follower) {
 
 std::vector<CollectionId> TenantCatalog::collections(DirectoryFactory& factory) {
   std::set<CollectionId> names;
-  for (const auto& child : factory.children(authoritative, "t")) if (child.directory) {
-    for (const auto& entry : TenantCatalog(factory, child.name).read().entries) {
-      if (entry.name && (entry.state == "active" || entry.state == "reserved")) names.emplace(child.name, *entry.name);
+  for (const auto& tenant : catalogTenants(factory)) {
+    for (const auto& entry : TenantCatalog(factory, tenant).read().entries) {
+      if (entry.name && (entry.state == "active" || entry.state == "reserved")) names.emplace(tenant, *entry.name);
     }
   }
   return {names.begin(), names.end()};
 }
 void TenantCatalog::recover(DirectoryFactory& factory, bool follower) {
-  for (const auto& child : factory.children(authoritative, "t")) if (child.directory) TenantCatalog(factory, child.name).cleanup(follower);
+  for (const auto& tenant : catalogTenants(factory)) TenantCatalog(factory, tenant).cleanup(follower);
 }
 bool TenantCatalog::empty(DirectoryFactory& factory) {
   for (const auto& child : factory.children(authoritative, "")) {

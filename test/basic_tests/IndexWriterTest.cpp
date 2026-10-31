@@ -3465,7 +3465,7 @@ TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
 }
 
 TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
-  for (auto name : {"s01.1_00", "commit_x", "commit_3.tmp"}) {
+  for (auto name : {"s01.1_00", "s01.1__L01.2", "s01.1__vec.title_v_02.3_00", "commit_3.1"}) {
     RAMDir dir;
     auto file = dir.createFile(name);
     OutputStream out(file.get());

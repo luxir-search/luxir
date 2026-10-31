@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -503,9 +505,6 @@ private:
   std::filesystem::path durabilityRoot;
   std::shared_ptr<ParentSync> parents;
   inline static std::atomic<uint64_t> nextPublishTemp{0};
-  // write.lock excludes other owning processes. Every install takes this lock
-  // so a Replace cannot interleave a Match check and rename. No fsync holds it.
-  inline static std::mutex publicationMutex;
   static constexpr std::string_view publishTempPrefix = ".luxir-publish-";
 
   static PublicationVersion versionOf(int fd, std::span<const std::byte> bytes) {
@@ -522,6 +521,26 @@ private:
         modified.tv_sec, modified.tv_nsec, info.st_size, XXH3_64bits(bytes.data(), bytes.size()));
   }
 
+  // Fresh file descriptions serialize threads and processes alike. Deletion
+  // shares this lock with publication so it cannot race a Match check/install.
+  // No fsync holds the lock; local filesystems release it on process death.
+  // Network filesystems that can revoke a stalled client's lock are unsafe.
+  int lockDirectory() const {
+    int fd = ::open(basePath_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ENOENT) return -1;
+      throw FileIOException("Cannot open publication directory: " + basePath_.string() + ": " + strerror(errno));
+    }
+    while (::flock(fd, LOCK_EX) < 0) {
+      if (errno != EINTR) {
+        auto message = "Cannot lock publication directory: " + basePath_.string() + ": " + strerror(errno);
+        ::close(fd);
+        throw FileIOException(message);
+      }
+    }
+    return fd;
+  }
+
   std::filesystem::path filePath(std::string_view name) const {
     if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\\0", 0, 3) != std::string_view::npos) {
       throw std::invalid_argument("invalid directory file name");
@@ -530,7 +549,7 @@ private:
   }
 
 public:
-  // Listings hide scratch files. Owned factories remove other processes' temps.
+  // Listings hide scratch files. Owned factories remove dead processes' temps.
   static bool isPublishTemp(std::string_view name) { return name.starts_with(publishTempPrefix); }
 
   void linkFile(Directory& source, std::string_view name) override {
@@ -556,7 +575,8 @@ public:
       if (dash == std::string_view::npos) continue;
       uint64_t pid = 0;
       auto [end, error] = std::from_chars(text.data(), text.data() + dash, pid);
-      if (error == std::errc() && end == text.data() + dash && pid != (uint64_t)getpid()) {
+      if (error == std::errc() && end == text.data() + dash && pid <= (uint64_t)std::numeric_limits<pid_t>::max()
+          && (pid == 0 || (::kill((pid_t)pid, 0) < 0 && errno == ESRCH))) {
         if (::unlink(entry.path().c_str()) < 0 && errno != ENOENT) throw FileIOException("Cannot remove publication temp: " + entry.path().string());
       }
     }
@@ -620,6 +640,9 @@ public:
 
   bool deleteFile(std::string_view name) override {
     auto path = filePath(name);
+    int fd = lockDirectory();
+    if (fd < 0) return false;
+    auto unlock = scope_guard([&] { ::close(fd); });
     return std::filesystem::remove(path);
   }
 
@@ -702,10 +725,13 @@ public:
     Signal::emit("publishSynced", this, &name);
     auto version = versionOf(fd, bytes);
     {
-      std::lock_guard lock(publicationMutex);
+      int directoryFd = lockDirectory();
+      if (directoryFd < 0) throw FileIOException("Publication directory was removed: " + basePath_.string());
+      auto unlock = scope_guard([&] { ::close(directoryFd); });
       if (condition.version) {
         auto current = readPublished(name);
         if (!current || current->version != *condition.version) return {};
+        Signal::emit("publishMatched", this, &name);
       }
       if (condition.mode == PublishMode::CREATE_ONLY) {
         if (::link(temp.c_str(), target.c_str()) < 0) {
@@ -762,9 +788,14 @@ public:
   }
 
   void deleteDurably(std::span<const std::string> names) override {
-    for (const auto& name : names) {
-      if (::unlink(filePath(name).c_str()) < 0 && errno != ENOENT) {
-        throw FileIOException("Cannot delete file: " + std::string(name) + ": " + strerror(errno));
+    {
+      int fd = lockDirectory();
+      if (fd < 0) return;
+      auto unlock = scope_guard([&] { ::close(fd); });
+      for (const auto& name : names) {
+        if (::unlink(filePath(name).c_str()) < 0 && errno != ENOENT) {
+          throw FileIOException("Cannot delete file: " + std::string(name) + ": " + strerror(errno));
+        }
       }
     }
     syncDirectory();

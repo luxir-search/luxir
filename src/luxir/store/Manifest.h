@@ -54,13 +54,31 @@ struct Manifest {
   }
 
   static bool indexFile(std::string_view name) {
+    if (name.ends_with(".tmp")) return false;
     if (candidate(name).first) return true;
     if (!name.starts_with("s")) return false;
     auto dot = name.find('.'), underscore = name.find('_');
     if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return false;
+    auto sortable = [](std::string_view text) {
+      return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
+    };
     auto seg = name.substr(1, dot - 1);
-    return Postings::getSortableString(Postings::parseSortableString(seg)) == seg
-        && Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1)) != 0;
+    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return false;
+    auto suffix = name.substr(underscore + 1);
+    if (!suffix.starts_with('_')) return sortable(suffix);
+    suffix.remove_prefix(1);
+    if (suffix.starts_with('L') && suffix.find('_') == std::string_view::npos) suffix.remove_prefix(1);
+    else {
+      auto file = suffix.rfind('_');
+      if (file == std::string_view::npos || !sortable(suffix.substr(file + 1))) return false;
+      suffix = suffix.substr(0, file);
+      auto generation = suffix.rfind('_');
+      if (generation == std::string_view::npos || generation == 0) return false;
+      suffix.remove_prefix(generation + 1);
+    }
+    dot = suffix.find('.');
+    return dot != std::string_view::npos && sortable(suffix.substr(0, dot))
+        && Postings::parseEpoch(suffix.substr(dot + 1));
   }
 
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {

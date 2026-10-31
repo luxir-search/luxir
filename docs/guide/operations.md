@@ -37,10 +37,51 @@ Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
 then `luxir promote` to restore it as a writer under new collection incarnations.
 Do not restore a raw directory copy over an existing writer identity.
 
+### Copying the authoritative tree
+
+The portable tree is `LAYOUT` and `t/`. Copy each file's bytes under the same
+relative key; do not copy `node/`, which contains the local `write.lock`,
+replication state and other node-private state. The destination needs a compatible
+Luxir build and the plugins referenced by the stored schemas. Hard links can
+become independent objects: link counts, inode numbers, timestamps, permissions
+and empty directories carry no index identity. Publication versions are computed
+by the destination backend, not stored in `STATE` or `CATALOG`.
+
+For a stopped node, copy into an empty destination in any order, then open the
+destination only after the entire copy finishes. A filesystem snapshot of a
+stopped node has the same rule. The format can be served by a backend that reads
+these keys directly, including a cache over an object store; this does not require
+rewriting manifests or catalog entries.
+
+For an online copy, dependency order is necessary but is not sufficient by
+itself. Capture the catalog and selected STATE bodies first and hold their
+snapshots and dependencies against retirement while copying. Install data files
+first, then their manifests, then the captured STATE bodies, and finally the
+captured CATALOG bodies. Install LAYOUT before exposing the destination. Never
+read a newer STATE or CATALOG midway through the copy: it could name files that
+were created after the data pass. Keep the captured catalogs stable against
+collection deletion or replacement as well. A coherent filesystem snapshot can
+provide the frozen source; otherwise use `luxir pull`, which pins snapshots.
+Plain recursive copying of a running writer provides none of those protections.
+
+Readers ignore publication scratch files (`.luxir-publish-*`), unfinished data
+files (`*.tmp`) and unrelated names, even if a raw copy included them. These are
+not dependencies and may be omitted. Corruption markers are portable diagnostic
+metadata and should be preserved. A new writer over the copied namespace claims
+a new epoch there; it does not fence the original namespace. Do not combine the
+subsequent histories of independently written copies. Use promotion when a
+restore should start a new lineage.
+
 ## Read-only nodes
 
 A data directory has exactly one writer, which holds `node/write.lock` from startup
-until exit.
+until exit. This is node admission policy. Conditional file publication uses a
+separate directory `flock`, so Match is an atomic compare-and-swap among processes
+on a local filesystem, including processes that bypass `write.lock`. All publish
+modes take that lock only for the check and install; file and directory fsyncs
+run outside it. The kernel releases the lock when the process dies. This
+guarantee does not extend to network filesystems, whose server may revoke a
+stalled client's lock.
 
 `--read-only` opens an existing data directory without that lock:
 
@@ -175,8 +216,15 @@ Once the new tip is durable, obsolete manifests and unreferenced data are
 removed. Writer startup sweeps unreferenced index files from fenced, older
 epochs; it leaves files of newer epochs alone. These local cleanup rules and
 process-local pins are not a retention protocol for shared remote readers.
-Retiring an incarnation seals its `STATE` before deleting data and leaves that
-small tombstone permanently, preventing delayed requests from reviving it.
+Catalog reservation/orphan cleanup also assumes startup has exclusive authority
+to decide what was abandoned, and collection transitions use process-local
+leases. Cross-process CAS protects catalog updates and writer fencing; it does
+not turn those cleanup policies into a multi-node retention coordinator.
+Removal durably deletes `STATE` first, fencing existing writers, then removes
+the incarnation directory and its catalog entry. Only catalog reservation can
+create STATE; claiming a writer or installing a snapshot requires it to exist.
+Writer incarnation ids are never reused. A follower can reserve a deleted source id again;
+its fresh STATE owner distinguishes that lifetime from earlier publications.
 
 Replication pin counters are described in the
 [replication reference](replication.md#reference). Replication file transfers have
@@ -185,7 +233,10 @@ HTTP responses have no write deadline.
 
 Publication scratch files use the reserved `.luxir-publish-` prefix and are
 hidden from index listings. An owned filesystem view removes scratch files from
-other processes when it opens; the current process's publishers are left alone.
+processes confirmed dead on the same host when it opens. Live or inaccessible
+processes' files are left alone. Copied scratch names are harmless even when a
+PID cannot be checked or has been reused. Unfinished `*.tmp` data files are also
+ignored by readers.
 
 Retirement removals are not directory-synced: a crash may restore obsolete
 names, but the durable tip does not reference them. A failed candidate is
