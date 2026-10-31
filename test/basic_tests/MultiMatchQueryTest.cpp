@@ -85,6 +85,17 @@ public:
     return query;
   }
 
+  // Scores without, then with, the two-field pair table.
+  auto runPairTable(const api::Query& query) {
+    auto restore = scope_guard([threshold = CombinedFieldQuery::pairNormMinDocFreq] {
+      CombinedFieldQuery::pairNormMinDocFreq = threshold;
+    });
+    CombinedFieldQuery::pairNormMinDocFreq = std::numeric_limits<int64_t>::max();
+    auto summed = run(query);
+    CombinedFieldQuery::pairNormMinDocFreq = 0;
+    return std::pair(summed, run(query));
+  }
+
   float score(const api::Query& query, const std::string& id) {
     auto hits = run(query);
     return hits && hits->contains(id) ? hits->at(id) : 0.0f;
@@ -155,12 +166,8 @@ TEST(CombinedFieldNormTest, normTablesMatchReference) {
 // Both fields have flat norms here, so a lowered threshold scores through the
 // shared pair table instead of summing the weighted lengths.
 TEST_F(MultiMatchQueryTest, pairNormTableScoresMatchSummedLengths) {
-  auto query = qb::multiMatch(mr(), "dune desert", {{"title_un", 1.3f}, {"body_un", 0.7f}});
-  auto summed = run(query);
-  int64_t threshold = CombinedFieldQuery::pairNormMinDocFreq;
-  CombinedFieldQuery::pairNormMinDocFreq = 0;
-  auto tabled = run(query);
-  CombinedFieldQuery::pairNormMinDocFreq = threshold;
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune desert", {{"title_un", 1.3f}, {"body_un", 0.7f}}));
   ASSERT_TRUE(summed && tabled);
   ASSERT_EQ(2u, summed->size());
   EXPECT_EQ(*summed, *tabled);
@@ -194,6 +201,18 @@ TEST_F(MultiMatchSparseNormsTest, missingFieldAddsNoLength) {
   // s1: freq 2*1 + 1, length 2*1 + 2; s2: freq 1, length 3 (no title)
   EXPECT_NEAR(bm25f(3.0f, 4.0f), hits->at("s1"), 1e-6);
   EXPECT_NEAR(bm25f(1.0f, 3.0f), hits->at("s2"), 1e-6);
+}
+
+// The pair table reads s2's missing sparse title as code 0. s4's segment has no
+// titles, so it scores through body_un's single-field table instead.
+TEST_F(MultiMatchSparseNormsTest, normTablesReadMissingFieldsAsZero) {
+  helper.index(flatdoc("id", "s4", "body_un", "dune desert planet"), UpdateMessage::COMMIT);
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(3u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+  EXPECT_EQ(summed->at("s2"), summed->at("s4"));
 }
 
 TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {

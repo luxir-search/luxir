@@ -176,11 +176,10 @@ public:
     std::span<Postings> postings;
     std::span<Norms> norms;
     Similarity::BM25Scorer* simScorer;
-    // Set when the only norms are one flat field: maps its code to the final norm.
-    const uint8_t* singleFlatNorm;
-    // Set when both fields of a two-field query have flat norms; see fillPairNorms.
-    const uint8_t* pairFlatNorm;
-    bool allFlat;
+    // Set when one field has norms in this segment: maps its code to the final norm.
+    const uint8_t* singleNorms;
+    // Set when both fields of a two-field query have norms; see fillPairNorms.
+    const uint8_t* pairNorms;
     int32_t doc = -1;
     float freq = 0.0f;
 
@@ -196,39 +195,31 @@ public:
       return doc;
     }
 
-    // Sums in field order, as the reference sum_f w_f * length_f(d) does.
+    // A document without the field reads as code 0, which decodes to length 0.
+    uint8_t code(Norms& n) {
+      if (n.flat != nullptr) return n.flat[doc];
+      if (n.sparse->docId() < doc) n.sparse->advance(doc);
+      return n.sparse->docId() == doc ? n.sparse->value() : 0;
+    }
+
+    // Sums in field order, as the reference sum_f w_f * length_f(d) does. A
+    // missing field adds +0.0, which leaves the non-negative sum unchanged.
     int64_t combinedNorm() {
-      if (pairFlatNorm != nullptr) {
-        return pairFlatNorm[(size_t)norms[0].flat[doc] << 8 | norms[1].flat[doc]];
-      }
-      if (singleFlatNorm != nullptr) return singleFlatNorm[norms[0].flat[doc]];
+      if (pairNorms != nullptr) return pairNorms[(size_t)code(norms[0]) << 8 | code(norms[1])];
+      if (singleNorms != nullptr) return singleNorms[code(norms[0])];
       double length = 0.0;
-      if (allFlat) {
-        for (auto& n : norms) length += n.lengths[n.flat[doc]];
-      } else {
-        for (auto& n : norms) {
-          uint8_t code;
-          if (n.flat != nullptr) {
-            code = n.flat[doc];
-          } else {
-            if (n.sparse->docId() < doc) n.sparse->advance(doc);
-            if (n.sparse->docId() != doc) continue;
-            code = n.sparse->value();
-          }
-          length += n.lengths[code];
-        }
-      }
+      for (auto& n : norms) length += n.lengths[code(n)];
       return encodeLength(length);
     }
 
   public:
     Scorer(std::span<Postings> postings, std::span<Norms> norms,
-           Similarity::BM25Scorer* simScorer, const uint8_t* singleNorm,
-           const uint8_t* pairNorm)
+           Similarity::BM25Scorer* simScorer, const uint8_t* singleNorms,
+           const uint8_t* pairNorms)
       : postings(postings), norms(norms), simScorer(simScorer),
-        singleFlatNorm(norms.size() == 1 && norms[0].flat != nullptr ? singleNorm : nullptr),
-        allFlat(std::ranges::all_of(norms, [](const Norms& n) { return n.flat != nullptr; })) {
-      pairFlatNorm = norms.size() == 2 && allFlat ? pairNorm : nullptr;
+        singleNorms(singleNorms), pairNorms(pairNorms) {
+      assert(singleNorms == nullptr || norms.size() == 1);
+      assert(pairNorms == nullptr || norms.size() == 2);
     }
 
     int32_t docId() override { return doc; }
@@ -445,17 +436,17 @@ public:
         }
       }
       auto norms = targetPool.make_span<Scorer::Norms>(hasNorms ? n : 0);
-      const uint8_t* singleNorm = nullptr;
+      size_t lastNormsField = 0;
       for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
         const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
         assert(segInfo->type == FieldType::TEXT);
-        const double* lengths = sharedNorms->lengths + i * 256;
         if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
-        singleNorm = sharedNorms->singleNorms + i * 256;
+        lastNormsField = i;
+        const double* lengths = sharedNorms->lengths + i * 256;
         if (reader->isFlat()) {
           norms[numNorms++] = {.lengths = lengths, .flat = reader->flatBase()};
         } else {
@@ -463,8 +454,11 @@ public:
         }
       }
       if (numPostings == 0) return nullptr;
-      return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer, singleNorm,
-          hasNorms ? sharedNorms->pairNorms : nullptr);
+      // Only a two-field query has a pair table, so two norms are fields 0 and 1.
+      const uint8_t* singleNorms = numNorms == 1 ? sharedNorms->singleNorms + lastNormsField * 256 : nullptr;
+      const uint8_t* pairNorms = numNorms == 2 ? sharedNorms->pairNorms : nullptr;
+      return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer,
+                                     singleNorms, pairNorms);
     }
   };
 
