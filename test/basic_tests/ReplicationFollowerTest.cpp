@@ -429,6 +429,8 @@ TEST_F(ReplicationFollowerTest, deleteWhileDownloadIsPendingCannotResurrectColle
   CollectionHelper h(*source, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(caughtUp());
+  auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation;
+  auto directory = path / "follower" / "t" / "t0" / "i" / id;
   std::latch downloading(1), resume(1);
   auto join = scope_guard([&] { if (!resume.try_wait()) resume.count_down(); stopFollower(); });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
@@ -437,11 +439,36 @@ TEST_F(ReplicationFollowerTest, deleteWhileDownloadIsPendingCannotResurrectColle
   ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(until([&] { return downloading.try_wait(); }));
   source->deleteCollection("main");
-  ASSERT_TRUE(until([&] { return stateIs("orphan"); }));
-  resume.count_down();
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
+  EXPECT_TRUE(std::filesystem::exists(directory)); // The running download still owns the directory.
+  resume.count_down();
+  ASSERT_TRUE(until([&] { return !std::filesystem::exists(directory); }));
   stopFollower();
   EXPECT_TRUE(std::filesystem::is_empty(path / "follower" / "t" / "t0" / "i"));
+}
+
+TEST_F(ReplicationFollowerTest, deletedStagedIncarnationIsRemoved) {
+  startSource(); startFollower(); ASSERT_TRUE(caughtUp()); stopFollower();
+  CollectionHelper h(*source, "staged");
+  ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  auto id = h.collection().getShard()->getSnapshots().snapshot()->id.incarnation;
+  std::latch downloading(1), resume(1);
+  auto join = scope_guard([&] { if (!resume.try_wait()) resume.count_down(); stopFollower(); });
+  Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
+    if (!downloading.try_wait()) downloading.count_down();
+    resume.wait(); return nullptr;
+  });
+  startFollower();
+  ASSERT_TRUE(until([&] { return downloading.try_wait(); }));
+  source->deleteCollection("staged");
+  ASSERT_TRUE(until([&] { return status().find("staged") == std::string::npos; }));
+  resume.count_down();
+  ASSERT_TRUE(until([&] {
+    auto entries = follower->collections().catalog().read().entries;
+    return std::ranges::none_of(entries, [&](const auto& entry) { return entry.id == id; });
+  }));
+  EXPECT_FALSE(std::filesystem::exists(path / "follower" / "t" / "t0" / "i" / id));
+  EXPECT_THROW(follower->getCollection("staged"), CollectionNotFoundError);
 }
 
 TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
@@ -959,14 +986,37 @@ TEST_F(ReplicationFollowerTest, promotionReusesFilesAcrossIncarnations) {
   LuxirNode ram(ramConfig), fs(fsConfig);
   HttpServer ramServer(ram, 1, 0); ramServer.start();
   auto old = source->getCollection("main")->getShard()->getSnapshots().snapshot();
-  ASSERT_TRUE(until([&] { return ram.collectionEntries().size() == 1 && fs.collectionEntries().size() == 1; }));
+  // Discovery lists placeholders before the initial snapshot is installed.
+  for (auto* replica : {&ram, &fs}) ASSERT_TRUE(until([&] {
+    try { return replica->getCollection("main")->getShard()->getSnapshots().snapshot()->id == old->id; }
+    catch (const CollectionResolutionError&) { return false; }
+  }));
   auto ramFile = ram.getCollection("main")->getShard()->getSnapshots().dir.openFile(old->files.front().name);
   stopFollower(); stopSource();
   ASSERT_EQ(0, promote().first);
   sourceConfig = followerConfig; sourceConfig.replication.source.clear();
   source = std::make_unique<LuxirNode>(sourceConfig);
   auto promoted = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  std::atomic<unsigned> staged{0};
+  std::promise<void> ready;
+  auto staging = ready.get_future();
+  std::latch resume(1);
+  bool released = false;
+  auto cleanup = scope_guard([&] {
+    if (!released) resume.count_down();
+    ram.getFollower()->stop(); fs.getFollower()->stop();
+    Signal::unlisten("snapshotRootDurable");
+  });
+  Signal::listen("snapshotRootDurable", [&](void*, void*, void*) -> void* {
+    if (++staged == 2) ready.set_value();
+    resume.wait();
+    return nullptr;
+  });
   sourceServer = std::make_unique<HttpServer>(*source, 1, sourcePort); sourceServer->start();
+  ASSERT_EQ(std::future_status::ready, staging.wait_for(10s));
+  for (auto* replica : {&ram, &fs})
+    EXPECT_EQ(old->id, replica->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+  released = true; resume.count_down();
   for (auto* replica : {&ram, &fs}) {
     ASSERT_TRUE(until([&] { return replica->getCollection("main")->getShard()->getSnapshots().snapshot()->id == promoted; }));
     api::ReplicationStatus status; std::pmr::monotonic_buffer_resource arena;
@@ -1159,9 +1209,11 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
   source->deleteCollection("main");
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
-  EXPECT_GT(follower->storageBytes(CollectionId::of("main")), 0); // Only the old reader now owns the data.
+  auto retired = std::string(old->incarnation());
+  EXPECT_EQ(0u, follower->storageBytes(CollectionId::of("main")));
+  EXPECT_GT(follower->collections().catalog().bytes(retired), 0); // The old reader still owns its incarnation's data.
   old.reset();
-  ASSERT_TRUE(until([&] { return follower->storageBytes(CollectionId::of("main")) == 0; }));
+  ASSERT_TRUE(until([&] { return follower->collections().catalog().bytes(retired) == 0; }));
 }
 
 class ReplicationPullTest : public ReplicationFollowerTest, public ::testing::WithParamInterface<std::string> {
@@ -1255,7 +1307,7 @@ TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
   EXPECT_NE(std::string::npos, offline.second.find("Connection refused"));
 }
 
-TEST_F(ReplicationFollowerTest, pullReportsCollectionFailureAndInstallsOtherCollections) {
+TEST_F(ReplicationFollowerTest, pullInstallsReadyCollectionsWhenOneFails) {
   startSource();
   for (auto name : {"aaa", "main"}) {
     CollectionHelper h(*source, name); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
@@ -1268,7 +1320,10 @@ TEST_F(ReplicationFollowerTest, pullReportsCollectionFailureAndInstallsOtherColl
   auto result = pull();
   EXPECT_NE(0, result.first);
   EXPECT_NE(std::string::npos, result.second.find("ERROR: interrupted installation"));
-  EXPECT_NE(std::string::npos, result.second.find("Pull: 1 installed, 1 failed"));
+  EXPECT_NE(std::string::npos, result.second.find("Pull: 1 installed, 1 failed")) << result.second;
+  FSDirFactory storage(followerConfig.store.data_dir, true);
+  TenantCatalog catalog(storage);
+  EXPECT_FALSE(catalog.current("aaa")); EXPECT_TRUE(catalog.current("main"));
   auto retry = pull();
   EXPECT_EQ(0, retry.first) << retry.second;
 }
@@ -1317,14 +1372,17 @@ TEST_F(ReplicationFollowerTest, waitingSurvivesFollowerRestartThenSameBootRecrea
   sourceConfig.store.backend = "ram";
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
-  ASSERT_TRUE(caughtUp());
+  ASSERT_TRUE(caughtUp()) << status();
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
   stopFollower(); startFollower();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
-  source->deleteCollection("main"); source->createCollection("main");
-  ASSERT_TRUE(caughtUp());
+  source->deleteCollection("main");
+  // Apply the deletion before the recreate can carry its predecessor's history.
+  ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); })) << status();
+  source->createCollection("main");
+  ASSERT_TRUE(caughtUp()) << status();
   EXPECT_EQ(0, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
@@ -1549,6 +1607,25 @@ TEST_F(ReplicationFollowerTest, narrowerRestartOrphansCopiesAndDropsBarrierMembe
   EXPECT_FALSE(std::ranges::any_of(stats.collections, [](const auto& row) { return row.tenant == "beta"; }));
   FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "node");
   EXPECT_FALSE(ReplicationState::read(*dir.openFile("replication.json")).tenants.contains("beta"));
+}
+
+TEST_F(ReplicationFollowerTest, reinclusionRestoresDeletedLocalCopy) {
+  startSource();
+  CollectionId beta{"beta", "docs"};
+  { CollectionHelper h(*source, beta); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  startFollower(); ASSERT_TRUE(caughtUp(beta));
+  auto original = follower->getCollection(beta)->getShard()->getSnapshots().snapshot()->id;
+  stopFollower();
+  followerConfig.replication.tenants = "t0";
+  startFollower();
+  follower->getFollower()->deleteOrphan(beta);
+  EXPECT_THROW(follower->getCollection(beta), CollectionNotFoundError);
+  stopFollower();
+  followerConfig.replication.tenants.clear();
+  startFollower();
+  ASSERT_TRUE(caughtUp(beta)) << status();
+  EXPECT_EQ(original, follower->getCollection(beta)->getShard()->getSnapshots().snapshot()->id);
+  EXPECT_EQ(1, follower->getCollection(beta)->getReaderManager().getReader()->liveDocs());
 }
 
 TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
@@ -1838,7 +1915,7 @@ TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacem
     FSDirFactory factory(sourceConfig.store.data_dir);
     TenantCatalog storage(factory);
     auto selected = *storage.current("main");
-    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory("main", selected))));
+    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
   }
   startSource();
   ASSERT_TRUE(caughtUp());
@@ -1889,7 +1966,7 @@ TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
     auto selected = storage.current("main");
     ASSERT_TRUE(selected);
     EXPECT_NE(snapshot->id.incarnation, *selected);
-    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory("main", *selected)));
+    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)));
   }
   auto writerConfig = followerConfig;
   writerConfig.replication.source.clear();
@@ -1937,4 +2014,169 @@ TEST_F(ReplicationFollowerTest, replicaReopenSharesUnchangedSegments) {
   EXPECT_EQ(1, search.found());
 }
 
+}
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, renameAndSwapReuseIncarnationsAndPromote) {
+  startSource();
+  CollectionHelper a(*source, "a"), b(*source, "b");
+  ASSERT_TRUE(a.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(b.indexAll({flatdoc("id", "b"), flatdoc("id", "c")}, UpdateMessage::COMMIT).success);
+  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+  auto first = follower->getCollection("a"), second = follower->getCollection("b");
+  std::atomic<int> downloads{0};
+  Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* { downloads++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  source->renameCollection(CollectionId::of("a"), CollectionId::of("renamed"));
+  ASSERT_TRUE(caughtUp("renamed"));
+  EXPECT_EQ(first, follower->getCollection("renamed"));
+  EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);
+  std::atomic<bool> stop{false}, valid{true};
+  auto observer = std::async(std::launch::async, [&] {
+    while (!stop) {
+      auto left = follower->collections().get(CollectionId::of("renamed"));
+      auto right = follower->collections().get(CollectionId::of("b"));
+      if ((left != first && left != second) || (right != first && right != second)) valid = false;
+    }
+  });
+  auto stopObserver = scope_guard([&] { stop = true; });
+  source->swapCollections(CollectionId::of("renamed"), CollectionId::of("b"));
+  bool converged = caughtUp("renamed") && caughtUp("b");
+  stop = true; observer.get();
+  ASSERT_TRUE(converged); EXPECT_TRUE(valid); EXPECT_EQ(0, downloads);
+  EXPECT_EQ(first, follower->getCollection("b"));
+  EXPECT_EQ(CollectionId::of("b"), first->getId());
+  stopFollower();
+  auto result = promote(); ASSERT_EQ(0, result.first) << result.second;
+  followerConfig.replication.source.clear();
+  LuxirNode promoted(followerConfig);
+  EXPECT_EQ(1, promoted.getCollection("b")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(2, promoted.getCollection("renamed")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(ReplicationFollowerTest, restartAfterDurableMappingBeforeLookupPublication) {
+  startSource();
+  CollectionHelper a(*source, "a"), b(*source, "b");
+  ASSERT_TRUE(a.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(b.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+  auto before = follower->getCollection("a");
+  auto wanted = source->collections().catalog().current("b");
+  auto* collections = &follower->collections();
+  Signal::listen("collectionMappingPublished", [collections](void* owner, void*, void*) -> void* {
+    if (owner == collections) throw FileIOException("stop after durable catalog");
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("collectionMappingPublished"); });
+  source->swapCollections(CollectionId::of("a"), CollectionId::of("b"));
+  ASSERT_TRUE(until([&] { return follower->collections().catalog().current("a") == wanted; }));
+  EXPECT_EQ(before, follower->getCollection("a"));
+  stopFollower();
+  Signal::unlisten("collectionMappingPublished");
+  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+}
+}
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, swapMakesMissingCounterpartUnavailableWhileDownloading) {
+  startSource();
+  CollectionHelper a(*source, "a"), b(*source, "b");
+  ASSERT_TRUE(a.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(b.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+  stopFollower();
+  source->deleteCollection("a");
+  CollectionHelper c(*source, "c");
+  ASSERT_TRUE(c.indexAll({flatdoc("id", "c"), flatdoc("id", "d")}, UpdateMessage::COMMIT).success);
+  source->swapCollections(CollectionId::of("b"), CollectionId::of("c"));
+  std::atomic<bool> paused{false};
+  std::latch resume(1);
+  bool released = false;
+  Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* {
+    if (!paused.exchange(true)) resume.wait();
+    return nullptr;
+  });
+  auto cleanup = scope_guard([&] {
+    if (!released) resume.count_down();
+    stopFollower();
+    Signal::unlisten("replicationDownloadStart");
+  });
+  startFollower();
+  bool downloading = until([&] { return paused.load(); });
+  EXPECT_TRUE(downloading);
+  ASSERT_TRUE(caughtUp("c"));
+  EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);
+  EXPECT_THROW(follower->getCollection("b"), CollectionUnavailableError);
+  EXPECT_EQ(1, follower->getCollection("c")->getReaderManager().getReader()->liveDocs());
+  released = true; resume.count_down();
+  ASSERT_TRUE(caughtUp("b")); ASSERT_TRUE(caughtUp("c"));
+  EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);
+  auto rejected = httpRequest(followerServer->getPort(), http::verb::post, "/collections/_swap", R"({"a":"b","b":"c"})");
+  EXPECT_EQ(403, rejected.result_int());
+}
+}
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, failedDownloadDoesNotBlockOtherNames) {
+  followerConfig.replication.downloads = 2;
+  startSource();
+  for (auto name : {"a", "b", "c"}) {
+    CollectionHelper h(*source, name);
+    ASSERT_TRUE(h.index(flatdoc("id", name), UpdateMessage::COMMIT).success);
+  }
+  startFollower();
+  ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b")); ASSERT_TRUE(caughtUp("c"));
+  stopFollower();
+  for (auto name : {"stuck", "ready"}) {
+    CollectionHelper h(*source, name);
+    ASSERT_TRUE(h.index(flatdoc("id", name), UpdateMessage::COMMIT).success);
+  }
+  std::atomic<bool> fail{true};
+  auto cleanup = scope_guard([&] { stopFollower(); Signal::unlisten("replicationDownloadStart"); });
+  Signal::listen("replicationDownloadStart", [&](void*, void* name, void*) -> void* {
+    if (fail && ((CollectionId*)name)->name == "stuck") throw FileIOException("download unavailable");
+    return nullptr;
+  });
+  startFollower();
+  ASSERT_TRUE(until([&] { return status().find("download unavailable") != std::string::npos; }));
+  auto a = follower->getCollection("a"), b = follower->getCollection("b"), c = follower->getCollection("c");
+  source->renameCollection(CollectionId::of("a"), CollectionId::of("renamed"));
+  source->swapCollections(CollectionId::of("b"), CollectionId::of("c"));
+  ASSERT_TRUE(caughtUp("ready")); ASSERT_TRUE(caughtUp("renamed"));
+  ASSERT_TRUE(caughtUp("b")); ASSERT_TRUE(caughtUp("c"));
+  EXPECT_EQ(a, follower->getCollection("renamed"));
+  EXPECT_EQ(c, follower->getCollection("b")); EXPECT_EQ(b, follower->getCollection("c"));
+  EXPECT_THROW(follower->getCollection("stuck"), CollectionUnavailableError);
+  fail = false;
+  ASSERT_TRUE(caughtUp("stuck"));
+}
+}
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, swappedUnreadableIncarnationStaysReservedForRepair) {
+  startSource();
+  for (auto name : {"a", "b"}) {
+    CollectionHelper h(*source, name);
+    ASSERT_TRUE(h.index(flatdoc("id", name), UpdateMessage::COMMIT).success);
+  }
+  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+  auto broken = follower->getCollection("b")->getShard()->getSnapshots().snapshot();
+  stopFollower();
+  auto directory = path / "follower" / "t" / "t0" / "i" / broken->id.incarnation;
+  std::filesystem::remove(directory / broken->manifestName());
+  source->swapCollections(CollectionId::of("a"), CollectionId::of("b"));
+  std::atomic<bool> fail{true};
+  auto cleanup = scope_guard([&] { stopFollower(); Signal::unlisten("snapshotRootDurable"); });
+  Signal::listen("snapshotRootDurable", [&](void*, void*, void*) -> void* {
+    if (fail) throw FileIOException("repair interrupted");
+    return nullptr;
+  });
+  startFollower(); ASSERT_TRUE(caughtUp("b"));
+  EXPECT_THROW(follower->getCollection("a"), CollectionUnavailableError);
+  auto entries = follower->collections().catalog().read().entries;
+  auto entry = std::ranges::find(entries, broken->id.incarnation, &TenantCatalog::Entry::id);
+  ASSERT_NE(entry, entries.end()); EXPECT_EQ("reserved", entry->state); EXPECT_EQ("a", entry->name);
+  EXPECT_TRUE(IncarnationState::read(*follower->collections().catalog().directory(broken->id.incarnation)));
+  fail = false; ASSERT_TRUE(caughtUp("a"));
+}
 }

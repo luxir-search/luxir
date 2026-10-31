@@ -889,6 +889,36 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   }
 }
 
+template <bool Swap>
+static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  using Request = std::conditional_t<Swap, api::SwapCollectionsRequest, api::RenameCollectionRequest>;
+  using Response = std::conditional_t<Swap, api::SwapCollectionsResponse, api::RenameCollectionResponse>;
+  auto request = std::make_shared<HppRequestState<Request>>();
+  constexpr auto method = Swap ? "SwapCollections" : "RenameCollection";
+  if (!parseRequest(readBuf, *request, method)) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, std::string(method) + ": malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        auto& node = call.server.getLuxirNode();
+        auto& req = request->proto;
+        Response response;
+        if constexpr (Swap) {
+          node.swapCollections(LuxirNode::adminTarget(req.tenant, req.a), LuxirNode::adminTarget(req.tenant, req.b));
+          response = {req.a, req.b};
+        } else {
+          node.renameCollection(LuxirNode::adminTarget(req.tenant, req.from), LuxirNode::adminTarget(req.tenant, req.to));
+          response = {req.from, req.to};
+        }
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) { finishWithException(call, e); }
+    });
+  } catch (const std::exception& e) { finishWithException(call, e); }
+}
+
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<SchemaReqProto> request;
@@ -1014,6 +1044,8 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/RenameCollection", {handleCollectionNames<false>, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/SwapCollections", {handleCollectionNames<true>, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},

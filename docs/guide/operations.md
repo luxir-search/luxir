@@ -119,6 +119,25 @@ is no undo. `GET /collections` (canonically `/collections/_list`) returns the
 sorted collection names, including any that failed to load;
 `/_stats?collections=true` has the per-collection detail.
 
+Rename with `POST /collections/_rename` and `{"from":"old","to":"new"}`.
+Swap with `POST /collections/_swap` and `{"a":"live","b":"staging"}`.
+Both operate within one tenant; use `/tenants/TENANT/collections/...` to select
+it. The gRPC calls are `RenameCollection` and `SwapCollections`. Rename requires
+a free destination and swap requires two active collections. Read-only nodes
+and followers reject both operations.
+
+Each operation changes the catalog once, then changes each name's lookup binding.
+No files move and commit ids remain unchanged. A request keeps the collection
+it resolved at admission. During a swap, each lookup may see the old or new
+binding for that name; both names may briefly resolve to the same collection.
+Indexing into a name during a swap is undefined.
+Collection metrics, storage charges and cached data follow the incarnation.
+Session cache-size overrides follow names and apply to their new selections.
+Followers apply ready bindings independently, reusing incarnations they already
+have. A stuck download does not delay unrelated names. A lagging name keeps its
+old data only if the source has not assigned that data to another name;
+otherwise it is unavailable until its replacement is ready.
+
 Deletion is synchronous and wins over concurrent use. When the call returns,
 the name resolves to nothing, the on-disk data is gone, and the name can be
 recreated as a fresh empty collection. New requests receive

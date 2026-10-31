@@ -1452,6 +1452,19 @@ message DeleteCollectionResponse {
   string name = 1;
 }
 
+message RenameCollectionRequest {
+  string from = 1;
+  string to = 2;
+  string tenant = 3;
+}
+message RenameCollectionResponse { string from = 1; string to = 2; }
+message SwapCollectionsRequest {
+  string a = 1;
+  string b = 2;
+  string tenant = 3;
+}
+message SwapCollectionsResponse { string a = 1; string b = 2; }
+
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
 // /tenants/{tenant}/collections/_list.
@@ -1840,6 +1853,11 @@ message ReplicationCatalog {
   string boot = 1;
   string cursor = 2;
   repeated ReplicationCatalogEntry collections = 3;
+  repeated ReplicationTenant tenants = 4;
+}
+message ReplicationTenant {
+  string tenant = 1;
+  uint64 revision = 2;
 }
 message ReplicationCatalogEntry {
   string commit = 1;

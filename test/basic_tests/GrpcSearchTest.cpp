@@ -435,3 +435,26 @@ TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
   serverThread.join();
   Signal::unlisten("searchRootChildStart");
 }
+
+TEST_F(GrpcSearchTest, collectionRenameSwapUnary) {
+  auto a = luxirNode->createCollection("grpc_rename_a"), b = luxirNode->createCollection("grpc_rename_b");
+  api::RenameCollectionRequest rename{"grpc_rename_a", "grpc_renamed", {}};
+  Reply<api::RenameCollectionResponse> renamed;
+  grpc::ClientContext renameContext;
+  auto result = hppUnaryCall(channel.get(), rpc::RenameCollection, &renameContext, rename, &renamed);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ("grpc_renamed", renamed.msg.to);
+  api::SwapCollectionsRequest swap{"grpc_renamed", "grpc_rename_b", {}};
+  Reply<api::SwapCollectionsResponse> swapped;
+  grpc::ClientContext swapContext;
+  result = hppUnaryCall(channel.get(), rpc::SwapCollections, &swapContext, swap, &swapped);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ(a, luxirNode->getCollection("grpc_rename_b")); EXPECT_EQ(b, luxirNode->getCollection("grpc_renamed"));
+  rename = {"grpc_rename_b", "grpc_renamed", {}};
+  grpc::ClientContext duplicate;
+  EXPECT_EQ(grpc::StatusCode::ALREADY_EXISTS, hppUnaryCall(channel.get(), rpc::RenameCollection, &duplicate, rename, &renamed).error_code());
+  swap.b = "grpc_missing";
+  grpc::ClientContext missing;
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, hppUnaryCall(channel.get(), rpc::SwapCollections, &missing, swap, &swapped).error_code());
+  luxirNode->deleteCollection("grpc_rename_b"); luxirNode->deleteCollection("grpc_renamed");
+}

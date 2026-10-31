@@ -419,7 +419,7 @@ TEST_F(CollectionAdminApiTest, createPreservesReservedStorage) {
   LuxirNode node(fsConfig(data));
   auto& catalog = node.collections().catalog();
   auto incarnation = catalog.reserve("unregistered");
-  auto existing = catalog.directory("unregistered", incarnation);
+  auto existing = catalog.directory(incarnation);
   {
     CommitSnapshotRegistry snapshots(*existing);
     IndexWriter writer(snapshots, {}, nullptr, 10, incarnation);
@@ -436,7 +436,7 @@ TEST_F(CollectionAdminApiTest, startupDiscardsAbandonedReservations) {
     LuxirNode node(config);
     auto& catalog = node.collections().catalog();
     incarnation = catalog.reserve("orphan");
-    auto dir = catalog.directory("orphan", incarnation);
+    auto dir = catalog.directory(incarnation);
     dir->publishFile("partial", {}, Directory::PublishMode::CREATE_ONLY);
     catalog.reserve("gone"); // crashed before writing its first file
   }
@@ -529,3 +529,35 @@ TEST_F(CollectionAdminApiTest, requestScopeNeverOutlivesItsRequest) {
 }
 
 } // namespace luxir::test
+
+namespace luxir::test {
+TEST_F(CollectionAdminApiTest, renameAndSwapHttp) {
+  LuxirNode node;
+  auto first = node.createCollection("first"), second = node.createCollection("second");
+  HttpServer server(node, 1, 0); server.start();
+  auto post = [&](const char* path, const char* body) { return httpRequest(server.getPort(), http::verb::post, path, body); };
+  auto renamed = post("/collections/_rename", R"({"from":"first","to":"third"})");
+  ASSERT_EQ(200, renamed.result_int()) << renamed.body();
+  EXPECT_EQ(first, node.getCollection("third"));
+  auto swapped = post("/collections/_swap", R"({"a":"third","b":"second"})");
+  ASSERT_EQ(200, swapped.result_int()) << swapped.body();
+  EXPECT_EQ(first, node.getCollection("second")); EXPECT_EQ(second, node.getCollection("third"));
+  EXPECT_EQ(409, post("/collections/_rename", R"({"from":"second","to":"third"})").result_int());
+  EXPECT_EQ(404, post("/collections/_swap", R"({"a":"second","b":"missing"})").result_int());
+  EXPECT_EQ(400, post("/collections/_swap", R"({"a":"second","b":"second"})").result_int());
+  EXPECT_EQ(400, post("/collections/_rename", R"({"from":"second","to":"_bad"})").result_int());
+}
+}
+
+namespace luxir::test {
+TEST_F(CollectionAdminApiTest, readOnlyRejectsNameChanges) {
+  CollectionAdminDataDir data("luxir_readonly_names");
+  auto config = fsConfig(data);
+  { LuxirNode writer(config); writer.createCollection("other"); }
+  config.read_only = true;
+  LuxirNode reader(config);
+  HttpServer server(reader, 1, 0); server.start();
+  EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/collections/_rename", R"({"from":"main","to":"renamed"})").result_int());
+  EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/collections/_swap", R"({"a":"main","b":"other"})").result_int());
+}
+}

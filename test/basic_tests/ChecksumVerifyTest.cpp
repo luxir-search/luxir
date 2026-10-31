@@ -267,7 +267,7 @@ TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
   auto selected = storage.current("main");
   ASSERT_TRUE(selected);
   EXPECT_NE(dir.filename().string(), *selected);
-  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory("main", *selected)));
+  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)));
   EXPECT_NO_THROW(node.getCollection("other"));
 }
 

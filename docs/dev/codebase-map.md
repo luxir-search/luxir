@@ -15,9 +15,13 @@ locations, browse `src/luxir/<area>/`.
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
-     (startup discovery, creation, activation of a new incarnation, removal),
-     announced in order through `CollectionEvents`
-   - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+     (startup discovery, creation, activation, rename, swap, removal), announced
+     in order through `CollectionEvents`; a multi-name mapping is one event and
+     atomic per-name lookup changes
+   - `ReplicationFollower`: Discovery and transfer protocol, with work keyed by
+     tenant/incarnation. Stages missing data, then applies each tenant mapping
+     through `Collections` for ready bindings, leaving dependent names unavailable
+     when their old data now belongs to another name
    - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
      fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
@@ -129,10 +133,12 @@ locations, browse `src/luxir/<area>/`.
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); opens path views under authoritative
      and node-private roots. `server/TenantCatalog` owns names, timestamp incarnation
-     allocation, and reservation/activation/retirement through catalog CAS
-   - `store/IncarnationState`: per-incarnation writer epochs, tip CAS and retirement
-     tombstones. `Manifest` loads the STATE-selected candidate; filenames carry
-     the creating writer epoch, including later live-doc and overlay generations
+     allocation, and reservation/activation/retirement through catalog CAS.
+     RAM storage accounts are keyed by tenant/incarnation; names select accounts
+   - `store/IncarnationState`: per-incarnation writer epochs and tip CAS. Catalog
+     reservation creates STATE; deleting STATE fences prior writers. `Manifest`
+     loads the STATE-selected candidate; filenames carry the creating writer
+     epoch, including later live-doc and overlay generations
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)

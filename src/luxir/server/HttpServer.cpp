@@ -650,7 +650,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
     PLUGIN
   };
@@ -745,7 +745,7 @@ private:
       case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
       case Route::HEALTH: operation = MetricOperation::HEALTH; break;
       case Route::TENANT_LIST: case Route::COLLECTION_LIST:
-      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE:
+      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE: case Route::COLLECTION_RENAME: case Route::COLLECTION_SWAP:
         operation = MetricOperation::COLLECTIONS; break;
       case Route::REPLICATION_STATUS: case Route::REPLICATION_WATCH:
       case Route::REPLICATION_SNAPSHOT: case Route::REPLICATION_FILE:
@@ -1067,7 +1067,7 @@ private:
       auto slash = target.find('/', 9);
       target = slash == std::string_view::npos ? std::string_view{} : target.substr(slash);
     }
-    if (target == "/collections/_create" || target == "/collections/_delete") return true;
+    if (target == "/collections/_create" || target == "/collections/_delete" || target == "/collections/_rename" || target == "/collections/_swap") return true;
     if (method != http::verb::post) return false;
     std::string coll;
     return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
@@ -1441,7 +1441,7 @@ private:
   // Routes that may name a tenant: administration and replication. Search,
   // update and replica waits always act in the caller's own tenant.
   static bool tenantRoute(Route route) {
-    return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE ||
+    return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE || route == Route::COLLECTION_RENAME || route == Route::COLLECTION_SWAP ||
            route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
            route == Route::REPLICATION_FILE;
   }
@@ -1479,6 +1479,10 @@ private:
       m.route = Route::COLLECTION_LIST; m.allow = "GET"; m.prettyDefault = true;  // synonym for _list
     } else if (target == "/collections/_create") {
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
+    } else if (target == "/collections/_rename") {
+      m.route = Route::COLLECTION_RENAME; m.allow = "POST";
+    } else if (target == "/collections/_swap") {
+      m.route = Route::COLLECTION_SWAP; m.allow = "POST";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
@@ -1611,6 +1615,8 @@ private:
       case Route::COLLECTION_CREATE:
         handleCollectionCreate(std::move(req.body()));
         break;
+      case Route::COLLECTION_RENAME: handleCollectionNames<false>(std::move(req.body())); break;
+      case Route::COLLECTION_SWAP: handleCollectionNames<true>(std::move(req.body())); break;
       case Route::COLLECTION_DELETE:
         handleCollectionDelete(req.body());
         break;
@@ -2218,6 +2224,42 @@ private:
             if (failure) self->respondError(*failure);
             else self->respondJson(http::status::ok, std::move(body));
           });
+    });
+  }
+
+  template <bool Swap>
+  void handleCollectionNames(std::string body) {
+    using Request = std::conditional_t<Swap, api::SwapCollectionsRequest, api::RenameCollectionRequest>;
+    using Response = std::conditional_t<Swap, api::SwapCollectionsResponse, api::RenameCollectionResponse>;
+    struct State {
+      std::string body;
+      std::pmr::monotonic_buffer_resource resource;
+      Request request;
+    };
+    auto state = std::make_shared<State>();
+    state->body = std::move(body);
+    CollectionId first, second;
+    try {
+      std::string error;
+      if (!api::read_json(state->request, state->body, state->resource, &error)) throw RequestError(error, "invalid_json");
+      auto& req = state->request;
+      if constexpr (Swap) { first = adminTarget(req.tenant, req.a); second = adminTarget(req.tenant, req.b); }
+      else { first = adminTarget(req.tenant, req.from); second = adminTarget(req.tenant, req.to); }
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    auto pin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, first, second, pin] {
+      std::string out;
+      std::optional<ErrorInfo> failure;
+      try {
+        if constexpr (Swap) self->node_.swapCollections(first, second);
+        else self->node_.renameCollection(first, second);
+        Response response{first.name, second.name};
+        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize collection mapping response");
+      } catch (const std::exception& e) { failure = classifyException(e, ErrorKind::INTERNAL); }
+      net::post(self->stream_.get_executor(), [self, pin, failure = std::move(failure), body = std::move(out)]() mutable {
+        if (failure) self->respondError(*failure);
+        else self->respondJson(http::status::ok, std::move(body));
+      });
     });
   }
 

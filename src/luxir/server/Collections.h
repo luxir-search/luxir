@@ -28,8 +28,9 @@ namespace api { struct SchemaDef; }
 //
 // Creation, removal and activation own their name for their whole duration
 // and announce their result before releasing it: a second transition of the
-// same name fails fast instead of waiting, and no lock is held across I/O.
-// Concurrent auto-creators wait on the map's creation slot instead.
+// same name fails fast instead of waiting. Lifecycle mutations serialize per
+// tenant through catalog publication and announcement; lookup locks never cover
+// I/O. Concurrent auto-creators wait on the map's creation slot instead.
 // Staged candidates hold leases on their incarnation directories, and
 // retirement removes only directories nothing selects, leases or retains.
 // Publications within an incarnation are not transitions; they reach the
@@ -102,6 +103,7 @@ private:
   class Transition {
     Collections& owner;
     CollectionId name;
+    std::unique_lock<std::recursive_mutex> catalogLock;
   public:
     Transition(Collections& owner, CollectionId name);
     ~Transition();
@@ -126,7 +128,7 @@ private:
   // Announced collections by tenant and name, changed only with their
   // announcements, so a listing reads its tenant without visiting the others.
   std::mutex listingMutex;
-  std::map<std::string, std::map<std::string, std::shared_ptr<Collection>, std::less<>>, std::less<>> listing;
+  std::map<std::string, std::map<std::string, std::shared_ptr<Collection>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
@@ -142,6 +144,10 @@ private:
   // Lists and announces a registration, or a removal.
   void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
   void removed(const CollectionId& id);
+  uint64_t revision(std::string_view tenant);
+  void publishMapping(std::string_view tenant, const std::map<std::string, std::shared_ptr<Collection>>& next,
+                      const std::function<uint64_t()>& publish);
+  void changeNames(const CollectionId& from, const CollectionId& to, bool exchange);
   bool reclaimStorage();
   void release(const CollectionId& id, const std::string& incarnation) noexcept;
   // Removes incarnation directories that nothing selects, leases or retains.
@@ -158,7 +164,8 @@ public:
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
   TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
-  uint64_t storageBytes(const CollectionId& id) { return catalog(id.tenant).bytes(id.name); }
+  uint64_t storageBytes(const CollectionId& id);
+  uint64_t storageBytes(const Collection& collection);
 
   // The single startup discovery path. Writers recover identities, remove
   // unselected leftovers and create the default collection; read-only nodes
@@ -186,6 +193,14 @@ public:
   // still removes leftover storage. Refused while a candidate is staged.
   void remove(const CollectionId& id, bool mustExist = true);
 
+  void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
+  void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }
+  // Empty incarnation ids leave unavailable names. Running installers retain
+  // their directories until they finish, even if the mapping removes them.
+  void applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
+                    const std::map<std::string, std::string>& desired,
+                    std::vector<Prepared> prepared, std::span<const std::string> retained);
+
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
   // caller verified and synced, and opens its readers. On failure the
@@ -198,8 +213,6 @@ public:
   // Closes an abandoned candidate and removes its directory unless something
   // selects, leases or retains it.
   void discard(Candidate& candidate) noexcept;
-  // After a same-incarnation advance: retire leftover candidates of earlier runs.
-  void retainSelected(const CollectionId& id) noexcept;
   // Registers an unavailable placeholder unless something is already registered.
   std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
 

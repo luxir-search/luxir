@@ -25,13 +25,14 @@ private:
   DirectoryFactory& factory;
   std::string tenant;
   std::mutex mutex;
+  std::recursive_mutex lifecycle;
   std::shared_ptr<StorageMemory> tenantAccount;
   std::string path;
   struct Snapshot { State state; std::optional<Directory::Publication> publication; };
 
   Snapshot snapshot();
-  void mutate(const std::function<bool(State&)>& mutation);
-  std::shared_ptr<StorageMemory> account(std::string_view name);
+  uint64_t mutate(const std::function<bool(State&)>& mutation);
+  std::shared_ptr<StorageMemory> account(std::string_view id);
 public:
   TenantCatalog(DirectoryFactory& factory, std::string_view tenant = CollectionId::kDefaultTenant);
   static void initialize(DirectoryFactory& factory, bool writable);
@@ -40,7 +41,13 @@ public:
   static bool empty(DirectoryFactory& factory);
   static uint64_t incarnationNumber(std::string_view id);
 
+  std::unique_lock<std::recursive_mutex> transition() { return std::unique_lock(lifecycle); }
   State read();
+  uint64_t rename(std::string_view from, std::string_view to);
+  uint64_t swap(std::string_view a, std::string_view b);
+  // Installs ready bindings and reserves desired incarnations still being staged.
+  uint64_t apply(const std::map<std::string, std::string>& names,
+                 const std::map<std::string, std::string>& desired);
   std::optional<std::string> current(std::string_view name);
   std::vector<std::string> incarnations(std::string_view name);
   // A supplied source id resumes a follower candidate or its active incarnation.
@@ -50,8 +57,8 @@ public:
   void remove(std::string_view name);
   void removeIncarnation(std::string_view id);
   void cleanup(bool follower);
-  std::shared_ptr<Directory> directory(std::string_view name, std::string_view id);
-  uint64_t bytes(std::string_view name);
+  std::shared_ptr<Directory> directory(std::string_view id);
+  uint64_t bytes(std::string_view id);
 };
 
 } // namespace luxir

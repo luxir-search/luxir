@@ -12,7 +12,7 @@
 
 namespace luxir {
 
-// One node counter, with child counters shared by all incarnations of a collection.
+// One node counter, with child counters for tenants and their incarnations.
 // Buffers own their charges, so unlinking a file never releases a reader's bytes.
 class StorageMemory : public std::enable_shared_from_this<StorageMemory> {
   std::shared_ptr<StorageMemory> parent;

@@ -29,7 +29,7 @@ protected:
   void SetUp() override {
     ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
     selected = *storage.current("main");
-    copy = copySnapshot(storage, "main", selected, Manifest::load(*storage.directory("main", selected)));
+    copy = copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected)));
   }
   Collections::Prepared prepared() {
     auto candidate = collections.stage(CollectionId::of("main"), copy);
@@ -228,4 +228,53 @@ TEST_F(CollectionsTest, concurrentCachePolicySettersPreserveLastAssignment) {
   Signal::unlisten("filterCacheDisabled");
   auto installed = collections.install(prepared(), collections.get(CollectionId::of("main")));
   EXPECT_EQ(8192u, installed->getReaderManager().filterCache->configuration().maxBytes);
+}
+
+TEST(CollectionsMappingTest, swapsPreserveDataAndPublishOneMapping) {
+  LuxirNode node;
+  auto& collections = node.collections();
+  CollectionHelper a(node, "a"), b(node, "b");
+  ASSERT_TRUE(a.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(b.indexAll({flatdoc("id", "b"), flatdoc("id", "c")}, UpdateMessage::COMMIT).success);
+  auto first = node.getCollection("a"), second = node.getCollection("b");
+  auto bytesA = node.storageBytes(CollectionId::of("a")), bytesB = node.storageBytes(CollectionId::of("b"));
+  collections.setCacheBytes("", "a", 4096); collections.setCacheBytes("", "b", 8192);
+  std::atomic<bool> stop{false}, valid{true};
+  auto lookup = std::async(std::launch::async, [&] {
+    while (!stop) {
+      auto left = collections.get(CollectionId::of("a"));
+      auto right = collections.get(CollectionId::of("b"));
+      if ((left != first && left != second) || (right != first && right != second)) valid = false;
+    }
+  });
+  auto stopLookup = scope_guard([&] { stop = true; });
+  for (int i = 0; i < 11; i++) node.swapCollections(CollectionId::of("a"), CollectionId::of("b"));
+  stop = true; lookup.get();
+  EXPECT_TRUE(valid);
+  EXPECT_EQ(second, node.getCollection("a")); EXPECT_EQ(first, node.getCollection("b"));
+  EXPECT_EQ(CollectionId::of("b"), first->getId());
+  EXPECT_EQ(bytesB, node.storageBytes(CollectionId::of("a"))); EXPECT_EQ(bytesA, node.storageBytes(CollectionId::of("b")));
+  EXPECT_EQ(4096u, second->getReaderManager().filterCache->configuration().maxBytes);
+  EXPECT_EQ(8192u, first->getReaderManager().filterCache->configuration().maxBytes);
+  std::pmr::monotonic_buffer_resource arena;
+  api::StatsRequest request; request.collections = true;
+  api::StatsResponse stats;
+  gatherStats(node, request, stats, arena);
+  for (const auto& row : stats.collections) if (row.name == "a" || row.name == "b") {
+    EXPECT_EQ(row.name == "a" ? bytesB : bytesA, row.storage_ram_bytes);
+    EXPECT_EQ(row.name == "a" ? 2u : 1u, row.totals.live_docs);
+    ASSERT_TRUE(row.activity);
+    EXPECT_EQ(row.name == "a" ? 2u : 1u, row.activity->documents_accepted);
+  }
+  auto advertised = node.getReplication().catalog(arena);
+  ASSERT_EQ(1u, advertised.tenants.size());
+  EXPECT_EQ(collections.catalog().read().rev, advertised.tenants[0].revision);
+  for (const auto& row : advertised.collections) if (row.collection == "a" || row.collection == "b") {
+    EXPECT_EQ((row.collection == "a" ? second : first)->getShard()->getSnapshots().snapshot()->id.token(), row.commit);
+  }
+  node.renameCollection(CollectionId::of("a"), CollectionId::of("renamed"));
+  EXPECT_EQ(second, node.getCollection("renamed")); EXPECT_EQ(CollectionId::of("renamed"), second->getId());
+  EXPECT_THROW(node.getCollection("a"), CollectionNotFoundError);
+  EXPECT_THROW(node.renameCollection(CollectionId::of("b"), CollectionId::of("renamed")), CollectionExistsError);
+  EXPECT_THROW(node.swapCollections(CollectionId::of("b"), CollectionId::of("absent")), CollectionNotFoundError);
 }

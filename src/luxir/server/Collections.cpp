@@ -69,8 +69,7 @@ void Collections::validateName(std::string_view name, std::string_view kind) {
   if (name[0] == '_') {
     throw InvalidCollectionNameError(what + " '" + std::string(name) + "' is reserved");
   }
-  // Lowercase id names ([a-z][a-z0-9_]*): the name is the on-disk directory,
-  // and lowercase keeps a data dir portable to case-insensitive filesystems.
+  // Lowercase names keep tenant paths portable to case-insensitive filesystems.
   if (name[0] < 'a' || name[0] > 'z') {
     throw InvalidCollectionNameError(what + " '" + std::string(name) +
                                      "' must start with a lowercase letter");
@@ -118,10 +117,13 @@ TenantCatalog& Collections::catalog(std::string_view tenant) {
 }
 
 Collections::Transition::Transition(Collections& owner, CollectionId name) : owner(owner), name(std::move(name)) {
-  std::lock_guard lock(owner.slotsMutex);
-  auto& slot = owner.slots[this->name];
-  if (slot.busy) throw CollectionUnavailableError("collection '" + this->name.label() + "' is changing");
-  slot.busy = true;
+  {
+    std::lock_guard lock(owner.slotsMutex);
+    auto& slot = owner.slots[this->name];
+    if (slot.busy) throw CollectionUnavailableError("collection '" + this->name.label() + "' is changing");
+    slot.busy = true;
+  }
+  catalogLock = owner.catalog(this->name.tenant).transition();
 }
 
 Collections::Transition::~Transition() {
@@ -189,7 +191,7 @@ void Collections::registered(const CollectionId& id, const std::shared_ptr<Colle
     applyCachePolicy(id, collection);
     listCollection(id, collection);
   }
-  events.registered(id, collection);
+  events.registered(id, collection, revision(id.tenant));
 }
 
 void Collections::removed(const CollectionId& id) {
@@ -202,7 +204,7 @@ void Collections::removed(const CollectionId& id) {
       if (tenant->second.empty()) listing.erase(tenant);
     }
   }
-  events.removed(id);
+  events.removed(id, revision(id.tenant));
 }
 
 std::vector<Collections::Entry> Collections::setCacheBytes(
@@ -296,13 +298,14 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
 
 void Collections::observe(const CollectionId& name, Collection& collection) {
   // The registry belongs to this collection, so the hook never outlives it.
-  collection.getShard()->getSnapshots().onChange = [&events = events, name, &collection]() noexcept {
-    events.updated(name, collection);
+  unused(name);
+  collection.getShard()->getSnapshots().onChange = [&events = events, &collection]() noexcept {
+    events.updated(collection.getId(), collection);
   };
 }
 
 std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& storage, const std::string& selected) {
-  auto manifest = Manifest::load(*storage.directory(name.name, selected));
+  auto manifest = Manifest::load(*storage.directory(selected));
   if (!manifest.bytes || manifest.generation == manifest.highestGeneration) return selected;
   auto recovered = copySnapshot(storage, name.name, selected, manifest);
   LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
@@ -328,7 +331,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   } else {
     selected = recoverWriter(name, storage, *selected);
   }
-  auto col = makeCollection(name, storage.directory(name.name, *selected));
+  auto col = makeCollection(name, storage.directory(*selected));
   if (!creating) {
     auto manifest = Manifest::load(*col->shard->dir);
     if (!manifest.bytes) throw std::runtime_error("catalog selects an empty index directory");
@@ -357,7 +360,7 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
     col = initWriter(name, {}, true);
   } else {
     if (!selected) throw ReadOnlyError("Collection has no catalog selection");
-    col = makeCollection(name, catalog(name.tenant).directory(name.name, *selected));
+    col = makeCollection(name, catalog(name.tenant).directory(*selected));
     arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
     if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
     observe(name, *col);
@@ -408,7 +411,7 @@ std::vector<Collections::Opened> Collections::open(Role role) {
         listCollection(row.id, collection);
       }
       row.collection = std::move(collection);
-      events.registered(row.id, row.collection);
+      events.registered(row.id, row.collection, revision(row.id.tenant));
       LOG_INFO("Loaded collection: {}", row.id.label());
     } catch (const std::exception& e) {
       failLoad(row, e);
@@ -427,13 +430,14 @@ std::shared_ptr<Collection> Collections::unavailable(const CollectionId& name, s
 
 void Collections::fail(const CollectionId& name, const std::shared_ptr<Collection>& collection, const std::string& reason,
                        std::span<const std::string> suspects) {
+  unused(name);
   if (auto shard = collection->getShard(); shard && !suspects.empty()) {
     try { CorruptionMarker::write(*shard->dir, suspects, reason); }
     catch (const ReadOnlyError&) {}
-    catch (const std::exception& e) { LOG_WARN("Cannot record suspect files of '{}': {}", name.label(), e.what()); }
+    catch (const std::exception& e) { LOG_WARN("Cannot record suspect files of '{}': {}", collection->getId().label(), e.what()); }
   }
   collection->fail(reason);
-  events.updated(name, *collection);
+  events.updated(collection->getId(), *collection);
 }
 
 void Collections::unload(const CollectionId& name, const std::shared_ptr<Collection>& expected, std::string reason) {
@@ -562,6 +566,151 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   removed(key);
 }
 
+uint64_t Collections::revision(std::string_view tenant) {
+  try { return catalog(tenant).read().rev; }
+  catch (...) { return 0; } // An unreadable catalog still announces an unavailable collection.
+}
+
+uint64_t Collections::storageBytes(const CollectionId& id) {
+  auto collection = get(id);
+  return collection ? storageBytes(*collection) : 0;
+}
+
+uint64_t Collections::storageBytes(const Collection& collection) {
+  auto shard = collection.getShard();
+  auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+  return snapshot ? catalog(collection.getId().tenant).bytes(snapshot->id.incarnation) : 0;
+}
+
+void Collections::publishMapping(std::string_view tenant,
+    const std::map<std::string, std::shared_ptr<Collection>>& next, const std::function<uint64_t()>& publish) {
+  struct Change { CollectionId key; std::shared_ptr<Collection> expected, replacement; };
+  std::vector<Change> changes;
+  std::vector<CollectionEvents::Binding> bindings;
+  std::vector<std::pair<CollectionId, std::shared_ptr<Collection>>> reserved;
+  auto rollback = scope_guard([&] { for (const auto& [id, collection] : reserved) map.erase(id, collection); });
+  for (const auto& entry : entries(tenant)) {
+    auto it = next.find(entry.id.name);
+    auto replacement = it == next.end() ? nullptr : it->second;
+    if (replacement != entry.collection) changes.push_back({entry.id, entry.collection, replacement});
+  }
+  for (const auto& [name, collection] : next) {
+    CollectionId id{std::string(tenant), name};
+    if (map.get(id)) continue;
+    auto placeholder = Collection::placeholder(id, "being installed");
+    if (!map.insert(id, placeholder)) throw CollectionUnavailableError("collection is changing");
+    reserved.emplace_back(id, placeholder);
+    changes.push_back({id, placeholder, collection});
+  }
+  for (const auto& change : changes) bindings.push_back({change.key, change.replacement});
+  // Prepare the listing before publication; lookups continue to see the old map.
+  auto nextListing = next;
+  auto rev = publish();
+  Signal::emit("collectionMappingPublished", this);
+  {
+    std::lock_guard policyLock(cachePolicyMutex);
+    std::lock_guard lock(listingMutex);
+    for (const auto& [name, collection] : next) {
+      CollectionId id{std::string(tenant), name};
+      collection->setId(id);
+      applyCachePolicy(id, collection);
+      if (std::ranges::any_of(changes, [&](const auto& change) { return change.key == id; })) Signal::emit("collectionPublishing", collection.get());
+    }
+    // Transitions own all affected names. Each lookup sees its old or new
+    // binding; two names may briefly resolve to the same collection during a swap.
+    // Install destinations before removing sources, including for a rename.
+    for (const auto& change : changes) if (change.replacement) {
+      if (!map.replace(change.key, change.expected, change.replacement)) throw std::logic_error("collection mapping changed during publication");
+    }
+    for (const auto& change : changes) if (!change.replacement) {
+      if (!map.erase(change.key, change.expected)) throw std::logic_error("collection mapping changed during publication");
+    }
+    listing[std::string(tenant)].swap(nextListing);
+    if (listing[std::string(tenant)].empty()) listing.erase(std::string(tenant));
+  }
+  events.remapped(tenant, rev, bindings);
+  for (const auto& change : changes) if (auto shard = change.expected->getShard()) {
+    bool reused = std::ranges::any_of(next, [&](const auto& e) { return e.second == change.expected; });
+    if (!reused) shard->snapshots->detach();
+  }
+}
+
+void Collections::changeNames(const CollectionId& from, const CollectionId& to, bool exchange) {
+  validate(from); validate(to);
+  if (from.tenant != to.tenant || from == to) throw InvalidCollectionNameError("names must differ and belong to one tenant");
+  Transition first(*this, std::min(from, to)), second(*this, std::max(from, to));
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[from].leased.empty() || !slots[to].leased.empty()) throw CollectionUnavailableError("collection has a staged replacement");
+  }
+  auto source = map.get(from), target = map.get(to);
+  if (!source || (exchange && !target)) throw CollectionNotFoundError("collection does not exist");
+  if (!exchange && target) throw CollectionExistsError("destination collection already exists");
+  if (!source->getUnavailableReason().empty() || (target && !target->getUnavailableReason().empty()))
+    throw CollectionUnavailableError("collection is unavailable");
+  std::map<std::string, std::shared_ptr<Collection>> next;
+  for (const auto& entry : entries(from.tenant)) next.emplace(entry.id.name, entry.collection);
+  next[to.name] = source;
+  if (exchange) next[from.name] = target;
+  else next.erase(from.name);
+  publishMapping(from.tenant, next, [&] {
+    auto& storage = catalog(from.tenant);
+    return exchange ? storage.swap(from.name, to.name) : storage.rename(from.name, to.name);
+  });
+}
+
+void Collections::applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
+                               const std::map<std::string, std::string>& desired,
+                               std::vector<Prepared> prepared, std::span<const std::string> retained) {
+  auto lock = catalog(tenant).transition();
+  std::set<CollectionId> keys;
+  for (const auto& entry : entries(tenant)) keys.insert(entry.id);
+  for (const auto& [name, id] : names) keys.emplace(std::string(tenant), name);
+  std::vector<std::unique_ptr<Transition>> transitions;
+  for (const auto& key : keys) transitions.push_back(std::make_unique<Transition>(*this, key));
+  std::map<std::string, std::shared_ptr<Collection>> byId, next;
+  auto previous = catalog(tenant).read();
+  for (const auto& entry : entries(tenant)) {
+    if (auto shard = entry.collection->getShard()) {
+      if (auto snapshot = shard->snapshots->snapshot()) byId.emplace(snapshot->id.incarnation, entry.collection);
+    } else {
+      auto selected = std::ranges::find_if(previous.entries, [&](const auto& e) { return e.name == entry.id.name && e.state == "active"; });
+      if (selected != previous.entries.end()) byId.emplace(selected->id, entry.collection);
+    }
+  }
+  for (auto& item : prepared) {
+    auto& candidate = item.candidate;
+    observe(candidate.id_, *candidate.collection_);
+    byId.insert_or_assign(candidate.incarnation_, candidate.collection_);
+  }
+  std::map<std::string, std::string> selected;
+  for (const auto& [name, id] : names) {
+    if (id.empty()) {
+      auto old = get({std::string(tenant), name});
+      next.emplace(name, old && !old->getShard() ? old : Collection::placeholder({std::string(tenant), name}, "waiting for replicated data"));
+    } else {
+      auto it = byId.find(id);
+      if (it == byId.end()) throw std::runtime_error("mapping incarnation is not ready");
+      next.emplace(name, it->second);
+      selected.emplace(name, id);
+    }
+  }
+  publishMapping(tenant, next, [&] { return catalog(tenant).apply(selected, desired); });
+  for (auto& item : prepared) {
+    item.candidate.lease.reset();
+    try { item.candidate.collection_->getShard()->getSnapshots().sweepOrphans(); }
+    catch (const std::exception& e) { LOG_WARN("Follower file retirement failed: {}", e.what()); }
+  }
+  {
+    std::lock_guard lock(slotsMutex);
+    for (const auto& key : keys) slots[key].retained.clear();
+  }
+  for (const auto& entry : catalog(tenant).read().entries) if (entry.state == "retiring" && std::ranges::find(retained, entry.id) == retained.end()) {
+    try { catalog(tenant).removeIncarnation(entry.id); }
+    catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
+  }
+}
+
 Collections::Candidate Collections::stage(const CollectionId& key, std::string_view incarnation) {
   auto lease = std::unique_ptr<Lease>(new Lease{*this, key, std::string(incarnation)});
   {
@@ -575,7 +724,7 @@ Collections::Candidate Collections::stage(const CollectionId& key, std::string_v
   }
   auto& tenant = catalog(key.tenant);
   tenant.reserve(key.name, incarnation);
-  auto collection = makeCollection(key, tenant.directory(key.name, incarnation));
+  auto collection = makeCollection(key, tenant.directory(incarnation));
   return Candidate(key, std::string(incarnation), std::move(collection), std::move(lease));
 }
 
@@ -596,49 +745,22 @@ Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr
 std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::shared_ptr<Collection>& expected) {
   auto& candidate = prepared.candidate;
   const auto& name = candidate.id_;
-  const auto& incarnation = candidate.incarnation_;
   auto collection = candidate.collection_;
   auto& storage = catalog(name.tenant);
   Transition transition(*this, name);
   if (map.get(name) != expected) throw std::runtime_error("collection changed during installation");
-  // Allocate what registration needs before the commit point.
   observe(name, *collection);
-  std::shared_ptr<Collection> reserved;
-  if (!expected) {
-    reserved = Collection::placeholder(name, "being installed");
-    if (!map.insert(name, reserved)) throw std::runtime_error("collection changed during installation");
-  }
-  // The catalog activation is the commit point. A repeated activation re-syncs
-  // an earlier uncertain publication. On failure nothing is retired.
-  try { storage.activate(name.name, incarnation); }
-  catch (...) {
-    if (reserved) map.erase(name, reserved);
-    throw;
-  }
-  // The transition owns the name, so the entry is still the expected one.
-  {
-    std::lock_guard lock(cachePolicyMutex);
-    applyCachePolicy(name, collection);
-    Signal::emit("collectionPublishing", collection.get());
-    map.replace(name, reserved ? reserved : expected, collection);
-    listCollection(name, collection);
-  }
-  events.registered(name, collection);
-  if (auto shard = expected ? expected->getShard() : nullptr) shard->snapshots->detach();
+  std::map<std::string, std::shared_ptr<Collection>> next;
+  for (const auto& entry : entries(name.tenant)) next.emplace(entry.id.name, entry.collection);
+  next[name.name] = collection;
+  publishMapping(name.tenant, next, [&] { storage.activate(name.name, candidate.incarnation_); return storage.read().rev; });
   {
     std::lock_guard lock(slotsMutex);
     slots[name].retained.clear();
   }
   candidate.lease.reset();
-  retire(name, incarnation);
+  retire(name, candidate.incarnation_);
   return collection;
-}
-
-void Collections::retainSelected(const CollectionId& name) noexcept {
-  try {
-    Transition transition(*this, name);
-    if (auto selected = catalog(name.tenant).current(name.name)) retire(name, *selected);
-  } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' skipped: {}", name.label(), e.what()); }
 }
 
 void Collections::discard(Candidate& candidate) noexcept {

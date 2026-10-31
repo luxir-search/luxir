@@ -310,7 +310,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
       auto& collectionStats = collections[i];
       collectionStats.name = api::build::arenaStr(resource, entry.id.name);
       collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
-      collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
+      collectionStats.storage_ram_bytes = node.collections().storageBytes(*entry.collection);
       auto unavailable = [&](const ErrorInfo& info) {
         collectionStats.schema_gen = 0;
         collectionStats.shards = {};

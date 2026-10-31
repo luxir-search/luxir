@@ -103,6 +103,8 @@ public:
     return createCollection(CollectionId::of(name), schema);
   }
   void deleteCollection(const CollectionId& id);
+  void renameCollection(const CollectionId& from, const CollectionId& to);
+  void swapCollections(const CollectionId& a, const CollectionId& b);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
 
   oneapi::tbb::task_arena& getTaskArena() {

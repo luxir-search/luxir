@@ -93,7 +93,7 @@ TEST(StoragePortabilityTest, authoritativeBytesOpenOnAnotherBackend) {
     TenantCatalog from(source, name.tenant), to(readonly, name.tenant);
     auto id = from.current(name.name).value();
     EXPECT_EQ(id, to.current(name.name));
-    auto fsDir = from.directory(name.name, id), ramDir = to.directory(name.name, id);
+    auto fsDir = from.directory(id), ramDir = to.directory(id);
     CommitSnapshotRegistry fsSnapshots(*fsDir), ramSnapshots(*ramDir);
     fsSnapshots.openLocalSnapshot(true); ramSnapshots.openLocalSnapshot(true);
     EXPECT_EQ(fsSnapshots.snapshot()->id, ramSnapshots.snapshot()->id);
@@ -110,7 +110,7 @@ TEST(StoragePortabilityTest, authoritativeBytesOpenOnAnotherBackend) {
     }
   }
   TenantCatalog imported(*writable);
-  auto dir = imported.directory("main", incarnation);
+  auto dir = imported.directory(incarnation);
   auto epoch = IncarnationState::read(*dir)->value.epoch;
   CommitSnapshotRegistry snapshots(*dir);
   IndexWriter writer(snapshots, {}, nullptr, 10, incarnation);

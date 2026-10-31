@@ -99,7 +99,7 @@ TEST(FSProcessTest, writerTakeover) {
   ASSERT_EQ('o', second.receive());
   second.send('g');
   ASSERT_EQ(0, second.join());
-  auto dir = catalog.directory("main", id);
+  auto dir = catalog.directory(id);
   auto winner = Manifest::load(*dir);
   first.send('g');
   ASSERT_EQ(0, first.join());

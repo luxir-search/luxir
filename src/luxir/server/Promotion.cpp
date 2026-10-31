@@ -11,9 +11,9 @@
 namespace luxir {
 
 std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest, bool verify) {
-  auto old = storage.directory(name, from);
+  auto old = storage.directory(from);
   auto incarnation = storage.reserve(name);
-  auto next = storage.directory(name, incarnation);
+  auto next = storage.directory(incarnation);
   auto state = IncarnationState::claim(*next);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
@@ -54,7 +54,7 @@ bool validTarget(TenantCatalog& storage, std::string_view name, const std::strin
   try {
     auto incarnations = storage.incarnations(name);
     if (!CommitId::validIncarnation(incarnation) || std::ranges::find(incarnations, incarnation) == incarnations.end()) return false;
-    auto target = Manifest::load(*storage.directory(name, incarnation));
+    auto target = Manifest::load(*storage.directory(incarnation));
     if (!target.bytes) return false;
     std::pmr::monotonic_buffer_resource arena;
     auto info = Manifest::decode(target.bytes, arena);
@@ -86,11 +86,13 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
       TenantCatalog storage(factory, id.tenant);
       auto selected = storage.current(id.name);
       if (!selected) continue;
-      auto& promoted = state.collection(id).promoted;
+      auto& history = state.tenants[id.tenant].incarnations;
+      auto saved = std::ranges::find_if(history, [&](const auto& entry) { return entry.second.promoted == *selected; });
+      auto& promoted = (saved == history.end() ? history[*selected] : saved->second).promoted;
       if (!promoted.empty() && !validTarget(storage, id.name, promoted)) promoted.clear();
       if (promoted.empty()) {
         Signal::emit("replicationPromotingCollection", (void*)&id.name);
-        promoted = copySnapshot(storage, id.name, *selected, Manifest::load(*storage.directory(id.name, *selected)), verify);
+        promoted = copySnapshot(storage, id.name, *selected, Manifest::load(*storage.directory(*selected)), verify);
         state.write(*metadata);
       }
       // Re-select even if the catalog already names the target: an earlier attempt

@@ -29,6 +29,8 @@ defaults and constraints are described in the comments and guides.
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
 | <a id="method-luxir.admin.deletecollection"></a>[`DeleteCollection`](#method-luxir.admin.deletecollection) | [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest) | [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse) |  |
+| <a id="method-luxir.admin.renamecollection"></a>[`RenameCollection`](#method-luxir.admin.renamecollection) | [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest) | [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse) |  |
+| <a id="method-luxir.admin.swapcollections"></a>[`SwapCollections`](#method-luxir.admin.swapcollections) | [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest) | [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse) |  |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
 | <a id="method-luxir.admin.cachecontrol"></a>[`CacheControl`](#method-luxir.admin.cachecontrol) | [`CacheControlRequest`](#message-luxir.cachecontrolrequest) | [`CacheControlResponse`](#message-luxir.cachecontrolresponse) |  |
 
@@ -165,6 +167,8 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest)
+- [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse)
 - [`ReplicaRequirement`](#message-luxir.replicarequirement)
 - [`ReplicaResult`](#message-luxir.replicaresult)
 - [`ReplicationCatalog`](#message-luxir.replicationcatalog)
@@ -172,6 +176,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus)
 - [`ReplicationInstalled`](#message-luxir.replicationinstalled)
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
+- [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
@@ -192,6 +197,8 @@ defaults and constraints are described in the comments and guides.
 - [`StatsTotals`](#message-luxir.statstotals)
 - [`StorageRamStats`](#message-luxir.storageramstats)
 - [`StoredResourceDef`](#message-luxir.storedresourcedef)
+- [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest)
+- [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse)
 - [`SystemStats`](#message-luxir.systemstats)
 - [`TcpStats`](#message-luxir.tcpstats)
 - [`TopDocs`](#message-luxir.topdocs)
@@ -1907,6 +1914,29 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 | <a id="field-luxir.regexquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.regexquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, and every member of character classes and ranges also match their simple Unicode case alternates. Negated classes exclude all case forms of their members. |
 
+<a id="message-luxir.renamecollectionrequest"></a>
+
+### luxir.RenameCollectionRequest
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.renamecollectionrequest.from"></a>[`from`](#field-luxir.renamecollectionrequest.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionrequest.to"></a>[`to`](#field-luxir.renamecollectionrequest.to) | 2 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionrequest.tenant"></a>[`tenant`](#field-luxir.renamecollectionrequest.tenant) | 3 | `string` | singular |  |
+
+<a id="message-luxir.renamecollectionresponse"></a>
+
+### luxir.RenameCollectionResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.renamecollectionresponse.from"></a>[`from`](#field-luxir.renamecollectionresponse.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionresponse.to"></a>[`to`](#field-luxir.renamecollectionresponse.to) | 2 | `string` | singular |  |
+
 <a id="message-luxir.replicarequirement"></a>
 
 ### luxir.ReplicaRequirement
@@ -1949,6 +1979,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationcatalog.boot"></a>[`boot`](#field-luxir.replicationcatalog.boot) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalog.cursor"></a>[`cursor`](#field-luxir.replicationcatalog.cursor) | 2 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalog.collections"></a>[`collections`](#field-luxir.replicationcatalog.collections) | 3 | [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry) | repeated |  |
+| <a id="field-luxir.replicationcatalog.tenants"></a>[`tenants`](#field-luxir.replicationcatalog.tenants) | 4 | [`ReplicationTenant`](#message-luxir.replicationtenant) | repeated |  |
 
 <a id="message-luxir.replicationcatalogentry"></a>
 
@@ -2009,6 +2040,17 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationstatus.last_contact"></a>[`last_contact`](#field-luxir.replicationstatus.last_contact) | 4 | `uint64` | singular | Unix milliseconds |
 | <a id="field-luxir.replicationstatus.collections"></a>[`collections`](#field-luxir.replicationstatus.collections) | 5 | [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus) | repeated |  |
 | <a id="field-luxir.replicationstatus.followers"></a>[`followers`](#field-luxir.replicationstatus.followers) | 6 | [`FollowerStatus`](#message-luxir.followerstatus) | repeated |  |
+
+<a id="message-luxir.replicationtenant"></a>
+
+### luxir.ReplicationTenant
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationtenant.tenant"></a>[`tenant`](#field-luxir.replicationtenant.tenant) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationtenant.revision"></a>[`revision`](#field-luxir.replicationtenant.revision) | 2 | `uint64` | singular |  |
 
 <a id="message-luxir.rescorequery"></a>
 
@@ -2350,6 +2392,29 @@ Chunk settings for one stored-field group (a FieldDef stored\_resource). Every s
 | <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with zstd. A chunk closes at whichever of the byte and document limits comes first. |
 | <a id="field-luxir.storedresourcedef.zstd_dictionary"></a>[`zstd_dictionary`](#field-luxir.storedresourcedef.zstd_dictionary) | 5 | `bool` | optional | Enable one ZSTD dictionary per resource, shared by its segments. The first merge with at least 100 times the capacity (at most 8 MiB) of live stored data trains it; earlier segments have none. Helps most with small chunks; decoding can be slower with large chunks. No automatic retraining: changing this setting, the capacity or codec clears it for a later merge to retrain. After restart, use the dictionary from the largest live segment carrying one. Only valid with codec zstd. |
 | <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with zstd\_dictionary. |
+
+<a id="message-luxir.swapcollectionsrequest"></a>
+
+### luxir.SwapCollectionsRequest
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.swapcollectionsrequest.a"></a>[`a`](#field-luxir.swapcollectionsrequest.a) | 1 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsrequest.b"></a>[`b`](#field-luxir.swapcollectionsrequest.b) | 2 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsrequest.tenant"></a>[`tenant`](#field-luxir.swapcollectionsrequest.tenant) | 3 | `string` | singular |  |
+
+<a id="message-luxir.swapcollectionsresponse"></a>
+
+### luxir.SwapCollectionsResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.swapcollectionsresponse.a"></a>[`a`](#field-luxir.swapcollectionsresponse.a) | 1 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsresponse.b"></a>[`b`](#field-luxir.swapcollectionsresponse.b) | 2 | `string` | singular |  |
 
 <a id="message-luxir.systemstats"></a>
 

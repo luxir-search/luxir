@@ -72,7 +72,7 @@ TenantCatalog::Snapshot TenantCatalog::snapshot() {
 
 TenantCatalog::State TenantCatalog::read() { return snapshot().state; }
 
-void TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
+uint64_t TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
   std::lock_guard lock(mutex);
   auto before = snapshot();
   Signal::emit("catalogRead", this);
@@ -87,7 +87,7 @@ void TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
         continue;
       }
       if (before.publication) { std::array<std::string, 1> names{"CATALOG"}; dir->sync(names); }
-      return;
+      return before.state.rev;
     }
     if (next.rev == UINT64_MAX) throw std::runtime_error("catalog revision exhausted");
     next.rev++;
@@ -99,7 +99,7 @@ void TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
     try {
       if (dir->publishFile("CATALOG", std::as_bytes(std::span(bytes)), condition)) {
         Signal::emit("catalogPublished", this);
-        return;
+        return next.rev;
       }
     } catch (...) {
       auto failure = std::current_exception();
@@ -108,7 +108,7 @@ void TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
         // Visibility alone does not prove FS durability after a failed directory sync.
         std::array<std::string, 1> names{"CATALOG"};
         dir->sync(names);
-        return;
+        return next.rev;
       }
       std::rethrow_exception(failure);
     }
@@ -116,14 +116,14 @@ void TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
   }
 }
 
-std::shared_ptr<StorageMemory> TenantCatalog::account(std::string_view name) {
-  return tenantAccount ? tenantAccount->child(std::string(name)) : nullptr;
+std::shared_ptr<StorageMemory> TenantCatalog::account(std::string_view id) {
+  return tenantAccount ? tenantAccount->child(std::string(id)) : nullptr;
 }
-uint64_t TenantCatalog::bytes(std::string_view name) { auto a = account(name); return a ? a->bytes() : 0; }
+uint64_t TenantCatalog::bytes(std::string_view id) { auto a = account(id); return a ? a->bytes() : 0; }
 
-std::shared_ptr<Directory> TenantCatalog::directory(std::string_view name, std::string_view id) {
+std::shared_ptr<Directory> TenantCatalog::directory(std::string_view id) {
   incarnationNumber(id);
-  return factory.directory(authoritative, path + "/i/" + std::string(id), {account(name)});
+  return factory.directory(authoritative, path + "/i/" + std::string(id), {account(id)});
 }
 
 std::optional<std::string> TenantCatalog::current(std::string_view name) {
@@ -137,6 +137,7 @@ std::vector<std::string> TenantCatalog::incarnations(std::string_view name) {
 }
 
 std::string TenantCatalog::reserve(std::string_view name, std::string_view sourceId, bool exclusive) {
+  auto lock = transition();
   Collections::validateName(name);
   if (!sourceId.empty()) incarnationNumber(sourceId);
   std::string reserved;
@@ -145,7 +146,7 @@ std::string TenantCatalog::reserve(std::string_view name, std::string_view sourc
       return e.name == name && e.state != "retiring";
     })) throw CollectionExistsError("collection '" + std::string(name) + "' already exists");
     if (!sourceId.empty()) for (const auto& entry : state.entries) if (entry.id == sourceId) {
-      if (entry.name != name || (entry.state != "reserved" && entry.state != "active")) throw std::runtime_error("incarnation is not available for installation");
+      if (entry.state != "reserved" && entry.state != "active") throw std::runtime_error("incarnation is not available for installation");
       reserved = sourceId;
       return false;
     }
@@ -157,7 +158,7 @@ std::string TenantCatalog::reserve(std::string_view name, std::string_view sourc
     state.entries.push_back({reserved, std::string(name), "reserved"});
     return true;
   });
-  IncarnationState::create(*directory(name, reserved));
+  IncarnationState::create(*directory(reserved));
   return reserved;
 }
 
@@ -174,6 +175,78 @@ void TenantCatalog::activate(std::string_view name, std::string_view id) {
   });
 }
 
+uint64_t TenantCatalog::rename(std::string_view from, std::string_view to) {
+  Collections::validateName(from); Collections::validateName(to);
+  if (from == to) throw InvalidCollectionNameError("rename requires different names");
+  return mutate([&](State& state) {
+    auto entry = std::ranges::find_if(state.entries, [&](const auto& e) { return e.name == from && e.state == "active"; });
+    if (entry == state.entries.end()) throw CollectionNotFoundError("collection '" + std::string(from) + "' does not exist");
+    for (const auto& e : state.entries) {
+      if (e.name == to && (e.state == "active" || e.state == "reserved")) throw CollectionExistsError("collection '" + std::string(to) + "' already exists");
+      if ((e.name == from || e.name == to) && e.state != "active") throw CollectionUnavailableError("collection is changing");
+    }
+    entry->name = to;
+    return true;
+  });
+}
+
+uint64_t TenantCatalog::swap(std::string_view a, std::string_view b) {
+  Collections::validateName(a); Collections::validateName(b);
+  if (a == b) throw InvalidCollectionNameError("swap requires different names");
+  return mutate([&](State& state) {
+    Entry *first = nullptr, *second = nullptr;
+    for (auto& entry : state.entries) if (entry.name == a || entry.name == b) {
+      if (entry.state != "active") throw CollectionUnavailableError("collection is changing");
+      (entry.name == a ? first : second) = &entry;
+    }
+    if (!first || !second) throw CollectionNotFoundError("swap requires two active collections");
+    std::swap(first->name, second->name);
+    return true;
+  });
+}
+
+uint64_t TenantCatalog::apply(const std::map<std::string, std::string>& names,
+                              const std::map<std::string, std::string>& desired) {
+  auto lock = transition();
+  std::map<std::string, std::string> byId;
+  for (const auto& [name, id] : names) {
+    Collections::validateName(name); incarnationNumber(id);
+    if (!byId.emplace(id, name).second) throw std::runtime_error("duplicate incarnation in mapping");
+  }
+  std::map<std::string, std::string> pending;
+  for (const auto& [name, id] : desired) if (!id.empty()) {
+    Collections::validateName(name); incarnationNumber(id);
+    if (!byId.contains(id)) pending.emplace(id, name);
+  }
+  auto rev = mutate([&](State& state) {
+    bool changed = false;
+    for (const auto& [id, name] : pending) {
+      auto entry = std::ranges::find(state.entries, id, &Entry::id);
+      if (entry == state.entries.end()) {
+        state.high = std::max(state.high, incarnationNumber(id));
+        state.entries.push_back({id, name, "reserved"});
+        changed = true;
+      } else if (entry->state != "active" && entry->state != "reserved") throw std::runtime_error("desired incarnation is not available");
+    }
+    for (const auto& [id, name] : byId) {
+      auto entry = std::ranges::find(state.entries, id, &Entry::id);
+      if (entry == state.entries.end() || (entry->state != "active" && entry->state != "reserved")) throw std::runtime_error("mapping requires a ready incarnation");
+    }
+    for (auto& entry : state.entries) {
+      if (auto it = byId.find(entry.id); it != byId.end()) {
+        changed |= entry.name != it->second || entry.state != "active";
+        entry.name = it->second; entry.state = "active";
+      } else if (auto it = pending.find(entry.id); it != pending.end()) {
+        changed |= entry.name != it->second || entry.state != "reserved";
+        entry.name = it->second; entry.state = "reserved";
+      } else if (entry.state == "active") { entry.state = "retiring"; changed = true; }
+    }
+    return changed;
+  });
+  for (const auto& [id, name] : pending) IncarnationState::create(*directory(id));
+  return rev;
+}
+
 void TenantCatalog::retire(std::string_view name) {
   mutate([&](State& state) {
     bool changed = false;
@@ -182,6 +255,7 @@ void TenantCatalog::retire(std::string_view name) {
   });
 }
 void TenantCatalog::removeIncarnation(std::string_view id) {
+  auto lock = transition();
   incarnationNumber(id);
   mutate([&](State& state) {
     auto entry = std::ranges::find(state.entries, id, &Entry::id);
@@ -191,7 +265,7 @@ void TenantCatalog::removeIncarnation(std::string_view id) {
     entry->state = "retiring";
     return true;
   });
-  auto dir = factory.directory(authoritative, path + "/i/" + std::string(id), {tenantAccount});
+  auto dir = directory(id);
   std::array<std::string, 1> names{"STATE"};
   dir->deleteDurably(names);
   Signal::emit("incarnationStateRemoved", this);
