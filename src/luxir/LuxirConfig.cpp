@@ -208,6 +208,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
+  app.add_flag("--indexing.source-default,!--no-indexing.source-default", index.source_default,
+               "Keep every document as submitted (the _source_ stored resource) in new collections "
+               "whose schema does not declare _source_; existing collections are unaffected")
+      ->default_val(index.source_default);
   app.add_option("--indexing.max-ram-mb", index.max_ram_mb,
                  "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
       ->check(CLI::NonNegativeNumber)

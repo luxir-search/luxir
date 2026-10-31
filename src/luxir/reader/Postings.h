@@ -47,6 +47,11 @@ public:
   // in this namespace too (e.g. "_stored_paragraphs_").
   static constexpr std::string_view STORED_DEFAULT_RESOURCE = "_stored_";
 
+  // Reserved stored-resource name of the document source store, which keeps
+  // each document as submitted in files of its own (the separated layout).
+  // No field may name it; it is never registered in a segment.
+  static constexpr std::string_view SOURCE_RESOURCE = "_source_";
+
 
   // Create a sortable string from a number.  It's currently
   // a base36 representation prefixed with the number of digits-1 to make it sort correctly.
@@ -126,6 +131,22 @@ public:
     s.append(getSortableString(gen));
     s += '_';
     s.append(getSortableString(fnum));
+    return s;
+  }
+
+  /// A _source file: "v<seq>".  Sequence numbers come from IndexInfo.next_source_seq
+  /// and are never reused.  The name carries no segment: a merged segment
+  /// references the source files of its inputs.
+  static std::string getSourceFileName(uint64_t seq) {
+    return "v" + getSortableString(seq);
+  }
+
+  /// The source map of a segment, which lists the source files holding its
+  /// documents: "s<seg>__S<gen>".
+  static std::string getSourceMapFileName(const std::string_view segStr, uint64_t sourceGen) {
+    std::string s = std::string(PREFIX_FNAME).append(segStr);
+    s += "__S";
+    s.append(getSortableString(sourceGen));
     return s;
   }
 

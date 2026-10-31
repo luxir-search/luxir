@@ -552,6 +552,12 @@ the node unlimited. The resolved values are logged at startup.
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
 
+`--indexing.source-default` (default off) keeps every document as submitted
+(the `_source_` stored resource) in each new collection whose schema does not
+declare `_source_`, including collections created on first use. A create request
+opts out with `"stored_resources": {"_source_": {"enabled": false}}`. Existing
+collections are never changed by it.
+
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
 with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a

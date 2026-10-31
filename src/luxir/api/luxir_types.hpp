@@ -138,7 +138,10 @@ enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 enum class DateUnit { MS = 0, NS = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
-namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
+namespace StoredResourceDef_ {
+enum class Codec { LZ4 = 0, ZSTD = 1 };
+enum class Layout { INLINE = 0, SEPARATED = 1 };
+}
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
@@ -815,12 +818,20 @@ struct KnnQuery {                                                // needs Vector
 };
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
+  using Layout = luxir::api::StoredResourceDef_::Layout;
+  std::optional<std::int64_t> min_file_bytes;                   // align 8
+  std::optional<double> min_live_ratio;
+  std::span<const std::string_view> includes;
+  std::span<const std::string_view> excludes;
   std::optional<Codec> codec;                                   // align 4 (enum)
+  std::optional<Layout> layout;
   std::optional<std::int32_t> zstd_level;                       // align 4
   std::optional<std::int32_t> chunk_size_bytes;
   std::optional<std::int32_t> max_docs_per_chunk;
   std::optional<std::int32_t> zstd_dictionary_bytes;
+  std::optional<std::int32_t> max_files;
   std::optional<bool> zstd_dictionary;                          // align 1
+  std::optional<bool> enabled;
 };
 struct SchemaDef {                                                // needs StoredResourceDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
@@ -1173,6 +1184,9 @@ struct UpdateRequest {                                         // needs CommitPa
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
   map_view<std::string_view, std::string_view> field_map;
+  // Source includes/excludes for this request's docs, replacing the collection's.
+  std::span<const std::string_view> source_includes;
+  std::span<const std::string_view> source_excludes;
   bool allow_dups = false;
   bool all_or_none = false;
   bool return_ids = false;

@@ -1203,6 +1203,12 @@ message UpdateRequest {
   // If true, doc keys not present in field_map are dropped instead of indexed.
   // Requires a non-empty field_map (note "id" is dropped too unless mapped).
   bool drop_unmapped = 12;
+
+  // Override the collection's source includes/excludes (SourceDef) for this
+  // request's docs: setting either replaces both. At most one of the two, with
+  // the same path syntax. Ignored by a collection that does not store sources.
+  repeated string source_includes = 13;
+  repeated string source_excludes = 14;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -2408,12 +2414,19 @@ message FieldDef {
 // Every setting is optional; absent selects the default. Changes apply to
 // segments written afterwards. A merge recompresses its inputs unless their
 // codec and chunk limits already match; the level alone does not count.
+//
+// The reserved resource "_source_" is the optional store of every document as
+// it was submitted (see docs/design/source-store.md). It always uses the
+// SEPARATED layout: files of their own that no search, warmup or segment open
+// reads. Declaring it turns the store on for documents indexed afterwards;
+// retrieve a document with fields ["_source"], or export it with format=docs
+// and source=true. No field may name it as its stored_resource.
 message StoredResourceDef {
   enum Codec {
     LZ4 = 0;  // fast compression and decompression
     ZSTD = 1; // smaller chunks for repetitive text such as logs, at more CPU
   }
-  // Chunk compression; absent selects lz4.
+  // Chunk compression; absent selects lz4, or zstd for the separated layout.
   optional Codec codec = 1;
 
   // ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid
@@ -2441,7 +2454,50 @@ message StoredResourceDef {
 
   // Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536.
   // Training can produce a smaller dictionary. Only valid with zstd_dictionary.
+  // Not yet available with the separated layout.
   optional int32 zstd_dictionary_bytes = 6;
+
+  // Where the resource's bytes live. INLINE (the default) keeps them in the
+  // segment's data files, copied by every merge. SEPARATED keeps them in files
+  // of their own that a merge references rather than copies, relocating only
+  // the mostly deleted or small ones. In this release only "_source_" may use
+  // SEPARATED, and it may use nothing else; the settings below apply to it.
+  enum Layout {
+    INLINE = 0;
+    SEPARATED = 1;
+  }
+  optional Layout layout = 7;
+
+  // "_source_" only. False keeps the entry but stops storing sources for
+  // documents indexed from now on; the next merge of a segment then drops that
+  // segment's sources. Absent means true.
+  optional bool enabled = 8;
+
+  // Separated layout: a merge keeps referencing a file while at least this
+  // fraction of its documents is live, and rewrites the live ones into a new
+  // file otherwise. Above 0 and at most 1; absent selects 0.5.
+  optional double min_live_ratio = 9;
+
+  // Separated layout: a merge also rewrites a file smaller than this, even when
+  // fully live, so small files fold together. 0 or more; absent selects 4194304.
+  optional int64 min_file_bytes = 10;
+
+  // Separated layout: a merged segment references at most this many files plus
+  // the one it writes. A file holding less than 1/max_files of the segment's
+  // live bytes is rewritten with the small ones. 1 or more; absent selects 32.
+  optional int32 max_files = 11;
+
+  // "_source_" only. Keep only these paths of each document's source (includes)
+  // or all but these (excludes); at most one of the two. The document is still
+  // indexed in full. A path joins object keys with '.' ("user.name") and
+  // reaches into arrays of objects without an index step; '*' in a pattern
+  // matches any run of characters, dots included. A matching path keeps or
+  // drops its whole value; with includes, an object or array left with nothing
+  // is dropped too. Paths name the keys as submitted, before field_map. An
+  // update request can override them for its own documents
+  // (UpdateRequest.source_includes).
+  repeated string includes = 12;
+  repeated string excludes = 13;
 }
 
 message SchemaDef {
@@ -2463,7 +2519,8 @@ message SchemaDef {
   // example "_stored_body_"), so it never matches a field or suffix template.
   // A field may name only an entry here or the default "_stored_", which uses
   // the defaults without one. mode=set replaces the named entries and keeps
-  // the others.
+  // the others. The reserved "_source_" entry is the document source store;
+  // mode=replace_all keeps the current one unless the replacement names it.
   map<string, StoredResourceDef> stored_resources = 4;
 }
 

@@ -2045,7 +2045,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 |---|---|---|---|---|
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
-| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. The reserved "\_source\_" entry is the document source store; mode=replace\_all keeps the current one unless the replacement names it. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2338,18 +2338,25 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 
 ### luxir.StoredResourceDef
 
-Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards. A merge recompresses its inputs unless their codec and chunk limits already match; the level alone does not count.
+Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards. A merge recompresses its inputs unless their codec and chunk limits already match; the level alone does not count.<br><br>The reserved resource "\_source\_" is the optional store of every document as it was submitted (see docs/design/source-store.md). It always uses the SEPARATED layout: files of their own that no search, warmup or segment open reads. Declaring it turns the store on for documents indexed afterwards; retrieve a document with fields \["\_source"\], or export it with format=docs and source=true. No field may name it as its stored\_resource.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects lz4. |
+| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects lz4, or zstd for the separated layout. |
 | <a id="field-luxir.storedresourcedef.zstd_level"></a>[`zstd_level`](#field-luxir.storedresourcedef.zstd_level) | 2 | `int32` | optional | ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid with codec zstd. |
 | <a id="field-luxir.storedresourcedef.chunk_size_bytes"></a>[`chunk_size_bytes`](#field-luxir.storedresourcedef.chunk_size_bytes) | 3 | `int32` | optional | Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384, or 65536 with zstd. Larger chunks compress better, but each retrieval decompresses a whole chunk. |
 | <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with zstd. A chunk closes at whichever of the byte and document limits comes first. |
 | <a id="field-luxir.storedresourcedef.zstd_dictionary"></a>[`zstd_dictionary`](#field-luxir.storedresourcedef.zstd_dictionary) | 5 | `bool` | optional | Enable one ZSTD dictionary per resource, shared by its segments. The first merge with at least 100 times the capacity (at most 8 MiB) of live stored data trains it; earlier segments have none. Helps most with small chunks; decoding can be slower with large chunks. No automatic retraining: changing this setting, the capacity or codec clears it for a later merge to retrain. After restart, use the dictionary from the largest live segment carrying one. Only valid with codec zstd. |
-| <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with zstd\_dictionary. |
+| <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with zstd\_dictionary. Not yet available with the separated layout. |
+| <a id="field-luxir.storedresourcedef.layout"></a>[`layout`](#field-luxir.storedresourcedef.layout) | 7 | [`StoredResourceDef.Layout`](#enum-luxir.storedresourcedef.layout) | optional |  |
+| <a id="field-luxir.storedresourcedef.enabled"></a>[`enabled`](#field-luxir.storedresourcedef.enabled) | 8 | `bool` | optional | "\_source\_" only. False keeps the entry but stops storing sources for documents indexed from now on; the next merge of a segment then drops that segment's sources. Absent means true. |
+| <a id="field-luxir.storedresourcedef.min_live_ratio"></a>[`min_live_ratio`](#field-luxir.storedresourcedef.min_live_ratio) | 9 | `double` | optional | Separated layout: a merge keeps referencing a file while at least this fraction of its documents is live, and rewrites the live ones into a new file otherwise. Above 0 and at most 1; absent selects 0.5. |
+| <a id="field-luxir.storedresourcedef.min_file_bytes"></a>[`min_file_bytes`](#field-luxir.storedresourcedef.min_file_bytes) | 10 | `int64` | optional | Separated layout: a merge also rewrites a file smaller than this, even when fully live, so small files fold together. 0 or more; absent selects 4194304. |
+| <a id="field-luxir.storedresourcedef.max_files"></a>[`max_files`](#field-luxir.storedresourcedef.max_files) | 11 | `int32` | optional | Separated layout: a merged segment references at most this many files plus the one it writes. A file holding less than 1/max\_files of the segment's live bytes is rewritten with the small ones. 1 or more; absent selects 32. |
+| <a id="field-luxir.storedresourcedef.includes"></a>[`includes`](#field-luxir.storedresourcedef.includes) | 12 | `string` | repeated | "\_source\_" only. Keep only these paths of each document's source (includes) or all but these (excludes); at most one of the two. The document is still indexed in full. A path joins object keys with '.' ("user.name") and reaches into arrays of objects without an index step; '\*' in a pattern matches any run of characters, dots included. A matching path keeps or drops its whole value; with includes, an object or array left with nothing is dropped too. Paths name the keys as submitted, before field\_map. An update request can override them for its own documents (UpdateRequest.source\_includes). |
+| <a id="field-luxir.storedresourcedef.excludes"></a>[`excludes`](#field-luxir.storedresourcedef.excludes) | 13 | `string` | repeated |  |
 
 <a id="message-luxir.systemstats"></a>
 
@@ -2445,6 +2452,8 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.commit"></a>[`commit`](#field-luxir.updaterequest.commit) | 10 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit; if absent, no commit is performed. |
 | <a id="field-luxir.updaterequest.field_map"></a>[`field_map`](#field-luxir.updaterequest.field_map) | 11 | map&lt;`string`, `string`&gt; | map | Renames input document keys onto schema fields for this request's docs, applied before schema lookup: a doc key found in the map indexes under the mapped name. An entry mapping to "" drops that input key. After mapping, a name appearing more than once in a doc keeps the last occurrence (the same last-wins rule as duplicate keys). Keys not in the map index under their own name unless drop\_unmapped is set. This reshapes a foreign document stream per request, without editing the input or the schema. |
 | <a id="field-luxir.updaterequest.drop_unmapped"></a>[`drop_unmapped`](#field-luxir.updaterequest.drop_unmapped) | 12 | `bool` | singular | If true, doc keys not present in field\_map are dropped instead of indexed. Requires a non-empty field\_map (note "id" is dropped too unless mapped). |
+| <a id="field-luxir.updaterequest.source_includes"></a>[`source_includes`](#field-luxir.updaterequest.source_includes) | 13 | `string` | repeated | Override the collection's source includes/excludes (SourceDef) for this request's docs: setting either replaces both. At most one of the two, with the same path syntax. Ignored by a collection that does not store sources. |
+| <a id="field-luxir.updaterequest.source_excludes"></a>[`source_excludes`](#field-luxir.updaterequest.source_excludes) | 14 | `string` | repeated |  |
 
 <a id="message-luxir.updateresponse"></a>
 
@@ -2628,6 +2637,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
+- [`StoredResourceDef.Layout`](#enum-luxir.storedresourcedef.layout)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
 - [`VectorMetric`](#enum-luxir.vectormetric)
@@ -2933,6 +2943,19 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 |---|---|---|
 | <a id="value-luxir.storedresourcedef.codec.lz4"></a>[`LZ4`](#value-luxir.storedresourcedef.codec.lz4) | 0 | fast compression and decompression |
 | <a id="value-luxir.storedresourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.storedresourcedef.codec.zstd) | 1 | smaller chunks for repetitive text such as logs, at more CPU |
+
+<a id="enum-luxir.storedresourcedef.layout"></a>
+
+### luxir.StoredResourceDef.Layout
+
+Where the resource's bytes live. INLINE (the default) keeps them in the segment's data files, copied by every merge. SEPARATED keeps them in files of their own that a merge references rather than copies, relocating only the mostly deleted or small ones. In this release only "\_source\_" may use SEPARATED, and it may use nothing else; the settings below apply to it.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.storedresourcedef.layout.inline"></a>[`INLINE`](#value-luxir.storedresourcedef.layout.inline) | 0 |  |
+| <a id="value-luxir.storedresourcedef.layout.separated"></a>[`SEPARATED`](#value-luxir.storedresourcedef.layout.separated) | 1 |  |
 
 <a id="enum-luxir.updateresponse.status"></a>
 

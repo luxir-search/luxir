@@ -13,6 +13,7 @@
 #include "luxir/util/StrRef.h"
 #include "FieldType.h"
 #include "FieldSignature.h"
+#include "SourceSettings.h"
 
 namespace luxir {
 
@@ -64,6 +65,7 @@ public:
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
+  SourceSettings source;      // the document source store, from SchemaDef.source
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, uint64_t, std::less<>> introducedGen;
 

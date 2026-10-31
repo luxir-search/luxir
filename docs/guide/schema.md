@@ -409,6 +409,42 @@ There is no automatic retraining. Changing `zstd_dictionary`,
 merge can train another. After a restart, the dictionary from the largest
 live segment carrying one is used.
 
+### The `_source_` resource (experimental)
+
+The reserved stored resource `_source_` keeps every document exactly as
+submitted, in files apart from the index (the `separated` layout); see
+[Documents](documents.md#keeping-documents-as-submitted-_source). Declaring it
+turns the store on for documents indexed from then on. No field may name it as
+its `stored_resource`, and only `_source_` may use the separated layout in this
+release. Every key is optional.
+
+```json
+"stored_resources": {
+  "_source_": {"codec": "zstd", "excludes": ["password_s"]}
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `false` keeps the entry but stops storing sources for new documents; the next merge of a segment then drops that segment's sources and their files. Absent means `true` |
+| `layout` | `separated`, the only layout `_source_` takes (absent selects it) |
+| `codec` | `zstd` (default) or `lz4` |
+| `zstd_level` | `zstd` only: 1 to 22; default 3 |
+| `chunk_size_bytes` | target uncompressed bytes per block, 1024 to 4194304; default 16384. One document larger than this gets a block of its own |
+| `max_docs_per_chunk` | most documents per block, 1 to 65536; absent lets the bytes alone close a block |
+| `min_live_ratio` | a merge keeps referencing a source file while at least this fraction of its documents is live, and rewrites the live ones otherwise; above 0 up to 1, default 0.5 |
+| `min_file_bytes` | a merge also rewrites a source file smaller than this so small files fold together; default 4194304 |
+| `max_files` | a merged segment references at most this many source files plus the one it writes; files holding less than `1/max_files` of its live source bytes are rewritten together; default 32 |
+| `includes` | keep only these paths of each document's source; see [Documents](documents.md#keeping-only-part-of-the-source) |
+| `excludes` | keep all but these paths; at most one of `includes` and `excludes` |
+
+`zstd_dictionary` is not yet available for `_source_`. `mode=set` adds or
+replaces the entry like any other resource. `mode=replace_all` keeps the current
+`_source_` entry unless the replacement names it, because dropping it would make
+the next merges discard every stored source; turn the store off explicitly with
+`"_source_": {"enabled": false}`. The store is experimental: the file format is
+meant to freeze, but carries no compatibility promise yet.
+
 ## Text analysis
 
 A text analyzer applies an ordered list of `char_filters` to the whole value,
