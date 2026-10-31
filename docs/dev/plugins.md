@@ -313,20 +313,20 @@ Rules:
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
-The example plugin registers a `reverse` filter (reverses token bytes, `normalizing`), a
+The example plugin registers an `example_reverse` filter (reverses token bytes, `normalizing`), a
 `strip_x` char filter (removes every `x` through `replace`) and the analyzer `example` =
-`whitespace` + char filter `strip_x` + filters `lowercase`, `reverse`:
+`whitespace` + char filter `strip_x` + filters `lowercase`, `example_reverse`:
 
 ```cpp
 void registerComponents(luxir::Registries& r) override {
-  r.analysis.addFilter("reverse", [](const luxir::api::AnalyzerComponent& def) {
+  r.analysis.addFilter("example_reverse", [](const luxir::api::AnalyzerComponent& def) {
     struct Factory : luxir::TokenFilterFactory {
       std::unique_ptr<luxir::TokenStream> create(std::unique_ptr<luxir::TokenStream> source) const override {
         return std::make_unique<ReverseFilter>(std::move(source));
       }
     };
     auto factory = std::make_unique<Factory>();
-    factory->name = "reverse";
+    factory->name = "example_reverse";
     factory->normalizing = true;
     return std::unique_ptr<luxir::TokenFilterFactory>(std::move(factory));
   });
@@ -346,6 +346,62 @@ void registerComponents(luxir::Registries& r) override {
 ```
 
 A schema then uses the plugin by name (`"analyzer": "example"`) or composes its components
-(`"analyzer": {"tokenizer": "whitespace", "filters": ["reverse"]}`).
+(`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+## Storage backends and layers
+
+`Registries::storage` (`src/luxir/store/StorageRegistry.h`) holds named storage
+backends and layers. `ram` and `fs` are built in and registered before plugins.
+
+- A **backend** builds the root `DirectoryFactory` from the node configuration. It
+  is selected by `--store.backend NAME`.
+- A **layer** wraps the factory built so far. Layers are selected by
+  `--store.layer NAME` (repeatable, innermost first) and sit between the backend and
+  the core wrappers: `checked_dir` and `read_only` stay outermost, so a mutation is
+  refused before any layer sees it.
+
+Both makers receive a `StorageContext`: the whole `LuxirConfig`, the free-form
+`options` map (`--store.option KEY=VALUE`, read directly or through `option()`,
+`optionOr()` and `optionBytes()`), and `reclaim`, the callback RAM backends call
+under memory pressure. Unknown names fail when the node opens its storage, with a
+message listing the registered names.
+
+```cpp
+void registerComponents(luxir::Registries& r) override {
+  r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
+    return std::make_unique<S3DirFactory>(ctx.option("bucket").value_or(""));
+  });
+  r.storage.addLayer("cache", [](std::unique_ptr<luxir::DirectoryFactory> inner, const luxir::StorageContext& ctx) {
+    return std::make_unique<CacheLayer>(std::move(inner), ctx.optionBytes("cache_bytes", 1ULL << 30));
+  });
+}
+```
+
+A backend implements `DirectoryFactory`. Beyond the collection primitives it provides
+`nodeDirectory()` (a stable directory for node-level files such as `replication.json`),
+may override `holdsNoCollections()` (a follower refuses a data directory that holds
+anything else) and `describe()` (one line for the startup log).
+
+A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
+`container()` and `incarnation()` to hand out `DelegatingDirectory` subclasses. Both
+bases forward every virtual, including `createFile` with options, `expectSynced`,
+`deletePrefix`, `sync`, `underlying`, `linkFile`, `openChecksum` and `capabilities`.
+A wrapper that changes the semantics of a mutator must override it explicitly.
+
+### Capabilities
+
+`Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
+shares bytes), `ATOMIC_RENAME`, `DURABLE_SYNC` (`sync` is an fsync), `MEMORY_MAPPED`
+(`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
+selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
+linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
+masks `HARD_LINK`) overrides `capabilities()`.
+
+### The example plugin
+
+`test/plugins/example` registers a `counting_ram` backend (RAM storage counting
+directory opens and creates per collection) and a `counting` layer (counting file
+opens and creates). `StorageExampleTest` runs a node on both and asserts the counters
+(`CountingStorage::count`).

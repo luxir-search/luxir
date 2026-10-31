@@ -163,10 +163,10 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
             compileWith(registry, R"("standard")")->canonical);
   // the example plugin's preset carries a char filter in the canonical form
   auto example = compileWith(globalAnalysisRegistry(), R"("example")");
-  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             example->canonical);
   EXPECT_EQ(example->canonical, compileWith(globalAnalysisRegistry(),
-      R"({"char_filters":["strip_x"],"tokenizer":"whitespace","filters":["lowercase","reverse"]})")->canonical);
+      R"({"char_filters":["strip_x"],"tokenizer":"whitespace","filters":["lowercase","example_reverse"]})")->canonical);
 }
 
 TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
@@ -179,7 +179,7 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
   EXPECT_EQ("english", withCharFilters->presetName);
   EXPECT_EQ(R"({"char_filters":["html_strip"],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})",
             withCharFilters->canonical);
-  EXPECT_EQ(R"({"char_filters":["nfkc_cf"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["nfkc_cf"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             compileWith(globalAnalysisRegistry(), R"({"name":"example","char_filters":["nfkc_cf"]})")->canonical);
 }
 
@@ -229,12 +229,12 @@ TEST_F(AnalysisRegistryTest, examplePluginComponentsAreRegistered) {
   auto has = [](const std::vector<std::string>& names, std::string_view name) {
     return std::find(names.begin(), names.end(), name) != names.end();
   };
-  EXPECT_TRUE(has(analysis.filterNames(), "reverse"));
+  EXPECT_TRUE(has(analysis.filterNames(), "example_reverse"));
   EXPECT_TRUE(has(analysis.filterNames(), "stop"));  // built-ins stay alongside plugin components
   EXPECT_TRUE(has(analysis.charFilterNames(), "strip_x"));
   EXPECT_TRUE(has(analysis.analyzerNames(), "example"));
   EXPECT_TRUE(has(analysis.analyzerNames(), "english"));
-  api::AnalyzerComponent withParams = component("reverse");
+  api::AnalyzerComponent withParams = component("example_reverse");
   EXPECT_NO_THROW(analysis.makeFilter(withParams));
 }
 
@@ -244,7 +244,7 @@ TEST_F(AnalysisRegistryTest, pluginComponentsIndexAndMatchEndToEnd) {
   CollectionHelper helper;
   putSchema(helper.collection(), R"({"fields":{
     "ex":{"type":"text","analyzer":{"name":"example"}},
-    "rv":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["reverse"]}},
+    "rv":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["example_reverse"]}},
     "en":{"type":"text","analyzer":"english"}
   }})");
   ASSERT_TRUE(helper.index(flatdoc("id", "d1", "ex", "Hxello WORLD", "rv", "abc def", "en", "The Winter's Ponies"),

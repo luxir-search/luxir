@@ -291,18 +291,13 @@ struct ReplicationFollower::Impl {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
-    bool fs = node.getConfig().store.backend == "fs";
-    metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.getConfig().store.data_dir))
-                  : std::make_shared<RAMDir>();
+    metadata = node.collections().storage().nodeDirectory();
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
       existing.source = binding.source;
       binding = std::move(existing);
     } else {
-      if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
-        auto name = entry.path().filename().string();
-        if (name == "write.lock" || name == "replication.json.pending") continue;
-        if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
+      if (!node.collections().storage().holdsNoCollections()) {
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
       binding.write(*metadata);

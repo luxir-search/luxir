@@ -34,8 +34,13 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
     auto present = std::ranges::find_if(listing, [&](const auto& entry) { return entry.name == file.name; });
     if (present == listing.end() || present->size != file.size) throw std::runtime_error("snapshot copy is missing " + file.name);
   }
-  std::array<std::string, 1> directory{"."};
-  next->sync(directory);
+  // Hard links share already-durable bytes, so only the directory entries need
+  // syncing; a backend without HARD_LINK wrote fresh copies that need it too.
+  std::vector<std::string> toSync{"."};
+  if (!(next->capabilities() & Directory::HARD_LINK)) {
+    for (const auto& file : files) toSync.push_back(file.name);
+  }
+  next->sync(toSync);
   info.incarnation = incarnation;
   info.index_gen = manifest.highestGeneration + 1;
   info.commit_time++;
@@ -72,6 +77,7 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
     output << "Promote failed: " << dataDir.string() << " is not a follower data directory\n";
     return false;
   }
+  // Offline tool for a follower filesystem data directory, so it opens the FS backend directly.
   FSDirFactory factory(dataDir);
   FSDirectory metadata(dataDir);
   auto state = ReplicationState::read(*metadata.openFile("replication.json"));

@@ -496,6 +496,8 @@ class FSDirectory : public Directory {
   }
 
 public:
+  Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
+
   void linkFile(Directory& source, std::string_view name) override {
     auto& fs = dynamic_cast<FSDirectory&>(source.underlying());
     std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
