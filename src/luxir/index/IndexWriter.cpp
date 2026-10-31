@@ -19,6 +19,7 @@
 #include "luxir/schema/Schema.h"
 
 #include "luxir/index/AuxInfo.h"
+#include "luxir/index/SegmentSummary.h"
 #include <memory_resource>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -1437,6 +1438,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     auto& postings = inverter.getPostingsWriter();
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
+    if (success) writeSegmentSummary(*segInfo, postings);
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
@@ -2100,6 +2102,25 @@ std::vector<std::string> IndexWriter::snapshotActiveVectorOverlayNames() {
   }
   std::sort(names.begin(), names.end());
   return names;
+}
+
+void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept {
+  try {
+    // Written once per segment at a fixed generation, so it takes none from
+    // the overlays that get rebuilt (vector indexes).
+    std::string fileName = SegmentSummary::overlayFileName(seg.segId);
+    AuxInfo info;
+    info.kind = std::string(SegmentSummary::OVERLAY_KIND);
+    info.name = std::string(SegmentSummary::OVERLAY_NAME);
+    info.gen = SegmentSummary::OVERLAY_GEN;
+    info.files.push_back(pwriter.summary.write(dir, fileName, seg.segId, seg.maxDoc, true));
+    seg.unsyncedFiles.push_back(fileName);
+    seg.auxOverlays.push_back(std::move(info));
+  } catch (const std::exception& e) {
+    LOG_WARN("Segment summary not written for seg={}: {}", seg.segId, e.what());
+  } catch (...) {
+    LOG_WARN("Segment summary not written for seg={}: unknown exception", seg.segId);
+  }
 }
 
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
@@ -2766,6 +2787,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
+      phase = "segment_summary";
+      writeSegmentSummary(*newSegInfo, pwriter);
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
