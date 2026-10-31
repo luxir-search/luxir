@@ -1425,7 +1425,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocs() == nullptr
+      DocSet* canonical = !segment.hasDeletes()
           ? nullptr : &segment.liveDocs()->docset();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));

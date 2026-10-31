@@ -806,7 +806,7 @@ public:
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
         ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    if (domain || segment.hasDeletes()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 

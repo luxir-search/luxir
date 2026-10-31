@@ -347,7 +347,7 @@ public:
             BulkAnswer::NO,
           };
         }
-        assert(bkd != nullptr && !reader.multiValued() && segment.liveDocs() == nullptr);
+        assert(bkd != nullptr && !reader.multiValued() && !segment.hasDeletes());
         size_t size = bkd->maxPointsPerLeaf();
         BKDReader::Scratch countScratch{
           {}, planPool.make_span<uint32_t>(size),

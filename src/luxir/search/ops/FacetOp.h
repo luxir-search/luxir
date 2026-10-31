@@ -2158,7 +2158,7 @@ public:
       auto& segment = rangeOp().reader.segments()[segnum];
       bool noSubOps = rangeOp().subOps.empty();
       if (!IntFacetRangeReq::disablePointsRangeFacetForTests
-          && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
+          && domain == nullptr && !segment.hasDeletes() && noSubOps
           && start < end) {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (auto* info = rangeOp().fieldInfo(segnum)) {

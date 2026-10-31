@@ -386,7 +386,7 @@ public:
         const ExpansionFacts& facts, ExpansionMode mode) {
       unused(facts.sumDocFreq);
       if (facts.matchState == Query::MatchState::EMPTY) return nullptr;
-      int32_t maxDoc = segment.postingsReader().maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       if (mode == ExpansionMode::EAGER) {
         return targetPool.make<MultiTermQuery::Scorer>(
             materializeEagerBitset(targetPool, facts, maxDoc), maxDoc, boost);
