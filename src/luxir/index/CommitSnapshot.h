@@ -40,6 +40,7 @@ struct CommitSnapshot {
   // segment mapped. Empty when the snapshot came from bytes (a replica's).
   std::vector<std::weak_ptr<PostingsReader>> openReaders = {};
 
+  std::string manifestName() const;
   static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes);
   static uint64_t digestOf(const std::vector<std::byte>& bytes);
   // A digest's text form on the wire: 16 lowercase hex digits.

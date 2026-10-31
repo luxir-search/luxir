@@ -316,7 +316,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
   for (const auto& file : std::filesystem::directory_iterator(indexPath)) {
     if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
   }
-  std::ofstream(indexPath / Manifest::name(1),
+  std::ofstream(indexPath / Manifest::name(1, 1),
                 std::ios::binary | std::ios::trunc)
       << "\xff\xff\xff\xff\xff\xff\xff\xff";
 

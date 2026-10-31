@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 #include "TenantCatalog.h"
+#include "luxir/store/IncarnationState.h"
 #include "Collections.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
@@ -147,6 +148,7 @@ std::string TenantCatalog::reserve(std::string_view name, std::string_view sourc
     state.entries.push_back({reserved, std::string(name), "reserved"});
     return true;
   });
+  IncarnationState::create(*directory(name, reserved));
   return reserved;
 }
 
@@ -180,6 +182,10 @@ void TenantCatalog::removeIncarnation(std::string_view id) {
     entry->state = "retiring";
     return true;
   });
+  auto dir = factory.directory(authoritative, path + "/i/" + std::string(id), {tenantAccount});
+  std::array<std::string, 1> names{"STATE"};
+  dir->deleteDurably(names);
+  Signal::emit("incarnationStateRemoved", this);
   factory.removeTree(authoritative, path + "/i/" + std::string(id));
   mutate([&](State& state) {
     return std::erase_if(state.entries, [&](const auto& entry) { return entry.id == id && entry.state == "retiring"; }) != 0;
@@ -229,7 +235,9 @@ bool TenantCatalog::empty(DirectoryFactory& factory) {
   for (const auto& child : factory.children(authoritative, "t")) {
     if (!child.directory || !TenantCatalog(factory, child.name).read().entries.empty()) return false;
     for (const auto& entry : factory.children(authoritative, "t/" + child.name)) {
-      if (entry.name != "CATALOG" && (entry.name != "i" || !factory.children(authoritative, "t/" + child.name + "/i").empty())) return false;
+      if (entry.name == "CATALOG") continue;
+      if (entry.name != "i") return false;
+      if (!factory.children(authoritative, "t/" + child.name + "/i").empty()) return false;
     }
   }
   return true;

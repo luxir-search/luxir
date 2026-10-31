@@ -158,38 +158,42 @@ liveness, not a deep read/write check of every collection or storage device.
 Operational statistics and Prometheus metrics are described in
 [Stats and monitoring](#stats-and-monitoring).
 
-Filesystem publication syncs new data files and then the directory before
-writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
-footer. It syncs that manifest and then the directory before acknowledging
-the commit. Startup checks the newest manifest's footer and decodes its payload;
-by default it does not hash data files (see
-[file integrity checks](#file-integrity-checks)). Torn candidates are skipped.
-Fallback candidates also require their referenced files to be present with
-matching sizes.
+Filesystem publication syncs data files and their directory entries, then writes
+an immutable `commit_<index_gen>.<epoch>` candidate with a length and xxh3
+checksum footer. It acknowledges the commit only after a durable conditional
+update of the incarnation's `STATE` tip. Each writer open claims a new epoch;
+a superseded writer cannot advance that tip. Segment files carry their creator
+epoch, and later live-doc and overlay files also carry their writer's epoch.
 
-Once the new root is durable, obsolete manifests and unreferenced data are removed.
+Startup follows `STATE`, not the highest candidate filename. If its manifest is
+invalid, recovery scans older candidates whose referenced files are present
+with matching sizes, and copies the recovered snapshot into a new incarnation.
+By default startup does not hash data files (see
+[file integrity checks](#file-integrity-checks)).
+
+Once the new tip is durable, obsolete manifests and unreferenced data are
+removed. Writer startup sweeps unreferenced index files from fenced, older
+epochs; it leaves files of newer epochs alone. These local cleanup rules and
+process-local pins are not a retention protocol for shared remote readers.
+Retiring an incarnation seals its `STATE` before deleting data and leaves that
+small tombstone permanently, preventing delayed requests from reviving it.
+
 Replication pin counters are described in the
 [replication reference](replication.md#reference). Replication file transfers have
 a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
 HTTP responses have no write deadline.
 
-Writer startup removes leftover unreferenced
-index files using the directory listing, without reading their contents. If
-startup falls back below the highest manifest generation, it logs an error and
-skips this sweep, preserving newer files for recovery.
-
 Publication scratch files use the reserved `.luxir-publish-` prefix and are
 hidden from index listings. An owned filesystem view removes scratch files from
 other processes when it opens; the current process's publishers are left alone.
 
-Removals are not directory-synced: a crash may restore obsolete names, but the
-newest durable manifest does not reference them. Failed publication candidates
-are removed and the directory is synced best-effort. An error response does not
-guarantee that the commit is absent: a crash or cleanup failure can leave a
-complete, unacknowledged candidate recoverable at startup. The local filename is not part
-of the commit identity: clients use the `incarnation:index_gen` token. That
-token's manifest is `<incarnation>/commit_<index_gen>`, with the generation in
-decimal; tools that list manifests in order sort by the parsed generation.
+Retirement removals are not directory-synced: a crash may restore obsolete
+names, but the durable tip does not reference them. A failed candidate is
+removed only if `STATE` definitely does not name it. An error response can still
+have an unknown outcome; a visible candidate alone does not prove a commit.
+Clients continue to use `incarnation:index_gen` tokens. Candidate generations
+are decimal and epochs are lowercase base36; tools resolve the candidate from
+`STATE` rather than sorting the directory listing.
 
 Set log verbosity with:
 
@@ -321,7 +325,7 @@ are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
 `update_version` are numeric. The schema and its history are embedded in each
-`commit_<index_gen>` manifest.
+`commit_<index_gen>.<epoch>` manifest selected by `STATE`.
 
 ### Prometheus scraping
 

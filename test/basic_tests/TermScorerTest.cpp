@@ -4808,7 +4808,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   const int32_t N = DocsEnumMeta::L1_DOCS + 19;
   RAMDir dir;
   MemPool pool;
-  PostingsWriter postingsWriter(dir, 0, N + 16);
+  PostingsWriter postingsWriter(dir, 0, 1, N + 16);
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField("f");
@@ -4826,7 +4826,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0);
+  PostingsReader reader(dir, 0, 1);
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;

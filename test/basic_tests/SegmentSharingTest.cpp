@@ -159,7 +159,8 @@ TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
   EXPECT_EQ(2, deleted->liveDocs());
 
   // The same segment set can be opened through another publisher's reader.
-  auto independent = PostingsReader::create(writer->dir, before->segments()[0].segInfo.seg_id);
+  auto stored = readDurableIndexInfo(writer->dir);
+  auto independent = PostingsReader::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch);
   auto snapshot = *writer->snapshots.snapshot();
   snapshot.openReaders[0] = independent;
   auto separate = std::make_shared<IndexReader>(writer->dir, snapshot, before.get());
@@ -309,13 +310,14 @@ TEST_F(SegmentSharingTest, newIncarnationSharesNothing) {
   root.info.index_gen++;
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(root.info, bytes));
-  Manifest::write(writer->dir, root.info.index_gen, bytes);
+  Manifest::write(writer->dir, root.info.index_gen, bytes, root->writer_epoch);
+  IncarnationState::install(writer->dir, Manifest::tip(root->index_gen, root->writer_epoch));
   auto rerooted = std::make_shared<IndexReader>(writer->dir, before.get());
   ASSERT_EQ(root.info.incarnation, rerooted->incarnation());
   EXPECT_NE(&before->segments()[0].postingsReader(), &rerooted->segments()[0].postingsReader());
   EXPECT_EQ(900, readAll(*rerooted));
   rerooted.reset();
-  writer->dir.deleteFile(Manifest::name(root.info.index_gen));
+  writer->dir.deleteFile(Manifest::name(root.info.index_gen, root->writer_epoch));
 
   node->deleteCollection("share");
   writer.reset();

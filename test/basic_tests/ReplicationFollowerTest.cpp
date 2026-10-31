@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "test/LuxirTest.h"
+#include "test/StorageTestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
@@ -127,10 +128,11 @@ protected:
     return command(std::move(args));
   }
   std::filesystem::path makeLocalUnreadable() {
-    auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+    auto snapshot = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+    auto id = snapshot->id;
     stopFollower();
     auto dir = path / "follower" / "t" / "t0" / "i" / id.incarnation;
-    auto root = dir / Manifest::name(id.index_gen);
+    auto root = dir / snapshot->manifestName();
     std::filesystem::rename(root, root.string() + ".saved");
     // ELOOP is independent of the test process's filesystem privileges.
     std::filesystem::create_symlink(root.filename(), root);
@@ -394,9 +396,7 @@ TEST_P(ReplicationMatrixTest, corruptDownloadLeavesOldReaderServing) {
   std::mutex mutex;
   std::string name, original;
   auto write = [&](const std::string& bytes) {
-    auto output = dir.createFile(name); OutputStream stream(output.get());
-    stream.write(bytes.data(), bytes.size()); stream.close(); dir.finishFile(*output);
-    std::array<std::string, 1> names{name}; dir.sync(names);
+    dir.publishFile(name, std::as_bytes(std::span(bytes)), Directory::PublishMode::REPLACE);
   };
   Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
     std::lock_guard lock(mutex);
@@ -480,7 +480,7 @@ TEST_F(ReplicationFollowerTest, unavailableSourceKeepsReplica) {
   auto directory = source->getCollection("main")->getShard()->getDirectory();
   auto manifest = Manifest::load(*directory);
   stopSource();
-  directory->deleteFile(Manifest::name(manifest.generation));
+  directory->deleteFile(Manifest::name(manifest.generation, manifest.epoch));
   startSource();
   ASSERT_TRUE(until([&] { return stateIs("stale"); }));
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
@@ -510,9 +510,10 @@ TEST_F(ReplicationFollowerTest, corruptLocalCollectionIsFetchedAgain) {
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp());
-  auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  auto snapshot = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto id = snapshot->id;
   stopFollower();
-  std::filesystem::remove(path / "follower" / "t" / "t0" / "i" / id.incarnation / Manifest::name(id.index_gen));
+  std::filesystem::remove(path / "follower" / "t" / "t0" / "i" / id.incarnation / snapshot->manifestName());
   startFollower();
   ASSERT_TRUE(caughtUp());
 }
@@ -875,8 +876,8 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
       FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "t" / "t0" / "i" / target);
       dir.sync({});
       auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
-      if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->id.index_gen, *snapshot->bytes);
-      if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {});
+      if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->manifestName(), *snapshot->bytes);
+      if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {}, 1);
     }
     ASSERT_EQ(0, promote().first);
     auto config = followerConfig; config.replication.source.clear();
@@ -1403,10 +1404,11 @@ TEST_F(ReplicationFollowerTest, fallbackWriterChangesIncarnation) {
   }
   startFollower(); ASSERT_TRUE(caughtUp());
   stopSource();
-  Manifest::write(*dir, old.generation, *old.bytes);
-  auto file = dir->createFile(Manifest::name(newer.generation));
+  Manifest::write(*dir, old.generation, *old.bytes, old.epoch);
+  dir->deleteFile(Manifest::name(newer.generation, newer.epoch));
+  auto file = dir->createFile(Manifest::name(newer.generation, newer.epoch));
   OutputStream out(file.get()); out.write((char)0); out.close(); dir->finishFile(*file);
-  std::array<std::string, 2> names{Manifest::name(old.generation), Manifest::name(newer.generation)};
+  std::array<std::string, 2> names{Manifest::name(old.generation, old.epoch), Manifest::name(newer.generation, newer.epoch)};
   dir->sync(names);
   startSource(); ASSERT_TRUE(caughtUp());
   EXPECT_NE(before.incarnation, source->getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);

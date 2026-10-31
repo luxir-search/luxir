@@ -83,7 +83,9 @@ public:
     if (key.empty()) throw std::invalid_argument("cannot remove a storage root");
     std::lock_guard lock(mutex);
     std::erase_if(views, [&](const auto& view) {
-      return view.first.first == root && (view.first.second == key || view.first.second.starts_with(key + '/'));
+      if (view.first.first != root || (view.first.second != key && !view.first.second.starts_with(key + '/'))) return false;
+      view.second->clear();
+      return true;
     });
   }
 };
@@ -145,7 +147,7 @@ public:
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
       auto name = entry.path().filename().string();
       if (FSDirectory::isPublishTemp(name) || (root == StorageRoot::AUTHORITATIVE && relative.empty() && name == "node")) continue;
-      result.push_back({name, entry.is_directory()});
+      result.push_back({name, entry.symlink_status().type() == std::filesystem::file_type::directory});
     }
     std::ranges::sort(result, {}, &Child::name);
     return result;

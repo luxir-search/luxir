@@ -78,8 +78,8 @@ struct PostingsReader::FieldPage {
 };
 
 // Initialize from files, returns false if missing files and missingFileOK=true
-bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
-  std::string segStr = Postings::getSortableString(segId);
+bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced) {
+  std::string segStr = Postings::segmentKey(segId, creatorEpoch);
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);
   files.emplace_back(dir.openFile(segInfoFile, expectSynced));
 
@@ -166,18 +166,18 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   return true;
 }
 
-std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
+std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced) {
   // Try to create the PostingsReader - use private constructor
   auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
-  if (!reader->initializeFromFiles(dir, segId, missingFileOK, expectSynced)) {
+  if (!reader->initializeFromFiles(dir, segId, creatorEpoch, missingFileOK, expectSynced)) {
     return nullptr;  // Missing files and missingFileOK=true
   }
   return reader;
 }
 
-PostingsReader::PostingsReader(Directory& dir, uint64_t segId) {
+PostingsReader::PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
   // missingFileOK=false throws on a missing file rather than returning false
-  initializeFromFiles(dir, segId, false);
+  initializeFromFiles(dir, segId, creatorEpoch, false, false);
 }
 
 PostingsReader::~PostingsReader() {

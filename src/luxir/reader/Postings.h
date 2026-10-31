@@ -70,16 +70,32 @@ public:
     return val;
   }
 
+  static std::string epochString(uint64_t epoch) {
+    std::array<char, 13> text;
+    auto [end, error] = std::to_chars(text.data(), text.data() + text.size(), epoch, 36);
+    return std::string(text.data(), end);
+  }
+
+  static uint64_t parseEpoch(std::string_view text) {
+    uint64_t value = 0;
+    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, 36);
+    return error == std::errc() && end == text.data() + text.size() && epochString(value) == text ? value : 0;
+  }
+
+  static std::string segmentKey(uint64_t segId, uint64_t epoch) {
+    return getSortableString(segId) + "." + epochString(epoch);
+  }
+
+  static std::string getIndexFileNamePrefix(uint64_t segId, uint64_t epoch) {
+    return std::string(PREFIX_FNAME) + segmentKey(segId, epoch) + '_';
+  }
+
   static std::string getIndexFileName(const std::string_view gen, const std::string_view suffix) {
     return std::string(PREFIX_FNAME).append(gen).append(suffix);
   }
 
-  static std::string getIndexFileNamePrefix(uint64_t segId) {
-    return std::string(PREFIX_FNAME).append(getSortableString(segId));
-  }
-
   /// Filename for the segment given the segment gen/number and the file number.
-  /// Example: the 3rd file in the 4th segment produced would be "s04_03"
+  /// Example: the 3rd file in the 4th segment produced in epoch 2 would be "s04.2_03"
   static std::string getIndexFileName(const std::string_view gen, uint32_t filenum) {
     std::string s = std::string(PREFIX_FNAME).append(gen);
     s += '_';
@@ -105,7 +121,7 @@ public:
   }
 
   /// Filename for a segment-local overlay file (see SegmentInfo.overlays).
-  /// Format: "s<segId>__<caseSafeName>_<gen>_<fnum>" - the segment prefix
+  /// Format: "s<segId>.<creatorEpoch>__<caseSafeName>_<gen>.<writerEpoch>_<fnum>" - the segment prefix
   /// groups a segment's overlays with its data files and liveDocs in ls, and
   /// lets the existing dead-segment deletePrefix sweep reclaim them
   /// automatically.  <name> conventionally contains a dot ("vec.title_v"), so
@@ -117,25 +133,29 @@ public:
   /// field) rebuild ordinal, so rebuilds write a new file while old readers
   /// still hold the previous file.
   static std::string getSegmentOverlayFileName(uint64_t segId, std::string_view name,
-                                               uint64_t gen, uint32_t fnum) {
+                                               uint64_t gen, uint32_t fnum, uint64_t creatorEpoch, uint64_t writerEpoch) {
     std::string s(PREFIX_FNAME);
-    s.append(getSortableString(segId));
+    s.append(segmentKey(segId, creatorEpoch));
     s += "__";
     s.append(caseSafeName(name));
     s += '_';
     s.append(getSortableString(gen));
+    s += '.';
+    s.append(epochString(writerEpoch));
     s += '_';
     s.append(getSortableString(fnum));
     return s;
   }
 
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
-  static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen) {
+  static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen, uint64_t writerEpoch) {
     std::string s = std::string(PREFIX_FNAME).append(gen);
     // double underscore to avoid name conflicts with other seg files.
     // Capital L instead of lowercase l because fonts suck.
     s += "__L";
     s.append(getSortableString(liveGen));
+    s += '.';
+    s.append(epochString(writerEpoch));
     return s;
   }
 };

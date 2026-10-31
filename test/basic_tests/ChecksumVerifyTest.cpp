@@ -254,8 +254,9 @@ TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
   {
     FSDirectory old(dir);
     auto manifest = Manifest::load(old);
-    auto torn = old.createFile(Manifest::name(manifest.generation + 1));
+    auto torn = old.createFile(Manifest::name(manifest.generation + 1, 1));
     OutputStream out(torn.get()); out.write((char)0); out.close(); old.finishFile(*torn);
+    IncarnationState::install(old, Manifest::tip(manifest.generation + 1, 1));
     std::array<std::string, 2> suspects{suspect.name, "s0_absent"};
     CorruptionMarker::write(old, suspects, "pending scrub hit");
     flip(dir, suspect);

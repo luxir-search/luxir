@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <atomic>
@@ -97,7 +98,7 @@ TEST_F(StoredFieldsTest, basicSingleValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
@@ -152,7 +153,7 @@ TEST_F(StoredFieldsTest, multiValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
@@ -199,7 +200,7 @@ TEST_F(StoredFieldsTest, manyDocsMultipleChunks) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     for (int32_t i = 0; i < N; i++) {
@@ -242,7 +243,7 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   std::string big = bigStoredValue();
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
@@ -277,7 +278,7 @@ TEST_F(StoredFieldsTest, segmentMerge) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     // Segment 1
     {
@@ -335,7 +336,7 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
   std::atomic<int64_t> maxReserved{0};
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
 
     {
@@ -395,7 +396,7 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
   // without stored fields using schemaPlain, by swapping schemas between
   // flushes.
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schemaWithStored);
 
     // Segment 1: stored on
@@ -446,7 +447,7 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     {
       auto& inv = iw.obtainInverter();
@@ -494,7 +495,7 @@ TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     {
       auto& inv = iw.obtainInverter();
@@ -568,7 +569,7 @@ TEST_F(StoredFieldsTest, columnFamilies) {
   schema->fieldTypeMap["paragraphs"] = paraFt;
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
@@ -631,7 +632,7 @@ TEST_F(StoredFieldsTest, manyFieldsVarintBoundary) {
   }
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
@@ -672,7 +673,7 @@ TEST_F(StoredFieldsTest, emptySegment) {
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
@@ -735,7 +736,7 @@ TEST_F(StoredFieldsTest, zstdRoundTripHonorsChunkLimits) {
   RAMDir dir;
   StoredChunkFormat format{StoredChunkFormat::ZSTD, 5, 1024, 4};
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, withStoredFormat(format));
     addBodySegment(iw, 0, 10);
   }
@@ -771,7 +772,7 @@ TEST_F(StoredFieldsTest, mergeRecompressesOtherFormatsAndCopiesMatching) {
   RAMDir dir;
   StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 4};
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, withStoredFormat({}));
     addBodySegment(iw, 0, 3);
     addBodySegment(iw, 3, 3);
@@ -796,7 +797,7 @@ TEST_F(StoredFieldsTest, mergeRepacksDirtyChunks) {
   RAMDir dir;
   StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 16};
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, withStoredFormat(zstd));
     for (int i = 0; i < 8; i++) {
       addBodySegment(iw, i * 4, 4);
@@ -819,7 +820,7 @@ TEST_F(StoredFieldsTest, mergeDirtyChunkThreshold) {
   for (int chunks : {99, 100}) {
     SCOPED_TRACE(chunks);
     RAMDir dir;
-    CommitSnapshotRegistry snapshots(dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
     StoredChunkFormat format;
     format.maxDocsPerChunk = 4;
     IndexWriter iw(snapshots, withStoredFormat(format));
@@ -844,7 +845,7 @@ TEST_F(StoredFieldsTest, mergeDirtyChunkThreshold) {
 
 TEST_F(StoredFieldsTest, mergeCopiesSmallCleanSources) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   StoredChunkFormat format;
   format.maxDocsPerChunk = 4;
   IndexWriter iw(snapshots, withStoredFormat(format));
@@ -861,7 +862,7 @@ TEST_F(StoredFieldsTest, mergeCopiesSmallCleanSources) {
 
 TEST_F(StoredFieldsTest, mergeInheritedDirtCrossesThreshold) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   StoredChunkFormat format;
   format.maxDocsPerChunk = 4;
   IndexWriter iw(snapshots, withStoredFormat(format));
@@ -888,7 +889,7 @@ TEST_F(StoredFieldsTest, mergeInheritedDirtCrossesThreshold) {
 
 TEST_F(StoredFieldsTest, mergePaddingPreservesDirtyCounts) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   StoredChunkFormat format;
   format.maxDocsPerChunk = 4;
   auto schema = withStoredFormat(format);
@@ -930,7 +931,7 @@ TEST_F(StoredFieldsTest, mergePreAdoptsLargestCopyFieldTable) {
   for (bool tie : {false, true}) {
     SCOPED_TRACE(tie);
     RAMDir dir;
-    CommitSnapshotRegistry snapshots(dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
     auto schema = makeSchema();
     StoredChunkFormat format;
     format.maxDocsPerChunk = 4;
@@ -1006,7 +1007,7 @@ static std::string trainStoredDictionary() {
 static void writeStoredSegment(RAMDir& dir, const StoredChunkFormat& format,
                                std::shared_ptr<const StoredCompressionDictionary> dictionary,
                                std::span<const std::string> docs, uint64_t segId = 1) {
-  PostingsWriter postings(dir, segId, (int32_t)docs.size());
+  PostingsWriter postings(dir, segId, 1, (int32_t)docs.size());
   StoredFieldsWriter stored(postings, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
   for (size_t doc = 0; doc < docs.size(); doc++) stored.addValue((int32_t)doc, "body", docs[doc]);
   stored.finish((int32_t)docs.size());
@@ -1096,7 +1097,7 @@ public:
 
 TEST_F(StoredFieldsTest, bootstrapTrainsPublishesSharesAndRetrainsAfterClear) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   addBodySegment(iw, 0, 8192);
   addBodySegment(iw, 8192, 8192);
@@ -1135,7 +1136,7 @@ TEST_F(StoredFieldsTest, bootstrapTrainsPublishesSharesAndRetrainsAfterClear) {
 
 TEST_F(StoredFieldsTest, bootstrapAdmissionPricesOnlyAnEmptySlotAndPinsTheDecision) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   addBodySegment(iw, 0, 8);
   addBodySegment(iw, 8, 8);
@@ -1164,7 +1165,7 @@ TEST_F(StoredFieldsTest, bootstrapAdmissionPricesOnlyAnEmptySlotAndPinsTheDecisi
 
 TEST_F(StoredFieldsTest, bootstrapManyTinyDocsHaveBoundedSamples) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   for (int source = 0; source < 2; source++) {
     auto& inv = iw.obtainInverter();
@@ -1193,7 +1194,7 @@ TEST_F(StoredFieldsTest, bootstrapLosingPublicationUsesWinnerOrMovedEpoch) {
   for (bool moveEpoch : {false, true}) {
     SCOPED_TRACE(moveEpoch);
     RAMDir dir;
-    CommitSnapshotRegistry snapshots(dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
     IndexWriter iw(snapshots, dictionarySchema(format));
     addBodySegment(iw, 0, 2048);
     addBodySegment(iw, 2048, 2048);
@@ -1220,7 +1221,7 @@ TEST_F(StoredFieldsTest, bootstrapLosingPublicationUsesWinnerOrMovedEpoch) {
 
 TEST_F(StoredFieldsTest, bootstrapPublicationSurvivesAFailedMerge) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   auto format = DICT_FORMAT;
   format.dictionaryBytes = 1024;
   IndexWriter iw(snapshots, dictionarySchema(format));
@@ -1245,7 +1246,7 @@ TEST_F(StoredFieldsTest, bootstrapPublicationSurvivesAFailedMerge) {
 TEST_F(StoredFieldsTest, bootstrapFullSampleReservesTrainingPeakAndCapsDictionary) {
   RAMDir dir;
   IndexRamBudget budget(64 * 1024 * 1024);
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   auto format = DICT_FORMAT;
   format.dictionaryBytes = 262144;
   IndexWriter iw(snapshots, dictionarySchema(format), &budget);
@@ -1277,7 +1278,7 @@ TEST_F(StoredFieldsTest, bootstrapFullSampleReservesTrainingPeakAndCapsDictionar
 
 TEST_F(StoredFieldsTest, registryFreshFlushesHaveNoDictionary) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   addBodySegment(iw, 0, 8);
   addBodySegment(iw, 8, 8);
@@ -1289,7 +1290,7 @@ TEST_F(StoredFieldsTest, registryFreshFlushesHaveNoDictionary) {
 
 TEST_F(StoredFieldsTest, registryFlushesShareDictionaryAndMergeCopies) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
   ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
@@ -1310,7 +1311,7 @@ TEST_F(StoredFieldsTest, registryFlushesShareDictionaryAndMergeCopies) {
 
 TEST_F(StoredFieldsTest, registryWriterKeepsPinAfterClear) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
   ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
@@ -1336,7 +1337,7 @@ TEST_F(StoredFieldsTest, registrySchemaInvalidatesOnlyAffectedPolicy) {
   for (int edit = 0; edit < 6; edit++) {
     SCOPED_TRACE(edit);
     RAMDir dir;
-    CommitSnapshotRegistry snapshots(dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
     IndexWriter iw(snapshots, dictionarySchema(DICT_FORMAT, DICT_FORMAT));
     ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
     ASSERT_TRUE(publishStoredDictionary(iw, "_stored_extra_", DICT_FORMAT, bytes));
@@ -1365,7 +1366,7 @@ TEST_F(StoredFieldsTest, registrySchemaInvalidatesOnlyAffectedPolicy) {
 
 TEST_F(StoredFieldsTest, registryPublishChecksEpochFormatAndEmptySlot) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
   auto before = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
@@ -1389,7 +1390,7 @@ TEST_F(StoredFieldsTest, registryPublishChecksEpochFormatAndEmptySlot) {
 
 TEST_F(StoredFieldsTest, registryPreparedDictionariesSharedBySettings) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, dictionarySchema());
   auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
   ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
@@ -1420,7 +1421,7 @@ TEST_F(StoredFieldsTest, registryUnchangedOnFailedSchemaPublication) {
   for (auto signal : {"publishSynced", "manifestDurable"}) {
     SCOPED_TRACE(signal);
     RAMDir dir;
-    CommitSnapshotRegistry snapshots(dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
     IndexWriter iw(snapshots, dictionarySchema());
     ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
     auto before = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
@@ -1447,7 +1448,7 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     int64_t liveBytes = 0;
     std::shared_ptr<const StoredCompressionDictionary> pin;
     {
-      CommitSnapshotRegistry snapshots(dir);
+      CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
       IndexWriter iw(snapshots, dictionarySchema());
       ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, a));
       addBodySegment(iw, 0, tie ? 8 : 128);
@@ -1490,11 +1491,11 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     std::vector<std::string> docs(4096, "orphan");
     writeStoredSegment(dir, DICT_FORMAT, orphan, docs, 99);
     {
-      PostingsReader reader(dir, 99);
+      PostingsReader reader(dir, 99, 1);
       ASSERT_GT(defaultStored(reader)->chunkRegionBytes(), liveBytes);
     }
     {
-      CommitSnapshotRegistry snapshots(dir);
+      CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
       IndexWriter iw(snapshots);
       pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
       ASSERT_NE(nullptr, pin);
@@ -1506,7 +1507,7 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     dir.clear(); // prepared dictionary must own bytes after segment mappings die
     RAMDir output;
     writeStoredSegment(output, DICT_FORMAT, pin, docs);
-    PostingsReader reader(output, 1);
+    PostingsReader reader(output, 1, 1);
     auto stored = defaultStored(reader);
     EXPECT_EQ(pin->bytes(), stored->dictionary());
     EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", "orphan"}}), readStored(*stored, 0).flat());
@@ -1534,7 +1535,7 @@ TEST_F(StoredFieldsTest, pinnedDictionaryRoundTrip) {
       RAMDir dir;
       writeStoredSegment(dir, format, std::move(prepared), docs);
       EXPECT_TRUE(pin.expired());
-      PostingsReader postings(dir, 1);
+      PostingsReader postings(dir, 1, 1);
       auto stored = defaultStored(postings);
       ASSERT_NE(nullptr, stored);
       EXPECT_EQ(trained, stored->dictionary());
@@ -1562,7 +1563,7 @@ TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
   ASSERT_FALSE(bytes->bytes().empty());
   auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
   RAMDir dir;
-  PostingsWriter postings(dir, 1);
+  PostingsWriter postings(dir, 1, 1);
   StoredFieldsWriter stored(postings, "_stored_", DICT_FORMAT, prepared);
   auto other = DICT_FORMAT;
   other.dictionaryBytes = 0;
@@ -1584,7 +1585,7 @@ TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
 
 TEST_F(StoredFieldsTest, emptyDictionarySourcesCopyAcrossPolicyChanges) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, withStoredFormat(DICT_FORMAT));
   addBodySegment(iw, 0, 8);
   auto plain = DICT_FORMAT;
@@ -1603,7 +1604,7 @@ TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
   RAMDir dir;
   std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
   writeStoredSegment(dir, DICT_FORMAT, {}, docs);
-  PostingsReader postings(dir, 1);
+  PostingsReader postings(dir, 1, 1);
   const auto* field = postings.fieldInfo("_stored_");
   auto input = postings.getInputStream(field->columnLoc.filenum());
   const char* ptr = input.ptr((int64_t)field->columnLoc.offset() + field->columnMetaOff);
@@ -1615,7 +1616,7 @@ TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
   InputStream::readVint(ptr, end);  // max docs
   ASSERT_GE(end - ptr, 5);
   memcpy(const_cast<char*>(ptr), "\xff\xff\xff\xff\x0f", 5);  // UINT32_MAX
-  PostingsReader corrupt(dir, 1);
+  PostingsReader corrupt(dir, 1, 1);
   EXPECT_THROW(corrupt.fieldInfo("_stored_"), std::runtime_error);
   EXPECT_EQ(0u, corrupt.fieldCacheStats().entries);
 }
@@ -1628,7 +1629,7 @@ TEST_F(StoredFieldsTest, storedMetadataCacheSharedAndAccounted) {
   writeStoredSegment(dir, DICT_FORMAT, prepared, docs);
   auto before = fieldMetadataMemory.entryBytes.load();
   {
-    PostingsReader postings(dir, 1);
+    PostingsReader postings(dir, 1, 1);
     EXPECT_EQ(0u, postings.fieldCacheStats().entries);
     std::array<const PostingsReader::Field*, 8> fields{};
     std::barrier start(8);

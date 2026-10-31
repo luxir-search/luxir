@@ -101,7 +101,7 @@ public:
   // With verify, checks all files; otherwise only marker-named files.
   // Only opening failures retry against a newer root, never hash failures.
   void openLocalSnapshot(bool verify = false);
-  void sweepOrphans(const Manifest& manifest);
+  void sweepOrphans(const Manifest& manifest, uint64_t writerEpoch);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
       const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});

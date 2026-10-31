@@ -109,7 +109,7 @@ int mergedSegmentFileCount(CollectionHelper& helper) {
   auto reader = iw->snapshots.readers.getReader();
   assert(reader->segments().size() == 1);
   uint64_t segId = reader->segments()[0].segInfo.seg_id;
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = Postings::getIndexFileNamePrefix(segId, 1);
 
   std::vector<Directory::FileInfo> files;
   iw->dir.listFiles(files);

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
@@ -92,6 +93,7 @@ public:
     }
     auto base = Schema::createDefaultSchema();
     schema = b.build(base.get());
+    test::reserveIncarnation(index.dir);
     index.iw = std::make_unique<IndexWriter>(
         index.snapshots, schema);
 

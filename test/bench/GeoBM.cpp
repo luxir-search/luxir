@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
@@ -357,6 +358,7 @@ public:
         points((uint64_t)docs * (corpus.multi ? 2ULL : 1ULL)),
         boxes(boxesFor(corpus.shape)), circles(circlesFor(corpus.shape)) {
     schema = geoSchema(corpus.multi);
+    test::reserveIncarnation(index.dir);
     index.iw = std::make_unique<IndexWriter>(
         index.snapshots, schema);
     Inverter& inverter = index.getInverter();
@@ -716,7 +718,7 @@ void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    CommitSnapshotRegistry snapshots(*dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(*dir));
     auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     Inverter& inverter = writer->obtainInverter();
     populate(inverter, shape, corpus.multi, docs,
@@ -751,7 +753,7 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    CommitSnapshotRegistry snapshots(*dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(*dir));
     auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     for (int32_t half = 0; half < 2; half++) {
       int32_t halfDocs = half == 0 ? firstHalf : docs - firstHalf;

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <chrono>
 #include <thread>
@@ -87,7 +88,7 @@ TEST_F(CommitSnapshotTest, budgetCountsUniqueRetiredBytesAndEvictsOldest) {
 TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now();
-  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), {}, [&] { return time; });
   IndexWriter writer(snapshots);
   snapshots.setPolicy({100ms, UINT64_MAX});
   auto first = snapshots.acquire();
@@ -108,7 +109,7 @@ TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
 TEST_F(CommitSnapshotTest, reacquireRenewsSharedPin) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now();
-  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), {}, [&] { return time; });
   IndexWriter writer(snapshots);
   snapshots.setPolicy({100ms, UINT64_MAX});
   auto first = snapshots.acquire();
@@ -290,18 +291,16 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
   auto newest = writer->snapshots.snapshot();
   writer->close();
-  Manifest::write(writer->dir, previous->id.index_gen, *previous->bytes);
-  auto name = Manifest::name(newest->id.index_gen);
-  auto file = writer->dir.createFile(name);
-  OutputStream out(file.get());
-  out.writeInt(42); // Simulate a torn newest root with recoverable data still present.
-  out.close();
-  writer->dir.finishFile(*file);
+  writer->dir.publishFile(previous->manifestName(), Manifest::withFooter(*previous->bytes), Directory::PublishMode::REPLACE);
+  writer->dir.publishFile(newest->manifestName(), std::as_bytes(std::span("torn", 4)), Directory::PublishMode::REPLACE);
+  auto fallback = Manifest::load(writer->dir);
+  EXPECT_EQ(previous->id.index_gen, fallback.generation);
+  EXPECT_EQ(newest->id.index_gen, fallback.highestGeneration);
   CommitSnapshotRegistry recovered(writer->dir);
-  IndexWriter reopened(recovered);
-  EXPECT_NE(previous->id.incarnation, recovered.snapshot()->id.incarnation);
-  EXPECT_GT(recovered.snapshot()->id.index_gen, newest->id.index_gen);
-  EXPECT_EQ(1, recovered.readers.getReader()->liveDocs());
+  // Recovery must copy into a new incarnation through the catalog. A direct
+  // writer cannot change identity inside this directory or sweep its data.
+  EXPECT_THROW(IndexWriter{recovered}, std::runtime_error);
+  EXPECT_EQ(1, IndexReader(writer->dir).liveDocs());
   for (const auto& desc : newest->files) EXPECT_NE(nullptr, writer->dir.openFile(desc.name));
 }
 

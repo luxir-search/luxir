@@ -26,6 +26,12 @@ CommitId CommitId::parse(std::string_view token) {
 }
 
 
+std::string CommitSnapshot::manifestName() const {
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(bytes, arena);
+  return Manifest::name(info.index_gen, info.writer_epoch);
+}
+
 std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(bytes, arena);

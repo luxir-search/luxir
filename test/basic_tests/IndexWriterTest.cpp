@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <iostream>
@@ -76,7 +77,7 @@ public:
 
 TEST_F(IndexWriterTest, closePreservesBorrowedInverter) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto& inverter = writer.obtainInverter();
   char* bytes = inverter.pool.alloc(1024);
@@ -96,7 +97,7 @@ TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
   };
 
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto heldReader = writer.snapshots.readers.getReader();
   writer.close();
@@ -218,10 +219,10 @@ uint32_t randomForceMergeTarget(Rng& r) {
   return (uint32_t)r.rint(3) + 1;
 }
 
-bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
+bool segmentPrefixAbsent(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
-  auto prefix = Postings::getIndexFileNamePrefix(segId);
+  auto prefix = Postings::getIndexFileNamePrefix(segId, creatorEpoch);
   for (const auto& file : files) {
     if (file.name.starts_with(prefix)) return false;
   }
@@ -331,7 +332,7 @@ TEST_F(IndexWriterTest, ramBudgetsDeriveFromNodeBudget) {
 TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   auto dir = std::make_unique<RAMDir>();
   {
-    CommitSnapshotRegistry writerSnapshots(*dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(*dir));
     IndexWriter writer(writerSnapshots);
     writer.mergePolicy->setMergeFactor(2);
 
@@ -376,7 +377,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
 
 TEST_F(IndexWriterTest, failedCommitAdmissionDoesNotLeaveSequencerHole) {
   auto dir = std::make_unique<RAMDir>();
-  CommitSnapshotRegistry snapshots(*dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(*dir));
   auto writer = std::make_unique<IndexWriter>(snapshots);
   auto failed = std::make_unique<TimedCommitMessage>();
 
@@ -419,7 +420,7 @@ TEST_F(IndexWriterTest, failedCommitAdmissionDoesNotLeaveSequencerHole) {
 
 TEST_F(IndexWriterTest, simple) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   auto* inverter = &iw.obtainInverter();
   auto* fieldHandler = &inverter->getIndexHandler(field);
@@ -463,7 +464,7 @@ TEST_F(IndexWriterTest, simple) {
 // and live docs never exceed max docs.
 TEST_F(IndexWriterTest, statsConcurrentWithCommitsAndMerges) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   std::atomic_bool stop = false;
   std::atomic_uint64_t samples = 0;
@@ -510,7 +511,7 @@ TEST_F(IndexWriterTest, statsConcurrentWithCommitsAndMerges) {
 
 TEST_F(IndexWriterTest, statsBytes) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   for (int i = 0; i < 3; i++) addDoc(iw);
   iw.commit();
@@ -531,7 +532,7 @@ TEST_F(IndexWriterTest, statsBytes) {
 // Test retrieving IndexReader from the IndexWriter
 TEST_F(IndexWriterTest, getReader) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   auto reader = iw.snapshots.readers.getReader();
   ASSERT_EQ(0, reader->maxDoc());
@@ -570,7 +571,7 @@ TEST_F(IndexWriterTest, getReader) {
 // acquisition on another thread returns the previous reader at once.
 TEST_F(IndexWriterTest, acquisitionSatisfiedByCurrentReaderDoesNotWaitForReopen) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   addDoc(iw);
   iw.commit();
@@ -598,7 +599,7 @@ TEST_F(IndexWriterTest, acquisitionSatisfiedByCurrentReaderDoesNotWaitForReopen)
 
 TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   auto cache = iw.snapshots.readers.filterCache;
 
@@ -628,7 +629,7 @@ TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {
 
 TEST_F(IndexWriterTest, queryContextOwnsAndDeduplicatesFilterUses) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   auto reader = iw.snapshots.readers.getReader();
   MemPool pool;
@@ -652,7 +653,7 @@ TEST_F(IndexWriterTest, queryContextOwnsAndDeduplicatesFilterUses) {
 
 TEST_F(IndexWriterTest, booleanAcquiresUsesAfterFilterNormalization) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   auto reader = iw.snapshots.readers.getReader();
   MemPool pool;
@@ -675,7 +676,7 @@ TEST_F(IndexWriterTest, autoMerge) {
   auto iterations = 1;  // increase for more thorough testing
   for (auto iter=0; iter<iterations; iter++) {
     RAMDir dir;
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
     int MERGE_FACTOR = 3;
     iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
@@ -826,7 +827,7 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   EXPECT_EQ(failure->phase, "segment_merge");
   EXPECT_FALSE(failure->outputPublished);
   EXPECT_EQ(failure->sourceSegIds.size(), 2u);
-  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId));
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId, 1));
 
   EXPECT_TRUE(waitForMergesCommit(*iw));
   auto afterFailureReader = iw->snapshots.readers.getReader();
@@ -850,7 +851,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
   int percentWaitForMerges = 30;  // of commits, fraction that wait for in-flight merges before publishing
 
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   int MERGE_FACTOR = 3;
   iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
@@ -1279,14 +1280,14 @@ TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
 
 TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
   RAMDir dir;
-  PostingsWriter writer(dir, 1, 3);
+  PostingsWriter writer(dir, 1, 1, 3);
   PostingsWriter::VersionRunsWriter versions(writer);
   versions.add(0, 5);
   versions.add(4, 7); // The last boundary is outside maxDoc.
   versions.finish();
   ASSERT_TRUE(writer.finish());
-  EXPECT_THROW(PostingsReader::create(dir, 1), std::runtime_error);
-  PostingsWriter missing(dir, 2, 1);
+  EXPECT_THROW(PostingsReader::create(dir, 1, 1), std::runtime_error);
+  PostingsWriter missing(dir, 2, 1, 1);
   EXPECT_THROW(missing.finish(), std::runtime_error);
 }
 
@@ -1309,10 +1310,10 @@ TEST_F(IndexWriterTest, requestBirthBlocksRoundTrip) {
     builder.add(start, expected.back().version);
     EXPECT_EQ(count, builder.size());
     start += 1000; // The final run can cover many documents, even in dense mode.
-    PostingsWriter writer(dir, 1, start);
+    PostingsWriter writer(dir, 1, 1, start);
     writer.writeVersionRuns(builder);
     ASSERT_TRUE(writer.finish());
-    auto reader = PostingsReader::create(dir, 1);
+    auto reader = PostingsReader::create(dir, 1, 1);
     const auto& runs = reader->versionRuns();
     ASSERT_EQ(count, runs.size());
     VersionRuns::Cursor cursor(runs);
@@ -1761,7 +1762,7 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   
   // Verify that the index files for the deleted segment have actually been removed
   // The deletePrefix method should have removed all files starting with the segment prefix
-  std::string deletedPrefix = Postings::getIndexFileNamePrefix(deletedSegmentId);
+  std::string deletedPrefix = Postings::getIndexFileNamePrefix(deletedSegmentId, 1);
 
   // Check that no files exist with the deleted segment prefix
   // Use the Directory's listFiles method to get all files
@@ -1792,20 +1793,20 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 
   // Test missingFileOK = false (should throw on missing files)
   EXPECT_THROW({
-      auto reader1 = PostingsReader::create(testDir, 999, false);  // non-existent segment
+      auto reader1 = PostingsReader::create(testDir, 999, 1, false);  // non-existent segment
   }, std::filesystem::filesystem_error);
 
   // Test missingFileOK = true (should return nullptr on missing files)
-  auto reader2 = PostingsReader::create(testDir, 999, true);
+  auto reader2 = PostingsReader::create(testDir, 999, 1, true);
   EXPECT_EQ(reader2, nullptr);
 
   // Test missingFileOK = false (should throw on missing files)
   EXPECT_THROW({
-      auto liveDocs1 = LiveDocs::create(testDir, 999, 1, 10, false);  // non-existent segment
+      auto liveDocs1 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, false);  // non-existent segment
   }, std::filesystem::filesystem_error);
 
   // Test missingFileOK = true (should return nullptr on missing files)
-  auto liveDocs2 = LiveDocs::create(testDir, 999, 1, 10, true);
+  auto liveDocs2 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, true);
   EXPECT_EQ(liveDocs2, nullptr);
 }
 
@@ -2359,7 +2360,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 // Test deletes by docid during indexing (when something goes wrong)
 TEST_F(IndexWriterTest, inverterDeletes) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   
   // Get an inverter and index some documents, marking some as deleted
@@ -2432,7 +2433,7 @@ TEST_F(IndexWriterTest, inverterDeletes) {
 // to 0, so every segment passed 0 < V and was always a delete candidate.
 TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
 
   std::set<int64_t> applied;  // segIds the delete was applied to this commit
@@ -2495,7 +2496,7 @@ TEST_F(IndexWriterTest, obtainInverterReusesOldestIdle) {
   for (size_t oldest = 0; oldest < 4; oldest++) {
     SCOPED_TRACE(oldest);
     RAMDir dir;
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
     std::vector<Inverter*> inverters;
     for (size_t i = 0; i < 4; i++) {
@@ -2532,7 +2533,7 @@ TEST_F(IndexWriterTest, idRangeClipsDeleteSelection) {
     EXPECT_EQ(wideEnvelope ? 2 : 1, applied.load());
     EXPECT_EQ(0, disjoint->liveGen);
     EXPECT_EQ(nullptr, disjoint->sharedPostingsReader.load());
-    EXPECT_EQ(nullptr, iw->dir.openFile(Postings::getLiveDocsFileName(Postings::getSortableString(disjoint->segId), 1)));
+    EXPECT_EQ(nullptr, iw->dir.openFile(Postings::getLiveDocsFileName(Postings::segmentKey(disjoint->segId, 1), 1, 1)));
     EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
     helper.clear();
   }
@@ -2769,7 +2770,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureRetainsDeletesForRetry) {
   ASSERT_EQ(1, iw->segInfos.size());
   auto& seg = *iw->segInfos.begin()->second;
   auto reader = iw->snapshots.readers.getReader();
-  auto failedName = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), 2);
+  auto failedName = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, 1), 2, 1);
   {
     auto fault = failFileCreation(iw->dir, failedName);
     ExpectLog quiet("Failed to create liveDocs file");
@@ -2805,7 +2806,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   ASSERT_EQ(1, iw->idleInverters.size());
   auto* inverter = iw->idleInverters.begin()->first;
   uint64_t segId = inverter->getPostingsWriter().segId;
-  auto failedName = Postings::getLiveDocsFileName(Postings::getSortableString(segId), 1);
+  auto failedName = Postings::getLiveDocsFileName(Postings::segmentKey(segId, 1), 1, 1);
   {
     Signal::listen("checkedCreateFile", [&](void* source, void* name, void*) -> void* {
       if (source != &iw->dir || *(std::string_view*)name != failedName) return nullptr;
@@ -2822,7 +2823,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
     iw->updateGraph->wait_for_all();
   }
   EXPECT_FALSE(iw->segInfos.contains(segId));
-  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, segId));
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, segId, 1));
   EXPECT_EQ(reserved, node.getIndexRamBudget().reservedBytes());
   EXPECT_EQ(0, node.getIndexRamBudget().drainingBytesCount());
   EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
@@ -2835,7 +2836,7 @@ TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {
   using namespace luxir::test;
   RAMDir dir;
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
     auto& future = iw.obtainInverter(1);
     future.startDoc();
@@ -2955,7 +2956,7 @@ TEST_F(IndexWriterTest, removeFields) {
 // flushing segment may not be included in commit
 TEST_F(IndexWriterTest, concurrentFlushAndCommit) {
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   int nDocs = 100;  // 100 docs was enough to reliably reproduce the issue with debug/asan at least
   
@@ -3150,7 +3151,7 @@ TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
     };
     std::map<std::string, std::pair<uint64_t, uint64_t>> before;
     {
-      CommitSnapshotRegistry writerSnapshots(*dir);
+      CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(*dir));
       IndexWriter writer(writerSnapshots);
       addDoc(writer);
       writer.commit();
@@ -3208,7 +3209,7 @@ TEST_F(IndexWriterTest, responsesIdentifyTheirPublishedSnapshot) {
 
 TEST_F(IndexWriterTest, failedSchemaChangeLeavesPublicationUntouched) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   auto schema = writer.getSchema();
@@ -3228,7 +3229,7 @@ TEST_F(IndexWriterTest, failedSchemaChangeLeavesPublicationUntouched) {
 
 TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForPendingMergeCommit) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   for (int i = 0; i < 2; i++) {
     addDoc(writer);
@@ -3278,7 +3279,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   auto fs = std::make_shared<FSDirectory>(path);
   CheckedDirectory dir(fs, CheckedDirMode::THROW);
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   auto originalSchema = writer.getSchema();
@@ -3286,7 +3287,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   writerSnapshots.onChange = [&]() noexcept { changes++; };
   Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
     if (source != &writer) return nullptr; // another test's background merge
-    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
+    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1, before->writer_epoch), true));
     throw std::runtime_error("injected publication failure");
   });
   auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
@@ -3311,7 +3312,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
 TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetKeepsIncarnation) {
   RAMDir dir;
   auto schema = Schema::createDefaultSchema();
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots, schema);
   EXPECT_EQ(0u, schema->gen_);
   auto before = test::readDurableIndexInfo(dir);
@@ -3371,7 +3372,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {
 
 TEST_F(IndexWriterTest, admittedCommitPublishesDuringClose) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addDoc(writer);
   std::latch admitted(1), release(1);
@@ -3398,7 +3399,7 @@ TEST_F(IndexWriterTest, admittedCommitPublishesDuringClose) {
 
 TEST_F(IndexWriterTest, noCommitReturnsNoIdentity) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   EXPECT_FALSE(writer.commit(UpdateMessage::NO_COMMIT));
@@ -3410,7 +3411,7 @@ TEST_F(IndexWriterTest, recoverySkipsTornCandidatesAndChecksFallbackPresence) {
     SCOPED_TRACE(damage);
     RAMDir dir;
     {
-      CommitSnapshotRegistry writerSnapshots(dir);
+      CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
       IndexWriter writer(writerSnapshots);
       addDoc(writer);
       writer.commit();
@@ -3419,37 +3420,37 @@ TEST_F(IndexWriterTest, recoverySkipsTornCandidatesAndChecksFallbackPresence) {
     uint64_t candidate = before->index_gen + 1;
     std::vector<char> corrupt;
     if (damage == 1) {
-      auto bytes = dir.openFile(Manifest::name(before->index_gen))->read();
+      auto bytes = dir.openFile(Manifest::name(before->index_gen, before->writer_epoch))->read();
       corrupt.assign(bytes.begin(), bytes.end());
       corrupt.back() ^= 1;
     }
-    auto file = dir.createFile(Manifest::name(candidate));
+    auto file = dir.createFile(Manifest::name(candidate, 1));
     OutputStream out(file.get());
     if (corrupt.empty()) out.writeInt(42);
     else out.write(corrupt.data(), corrupt.size());
     out.close();
     dir.finishFile(*file);
+    IncarnationState::install(dir, Manifest::tip(candidate, 1));
     if (damage == 2) {
       ASSERT_TRUE(dir.deleteFile(before->segments.front().files.front().name));
-      CommitSnapshotRegistry snapshots(dir);
+      CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
       EXPECT_THROW(IndexWriter{snapshots}, std::runtime_error);
       EXPECT_THROW(IndexReader{dir}, std::runtime_error);
       continue;
     }
+    auto recovered = Manifest::load(dir);
+    EXPECT_EQ(before->index_gen, recovered.generation);
+    EXPECT_EQ(candidate, recovered.highestGeneration);
     CommitSnapshotRegistry recoveredSnapshots(dir);
-    IndexWriter recovered(recoveredSnapshots);
-    EXPECT_GT(recovered.snapshots.readers.getReader()->commitId(), candidate);
-    EXPECT_EQ(recovered.snapshots.readers.getReader()->commitId(), IndexReader(dir).commitId());
-    EXPECT_NE(before->incarnation, recovered.snapshots.snapshot()->id.incarnation);
-    EXPECT_EQ(1, recovered.snapshots.readers.getReader()->liveDocs());
-    EXPECT_GT(recovered.commit()->index_gen, candidate);
+    EXPECT_THROW(IndexWriter{recoveredSnapshots}, std::runtime_error);
+    EXPECT_EQ(1, IndexReader(dir).liveDocs());
   }
 }
 
 TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
   RAMDir dir;
   {
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots);
     addDoc(writer);
     writer.commit();
@@ -3464,7 +3465,7 @@ TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
 }
 
 TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
-  for (auto name : {"s01_00", "commit_x", "commit_3.tmp"}) {
+  for (auto name : {"s01.1_00", "commit_x", "commit_3.tmp"}) {
     RAMDir dir;
     auto file = dir.createFile(name);
     OutputStream out(file.get());
@@ -3485,7 +3486,7 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   auto fs = std::make_shared<FSDirectory>(path);
   CheckedDirectory dir(fs, CheckedDirMode::THROW);
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   Signal::listen("publishOpened", [&](void* source, void*, void* file) -> void* {
@@ -3512,7 +3513,7 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
 TEST_F(IndexWriterTest, failuresBeforeDurabilityLeaveWriterUsable) {
   for (auto signal : {"commitDataSync", "publishWritten", "publishSynced"}) {
     RAMDir dir;
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots);
     auto before = test::readDurableIndexInfo(dir);
     addDoc(writer);
@@ -3531,7 +3532,7 @@ TEST_F(IndexWriterTest, failuresBeforeDurabilityLeaveWriterUsable) {
 TEST_F(IndexWriterTest, readersAndSchemaDoNotWaitForDataSync) {
   for (auto signal : {"commitDataSync", "publishWritten"}) {
     RAMDir dir;
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots);
     addDoc(writer);
     auto before = writer.commit();
@@ -3583,7 +3584,7 @@ TEST_F(IndexWriterTest, fatalPublicationMakesCollectionUnavailable) {
 
 TEST_F(IndexWriterTest, admittedMergePublishesDuringClose) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   for (int i = 0; i < 2; i++) {
     addDoc(writer);
@@ -3619,7 +3620,7 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
   auto before = test::readDurableIndexInfo(writer->dir);
   const auto& seg = before->segments.front();
-  auto oldLiveDocs = Postings::getLiveDocsFileName(Postings::getSortableString(seg.seg_id), seg.live_gen);
+  auto oldLiveDocs = Postings::getLiveDocsFileName(Postings::segmentKey(seg.seg_id, seg.creator_epoch), seg.live_gen, seg.live_epoch);
   std::latch started(1), release(1);
   Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
     started.count_down();
@@ -3635,7 +3636,7 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
   EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
   auto intermediate = test::readDurableIndexInfo(writer->dir);
   auto intermediateLiveDocs = Postings::getLiveDocsFileName(
-      Postings::getSortableString(seg.seg_id), intermediate->segments.front().live_gen);
+      Postings::segmentKey(seg.seg_id, seg.creator_epoch), intermediate->segments.front().live_gen, intermediate->segments.front().live_epoch);
   for (auto id : {"c", "e", "f"}) {
     EXPECT_TRUE(helper.deleteById(id, UpdateMessage::COMMIT).success);
     EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
@@ -3851,13 +3852,13 @@ TEST_F(IndexWriterTest, failedMergeLiveDocsDiffPreservesSources) {
   EXPECT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
   {
     auto fault = failFileCreation(writer->dir,
-        Postings::getLiveDocsFileName(Postings::getSortableString(outputId), 1));
+        Postings::getLiveDocsFileName(Postings::segmentKey(outputId, 1), 1, 1));
     ExpectLog quiet("Merge failed and was contained");
     release.count_down();
     merge.get();
     writer->updateGraph->wait_for_all();
   }
-  EXPECT_TRUE(segmentPrefixAbsent(writer->dir, outputId));
+  EXPECT_TRUE(segmentPrefixAbsent(writer->dir, outputId, 1));
   EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
   for (auto& [id, seg] : writer->segInfos) {
     EXPECT_FALSE(seg->merging);
@@ -3871,7 +3872,7 @@ TEST_F(IndexWriterTest, failedMergeLiveDocsDiffPreservesSources) {
 
 TEST_F(IndexWriterTest, automaticMergePublishesDuringClose) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   writer.mergePolicy->setMergeFactor(2);
   addDoc(writer);
@@ -3917,7 +3918,7 @@ TEST_F(IndexWriterTest, retiresOldLiveDocsWithoutMerging) {
 
 TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForSegmentUnlinks) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addDoc(writer);
   std::latch entered(1), release(1);
@@ -3939,7 +3940,7 @@ TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForSegmentUnlinks) {
 TEST_F(IndexWriterTest, readerRetriesAnyFailureOnlyWhenPublicationChanges) {
   for (bool change : {false, true}) {
     RAMDir dir;
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots);
     bool first = true;
     Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* {
@@ -4036,7 +4037,7 @@ TEST_F(IndexWriterTest, shadowFrontierWaitsForCompletedHandlers) {
 
 TEST_F(IndexWriterTest, mergeLevelsBreakAtExactPowersOfMergeFactor) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   auto& policy = *writer.mergePolicy;
   for (int32_t factor = 2; factor <= 32; factor++) {
@@ -4057,7 +4058,7 @@ TEST_F(IndexWriterTest, mergeLevelsBreakAtExactPowersOfMergeFactor) {
 
 TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   writer.mergePolicy->setMergeFactor(2);
   addDoc(writer);
@@ -4068,6 +4069,7 @@ TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {
   Signal::unlisten("commitDataSync");
   ASSERT_EQ(1u, writer.segInfos.size());
   auto failedSegId = writer.segInfos.begin()->first;
+  auto failedCreatorEpoch = writer.segInfos.begin()->second->creatorEpoch;
 
   // A second flushed segment merges with the never-published one before any
   // commit succeeds; the merge's own commit then publishes the output.
@@ -4080,13 +4082,13 @@ TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {
   EXPECT_TRUE(writer.segmentsToDelete.empty());
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
-  auto prefix = Postings::getIndexFileNamePrefix(failedSegId);
+  auto prefix = Postings::getIndexFileNamePrefix(failedSegId, failedCreatorEpoch);
   EXPECT_FALSE(std::ranges::any_of(files, [&](const auto& file) { return file.name.starts_with(prefix); }));
 }
 
 TEST_F(IndexWriterTest, nonStandardHandlerExceptionCompletesMessage) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   ProbeUpdate update;
   update.commit = UpdateMessage::COMMIT;
@@ -4100,7 +4102,7 @@ TEST_F(IndexWriterTest, nonStandardHandlerExceptionCompletesMessage) {
 
 TEST_F(IndexWriterTest, nonStandardCommitExceptionCompletesCommit) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addDoc(writer);
   Signal::listen("commitDataSync", [](void*, void*, void*) -> void* { throw 42; });
@@ -4116,7 +4118,7 @@ TEST_F(IndexWriterTest, nonStandardCommitExceptionCompletesCommit) {
 
 TEST_F(IndexWriterTest, emptyFlushLeavesNoState) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   writer.releaseInverter(writer.obtainInverter(), true);
   writer.updateGraph->wait_for_all();
@@ -4127,7 +4129,7 @@ TEST_F(IndexWriterTest, emptyFlushLeavesNoState) {
 
 TEST_F(IndexWriterTest, forceMergeOfEmptyOrClosedWriterCompletes) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   writer.mergeSegments();
   EXPECT_TRUE(writer.testIsEmpty());
@@ -4222,7 +4224,7 @@ TEST_F(IndexWriterTest, deletePassReclaimsFailedCommitLiveDocs) {
                               UpdateMessage::COMMIT).success);
   holdDeletePasses(node);
   auto& seg = *iw->segInfos.begin()->second;
-  auto failed = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), 1);
+  auto failed = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, 1), 1, 1);
   {
     Signal::listen("commitDataSync", [](void*, void*, void*) -> void* {
       throw std::runtime_error("injected commit failure");
@@ -4308,7 +4310,7 @@ TEST_F(IndexWriterTest, deletePassIsLostOnReopen) {
     iw->updateGraph->wait_for_all();
     ASSERT_TRUE(iw->pendingDeletes.empty());
     auto& seg = *iw->segInfos.begin()->second;
-    orphan = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
+    orphan = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, 1), seg.liveGen, 1);
     EXPECT_NE(nullptr, dir->openFile(orphan));
   }
   CommitSnapshotRegistry snapshots(*dir);
@@ -4354,7 +4356,7 @@ TEST_F(IndexWriterTest, failedDeletePassRetriesWithoutCommit) {
   auto iw = helper.getIndexWriter();
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
   auto& seg = *iw->segInfos.begin()->second;
-  auto name = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), 1);
+  auto name = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, 1), 1, 1);
   enableDeletePasses(node, *iw);
   ExpectLog quiet("Failed to create liveDocs file");
   {
@@ -4479,7 +4481,7 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   runDeletePass(*iw);
   iw->updateGraph->wait_for_all();
   auto& source = *iw->segInfos.begin()->second;
-  auto captured = Postings::getLiveDocsFileName(Postings::getSortableString(source.segId), source.liveGen);
+  auto captured = Postings::getLiveDocsFileName(Postings::segmentKey(source.segId, 1), source.liveGen, 1);
   std::latch started(1), release(1), waiting(1);
   std::future<IndexResult> trigger;
   TimedCommitMessage oldCommit;
@@ -4715,4 +4717,118 @@ TEST_F(IndexWriterTest, deleteFactReachesMergedDuplicatePostings) {
   helper.commit();
   EXPECT_EQ((std::multiset<std::string>{"dup", "dup", "keep"}), publishedIds(helper));
   EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, takeoverFencesTheOldWriterOnRam) {
+  RAMDir dir;
+  CommitSnapshotRegistry firstSnapshots(test::reserveIncarnation(dir)), secondSnapshots(dir);
+  IndexWriter first(firstSnapshots);
+  EXPECT_EQ(1u, IncarnationState::read(dir)->value.epoch);
+  IndexWriter second(secondSnapshots);
+  EXPECT_EQ(2u, IncarnationState::read(dir)->value.epoch);
+  addDoc(first, true);
+  addDoc(second, true);
+  auto winner = second.commit();
+  auto info = test::readDurableIndexInfo(dir);
+  ASSERT_EQ(1u, info->segments.size());
+  EXPECT_EQ(2u, info->segments[0].creator_epoch);
+  EXPECT_EQ(2u, second.stats(true).segmentStats.at(0).creatorEpoch);
+  EXPECT_EQ(2u, secondSnapshots.readers.stats(true).segmentStats.at(0).creatorEpoch);
+  try { first.commit(); FAIL() << "stale writer committed"; }
+  catch (const std::exception& e) { EXPECT_NE(std::string::npos, std::string(e.what()).find("superseded")); }
+  EXPECT_TRUE(first.isClosed());
+  EXPECT_EQ(winner->index_gen, test::readDurableIndexInfo(dir)->index_gen);
+  EXPECT_EQ(1, IndexReader(dir).liveDocs());
+  test::expectValidInventory(dir, *info);
+}
+
+TEST_F(IndexWriterTest, statePublicationLostReplyReconcilesTheTip) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(snapshots);
+  auto before = IncarnationState::read(dir).value();
+  Signal::listen("statePublished", [](void*, void*, void*) -> void* { throw FileIOException("lost reply"); });
+  auto unlisten = scope_guard([] { Signal::unlisten("statePublished"); });
+  addDoc(writer);
+  EXPECT_NO_THROW(writer.commit());
+  EXPECT_FALSE(writer.isClosed());
+  EXPECT_EQ(before.value.rev + 1, IncarnationState::read(dir)->value.rev);
+  EXPECT_EQ(1, IndexReader(dir).liveDocs());
+}
+
+TEST_F(IndexWriterTest, statePublicationLostReplyAfterTakeoverFencesWriter) {
+  RAMDir dir;
+  CommitSnapshotRegistry firstSnapshots(test::reserveIncarnation(dir)), secondSnapshots(dir);
+  IndexWriter first(firstSnapshots);
+  std::unique_ptr<IndexWriter> second;
+  bool injected = false;
+  Signal::listen("statePublished", [&](void*, void*, void*) -> void* {
+    if (injected) return nullptr;
+    injected = true;
+    second = std::make_unique<IndexWriter>(secondSnapshots);
+    addDoc(*second);
+    second->commit();
+    throw FileIOException("lost reply after takeover");
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("statePublished"); });
+  addDoc(first);
+  try { first.commit(); FAIL() << "stale writer committed"; }
+  catch (const std::exception& e) { EXPECT_NE(std::string::npos, std::string(e.what()).find("superseded")); }
+  EXPECT_TRUE(first.isClosed());
+  EXPECT_EQ(2u, test::readDurableIndexInfo(dir)->writer_epoch);
+  EXPECT_EQ(2, IndexReader(dir).liveDocs());
+}
+
+TEST_F(IndexWriterTest, stateTipIgnoresHigherUnpublishedCandidates) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(snapshots);
+  auto current = test::readDurableIndexInfo(dir);
+  auto gen = current->index_gen;
+  current.info.index_gen += 10;
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(*current, bytes));
+  Manifest::commit(dir, current->index_gen, bytes, current->writer_epoch);
+  EXPECT_EQ(gen, Manifest::load(dir).generation);
+  EXPECT_EQ(gen, IndexReader(dir).commitId());
+}
+
+TEST_F(IndexWriterTest, failedSegmentPrefixDoesNotDeleteAnotherEpoch) {
+  RAMDir dir;
+  for (auto epoch : {3u, 108u}) {
+    auto name = Postings::getIndexFileName(Postings::segmentKey(4, epoch), 0);
+    dir.publishFile(name, {}, Directory::PublishMode::CREATE_ONLY);
+  }
+  dir.deletePrefix(Postings::getIndexFileNamePrefix(4, 3));
+  EXPECT_FALSE(dir.openFile("s04.3_00"));
+  EXPECT_TRUE(dir.openFile("s04.30_00"));
+  EXPECT_EQ(0u, Manifest::generationOf("commit_42"));
+  EXPECT_EQ(42u, Manifest::generationOf("commit_42.7"));
+  EXPECT_FALSE(Manifest::indexFile("s04_00"));
+}
+
+TEST_F(IndexWriterTest, takeoverDuringStateCasFencesCandidate) {
+  RAMDir dir;
+  CommitSnapshotRegistry firstSnapshots(test::reserveIncarnation(dir)), secondSnapshots(dir);
+  IndexWriter first(firstSnapshots);
+  std::unique_ptr<IndexWriter> second;
+  bool takeover = false;
+  Signal::listen("publishSynced", [&](void* source, void* name, void*) -> void* {
+    if (source != &dir || *(std::string_view*)name != "STATE" || takeover) return nullptr;
+    takeover = true;
+    second = std::make_unique<IndexWriter>(secondSnapshots);
+    addDoc(*second);
+    second->commit();
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishSynced"); });
+  addDoc(first);
+  try { first.commit(); FAIL() << "stale STATE CAS applied"; }
+  catch (const std::exception& e) { EXPECT_NE(std::string::npos, std::string(e.what()).find("superseded")); }
+  EXPECT_TRUE(takeover);
+  EXPECT_TRUE(first.isClosed());
+  auto winner = test::readDurableIndexInfo(dir);
+  EXPECT_EQ(2u, winner->writer_epoch);
+  EXPECT_EQ(1, IndexReader(dir).liveDocs());
+  test::expectValidInventory(dir, *winner);
 }

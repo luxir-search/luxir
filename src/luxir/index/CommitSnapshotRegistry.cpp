@@ -18,14 +18,14 @@ void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snaps
 
 void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
   auto previous = this->snapshot();
-  Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
+  Manifest::install(dir, snapshot->bytes);
   Signal::emit("snapshotRootDurable", this);
   publish(snapshot, std::move(opened));
   // Best-effort: obsolete names that reappear after a crash are unreferenced.
   try {
     if (previous) {
       auto names = obsoleteFiles(*previous, *snapshot);
-      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(Manifest::name(previous->id.index_gen));
+      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(previous->manifestName());
       retire(names);
     }
   } catch (const std::exception& e) { LOG_WARN("Snapshot retirement failed: {}", e.what()); }
@@ -77,14 +77,19 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   }
 }
 
-void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest) {
+void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest, uint64_t writerEpoch) {
   if (!manifest.bytes) return;
   if (manifest.generation != manifest.highestGeneration) {
     LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
               manifest.generation, manifest.highestGeneration);
     return;
   }
-  retireUnreferenced(manifest.listing);
+  auto listing = manifest.listing;
+  std::erase_if(listing, [&](const auto& file) {
+    auto epoch = Manifest::fileEpoch(file.name);
+    return !epoch || epoch >= writerEpoch;
+  });
+  retireUnreferenced(listing);
 }
 
 void CommitSnapshotRegistry::sweepOrphans() {
@@ -96,7 +101,7 @@ void CommitSnapshotRegistry::sweepOrphans() {
 void CommitSnapshotRegistry::retireUnreferenced(std::span<const Directory::FileInfo> listing) {
   boost::unordered_flat_set<std::string> retained;
   auto installed = snapshot();
-  retained.insert(Manifest::name(installed->id.index_gen));
+  retained.insert(installed->manifestName());
   for (const auto& file : installed->files) retained.insert(file.name);
   std::vector<std::string> obsolete;
   for (const auto& file : listing) {

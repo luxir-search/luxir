@@ -45,13 +45,19 @@ TEST_P(TenantCatalogTest, createReplaceAndRemove) {
   TenantCatalog reopened(*factory);
   reopened.cleanup(false);
   EXPECT_EQ(std::vector<std::string>{next}, reopened.incarnations("main"));
-  EXPECT_FALSE(reopened.directory("main", first)->openFile("commit_1"));
+  EXPECT_FALSE(reopened.directory("main", first)->openFile("commit_1.1"));
   auto high = reopened.read().high;
   reopened.remove("main");
   EXPECT_TRUE(reopened.read().entries.empty());
   EXPECT_EQ(high, reopened.read().high);
   EXPECT_TRUE(factory->children(StorageRoot::AUTHORITATIVE, "t/t0/i").empty());
-  EXPECT_GT(reopened.reserve("main"), next);
+  EXPECT_FALSE(IncarnationState::read(*reopened.directory("main", first)));
+  EXPECT_FALSE(IncarnationState::read(*reopened.directory("main", next)));
+  auto recreated = reopened.reserve("main");
+  EXPECT_GT(recreated, next);
+  populate(reopened, "main", recreated);
+  reopened.activate("main", recreated);
+  EXPECT_EQ(recreated, reopened.current("main"));
 }
 
 TEST_P(TenantCatalogTest, startupKeepsFollowerReservationsAndFinishesRetirement) {
@@ -64,17 +70,17 @@ TEST_P(TenantCatalogTest, startupKeepsFollowerReservationsAndFinishesRetirement)
   TenantCatalog follower(*factory);
   follower.cleanup(true);
   EXPECT_EQ(pending, follower.reserve("main", pending));
-  EXPECT_TRUE(follower.directory("main", pending)->openFile("commit_1"));
+  EXPECT_TRUE(follower.directory("main", pending)->openFile("commit_1.1"));
   follower.activate("main", pending); // crash before deleting the old directory
   auto abandoned = follower.reserve("other");
   populate(follower, "other", abandoned);
   TenantCatalog restarted(*factory);
   restarted.cleanup(true);
-  EXPECT_FALSE(restarted.directory("main", old)->openFile("commit_1"));
-  EXPECT_TRUE(restarted.directory("other", abandoned)->openFile("commit_1"));
+  EXPECT_FALSE(restarted.directory("main", old)->openFile("commit_1.1"));
+  EXPECT_TRUE(restarted.directory("other", abandoned)->openFile("commit_1.1"));
   restarted.cleanup(false);
   EXPECT_TRUE(restarted.incarnations("other").empty());
-  EXPECT_FALSE(restarted.directory("other", abandoned)->openFile("commit_1"));
+  EXPECT_FALSE(restarted.directory("other", abandoned)->openFile("commit_1.1"));
   EXPECT_EQ(pending, restarted.current("main"));
 }
 

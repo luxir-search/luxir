@@ -156,7 +156,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  auto manifest = Manifest::load(dir);
+  writerState = IncarnationState::claim(dir);
+  writerEpoch = writerState.value.epoch;
+  auto manifest = Manifest::load(dir, &writerState);
+  if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
+    throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
+  }
   nextManifestGen = manifest.highestGeneration;
   manifestNames = std::move(manifest.names);
   if (!manifest.bytes) {
@@ -191,10 +196,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       int32_t nDocs = segment.max_doc;
       // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
       // for now it makes it easy to populate nDocs for merge decisions.
-      auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
+      auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, segment.creator_epoch, nDocs));
       assert(success); // should be no repeated segments
       auto& seg = *iter->second;
-      seg.liveGen = seg.publishedLiveGen = segment.live_gen;
+      seg.liveGen = seg.publishedLiveGen = seg.initialLiveGen = segment.live_gen;
+      seg.liveEpoch = seg.initialLiveEpoch = segment.live_epoch;
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
@@ -225,15 +231,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     api::IndexInfo initial;
     std::pmr::monotonic_buffer_resource arena;
     publish(initial, arena, schema ? schema : Schema::createDefaultSchema());
-  } else if (manifest.generation != manifest.highestGeneration) {
-    // A recovered older root must not advertise a regressed generation under
-    // the old identity. Collection storage also switches incarnation directories.
-    incarnation = CommitId::newIncarnation();
-    std::pmr::monotonic_buffer_resource arena;
-    auto recovered = Manifest::decode(manifest.bytes, arena);
-    publish(recovered, arena);
   }
-  snapshots.sweepOrphans(manifest);
+  snapshots.sweepOrphans(manifest, writerEpoch);
   storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
   // Only manifest-live segments can seed a resource. Own the winning bytes;
   // later retirement of its segment must not affect inverter/merge writers.
@@ -734,7 +733,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   }
   if (!inverter) {
     auto newInverter = std::make_unique<Inverter>(
-        dir, ++lastSegId, pinned, indexRamBudget,
+        dir, ++lastSegId, writerEpoch, pinned, indexRamBudget,
         [this](std::string_view resource, const StoredChunkFormat& format) {
           return storedDictionaries.lookup(resource, format);
         });
@@ -1428,6 +1427,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   std::unique_ptr<SegInfo> segInfo;
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
+                                        inverter.getPostingsWriter().creatorEpoch,
                                         inverter.getPostingsWriter().getMaxDoc());
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
@@ -1435,6 +1435,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schemaGen = inverter.schema->gen_;
     auto& postings = inverter.getPostingsWriter();
+    segInfo->creatorEpoch = segInfo->liveEpoch = postings.creatorEpoch;
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
@@ -1551,9 +1552,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   inverterPtr.reset();
   if (aborted) {
     try {
-      dir.deletePrefix(Postings::getIndexFileNamePrefix(segId));
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(segId, writerEpoch));
     } catch (const std::exception& e) {
-      LOG_ERROR("Failed to clean files for aborted segment {}: {}", segId, e.what());
+      LOG_ERROR("Failed to clean files for aborted segment s{}: {}", Postings::segmentKey(segId, writerEpoch), e.what());
     }
   }
 }
@@ -1856,7 +1857,7 @@ void IndexWriter::collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::s
     if (gen == seg.liveGen || gen == seg.publishedLiveGen
         || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
         || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
-    names.push_back(Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen));
+    names.push_back(Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, seg.creatorEpoch), gen, seg.liveEpochFor(gen, writerEpoch)));
     return true;
   });
 }
@@ -1904,7 +1905,12 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
   for (auto& seg : segments) {
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
-    snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+    std::vector<std::string> names;
+    for (const auto& file : seg->files) names.push_back(file.name);
+    for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
+    for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
+        Postings::segmentKey(seg->segId, seg->creatorEpoch), gen, seg->liveEpochFor(gen, writerEpoch)));
+    snapshots.retire(names);
   }
   releaseSegments(segments);
 }
@@ -2029,7 +2035,7 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
   if (!pr) {
     std::shared_ptr<IndexReader> reader;
     if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
-    if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
+    if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId, seg.creatorEpoch);
     seg.sharedPostingsReader.store(pr);
   }
   bool rangeKnown = seg.idRange.load() != nullptr;
@@ -2122,7 +2128,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     }
   }
 
-  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader};
+  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader, seg.creatorEpoch};
   for (const auto& overlayName : overlayNames) {
     if (existingNames.contains(overlayName)) {
       continue;
@@ -2130,7 +2136,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
 
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          schema, overlayGen);
+                          schema, overlayGen, writerEpoch);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
@@ -2206,7 +2212,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
 
         auto gen = nextSegmentOverlayGen(*seg);
         std::string fileName = Postings::getSegmentOverlayFileName(
-          seg->segId, TestOverlayAuxReader::NAME, gen, 0);
+          seg->segId, TestOverlayAuxReader::NAME, gen, 0, seg->creatorEpoch, writerEpoch);
         FileDescriptor descriptor;
         {
           auto file = dir.createFile(fileName);
@@ -2236,9 +2242,9 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
         auto pr = getSegmentPostingsReader(*seg);
-        VectorIndexBuilder::SegInput input{seg->segId, pr.get()};
+        VectorIndexBuilder::SegInput input{seg->segId, pr.get(), seg->creatorEpoch};
         VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                                   *schema, 0);
+                                   *schema, 0, writerEpoch);
         auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
         stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
                                         overlayNames.begin(), overlayNames.end());
@@ -2280,6 +2286,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
   info.version = 1;
   info.index_gen = ++nextManifestGen;
+  info.writer_epoch = writerEpoch;
   info.schema_gen = schema->gen_;
   info.schema = schema->storedInfo(arena);
   info.incarnation = incarnation;
@@ -2348,11 +2355,15 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       if (ownedSegments.contains(segment.seg_id)) for (const auto& file : segment.files) retainedFiles.emplace(file.name);
     }
   }
-  manifestNames.push_back(Manifest::name(info.index_gen));
+  manifestNames.push_back(Manifest::name(info.index_gen, info.writer_epoch));
   auto failure = std::make_shared<const std::string>("snapshot publication failed");
+  auto superseded = std::make_shared<const std::string>("index writer was superseded");
   bool durable = false;
+  bool stateAttempted = false;
   try {
-    Manifest::commit(dir, info.index_gen, *snapshot->bytes);
+    Manifest::commit(dir, info.index_gen, *snapshot->bytes, info.writer_epoch);
+    stateAttempted = true;
+    writerState.advance(dir, Manifest::tip(info.index_gen, info.writer_epoch));
     durable = true;
     Signal::emit("manifestDurable", this);
     {
@@ -2394,7 +2405,8 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     lastSnapshot.store(snapshot);
     snapshots.publish(snapshot);
   } catch (...) {
-    if (durable) {
+    if (durable || stateAttempted) {
+      try { throw; } catch (const WriterSupersededError&) { failure = std::move(superseded); } catch (...) {}
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
       snapshots.fail();
@@ -2403,8 +2415,9 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       // are durable, so even a crash during cleanup is recoverable. Never reuse
       // its generation; a later successful publication also cleans its names.
       try {
-        std::array<std::string, 1> names{Manifest::name(info.index_gen)};
-        dir.deleteDurably(names);
+        std::array<std::string, 1> names{Manifest::name(info.index_gen, info.writer_epoch)};
+        auto state = IncarnationState::read(dir);
+        if (state && state->value.tip != Manifest::tip(info.index_gen, info.writer_epoch)) dir.deleteDurably(names);
       } catch (const std::exception& e) {
         LOG_WARN("Failed snapshot cleanup: {}", e.what());
       } catch (...) {
@@ -2450,6 +2463,8 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     const auto& seg = *segs[i];
     auto& wire = segments[i];
     wire.seg_id = seg.segId;
+    wire.creator_epoch = seg.creatorEpoch;
+    wire.live_epoch = seg.liveEpoch;
     wire.max_doc = seg.maxDoc;
     wire.live_gen = seg.liveGen;
     wire.min_version = seg.minVersion;
@@ -2605,7 +2620,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       for (SegInfo* seg : segs) {
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
-                      seg->segId);
+                      seg->name());
           continue;
         }
         auto postingsReader = getSegmentPostingsReader(*seg);
@@ -2631,7 +2646,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         }
         if (!fits) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged ord dictionary would exceed the safety limit",
-                      seg->segId);
+                      seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
@@ -2713,7 +2728,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     for (auto segInfo : segs) {
       if (segInfo->mergedLiveGen > 0) {
         // Load liveDocs for this segment
-        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->mergedLiveGen, segInfo->maxDoc);
+        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->creatorEpoch, segInfo->mergedLiveGen, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch), segInfo->maxDoc, false, false);
         if (!liveDocs) {
           throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
                                    " gen=" + std::to_string(segInfo->mergedLiveGen));
@@ -2736,7 +2751,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
 
     {
-      PostingsWriter pwriter(dir, outputSegId);
+      PostingsWriter pwriter(dir, outputSegId, writerEpoch);
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
@@ -2749,7 +2764,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
-      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc());
       newSegInfo->minVersion = segs.front()->minVersion;
       newSegInfo->maxVersion = segs.front()->maxVersion;
       newSegInfo->schemaGen = segs.front()->schemaGen;
@@ -2797,11 +2812,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         } catch (const std::exception& e) {
           deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
           LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
-                    newSegInfo->segId, e.what());
+                    newSegInfo->name(), e.what());
         } catch (...) {
           deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
           LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
-                    newSegInfo->segId);
+                    newSegInfo->name());
         }
         phase = "after_merge_vector_overlay";
       }
@@ -2830,7 +2845,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // Rescan from the merged generation on every retry. Clearing an
           // already-clear output bit is a no-op, so only the generation the
           // diff covered needs to be remembered.
-          auto current = LiveDocs::create(dir, seg->segId, currentGens[i], seg->maxDoc, false);
+          auto current = LiveDocs::create(dir, seg->segId, seg->creatorEpoch, currentGens[i], seg->liveEpochFor(currentGens[i], writerEpoch), seg->maxDoc, false, false);
           const auto* merged = liveDocsVec[i] ? &liveDocsVec[i]->bitset() : nullptr;
           const auto& now = current->bitset();
           for (int32_t word = 0; word < (int32_t)screaming::FixedBitSet::sizeInWords(seg->maxDoc); word++) {
@@ -2854,17 +2869,17 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           coveredGens[i] = currentGens[i];
         }
         if (changed) {
-          // The output is private. Replace its first generation on a retry;
-          // no reader or manifest can observe an intermediate bitmap.
+          // Each retry writes a new immutable bitmap for this private output.
           newSegInfo->unsyncedFiles.reserve(newSegInfo->unsyncedFiles.size() + 1);
           newSegInfo->files.reserve(newSegInfo->files.size() + 1);
-          auto name = Postings::getLiveDocsFileName(Postings::getSortableString(outputSegId), 1);
+          auto name = Postings::getLiveDocsFileName(Postings::segmentKey(outputSegId, writerEpoch), newSegInfo->liveGen, writerEpoch);
+          if (newSegInfo->liveGen) dir.deleteFile(name);
           std::erase(newSegInfo->unsyncedFiles, name);
           std::erase_if(newSegInfo->files, [&](const auto& file) { return file.name == name; });
-          liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, 1, *outputLiveBits,
-                                                                newSegInfo->maxDoc, newSegInfo->liveDocs,
-                                                                newSegInfo->unsyncedFiles, &newSegInfo->files);
-          newSegInfo->liveGen = 1;
+          liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, writerEpoch,
+              newSegInfo->liveGen + 1, writerEpoch, *outputLiveBits, newSegInfo->maxDoc, newSegInfo->liveDocs,
+              newSegInfo->unsyncedFiles, &newSegInfo->files);
+          newSegInfo->liveGen++;
         }
         Signal::emit("mergeLiveDocsDiff", newSegInfo.get());
         phase = "publish_swap_prepare";
@@ -2991,7 +3006,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     if (!outputPublished) {
       try {
-        dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+        dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
       } catch (const std::exception& e) {
         LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: {}",
                   outputSegId, e.what());
@@ -3014,7 +3029,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
   } else if (!outputPublished) {
     try {
-      dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to delete unused merged segment files for segId={}: {}",
                 outputSegId, e.what());
@@ -3164,7 +3179,11 @@ void IndexWriter::testDeleteAllData() {
     snapshots.testReset();
     pendingRetirement.clear();
     // drop all index files
-    dir.clear();
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);
+    for (const auto& file : files) if (file.name != "STATE") dir.deleteFile(file.name);
+    writerState = IncarnationState::claim(dir);
+    writerEpoch = writerState.value.epoch;
 
     // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
     // swap or epoch the filter cache before reusing those namespaces.
@@ -3320,6 +3339,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
       auto& dst = out.segmentStats.emplace_back();
       dst.segId = seg->segId;
+      dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
       dst.minUpdateVersion = seg->minVersion;
       dst.maxUpdateVersion = seg->maxVersion;
@@ -3366,7 +3386,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     // Prefix attribution is unambiguous: the length-prefixed base36 segId
     // encoding means no segId string is a prefix of another, and '_' is not
     // an id character.
-    auto prefix = Postings::getIndexFileNamePrefix(segment.segId);
+    auto prefix = Postings::getIndexFileNamePrefix(segment.segId, segment.creatorEpoch);
     auto it = std::lower_bound(files.begin(), files.end(), prefix,
                                [](const Directory::FileInfo& f, const std::string& p) { return f.name < p; });
     for (; it != files.end() && it->name.starts_with(prefix); ++it) {
@@ -3460,7 +3480,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     if (published != nullptr && published->segInfo.live_gen == seg.liveGen) {
       existingLiveDocs = published->liveDocsShared();
     }
-    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
+    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.creatorEpoch, seg.liveGen, seg.liveEpoch, maxDocId, false, false);
   }
 
   // The new generation's bits: copied from the existing liveDocs at the first
@@ -3484,7 +3504,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   // Read the "id" field using TermsEnum
   auto* idFieldInfo = reader.fieldInfo("id");
   if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
     return 0;
   }
 
@@ -3515,7 +3535,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       std::atomic_ref<uint64_t> word(liveBits->words[hit.docId >> 6]);
       uint64_t mask = (uint64_t)1 << (hit.docId & 63);
       if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
-        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.segId);
+        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.name());
         cleared++;
       }
     }
@@ -3533,7 +3553,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       std::string_view deleteId = (std::string_view)entry;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
-               deleteId, deleteVersion, seg.segId);
+               deleteId, deleteVersion, seg.name());
 
       if (termsEnum.seekForward(deleteId)) {
         // Found the ID term, now get documents containing this ID
@@ -3576,15 +3596,15 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     auto newLiveGen = seg.liveGen + 1;
     numLiveDocs -= deleted;
 
-    std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
-    liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs,
-                                                          seg.unsyncedFiles, &seg.files);
+    std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, seg.creatorEpoch), seg.liveGen, seg.liveEpoch);
+    liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, seg.creatorEpoch, newLiveGen, writerEpoch,
+                                                        *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
     // The superseded generation needs no sync: it is published or never will be.
     std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
     std::erase(seg.unsyncedFiles, oldLiveFile);
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
-                deleted, seg.segId, newLiveGen, numLiveDocs);
+                deleted, seg.name(), newLiveGen, numLiveDocs);
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -3592,6 +3612,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       assert(seg.liveGen + 1 == newLiveGen);
       if (seg.liveGen > 0) seg.obsoleteLiveGens.push_back(seg.liveGen);
       seg.liveGen = newLiveGen;
+      seg.liveEpoch = writerEpoch;
     }
   }
   return applied;

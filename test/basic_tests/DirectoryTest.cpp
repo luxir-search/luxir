@@ -389,12 +389,12 @@ TEST_F(DirectoryTest, checkedDirThrowsOnPublishingUnsyncedFiles) {
   info.segments = std::span<const api::SegmentInfo>(&segment, 1);
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(info, bytes));
-  EXPECT_THROW(Manifest::commit(dir, 1, bytes), std::runtime_error);
-  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(1)));
+  EXPECT_THROW(Manifest::commit(dir, 1, bytes, 1), std::runtime_error);
+  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(1, 1)));
 
   std::vector<std::string> syncFiles = {"s01_00"};
   dir.sync(syncFiles);
-  EXPECT_NO_THROW(Manifest::commit(dir, 1, bytes));
+  EXPECT_NO_THROW(Manifest::commit(dir, 1, bytes, 1));
 }
 
 TEST_F(DirectoryTest, checkedDirWarnMode) {
@@ -512,16 +512,16 @@ TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
 TEST_F(DirectoryTest, manifestCommitKeepsAnExistingRootOnFailure) {
   RAMDir dir;
   std::vector<std::byte> original(8, std::byte{1}), replacement(8, std::byte{2});
-  Manifest::write(dir, 3, original);
+  Manifest::write(dir, 3, original, 1);
   Signal::listen("publishWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("injected"); });
-  EXPECT_THROW(Manifest::commit(dir, 3, replacement), std::runtime_error);
+  EXPECT_THROW(Manifest::commit(dir, 3, replacement, 1), std::runtime_error);
   Signal::unlisten("publishWritten");
-  auto input = dir.openFile(Manifest::name(3))->getInputStream();
+  auto input = dir.openFile(Manifest::name(3, 1))->getInputStream();
   EXPECT_EQ(std::byte{1}, *(const std::byte*)input.ptr());
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   ASSERT_EQ(1, files.size());
-  EXPECT_EQ(Manifest::name(3), files[0].name);
+  EXPECT_EQ(Manifest::name(3, 1), files[0].name);
 }
 
 TEST_F(DirectoryTest, publicationAndDurableDeletion) {
@@ -549,9 +549,11 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     ASSERT_TRUE(repeated);
     EXPECT_NE(*changed, *repeated);
     EXPECT_FALSE(dir->publishFile("root", next, Directory::PublishCondition::match(published->version)));
+    EXPECT_THROW(addFile(*dir, "root", "other"), FileIOException);
     EXPECT_EQ("first", dir->openFile("root", true)->read());
     std::array<FileDescriptor, 1> expected{FileDescriptor{"root", 5, 0}};
     EXPECT_NO_THROW(dir->expectSynced(expected));
+    dir->deleteFile("root");
     addFile(*dir, "root", "unsynced");
     if (checked) {
       EXPECT_THROW(dir->expectSynced(expected), std::runtime_error);
@@ -559,6 +561,7 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     ASSERT_TRUE(dir->publishFile("root", next, Directory::PublishMode::REPLACE));
     EXPECT_EQ("next", dir->openFile("root", true)->read());
     EXPECT_NO_THROW(dir->expectSynced(expected));
+    dir->deleteFile("root");
     addFile(*dir, "root", "unsynced");
     std::array<std::string, 2> names{"root", "absent"};
     dir->deleteDurably(names);

@@ -1991,9 +1991,9 @@ message IndexStats {
 
 // Ids and generations that appear in filenames are reported in their
 // filesystem spelling so stats output correlates directly with directory
-// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// listings and logs: "seg" includes the creator epoch (e.g. "s0a.2"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// in filenames (e.g. live_gen "01" written in epoch 3 -> file "s0a.2__L01.3").
 // Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,

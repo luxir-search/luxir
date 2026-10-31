@@ -130,6 +130,9 @@ locations, browse `src/luxir/<area>/`.
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); opens path views under authoritative
      and node-private roots. `server/TenantCatalog` owns names, timestamp incarnation
      allocation, and reservation/activation/retirement through catalog CAS
+   - `store/IncarnationState`: per-incarnation writer epochs, tip CAS and retirement
+     tombstones. `Manifest` loads the STATE-selected candidate; filenames carry
+     the creating writer epoch, including later live-doc and overlay generations
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)

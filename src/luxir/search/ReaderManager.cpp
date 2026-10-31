@@ -134,6 +134,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
     if (!includeSegments) continue;
     SegmentStats result;
     result.segId = seg.seg_id;
+    result.creatorEpoch = seg.creator_epoch;
     result.liveGen = seg.live_gen;
     result.minUpdateVersion = seg.min_version;
     result.maxUpdateVersion = seg.max_version;

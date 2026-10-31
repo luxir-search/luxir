@@ -429,11 +429,11 @@ public:
   size_t copyTo(void *dest) {
     char *ptr = (char *) dest;
     for (const auto& buffer : buffers) {
-      assert(ptr - (char *) dest <= fileSize);
+      assert((size_t)(ptr - (char *) dest) <= fileSize);
       memcpy(ptr, buffer.data.get(), buffer.used);
       ptr += buffer.used;
     }
-    assert(ptr - (char *) dest == fileSize);
+    assert((size_t)(ptr - (char *) dest) == fileSize);
     return ptr - (char *) dest;
   }
 

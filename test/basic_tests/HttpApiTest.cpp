@@ -20,6 +20,7 @@
 
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
@@ -737,7 +738,9 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   ASSERT_NE(nullptr, seg);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
+  auto info = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  const auto& segment = info->segments[0];
+  EXPECT_EQ("s" + Postings::segmentKey(segment.seg_id, segment.creator_epoch), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
 }
 

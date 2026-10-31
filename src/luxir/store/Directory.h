@@ -130,6 +130,7 @@ public:
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
+  // Installs a complete immutable file; an existing name is an error.
   virtual void finishFile(File &file) = 0;
 
   // Installs bytes atomically and durably, returning a fresh version even for identical bytes.
@@ -335,9 +336,9 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex);
 
-      // overwrite existing entries.
-      // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
-      files[file.name()] = {std::move(inputFile), ++nextVersion};
+      if (!files.emplace(file.name(), Entry{std::move(inputFile), ++nextVersion}).second) {
+        throw FileIOException("File already exists: " + std::string(file.name()));
+      }
       materialized.store(true, std::memory_order_release);
     }
   }

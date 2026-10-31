@@ -680,6 +680,7 @@ struct ReplicationFollower::Impl {
         }
       }
       if (!reuse) {
+        dir.deleteFile(file.name); // only non-serving, unverified copies reach this path
         // A peer copy that fails verification is fetched again from the source.
         try { download(clients, name, dir, snapshot, file); }
         catch (const PeerMismatch&) { download(clients, name, dir, snapshot, file, false); }

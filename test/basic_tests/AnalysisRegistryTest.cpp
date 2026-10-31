@@ -296,7 +296,8 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
   ASSERT_TRUE(api::encode(missing, schemaBytes));
   loaded.info.schema->source_def = std::span<const std::byte>(schemaBytes);
   ASSERT_TRUE(api::encode(loaded.info, manifest));
-  Manifest::write(dir, loaded.info.index_gen, manifest);
+  dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+      Manifest::withFooter(manifest), Directory::PublishMode::REPLACE);
 
   LuxirNode node(config);
   CollectionHelper good(node, "good");

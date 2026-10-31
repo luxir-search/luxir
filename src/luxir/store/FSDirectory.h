@@ -228,7 +228,7 @@ class FSFile : public File {
   friend class RAMDelegatingFile;
 
   std::filesystem::path path_;
-  std::filesystem::path tmpPath_;  // write to temp, rename on finish
+  std::filesystem::path tmpPath_;  // write to temp, install create-only on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
   XXH3_state_t hash;
@@ -652,9 +652,10 @@ public:
       fsFile.openFd();
     }
     fsFile.closeFd();
-    // Atomic rename from temp to final path. Existing mmap readers of the old
-    // inode are unaffected because the mapping keeps the old inode alive.
-    std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
+    if (::link(fsFile.tmpPath_.c_str(), fsFile.path_.c_str()) < 0) {
+      throw FileIOException("File install failed: " + fsFile.path_.string() + ": " + strerror(errno));
+    }
+    if (::unlink(fsFile.tmpPath_.c_str()) < 0) throw FileIOException("Cannot remove file temp: " + fsFile.tmpPath_.string());
   }
 
   std::optional<Publication> readPublished(std::string_view name) override {

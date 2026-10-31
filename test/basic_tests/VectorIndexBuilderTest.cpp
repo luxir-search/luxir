@@ -127,10 +127,10 @@ std::vector<std::string> vectorOverlayFiles(Directory& dir) {
   return out;
 }
 
-bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
+bool segmentPrefixAbsent(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
-  auto prefix = Postings::getIndexFileNamePrefix(segId);
+  auto prefix = Postings::getIndexFileNamePrefix(segId, creatorEpoch);
   for (const auto& file : files) {
     if (file.name.starts_with(prefix)) return false;
   }
@@ -285,8 +285,8 @@ TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {
   EXPECT_EQ("FooBar-0-3", Postings::caseSafeName("FooBar"));
   EXPECT_EQ("foobar", Postings::caseSafeName("foobar"));
 
-  std::string a = Postings::getSegmentOverlayFileName(1, "vec.Emb_v", 0, 0);
-  std::string b = Postings::getSegmentOverlayFileName(1, "vec.emb_v", 0, 0);
+  std::string a = Postings::getSegmentOverlayFileName(1, "vec.Emb_v", 0, 0, 1, 1);
+  std::string b = Postings::getSegmentOverlayFileName(1, "vec.emb_v", 0, 0, 1, 1);
   for (char& c : a) {
     if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
   }
@@ -591,7 +591,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment
   // (all-lowercase names render verbatim in filenames).
   EXPECT_TRUE(firstFile.starts_with(
-      Postings::getIndexFileNamePrefix(info1->segments[0].seg_id) + "__vec.embedding_v_"))
+      Postings::getIndexFileNamePrefix(info1->segments[0].seg_id, info1->segments[0].creator_epoch) + "_vec.embedding_v_"))
       << "unexpected overlay filename: " << firstFile;
 
   for (int i = 0; i < 80; i++) {
@@ -672,7 +672,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   const auto& first = onlyVectorOverlay(info1);
   std::string firstFile{first.files[0].name};
   EXPECT_EQ(first.gen, 0u);
-  EXPECT_TRUE(firstFile.ends_with("_00_00")) << firstFile;
+  EXPECT_TRUE(firstFile.ends_with("_00." + Postings::epochString(info1->writer_epoch) + "_00")) << firstFile;
 
   auto pin = h.getIndexWriter()->snapshots.acquire();
   ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
@@ -686,7 +686,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   ASSERT_EQ(rebuilt.files.size(), 1);
   EXPECT_EQ(rebuilt.gen, 1u);
   EXPECT_NE(rebuilt.files[0].name, firstFile);
-  EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01_00")) << rebuilt.files[0].name;
+  EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01." + Postings::epochString(info2->writer_epoch) + "_00")) << rebuilt.files[0].name;
   auto bytes = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile)->read();
   auto desc = std::ranges::find(pin->files, firstFile, &FileDescriptor::name);
   ASSERT_NE(desc, pin->files.end());
@@ -1119,7 +1119,7 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
   EXPECT_EQ(failure->phase, "merged_postings_reader");
   EXPECT_FALSE(failure->outputPublished);
   EXPECT_EQ(failure->sourceSegIds.size(), 2u);
-  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId));
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId, 1));
   EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
 
   auto info1 = readIndexInfo(iw->dir);
@@ -1492,7 +1492,8 @@ TEST_F(VectorIndexBuilderTest, skipPolicyPrecedesProgrammaticPqMSelection) {
   auto reader = writer->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u);
   const auto& seg = reader->segments()[0];
-  VectorIndexBuilder::SegInput input{seg.segInfo.seg_id, &seg.postingsReader()};
+  auto stored = readDurableIndexInfo(writer->dir);
+  VectorIndexBuilder::SegInput input{seg.segInfo.seg_id, &seg.postingsReader(), stored->segments[0].creator_epoch};
   auto schema = Schema::createDefaultSchema();
   VectorAnnConfig ann;
   ann.codec = VectorAnnConfig::PQ;
@@ -1501,7 +1502,7 @@ TEST_F(VectorIndexBuilderTest, skipPolicyPrecedesProgrammaticPqMSelection) {
   ann.pqBits = 1;
   schema->fieldTypeMap["embedding_v"] = std::make_shared<VectorFieldType>("embedding_v", 4,
       FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2, false, false, ann);
-  VectorIndexBuilder builder(writer->dir, std::span(&input, 1), *schema, 0);
+  VectorIndexBuilder builder(writer->dir, std::span(&input, 1), *schema, 0, stored->writer_epoch);
   std::vector<std::string> files;
   auto build = [&] { return builder.build({"*"}, {}, files, VectorIndexBuilder::BuildSite::COMMIT); };
   VectorIndexBuilder::ivfPqMinTrainingVectors = 81;

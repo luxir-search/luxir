@@ -14,6 +14,7 @@ std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::str
   auto old = storage.directory(name, from);
   auto incarnation = storage.reserve(name);
   auto next = storage.directory(name, incarnation);
+  auto state = IncarnationState::claim(*next);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
@@ -40,9 +41,11 @@ std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::str
   info.incarnation = incarnation;
   info.index_gen = manifest.highestGeneration + 1;
   info.commit_time++;
+  info.writer_epoch = state.value.epoch;
   std::vector<std::byte> bytes;
   if (!api::encode(info, bytes)) throw std::runtime_error("Failed to encode copied snapshot");
-  Manifest::commit(*next, info.index_gen, bytes);
+  Manifest::commit(*next, info.index_gen, bytes, info.writer_epoch);
+  state.advance(*next, Manifest::tip(info.index_gen, info.writer_epoch));
   return incarnation;
 }
 

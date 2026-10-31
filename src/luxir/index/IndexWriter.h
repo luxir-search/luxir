@@ -20,6 +20,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
+#include "luxir/store/IncarnationState.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -49,6 +50,10 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
+    uint64_t creatorEpoch;
+    uint64_t initialLiveGen = 0;
+    uint64_t initialLiveEpoch;
+    uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
@@ -99,15 +104,15 @@ public:
     std::vector<AuxInfo> auxOverlays;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
+    uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
-    // firendly name for logs that match the segment filenames for easier debugging.
-    static std::string name(uint64_t segId) {
-      return Postings::getIndexFileNamePrefix(segId);
-    }
+    SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
+      : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
+        maxDoc(nDocs), liveDocs(nDocs) {}
 
+    // Friendly name for logs that matches the segment filenames.
     std::string name() const {
-      return name(segId);
+      return "s" + Postings::segmentKey(segId, creatorEpoch);
     }
   };
 
@@ -132,6 +137,8 @@ class IndexWriter {
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t completedUpdateVersion = 0; // indexMutex
+  IncarnationState writerState;
+  uint64_t writerEpoch = 0;
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 

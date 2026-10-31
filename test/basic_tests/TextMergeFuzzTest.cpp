@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "gtest/gtest.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/PostingsWriter.h"
@@ -205,6 +206,7 @@ public:
 TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
   auto schema = mixedSchema();
   TestIndex index;
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
   index.iw->termPartitionMinBytes = 1;
   index.iw->termPartitionMinRangeBytes = 1;
@@ -356,7 +358,7 @@ TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
 TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   RAMDir sourceDir;
   MemPool pool;
-  PostingsWriter sourcePostings(sourceDir, 0, 1);
+  PostingsWriter sourcePostings(sourceDir, 0, 1, 1);
   {
     TextWriter writer(sourcePostings);
     auto& fieldInfo = sourcePostings.addField("pos");
@@ -376,7 +378,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   writeUnversionedRuns(sourcePostings);
   sourcePostings.finish();
 
-  PostingsReader sourceReader(sourceDir, 0);
+  PostingsReader sourceReader(sourceDir, 0, 1);
   FieldReader sourceFields(sourceReader);
   ASSERT_TRUE(sourceFields.readNextField());
   SegFieldInfo sourceInfo;
@@ -390,7 +392,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   sourcePositions.startPositions();
 
   RAMDir targetDir;
-  PostingsWriter targetPostings(targetDir, 1, 1);
+  PostingsWriter targetPostings(targetDir, 1, 1, 1);
   {
     TextWriter writer(targetPostings);
     auto& fieldInfo = targetPostings.addField("pos");
@@ -415,7 +417,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   writeUnversionedRuns(targetPostings);
   targetPostings.finish();
 
-  PostingsReader targetReader(targetDir, 1);
+  PostingsReader targetReader(targetDir, 1, 1);
   FieldReader targetFields(targetReader);
   ASSERT_TRUE(targetFields.readNextField());
   SegFieldInfo targetInfo;

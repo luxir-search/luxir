@@ -246,7 +246,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
   for (std::size_t i = 0; i < src.segmentStats.size(); i++) {
     const auto& in = src.segmentStats[i];
     auto& out = segments[i];
-    out.seg = api::build::arenaStr(resource, Postings::getIndexFileNamePrefix(in.segId));
+    out.seg = api::build::arenaStr(resource, "s" + Postings::segmentKey(in.segId, in.creatorEpoch));
     out.live_gen = sortableGen(in.liveGen, resource);
     out.min_update_version = in.minUpdateVersion;
     out.max_update_version = in.maxUpdateVersion;
