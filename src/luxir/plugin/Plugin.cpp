@@ -40,14 +40,17 @@ PluginRegistry& PluginRegistry::global() {
 }
 
 Registries Registries::global() {
-  return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), QueryRegistry::global(),
-          SearchOpRegistry::global(), HttpRouteRegistry::global()};
+  return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), CollationRegistry::global(),
+          QueryRegistry::global(), SearchOpRegistry::global(), HttpRouteRegistry::global()};
 }
+
+const CollationRegistry& globalCollationRegistry() { return CollationRegistry::global(); }
 
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
   storage.freeze();  // storage backends and layers
+  collation.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();

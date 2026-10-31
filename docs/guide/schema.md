@@ -276,6 +276,7 @@ publication advances the schema generation.
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`, or the name of a registered analyzer such as `"english"`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
+| `collation` | `string` only, column-only (`index: "none"`): a collation registered by a plugin, as a name or `{"name": ..., "params": {...}}`. The column stores the collation's sort keys instead of the text, so sorting orders by it; use it on a [variant](#field-variants) of the field that sorts. See [Collations](../dev/plugins.md#collations) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
@@ -885,6 +886,7 @@ GET /collections/authors/_schema?view=resolved
       "representations": {
         "s": {
           "analyzer": null,
+          "collation": null,
           "column": true,
           "coverage_complete": false,
           "index": "match",
@@ -902,6 +904,7 @@ GET /collections/authors/_schema?view=resolved
             "filters": ["nfkc_cf", "fold"],
             "tokenizer": "unicode_word"
           },
+          "collation": null,
           "column": false,
           "coverage_complete": false,
           "index": "match",

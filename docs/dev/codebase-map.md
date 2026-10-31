@@ -166,6 +166,11 @@ locations, browse `src/luxir/<area>/`.
      (char filters, tokenizer, token filters). All callers feed text through
      `TokenChain::setValue`, which runs the char filters; `sourceOffset` maps token offsets back
 
+   - Collation (`src/luxir/collation/`): `CollationRegistry` (name -> maker of `Collator`s that
+     turn a string into a binary sort key). A column-only STRING field names one in its schema
+     (`collation`); `StringValue` stores the key in the column instead of the value, so the
+     string column sort orders by it.
+
 9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
    - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by
      `initPlugins()` at startup, then frozen. Plugins are CMake targets added with

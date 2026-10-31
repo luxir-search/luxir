@@ -1230,7 +1230,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     for (auto& [resourceName, group] : storedByResource) {
       auto& reqs = group.reqs;
       // A single-valued STRING or ID column holds the source value except
-      // where a normalizer rewrote it (every row) or the term was fitted to
+      // where a normalizer or collation rewrote it (every row) or the term was fitted to
       // the term space (rows recognizable by length, re-read from the chunk
       // after the loads). Multi-valued columns can differ from stored source,
       // and TEXT has no column, so such members send the group to the chunk.
@@ -1238,7 +1238,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         if (r.multi || !r.fieldType->hasColumn()) return false;
         switch (r.fieldType->type()) {
           case FieldType::ID: return true;
-          case FieldType::STRING: return !static_cast<StrFieldType*>(r.fieldType)->normalizer;
+          case FieldType::STRING: {
+            auto* str = static_cast<StrFieldType*>(r.fieldType);
+            return !str->normalizer && !str->collation;
+          }
           default: return false;
         }
       });
