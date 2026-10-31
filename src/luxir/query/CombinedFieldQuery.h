@@ -17,15 +17,19 @@
 
 namespace luxir {
 
-// Per field, 256 entries each: weighted decoded lengths, and their encoded
-// norms for a segment where that field alone has norms. Two-field groups may
-// add the pair table of CombinedFieldQuery::fillPairNorms.
-struct Query::Context::CombinedNorms {
+// Norm tables for one field weight vector, shared by the request's
+// CombinedFieldQuery weights. Per field, 256 entries each: weighted decoded
+// lengths, and their encoded norms for a segment where that field alone has
+// norms. A two-field vector adds the pair table of
+// CombinedFieldQuery::fillPairNorms once its weights' estimated pair
+// evaluations reach the build threshold.
+struct CombinedNormTables {
   std::span<const float> weights;
   const double* lengths;
   const uint8_t* singleNorms;
   const uint8_t* pairNorms;
-  CombinedNorms* next;
+  int64_t pairEvaluations;
+  CombinedNormTables* next;
 };
 
 // BM25F over (field, term) entries, scored as if the fields were a
@@ -79,8 +83,10 @@ public:
     for (float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
   }
 
-  // Minimum term docFreq that builds the pair table; tests lower it.
-  static inline int64_t pairNormMinDocFreq = 16384;
+  // Estimated pair-table evaluations that amortize building it: the 64K
+  // encodings cost about as much as this many summed-length evaluations.
+  static constexpr int64_t PAIR_TABLE_MIN_EVALUATIONS = 50000;
+  static inline int64_t pairTableMinEvaluationsForTests = PAIR_TABLE_MIN_EVALUATIONS;
 
   std::span<const std::string_view> getFields() const { return fields; }
   std::span<const float> getWeights() const { return weights; }
@@ -264,24 +270,25 @@ public:
     std::span<CachedTermInfo*> termInfos;
     Similarity::TermStats termStats;
     Similarity::BM25Scorer* simScorer = nullptr;
-    Context::CombinedNorms* sharedNorms = nullptr;
+    CombinedNormTables* normTables = nullptr;
     bool hasNorms = false;
 
-    // Finds or builds the tables for this field weight vector. The 64K-entry
-    // pair table is built once a two-field term has enough matches to
-    // amortize it; the other term weights of the group then reuse it.
-    void useSharedNorms(Context& context) {
+    // Finds or builds the tables for this field weight vector. A two-field
+    // vector builds the 64K-entry pair table once the estimated evaluations of
+    // all its weights amortize it. Construction is serial, so every weight,
+    // including earlier ones, reads the table when it creates scorers.
+    void useNormTables(Context& context) {
       auto bits = [](float weight) { return std::bit_cast<uint32_t>(weight); };
       auto sameWeights = [&](std::span<const float> weights) {
         return std::ranges::equal(weights, query.weights, {}, bits, bits);
       };
-      for (auto* norms = context.combinedNorms; norms != nullptr; norms = norms->next) {
-        if (sameWeights(norms->weights)) {
-          sharedNorms = norms;
+      for (auto* tables = context.combinedNormTables; tables != nullptr; tables = tables->next) {
+        if (sameWeights(tables->weights)) {
+          normTables = tables;
           break;
         }
       }
-      if (sharedNorms == nullptr) {
+      if (normTables == nullptr) {
         size_t n = query.weights.size();
         auto lengths = context.pool.make_span<double>(n * 256);
         auto singleNorms = context.pool.make_span<uint8_t>(n * 256);
@@ -292,16 +299,38 @@ public:
             singleNorms[i * 256 + code] = encodeLength(length);
           }
         }
-        sharedNorms = context.pool.make<Context::CombinedNorms>(
-            query.weights, lengths.data(), singleNorms.data(), nullptr, context.combinedNorms);
-        context.combinedNorms = sharedNorms;
+        normTables = context.pool.make<CombinedNormTables>(
+            query.weights, lengths.data(), singleNorms.data(), nullptr, 0, context.combinedNormTables);
+        context.combinedNormTables = normTables;
       }
-      if (query.weights.size() == 2 && sharedNorms->pairNorms == nullptr
-          && termStats.docFreq >= pairNormMinDocFreq) {
+      if (query.weights.size() != 2 || normTables->pairNorms != nullptr) return;
+      int64_t threshold = pairTableMinEvaluationsForTests;
+      normTables->pairEvaluations += pairEvaluations(context, threshold - normTables->pairEvaluations);
+      if (normTables->pairEvaluations >= threshold) {
         auto pairNorms = context.pool.make_span<uint8_t>(256 * 256);
         fillPairNorms(pairNorms, query.weights[0], query.weights[1]);
-        sharedNorms->pairNorms = pairNorms.data();
+        normTables->pairNorms = pairNorms.data();
       }
+    }
+
+    // Norm evaluations this weight may make through a pair table: in each
+    // segment where both fields have norms, its matches capped at maxDoc.
+    // Counts no further than limit.
+    int64_t pairEvaluations(Context& context, int64_t limit) const {
+      auto fieldHasNorms = [&](size_t field, const IndexReader::Segment& segment) {
+        if (fieldInfos[field] == nullptr) return false;
+        const SegFieldInfo* segInfo = fieldInfos[field]->segInfos.at(segment);
+        return segInfo != nullptr && segInfo->normsFormat != SegFieldInfo::NORMS_NONE
+            && segInfo->normsLen > 0;
+      };
+      int64_t evaluations = 0;
+      for (auto& segment : context.topReader.segments()) {
+        if (evaluations >= limit) break;
+        if (fieldHasNorms(0, segment) && fieldHasNorms(1, segment)) {
+          evaluations += std::min<int64_t>(segment.maxDoc(), segmentCost(segment));
+        }
+      }
+      return evaluations;
     }
 
     int64_t segmentCost(IndexReader::Segment& segment) const {
@@ -363,7 +392,7 @@ public:
         simScorer = context.pool.make<Similarity::BM25Scorer>(
             multiplier, similarity.k1, similarity.b, idf, avgdl, hasNorms);
       }
-      if (simScorer != nullptr && hasNorms) useSharedNorms(context);
+      if (simScorer != nullptr && hasNorms) useNormTables(context);
     }
 
     const Similarity::TermStats& getTermStats() const { return termStats; }
@@ -446,7 +475,7 @@ public:
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
         lastNormsField = i;
-        const double* lengths = sharedNorms->lengths + i * 256;
+        const double* lengths = normTables->lengths + i * 256;
         if (reader->isFlat()) {
           norms[numNorms++] = {.lengths = lengths, .flat = reader->flatBase()};
         } else {
@@ -455,8 +484,8 @@ public:
       }
       if (numPostings == 0) return nullptr;
       // Only a two-field query has a pair table, so two norms are fields 0 and 1.
-      const uint8_t* singleNorms = numNorms == 1 ? sharedNorms->singleNorms + lastNormsField * 256 : nullptr;
-      const uint8_t* pairNorms = numNorms == 2 ? sharedNorms->pairNorms : nullptr;
+      const uint8_t* singleNorms = numNorms == 1 ? normTables->singleNorms + lastNormsField * 256 : nullptr;
+      const uint8_t* pairNorms = numNorms == 2 ? normTables->pairNorms : nullptr;
       return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer,
                                      singleNorms, pairNorms);
     }

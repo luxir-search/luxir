@@ -43,6 +43,7 @@ namespace luxir {
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
+struct CombinedNormTables;
 
 enum class QueryKind : uint8_t {
   TERM = 1,
@@ -1382,10 +1383,9 @@ public:
     FilterKeyContext& filterKeyContext;
     Limits& limits;
     FieldInfoMap fieldInfoMap;
-    // Pool-owned norm tables shared by the CombinedFieldQuery weights of a
-    // multi_match group, one per field weight vector; defined there.
-    struct CombinedNorms;
-    CombinedNorms* combinedNorms = nullptr;
+    // Pool-owned norm tables shared by the request's CombinedFieldQuery
+    // weights, one per field weight vector; defined in CombinedFieldQuery.h.
+    CombinedNormTables* combinedNormTables = nullptr;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
             FieldInfoMap&& fieldInfoMap)

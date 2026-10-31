@@ -87,12 +87,11 @@ public:
 
   // Scores without, then with, the two-field pair table.
   auto runPairTable(const api::Query& query) {
-    auto restore = scope_guard([threshold = CombinedFieldQuery::pairNormMinDocFreq] {
-      CombinedFieldQuery::pairNormMinDocFreq = threshold;
-    });
-    CombinedFieldQuery::pairNormMinDocFreq = std::numeric_limits<int64_t>::max();
+    auto& threshold = CombinedFieldQuery::pairTableMinEvaluationsForTests;
+    auto restore = scope_guard([&threshold, saved = threshold] { threshold = saved; });
+    threshold = std::numeric_limits<int64_t>::max();
     auto summed = run(query);
-    CombinedFieldQuery::pairNormMinDocFreq = 0;
+    threshold = 0;
     return std::pair(summed, run(query));
   }
 
@@ -213,6 +212,38 @@ TEST_F(MultiMatchSparseNormsTest, normTablesReadMissingFieldsAsZero) {
   ASSERT_EQ(3u, summed->size());
   EXPECT_EQ(*summed, *tabled);
   EXPECT_EQ(summed->at("s2"), summed->at("s4"));
+}
+
+// Three fields have no pair table and sum their weighted lengths before rounding.
+class MultiMatchThreeFieldsTest : public MultiMatchQueryTest {
+public:
+  void SetUp() override {
+    helper.index(flatdoc("id", "t1", "title_un", "dune", "body_un", "a desert planet",
+                         "note_un", "dune dune"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "t2", "title_un", "sand", "body_un", "dune",
+                         "note_un", "empire of sand"), UpdateMessage::COMMIT);
+  }
+};
+
+TEST_F(MultiMatchThreeFieldsTest, scoresMatchBm25fFormula) {
+  auto [summed, tabled] = runPairTable(qb::multiMatch(mr(), "dune",
+      {{"title_un", 2.0f}, {"body_un", {}}, {"note_un", 0.5f}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+
+  // docCount = 2; weighted sumTotalTermFreq = 2*2 + 4 + 0.5*5; df = max(1, 1, 1)
+  Similarity sim;
+  float idf = sim.idf(1, 2);
+  float avgdl = (float)(10.5 / 2.0);
+  auto bm25f = [&](float freq, float length) {
+    return Similarity::BM25Scorer(1.0f, sim.k1, sim.b, idf, avgdl)
+        .score(freq, SmallFloat::intToByte4((int32_t)length));
+  };
+  // t1: freq 2*1 + 0.5*2, length 2*1 + 3 + 0.5*2
+  // t2: freq 1, length 2*1 + 1 + 0.5*3 = 4.5, rounded half up to 5
+  EXPECT_NEAR(bm25f(3.0f, 6.0f), summed->at("t1"), 1e-6);
+  EXPECT_NEAR(bm25f(1.0f, 5.0f), summed->at("t2"), 1e-6);
 }
 
 TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {
