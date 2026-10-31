@@ -175,14 +175,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     incarnation = indexInfo.incarnation;
     lastSegId = indexInfo.last_seg_id;
     lastCommitTime = indexInfo.commit_time;
-    lastSnapshot.store(std::make_shared<const CommitSnapshot>(manifest.bytes,
-        Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen),
-        CommitId{incarnation, indexInfo.index_gen}, indexInfo.commit_time, filesOf(indexInfo),
-        CommitSnapshot::populatedOf(indexInfo), CommitSnapshot::digestOf(*manifest.bytes)));
+    lastSnapshot.store(snapshots.resolve(manifest.bytes));
     snapshots.publish(lastSnapshot.load());
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
-    schemaGen_ = indexInfo.schema_gen;
+    schemaGen_ = indexInfo.schema->version.generation();
+    nextSchemaVersion = indexInfo.schema->version.local;
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
     completedUpdateVersion = indexInfo.update_version;
     durableUpdateVersion = indexInfo.update_version;
@@ -204,7 +202,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
-      seg.schemaGen = segment.schema_gen;
+      seg.schema = SchemaBinding(segment.schema);
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
@@ -1433,9 +1431,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
-    segInfo->schemaGen = inverter.schema->gen_;
+    segInfo->schema = inverter.schema->binding;
     auto& postings = inverter.getPostingsWriter();
-    segInfo->creatorEpoch = segInfo->liveEpoch = postings.creatorEpoch;
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
@@ -2280,15 +2277,21 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   auto previous = lastSnapshot.load();
   auto previousSchema = previous ? previous->schema : nullptr;
-  schema = schema ? schema->withHistory(previousSchema ? previousSchema->gen_ + 1 : 1,
-      previousSchema.get()) : previousSchema;
+  if (schema) {
+    SchemaBinding binding = previousSchema ? previousSchema->binding : SchemaBinding{};
+    if (binding.scope.empty()) binding.scope = snapshots.schemaScope;
+    binding.version.local = ++nextSchemaVersion;
+    binding.version.epoch = writerEpoch;
+    schema = schema->withHistory(std::move(binding), previousSchema.get());
+  } else schema = previousSchema;
   std::optional<StoredDictionaryRegistry::SchemaState> dictionarySlots;
   if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
   info.version = 1;
   info.index_gen = ++nextManifestGen;
   info.writer_epoch = writerEpoch;
-  info.schema_gen = schema->gen_;
-  info.schema = schema->storedInfo(arena);
+  if (schema != previousSchema) schema = snapshots.schemas->publish(dir, incarnation, std::move(schema));
+  info.schema = schema->binding.wire();
+  info.schema_file = {schema->file.name, schema->file.size, schema->file.xxh3};
   info.incarnation = incarnation;
   info.last_seg_id = lastSegId.load(std::memory_order_relaxed);
   auto now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2391,7 +2394,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       }
       indexGen = info.index_gen;
       coreGen = info.core_gen;
-      schemaGen_ = info.schema_gen;
+      schemaGen_ = schema->gen_;
       durableUpdateVersion = info.update_version;
       lastCommittedSegIds.swap(segmentIds);
       currentAuxIndexes_.swap(auxIndexes);
@@ -2471,7 +2474,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.max_version = seg.maxVersion;
     wire.commit_time = seg.firstCommitTime;
     wire.live_docs = seg.liveDocs;
-    wire.schema_gen = seg.schemaGen;
+    wire.schema = seg.schema.wire();
     wire.next_overlay_gen = seg.nextOverlayGen;
     wire.files = toWire(seg.files, arena);
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
@@ -2767,11 +2770,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc());
       newSegInfo->minVersion = segs.front()->minVersion;
       newSegInfo->maxVersion = segs.front()->maxVersion;
-      newSegInfo->schemaGen = segs.front()->schemaGen;
+      newSegInfo->schema = segs.front()->schema;
       for (size_t i = 1; i < segs.size(); i++) {
         newSegInfo->minVersion = std::min(newSegInfo->minVersion, segs[i]->minVersion);
         newSegInfo->maxVersion = std::max(newSegInfo->maxVersion, segs[i]->maxVersion);
-        newSegInfo->schemaGen = std::min(newSegInfo->schemaGen, segs[i]->schemaGen);
+        newSegInfo->schema = std::min(newSegInfo->schema, segs[i]->schema);
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
@@ -3181,7 +3184,7 @@ void IndexWriter::testDeleteAllData() {
     // drop all index files
     std::vector<Directory::FileInfo> files;
     dir.listFiles(files);
-    for (const auto& file : files) if (file.name != "STATE") dir.deleteFile(file.name);
+    for (const auto& file : files) if (file.name != "STATE" && file.name != getSchema()->file.name) dir.deleteFile(file.name);
     writerState = IncarnationState::claim(dir);
     writerEpoch = writerState.value.epoch;
 
@@ -3344,7 +3347,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.minUpdateVersion = seg->minVersion;
       dst.maxUpdateVersion = seg->maxVersion;
       dst.firstCommitTime = seg->firstCommitTime;
-      dst.schemaGen = seg->schemaGen;
+      dst.schemaGen = seg->schema.generation();
       dst.overlays.reserve(seg->auxOverlays.size());
       std::ranges::transform(seg->auxOverlays, std::back_inserter(dst.overlays), copyAux);
       dst.maxDoc = seg->maxDoc;

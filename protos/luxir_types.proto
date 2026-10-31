@@ -1846,6 +1846,8 @@ message MemoryStats {
   uint64 node_budget_bytes = 5;
   // Per-request tracked search memory ceiling; zero disables rejection.
   uint64 search_request_limit_bytes = 6;
+  // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
+  uint64 schema_cache_bytes = 7;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.

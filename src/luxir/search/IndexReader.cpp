@@ -10,6 +10,7 @@
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/SchemaCache.h"
 #include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
@@ -206,12 +207,13 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         prevAuxByName.clear();
         prevSegAuxByKey.clear();
       }
-      if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
+      if (preferredSchema && preferredSchema->binding == SchemaBinding(*indexInfo.schema)) {
         schema = preferredSchema;
-      } else if (previous && previousReader->schema()->gen_ == indexInfo.schema_gen) {
+      } else if (previous && previousReader->schema()->binding == SchemaBinding(*indexInfo.schema)) {
         schema = previousReader->schema();
       } else {
-        schema = Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen);
+        SchemaCache schemas; // standalone readers have no node owner
+        schema = schemas.load(dir, indexInfo);
       }
       indexGen = indexInfo.index_gen;
       core->segmentFiles.clear();

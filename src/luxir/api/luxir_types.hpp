@@ -389,6 +389,7 @@ struct MemoryStats {
   FieldMetadataStats field_metadata;
   uint64_t node_budget_bytes = 0;
   uint64_t search_request_limit_bytes = 0;
+  uint64_t schema_cache_bytes = 0;
 };
 struct StatsTotals {
   uint64_t collections = 0;

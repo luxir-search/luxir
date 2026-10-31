@@ -330,7 +330,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
 
 namespace luxir::test {
 
-TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
+TEST_F(CollectionAdminApiTest, manifestsReferenceSchemaAndOwnIncarnation) {
   for (bool disk : {false, true}) {
     CollectionAdminDataDir data("luxir_manifest");
     auto config = disk ? fsConfig(data) : LuxirConfig{};
@@ -344,7 +344,8 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       auto initial = readDurableIndexInfo(writer->dir);
       ASSERT_TRUE(initial->schema);
       EXPECT_TRUE(initial->segments.empty());
-      EXPECT_TRUE(manifestFiles(*initial).empty());
+      ASSERT_EQ(1u, manifestFiles(*initial).size());
+      EXPECT_EQ(initial->schema_file.name, manifestFiles(*initial).front().name);
       EXPECT_GT(initial->index_gen, 0u);
       incarnation = initial->incarnation;
       EXPECT_TRUE(CommitId::validIncarnation(incarnation));
@@ -361,7 +362,10 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       EXPECT_GT(changed->index_gen, physical->index_gen);
       EXPECT_EQ(physical->update_version, changed->update_version);
       EXPECT_EQ(physical->core_gen, changed->core_gen);
-      EXPECT_EQ(fileInventory(*physical), fileInventory(*changed));
+      auto beforeFiles = fileInventory(*physical), afterFiles = fileInventory(*changed);
+      beforeFiles.erase(std::string(physical->schema_file.name));
+      afterFiles.erase(std::string(changed->schema_file.name));
+      EXPECT_EQ(beforeFiles, afterFiles);
       auto current = writer->snapshots.readers.getReader(UINT64_MAX);
       EXPECT_EQ(1, current->liveDocs());
       EXPECT_EQ(old->segments().data(), current->segments().data());
@@ -372,7 +376,7 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       EXPECT_EQ(changed->index_gen, current->commitId());
       std::vector<Directory::FileInfo> files;
       writer->dir.listFiles(files);
-      for (const auto& file : files) EXPECT_FALSE(file.name.starts_with("_schema_"));
+      EXPECT_EQ(1, std::ranges::count_if(files, [](const auto& f) { return SchemaBinding::isFile(f.name); }));
     }
     {
       LuxirNode reopened(config);
@@ -405,7 +409,7 @@ TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
   auto collection = node.createCollection("initial_schema", &schema);
   auto manifest = readDurableIndexInfo(*collection->getShard()->getDirectory());
   EXPECT_EQ(1u, manifest->index_gen);
-  EXPECT_EQ(1u, manifest->schema_gen);
+  EXPECT_EQ(1u, manifest->schema->version.generation());
   EXPECT_TRUE(manifest->segments.empty());
   EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title_i"));
   EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("id"));

@@ -394,8 +394,18 @@ the response correlates directly with a directory listing: each segment's
 are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
-`update_version` are numeric. The schema and its history are embedded in each
-`commit_<index_gen>.<epoch>` manifest selected by `STATE`.
+`update_version` are numeric. The `commit_<index_gen>.<epoch>` manifest selected
+by `STATE` references an immutable `schema_0.0.<local>.<epoch>` file in the
+incarnation. Schema files contain the authored definition and field introduction
+history, with the same length/xxh3 footer as manifests. They participate in the
+ordinary file inventory, transfers, verification and snapshot retention. Copy
+them with the data files before copying manifests.
+
+Each node shares parsed schema versions across its snapshots and readers.
+`memory.schema_cache_bytes` reports an estimated owned payload, charged once per
+cached version to its schema tenant and released with its last user. This is
+separate from RAM backing-file bytes and allocator RSS; it excludes allocator
+overhead and analysis factories' private resources.
 
 ### Prometheus scraping
 

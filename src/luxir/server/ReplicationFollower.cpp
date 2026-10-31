@@ -886,6 +886,7 @@ struct ReplicationFollower::Impl {
       auto& registry = decision.active->getShard()->getSnapshots();
       auto previous = registry.snapshot();
       stageFiles(clients, key, name, registry.dir, previous, *snapshot, decision.active);
+      snapshot = registry.resolve(snapshot->bytes);
       auto opened = registry.readers.prepare(*snapshot);
       stillAdvertised();
       if (stopping.stop_requested()) return;

@@ -9,6 +9,13 @@
 
 namespace luxir {
 
+std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::resolve(CommitSnapshot::Bytes bytes, Directory& source) {
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(bytes, arena);
+  auto schema = schemas->load(source, info);
+  return CommitSnapshot::fromBytes(std::move(bytes), std::move(schema));
+}
+
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
   // No pin lock: a large acquire or slow file open cannot stall publication.
@@ -64,6 +71,7 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       verification.run();
       try {
         VerifiedDirectory source(dir, verification);
+        snapshot = resolve(snapshot->bytes, source);
         reader = readers.prepare(*snapshot, source);
       } catch (...) {
         // Full holds every file: a prepare failure is final. Under none an

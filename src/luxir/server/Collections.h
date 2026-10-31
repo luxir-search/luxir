@@ -37,6 +37,8 @@ namespace api { struct SchemaDef; }
 // events feed from the collection's registry.
 class Collections {
 public:
+  uint64_t schemaBytes() const { return schemas->bytes(); }
+  uint64_t schemaBytes(std::string_view tenant) { return schemas->tenantBytes(tenant); }
   static constexpr std::string_view kDefaultCollectionName = "main";
   enum class Role { WRITER, READ_ONLY, FOLLOWER };
 
@@ -109,6 +111,7 @@ private:
     ~Transition();
   };
 
+  std::shared_ptr<SchemaCache> schemas = std::make_shared<SchemaCache>();
   std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
   CollectionEvents& events;

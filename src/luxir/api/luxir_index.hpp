@@ -6,6 +6,7 @@
 // by member pointer and field number, independent of declaration order.
 #pragma once
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
@@ -27,9 +28,24 @@ struct FileDescriptor {
   uint64_t xxh3 = 0;
 };
 
+struct SchemaVersion {
+  uint64_t major = 0;
+  uint64_t minor = 0;
+  uint64_t local = 0;
+  uint64_t epoch = 0;
+  auto operator<=>(const SchemaVersion&) const = default;
+  uint64_t generation() const { return local ? local : minor; }
+};
+
+struct SchemaReference {
+  std::string_view scope;
+  std::string_view name;
+  SchemaVersion version;
+};
+
 struct SchemaInfo {
   ::hpp_proto::bytes_view source_def;
-  map_view<std::string_view, uint64_t> introduced_gen;
+  map_view<std::string_view, SchemaVersion> introduced;
 };
 
 struct AuxIndexInfo {
@@ -52,7 +68,7 @@ struct SegmentInfo {
   uint64_t min_version = 0;
   uint64_t max_version = 0;
   uint64_t commit_time = 0;
-  uint64_t schema_gen = 0;
+  SchemaReference schema;
   std::span<const AuxIndexInfo> overlays;
   std::span<const FileDescriptor> files;
   int32_t max_doc = 0;
@@ -62,21 +78,21 @@ struct SegmentInfo {
 struct IndexInfo {
   uint64_t writer_epoch = 0;
   uint64_t last_seg_id = 0;
-  std::optional<SchemaInfo> schema;
+  std::optional<SchemaReference> schema;
+  FileDescriptor schema_file;
   std::string_view incarnation;
   uint64_t version = 0;
   uint64_t commit_time = 0;
   uint64_t index_gen = 0;
   uint64_t core_gen = 0;
   uint64_t update_version = 0;
-  uint64_t schema_gen = 0;
   std::span<const SegmentInfo> segments;
   std::span<const AuxIndexInfo> aux_indexes;
 };
 
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
-LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
+LUXIR_TD(SchemaVersion) LUXIR_TD(SchemaReference) LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
 #undef LUXIR_TD
 
 #define LUXIR_ENTRY(M)                                                                  \
@@ -88,7 +104,7 @@ LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
 LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
-LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
+LUXIR_ENTRY(SchemaVersion) LUXIR_ENTRY(SchemaReference) LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

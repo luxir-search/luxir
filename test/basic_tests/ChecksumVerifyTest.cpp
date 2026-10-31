@@ -171,6 +171,7 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
       dir.sync(names);
       for (const auto& name : names) ASSERT_TRUE(dir.deleteFile(name));
       ReaderManager readers(dir);
+      snapshot = registry.resolve(snapshot->bytes, source);
       reader = readers.prepare(*snapshot, source);
     }
     EXPECT_EQ(1, reader->liveDocs());

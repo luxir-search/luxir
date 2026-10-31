@@ -289,7 +289,7 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
     bytes = cacheBytes(name);
   }
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
-      FilterCacheConfig{.maxBytes = bytes});
+      FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant);
   col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
@@ -734,6 +734,7 @@ Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr
   // An interrupted activation may already have committed this snapshot.
   auto committed = registry.snapshot();
   if (!committed || committed->id != snapshot->id) {
+    snapshot = registry.resolve(snapshot->bytes);
     auto opened = registry.readers.prepare(*snapshot);
     registry.commit(std::move(snapshot), std::move(opened));
   }

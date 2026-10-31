@@ -42,6 +42,7 @@ inline std::vector<api::FileDescriptor> manifestFiles(const api::IndexInfo& info
     for (const auto& overlay : segment.overlays) append(overlay.files);
   }
   for (const auto& aux : info.aux_indexes) append(aux.files);
+  files.push_back(info.schema_file);
   return files;
 }
 

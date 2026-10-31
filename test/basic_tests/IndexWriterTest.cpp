@@ -3170,7 +3170,8 @@ TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
       EXPECT_EQ(before, verify());
       reopened.mergeSegments();
       verify();
-      for (const auto& [name, descriptor] : before) EXPECT_EQ(nullptr, dir->openFile(name));
+      auto current = verify();
+      for (const auto& [name, descriptor] : before) EXPECT_EQ(current.contains(name), dir->openFile(name) != nullptr);
       std::vector<Directory::FileInfo> files;
       dir->listFiles(files);
       EXPECT_EQ(1, std::ranges::count_if(files, [](const auto& f) { return Manifest::generationOf(f.name) != 0; }));
@@ -3218,12 +3219,12 @@ TEST_F(IndexWriterTest, failedSchemaChangeLeavesPublicationUntouched) {
   }), SchemaError);
   auto after = test::readDurableIndexInfo(dir);
   EXPECT_EQ(before->index_gen, after->index_gen);
-  EXPECT_EQ(before->schema_gen, after->schema_gen);
+  EXPECT_EQ(before->schema->version.generation(), after->schema->version.generation());
   EXPECT_EQ(before->commit_time, after->commit_time);
   EXPECT_EQ(schema, writer.getSchema());
   writer.setSchema(schema);
   EXPECT_EQ(before->index_gen + 1, test::readDurableIndexInfo(dir)->index_gen);
-  EXPECT_EQ(before->schema_gen, schema->gen_);
+  EXPECT_EQ(before->schema->version.generation(), schema->gen_);
   EXPECT_NE(schema, writer.getSchema());
 }
 
@@ -3259,7 +3260,10 @@ TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForPendingMergeCommit) {
     EXPECT_FALSE(commit.waitFor(std::chrono::milliseconds(0)));
     auto after = test::readDurableIndexInfo(dir);
     EXPECT_EQ(before->index_gen + 1, after->index_gen);
-    EXPECT_EQ(test::fileInventory(*before), test::fileInventory(*after));
+    auto beforeFiles = test::fileInventory(*before), afterFiles = test::fileInventory(*after);
+    beforeFiles.erase(std::string(before->schema_file.name));
+    afterFiles.erase(std::string(after->schema_file.name));
+    EXPECT_EQ(beforeFiles, afterFiles);
   }
   releaseMerge.count_down();
   schema.get();
@@ -3269,7 +3273,7 @@ TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForPendingMergeCommit) {
   Signal::unlisten("mergeStart");
   Signal::unlisten("commitWaitingForMerges");
   auto final = test::readDurableIndexInfo(dir);
-  EXPECT_EQ(writer.getSchema()->gen_, final->schema_gen);
+  EXPECT_EQ(writer.getSchema()->gen_, final->schema->version.generation());
   EXPECT_GT(final->index_gen, before->index_gen + 1);
 }
 
@@ -3325,7 +3329,7 @@ TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetKeepsIncarnation) 
   EXPECT_THROW(IndexWriter(writerSnapshots, schema), std::invalid_argument);
   CommitSnapshotRegistry reopenedSnapshots(dir);
   IndexWriter reopened(reopenedSnapshots);
-  EXPECT_EQ(after->schema_gen, reopened.getSchema()->gen_);
+  EXPECT_EQ(after->schema->version.generation(), reopened.getSchema()->gen_);
 }
 
 TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {

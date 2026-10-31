@@ -150,7 +150,12 @@ locations, browse `src/luxir/<area>/`.
      authored source stays sparse, resolved HTTP view exposes effective settings
      and introduction/segment generations for conservative coverage
    - `FieldSignature`: Effective properties for schema introduction history and
-     the resolved view; `SchemaInfo` persists authored definitions and introductions
+     the resolved view; immutable `SchemaInfo` files persist authored definitions
+     and structured introduction versions
+   - `SchemaBinding`: Tenant scope, shared name and major/minor/local/epoch version;
+     manifests reference a schema file, segments record historical bindings
+   - `SchemaCache`: Node-wide weak cache by location/version; snapshots and readers
+     share parsed schemas and their tenant memory charge
    - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
      token filters, char filters, plus named analyzers) is the only path from an authored
      `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
@@ -175,8 +180,9 @@ locations, browse `src/luxir/<area>/`.
   incarnations (identities), one active in the tenant catalog
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
-  - Flush records the pinned schema generation; merge records the minimum input
-    generation, preserving the no-backfill contract
+  - Flush records the pinned schema binding; merge records the oldest input
+    version, preserving the no-backfill contract. Historical segment bindings
+    do not require opening old schema definitions
 
 ## Request Flow
 

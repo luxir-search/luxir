@@ -80,8 +80,8 @@ public:
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
     std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
-    // Schema generation this segment was indexed under.
-    uint64_t schemaGen = 0;
+    // Oldest input schema binding; merging does not backfill fields.
+    SchemaBinding schema;
 
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
@@ -119,7 +119,7 @@ public:
 
 inline std::string format_as(const SegInfo& seg) {
   return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schemaGen, seg.personalDeletes.size());
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schema.generation(), seg.personalDeletes.size());
 }
 
 
@@ -418,6 +418,7 @@ public:
   // Schema generation read from IndexInfo on startup and advanced only after
   // a new commit is durable. Protected by indexMutex.
   uint64_t schemaGen_ = 0;
+  uint64_t nextSchemaVersion = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // manifest. Both commit and schema publication update these under

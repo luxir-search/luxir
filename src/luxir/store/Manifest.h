@@ -6,6 +6,7 @@
 #include <charconv>
 #include <map>
 #include "Directory.h"
+#include "luxir/schema/SchemaBinding.h"
 #include "IncarnationState.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/api/index_files.h"
@@ -55,7 +56,7 @@ struct Manifest {
 
   static bool indexFile(std::string_view name) {
     if (name.ends_with(".tmp")) return false;
-    if (candidate(name).first) return true;
+    if (candidate(name).first || SchemaBinding::isFile(name)) return true;
     if (!name.starts_with("s")) return false;
     auto dot = name.find('.'), underscore = name.find('_');
     if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return false;
@@ -84,7 +85,7 @@ struct Manifest {
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {
     api::IndexInfo info;
     if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)
-        || !info.schema || info.incarnation.empty()) {
+        || !info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
     return info;

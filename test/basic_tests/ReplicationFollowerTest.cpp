@@ -177,7 +177,11 @@ protected:
     api::ReplicationStatus stats;
     follower->getFollower()->stats(stats, arena);
     ASSERT_EQ(1u, stats.collections.size());
-    EXPECT_EQ(0u, stats.collections[0].bytes_downloaded);
+    auto installedSchema = col->getSchema();
+    EXPECT_EQ(installedSchema->file.size, stats.collections[0].bytes_downloaded);
+    EXPECT_NE(nullptr, col->getShard()->getSnapshots().dir.openFile(installedSchema->file.name));
+    EXPECT_EQ(h.collection().getSchema()->binding, installedSchema->binding);
+    EXPECT_NE(nullptr, installedSchema->getFieldTypePtr("extra_s"));
     CollectionHelper::UpdateBuilder merge;
     merge.commit(true, 1);
     ASSERT_TRUE(h.submit(merge).success);
@@ -1229,7 +1233,9 @@ TEST_P(ReplicationPullTest, copiesEmptyAndPopulatedCollectionsThenSeedsAndPromot
   source->createCollection("empty");
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
-  uint64_t bytes = 0; for (const auto& file : snapshot->files) bytes += file.size;
+  uint64_t bytes = 0;
+  auto empty = source->getCollection("empty")->getShard()->getSnapshots().snapshot();
+  for (const auto& current : {snapshot, empty}) for (const auto& file : current->files) bytes += file.size;
   auto first = pull();
   ASSERT_EQ(0, first.first) << first.second;
   EXPECT_NE(std::string::npos, first.second.find("main " + snapshot->id.token()));
@@ -2022,7 +2028,7 @@ TEST_F(ReplicationFollowerTest, renameAndSwapReuseIncarnationsAndPromote) {
   CollectionHelper a(*source, "a"), b(*source, "b");
   ASSERT_TRUE(a.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(b.indexAll({flatdoc("id", "b"), flatdoc("id", "c")}, UpdateMessage::COMMIT).success);
-  startFollower(); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
+  startFollower(); ASSERT_TRUE(caughtUp()); ASSERT_TRUE(caughtUp("a")); ASSERT_TRUE(caughtUp("b"));
   auto first = follower->getCollection("a"), second = follower->getCollection("b");
   std::atomic<int> downloads{0};
   Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* { downloads++; return nullptr; });
@@ -2090,10 +2096,16 @@ TEST_F(ReplicationFollowerTest, swapMakesMissingCounterpartUnavailableWhileDownl
   ASSERT_TRUE(c.indexAll({flatdoc("id", "c"), flatdoc("id", "d")}, UpdateMessage::COMMIT).success);
   source->swapCollections(CollectionId::of("b"), CollectionId::of("c"));
   std::atomic<bool> paused{false};
+  std::promise<void> blocked;
+  auto downloadStarted = blocked.get_future();
   std::latch resume(1);
   bool released = false;
-  Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* {
-    if (!paused.exchange(true)) resume.wait();
+  Signal::listen("replicationDownloadStart", [&](void*, void* name, void*) -> void* {
+    // main may still need its initial schema file; only pause the missing counterpart.
+    if (*(CollectionId*)name == CollectionId::of("b") && !paused.exchange(true)) {
+      blocked.set_value();
+      resume.wait();
+    }
     return nullptr;
   });
   auto cleanup = scope_guard([&] {
@@ -2102,12 +2114,15 @@ TEST_F(ReplicationFollowerTest, swapMakesMissingCounterpartUnavailableWhileDownl
     Signal::unlisten("replicationDownloadStart");
   });
   startFollower();
-  bool downloading = until([&] { return paused.load(); });
-  EXPECT_TRUE(downloading);
+  ASSERT_EQ(std::future_status::ready, downloadStarted.wait_for(10s));
   ASSERT_TRUE(caughtUp("c"));
-  EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);
-  EXPECT_THROW(follower->getCollection("b"), CollectionUnavailableError);
-  EXPECT_EQ(1, follower->getCollection("c")->getReaderManager().getReader()->liveDocs());
+  {
+    // c can flip before the remapping finishes removing a. Join that transition.
+    auto transition = follower->collections().catalog().transition();
+    EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);
+    EXPECT_THROW(follower->getCollection("b"), CollectionUnavailableError);
+    EXPECT_EQ(1, follower->getCollection("c")->getReaderManager().getReader()->liveDocs());
+  }
   released = true; resume.count_down();
   ASSERT_TRUE(caughtUp("b")); ASSERT_TRUE(caughtUp("c"));
   EXPECT_THROW(follower->getCollection("a"), CollectionNotFoundError);

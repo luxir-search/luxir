@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <unordered_map>
 #include "luxir/search/ReaderManager.h"
+#include "luxir/schema/SchemaCache.h"
 
 namespace luxir {
 
@@ -66,6 +67,8 @@ private:
   boost::unordered_flat_map<std::string_view, const FileDescriptor*> indexedFiles;
   std::unordered_map<std::string, FileRef> files;
 public:
+  std::shared_ptr<SchemaCache> schemas;
+  std::string schemaScope;
   Directory& dir;
   ReaderManager readers;
   // Set once by the collection owner before admitting requests. Runs after
@@ -82,8 +85,12 @@ private:
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
   void requireHeld(const FileDescriptor& descriptor);
 public:
-  explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
-      : now(std::move(now)), dir(dir), readers(dir, config) {}
+  explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now,
+                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0")
+      : now(std::move(now)), schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
+        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {}
+  std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes, Directory& source);
+  std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes) { return resolve(std::move(bytes), dir); }
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
   // The owning writer failed after durable publication: close and notify.

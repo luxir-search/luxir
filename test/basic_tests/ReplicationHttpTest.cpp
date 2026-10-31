@@ -341,7 +341,7 @@ TEST_F(ReplicationHttpTest, snapshotJsonHeadAndEmptyFile) {
   info.index_gen++;
   auto bytes = std::make_shared<std::vector<std::byte>>();
   ASSERT_TRUE(api::encode(info, *bytes));
-  registry.publish(CommitSnapshot::fromBytes(bytes));
+  registry.publish(registry.resolve(bytes));
   auto snap = snapshot();
   EXPECT_EQ(200, get(fileUrl(*snap, "zero")).result_int());
   EXPECT_TRUE(get(fileUrl(*snap, "zero")).body().empty());

@@ -32,13 +32,14 @@ std::string CommitSnapshot::manifestName() const {
   return Manifest::name(info.index_gen, info.writer_epoch);
 }
 
-std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
+std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes, std::shared_ptr<Schema> schema) {
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(bytes, arena);
+  auto digest = digestOf(*bytes);
   return std::make_shared<const CommitSnapshot>(std::move(bytes),
-      Schema::fromStored(*info.schema, info.schema_gen),
+      std::move(schema),
       CommitId{std::string(info.incarnation), info.index_gen}, info.commit_time, filesOf(info), populatedOf(info),
-      digestOf(*bytes));
+      digest);
 }
 
 std::string CommitId::newIncarnation() {
