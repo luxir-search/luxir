@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -32,7 +33,24 @@ enum class ValueOpcode : uint8_t {
   MIN,
   MAX,
   AVG,
+  EXP,
+  POW,
+  LT,
+  LE,
+  GT,
+  GE,
+  EQ,
+  NE,
+  AND,
+  OR,
+  NOT,
+  IF,
+  RANDOM,
+  GEO_DISTANCE,
 };
+
+// Most children any one value-function node has (if(cond, then, else)).
+inline constexpr size_t VALUE_MAX_ARITY = 3;
 
 struct ValueFunction {
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);

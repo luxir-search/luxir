@@ -76,7 +76,12 @@ public:
   uint32_t makeFunction(std::string_view name, size_t pos,
                         std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
-    assert(function != nullptr && function->evalBucketScalar != nullptr);
+    assert(function != nullptr);
+    if (function->evalBucketScalar == nullptr || args.size() > 2) {
+      fail(pos, fmt::format(
+          "{}() is a per-document value function and is not valid on bucket values",
+          name));
+    }
     std::array<uint32_t, 2> indices{};
     std::copy(args.begin(), args.end(), indices.begin());
     std::span<uint32_t> children(indices.data(), args.size());
