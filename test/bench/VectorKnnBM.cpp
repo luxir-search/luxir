@@ -600,6 +600,13 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec,
   state.counters["cand"] = Counter((double)cand, Counter::kAvgThreads);
   state.counters["lists"] = (double)stats.lists.load() / nQueries;
   state.counters["vectors"] = (double)stats.vectors.load() / nQueries;
+  state.counters["scanned"] = (double)stats.scanned.load() / nQueries;
+  state.counters["extra_bits"] = (double)stats.extraBitEvaluations.load() / nQueries;
+  state.counters["gate_rejections"] = (double)stats.gateRejections.load() / nQueries;
+  state.counters["retained_peak"] = (double)stats.retainedPeak.load() / nQueries;
+  state.counters["retained_terminal"] = (double)stats.retainedTerminal.load() / nQueries;
+  state.counters["seed_reads"] = (double)stats.seedReads.load() / nQueries;
+  state.counters["remaining_reads"] = (double)stats.remainingReads.load() / nQueries;
   state.counters["bytes_read"] = (double)stats.bytes.load() / nQueries;
   state.counters["rounds"] = (double)stats.rounds.load() / nQueries;
   state.counters["exact"] = exact;
