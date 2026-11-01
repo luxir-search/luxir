@@ -1858,9 +1858,9 @@ TEST_F(SchemaTest, vectorAnnSettings) {
     "inherits":{"parent":"_e"},
     "replaces":{"parent":"_e","ann":{"nlist":4}}}})");
   auto ann = [&](std::string_view name) { return ((VectorFieldType*)s->physical(name))->ann(); };
-  EXPECT_EQ(VectorAnnConfig::PQ, ann("plain").codec);
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("plain").codec);
   EXPECT_EQ(0, ann("plain").nlist);
-  EXPECT_EQ(1, ann("plain").rabitqBits);
+  EXPECT_EQ(0, ann("plain").rabitqBits);
   EXPECT_EQ(4, ann("plain").rabitqQueryBits);
   EXPECT_EQ(4, ann("rbq").rabitqBits);
   EXPECT_EQ(0, ann("rbq").rabitqQueryBits);
@@ -1869,7 +1869,7 @@ TEST_F(SchemaTest, vectorAnnSettings) {
   EXPECT_EQ(4, ann("inherits").pqM);
   EXPECT_EQ(6, ann("inherits").pqBits);
   // An authored ann replaces the parent's whole definition.
-  EXPECT_EQ(VectorAnnConfig::PQ, ann("replaces").codec);
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("replaces").codec);
   EXPECT_EQ(4, ann("replaces").nlist);
   EXPECT_NE(std::string::npos, authoredJson(*s).find(R"("pq":{"m":4,"bits":6})"));
 
@@ -1877,7 +1877,7 @@ TEST_F(SchemaTest, vectorAnnSettings) {
       R"({"type":"string","ann":{}})",
       R"({"type":"vector","ann":{"codec":"pq","rabitq":{"bits":2}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","pq":{"m":4}}})",
-      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":0}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":-1}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":10}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"query_bits":9}}})",
       R"({"type":"vector","ann":{"codec":"pq","pq":{"bits":9}}})",
@@ -1895,7 +1895,7 @@ TEST_F(SchemaTest, vectorAnnCodecDefaultsAndPresence) {
   auto s = schemaJson(R"({"fields":{
     "absent":{"type":"vector"}, "empty":{"type":"vector","ann":{}},
     "lists":{"type":"vector","ann":{"nlist":7}},
-    "pqSettings":{"type":"vector","dims":8,"ann":{"nlist":12,"pq":{"m":2,"bits":6}}},
+    "pqSettings":{"type":"vector","dims":8,"ann":{"codec":"pq","nlist":12,"pq":{"m":2,"bits":6}}},
     "pq":{"type":"vector","ann":{"codec":"pq"}},
     "rq":{"type":"vector","ann":{"codec":"rabitq"}}
   }})");
@@ -1905,20 +1905,15 @@ TEST_F(SchemaTest, vectorAnnCodecDefaultsAndPresence) {
     for (auto name : {"absent", "empty", "lists", "pqSettings", "pq", "rq"}) {
       SCOPED_TRACE(name);
       const auto& ann = dynamic_cast<VectorFieldType&>(*schema->physical(name)).ann();
-      EXPECT_EQ(name == std::string_view("rq") ? VectorAnnConfig::RABITQ : VectorAnnConfig::PQ, ann.codec);
+      EXPECT_EQ((name == std::string_view("pq") || name == std::string_view("pqSettings")) ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ, ann.codec);
       EXPECT_EQ(name == std::string_view("lists") ? 7 : name == std::string_view("pqSettings") ? 12 : 0, ann.nlist);
       EXPECT_EQ(name == std::string_view("pqSettings") ? 2 : 0, ann.pqM);
       EXPECT_EQ(name == std::string_view("pqSettings") ? 6 : 8, ann.pqBits);
     }
   }
-  for (auto ann : {R"({"rabitq":{}})", R"({"rabitq":{"bits":2}})"}) {
-    try {
-      schemaJson(std::string(R"({"fields":{"v":{"type":"vector","ann":)") + ann + "}}}");
-      FAIL() << "Accepted RaBitQ settings without a codec";
-    } catch (const SchemaError& e) {
-      EXPECT_NE(std::string_view(e.what()).find("explicit codec \"rabitq\""), std::string_view::npos);
-    }
-  }
+  EXPECT_NO_THROW(schemaJson(R"({"fields":{"v":{"type":"vector","ann":{"rabitq":{"bits":0}}}}})"));
+  EXPECT_THROW(schemaJson(R"({"fields":{"v":{"type":"vector","ann":{"pq":{}}}}})"), SchemaError);
+
 }
 
 TEST_F(SchemaTest, vectorPqMUsesEffectiveDimensions) {

@@ -9,35 +9,25 @@
 
 namespace luxir {
 
-/// One round of the host's widen loop.  The host re-enters search() along two
-/// axes, growing exactly one per round:
-///   - candidates (DEPTH): more results from the same recall effort.  On
-///     round 1 (no `eligible` bitmaps) this is a plain pool-depth request.
-///     From the first deepen round on, the request carries per-segment
-///     `eligible` bitmaps with already-pooled ranks cleared and candidates
-///     becomes a PER-ROUND FRESH BUDGET - it may repeat or shrink across
-///     rounds - because every engine must exclude cleared ranks and so
-///     spends the whole result heap on fresh hits (a poor-man's resumable
-///     cursor).  The host plans round sizes and termination around that
-///     fresh-only property; an engine that re-returned pooled hits would
-///     stall the widen loop, not just waste work.
-///   - breadth: more recall effort (for IVF, more lists; engine-defined for
-///     other index kinds).  Units are merge-stable "reference index" lists:
-///     the lists a single IVF index with nlist=sqrt(live vectors) would
-///     probe.  0 means the engine picks its adaptive default.
+/// One round of WIDEN. Bounded collectors receive a fresh candidate budget
+/// and exclude already returned ranks. Interval collectors persist witnesses
+/// and retained records for the query: DEPTH never rescans them; BREADTH scans
+/// only newly selected lists. Exact slots supply distinct-unit top-k witnesses.
 struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;
-  // Document/vector budget; group approximate cuts count documents.
+  // Bounded-channel budget; group bounded cuts count documents.
+  // IVF applies one shared bounded cut across its bounded segments and chunks
+  // for this round. A fresh-only depth request starts a new cut/floor.
   int64_t candidates = 0;
-  // Domain filtering is supplied by engine construction today.  Flat FAISS
-  // receives it through SearchParameters::sel instead of per request state.
+  // Domain filtering is supplied by engine construction. IVF scanners
+  // apply it through task-local selectors instead of per-request state.
   int32_t breadth = 0;
   // Floor on the fraction of live vectors the engine examines, in [0,1];
   // raises the effective breadth when breadth maps below it.  1.0 forces a
   // full scan.  Exact engines satisfy it trivially.
   float minScanFraction = 0.0f;
-  // Per-segment exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
+  // Bounded-channel exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
   // indexed by segOrd; empty (or an empty per-segment span) until the host's
   // first deepen round, when the host folds its pooled-hit set into them.
   // Contract:
@@ -58,7 +48,7 @@ struct VectorSearchRequest {
   //   - The spans are valid only for the duration of this search() call.
   //     The host mutates the backing bytes between rounds; never cache them.
   std::span<const std::span<const uint8_t>> eligible;
-  // Group policy only; docs engines ignore it. Exact cuts always use one.
+  // Bounded group policy only; interval collectors have no member cap.
   int64_t perKey = 1;
 };
 
@@ -75,14 +65,16 @@ struct VectorEngineHit {
 };
 static_assert(sizeof(VectorEngineHit) == 16);
 
-/// The exhaustion flags drive the host's deepen policy, tried in this order:
-///   !poolExhausted                      -> grow candidates (depth) and retry.
-///   poolExhausted && !breadthExhausted  -> grow breadth and retry.
-///   poolExhausted && breadthExhausted   -> nothing left; stop.
-/// poolExhausted means "this effort level cannot yield more hits" (the heap
-/// was not filled, or everything eligible at this breadth was returned).
-/// breadthExhausted means there is no more effort to add (exact engines
-/// always set it; IVF sets it when every list everywhere has been probed).
+enum class VectorSelection { COMPLETE, MORE_DEPTH };
+
+/// Completion and breadth are independent. MORE_DEPTH reports unreturned
+/// bounded candidates at this breadth. COMPLETE means no bounded depth remains
+/// (including queries with no bounded channel). The host also stops a bounded
+/// channel once its distinct-unit/count obligation is met. Interval selection
+/// completes when the selected lists have been scanned, regardless of retained
+/// size; a small interval set can request BREADTH, never DEPTH.
+/// Resource exhaustion throws through the request-memory breaker, never marks
+/// an incomplete interval selection complete.
 struct VectorSearchResult {
   std::vector<VectorEngineHit> hits;
   // False means hit.score is only an engine approximation; the host must
@@ -96,22 +88,18 @@ struct VectorSearchResult {
   // cannot attribute exactness per segment leaves this empty - every hit is
   // then treated as approximate, which is always safe.
   std::vector<int32_t> exactSegOrds;
-  bool poolExhausted = false;
+  VectorSelection boundedSelection = VectorSelection::COMPLETE;
   bool breadthExhausted = true;
   // Engine's hint for the next useful breadth value (the smallest one that
   // adds work).  0 = no hint; the host then steps breadth by 1.
   int32_t nextBreadth = 0;
 };
 
-/// Seam between the host widen/refine loop (KnnQuery::Weight::prepare) and a
-/// vector index implementation.  Engines return raw vector candidates in
-/// segment-local identities and report the taxonomy above; everything
-/// cross-cutting stays in the host: candidate pooling and dedup across
-/// rounds, the deepen policy, exact rescore, multi-valued doc collapse, and
-/// the selected-unit guarantee. Document-unit engines operate on vectors;
-/// group-unit engines resolve group identities before every bounded cut,
-/// retaining at most perKey documents per group. Exact cuts use one. Unit selection is a
-/// construction-time policy, never a per-candidate switch on document search.
+/// Engines return fresh bounded and exact candidates here. Query-owned interval
+/// state bypasses this result cut and survives every round. Exact scores and
+/// interval lower endpoints may witness the true k-th unit; bounded estimates
+/// never do. The host owns bounded pooling, depth obligations and terminal
+/// exact scoring. Group identities come from the enclosing CollapsePlan.
 class VectorEngine {
 public:
   virtual ~VectorEngine() = default;

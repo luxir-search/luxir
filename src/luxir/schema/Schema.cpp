@@ -335,12 +335,12 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
     cfg.nlist = *def->nlist;
   }
   if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
-    fail("rabitq settings require explicit codec \"rabitq\"");
+    fail("rabitq settings require codec \"rabitq\"");
   }
   if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
   if (def->rabitq) {
     if (def->rabitq->bits) {
-      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      if (*def->rabitq->bits < 0 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [0, 9]");
       cfg.rabitqBits = *def->rabitq->bits;
     }
     if (def->rabitq->query_bits) {

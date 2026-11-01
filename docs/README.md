@@ -91,6 +91,8 @@ state, and commits are crash-safe on immutable segments.
   and runtime time-zone data.
 - [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
   compiler and dependency environment, including ASan.
+- [Vector comparison](dev/vector-comparison.md) explains dependency images and
+  interleaved HTTP measurements across source refs.
 - [Building a release](dev/releases.md) covers branches, tags, CPU tiers,
   validation, and binary packaging.
 - [Plugins](dev/plugins.md) explains the compiled-in plugin model and how to

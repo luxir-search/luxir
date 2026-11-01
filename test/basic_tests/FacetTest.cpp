@@ -4154,7 +4154,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     }, "cannot sort by a subop without inline support: nested"},
     {"int_mincount_zero", [](LocalReq& req) {
       req.facet("f", "foo_i").mincount(0);
-    }, "not supported for int field facets"},
+    }, "not supported for numeric field facets"},
     {"text_unknown_sort", [](LocalReq& req) {
       qb::sort(req.facet("f", "body_w"), "unknown", qb::ASC);
     }, "unknown sort field 'unknown'"},
