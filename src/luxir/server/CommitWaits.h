@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <functional>
+#include <mutex>
 #include <stop_token>
 #include "ReplicationSource.h"
 #include "luxir/util/DeadlineScheduler.h"
@@ -81,5 +83,13 @@ public:
   void acknowledged(const CollectionId* name);
   void poll();
   void close();
+  // Runs (outside the lock) whenever a wait parks on a collection: a
+  // publisher that pulls commits from elsewhere (a replica refresher) can
+  // fetch at once instead of on its next interval. Dispatch only.
+  using ParkHook = std::function<void(const CollectionId&)>;
+  void setParkHook(ParkHook hook);
+private:
+  std::mutex hookMutex;
+  ParkHook parkHook;
 };
 }

@@ -190,11 +190,19 @@ public:
   // collection, or the next startup opens it again. Refused while a candidate
   // is staged.
   void detach(const CollectionId& id);
+  // Closes the writer of a registered collection after a commit and keeps
+  // serving its last snapshot read-only (updates get ReadOnlyError). The
+  // first half of a writer handoff: another node may then open the
+  // collection as writer at exactly that commit. Idempotent.
+  void demote(const CollectionId& id);
   // Opens a collection that storage lists and this node has not opened, as
   // startup does for each (writers only). Throws CollectionExistsError when it
   // is registered (even unavailable), CollectionNotFoundError when storage
   // does not list it or it has no CURRENT.
-  std::shared_ptr<Collection> attach(const CollectionId& id);
+  // As WRITER (the default) the collection is opened for indexing; as
+  // READ_ONLY it serves its selected snapshot and a publisher other than a
+  // writer (a replica refresher) advances it with prepare/publish.
+  std::shared_ptr<Collection> attach(const CollectionId& id, Role role = Role::WRITER);
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the

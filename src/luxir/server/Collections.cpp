@@ -589,7 +589,8 @@ void Collections::detach(const CollectionId& key) {
   try {
     if (auto shard = collection->getShard()) {
       if (shard->iw) {
-        shard->iw->commit();
+        // A demoted writer committed and closed already.
+        if (!shard->readOnly.load(std::memory_order_acquire)) shard->iw->commit();
         shard->iw->close();
       }
       shard->snapshots->close();
@@ -612,29 +613,52 @@ void Collections::detach(const CollectionId& key) {
   LOG_INFO("Detached collection: {}", key.label());
 }
 
-std::shared_ptr<Collection> Collections::attach(const CollectionId& key) {
+void Collections::demote(const CollectionId& key) {
+  validate(key);
+  Transition transition(*this, key);
+  auto collection = map.get(key);
+  if (!collection) throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  auto shard = collection->getShard();
+  if (!shard || !shard->iw || shard->readOnly.load(std::memory_order_acquire)) return;
+  // Refuse new updates first, then make what was accepted durable, then
+  // let the writer go. The registry and its readers stay: searches go on.
+  shard->readOnly.store(true, std::memory_order_release);
+  try {
+    shard->iw->commit();
+    shard->iw->close();
+  } catch (...) {
+    shard->readOnly.store(false, std::memory_order_release);
+    throw;
+  }
+  LOG_INFO("Demoted collection to read-only: {}", key.label());
+}
+
+std::shared_ptr<Collection> Collections::attach(const CollectionId& key, Role role) {
   validate(key);
   Transition transition(*this, key);
   if (map.get(key)) throw CollectionExistsError("collection '" + key.label() + "' already exists");
-  auto stored = factory->collections();
-  if (std::ranges::find(stored, key) == stored.end()) {
-    throw CollectionNotFoundError("collection '" + key.label() + "' is not in storage");
+  // The storage may hide the collection from its listing (a replica is not
+  // opened at startup): what matters is that its directory is there.
+  std::optional<std::string> selected;
+  try {
+    selected = factory->collection(key).current();
+  } catch (const std::exception& e) {
+    throw CollectionNotFoundError("collection '" + key.label() + "' is not in storage: " + e.what());
   }
-  auto selected = factory->collection(key).current();
   if (!selected) throw CollectionNotFoundError("collection '" + key.label() + "' has no CURRENT in storage");
   if (!CommitId::validIncarnation(*selected)) throw std::runtime_error("CURRENT selects an invalid incarnation");
-  auto collection = openCollection(key, Role::WRITER, selected);
+  auto collection = openCollection(key, role, selected);
   {
     std::lock_guard lock(cachePolicyMutex);
     applyCachePolicy(key, collection);
     if (!map.insert(key, collection)) {
-      collection->getShard()->iw->close();
+      if (auto iw = collection->getShard()->iw) iw->close();
       throw CollectionExistsError("collection '" + key.label() + "' already exists");
     }
     listCollection(key, collection);
   }
   events.registered(key, collection);
-  LOG_INFO("Attached collection: {}", key.label());
+  LOG_INFO("Attached collection{}: {}", role == Role::WRITER ? "" : " read-only", key.label());
   return collection;
 }
 

@@ -164,6 +164,13 @@ public:
   }
 
   // --- request-level setters ---
+  // The search waits (up to timeoutMs) until the collection serves `token`
+  // or a later commit (a replica refreshes on it).
+  LocalReq& minCommit(std::string_view token, uint64_t timeoutMs) {
+    view.min_commit = build::arenaStr(mr, token);
+    view.min_commit_timeout_ms = timeoutMs;
+    return *this;
+  }
   LocalReq& collection(std::string_view name) {
     view.collection = build::arenaStr(mr, name);
     return *this;
