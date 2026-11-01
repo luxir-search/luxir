@@ -591,6 +591,12 @@ private:
       fieldOutput.writeVlong(finfo.mono2MetaOff);
       fieldOutput.writeVal(finfo.valDocLoc);
       fieldOutput.writeVlong(finfo.valDocMetaOff);
+      if ((finfo.flags & FieldType::BOOL_BITSETS) != 0) {
+        fieldOutput.writeVint((uint32_t)finfo.trueDocs);
+        fieldOutput.writeVal(finfo.trueDocsEndLoc);
+        fieldOutput.writeVint((uint32_t)finfo.falseDocs);
+        fieldOutput.writeVal(finfo.falseDocsEndLoc);
+      }
     }
 
     // Now write the start of each fieldInfo

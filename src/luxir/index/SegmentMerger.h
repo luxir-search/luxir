@@ -9,6 +9,7 @@
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
 #include "BKDWriter.h"
+#include "BoolBitsetsWriter.h"
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "StoredDictionaryRegistry.h"
@@ -3007,8 +3008,17 @@ private:
     int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
     [[maybe_unused]] int32_t docsWithField = 0;
 
+    // BOOLEAN columns rebuild their true/false doc bitsets from the values
+    // as they stream past, like geo points rebuild the BKD. Both paths below
+    // emit docs in merged (non-decreasing) order.
+    std::optional<BoolBitsetsWriter> boolBitsets;
+    if (outputFieldInfo.flags & FieldType::BOOL_BITSETS) {
+      boolBitsets.emplace(pool, postingsWriter);
+    }
+
     auto emitValue = [&](int64_t val, int32_t mappedDoc) {
       intColWriter->addInt64(val);
+      if (boolBitsets) boolBitsets->add(mappedDoc, val);
       if (geoPoints != nullptr) {
         geoPoints->push_back({geo::unpackLatitude(val), geo::unpackLongitude(val), mappedDoc});
       }
@@ -3160,6 +3170,7 @@ private:
           for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
             auto val = values.valueAt(inRank);
             intColWriter->addInt64(val);
+            if (boolBitsets) boolBitsets->add(mappedDoc, val);
             if (geoPoints != nullptr) {
               geoPoints->push_back({geo::unpackLatitude(val),
                                     geo::unpackLongitude(val), mappedDoc});
@@ -3172,6 +3183,7 @@ private:
           // single-valued
           auto val = values.valueAt(docRankIn);
           intColWriter->addInt64(val);
+          if (boolBitsets) boolBitsets->add(mappedDoc, val);
           if (geoPoints != nullptr) {
             geoPoints->push_back({geo::unpackLatitude(val),
                                   geo::unpackLongitude(val), mappedDoc});
@@ -3205,6 +3217,7 @@ private:
       outputFieldInfo.monoLoc = endValueRankWriter->blockLoc;
       outputFieldInfo.monoMetaOff = endValueRankWriter->metaOff;
     }
+    if (boolBitsets) boolBitsets->finish(postingsWriter.getMaxDoc(), outputFieldInfo);
   }
 
 };

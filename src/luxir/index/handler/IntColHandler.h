@@ -5,6 +5,7 @@
 
 #include "luxir/util/ApiError.h"
 
+#include "luxir/index/BoolBitsetsWriter.h"
 #include "luxir/index/DocStream.h"
 #include "luxir/index/BKDWriter.h"
 #include "luxir/index/Inverter.h"
@@ -192,6 +193,21 @@ public:
       }
     }
 
+    if (fieldType->isSet(FieldType::BOOL_BITSETS)) {
+      // The value and doc streams are separate; one bit per value pairs them.
+      auto guard = tmpPool.rewindScopeGuard();
+      std::vector<bool> values;
+      values.reserve((size_t)numVals);
+      longStream.visitValues(inverter.pool, [&](int64_t value) { values.push_back(value != 0); });
+      BoolBitsetsWriter bitsets(tmpPool, postingsWriter);
+      size_t valueIndex = 0;
+      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        assert(valueIndex < values.size());
+        bitsets.add(docid, values[valueIndex++]);
+      });
+      assert(valueIndex == values.size());
+      bitsets.finish(postingsWriter.getMaxDoc(), fieldInfo);
+    }
   }
 };
 
@@ -391,6 +407,26 @@ public:
       fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
+    if (fieldType->isSet(FieldType::BOOL_BITSETS)) {
+      auto guard = pool.rewindScopeGuard();
+      std::vector<bool> values;
+      values.reserve((size_t)numVals);
+      longStream.visitValues(inverter.pool, [&](int64_t value) { values.push_back(value != 0); });
+      BoolBitsetsWriter bitsets(pool, postingsWriter);
+      IntStream::Reader lengths(lengthStream, inverter.pool);
+      size_t valueIndex = 0;
+      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        assert(!lengths.eof());
+        int32_t length = lengths.next();
+        for (int32_t i = 0; i < length; i++) {
+          assert(valueIndex < values.size());
+          bitsets.add(docid, values[valueIndex++]);
+        }
+      });
+      assert(lengths.eof());
+      assert(valueIndex == values.size());
+      bitsets.finish(postingsWriter.getMaxDoc(), fieldInfo);
+    }
   }
 };
 

@@ -14,8 +14,9 @@ namespace luxir {
 
 namespace {
 
-constexpr std::string_view BUILTIN_NAMES[] = {"date", "double", "float", "geo_point", "id",
-                                              "int", "string", "text", "vector"};
+constexpr std::string_view BUILTIN_NAMES[] = {"boolean", "date", "decimal", "double", "float",
+                                              "geo_point", "id", "int", "ip", "string",
+                                              "text", "vector"};
 
 bool validName(std::string_view name) {
   return !name.empty() && std::ranges::all_of(name, [](char c) {

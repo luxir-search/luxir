@@ -16,6 +16,9 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
+| `decimal` | Fixed-point number with a required `scale` (digits after the point, 0 to 18): prices and other amounts that need exact decimal values. See [Booleans, IP addresses and decimals](#booleans-ip-addresses-and-decimals). |
+| `boolean` | `true` or `false`: flags and on/off attributes. |
+| `ip` | IPv4 or IPv6 address, with exact, range, and CIDR (`10.0.0.0/8`) queries. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
@@ -37,6 +40,49 @@ built-in settings either. A
 collection whose schema names a type the server lacks fails to load with a
 message listing the available types. See
 [Plugin field types](../dev/plugins.md#field-types).
+
+### Booleans, IP addresses and decimals
+
+These types reuse existing storage; the only addition is the pair of
+document bitsets a `boolean` field keeps beside its column.
+
+- `boolean` accepts JSON `true`/`false` and the strings `"true"`/`"false"`;
+  other values reject the document. Values are stored as 0/1 in the integer
+  column, so facets and sorting (`false` before `true`) work as they do for
+  `int`. Next to the column each segment keeps two document bitsets, the
+  documents with a `true` value and those with a `false` value, and match,
+  `any_of`, and range queries read those bitsets directly instead of scanning
+  the column. Query literals use the same rules: `flag:true`,
+  `{"match": {"flag": false}}`. Retrieved values are JSON booleans; document
+  columns have no boolean kind, so a boolean column is returned as a `col_val`
+  column holding one boolean value (or array) per document.
+  Facet buckets are `"true"` and `"false"`.
+- `ip` accepts dotted IPv4 and IPv6 text. Each address is indexed as its
+  16-byte IPv6 form, with IPv4 mapped to `::ffff:a.b.c.d`, so `10.0.0.1` and
+  `::ffff:10.0.0.1` are the same value and terms sort in address order
+  (all IPv4 addresses before other IPv6 ones). Match takes an address or a
+  CIDR block (`{"match": {"src_ip": "10.0.0.0/8"}}`, `src_ip:"2001:db8::/32"`),
+  which searches the block's address range; `any_of` and `range` take
+  addresses. Prefix, wildcard, regex, and fuzzy queries are rejected. Sorting
+  and facets use the term ordinals. Results show the canonical text: dotted
+  for IPv4, compressed lowercase for IPv6. `ip` fields must be match-indexed
+  (the default) and cannot set `stored`.
+- `decimal` stores `value * 10^scale` as a 64-bit integer, so a scale of 2
+  holds amounts up to about 9.2e16 with exact cents. It accepts JSON numbers
+  and numeric strings (`"12.50"`, `"1e2"`). A value with more fractional
+  digits than the scale is rejected, not rounded: with scale 2, `1.234` fails
+  the document and fails a query literal. Range, match, sort, range facets,
+  and field facets work on the decoded values (`gte: 9.99`, a facet `gap` of
+  `0.5`); retrieved values and facet buckets are JSON numbers, and value
+  expressions such as `sum(price)` see the decimal value as a double.
+
+```json
+{"fields": {
+  "in_stock": "boolean",
+  "client_ip": "ip",
+  "price": {"type": "decimal", "scale": 2, "index": "range"}
+}}
+```
 
 ### `text` versus `string`
 
@@ -140,6 +186,8 @@ The built-in templates are:
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_b`, `_bs` | Boolean column, single- or multi-valued. |
+| `_ip`, `_ips` | IP address, single- or multi-valued. |
 | `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |
@@ -155,7 +203,8 @@ Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
 The geo suffixes `_p` and `_ps` build one by default, because geo queries are
-their only use.
+their only use. There is no default decimal suffix (a decimal needs a scale);
+define those fields explicitly.
 
 ## Field templates for dynamic fields
 
@@ -285,7 +334,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
@@ -303,6 +352,7 @@ publication advances the schema generation.
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). `ignore_malformed` also applies to a plugin field type. |
 | `params` | beside a plugin field type's `type`: its settings, which the plugin validates. See [Field types](#field-types) |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
+| `scale` | `decimal` only, and required there: digits after the decimal point, 0 to 18 |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -657,7 +707,7 @@ The primary and every variant must use types from the same group:
 
 | Group | Allowed types |
 |---|---|
-| Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
+| Scalar | `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 

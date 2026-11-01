@@ -888,7 +888,8 @@ struct from<JSON, luxir::api::FieldDef> {
     using C = luxir::api::FieldDef::FieldClass;
     static constexpr std::pair<std::string_view, C> names[] = {
         {"string", C::STRING}, {"text", C::TEXT}, {"int", C::INT}, {"float", C::FLOAT}, {"double", C::DOUBLE},
-        {"id", C::ID}, {"vector", C::VECTOR}, {"date", C::DATE}, {"geo_point", C::GEO_POINT}};
+        {"id", C::ID}, {"vector", C::VECTOR}, {"date", C::DATE}, {"geo_point", C::GEO_POINT},
+        {"boolean", C::BOOLEAN}, {"ip", C::IP}, {"decimal", C::DECIMAL}};
     for (const auto& [n, c] : names) {
       if (n == name) return c;
     }
@@ -993,6 +994,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
+          } else if (key == "scale") {
+            util::from_json<V>(value.scale, ctx, vit, vend);
           } else if (key == "ignore_malformed") {
             util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
           } else if (key == "ignore_z_value") {

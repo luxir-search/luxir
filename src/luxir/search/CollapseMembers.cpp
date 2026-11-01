@@ -6,6 +6,7 @@
 #include "luxir/search/EmitDocs.h"
 #include "luxir/search/SortKindRegistry.h"
 #include "luxir/value/ValueExpr.h"
+#include "luxir/util/IpAddress.h"
 #include "luxir/util/NumericUtils.h"
 
 namespace luxir {
@@ -75,6 +76,7 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         if (!found) break;
         const SegFieldInfo& info = *found;
         auto type = const_cast<FieldType&>(field.getFieldType()).type();
+        const FieldType& fieldType = field.getFieldType();
         if (FieldType::sortsByIntColumn(type)) {
           IntColReader column(segment.postingsReader(), info);
           IntColReader::Iterator iter(column);
@@ -84,13 +86,21 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
               : iter.value();
           if (type == FieldType::FLOAT) value.kind = sortableInt32ToFloat((int32_t)raw);
           else if (type == FieldType::DOUBLE) value.kind = sortableInt64ToDouble(raw);
-          else value.kind = raw;
+          else if (fieldType.logical == FieldType::Logical::BOOLEAN) value.kind = raw != 0;
+          else if (fieldType.logical == FieldType::Logical::DECIMAL) {
+            value.kind = static_cast<const DecimalFieldType&>(fieldType).decode(raw);
+          } else value.kind = raw;
         } else if (const_cast<FieldType&>(field.getFieldType()).isSet(FieldType::INDEX_DOCS)) {
           OrdColReader column(segment.postingsReader(), info);
           int32_t ord = selectedSortOrd(column, doc.docId(), field.isReversed());
           if (ord == 0) break;
           TermsEnum terms(pool, segment.postingsReader(), info); terms.seekOrd((int64_t)ord - 1);
-          value.kind = build::arenaStr(mr, (std::string_view)terms.term());
+          std::string_view term = (std::string_view)terms.term();
+          char text[ip::TEXT_BUF_SIZE];
+          if (fieldType.logical == FieldType::Logical::IP && term.size() == ip::BYTES) {
+            term = ip::format(term, text);
+          }
+          value.kind = build::arenaStr(mr, term);
         } else {
           StrColReader column(segment.postingsReader(), info);
           StrColReader::DocIterator iter(column);

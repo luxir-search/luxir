@@ -166,8 +166,8 @@ TEST_F(FieldTypeExampleTest, registeredAndFrozen) {
 }
 
 TEST_F(FieldTypeExampleTest, schemaValidationTeaches) {
-  EXPECT_EQ("unknown field type 'piar'; valid types: date, double, float, geo_point, id, int, string, text, "
-            "vector; " + pluginTypes() + " (field: pt)",
+  EXPECT_EQ("unknown field type 'piar'; valid types: boolean, date, decimal, double, float, geo_point, id, int, "
+            "ip, string, text, vector; " + pluginTypes() + " (field: pt)",
             schemaError(R"({"fields":{"pt":"piar"}})"));
   EXPECT_EQ("field type 'pair': unknown parameter 'sep'; valid: separator, multi (field: pt)",
             schemaError(R"({"fields":{"pt":{"type":"pair","params":{"sep":"/"}}}})"));
