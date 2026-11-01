@@ -213,6 +213,30 @@ std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
       std::move(candidates), minCount, offset, limit, countFieldBucketOrder);
 }
 
+// Output columns for a decoder's value type, for bucket ids and range
+// bounds. Undefined for other types, so a new decoder must add its columns.
+template <typename T> struct FacetOutputTypes;
+
+template <> struct FacetOutputTypes<int64_t> {
+  using Column = api::ColInt;
+  using ArrayColumn = api::ArrArrInt;
+};
+
+template <> struct FacetOutputTypes<float> {
+  using Column = api::ColFloat;
+  using ArrayColumn = api::ArrArrFloat;
+};
+
+template <> struct FacetOutputTypes<double> {
+  using Column = api::ColDouble;
+  using ArrayColumn = api::ArrArrDouble;
+};
+
+template <> struct FacetOutputTypes<std::string_view> {
+  using Column = api::ColStr;
+  using ArrayColumn = api::ArrArrStr;
+};
+
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING
 // FacetResult.  The bucket count is known up front (buckets.size()), so each
 // span is allocArray'd once into the response arena `mr` and index-filled.
@@ -220,8 +244,7 @@ template <typename Output = NativeDateOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<int64_t, int64_t>>& buckets,
                         std::pmr::memory_resource& mr, Output output = {}) {
-  using Column = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
-                                    luxir::api::ColStr, luxir::api::ColInt>;
+  using Column = typename FacetOutputTypes<decltype(output(int64_t{}))>::Column;
   auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<Column>();
   size_t n = buckets.size();
   auto* ids = build::allocArray(bucketIds.v, n, mr);
