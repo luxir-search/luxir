@@ -472,7 +472,7 @@ TEST_F(CaseInsensitiveMappingTest, literalAndPatternIdentity) {
     EXPECT_NE(literal->hash(), pattern->hash());
     EXPECT_NE(key(*literal), key(*pattern));
   };
-  distinct(builder.createPrefixQuery("body", "a", true), builder.createWildcardQuery("body", "b*", true));
+  distinct(builder.createPrefixQuery("body", "a", 0, true), builder.createWildcardQuery("body", "b*", true));
   distinct(builder.createMatchQuery("name_s", "b", QueryBuilder::Operator::OR, 0, 1.0f, true),
            builder.createWildcardQuery("name_s", "b", true));
 }

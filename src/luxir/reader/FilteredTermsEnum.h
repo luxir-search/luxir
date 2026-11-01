@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -24,14 +26,31 @@ protected:
   TermsEnum& te;
   bool started = false;
   bool exhausted = false;
+  // Set when the scan ended at visitLimit instead of at the end of its
+  // candidates, so the accepted terms so far are not the whole set.
+  bool stoppedAtLimit = false;
+  // Dictionary terms classified so far, accepted or not.
+  int64_t visitedTerms = 0;
+  int64_t visitLimit = std::numeric_limits<int64_t>::max();
 
   bool finish() {
     exhausted = true;
     return false;
   }
 
+  bool finishAtLimit() {
+    stoppedAtLimit = true;
+    return finish();
+  }
+
 public:
   explicit FilteredTermsEnum(TermsEnum& te) : te(te) {}
+
+  // Bounds the terms the scan may classify; past it next() returns false and
+  // stoppedAtVisitLimit() reports why. Set before the first next().
+  void setVisitLimit(int64_t limit) { visitLimit = limit; }
+  bool stoppedAtVisitLimit() const { return stoppedAtLimit; }
+  int64_t termsVisited() const { return visitedTerms; }
 
   // Underlying enum at the current accepted term.
   TermsEnum& terms() { return te; }
@@ -79,6 +98,8 @@ public:
       if (!advance()) return finish();
     }
     for (;;) {
+      if (visitedTerms >= visitLimit) return finishAtLimit();
+      visitedTerms++;
       switch (accept()) {
         case Status::ACCEPT: return true;
         case Status::END:    return finish();
@@ -159,6 +180,8 @@ public:
     }
 
     while (candidate != end) {
+      if (visitedTerms >= visitLimit) return finishAtLimit();
+      visitedTerms++;
       std::string_view indexed = termView();
       if (indexed == *candidate) return true;
       if (*candidate < indexed) {

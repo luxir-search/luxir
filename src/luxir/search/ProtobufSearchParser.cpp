@@ -213,6 +213,13 @@ public:
   // The provided pool will be used to store the parsed query tree.
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
+  // Every planning context of the request draws on one multi-term budget.
+  Query::PlanningContext::Limits queryLimits() const {
+    Query::PlanningContext::Limits limits;
+    limits.multiTermBudget = &req.multiTermBudget;
+    return limits;
+  }
+
   explicit SearchParserImpl(SearchRequest& req)
     : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
   }
@@ -237,7 +244,7 @@ public:
     if (!domains.empty()) {
       rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
           req.arena, req.requestPool, *req.reader,
-          Query::PlanningContext::Limits{}, &req.warnings,
+          queryLimits(), &req.warnings,
           FilterKeyContext{.schemaGen = req.schema->gen_,
                            .timeZone = req.proto.time_zone},
           req.filterUses, &req.memoryTracker);
@@ -351,7 +358,7 @@ public:
         }
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
         bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
-            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
+            req.arena, req.requestPool, *req.reader, queryLimits(), &req.warnings,
             FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
@@ -1299,7 +1306,7 @@ public:
   void validateQueryFacetQueries(FacetParsePlan& plan) {
     plan.planning = luxir::arenaCreate<Query::PlanningContext>(
         req.arena, req.requestPool, *req.reader,
-        Query::PlanningContext::Limits{}, &req.warnings,
+        queryLimits(), &req.warnings,
         FilterKeyContext{.schemaGen = req.schema->gen_,
                          .timeZone = req.proto.time_zone},
         req.filterUses, &req.memoryTracker);
@@ -1691,7 +1698,7 @@ public:
       headSort = parseSorts(topDocsReq.collapse->head_sort);
     }
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
-      req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
+      req.arena, req.requestPool, *req.reader, queryLimits(),
       &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},

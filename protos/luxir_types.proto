@@ -656,6 +656,13 @@ message PrefixQuery {
   // After whole-prefix normalization, also match simple Unicode case
   // alternates. TEXT fields are supported. Uses a constant-score automaton.
   bool case_insensitive = 3;
+
+  // Max term expansions per segment. Unset/0 = every term with the prefix.
+  // A positive value keeps only the terms with the highest document frequency
+  // in each segment (ties go to the lower term), so a short prefix over a
+  // large dictionary costs at most this many postings lists per segment.
+  // Values above 4096 and negative values are rejected.
+  int32 max_expansions = 4;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one

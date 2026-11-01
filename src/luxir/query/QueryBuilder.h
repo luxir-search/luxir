@@ -564,14 +564,27 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
+  // maxExpansions 0 expands every matching term; a positive value keeps the
+  // highest-docFreq terms per segment, up to MultiTermQuery's lazy-union cap.
+  // It does not combine with caseInsensitive (constant-score automaton).
   Query* createPrefixQuery(std::string_view field, std::string_view prefix,
-                            bool caseInsensitive = false) {
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
     return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
-                              caseInsensitive);
+                             maxExpansions, caseInsensitive);
   }
 
   Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
-                            bool caseInsensitive = false) {
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
+    if (maxExpansions < 0
+        || (size_t) maxExpansions > MultiTermQuery::Weight::MAX_LAZY_TERMS) {
+      throw std::runtime_error(std::format(
+          "Prefix query max_expansions must be between 0 and {} (got {})",
+          MultiTermQuery::Weight::MAX_LAZY_TERMS, maxExpansions));
+    }
+    if (caseInsensitive && maxExpansions > 0) {
+      throw std::runtime_error(
+          "Prefix query max_expansions cannot be combined with case_insensitive");
+    }
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
@@ -586,7 +599,8 @@ public:
         if (caseInsensitive) {
           return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field, prefix);
         }
-        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
+        return pool.make<PrefixQuery>(
+            field, PackedTerm::fitPrefix(fieldType.longTerms, prefix), maxExpansions);
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }

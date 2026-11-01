@@ -164,6 +164,7 @@ struct PrefixQuery {
   std::string_view field;
   std::string_view prefix;
   bool case_insensitive = false;
+  int32_t max_expansions = 0;
 };
 struct WildcardQuery {
   std::string_view field;
