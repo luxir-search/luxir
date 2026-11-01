@@ -6,6 +6,7 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "luxir/BuildInfo.h"
 #include "Prometheus.h"
 
 #include <cassert>
@@ -650,7 +651,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
     PLUGIN
   };
@@ -1467,7 +1468,9 @@ private:
 
   static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
-    if (target == "/health") {
+    if (target == "/") {
+      m.route = Route::BUILD_INFO; m.allow = "GET"; m.prettyDefault = true;
+    } else if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
     } else if (target == "/metrics") {
       m.route = Route::METRICS; m.allow = "GET";
@@ -1578,6 +1581,15 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::BUILD_INFO: {
+        const auto& build = buildInfo();
+        OverlayJsonBuilder json;
+        json.string("version", build.version);
+        json.string("source_commit", build.sourceCommit);
+        json.string("cpu_target", build.cpuTarget);
+        respondJson(http::status::ok, json.finish());
+        break;
+      }
       case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
