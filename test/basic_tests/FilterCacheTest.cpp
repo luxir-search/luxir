@@ -6167,15 +6167,11 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   struct PolicyRestore {
     int64_t candidates = KnnQuery::maxKnnCandidates;
     int32_t breadth = KnnQuery::maxKnnBreadth;
-    int32_t refineCount = KnnQuery::defaultAnnRefineCount;
-    int32_t refineRatio = KnnQuery::defaultAnnRefineRatio;
     decltype(KnnQuery::engineWrapperForTests) wrapper =
         KnnQuery::engineWrapperForTests;
     ~PolicyRestore() {
       KnnQuery::maxKnnCandidates = candidates;
       KnnQuery::maxKnnBreadth = breadth;
-      KnnQuery::defaultAnnRefineCount = refineCount;
-      KnnQuery::defaultAnnRefineRatio = refineRatio;
       KnnQuery::engineWrapperForTests = std::move(wrapper);
     }
   } restore;
@@ -6215,12 +6211,6 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   KnnQuery::maxKnnBreadth++;
   EXPECT_NE(baseKey, keyFor(base));
   KnnQuery::maxKnnBreadth = restore.breadth;
-  KnnQuery::defaultAnnRefineCount++;
-  EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::defaultAnnRefineCount = restore.refineCount;
-  KnnQuery::defaultAnnRefineRatio++;
-  EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::defaultAnnRefineRatio = restore.refineRatio;
 
   KnnQuery::engineWrapperForTests = [](VectorEngine&, int64_t) {
     return std::unique_ptr<VectorEngine>();

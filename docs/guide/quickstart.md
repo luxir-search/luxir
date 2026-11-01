@@ -317,11 +317,11 @@ POST /collections/books/_search
     {
       "id": "2",
       "title_t": "Words of Radiance",
-      "price_f": 15
+      "price_f": 15.0
     }
   ],
   "ops": {
-    "average_price": 12,
+    "average_price": 12.0,
     "series": {
       "buckets": [
         {
