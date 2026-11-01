@@ -5,6 +5,7 @@
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
+#include "luxir/index/SegmentMerger.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
@@ -260,6 +261,71 @@ TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   auto unbound = sourceConfig; unbound.replication.source = followerConfig.replication.source;
   stopSource();
   EXPECT_THROW(LuxirNode invalid(unbound), std::invalid_argument);
+}
+
+// A segment written by an index-sorting merge survives a source restart
+// (manifest and schema round trip) and installs on a follower in its merged
+// order. The FS source also spills the merge's stored-field scratch.
+TEST_F(ReplicationFollowerTest, reorderedMergeRestartsAndReplicates) {
+  auto saved = SegmentMerger::reorderStoredRamBytes;
+  SegmentMerger::reorderStoredRamBytes = 64;
+  bool reordered = false, spilled = false;
+  Signal::listen("mergeIndexSort", [&](void* merged, void*, void*) -> void* { reordered |= *(bool*)merged; return nullptr; });
+  Signal::listen("storedFieldsReorderScratch", [&](void*, void* spill, void*) -> void* { spilled |= *(bool*)spill; return nullptr; });
+  auto restore = scope_guard([&] {
+    SegmentMerger::reorderStoredRamBytes = saved;
+    Signal::unlisten("mergeIndexSort");
+    Signal::unlisten("storedFieldsReorderScratch");
+  });
+  // "id:k_i" in index order.
+  auto order = [](int port) {
+    auto res = httpRequest(port, http::verb::post, "/collections/main/_search",
+                           R"({"query":{"all":true},"sort":"_docid_","limit":-1,"fields":["id","k_i"]})");
+    EXPECT_EQ(200, (int)res.result_int()) << res.body();
+    std::vector<std::string> docs;
+    const std::string& body = res.body();
+    for (size_t at = body.find("\"id\":\""); at != std::string::npos; at = body.find("\"id\":\"", at + 1)) {
+      size_t end = body.find('"', at + 6);
+      size_t key = body.find("\"k_i\":", at);
+      docs.push_back(body.substr(at + 6, end - at - 6) + ":" + std::to_string(std::stoi(body.substr(key + 6))));
+    }
+    return docs;
+  };
+  startSource(); startFollower();
+  {
+    CollectionHelper h(*source, "main");
+    h.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    SchemaBuilder b;
+    b.indexSort("k_i");
+    b.set(h.collection());
+    for (int segment = 0; segment < 3; segment++) {
+      std::vector<Doc> batch;
+      for (int i = 0; i < 20; i++) {
+        int n = segment * 20 + i;
+        batch.push_back(flatdoc("id", "d" + std::to_string(n), "k_i", (int64_t)((n * 7) % 13),
+                                "body_t", "doc " + std::to_string(n)));
+      }
+      ASSERT_TRUE(h.indexAll(batch, UpdateMessage::COMMIT).success);
+    }
+    CollectionHelper::UpdateBuilder merge;
+    merge.commit(true, 1);
+    ASSERT_TRUE(h.submit(merge).success);
+    ASSERT_EQ(1u, h.durableSegmentCount());
+  }
+  EXPECT_TRUE(reordered);
+  EXPECT_TRUE(spilled);
+  auto merged = order(sourcePort);
+  // Keys ascend through the merged segment.
+  std::vector<int> keys;
+  for (const auto& doc : merged) keys.push_back(std::stoi(doc.substr(doc.find(':') + 1)));
+  ASSERT_EQ(60u, keys.size());
+  EXPECT_TRUE(std::ranges::is_sorted(keys));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(merged, order(followerServer->getPort()));
+  stopFollower();
+  stopSource(); startSource();
+  EXPECT_EQ("k_i", source->getCollection("main")->getSchema()->indexSortField);
+  EXPECT_EQ(merged, order(sourcePort));
 }
 
 TEST_F(ReplicationFollowerTest, ramRestartKeepsOldUntilRealCommitAndOrphanDelete) {

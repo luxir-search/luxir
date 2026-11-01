@@ -33,6 +33,9 @@ public:
   ReadOnlyDirectory(std::shared_ptr<Directory> inner, std::string name)
       : DelegatingDirectory(std::move(inner)), name_(std::move(name)) {}
 
+  // No writes reach the backend's disk, scratch included.
+  std::string scratchPath() const override { return {}; }
+
   std::unique_ptr<File> createFile(std::string_view name) override {
     reject(std::string("createFile(") + std::string(name) + ")");
   }

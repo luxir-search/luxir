@@ -72,9 +72,10 @@ public:
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
-  // SchemaDef.index_sort.field: merges order their sources by this int/date
-  // column's per-segment minimum. Empty keeps segment creation order.
+  // SchemaDef.index_sort: merges write their documents in this int/date
+  // column's order (see SegmentMerger). Empty keeps arrival order.
   std::string indexSortField;
+  api::SchemaDef::IndexSort::Order indexSortOrder = api::SchemaDef::IndexSort::Order::ASC;
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, uint64_t, std::less<>> introducedGen;
   // Nonfatal notes from the schema update that produced this schema, for its

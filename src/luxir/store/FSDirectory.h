@@ -497,6 +497,7 @@ class FSDirectory : public Directory {
 
 public:
   Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
+  std::string scratchPath() const override { return basePath_.string(); }
 
   void linkFile(Directory& source, std::string_view name) override {
     auto& fs = dynamic_cast<FSDirectory&>(source.underlying());

@@ -79,6 +79,10 @@ public:
   // Unknown backends claim nothing, which selects the conservative fallbacks.
   virtual Capabilities capabilities() const { return 0; }
 
+  // A local directory where a task may spill scratch bytes it does not keep
+  // (see ScratchBytes), or empty to keep them in RAM.
+  virtual std::string scratchPath() const { return {}; }
+
   // TODO: add a prefix option?
   // Appends; the appended range is sorted by name.  Sizes are a best-effort
   // snapshot and entries vanishing mid-scan are skipped, never thrown.

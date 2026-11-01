@@ -869,27 +869,41 @@ representations.
 
 ## Index sort
 
-Merges concatenate their source segments, by default in segment creation
-order. When ingest arrives out of time order, such as backfills or late log
-shippers, a merged segment's time column can jump back and forth across
-source boundaries. `index_sort` names an `int` or `date` column field, either
-concrete or a template instance, and merges then order their sources by each
-source's minimum value of it:
+`index_sort` makes merges write their documents sorted by a field. It names
+an `int` or `date` column field, either concrete or a template instance, and
+an optional `order` (`asc`, the default, or `desc`):
 
 ```json
-{"index_sort": {"field": "timestamp_dt"}}
+{"index_sort": {"field": "timestamp_dt", "order": "desc"}}
 ```
 
-- Only the order of whole source segments changes. Documents within a source
-  keep their arrival order, so a merged segment is roughly sorted, not exactly.
-  The gain is limited to blocks that straddle source boundaries, which matters
-  most when sources are small (frequent commits).
-- Sources without values for the field go last; ties keep creation order.
-- Results do not change, except for the order of hits with equal sort keys.
+- A merged segment is exactly sorted: documents with equal keys keep merge
+  source order, and documents without a value go last. A multi-valued field
+  sorts a document by its minimum value ascending, its maximum descending.
+- Merge sources are concatenated by their minimum (ascending) or maximum
+  (descending) value, so ties and the segment's leading documents follow
+  time order. When the sources are already in key order the merge just
+  concatenates them.
+- Freshly flushed segments keep arrival order; only merged segments are
+  sorted.
+- Sorting tightens column zones and points leaves for range filters and
+  sorts on the field, and puts related documents next to each other.
+  Results do not change, except for the order of hits with equal sort keys.
+- The cost is merge work: postings are re-sorted term by term (a frequent
+  term's positions in bounded windows of documents), and every column is
+  read from its sources in the new order instead of streamed. Stored fields
+  of a source whose documents stay one increasing run are copied as
+  compressed chunks (or streamed); other sources are decoded once into
+  scratch, which spills to an unnamed temporary file in the data directory
+  past 32 MiB. Interleaving sources also splits their request-version runs,
+  so a sorted segment's `_version_` bookkeeping takes more space: when the
+  sort scatters arrival order, about log2(indexing requests) bits per
+  document (one byte per document for 200 requests).
 - A `mode=set` request without `index_sort` keeps the current setting;
   `{"index_sort": {}}` clears it, and `mode=replace_all` without it clears it
   (the response then carries an `index_sort_cleared` warning).
-  A change affects only future merges.
+  A change affects only future merges; existing segments keep their order
+  until they merge again.
 - Changing the field's type to one that is not an `int` or `date` column is
   rejected while it is the index sort; switching between `int` and `date` is
   allowed.

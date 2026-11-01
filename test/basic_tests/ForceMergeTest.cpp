@@ -315,8 +315,8 @@ TEST_F(ForceMergeTest, emptyCommitIsResumeForm) {
   EXPECT_EQ(1u, helper.durableSegmentCount());
 }
 
-// Segments flushed out of time order (b, a, untimed n, c) force-merged into
-// one. Returns the merged doc order; documents within a source keep arrival order.
+// Segments flushed out of time order (b, a, untimed n, c), each with
+// descending times, force-merged into one. Returns the merged doc order.
 static std::vector<std::string> mergedOrder(bool indexSort) {
   LuxirConfig config;
   config.store.backend = "ram";
@@ -350,9 +350,11 @@ static std::vector<std::string> mergedOrder(bool indexSort) {
   return ids;
 }
 
-TEST_F(ForceMergeTest, indexSortOrdersMergeSourcesByFieldMinimum) {
+// Without an index sort sources concatenate in creation order; with one the
+// documents themselves are sorted, and those without a value go last.
+TEST_F(ForceMergeTest, indexSortOrdersMergedDocuments) {
   EXPECT_EQ(vecs("b0", "b1", "a0", "a1", "n0", "n1", "c0", "c1"), mergedOrder(false));
-  EXPECT_EQ(vecs("a0", "a1", "b0", "b1", "c0", "c1", "n0", "n1"), mergedOrder(true));
+  EXPECT_EQ(vecs("a1", "a0", "b1", "b0", "c1", "c0", "n0", "n1"), mergedOrder(true));
 }
 
 } // namespace luxir::test

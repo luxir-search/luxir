@@ -255,11 +255,12 @@ public:
         builder([this](std::span<const char> block, uint32_t first) { target().add(block, first); }) {}
     VersionRunsWriter(VersionRunsWriter&&) = delete;
 
-    void add(uint32_t firstDocId, uint64_t version) {
+    // split starts a run even when the version equals the previous one.
+    void add(uint32_t firstDocId, uint64_t version, bool split = false) {
       if (added ? firstDocId <= lastStart : firstDocId != 0) {
         throw std::runtime_error("Request-version runs must start at zero and increase");
       }
-      builder.add(firstDocId, version);
+      builder.add(firstDocId, version, split);
       lastStart = firstDocId;
       added = true;
     }

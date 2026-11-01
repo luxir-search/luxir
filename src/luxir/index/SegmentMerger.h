@@ -23,10 +23,12 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
+#include "luxir/store/ScratchBytes.h"
 
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -52,10 +54,13 @@ class SegmentMerger {
     int32_t numLive; // number of live documents in this segment
     int32_t base; // docId base for this segment in the merged segment, accounting for deletions
     int ord; // 0-based ordinal (index in original merge list)
-    std::vector<int32_t> remap;  // 0 based (segment local) old to new id mapping, -1 means deleted
+    // 0 based (segment local) old to new id mapping, -1 means deleted. Under an
+    // index sort reorder it holds absolute merged ids (base is 0) and is not
+    // monotone.
+    std::vector<int32_t> remap;
 
-    bool hasDeletes() {
-      return !remap.empty();
+    bool hasDeletes() const {
+      return numLive != postingsReader->maxDoc();
     }
 
     // returns a pair of (mappedDocId, isDeleted)
@@ -133,7 +138,8 @@ class SegmentMerger {
         }
         uint16_t index = pointIndex++;
         // Live-doc compaction is monotone, so filtering/remapping cannot
-        // disturb this source run's (value, docid) order.
+        // disturb this source run's (value, docid) order. An index sort
+        // reorder is not; mergePoints re-sorts its points.
         auto [mappedDoc, isDeleted] = segment->remapDocId(
             (int32_t)leafDocids[index]);
         if (isDeleted) continue;
@@ -573,12 +579,33 @@ class SegmentMerger {
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
+
+  // Index sort reorder: merged doc n is source doc newToOld[n], packed as
+  // (source ord << 32 | local doc). Empty when the merge concatenates its
+  // sources (no index sort, or the key order already is concatenation order).
+  // Every per-doc writer then emits in merged-doc order by reading its
+  // sources at random; see the *Reordered paths below.
+  std::vector<uint64_t> newToOld;
+  bool reorder = false;
+  IndexRamBudget::Guard reorderGuard;  // newToOld plus the absolute remaps
+
+  static uint32_t sourceOf(uint64_t packed) { return (uint32_t)(packed >> 32); }
+  static int32_t localOf(uint64_t packed) { return (int32_t)(uint32_t)packed; }
 public:
+  // Reorder scratch limits: a term's positions buffered at once, and the
+  // stored-field docs held in RAM before they spill to a temp file.
+  // Non-const so tests can force windows and spills.
+  static inline int64_t reorderPositionsWindowBytes = MergeCostModel::REORDER_POSITIONS_WINDOW_BYTES;
+  static inline int64_t reorderStoredRamBytes = MergeCostModel::REORDER_STORED_RAM_BYTES;
 
   int32_t mapDocId(size_t sourceOrd, int32_t localDocId) const {
     auto [docId, deleted] = segs[sourceOrd].remapDocId(localDocId);
     return deleted ? -1 : docId;
   }
+
+  // Whether this merge wrote its documents in index sort order rather than
+  // concatenating its sources.
+  bool reordered() const { return reorder; }
 
 
 
@@ -636,11 +663,17 @@ public:
 
     // Now build the docId maps based on liveDocs, then release the liveDocs.
     PostingsWriter::VersionRunsWriter versions(postingsWriter);
-    for (size_t i = 0; i < segs.size(); i++) {
-      auto& seg = segs[i];
-      buildDocIdMapping(seg, liveDocs[i], seg.remap, versions);
-      // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
+    planIndexSort(totalLive);
+    if (reorder) {
+      buildReorderedMapping(versions);
+    } else {
+      for (size_t i = 0; i < segs.size(); i++) {
+        auto& seg = segs[i];
+        buildDocIdMapping(seg, liveDocs[i], seg.remap, versions);
+        // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
+      }
     }
+    Signal::emit("mergeIndexSort", &reorder);
 
     versions.finish();
 
@@ -752,14 +785,17 @@ private:
             maxChunkBytes,
             StoredFieldsReader::peekMaxChunkBytes(*field.seg->postingsReader, field.segFieldInfo));
       }
-      // Stored-field merge processes one source segment at a time.  The
-      // value-scaled buffers are: source decompressed chunk, writer per-doc
-      // staging, writer chunk body, writer assembled uncompressed chunk, and
-      // compression output.  LIGHT_BYTES covers fixed stream/mono scratch,
-      // the small compress-bound overhead above 1x and a ZSTD source's
-      // decompression context; a ZSTD output adds its compression context.
+      // Stored-field merge processes one source segment at a time, also
+      // under a reorder (which adds its scratch).  The value-scaled buffers
+      // are: source decompressed chunk (the largest of any source's format),
+      // writer per-doc staging, writer chunk body, writer assembled
+      // uncompressed chunk, and compression output.  LIGHT_BYTES covers fixed
+      // stream/mono scratch, the small compress-bound overhead above 1x and a
+      // ZSTD source's decompression context; a ZSTD output adds its
+      // compression context.
       return MergeCostModel::storedFieldsBytes(maxChunkBytes)
-          + StoredChunkCompressor::contextBytes(format, maxChunkBytes);
+          + StoredChunkCompressor::contextBytes(format, maxChunkBytes)
+          + (reorder ? MergeCostModel::reorderStoredBytes(postingsWriter.getMaxDoc(), reorderStoredRamBytes) : 0);
     }
 
     FieldType::Type type;
@@ -768,13 +804,32 @@ private:
 
     int64_t numValues = 0;
     int64_t docsWithField = 0;
+    int64_t totalTermFreq = 0;
     int64_t synthesizedPointValues = 0;
+    int64_t maxSynthesizedRun = 0;
     for (const auto& field : fields) {
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
+      totalTermFreq += field.segFieldInfo.sumTotalTermFreq;
       if (field.segFieldInfo.pointsMetaOff == 0) {
         synthesizedPointValues += field.segFieldInfo.numValues;
+        maxSynthesizedRun = std::max(maxSynthesizedRun, field.segFieldInfo.numValues);
       }
+    }
+    // A reorder pools every point to re-sort it, draining one source run at
+    // a time (a synthesized run is held while it drains).
+    if (reorder) synthesizedPointValues = numValues + maxSynthesizedRun;
+    // Reorder scratch: buffered postings of the largest term (indexed fields),
+    // a norm per merged doc (text) or a value rank per merged doc (columns).
+    int64_t maxDoc = postingsWriter.getMaxDoc();
+    int64_t reorderBytes = 0;
+    if (reorder) {
+      if (allFlags & FieldType::INDEX_DOCS) {
+        reorderBytes += MergeCostModel::reorderTermBytes(std::min(docsWithField, maxDoc), totalTermFreq,
+            FieldType::hasPositions(allFlags), reorderPositionsWindowBytes);
+      }
+      reorderBytes += maxDoc * (type == FieldType::Type::TEXT
+          ? MergeCostModel::REORDER_NORM_BYTES : MergeCostModel::REORDER_RANK_BYTES);
     }
     int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
@@ -794,7 +849,7 @@ private:
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
-            + MergeCostModel::LIGHT_BYTES + pointsBytes;
+            + MergeCostModel::LIGHT_BYTES + pointsBytes + reorderBytes;
       }
       // A doc's first value takes its ords[maxDoc] slot.  A multi-valued doc
       // spills into a pool delta stream: about 40 bytes for its header and
@@ -802,15 +857,15 @@ private:
       int64_t spilledValues = std::max<int64_t>(0, numValues - docsWithField);
       int64_t multiValuedDocs = std::min(spilledValues, docsWithField);
       return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
-          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+          + MergeCostModel::LIGHT_BYTES + pointsBytes + reorderBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
-      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes + reorderBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
-    return MergeCostModel::LIGHT_BYTES + pointsBytes;
+    return MergeCostModel::LIGHT_BYTES + pointsBytes + reorderBytes;
   }
 
   // In postings and values processed. A merged term is a heap step over the
@@ -893,6 +948,136 @@ private:
     }
 
     assert(newDocId == seg.numLive); // Make sure we got the right number of live documents
+  }
+
+  // One live source doc and its index sort key: the field's value flipped to
+  // unsigned order (complemented when descending), so every order compares
+  // keys ascending.
+  struct SortKeyEntry {
+    uint64_t key;
+    uint32_t source;
+    int32_t local;
+  };
+
+  // Computes the index sort permutation. Live docs with a key sort by it,
+  // ties keep concatenation (source, then local) order, and docs without a
+  // key follow in concatenation order. When that is the concatenation order
+  // already the merge takes the ordinary concatenating path.
+  void planIndexSort(int64_t totalLive) {
+    const std::string& field = schema.indexSortField;
+    if (field.empty() || segs.empty() || totalLive == 0) return;
+    bool descending = schema.indexSortOrder == api::SchemaDef::IndexSort::Order::DESC;
+
+    int64_t sourceDocs = 0;
+    for (const auto& seg : segs) sourceDocs += seg.postingsReader->maxDoc();
+    // Peak: the keyed entries plus newToOld, then newToOld plus the absolute
+    // per-source remaps for the rest of the merge.
+    reorderGuard = ramBudget.forceAcquire(
+        MergeCostModel::indexSortPlanBytes(totalLive, sourceDocs));
+
+    // One entry per live doc: keyed docs fill from the front, docs without a
+    // key from the back (reversed below into concatenation order).
+    std::vector<SortKeyEntry> entries((size_t)totalLive);
+    size_t valued = 0;
+    size_t missing = (size_t)totalLive;
+    for (auto& seg : segs) {
+      const FixedBitSet* live = liveDocs[seg.ord] ? &liveDocs[seg.ord]->bitset() : nullptr;
+      int32_t maxDoc = seg.postingsReader->maxDoc();
+      // Sources where the field has no int/date column (never set, or an
+      // older generation typed it differently) contribute no keys.
+      const auto* info = seg.postingsReader->fieldInfo(field);
+      std::optional<IntColReader> reader;
+      std::optional<IntColReader::Iterator> docs;
+      int32_t next = IntColReader::ENDDOC;
+      if (info != nullptr && (info->type == FieldType::INT || info->type == FieldType::DATE)
+          && (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
+        reader.emplace(*seg.postingsReader, *info);
+        docs.emplace(*reader);
+        next = docs->next();
+      }
+      for (int32_t local = 0; local < maxDoc; local++) {
+        bool has = next == local;
+        uint64_t key = 0;
+        if (has) {
+          int64_t value = reader->multiValued()
+              ? reader->selectedValue(docs->rank(), descending, docs->values())
+              : docs->value();
+          key = (uint64_t)value ^ (1ULL << 63);
+          if (descending) key = ~key;
+          next = docs->next();
+        }
+        if (live != nullptr && !live->get(local)) continue;
+        entries[has ? valued++ : --missing] = {key, (uint32_t)seg.ord, local};
+      }
+    }
+    assert(valued == missing);
+    std::reverse(entries.begin() + (ptrdiff_t)missing, entries.end());
+
+    auto byKey = [](const SortKeyEntry& a, const SortKeyEntry& b) { return a.key < b.key; };
+    auto before = [](const SortKeyEntry& a, const SortKeyEntry& b) {
+      return a.source != b.source ? a.source < b.source : a.local < b.local;
+    };
+    auto keyed = std::span<SortKeyEntry>(entries).first(valued);
+    bool monotone = std::is_sorted(keyed.begin(), keyed.end(), byKey)
+        && (valued == 0 || valued == entries.size() || before(entries[valued - 1], entries[valued]));
+    if (monotone) {
+      reorderGuard.release();
+      return;
+    }
+    // Ties keep concatenation order. (source, local) is unique, so an
+    // unstable sort on the full triple needs no merge buffer.
+    std::sort(keyed.begin(), keyed.end(), [&](const SortKeyEntry& a, const SortKeyEntry& b) {
+      return a.key != b.key ? a.key < b.key : before(a, b);
+    });
+    newToOld.reserve((size_t)totalLive);
+    for (const auto& entry : entries) {
+      newToOld.push_back((uint64_t)entry.source << 32 | (uint32_t)entry.local);
+    }
+    entries = {};
+    reorder = true;
+  }
+
+  // Under a reorder every source maps to absolute merged ids, and the
+  // request-version runs follow the merged order (they need not be monotone
+  // in version, only in doc id). Interleaving sources breaks up their runs:
+  // in the worst case every merged doc starts a run, and versions that
+  // stepped by one per doc in arrival order no longer form the affine prefix
+  // VersionRuns answers birth() from arithmetically, so a reordered
+  // segment's runs take more bytes and birth() decodes blocks instead. That
+  // cost is the information itself: which request each doc came from, about
+  // log2(requests) bits per doc once the order no longer follows arrival.
+  // A window of docs that is mostly run starts is written as one run per
+  // doc: blocks of consecutive starts store no start column, which the few
+  // runs merged by an equal neighbor would otherwise cost every block.
+  static constexpr size_t DENSE_VERSION_WINDOW = 256;
+  void buildReorderedMapping(PostingsWriter::VersionRunsWriter& versions) {
+    std::vector<std::unique_ptr<VersionRuns::Cursor>> cursors;
+    cursors.reserve(segs.size());
+    for (auto& seg : segs) {
+      seg.base = 0;
+      seg.remap.assign((size_t)seg.postingsReader->maxDoc(), -1);
+      cursors.push_back(std::make_unique<VersionRuns::Cursor>(seg.postingsReader->versionRuns()));
+    }
+    std::array<uint64_t, DENSE_VERSION_WINDOW> window;
+    uint64_t last = 0;
+    for (size_t first = 0; first < newToOld.size(); first += DENSE_VERSION_WINDOW) {
+      size_t count = std::min(DENSE_VERSION_WINDOW, newToOld.size() - first);
+      size_t starts = 0;
+      for (size_t i = 0; i < count; i++) {
+        size_t n = first + i;
+        uint32_t source = sourceOf(newToOld[n]);
+        int32_t local = localOf(newToOld[n]);
+        segs[source].remap[(size_t)local] = (int32_t)n;
+        window[i] = cursors[source]->birth(local);
+        starts += n == 0 || window[i] != (i ? window[i - 1] : last);
+      }
+      bool dense = starts * 2 > count;
+      for (size_t i = 0; i < count; i++) {
+        size_t n = first + i;
+        if (n == 0 || dense || window[i] != last) versions.add((uint32_t)n, window[i], dense);
+        last = window[i];
+      }
+    }
   }
 
   void addDocsFreq(TextWriter& textWriter, DocsFreqEnum& docsEnum, const Segment& seg) {
@@ -994,6 +1179,27 @@ private:
   void buildMergedNorms(std::span<MergeFieldInfo*> compactFields, Stream& normBytes,
                         DocStream& normDocsWithField, int32_t& numDocsWithField, MemPool& pool) {
     numDocsWithField = 0;
+    if (reorder) {
+      // Scatter each source's norms by merged id (-1: none), then write them
+      // in merged order.
+      std::vector<int16_t> norms((size_t)postingsWriter.getMaxDoc(), -1);
+      for (auto* field : compactFields) {
+        auto& seg = *field->seg;
+        NormsReader reader(*seg.postingsReader, field->segFieldInfo);
+        NormsReader::Iterator iter(reader);
+        for (int32_t localId = iter.next(); localId != NormsReader::ENDDOC; localId = iter.next()) {
+          int32_t mapped = seg.remap[(size_t)localId];
+          if (mapped >= 0) norms[(size_t)mapped] = (int16_t)iter.value();
+        }
+      }
+      for (int32_t doc = 0; doc < (int32_t)norms.size(); doc++) {
+        if (norms[(size_t)doc] < 0) continue;
+        normBytes.writeByte(pool, (uint8_t)norms[(size_t)doc]);
+        normDocsWithField.addDoc(pool, doc);
+        numDocsWithField++;
+      }
+      return;
+    }
     for (auto* field : compactFields) {
       auto& seg = *field->seg;
       NormsReader reader(*seg.postingsReader, field->segFieldInfo);
@@ -1018,10 +1224,12 @@ private:
 
   // The coordinator holds the merged norms until stitch. Range term blocks are
   // charged by the ranges as they grow, then handed to the coordinator.
-  static int64_t partitionCoordinatorCost(std::span<MergeFieldInfo*> fields) {
+  int64_t partitionCoordinatorCost(std::span<MergeFieldInfo*> fields) const {
     int64_t docsWithField = 0;
     for (const auto* field : fields) docsWithField += field->segFieldInfo.docsWithField;
-    return docsWithField * 2;
+    int64_t reorderNorms = reorder
+        ? (int64_t)postingsWriter.getMaxDoc() * MergeCostModel::REORDER_NORM_BYTES : 0;
+    return docsWithField * 2 + reorderNorms;
   }
 
   static int64_t sourceTermBlocks(std::span<MergeFieldInfo*> fields) {
@@ -1176,6 +1384,205 @@ private:
     return plan;
   }
 
+  // One term's postings across all sources under a reorder: source runs are
+  // monotone in local ids but not in merged ids, so the docs (with their tfs
+  // and positions) are gathered, sorted by merged id and then written.
+  //
+  // Docs and tfs are bounded by the merged doc count. Positions are not (a
+  // frequent term in long documents), so a term whose positions exceed the
+  // window goes in merged-doc windows: one pass collects every doc and tf,
+  // then each window [lo, hi) of merged docs whose positions fit walks the
+  // sources' postings again and copies only its docs' positions, straight
+  // into slots laid out from the known tfs.
+  struct ReorderedPostings {
+    struct Source {
+      TermsEnum::PostingsState state;
+      const Segment* seg;
+    };
+    std::vector<Source> sources;
+    std::vector<int32_t> docs;
+    std::vector<int32_t> tfs;
+    std::vector<int64_t> posStarts;  // by entry, into deltas
+    std::vector<int32_t> deltas;
+    std::vector<uint64_t> keys;      // merged doc << 32 | entry
+    std::vector<uint64_t> scratch;   // radix sort buffer
+    int64_t windowPositions;
+    int32_t maxDoc;
+    // Test seam totals: windowed terms, windows, and the most positions held.
+    int64_t windowedTerms = 0;
+    int64_t windows = 0;
+    int64_t peakPositions = 0;
+
+    ReorderedPostings(int64_t windowPositions, int32_t maxDoc)
+        : windowPositions(std::max<int64_t>(1, windowPositions)), maxDoc(maxDoc) {}
+
+    void add(int32_t doc, int32_t tf) {
+      keys.push_back((uint64_t)(uint32_t)doc << 32 | (uint32_t)docs.size());
+      docs.push_back(doc);
+      tfs.push_back(tf);
+    }
+
+    void reserve(int64_t docFreq) {
+      docs.reserve((size_t)docFreq);
+      tfs.reserve((size_t)docFreq);
+      keys.reserve((size_t)docFreq);
+    }
+
+    // Keys sort by merged doc, unique within a term. Large terms take an LSD
+    // radix sort over the doc bits, small ones a plain sort.
+    void sortKeys() {
+      if (keys.size() < 256) {
+        std::sort(keys.begin(), keys.end());
+        return;
+      }
+      int docBits = std::bit_width((uint32_t)maxDoc);
+      scratch.resize(keys.size());
+      for (int shift = 32; shift < 32 + docBits; shift += 8) {
+        std::array<size_t, 257> counts{};
+        for (uint64_t key : keys) counts[((key >> shift) & 0xFF) + 1]++;
+        for (size_t i = 0; i < 256; i++) counts[i + 1] += counts[i];
+        for (uint64_t key : keys) scratch[counts[(key >> shift) & 0xFF]++] = key;
+        keys.swap(scratch);
+      }
+    }
+
+    static uint32_t entryOf(uint64_t key) { return (uint32_t)key; }
+
+    template<DocsEnumTier Tier>
+    void gatherDocs(BasicDocsEnum<Tier>& docsEnum, const Segment& seg) {
+      for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
+        int32_t mapped = seg.remap[(size_t)doc];
+        if (mapped != -1) add(mapped, docsEnum.termFreq());
+      }
+    }
+
+    // Copies one source's positions of the docs in [lo, hi) into their
+    // slots; entry numbers follow the gather order.
+    void copyPositions(const Source& source, uint32_t& entry, int32_t lo, int32_t hi) {
+      DocsPosEnum docsEnum(source.state);
+      PosEnum positions(docsEnum);
+      for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
+        int32_t mapped = source.seg->remap[(size_t)doc];
+        if (mapped == -1) continue;
+        uint32_t index = entry++;
+        if (mapped < lo || mapped >= hi) continue;
+        int32_t* out = deltas.data() + posStarts[index];
+        positions.startPositions();
+        for (;;) {
+          auto span = positions.nextPositionDeltaSpan();
+          if (span.empty()) break;
+          out = std::copy(span.begin(), span.end(), out);
+        }
+        assert(out == deltas.data() + posStarts[index] + tfs[index]);
+      }
+    }
+
+    void writeDocs(TextWriter& textWriter) {
+      sortKeys();
+      for (uint64_t key : keys) {
+        uint32_t i = entryOf(key);
+        textWriter.addDoc(docs[i], tfs[i]);
+      }
+    }
+
+    void writePositions(TextWriter& textWriter) {
+      int64_t df = 0;
+      int64_t ttf = 0;
+      for (const auto& source : sources) {
+        df += source.state.docFreq;
+        ttf += source.state.totalTermFreq;
+      }
+      reserve(df);
+      posStarts.reserve((size_t)df);
+      if (ttf <= windowPositions) {
+        // One pass: positions travel with their doc.
+        deltas.reserve((size_t)ttf);
+        for (const auto& source : sources) gatherWithPositions(source);
+        peakPositions = std::max(peakPositions, (int64_t)deltas.size());
+        sortKeys();
+        for (uint64_t key : keys) writePositionsDoc(textWriter, entryOf(key));
+        return;
+      }
+      windowedTerms++;
+      for (const auto& source : sources) {
+        DocsPosEnum docsEnum(source.state);
+        gatherDocs(docsEnum, *source.seg);
+      }
+      sortKeys();
+      posStarts.resize(docs.size());
+      for (size_t at = 0; at < keys.size();) {
+        // The window: the next docs in merged order whose positions fit
+        // (always at least one doc). Only its entries get slots.
+        size_t end = at;
+        int64_t positions = 0;
+        while (end < keys.size()) {
+          int32_t tf = tfs[entryOf(keys[end])];
+          if (end > at && positions + tf > windowPositions) break;
+          posStarts[entryOf(keys[end])] = positions;
+          positions += tf;
+          end++;
+        }
+        int32_t lo = docs[entryOf(keys[at])];
+        int32_t hi = docs[entryOf(keys[end - 1])] + 1;
+        deltas.resize((size_t)positions);
+        uint32_t entry = 0;
+        for (const auto& source : sources) copyPositions(source, entry, lo, hi);
+        assert(entry == docs.size());
+        windows++;
+        peakPositions = std::max(peakPositions, positions);
+        for (size_t k = at; k < end; k++) writePositionsDoc(textWriter, entryOf(keys[k]));
+        at = end;
+      }
+    }
+
+    void gatherWithPositions(const Source& source) {
+      DocsPosEnum docsEnum(source.state);
+      PosEnum positions(docsEnum);
+      for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
+        int32_t mapped = source.seg->remap[(size_t)doc];
+        if (mapped == -1) continue;
+        add(mapped, docsEnum.termFreq());
+        posStarts.push_back((int64_t)deltas.size());
+        positions.startPositions();
+        for (;;) {
+          auto span = positions.nextPositionDeltaSpan();
+          if (span.empty()) break;
+          deltas.insert(deltas.end(), span.begin(), span.end());
+        }
+      }
+    }
+
+    void writePositionsDoc(TextWriter& textWriter, uint32_t i) {
+      textWriter.startDoc(docs[i]);
+      textWriter.appendPositionDeltas(std::span<const int32_t>(
+          deltas.data() + posStarts[i], (size_t)tfs[i]));
+      textWriter.endDoc(docs[i], tfs[i]);
+    }
+
+    template<DocsEnumTier Tier>
+    void write(TextWriter& textWriter) {
+      if constexpr (Tier == DocsEnumTier::POSITIONS) {
+        writePositions(textWriter);
+      } else {
+        writeDocs(textWriter);
+      }
+      // Ordinary terms keep their capacity; a large term's buffers go back.
+      constexpr size_t RETAIN_ENTRIES = 1 << 16;
+      bool release = keys.capacity() > RETAIN_ENTRIES || deltas.capacity() > 4 * RETAIN_ENTRIES;
+      auto reset = [release](auto& v) {
+        if (release) v = {};
+        else v.clear();
+      };
+      reset(docs);
+      reset(tfs);
+      reset(keys);
+      reset(scratch);
+      reset(posStarts);
+      reset(deltas);
+      sources.clear();
+    }
+  };
+
   struct NoTermHook {
     void operator()() const {}
   };
@@ -1218,6 +1625,7 @@ private:
     };
     IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenumPtrs);
 
+    ReorderedPostings reordered(reorderPositionsWindowBytes / 4, postingsWriter.getMaxDoc());
     char termBuf[PackedTerm::MAX_BYTES];
     while (termPQ.size() > 0) {
       TermsEnumIdx& first = termPQ.top();
@@ -1228,24 +1636,48 @@ private:
 
       do {
         TermsEnumIdx& entry = termPQ.top();
-        BasicDocsEnum<Tier> docsEnum(entry.tenum);
-        if constexpr (Tier == DocsEnumTier::DOCS) {
-          if constexpr (Array) {
-            (*ordMaps)[entry.idx][(size_t)entry.tenum.ord() + 1] = (uint32_t)termOrd;
-            const auto& seg = *compactFields[entry.idx]->seg;
+        if (reorder) {
+          // Ords for one doc still arrive in increasing term order, so the
+          // collectors take them as they come; only the postings wait.
+          // Positions are read once every source's docs are known.
+          const Segment& seg = *compactFields[entry.idx]->seg;
+          if constexpr (Tier == DocsEnumTier::POSITIONS) {
+            reordered.sources.push_back({entry.tenum.postingsState(), &seg});
+          } else if constexpr (Tier == DocsEnumTier::DOCS) {
+            BasicDocsEnum<Tier> docsEnum(entry.tenum);
+            if constexpr (Array) {
+              (*ordMaps)[entry.idx][(size_t)entry.tenum.ord() + 1] = (uint32_t)termOrd;
+            }
             for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
-              auto [mapped, deleted] = seg.remapDocId(doc);
-              if (!deleted) textWriter.addDoc(mapped, 1);
+              int32_t mapped = seg.remap[(size_t)doc];
+              if (mapped == -1) continue;
+              if constexpr (!Array) ordCollector->add(mapped, (uint32_t)termOrd);
+              reordered.add(mapped, 1);
             }
           } else {
-            assert(ordCollector != nullptr);
-            addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
-                        *ordCollector, termOrd);
+            BasicDocsEnum<Tier> docsEnum(entry.tenum);
+            reordered.gatherDocs(docsEnum, seg);
           }
-        } else if constexpr (Tier == DocsEnumTier::FREQS) {
-          addDocsFreq(textWriter, docsEnum, *compactFields[entry.idx]->seg);
         } else {
-          addDocsPos(textWriter, docsEnum, *compactFields[entry.idx]->seg);
+          BasicDocsEnum<Tier> docsEnum(entry.tenum);
+          if constexpr (Tier == DocsEnumTier::DOCS) {
+            if constexpr (Array) {
+              (*ordMaps)[entry.idx][(size_t)entry.tenum.ord() + 1] = (uint32_t)termOrd;
+              const auto& seg = *compactFields[entry.idx]->seg;
+              for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
+                auto [mapped, deleted] = seg.remapDocId(doc);
+                if (!deleted) textWriter.addDoc(mapped, 1);
+              }
+            } else {
+              assert(ordCollector != nullptr);
+              addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
+                          *ordCollector, termOrd);
+            }
+          } else if constexpr (Tier == DocsEnumTier::FREQS) {
+            addDocsFreq(textWriter, docsEnum, *compactFields[entry.idx]->seg);
+          } else {
+            addDocsPos(textWriter, docsEnum, *compactFields[entry.idx]->seg);
+          }
         }
 
         bool next = entry.tenum.nextTerm();
@@ -1258,8 +1690,14 @@ private:
       } while (termPQ.size() > 0 && termPQ.top().key == termKey &&
                termPQ.top().tenum.term() == term);
 
+      if (reorder) reordered.write<Tier>(textWriter);
       textWriter.endTerm(term);
       onTerm();
+    }
+    if (reorder && reordered.windowedTerms > 0) {
+      // Test seam: windowed terms, windows, and the most positions held.
+      std::array<int64_t, 3> stats = {reordered.windowedTerms, reordered.windows, reordered.peakPositions};
+      Signal::emit("mergeReorderPositionWindows", &stats);
     }
   }
 
@@ -1362,6 +1800,62 @@ private:
     }
   };
 
+  // MergedArrayOrds under a reorder: random access by merged doc through each
+  // source column's value rank, recorded in one walk per source.
+  class ReorderedArrayOrds {
+    struct Source {
+      OrdColReader column;
+      const std::vector<uint32_t>& map;
+      Source(PostingsReader& reader, const SegFieldInfo& info, const std::vector<uint32_t>& map)
+          : column(reader, info), map(map) {}
+    };
+    std::vector<std::unique_ptr<Source>> sources;  // by source ord; null without the field
+    const std::vector<uint64_t>& newToOld;
+    std::vector<int32_t> ranks;  // by merged doc: its source value rank, -1 without values
+    int32_t docCount = 0;
+    bool multi = false;
+
+  public:
+    ReorderedArrayOrds(std::span<MergeFieldInfo*> fields,
+                       const std::vector<std::vector<uint32_t>>& maps,
+                       const std::vector<uint64_t>& newToOld, size_t sourceCount, int32_t maxDoc)
+        : sources(sourceCount), newToOld(newToOld), ranks((size_t)maxDoc, -1) {
+      for (size_t idx = 0; idx < fields.size(); idx++) {
+        auto* field = fields[idx];
+        auto& source = sources[(size_t)field->seg->ord];
+        source = std::make_unique<Source>(*field->seg->postingsReader, field->segFieldInfo, maps[idx]);
+        OrdColReader::Iterator docs(source->column);
+        for (int32_t doc = docs.next(); doc != OrdColReader::ENDDOC; doc = docs.next()) {
+          int32_t mapped = field->seg->remap[(size_t)doc];
+          if (mapped < 0) continue;
+          ranks[(size_t)mapped] = docs.rank();
+          docCount++;
+          if (source->column.multiValued() && !multi) {
+            auto [start, end] = source->column.getStartEndValueRank(docs.rank());
+            multi = end - start > 1;
+          }
+        }
+      }
+    }
+    int32_t size() const { return (int32_t)ranks.size(); }
+    int32_t docsWithValue() const { return docCount; }
+    bool multiValued() const { return multi; }
+    bool hasValues(int32_t doc) const { return ranks[(size_t)doc] >= 0; }
+    void pushValues(int32_t doc, auto&& acceptor) const {
+      int32_t rank = ranks[(size_t)doc];
+      if (rank < 0) return;
+      const Source& source = *sources[sourceOf(newToOld[(size_t)doc])];
+      OrdColReader::PointOrds ords(source.column);
+      if (!source.column.multiValued()) {
+        int64_t index = source.column.docIdIndexed() ? localOf(newToOld[(size_t)doc]) : rank;
+        acceptor(source.map[(size_t)ords.valueAt(index)]);
+      } else {
+        auto [start, end] = source.column.getStartEndValueRank(rank);
+        for (int64_t r = start; r < end; r++) acceptor(source.map[(size_t)ords.valueAt(r)]);
+      }
+    }
+  };
+
   // ARRAY columns cannot be reconstructed from DOCS-only postings. Keep their
   // term map/replay workspace and walks out of the SET merge instantiation.
   void LUXIR_NOINLINE mergeArrayOrdColumn(
@@ -1375,6 +1869,12 @@ private:
         std::nullopt, std::nullopt, pool, &ordMaps);
     textWriter.endField();
 
+    if (reorder) {
+      ReorderedArrayOrds ords(fields, ordMaps, newToOld, segs.size(), postingsWriter.getMaxDoc());
+      BasicOrdColWriter<ReorderedArrayOrds> writer(pool, postingsWriter, output, ords);
+      writer.finish();
+      return;
+    }
     MergedArrayOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
     BasicOrdColWriter<MergedArrayOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
@@ -1456,6 +1956,17 @@ private:
       for (const auto& output : outputs) planBytes += output->plan.bytes;
       int64_t rangeCost =
           MergeCostModel::termRangeWorkingBytes((int64_t) compactFields.size());
+      if (merger.reorder) {
+        int64_t docsWithField = 0;
+        int64_t totalTermFreq = 0;
+        for (const auto* field : compactFields) {
+          docsWithField += field->segFieldInfo.docsWithField;
+          totalTermFreq += field->segFieldInfo.sumTotalTermFreq;
+        }
+        rangeCost += MergeCostModel::reorderTermBytes(
+            std::min(docsWithField, (int64_t)merger.postingsWriter.getMaxDoc()), totalTermFreq,
+            FieldType::hasPositions(flags), reorderPositionsWindowBytes);
+      }
       for (size_t i = 0; i < outputs.size(); i++) {
         MergeAdmissionDriver::Batch batch;
         batch.cost = rangeCost;
@@ -1888,6 +2399,141 @@ private:
     return storedDictionaries.lookup(resource, format);
   }
 
+  // mergeStoredFields under a reorder. A source whose live docs land on one
+  // increasing run of merged ids is emitted in place when the walk reaches
+  // the run: copied as compressed chunks when it qualifies like a
+  // concatenating merge's source, else re-added reading its chunks in order.
+  // Every other source is decoded once, chunk by chunk in local order, into
+  // scratch (its encoded docs, RAM up to a limit and then an unlinked temp
+  // file), and its docs re-add from there as the walk meets them. One reader
+  // is open at a time.
+  void mergeStoredFieldsReordered(std::string_view resourceName,
+                                  std::span<const PostingsReader::Field* const> fieldInfos,
+                                  StoredFieldsWriter& writer) {
+    enum class Plan : uint8_t { NONE, COPY, IN_ORDER, SCRATCH };
+    struct Source {
+      Plan plan = Plan::NONE;
+      int32_t first = -1;  // merged id of the first live doc
+      std::span<const std::string_view> fieldNames;
+    };
+    std::vector<Source> sources(segs.size());
+    for (auto& seg : segs) {
+      if (fieldInfos[seg.ord] == nullptr || seg.numLive == 0) continue;
+      Source& source = sources[(size_t)seg.ord];
+      int32_t expected = -1;
+      bool run = true;
+      for (int32_t mapped : seg.remap) {
+        if (mapped < 0) continue;
+        if (expected < 0) source.first = mapped;
+        else if (mapped != expected) run = false;
+        expected = mapped + 1;
+      }
+      source.plan = run ? Plan::IN_ORDER : Plan::SCRATCH;
+    }
+
+    // Copy candidates, the largest chunk region's field table adopted first
+    // as in the concatenating merge.
+    auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
+      return !seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && !StoredFieldsWriter::tooDirty(reader.numChunks(), reader.numDirtyChunks())
+          && writer.canCopyChunks(reader.format(), reader.dictionary());
+    };
+    int bestSource = -1;
+    int64_t bestBytes = 0;
+    for (auto& seg : segs) {
+      if (sources[(size_t)seg.ord].plan != Plan::IN_ORDER) continue;
+      StoredFieldsReader reader(*seg.postingsReader, *fieldInfos[seg.ord]);
+      if (copyable(seg, reader) && reader.chunkRegionBytes() > bestBytes) {
+        bestSource = seg.ord;
+        bestBytes = reader.chunkRegionBytes();
+      }
+    }
+    if (bestSource >= 0) {
+      StoredFieldsReader reader(*segs[bestSource].postingsReader, *fieldInfos[bestSource]);
+      writer.adoptFieldTable(reader.fieldNames());
+    }
+
+    // Scratch: one sequential pass per out-of-order source.
+    int32_t maxDoc = postingsWriter.getMaxDoc();
+    ScratchBytes scratch(postingsWriter.getDirectory().scratchPath(), (size_t)reorderStoredRamBytes);
+    std::vector<int64_t> scratchOffsets;
+    for (auto& seg : segs) {
+      Source& source = sources[(size_t)seg.ord];
+      if (source.plan != Plan::SCRATCH) continue;
+      if (scratchOffsets.empty()) scratchOffsets.assign((size_t)maxDoc, -1);
+      StoredFieldsReader reader(*seg.postingsReader, *fieldInfos[seg.ord]);
+      source.fieldNames = reader.fieldNames();  // lives as long as the PostingsReader
+      for (int32_t chunk = 0; chunk < reader.numChunks(); chunk++) {
+        reader.readChunkDocs(chunk, [&](int32_t doc, std::string_view encoded) {
+          int32_t mapped = seg.remap[(size_t)doc];
+          if (mapped < 0) return true;
+          uint32_t length = (uint32_t)encoded.size();
+          scratchOffsets[(size_t)mapped] = (int64_t)scratch.append(
+              std::string_view((const char*)&length, sizeof(length)));
+          scratch.append(encoded);
+          return true;
+        });
+      }
+    }
+    scratch.finish();
+    std::string_view resource = resourceName;
+    bool spilled = scratch.spilled();
+    Signal::emit("storedFieldsReorderScratch", &resource, &spilled);
+
+    auto add = [&](int32_t mappedDoc) {
+      return [&writer, mappedDoc](std::string_view name, std::span<const std::string_view> values) {
+        if (values.size() == 1) {
+          writer.addValue(mappedDoc, name, values[0]);
+        } else {
+          writer.addValues(mappedDoc, name, values);
+        }
+      };
+    };
+    std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
+    std::vector<std::string_view> valueScratch;
+    std::unique_ptr<StoredFieldsReader> inOrder;  // the in-order source being emitted
+    for (int32_t n = 0; n < maxDoc; n++) {
+      Segment& seg = segs[sourceOf(newToOld[(size_t)n])];
+      int32_t local = localOf(newToOld[(size_t)n]);
+      Source& source = sources[(size_t)seg.ord];
+      switch (source.plan) {
+        case Plan::NONE:  // no stored fields; the writer pads
+        case Plan::COPY:
+          break;
+        case Plan::SCRATCH: {
+          int64_t offset = scratchOffsets[(size_t)n];
+          uint32_t length;
+          std::memcpy(&length, scratch.view((uint64_t)offset, sizeof(length)).data(), sizeof(length));
+          StoredFieldsReader::decodeDoc(scratch.view((uint64_t)offset + sizeof(length), length),
+                                        source.fieldNames, valueScratch, add(n));
+          break;
+        }
+        case Plan::IN_ORDER: {
+          if (n == source.first) {
+            inOrder = std::make_unique<StoredFieldsReader>(*seg.postingsReader, *fieldInfos[seg.ord]);
+            bool copy = copyable(seg, *inOrder) && writer.adoptFieldTable(inOrder->fieldNames());
+            Signal::emit("storedFieldsMergeSource", &resourceName, &seg.ord, &copy);
+            if (copy) {
+              // No deletes: the source's docs are merged ids [first, first + maxDoc).
+              writer.alignForRawAppend(n);
+              inOrder->readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
+              writer.appendRawChunkRegion(n, inOrder->chunkRegionPtr(), inOrder->chunkRegionBytes(),
+                                          srcChunkFirstDocs, srcChunkOffsets, inOrder->maxDoc(),
+                                          inOrder->maxChunkBytes(), inOrder->numDirtyChunks());
+              source.plan = Plan::COPY;
+              inOrder.reset();
+              break;
+            }
+          }
+          inOrder->readDoc(local, add(n));
+          if (n == source.first + seg.numLive - 1) inOrder.reset();
+          break;
+        }
+      }
+    }
+    writer.finish(maxDoc);
+  }
+
   // Merge one stored-fields resource (default or named column family).
   // Writes a fresh StoredFieldsWriter for the same resource name in the
   // resource's current format. Sources in that layout within the dirt threshold
@@ -1915,6 +2561,11 @@ private:
     StoredFieldsWriter writer(postingsWriter, resourceName, format,
                               storedDictionary(resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
+
+    if (reorder) {
+      mergeStoredFieldsReordered(resourceName, fieldInfos, writer);
+      return;
+    }
 
     auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
       return !seg.hasDeletes() && reader.format().sameLayout(writer.format())
@@ -2071,9 +2722,52 @@ private:
       totalValues++;
     };
 
-    // Process segments in order - since doc remapping is monotonic,
-    // we can simply iterate through each segment sequentially.
-    for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
+    // Under a reorder, record each merged doc's source value rank in one walk
+    // per source, then emit in merged order by random access.
+    if (reorder) {
+      int32_t maxDoc = postingsWriter.getMaxDoc();
+      std::vector<std::unique_ptr<StrColReader>> readers(segs.size());
+      std::vector<int32_t> ranks((size_t)maxDoc, -1);
+      int32_t withValue = 0;
+      for (auto* field : sortedFields) {
+        if (field == nullptr) continue;
+        auto& reader = readers[(size_t)field->seg->ord];
+        reader = std::make_unique<StrColReader>(*field->seg->postingsReader, field->segFieldInfo);
+        StrColReader::Iterator iter(*reader);
+        for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC;
+             localId = iter.next()) {
+          int32_t mapped = field->seg->remap[(size_t)localId];
+          if (mapped < 0) continue;
+          ranks[(size_t)mapped] = iter.rank();
+          withValue++;
+        }
+      }
+      if (withValue < maxDoc) {
+        docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
+      }
+      for (int32_t doc = 0; doc < maxDoc; doc++) {
+        int32_t rank = ranks[(size_t)doc];
+        if (rank < 0) continue;
+        const StrColReader& reader = *readers[sourceOf(newToOld[(size_t)doc])];
+        if (multiValued) {
+          auto [startValueRank, endValueRank] = reader.isMultiValued()
+              ? reader.getStartEndValueRank(rank) : std::pair<int64_t, int64_t>(rank, rank + 1);
+          for (int64_t r = startValueRank; r < endValueRank; r++) {
+            emitValue(reader.valueAt(r));
+            if (valDocWriter) valDocWriter->addInt64(doc);
+          }
+          endValueRankWriter->addInt64(totalValues);
+        } else {
+          emitValue(reader.singleValueAt(rank));
+        }
+        if (docsWriter) docsWriter->startDoc(doc);
+        docsWithField++;
+      }
+    }
+
+    // Without a reorder (emitted above) doc remapping is monotonic, so we
+    // can simply iterate through each segment sequentially.
+    for (size_t segnum = 0; segnum < sortedFields.size() && !reorder; segnum++) {
       auto* field = sortedFields[segnum];
       auto& seg = segs[segnum];
 
@@ -2210,17 +2904,42 @@ private:
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     auto poolGuard = MemPool::threadLocalPoolGuard();
     MemPool& pool = poolGuard.pool();
-    std::vector<PointRun> runs;
-    runs.reserve(sortedFields.size());
-    for (MergeFieldInfo* field : sortedFields) {
-      if (field == nullptr) continue;
+    auto makeRun = [&](MergeFieldInfo* field) {
       if (field->segFieldInfo.pointsMetaOff != 0) {
         auto* reader = pool.make<PointsReader>(
             *field->seg->postingsReader, field->segFieldInfo);
-        runs.emplace_back(*field->seg, *reader, pool);
-      } else {
-        runs.emplace_back(*field->seg, synthesizePointRun(*field));
+        return PointRun(*field->seg, *reader, pool);
       }
+      return PointRun(*field->seg, synthesizePointRun(*field));
+    };
+
+    if (reorder) {
+      // Mapped doc ids no longer keep each run in (value, docid) order: pool
+      // every point and sort once. Runs drain one at a time, so only one
+      // synthesized run is held beside the pool.
+      std::vector<MergePoint> points;
+      points.reserve((size_t)outputFieldInfo.numValues);
+      for (MergeFieldInfo* field : sortedFields) {
+        if (field == nullptr) continue;
+        PointRun run = makeRun(field);
+        while (run.next()) points.push_back(run.point());
+      }
+      if (points.empty()) return;
+      sortPointsByValueDocid(std::span<MergePoint>(points));
+      auto output = postingsWriter.getOutputStream();
+      PointsWriter writer(*output, PointsWriter::Options{});
+      for (const MergePoint& point : points) writer.addPoint(point.value, point.docid);
+      auto data = writer.finish();
+      assert(data.pointCount == (uint64_t)outputFieldInfo.numValues);
+      outputFieldInfo.pointsLoc = data.pointsLoc;
+      outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
+      return;
+    }
+
+    std::vector<PointRun> runs;
+    runs.reserve(sortedFields.size());
+    for (MergeFieldInfo* field : sortedFields) {
+      if (field != nullptr) runs.push_back(makeRun(field));
     }
 
     std::vector<PointRun*> active;
@@ -2277,7 +2996,61 @@ private:
     int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
     [[maybe_unused]] int32_t docsWithField = 0;
 
-    for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
+    auto emitValue = [&](int64_t val, int32_t mappedDoc) {
+      intColWriter->addInt64(val);
+      if (geoPoints != nullptr) {
+        geoPoints->push_back({geo::unpackLatitude(val), geo::unpackLongitude(val), mappedDoc});
+      }
+    };
+
+    // Under a reorder, record each merged doc's source value rank in one walk
+    // per source, then emit in merged order by random access. Writing values
+    // in key order is what makes the column zones (and, for geo, the rebuilt
+    // BKD's leaf doc ids) tight.
+    if (reorder) {
+      int32_t maxDoc = postingsWriter.getMaxDoc();
+      std::vector<IntColReader*> readers(segs.size(), nullptr);
+      std::vector<std::unique_ptr<IntColReader::SparseValues>> values(segs.size());
+      std::vector<int32_t> ranks((size_t)maxDoc, -1);
+      int32_t withValue = 0;
+      for (auto* field : sortedFields) {
+        if (field == nullptr) continue;
+        size_t source = (size_t)field->seg->ord;
+        readers[source] = pool.make_align<IntColReader>(8, *field->seg->postingsReader, field->segFieldInfo);
+        values[source] = std::make_unique<IntColReader::SparseValues>(*readers[source]);
+        IntColReader::Iterator docs(*readers[source]);
+        for (int32_t localId = docs.next(); localId != IntColReader::ENDDOC; localId = docs.next()) {
+          int32_t mapped = field->seg->remap[(size_t)localId];
+          if (mapped < 0) continue;
+          ranks[(size_t)mapped] = docs.rank();
+          withValue++;
+        }
+      }
+      if (withValue < maxDoc) {
+        docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
+      }
+      int64_t endValueRank = 0;
+      for (int32_t doc = 0; doc < maxDoc; doc++) {
+        int32_t rank = ranks[(size_t)doc];
+        if (rank < 0) continue;
+        size_t source = sourceOf(newToOld[(size_t)doc]);
+        IntColReader& reader = *readers[source];
+        IntColReader::SparseValues& sourceValues = *values[source];
+        if (docsWriter) docsWriter->startDoc(doc);
+        docsWithField++;
+        if (!endValueRankWriter) {
+          emitValue(sourceValues.valueAt(rank), doc);
+          continue;
+        }
+        auto [start, end] = reader.multiValued() ? reader.getStartEndValueRank(rank)
+                                                 : std::pair<int64_t, int64_t>(rank, rank + 1);
+        for (int64_t r = start; r < end; r++) emitValue(sourceValues.valueAt(r), doc);
+        endValueRank += end - start;
+        endValueRankWriter->addInt64(endValueRank);
+      }
+    }
+
+    for (size_t segnum = 0; segnum < sortedFields.size() && !reorder; segnum++) {
       auto* field = sortedFields[segnum];
       auto& seg = segs[segnum];
       auto base = seg.base;

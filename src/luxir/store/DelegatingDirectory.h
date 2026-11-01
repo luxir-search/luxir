@@ -12,7 +12,7 @@ namespace luxir {
 ///
 /// Forwarding is total, including the createFile overload with options,
 /// expectSynced, knownFiles, deletePrefix, sync, underlying, linkFile,
-/// openChecksum, clear and capabilities. A wrapper that must not let a new virtual through (see
+/// openChecksum, clear, capabilities and scratchPath. A wrapper that must not let a new virtual through (see
 /// ReadOnlyDirectory) overrides it explicitly.
 class DelegatingDirectory : public Directory {
 protected:
@@ -43,6 +43,7 @@ public:
     return delegate->openChecksum(name, direct);
   }
   Capabilities capabilities() const override { return delegate->capabilities(); }
+  std::string scratchPath() const override { return delegate->scratchPath(); }
 };
 
 

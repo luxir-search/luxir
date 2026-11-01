@@ -114,6 +114,8 @@ public:
   ~ObjectStoreDirectory() override;
 
   Capabilities capabilities() const override { return REMOTE | ATOMIC_RENAME | DURABLE_SYNC; }
+  // Staged writes already spill here; without a staging dir they stage in RAM.
+  std::string scratchPath() const override { return options.stagingDir; }
   ObjectStore& objects() { return *store; }
   const std::string& keyPrefix() const { return prefix; }
 
