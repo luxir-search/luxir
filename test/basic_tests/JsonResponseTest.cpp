@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
+#include <limits>
 #include <string>
 
 #include "luxir/server/JsonResponse.h"
@@ -186,6 +188,49 @@ TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
       renderOperations(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, floatingFacetIdsPreserveSignedZeroAndSelection) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "negative", "price_f", -0.0f, "price_d", -0.0),
+    flatdoc("id", "positive", "price_f", 0.0f, "price_d", 0.0),
+    flatdoc("id", "infinite", "price_f", std::numeric_limits<float>::infinity(),
+            "price_d", std::numeric_limits<double>::infinity()),
+  }, UpdateMessage::COMMIT).success);
+
+  for (const char* field : {"price_f", "price_d"}) {
+    SCOPED_TRACE(field);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").facet("f", field).limit(-1);
+    req->execute(false);
+    ASSERT_OK(req);
+    auto body = renderOperations(req->responses[0]->proto);
+    EXPECT_EQ(
+        R"({"ops":{"f":{"buckets":[{"val":-0.0,"count":1},{"val":0.0,"count":1},{"val":null,"count":1}]}}})",
+        body);
+
+    auto start = body.find("-0.0");
+    ASSERT_NE(std::string::npos, start);
+    auto selected = localReq(helper.getSearchEngine());
+    parseQueryRequest(std::string(R"({"query":"*:*","limit":10,"count_limit":-1,"fields":["id"],"ops":{
+        "f":{"field_facet":{"field":")") + field + R"(","selected":)"
+        + body.substr(start, 4) + "}}}}", selected->rawRequest(), selected->mr);
+    selected->collection("main");
+    selected->execute(false);
+    ASSERT_OK(selected);
+    EXPECT_EQ(1, selected->getMatchCount());
+    EXPECT_CONTAINS_DOC(selected->getDocs(), flatdoc("id", "negative"));
+    const auto& facet = *selected->docList()->ops.at("f")->facetResult();
+    std::visit([](const auto& ids) {
+      using T = std::decay_t<decltype(ids)>;
+      if constexpr (std::is_same_v<T, api::ColFloat> || std::is_same_v<T, api::ColDouble>) {
+        ASSERT_EQ(3u, ids.v.size());
+        EXPECT_TRUE(std::signbit(ids.v[0]));
+        EXPECT_FALSE(std::signbit(ids.v[1]));
+      } else FAIL() << "expected floating bucket IDs";
+    }, facet.bucket_ids->kind);
+  }
+}
+
 TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -224,7 +269,7 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseFloatingBounds) {
     ASSERT_OK(req);
 
     EXPECT_EQ(
-        R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0],"count":1},{"val":[0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
+        R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0.0],"count":1},{"val":[0.0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
         renderOperations(req->responses[0]->proto));
   }
 }
@@ -290,7 +335,7 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   req->execute(false);
   ASSERT_OK(req);
 
-  EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})",
+  EXPECT_EQ(R"({"ops":{"average":20.0,"empty":null,"empty_sum":null,"total":40}})",
             renderOperations(req->responses[0]->proto));
 }
 

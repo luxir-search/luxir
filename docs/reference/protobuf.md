@@ -704,7 +704,7 @@ Engine work that reached this collection since it was opened. The node's Service
 
 ### luxir.Column
 
-One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector and value columns use the missing-value rules described on their fields. Every returned field type has a column form: a type with no typed arm uses col\_val.
+One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector and value columns use the missing-value rules described on their fields. Every returned field type has a column form: a type with no typed arm uses col\_val. In FacetResult.bucket\_ids, every value is present and missing\_val is ignored.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1010,7 +1010,7 @@ An expression in the Luxir query language, with strict syntax and precise parse 
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.facetresult.bucket_ids"></a>[`bucket_ids`](#field-luxir.facetresult.bucket_ids) | 2 | [`Column`](#message-luxir.column) | singular |  |
+| <a id="field-luxir.facetresult.bucket_ids"></a>[`bucket_ids`](#field-luxir.facetresult.bucket_ids) | 2 | [`Column`](#message-luxir.column) | singular | Always-present bucket labels; Column.missing\_val sentinels do not apply. |
 | <a id="field-luxir.facetresult.counts"></a>[`counts`](#field-luxir.facetresult.counts) | 3 | `int64` | repeated |  |
 | <a id="field-luxir.facetresult.missing"></a>[`missing`](#field-luxir.facetresult.missing) | 4 | `int64` | optional | the number of documents that do not have this field |
 | <a id="field-luxir.facetresult.ops"></a>[`ops`](#field-luxir.facetresult.ops) | 22 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | sub-operation results performed per bucket, like a sub-facet or statistics. |
@@ -1067,7 +1067,7 @@ Default representations for bare field names. Each binding names "self" or a loc
 
 ### luxir.FieldFacet
 
-Buckets of distinct field values, using the field's value binding. STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support counts, limits, mincount, missing, and selections.
+Buckets of distinct field values, using the field's value binding. STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount, missing, selections, sub-operations, and metric sorts. Distinct counts are supported except on TEXT; metric sorts with distinct counts are unsupported.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1075,7 +1075,7 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 |---|---|---|---|---|
 | <a id="field-luxir.fieldfacet.field"></a>[`field`](#field-luxir.fieldfacet.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.fieldfacet.limit"></a>[`limit`](#field-luxir.fieldfacet.limit) | 2 | `sint64` | optional | Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all. Selected buckets outside the ordinary page are appended after it. |
-| <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE require a positive value when set. |
+| <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE/FLOAT/DOUBLE require a positive value when set. |
 | <a id="field-luxir.fieldfacet.missing"></a>[`missing`](#field-luxir.fieldfacet.missing) | 4 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.fieldfacet.sort"></a>[`sort`](#field-luxir.fieldfacet.sort) | 5 | [`SortSpec`](#message-luxir.sortspec) | repeated | One metric sub-operation name. Unset sorts by count descending, then bucket value ascending. |
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
