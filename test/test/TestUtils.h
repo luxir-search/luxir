@@ -11,6 +11,7 @@
 #include "LuxirTest.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/VectorEngine.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/util/Overloaded.h"
@@ -48,17 +49,19 @@ template <class... Values>
 SearchOverridesGuard(Values&...) -> SearchOverridesGuard<Values...>;
 
 // Opens the IVF build policy for tiny test corpora (training floor
-// minTraining, no scan-cost threshold). Restores on destruction.
+// minTraining, no scan-cost threshold) and keeps queries on the overlays
+// their tiny vectors would otherwise price as exact. Restores on destruction.
 class IvfTestGuard {
-  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
+  SearchOverridesGuard<int64_t, int64_t, int64_t, bool> saved{
     VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
-    VectorIndexBuilder::ivfBuildThresholdScanCost};
+    VectorIndexBuilder::ivfBuildThresholdScanCost, VectorEngine::costBasedExact};
 
 public:
   explicit IvfTestGuard(int64_t minTraining = 2) {
     VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
     VectorIndexBuilder::ivfRaBitQMinTrainingVectors = minTraining;
     VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
+    VectorEngine::costBasedExact = false;
   }
 };
 

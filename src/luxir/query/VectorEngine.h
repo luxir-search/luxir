@@ -102,6 +102,11 @@ struct VectorSearchResult {
 /// exact scoring. Group identities come from the enclosing CollapsePlan.
 class VectorEngine {
 public:
+  // KnnQuery serves an overlay segment with the exact column engine when its
+  // cost model finds that cheaper (KnnQuery::chooseExactSegments). Off keeps
+  // every overlay on IVF, for tests that exercise IVF on tiny corpora.
+  static inline bool costBasedExact = true;
+
   virtual ~VectorEngine() = default;
 
   virtual VectorSearchResult search(const VectorSearchRequest& request) = 0;

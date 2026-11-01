@@ -950,6 +950,118 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
+// Filtered kNN: auto (the cost-based exact/IVF choice), IVF forced, or exact,
+// at a filter selectivity in permyriad, uncorrelated with the vectors. The
+// mode sweep at one selectivity shows which strategy is cheaper there and
+// whether auto picks it; recall is against the exact filtered top-k. The
+// corpus is synthetic clustered 128-d unless LUXIR_VECTOR_DATASET names a
+// real one (see VectorDataset), whose held-out rows are the queries. The
+// optional scan arg (permille) pins min_scan_fraction, so an IVF sweep finds
+// the effort IVF needs to match a recall under the filter.
+enum FilteredMode { FILTER_AUTO, FILTER_IVF, FILTER_EXACT };
+
+int64_t filterSel(int64_t docId) {
+  SplitMix64 rng((uint64_t)docId * 0x9e3779b97f4a7c15ULL + 0x632be59bd9b4e019ULL);
+  return rng.rint((int64_t)10'000);
+}
+
+void BM_VectorKnnFiltered(benchmark::State& state) {
+  int32_t codec = (int32_t)state.range(0);
+  int64_t permyriad = state.range(1);
+  auto mode = (FilteredMode)state.range(2);
+  float minScanFraction = (float)state.range(3) / 1000.0f;
+  const VectorDataset* ds = luxir::unit_tests ? nullptr : VectorDataset::get();
+  int64_t nDocs = ds ? ds->nBase : luxir::unit_tests ? LuxirTest::scaleTestWork(400) : 500'000;
+  int32_t dims = ds ? ds->dims : luxir::unit_tests ? 16 : 128;
+  int32_t nClusters = luxir::unit_tests ? 8 : 200;
+  int32_t nQueries = ds ? std::min(ds->nQueries, 16) : luxir::unit_tests ? 2 : 16;
+  api::VectorMetric metric = ds ? ds->metric : api::VectorMetric::L2;
+  auto vectorAt = [&](int64_t docId) {
+    return ds ? ds->row(docId) : makeClusteredVector(docId, dims, nClusters);
+  };
+  int32_t k = 10;
+
+  CollectionHelper helper("main");
+  std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs, ds ? ds->segments : 2);
+  static int64_t builtKey = -1;
+  int64_t key = codec * 1'000'000'000LL + nDocs;
+  if (builtKey != key || !helper.indexMatchesShape(docsPerSeg)) {
+    IvfBenchGuard guard;
+    helper.clear();
+    installVectorBenchSchema(helper.collection(), dims, metric, codec);
+    int64_t docId = 0;
+    std::vector<Doc> docs;
+    for (int32_t segDocs : docsPerSeg) {
+      for (int32_t i = 0; i < segDocs; i++, docId++) {
+        docs.push_back(flatdoc("id", "d" + std::to_string(docId),
+                               "bench_v", vectorAt(docId), "sel_i", filterSel(docId)));
+        if (docs.size() == 256) {
+          helper.indexAll(docs);
+          docs.clear();
+        }
+      }
+      if (!docs.empty()) helper.indexAll(docs);
+      docs.clear();
+      helper.commit();
+    }
+    helper.commit({"vec.bench_v"});
+    builtKey = key;
+  }
+
+  auto request = [&](const std::vector<float>& query, bool exact) {
+    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(k).countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "bench_v", query, k, 0, exact, 0,
+                             exact ? 0.0f : minScanFraction);
+    auto& td = std::get<api::TopDocs>(cur.rawOp().kind);
+    auto& mr = cur.mr();
+    api::Filter* filter = api::build::allocArray(td.filter, 1, mr);
+    auto* q = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
+    new (q) api::Query(qb::range(mr, "sel_i", nullptr, nullptr, nullptr, qb::valI64(mr, permyriad)));
+    filter[0].query = q;
+    return req;
+  };
+  auto ids = [&](const std::vector<float>& query, bool exact) {
+    auto* req = request(query, exact);
+    req->execute(false);
+    std::vector<std::string> out;
+    std::string error;
+    if (!responseIds(*req, out, error)) state.SkipWithError(error.c_str());
+    req->done();
+    return out;
+  };
+
+  SearchOverridesGuard costGuard(VectorEngine::costBasedExact);
+  VectorEngine::costBasedExact = mode == FILTER_AUTO;
+  std::vector<std::vector<float>> queries;
+  double recallSum = 0;
+  int64_t chosen0 = KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed);
+  int64_t fallbacks0 = KnnQuery::exactFallbacksForTests.load(std::memory_order_relaxed);
+  for (int32_t q = 0; q < nQueries; q++) {
+    queries.push_back(ds ? ds->query(q) : makeClusteredQuery(q, dims, nClusters));
+    auto truth = ids(queries.back(), true);
+    auto got = ids(queries.back(), mode == FILTER_EXACT);
+    int64_t hits = 0;
+    for (const auto& id : got) hits += std::ranges::count(truth, id);
+    recallSum += truth.empty() ? 1.0 : (double)hits / (double)truth.size();
+  }
+  int64_t chosen = KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed) - chosen0;
+  int64_t fallbacks = KnnQuery::exactFallbacksForTests.load(std::memory_order_relaxed) - fallbacks0;
+
+  size_t next = 0;
+  for (auto _ : state) {
+    auto* req = request(queries[next++ % queries.size()], mode == FILTER_EXACT);
+    req->execute(false);
+    req->done();
+  }
+  state.counters["recall"] = recallSum / nQueries;
+  state.counters["exactSegs"] = (double)chosen / nQueries;
+  state.counters["fallbacks"] = (double)fallbacks / nQueries;
+  state.counters["nDocs"] = (double)nDocs;
+  state.counters["dims"] = (double)dims;
+}
+
 }  // namespace
 
 // Real-corpus codec comparison (see BM_VectorAnnDataset); needs
@@ -967,6 +1079,11 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, PQ);
       datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
+
+TUNING_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "mode", "scan"})
+    ->ArgsProduct({{RABITQ1, PQ}, {1, 3, 10, 30, 100, 300, 1000}, {FILTER_AUTO, FILTER_IVF, FILTER_EXACT}, {0}})
+    ->ArgsProduct({{RABITQ1, PQ}, {1, 10, 30, 100, 300}, {FILTER_IVF}, {30, 100, 300, 1000}})
+    ->UseRealTime();
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.
