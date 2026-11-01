@@ -76,6 +76,10 @@ class ScoreCollector {
 
   int64_t hitCount = 0;
   bool countIncomplete = false;
+  // Estimated matches for an unset count_limit; countEstimated is set when
+  // any segment's share was extrapolated from a sample.
+  int64_t estimatedHits = 0;
+  bool countEstimated = false;
 
   float minCompetitiveVal = std::numeric_limits<float>::lowest();
 
@@ -193,6 +197,8 @@ class ScoreCollector {
     // Self-merge would iterate a span that collect() can reallocate out from under us.
     assert(this != &other);
     countIncomplete |= other.countIncomplete;
+    estimatedHits += other.estimatedHits;
+    countEstimated |= other.countEstimated;
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
@@ -940,6 +946,40 @@ inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
     cursor = next;
   }
   assert(builder == nullptr || count == builder->card());
+  return count;
+}
+
+// Count a windowed bulk's matches in [min, max). Later calls may count later,
+// disjoint ranges of the same bulk.
+inline int64_t countMatchesInRange(BulkScorer* bulk, DocSet* filter,
+                                   int32_t min, int32_t max) {
+  assert(bulk != nullptr);
+  int64_t count = 0;
+  int32_t cursor = min;
+  while (cursor != PostingsReader::END && cursor < max) {
+    int32_t next = bulk->countNextWindow(count, nullptr, filter, cursor, max);
+    if (next == PostingsReader::END) {
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
+  }
+  return count;
+}
+
+// Count an unscored pull scorer's matches in [min, max) that filter accepts.
+// Ranges must increase: the scorer only moves forward.
+inline int64_t countMatchesInRange(Query::Scorer* scorer, DocSet* filter,
+                                   int32_t min, int32_t max) {
+  assert(scorer != nullptr);
+  DocSetProbe accepted(filter);
+  int64_t count = 0;
+  int32_t doc = scorer->docId();
+  if (doc < min) doc = scorer->advance(min);
+  while (doc < max) {
+    if (accepted.get(doc)) count++;
+    doc = scorer->next();
+  }
   return count;
 }
 

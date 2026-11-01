@@ -349,7 +349,7 @@ TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   req->topDocs("q").allQuery().fields({"id", "cat_s", "n_i"})
-      .documentFormat(api::DocFormat::ROWS).limit(-1);
+      .documentFormat(api::DocFormat::ROWS).limit(-1).countLimit(0);
   req->execute(false);
   ASSERT_OK(req);
 
@@ -440,7 +440,7 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
+      R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"found":3,"docs":[{"id":"1"},{"id":"2"}]}}})",
       renderOperations(req->responses[0]->proto));
 }
 

@@ -152,7 +152,7 @@ public:
           (int64_t)ranked.size(), [this](int64_t i) { return ranked[(size_t)i]; },
           [](int64_t) { return 0.0f; }, (int64_t)ranked.size(), sop.fields, 0, 0, true, false,
           luxir::api::DocFormat{}, underBucketSlot() ? luxir::DocEmission::FINAL_RESPONSE : luxir::DocEmission::STREAM,
-          {}, false, extraColumns);
+          {}, false, false, extraColumns);
     }
   };
 

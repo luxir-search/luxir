@@ -149,6 +149,9 @@ public:
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
   // ROWS (doc-oriented JSON consumers; row rendering becomes a passthrough).
   luxir::api::DocFormat docFormatDefault = luxir::api::DocFormat::COLUMNS;
+  // An unset count_limit estimates found where it can (TopDocs.count_limit).
+  // Transports whose output carries no count header turn it off.
+  bool estimateUnsetCount = true;
 
   // TEST-ONLY: wrap each top-docs root query in ForcePrepareQuery so tests
   // can assert prepared execution matches normal execution end-to-end.  This

@@ -500,6 +500,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     appendInt<Int64Str>(out, *docs.found);
     out += ',';
     if (docs.found_gte) out += R"("found_gte":true,)";
+    if (docs.found_estimated) out += R"("found_estimated":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -740,6 +741,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       marker += R"("found":)";
       appendInt<Int64Str>(marker, *docs.found);
       if (docs.found_gte) marker += R"(,"found_gte":true)";
+      if (docs.found_estimated) marker += R"(,"found_estimated":true)";
       first = false;
     }
     if (haveFoundDocs) {
