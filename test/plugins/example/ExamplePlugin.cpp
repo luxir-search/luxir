@@ -196,6 +196,9 @@ public:
               {.suffix = "letters", .kind = DerivedField::Kind::TEXT, .column = false}};
   }
 
+  // index_sort {"field": <spot field>, "order": "hilbert"} sorts by the point.
+  std::string_view sortProxy() const override { return "at"; }
+
   void index(const api::Val& value, DerivedSink& sink) const override {
     auto* map = std::get_if<api::Map>(&value.kind);
     if (map == nullptr) throw std::invalid_argument("expected an object");

@@ -117,6 +117,51 @@ inline int32_t unpackLongitude(int64_t packed) {
   return (int32_t)(uint32_t)packed;
 }
 
+// The Hilbert index of (x, y) on a 2^bits grid (Skilling, "Programming the
+// Hilbert curve", AIP 2004): the axes go to transposed form, then the
+// transpose's bits interleave with x leading at each level. Consecutive keys
+// are neighboring cells, so sorting by key keeps nearby points together.
+inline uint64_t hilbertKey(uint32_t x, uint32_t y, int bits = 32) {
+  uint32_t axes[2] = {x, y};
+  uint32_t top = 1u << (bits - 1);
+  for (uint32_t q = top; q > 1; q >>= 1) {
+    uint32_t p = q - 1;
+    for (int i = 0; i < 2; i++) {
+      if (axes[i] & q) {
+        axes[0] ^= p;
+      } else {
+        uint32_t t = (axes[0] ^ axes[i]) & p;
+        axes[0] ^= t;
+        axes[i] ^= t;
+      }
+    }
+  }
+  axes[1] ^= axes[0];
+  uint32_t t = 0;
+  for (uint32_t q = top; q > 1; q >>= 1) {
+    if (axes[1] & q) t ^= q - 1;
+  }
+  axes[0] ^= t;
+  axes[1] ^= t;
+  // Interleave: spread each axis to the even bits, x one place higher.
+  auto spread = [](uint64_t v) {
+    v = (v | (v << 16)) & 0x0000FFFF0000FFFFULL;
+    v = (v | (v << 8)) & 0x00FF00FF00FF00FFULL;
+    v = (v | (v << 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    v = (v | (v << 2)) & 0x3333333333333333ULL;
+    v = (v | (v << 1)) & 0x5555555555555555ULL;
+    return v;
+  };
+  return (spread(axes[0]) << 1) | spread(axes[1]);
+}
+
+// The 64-bit Hilbert key of a packed point (pack()): longitude as x and
+// latitude as y, each biased from signed to unsigned order.
+inline uint64_t hilbertKey(int64_t packed) {
+  return hilbertKey((uint32_t)unpackLongitude(packed) ^ 0x80000000u,
+                    (uint32_t)unpackLatitude(packed) ^ 0x80000000u);
+}
+
 // Inclusive longitude interval. A reversed interval wraps across the dateline.
 // Pass B's BKD relation functor can reuse this exact encoded-space predicate.
 inline bool longitudeInRange(int32_t longitude, int32_t minLongitude,

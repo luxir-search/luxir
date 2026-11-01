@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <future>
+#include <format>
 #include <latch>
+#include <map>
 #include <memory_resource>
 #include <optional>
 #include <set>
@@ -23,10 +25,12 @@
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/index/SegmentMerger.h"
 #include "luxir/reader/OrdColReader.h"
+#include "luxir/reader/BKDReader.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/Collection.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
@@ -176,9 +180,13 @@ std::vector<std::string> some(Rng& rng, const char* prefix, int distinct, int ma
   return out;
 }
 
-// Document i, version v: every field type the merger writes, each sometimes
-// missing. ts_i takes few distinct values, so the sort has many ties.
-Doc randomDoc(Rng& rng, int i) {
+// Each document's locs_ps points (latitude, longitude), by id: geo columns
+// are not retrievable, so the Hilbert order check keys documents from here.
+using Points = std::map<std::string, std::vector<std::pair<double, double>>>;
+
+// Document i: every field type the merger writes, each sometimes missing.
+// ts_i takes few distinct values, so the sort has many ties.
+Doc randomDoc(Rng& rng, int i, Points& points) {
   auto maybe = [&]() { return rng.rint(100) < 85; };
   Doc doc = flatdoc("id", "d" + std::to_string(i), "seq_i", (int64_t)i);
   if (maybe()) doc.push_back({"ts_i", (int64_t)rng.rint(40) - 10});
@@ -202,6 +210,19 @@ Doc randomDoc(Rng& rng, int i) {
   if (maybe()) {
     doc.push_back({"vec_v", std::vector<float>{(float)rng.rint(100) / 10, (float)rng.rint(100) / 10,
                                                (float)rng.rint(100) / 10, (float)rng.rint(100) / 10}});
+  }
+  // Clustered points, a few per document.
+  auto& mine = points["d" + std::to_string(i)];
+  mine.clear();
+  if (maybe()) {
+    std::vector<std::string> values;
+    double centerLat = (double)rng.rint(6) * 20 - 50, centerLon = (double)rng.rint(8) * 40 - 150;
+    for (int n = 1 + (int)rng.rint(3); n > 0; n--) {
+      double lat = centerLat + (double)rng.rint(500) / 100, lon = centerLon + (double)rng.rint(500) / 100;
+      mine.push_back({lat, lon});
+      values.push_back(std::format("{},{}", lat, lon));
+    }
+    doc.push_back({"locs_ps", values});
   }
   if (maybe()) {
     std::vector<std::vector<float>> vectors;
@@ -236,6 +257,8 @@ std::vector<Request> battery() {
   }
   all(R"j({"geo_box":{"field":"loc_p","min_lat":-10,"max_lat":15,"min_lon":-20,"max_lon":5}})j");
   all(R"j({"geo_distance":{"field":"loc_p","lat":5,"lon":-3,"radius_meters":2000000}})j");
+  all(R"j({"geo_box":{"field":"locs_ps","min_lat":-32,"max_lat":12,"min_lon":-75,"max_lon":13}})j");
+  all(R"j({"geo_distance":{"field":"locs_ps","lat":-8,"lon":-27,"radius_meters":700000}})j");
   all(R"j({"knn":{"field":"vec_v","query":[1,2,3,4],"k":100000,"exact":true}})j");
   all(R"j({"knn":{"field":"vecs_vs","query":[10,20],"k":100000,"exact":true}})j");
   all(R"j({"boolean":{"required":[{"match":{"body_t":"w4"}}],"optional":[{"match":{"title_w":"w2"}}],)j"
@@ -291,11 +314,45 @@ void expectKeyOrder(const std::vector<Json>& docs, const char* field, bool desce
   }
 }
 
+// Index order is ascending minimum Hilbert key, documents without points last.
+void expectHilbertOrder(const std::vector<Json>& docs, const Points& points) {
+  std::optional<uint64_t> previous;
+  bool missingSeen = false;
+  for (const Json& doc : docs) {
+    const auto& mine = points.at(doc["id"].get<std::string>());
+    if (mine.empty()) {
+      missingSeen = true;
+      continue;
+    }
+    ASSERT_FALSE(missingSeen) << "a document with points follows one without";
+    uint64_t key = UINT64_MAX;
+    for (auto [lat, lon] : mine) key = std::min(key, geo::hilbertKey(geo::encodePoint(lat, lon)));
+    if (previous) {
+      ASSERT_GE(key, *previous) << "Hilbert keys out of order";
+    }
+    previous = key;
+  }
+}
+
+// Bytes of docid payload across the BKD leaves of the one segment's field.
+int64_t bkdDocBytes(CollectionHelper& helper, const std::string& field) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_EQ(1u, reader->segments().size());
+  auto& postings = reader->segments()[0].postingsReader();
+  const auto* info = postings.fieldInfo(field);
+  if (info == nullptr) return 0;
+  BKDReader bkd(postings, *info);
+  int64_t bytes = 0;
+  for (uint32_t leaf = 0; leaf < bkd.leafCount(); leaf++) bytes += bkd.leafInfo(leaf).docBytes;
+  return bytes;
+}
+
 }  // namespace
 
-// The equivalence run: ascending and descending on a single-valued field,
-// and descending on a multi-valued one (max key).
-enum class Mode { SINGLE_ASC, SINGLE_DESC, MULTI_DESC };
+// The equivalence run: ascending on a single-valued field, descending on a
+// multi-valued one (max key), and Hilbert order on a multi-valued geo field
+// (min key).
+enum class Mode { SINGLE_ASC, SINGLE_DESC, MULTI_DESC, HILBERT };
 
 class IndexSortEquivalenceTest : public IndexSortTest, public ::testing::WithParamInterface<Mode> {};
 
@@ -306,7 +363,16 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   const char* field = multi ? "ns_is" : "ts_i";
   std::string spec = mode == Mode::MULTI_DESC ? R"j("index_sort":{"field":"ns_is","order":"desc"})j"
       : mode == Mode::SINGLE_DESC ? R"j("index_sort":{"field":"ts_i","order":"desc"})j"
+      : mode == Mode::HILBERT ? R"j("index_sort":{"field":"locs_ps","order":"hilbert"})j"
       : R"j("index_sort":{"field":"ts_i"})j";
+  Points points;
+  auto expectOrder = [&]() {
+    if (mode == Mode::HILBERT) {
+      expectHilbertOrder(indexOrder("isort_sorted"), points);
+    } else {
+      expectKeyOrder(indexOrder("isort_sorted"), field, descending);
+    }
+  };
   auto plain = collection("isort_plain", "");
   auto sorted = collection("isort_sorted", spec);
   std::vector<CollectionHelper*> both = {plain.get(), sorted.get()};
@@ -324,7 +390,7 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
     for (int n = 0; n < count; n++) {
       // A quarter of the batch updates an earlier document.
       int i = next > 0 && rng.rint(4) == 0 ? (int)rng.rint(next) : next++;
-      batch.push_back(randomDoc(rng, i));
+      batch.push_back(randomDoc(rng, i, points));
     }
     for (auto* helper : both) ASSERT_TRUE(helper->indexAll(batch, UpdateMessage::COMMIT, true).success);
   };
@@ -361,8 +427,13 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   compare("segments");
   forceMerge();
   EXPECT_EQ(1, reorders);
-  expectKeyOrder(indexOrder("isort_sorted"), field, descending);
+  expectOrder();
   compare("merged");
+  if (mode == Mode::HILBERT) {
+    // Spatially close points now have close doc ids, so the rebuilt BKD's
+    // leaves encode their doc ids in less space.
+    EXPECT_LT(bkdDocBytes(*sorted, "locs_ps"), bkdDocBytes(*plain, "locs_ps"));
+  }
 
   // Deletes and updates after the merge, then a merge of the sorted segment
   // with a new one.
@@ -371,15 +442,16 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   compare("merged plus segment");
   forceMerge();
   EXPECT_EQ(2, reorders);
-  expectKeyOrder(indexOrder("isort_sorted"), field, descending);
+  expectOrder();
   compare("merged again");
 }
 
 INSTANTIATE_TEST_SUITE_P(IndexSort, IndexSortEquivalenceTest,
-                         ::testing::Values(Mode::SINGLE_ASC, Mode::SINGLE_DESC, Mode::MULTI_DESC),
+                         ::testing::Values(Mode::SINGLE_ASC, Mode::SINGLE_DESC, Mode::MULTI_DESC, Mode::HILBERT),
                          [](const auto& info) {
                            return info.param == Mode::SINGLE_ASC ? "singleAsc"
-                               : info.param == Mode::SINGLE_DESC ? "singleDesc" : "multiDesc";
+                               : info.param == Mode::SINGLE_DESC ? "singleDesc"
+                               : info.param == Mode::MULTI_DESC ? "multiDesc" : "hilbert";
                          });
 
 // Sources already in key order concatenate: the permutation is the identity.
@@ -715,4 +787,30 @@ TEST_F(IndexSortTest, reorderedSegmentSizeMatchesPresortedIngest) {
   EXPECT_EQ(DOCS, reordered.runs);
   EXPECT_EQ(reordered.blocks, reordered.denseBlocks);
   EXPECT_LE(reordered.versions, DOCS + reordered.blocks * 80);
+}
+
+// Every cell of a small grid gets one key, and consecutive keys are
+// neighboring cells.
+TEST(GeoHilbertKeyTest, visitsEveryCellOnceThroughNeighbors) {
+  constexpr int bits = 5;
+  constexpr uint32_t side = 1u << bits;
+  std::vector<std::pair<uint32_t, uint32_t>> byKey(side * side, {UINT32_MAX, UINT32_MAX});
+  for (uint32_t x = 0; x < side; x++) {
+    for (uint32_t y = 0; y < side; y++) {
+      uint64_t key = geo::hilbertKey(x, y, bits);
+      ASSERT_LT(key, side * side);
+      ASSERT_EQ(UINT32_MAX, byKey[key].first) << "key " << key << " taken twice";
+      byKey[key] = {x, y};
+    }
+  }
+  for (size_t k = 1; k < byKey.size(); k++) {
+    int dx = std::abs((int)byKey[k].first - (int)byKey[k - 1].first);
+    int dy = std::abs((int)byKey[k].second - (int)byKey[k - 1].second);
+    EXPECT_EQ(1, dx + dy) << "keys " << k - 1 << " and " << k << " are not neighbors";
+  }
+  EXPECT_EQ(0u, geo::hilbertKey(0, 0));
+  // Packed points: the curve starts at the south-west corner and is a full
+  // 64-bit key.
+  EXPECT_EQ(0u, geo::hilbertKey(geo::pack(INT32_MIN, INT32_MIN)));
+  EXPECT_GT(geo::hilbertKey(geo::encodePoint(10, 20)), (uint64_t)UINT32_MAX);
 }

@@ -2055,13 +2055,13 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 
 ### luxir.SchemaDef.IndexSort
 
-A merge writes its documents in this field's order: postings, columns, stored fields, norms and points all follow the new doc ids, so a merged segment is exactly sorted. Ties keep merge source order, and sources are concatenated by their minimum (ascending) or maximum (descending) value. Documents without a value go last. A multi-valued document sorts by its minimum value ascending, its maximum descending. Flushed segments keep arrival order.
+A merge writes its documents in this field's order: postings, columns, stored fields, norms and points all follow the new doc ids, so a merged segment is exactly sorted. Ties keep merge source order, and with ASC or DESC sources are concatenated by their minimum (ascending) or maximum (descending) value. Documents without a value go last. A multi-valued document sorts by its minimum value ascending, its maximum descending, and its minimum Hilbert key under HILBERT. Flushed segments keep arrival order.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.schemadef.indexsort.field"></a>[`field`](#field-luxir.schemadef.indexsort.field) | 1 | `string` | singular | A concrete field or template instance of type int or date with a column. |
+| <a id="field-luxir.schemadef.indexsort.field"></a>[`field`](#field-luxir.schemadef.indexsort.field) | 1 | `string` | singular | A concrete field or template instance: an int or date column for ASC and DESC, a geo\_point column for HILBERT. A plugin-typed field names its sort proxy, one of its derived fields, instead. |
 | <a id="field-luxir.schemadef.indexsort.order"></a>[`order`](#field-luxir.schemadef.indexsort.order) | 2 | [`SchemaDef.IndexSort.Order`](#enum-luxir.schemadef.indexsort.order) | singular | unset selects ASC |
 
 <a id="message-luxir.schemarequest"></a>
@@ -2916,6 +2916,7 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 |---|---|---|
 | <a id="value-luxir.schemadef.indexsort.order.asc"></a>[`ASC`](#value-luxir.schemadef.indexsort.order.asc) | 0 |  |
 | <a id="value-luxir.schemadef.indexsort.order.desc"></a>[`DESC`](#value-luxir.schemadef.indexsort.order.desc) | 1 |  |
+| <a id="value-luxir.schemadef.indexsort.order.hilbert"></a>[`HILBERT`](#value-luxir.schemadef.indexsort.order.hilbert) | 2 | The 64-bit Hilbert curve key of the encoded latitude and longitude, so spatially close points get close doc ids: geo leaves and column zones cover small areas. |
 
 <a id="enum-luxir.schemarequest.mode"></a>
 

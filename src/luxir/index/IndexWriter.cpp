@@ -2274,7 +2274,9 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
 
 void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const Schema& schema) {
   const std::string& indexSortField = schema.indexSortField;
-  if (indexSortField.empty()) {
+  // Hilbert keys have no per-source bound in the column trailer; the doc
+  // reorder decides their order, and sources keep creation order for ties.
+  if (indexSortField.empty() || schema.indexSortOrder == api::SchemaDef::IndexSort::Order::HILBERT) {
     std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
       return a->segId < b->segId;
     });

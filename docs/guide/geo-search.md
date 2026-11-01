@@ -219,6 +219,33 @@ The geo constraint participates in the same prepared execution as the lexical
 query. A selective surrounding domain can drive point verification; a broader
 domain can be driven by the points index.
 
+## Sort the index by location
+
+A collection whose queries are mostly spatial can keep its merged segments in
+Hilbert curve order, so documents near each other on the map get nearby doc
+ids:
+
+```json
+{"fields": {"location_p": "geo_point"},
+ "index_sort": {"field": "location_p", "order": "hilbert"}}
+```
+
+Each merge then writes its documents ordered by the 64-bit Hilbert key of the
+encoded latitude and longitude (a multi-valued field uses its smallest key;
+documents without a point go last). The points index is rebuilt over the new
+doc ids, so a leaf of nearby points holds a short run of doc ids that encodes
+compactly, and the column's per-block bounds cover small areas. Box and
+distance queries that hit a region then touch fewer, denser blocks.
+
+- Only merged segments are sorted; freshly flushed segments keep arrival
+  order until they merge.
+- A field type from a plugin can be the sort field when it names a derived
+  point as its sort proxy, such as a shape's centroid:
+  `{"index_sort": {"field": "shape", "order": "hilbert"}}`.
+- Results do not change, only the order of tied hits. See
+  [Index sort](schema.md#index-sort) for the setting's other rules and the
+  merge cost.
+
 ## Current limits
 
 - Polygon queries and geo-distance sorting are not implemented.
