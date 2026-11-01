@@ -2657,6 +2657,7 @@ private:
               newSchema->schema->toProto(&response.schema.emplace(), arena);
               response.commit = api::build::arenaStr(arena, newSchema->id.token());
               response.replicas = replicas;
+              response.warnings = newSchema->schema->responseWarnings(arena);
               std::string out;
               if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize schema response");
               return out;
