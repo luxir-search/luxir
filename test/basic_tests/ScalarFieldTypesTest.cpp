@@ -204,8 +204,8 @@ TEST_F(ScalarFieldTypesTest, decimalRangeSortFacetsAndStats) {
   auto body = json(R"({"limit":0,"ops":{
     "ranges":{"range_facet":{"field":"price","start":0,"end":100,"gap":"12.5"}},
     "prices":{"field_facet":{"field":"price","limit":1}}}})");
-  EXPECT_NE(std::string::npos, body.find(R"({"val":[0,12.5],"count":2})")) << body;
-  EXPECT_NE(std::string::npos, body.find(R"({"val":[12.5,25],"count":1})")) << body;
+  EXPECT_NE(std::string::npos, body.find(R"({"val":[0.0,12.5],"count":2})")) << body;
+  EXPECT_NE(std::string::npos, body.find(R"({"val":[12.5,25.0],"count":1})")) << body;
   EXPECT_NE(std::string::npos, body.find(R"({"val":0.1,"count":1})")) << body;
 
   EXPECT_TRUE(rejected(flatdoc("id", "x", "price", 1.234)));

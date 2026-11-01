@@ -81,9 +81,36 @@ public:
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
   ValueNature outputNature = ValueNature::NUMBER;
-  // The faceted field's schema type, which renders logical-type bucket keys
-  // (see emitBuckets). Set by the parser.
+  // The faceted field's schema type: renders logical-type bucket keys (see
+  // emitBuckets) and picks the column decoder. Set by the constructor/parser.
   const FieldType* valueType = nullptr;
+
+  FieldType::Type valueKind() const {
+    return valueType ? const_cast<FieldType*>(valueType)->type() : FieldType::NONE;
+  }
+
+  // Hands `emit` the decoder from an encoded column value to its output:
+  // sortable bits back to float/double, decimals scaled to double, date
+  // ticks in the request's date mode, integers as stored.
+  template <typename Emit>
+  void withValueOutput(std::pmr::memory_resource& mr, Emit emit) const {
+    if (valueType && valueType->logical == FieldType::Logical::DECIMAL) {
+      double unit = static_cast<const DecimalFieldType*>(valueType)->unit;
+      emit([unit](int64_t value) { return (double)value / unit; });
+      return;
+    }
+    switch (valueKind()) {
+      case FieldType::FLOAT:
+        emit([](int64_t value) { return sortableInt32ToFloat((int32_t)value); });
+        break;
+      case FieldType::DOUBLE:
+        emit([](int64_t value) { return sortableInt64ToDouble(value); });
+        break;
+      default:
+        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        break;
+    }
+  }
 
   template <typename Label>
   void emitFieldBuckets(api::FacetResult& result,
@@ -94,7 +121,7 @@ public:
         emitLogicalBuckets(result, buckets, mr, valueType);
         return;
       }
-      withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+      withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
     } else emitBuckets(result, buckets, mr, valueType);
@@ -110,6 +137,7 @@ public:
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
+      valueType = &type;
       if (type.type() == FieldType::DATE) {
         outputNature = dateValueNature(DateFieldType::unitOf(type));
       }
@@ -1828,7 +1856,6 @@ public:
 class IntFacetRangeReq : public FixedBucketFacetReq {
   std::span<const int64_t> fences;
   int64_t affineGap;
-  FieldType::Type valueType;
   bool affine;
   std::optional<RangeFacetGrid> grid;
   std::optional<int64_t> wideningStart, wideningEnd;
@@ -2030,27 +2057,26 @@ public:
   static inline bool disableZoneRangeFacetForTests = false;
 
   // 10^scale for a DECIMAL field, whose bounds are emitted decoded; 0 otherwise.
-  double decimalUnit = 0;
 
   std::span<const int64_t> bucketFences() const { return fences; }
 
   IntFacetRangeReq(SearchRequest& req,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
-    FieldType::Type valueType, int64_t minCount, bool missing,
+    int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
         req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
-    fences(fences), affineGap(affineGap), valueType(valueType),
+    fences(fences), affineGap(affineGap),
     affine(affine), runs(runs) {}
 
   IntFacetRangeReq(SearchRequest& req,
       std::string_view fieldName, std::string_view facetName,
       RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
-      FieldType::Type valueType, int64_t minCount, bool missing)
+      int64_t minCount, bool missing)
     : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
-      affineGap(0), valueType(valueType), affine(false), grid(std::move(grid)),
+      affineGap(0), affine(false), grid(std::move(grid)),
       wideningStart(start), wideningEnd(end) {}
 
   size_t facetBucketResidentBytes() const override;
@@ -2102,7 +2128,8 @@ public:
       std::span<const size_t> emitted, std::pmr::memory_resource& mr,
       std::span<const int64_t> layout) const {
     size_t n = emitted.size();
-    auto emitBounds = [&]<typename Outer>(auto decode) {
+    withValueOutput(mr, [&](auto decode) {
+      using Outer = typename FacetOutputTypes<decltype(decode(int64_t{}))>::ArrayColumn;
       auto& bucketIds = result.bucket_ids.emplace().kind.emplace<Outer>();
       auto* pairs = build::allocArray(bucketIds.v, n, mr);
       int64_t* counts = build::allocArray(result.counts, n, mr);
@@ -2113,35 +2140,7 @@ public:
         bounds[1] = decode(layout[bucket + 1]);
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
-    };
-    switch (valueType) {
-      case FieldType::Type::DATE:
-        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
-          using Outer = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
-                                            luxir::api::ArrArrStr, luxir::api::ArrArrInt>;
-          emitBounds.template operator()<Outer>(output);
-        });
-        break;
-      case FieldType::Type::FLOAT:
-        emitBounds.template operator()<luxir::api::ArrArrFloat>(
-            [](int64_t encoded) {
-              return sortableInt32ToFloat((int32_t)encoded);
-            });
-        break;
-      case FieldType::Type::DOUBLE:
-        emitBounds.template operator()<luxir::api::ArrArrDouble>(
-            [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
-        break;
-      default:
-        if (decimalUnit != 0) {
-          emitBounds.template operator()<luxir::api::ArrArrDouble>(
-              [unit = decimalUnit](int64_t value) { return (double)value / unit; });
-          break;
-        }
-        emitBounds.template operator()<luxir::api::ArrArrInt>(
-            [](int64_t value) { return value; });
-        break;
-    }
+    });
     if (missing) result.missing = merged.missing_num;
   }
 

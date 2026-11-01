@@ -26,6 +26,7 @@
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/RequestMemTracker.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/DocsEnum.h"
@@ -43,6 +44,7 @@ namespace luxir {
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
+struct CombinedNormTables;
 
 enum class QueryKind : uint8_t {
   TERM = 1,
@@ -1160,6 +1162,7 @@ public:
   // owns logical/key memos, validation tracking, and request cache Uses, but
   // deliberately does not initialize per-segment field readers.
   class PlanningContext {
+    RequestMemTracker standaloneMemoryTracker{0};
     struct CachedFilterIdentity {
       FilterKeyScope scope;
       std::optional<FilterKey> key;
@@ -1196,6 +1199,7 @@ public:
         : fuzzyMaxExpansions(fuzzyMaxExpansions) {}
     };
 
+    RequestMemTracker& memoryTracker;
     MemPool& pool;
     IndexReader& topReader;
     std::shared_ptr<FilterCache::UseRegistry> filterUses;
@@ -1207,8 +1211,10 @@ public:
         MemPool& pool, IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
-        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr,
+        RequestMemTracker* memoryTracker = nullptr)
+      : memoryTracker(memoryTracker ? *memoryTracker : standaloneMemoryTracker),
+        pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext), limits(limits),
         warnings(warnings) {
       this->filterKeyContext.coreGen = topReader.coreGen();
@@ -1383,6 +1389,9 @@ public:
     FilterKeyContext& filterKeyContext;
     Limits& limits;
     FieldInfoMap fieldInfoMap;
+    // Pool-owned norm tables shared by the request's CombinedFieldQuery
+    // weights, one per field weight vector; defined in CombinedFieldQuery.h.
+    CombinedNormTables* combinedNormTables = nullptr;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
             FieldInfoMap&& fieldInfoMap)

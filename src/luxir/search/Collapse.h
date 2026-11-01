@@ -42,7 +42,7 @@ struct CollapseKey {
 };
 
 struct CollapseKeyHash {
-  size_t operator()(const CollapseKey& key) const {
+  template <typename Key> size_t operator()(const Key& key) const {
     size_t hash = 0;
     boost::hash_combine(hash, key.singleton.has_value());
     if (key.singleton) boost::hash_combine(hash, *key.singleton);

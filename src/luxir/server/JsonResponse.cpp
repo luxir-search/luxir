@@ -141,6 +141,8 @@ void appendFloating(std::string& out, F v) {
   char buf[40];
   auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), v);
   out.append(buf, p);
+  // Keep floating tokens floating when parsed back, including signed zero.
+  if (std::find(buf, p, '.') == p && std::find(buf, p, 'e') == p) out += ".0";
 }
 
 template <typename Repeated, typename Emit>
@@ -262,6 +264,9 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
     else out += "null";
   } else if (auto* c = std::get_if<luxir::api::ColStr>(&col.kind)) {
     if (i < c->v.size()) appendJsonString(out, c->v[i]);
+    else out += "null";
+  } else if (auto* c = std::get_if<luxir::api::ColFloat>(&col.kind)) {
+    if (i < c->v.size()) appendFloating(out, c->v[i]);
     else out += "null";
   } else if (auto* c = std::get_if<luxir::api::ColDouble>(&col.kind)) {
     if (i < c->v.size()) appendFloating(out, c->v[i]);
