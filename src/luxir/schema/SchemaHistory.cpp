@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Schema.h"
+#include "FieldTypeRegistry.h"
 #include "luxir/api/build.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/padded_input.h"
@@ -29,6 +30,14 @@ FieldSignatures Schema::signatures(bool includeTemplates) const {
       for (const auto& [label, variant] : it->second->variants) {
         std::string physicalName = name + "__" + label;
         result.emplace(physicalName, FieldSignature(physicalName, *variant));
+      }
+      // What a derived field holds depends on the plugin type's definition.
+      if (auto* composite = dynamic_cast<CompositeFieldType*>(type.get())) {
+        for (const auto& [suffix, derived] : it->second->derived) {
+          std::string physicalName = CompositeFieldType::derivedName(name, suffix);
+          auto& signature = result.emplace(physicalName, FieldSignature(physicalName, *derived)).first->second;
+          signature.properties["plugin_type"] = composite->plugin->canonical;
+        }
       }
     }
   }

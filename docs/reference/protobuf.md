@@ -704,7 +704,7 @@ Engine work that reached this collection since it was opened. The node's Service
 
 ### luxir.Column
 
-One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector and value columns use the missing-value rules described on their fields. Every returned field type has a column form: a type with no typed arm uses col\_val.
+One slot per document, including missing values, aligned with DocList rows. Scalar columns use missing\_val; multi-valued columns use empty arrays. Vector and value columns use the missing-value rules described on their fields. Every returned field type has a column form: a type with no typed arm uses col\_val. In FacetResult.bucket\_ids, every value is present and missing\_val is ignored.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1010,7 +1010,7 @@ An expression in the Luxir query language, with strict syntax and precise parse 
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.facetresult.bucket_ids"></a>[`bucket_ids`](#field-luxir.facetresult.bucket_ids) | 2 | [`Column`](#message-luxir.column) | singular |  |
+| <a id="field-luxir.facetresult.bucket_ids"></a>[`bucket_ids`](#field-luxir.facetresult.bucket_ids) | 2 | [`Column`](#message-luxir.column) | singular | Always-present bucket labels; Column.missing\_val sentinels do not apply. |
 | <a id="field-luxir.facetresult.counts"></a>[`counts`](#field-luxir.facetresult.counts) | 3 | `int64` | repeated |  |
 | <a id="field-luxir.facetresult.missing"></a>[`missing`](#field-luxir.facetresult.missing) | 4 | `int64` | optional | the number of documents that do not have this field |
 | <a id="field-luxir.facetresult.ops"></a>[`ops`](#field-luxir.facetresult.ops) | 22 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | sub-operation results performed per bucket, like a sub-facet or statistics. |
@@ -1045,9 +1045,10 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
-| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
+| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT and plugin\_type fields. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. A plugin\_type field skips the whole value when the plugin rejects it. Unset inherits, else false: a malformed value fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
 | <a id="field-luxir.fielddef.collation"></a>[`collation`](#field-luxir.fielddef.collation) | 23 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | STRING only: a registered collation (a plugin's name and params) whose sort keys the column stores in place of the normalized value, so sorting the field orders by the collation. Requires index=NONE and column=true, so it is normally a variant of the field it sorts (see FieldVariants and FieldDefaults.value). The column then holds opaque key bytes: facets and value expressions over it see keys, not text. Absent inherits; present replaces. A changed definition is a new representation: segments written before it do not carry its keys. HTTP JSON takes a bare name or {"name": ..., "params": {...}}. |
+| <a id="field-luxir.fielddef.plugin_type"></a>[`plugin_type`](#field-luxir.fielddef.plugin_type) | 31 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | A field type a plugin registered (Registries::fieldTypes): its name and params. The authored value is handed whole (objects and arrays included) to the plugin, which indexes it into hidden built-in sub-fields named &lt;field&gt;$&lt;suffix&gt;; those are queried, sorted and faceted by that name, and retrieving the field returns what the plugin projects from them. Excludes type and every other property except parent and ignore\_malformed (skip a value the plugin rejects and index the rest of the document). Absent inherits; a parent with a built-in type clears it. The name and params are part of the sub-fields' signatures. HTTP JSON also reads {"type": "&lt;name&gt;", "params": {...}} for a name that is not a built-in type. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1066,7 +1067,7 @@ Default representations for bare field names. Each binding names "self" or a loc
 
 ### luxir.FieldFacet
 
-Buckets of distinct field values, using the field's value binding. STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support counts, limits, mincount, missing, and selections.
+Buckets of distinct field values, using the field's value binding. STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount, missing, selections, sub-operations, and metric sorts. Distinct counts are supported except on TEXT; metric sorts with distinct counts are unsupported.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1074,7 +1075,7 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 |---|---|---|---|---|
 | <a id="field-luxir.fieldfacet.field"></a>[`field`](#field-luxir.fieldfacet.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.fieldfacet.limit"></a>[`limit`](#field-luxir.fieldfacet.limit) | 2 | `sint64` | optional | Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all. Selected buckets outside the ordinary page are appended after it. |
-| <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE require a positive value when set. |
+| <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE/FLOAT/DOUBLE require a positive value when set. |
 | <a id="field-luxir.fieldfacet.missing"></a>[`missing`](#field-luxir.fieldfacet.missing) | 4 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.fieldfacet.sort"></a>[`sort`](#field-luxir.fieldfacet.sort) | 5 | [`SortSpec`](#message-luxir.sortspec) | repeated | One metric sub-operation name. Unset sorts by count descending, then bucket value ascending. |
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |

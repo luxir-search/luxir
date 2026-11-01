@@ -299,6 +299,7 @@ struct FieldDef {
   std::optional<FieldDefaults> defaults;
   std::optional<NormalizerDef> normalizer;
   std::optional<AnalyzerComponent> collation;
+  std::optional<AnalyzerComponent> plugin_type;
   std::optional<VectorAnnDef> ann;                              // align 4
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)

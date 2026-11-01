@@ -21,6 +21,23 @@ Choose a type based on how you want to search and use the values:
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
+A plugin can register more field types. Name one as the type, with its
+settings in `params`: `{"shape": {"type": "geo_shape", "params": {...}}}`
+(canonically `{"plugin_type": {"name": "geo_shape", "params": {...}}}`, which
+is what the schema reads back as). The plugin receives each whole value,
+objects and arrays included, and indexes it into hidden built-in fields named
+`<field>$<suffix>`, such as `shape$cells`. Query, sort, facet and retrieve
+those by name (except ones the type marks opaque, its internal encoding);
+retrieving the field itself returns what the plugin rebuilds from them, when
+it does. Each multi-valued derived field is its own set of values: a query on
+two of them does not require the values to come from the same input element.
+Only `parent` and `ignore_malformed` (skip a value the plugin rejects instead
+of failing the document) apply beside `params`, and a parent may not bring
+built-in settings either. A
+collection whose schema names a type the server lacks fails to load with a
+message listing the available types. See
+[Plugin field types](../dev/plugins.md#field-types).
+
 ### `text` versus `string`
 
 Both accept text values, but they make different things searchable. Suppose
@@ -283,8 +300,9 @@ publication advances the schema generation.
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
-| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
-| `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). `ignore_malformed` also applies to a plugin field type. |
+| `params` | beside a plugin field type's `type`: its settings, which the plugin validates. See [Field types](#field-types) |
+| `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -934,7 +952,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
 | Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer` (always the expanded definition; `analyzer_preset` adds the registered name when one was used), `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
-| `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
+| `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist`, `pq.m` and `rabitq.bits` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |

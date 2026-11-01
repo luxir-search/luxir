@@ -10,6 +10,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
 #include "PostingsWriter.h"
@@ -224,6 +225,13 @@ public:
       unused(inverter, points);
       unsupportedValue("typed geo point array");
     }
+    // Analyzed tokens with their positions (non-decreasing, >= 0), for a plugin
+    // field type's derived TEXT field.
+    virtual void indexTokens(Inverter& inverter, std::span<const std::string_view> terms,
+                             std::span<const int32_t> positions) {
+      unused(inverter, terms, positions);
+      unsupportedValue("token");
+    }
 
     virtual void index(Inverter& inverter, const IndexVal& val) {
       if (std::holds_alternative<std::string_view>(val.kind)) {
@@ -295,6 +303,11 @@ public:
     std::vector<Branch> branches;
     std::vector<GeoPoint> geoPoints;
     size_t geoScratchBytes = 0;
+    // PLUGIN shape: what the plugin emits for a document, per derived field
+    // (branches are in the type's declaration order).
+    std::unique_ptr<DerivedSink> derivedSink;
+    std::vector<std::string_view> derivedViews;
+    size_t derivedScratchBytes = 0;
     // The document that last claimed this field, and the slot it claimed (see claim).
     int32_t claimedDoc = -1;
     uint32_t claimedSlot = 0;
@@ -302,6 +315,9 @@ public:
     void store(Inverter& inverter, const IndexVal& val);
     void checkShape(const IndexVal& val) const;
     void indexPoints(Inverter& inverter, std::span<const GeoPoint> points);
+    void indexDerived(Inverter& inverter, const IndexVal& val);
+    void indexDerivedField(Inverter& inverter, const DerivedField& spec, const DerivedSink::Values& values,
+                           IndexHandler& handler);
 
     template<typename F>
     void forEachBranch(F&& index) {

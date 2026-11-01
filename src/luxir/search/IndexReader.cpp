@@ -9,6 +9,7 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/MemPool.h"
 
@@ -619,6 +620,22 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
   callOnce(retrievableOnce, [this] {
     std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
+      // A plugin field's derived fields are hidden; the field itself is
+      // retrievable (in their place, which keeps the catalog sorted) when its
+      // type projects a value from them.
+      if (auto dollar = source.name.find(CompositeFieldType::SEPARATOR); dollar != std::string_view::npos) {
+        auto root = source.name.substr(0, dollar);
+        if (!fields.empty() && fields.back().name == root) continue;
+        FieldType* type = nullptr;
+        try {
+          type = sharedSchema->getFieldTypePtr(root);
+        } catch (const RequestError&) {
+          continue;
+        }
+        auto* composite = dynamic_cast<CompositeFieldType*>(type);
+        if (composite && composite->impl().projects()) fields.push_back({root, type, false});
+        continue;
+      }
       auto split = source.name.rfind("__");
       bool derived = split != std::string_view::npos;
       auto root = derived ? source.name.substr(0, split) : source.name;
