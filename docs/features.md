@@ -239,7 +239,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
-- `knn` vector search, `geo_box`, and `geo_distance`.
+- `knn` vector search, `geo_box`, `geo_distance`, and `geo_polygon`.
 - `multi_match`: search one text across weighted fields. `combined`
   (default) scores TEXT fields sharing an analyzer and long-term policy as
   one field with BM25F; weights scale term frequency and length at every
@@ -361,8 +361,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `Point` objects, `"lat,lon"` strings, WKT `POINT` strings, or geohashes.
   `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
   `ignore_z_value`.
-- Bounding-box queries (dateline-aware) and great-circle distance queries,
-  usable as the main query, as a non-scoring filter, or as a boolean clause.
+- Bounding-box queries (dateline-aware), great-circle distance queries, and
+  polygon queries with holes, usable as the main query, as a non-scoring
+  filter, or as a boolean clause.
+- Points are stored Morton-interleaved, so column scans skip blocks by their
+  2-D bounds, and requested geo fields come back as `[lon, lat]`.
 
 ## API surfaces
 

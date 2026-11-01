@@ -728,14 +728,15 @@ in their own guides:
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
-- [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
-  inclusive boundaries, dateline crossing, and distance units.
+- [`geo_box`, `geo_distance`, and `geo_polygon`](geo-search.md) cover
+  coordinate order, inclusive boundaries, dateline crossing, distance units,
+  and polygon rings and holes.
 
 ## Limits
 
-- `knn`, `geo_box`, and `geo_distance` are structured-only: expression
-  functions cannot currently represent vector or coordinate-list arguments,
-  so use the objects shown in the vector and geo guides.
+- `knn`, `geo_box`, `geo_distance`, and `geo_polygon` are structured-only:
+  expression functions cannot currently represent vector or coordinate-list
+  arguments, so use the objects shown in the vector and geo guides.
 - New structured arms are not automatically callable from the query language
   until their expression behavior is declared.
 - `except_ops` routing is not accepted on Fusion filters or Fusion source

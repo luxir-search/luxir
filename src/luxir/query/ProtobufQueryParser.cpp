@@ -25,6 +25,7 @@
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/QueryRegistry.h"
@@ -228,6 +229,23 @@ luxir::Query* ProtobufQueryParser::parseGeoDistance(
   return pool.make<luxir::GeoDistanceQuery>(
       api::build::arenaStr(pool, target.physicalName), geoDistanceQuery.lat, geoDistanceQuery.lon,
       geoDistanceQuery.radius_meters);
+}
+
+luxir::Query* ProtobufQueryParser::parseGeoPolygon(
+    const luxir::api::GeoPolygonQuery& geoPolygonQuery) {
+  const auto& target = context.fields.resolve(geoPolygonQuery.field, OpClass::PRIMARY, context.opName);
+  if (target.fieldType->type() != FieldType::GEO_POINT) {
+    throw std::runtime_error(std::format("GeoPolygon query on non-geo field: {}", geoPolygonQuery.field));
+  }
+  auto ring = [this](std::span<const luxir::api::GeoLatLon> points) {
+    auto out = pool.make_span<geo::LatLon>(points.size());
+    for (size_t i = 0; i < points.size(); i++) out[i] = {points[i].lat, points[i].lon};
+    return std::span<const geo::LatLon>(out);
+  };
+  auto holes = pool.make_span<std::span<const geo::LatLon>>(geoPolygonQuery.holes.size());
+  for (size_t i = 0; i < holes.size(); i++) holes[i] = ring(geoPolygonQuery.holes[i].points);
+  return pool.make<luxir::GeoPolygonQuery>(
+      api::build::arenaStr(pool, target.physicalName), ring(geoPolygonQuery.points), holes);
 }
 
 luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery) {
@@ -629,6 +647,9 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::GeoBoxQuery& g) -> luxir::Query* { return parseGeoBox(g); },
     [&](const luxir::api::GeoDistanceQuery& g) -> luxir::Query* {
       return parseGeoDistance(g);
+    },
+    [&](const luxir::api::GeoPolygonQuery& g) -> luxir::Query* {
+      return parseGeoPolygon(g);
     },
     [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseFuzzy(f); },
     [&](const luxir::api::SimpleQuery& s) -> luxir::Query* { return parseSimpleQuery(s, pquery); },

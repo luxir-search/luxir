@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -18,6 +19,8 @@
 
 #include "luxir/api/build.h"
 #include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/BKDReader.h"
@@ -113,6 +116,41 @@ std::vector<int32_t> run(IndexReader& reader, std::string_view field,
   QueryState state(pool, reader, field, box);
   return collect(state.weight->createScorer(pool, reader.segments()[0]),
                  twoPhase);
+}
+
+// Runs any geo query on the first segment, through the planned arm or the
+// column scan.
+template <class Q>
+std::vector<int32_t> runQuery(IndexReader& reader, Q& query, bool scan,
+                              bool twoPhase) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto* weight = (typename Q::Weight*)query.createWeight(context, 0);
+  auto& segment = reader.segments()[0];
+  return collect(scan ? weight->createScanScorerForTests(pool, segment)
+                      : weight->createScorer(pool, segment),
+                 twoPhase);
+}
+
+using EncodedPoints = std::vector<std::vector<std::pair<int32_t, int32_t>>>;
+
+// Docs with any point the relation's per-point check accepts.
+template <class Relation>
+std::vector<int32_t> relationOracle(const EncodedPoints& points,
+                                    const Relation& relation) {
+  std::vector<int32_t> docs;
+  for (int32_t doc = 0; doc < (int32_t)points.size(); doc++) {
+    if (std::ranges::any_of(points[(size_t)doc], [&](const auto& point) {
+          return relation.matches(point.first, point.second);
+        })) {
+      docs.push_back(doc);
+    }
+  }
+  return docs;
+}
+
+void addEncoded(EncodedPoints& points, int32_t doc, double lat, double lon) {
+  points[(size_t)doc].push_back({geo::encodeLatitude(lat), geo::encodeLongitude(lon)});
 }
 
 void setGeoSchema(CollectionHelper& helper, bool range = true) {
@@ -221,6 +259,71 @@ TEST_F(GeoEncodingTest, endpointsZerosValidationAndPacking) {
   int64_t packed = geo::pack(-123456789, 987654321);
   EXPECT_EQ(-123456789, geo::unpackLatitude(packed));
   EXPECT_EQ(987654321, geo::unpackLongitude(packed));
+}
+
+TEST_F(GeoEncodingTest, mortonOrderRoundTripsAndZoneCells) {
+  EXPECT_EQ(std::numeric_limits<int64_t>::min(), geo::pack(INT32_MIN, INT32_MIN));
+  EXPECT_EQ(std::numeric_limits<int64_t>::max(), geo::pack(INT32_MAX, INT32_MAX));
+  // Nearby points share the high bits, so a clustered block packs tightly.
+  int64_t a = geo::encodePoint(40.7128, -74.0060);
+  int64_t b = geo::encodePoint(40.7129, -74.0061);
+  EXPECT_GE(std::countl_zero((uint64_t)(a ^ b)), 36);
+
+  SplitMix64 rng(0x3c0ffee5);
+  for (int32_t i = 0; i < 2000; i++) {
+    int32_t lat1 = (int32_t)rng(), lon1 = (int32_t)rng();
+    int32_t lat2 = (int32_t)rng(), lon2 = (int32_t)rng();
+    int64_t p1 = geo::pack(lat1, lon1);
+    int64_t p2 = geo::pack(lat2, lon2);
+    ASSERT_EQ(lat1, geo::unpackLatitude(p1));
+    ASSERT_EQ(lon1, geo::unpackLongitude(p1));
+    if (lat1 <= lat2 && lon1 <= lon2) {
+      EXPECT_LE(p1, p2);
+    }
+    int64_t lo = std::min(p1, p2), hi = std::max(p1, p2);
+    int64_t mid = (int64_t)((uint64_t)lo + ((uint64_t)hi - (uint64_t)lo) / 2);
+    geo::Cell cell = geo::mortonCell(lo, hi);
+    for (int64_t value : {lo, mid, hi}) {
+      int32_t lat = geo::unpackLatitude(value), lon = geo::unpackLongitude(value);
+      EXPECT_TRUE(cell.latMin <= lat && lat <= cell.latMax);
+      EXPECT_TRUE(cell.lonMin <= lon && lon <= cell.lonMax);
+      EXPECT_TRUE(geo::mortonRangeMayIntersect(lo, hi, lat, lat, lon, lon));
+    }
+  }
+  geo::Cell point = geo::mortonCell(a, a);
+  EXPECT_EQ(point.latMin, point.latMax);
+  EXPECT_EQ(point.lonMin, point.lonMax);
+  EXPECT_FALSE(geo::mortonRangeMayIntersect(
+      a, a, geo::encodeLatitude(-10.0), geo::encodeLatitude(10.0),
+      geo::encodeLongitude(-10.0), geo::encodeLongitude(10.0)));
+}
+
+// The packed value's top bits are the geohash: longitude-major interleave of
+// the biased coordinates, the same bits Elasticsearch's Geohash.longEncode uses.
+TEST_F(GeoEncodingTest, packedPrefixIsGeohash) {
+  static constexpr std::string_view BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+  auto geohash = [](int64_t packed, int32_t precision) {
+    uint64_t bits = geo::geohashPrefix(packed, precision);
+    std::string out((size_t)precision, ' ');
+    for (int32_t i = precision - 1; i >= 0; i--, bits >>= 5) {
+      out[(size_t)i] = BASE32[bits & 31];
+    }
+    return out;
+  };
+  EXPECT_EQ("u4pruydqqvj", geohash(geo::encodePoint(57.64911, 10.40744), 11));
+  EXPECT_EQ("dr5regw3p", geohash(geo::encodePoint(40.7128, -74.0060), 9));
+  EXPECT_EQ("gcpvj0duq", geohash(geo::encodePoint(51.5074, -0.1278), 9));
+  EXPECT_EQ("7zzzzzzzzzzz", geohash(geo::encodePoint(-0.0000001, -0.0000001), 12));
+  EXPECT_EQ("s00000000000", geohash(geo::encodePoint(0.0, 0.0), 12));
+  EXPECT_EQ("0", geohash(geo::encodePoint(-90.0, -180.0), 1));
+  EXPECT_EQ("z", geohash(geo::encodePoint(90.0, 180.0), 1));
+  SplitMix64 rng(0x6e0ba5e);
+  for (int32_t i = 0; i < 2000; i++) {
+    int64_t packed = geo::pack((int32_t)rng(), (int32_t)rng());
+    for (int32_t p = 1; p < 12; p++) {
+      EXPECT_EQ(geo::geohashPrefix(packed, p), geo::geohashPrefix(packed, p + 1) >> 5);
+    }
+  }
 }
 
 TEST_F(GeoEncodingTest, quantizationBoundariesAndRandomRoundTrips) {
@@ -771,4 +874,198 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   EXPECT_EQ(39, countForTests(singleCountState.weight, merged));
   QueryState multiCountState(countPool, *afterMerge, "geo_multi", all);
   EXPECT_EQ(-1, countForTests(multiCountState.weight, merged));
+}
+
+// A dense single-valued column clustered by doc order gives tight leaf
+// zones; the scan arm skips and accepts whole zones and must still agree with
+// the per-point check for every geo relation.
+TEST_F(GeoBoxQueryTest, scanZonesAgreeWithPointChecks) {
+  constexpr int32_t N = 4 * 512 + 100;
+  CollectionHelper helper;
+  setGeoSchema(helper, false);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  const std::array<GeoPoint, 5> clusters = {{{40.7, -74.0}, {51.5, -0.1},
+                                             {35.7, 139.7}, {-33.9, 151.2},
+                                             {0.0, 179.9}}};
+  EncodedPoints points(N);
+  SplitMix64 rng(0x2b0e5a17);
+  for (int32_t doc = 0; doc < N; doc++) {
+    const auto& center = clusters[(size_t)(doc / 512)];
+    double lat = center.latitude + (unitDouble(rng) - 0.5) * 0.2;
+    double lon = std::min(180.0, center.longitude + (unitDouble(rng) - 0.5) * 0.2);
+    inverter.startDoc();
+    handler.index(inverter, lat, lon);
+    addEncoded(points, doc, lat, lon);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+
+  auto check = [&](auto& query) {
+    auto expected = relationOracle(points, query.makeRelation());
+    EXPECT_EQ(expected, runQuery(*reader, query, true, false));
+    EXPECT_EQ(expected, runQuery(*reader, query, true, true));
+    return expected.size();
+  };
+  for (const Box& box : {Box{40.0, 41.0, -75.0, -73.0}, Box{40.7, 51.5, -74.0, 0.0},
+                         Box{-1.0, 1.0, 179.85, -179.0}, Box{-90.0, 90.0, -180.0, 180.0}}) {
+    GeoBoxQuery query("geo_single", box.minLat, box.maxLat, box.minLon, box.maxLon);
+    EXPECT_GT(check(query), 0u);
+  }
+  for (double radius : {3000.0, 8000.0, 6000000.0}) {
+    GeoDistanceQuery query("geo_single", 40.7, -74.0, radius);
+    EXPECT_GT(check(query), 0u);
+  }
+  std::array<geo::LatLon, 4> outer{{{35.0, 139.0}, {36.0, 139.0},
+                                    {36.0, 140.0}, {35.0, 140.0}}};
+  std::array<geo::LatLon, 3> hole{{{35.65, 139.65}, {35.75, 139.65},
+                                   {35.7, 139.75}}};
+  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
+  GeoPolygonQuery polygon("geo_single", outer, holes);
+  EXPECT_GT(check(polygon), 0u);
+  EXPECT_LT(check(polygon), 512u);
+}
+
+class GeoPolygonQueryTest : public LuxirTest {};
+
+TEST_F(GeoPolygonQueryTest, containmentHolesAndValidation) {
+  // A concave "C" around New York with a triangular hole in its top bar;
+  // the ring repeats its first vertex, which the query drops.
+  std::array<geo::LatLon, 9> outer{{{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0},
+                                    {41.0, -73.0}, {41.0, -74.5}, {40.5, -74.5},
+                                    {40.5, -73.0}, {40.0, -73.0}, {40.0, -75.0}}};
+  std::array<geo::LatLon, 3> hole{{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}};
+  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
+  GeoPolygonQuery query("geo", outer, holes);
+  const geo::Polygon& polygon = query.getPolygon();
+  EXPECT_EQ(8u, polygon.outer.size());
+  EXPECT_TRUE(polygon.contains(40.25, -74.0));   // bottom bar
+  EXPECT_TRUE(polygon.contains(41.25, -73.5));   // top bar
+  EXPECT_TRUE(polygon.contains(40.75, -74.75));  // left bar
+  EXPECT_FALSE(polygon.contains(40.75, -73.5));  // the notch
+  EXPECT_FALSE(polygon.contains(41.35, -74.85)); // the hole
+  EXPECT_FALSE(polygon.contains(42.0, -74.0));
+
+  BKDPolygonRelation relation = query.makeRelation();
+  auto cell = [](double minLat, double maxLat, double minLon, double maxLon) {
+    return std::array<int32_t, 4>{geo::encodeLatitude(minLat), geo::encodeLatitude(maxLat),
+                                  geo::encodeLongitude(minLon), geo::encodeLongitude(maxLon)};
+  };
+  auto compare = [&](std::array<int32_t, 4> c) {
+    return relation.compare(c[0], c[1], c[2], c[3]);
+  };
+  EXPECT_EQ(BKDRelation::INSIDE, compare(cell(40.1, 40.4, -74.9, -73.1)));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(cell(40.6, 40.9, -74.4, -73.1)));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(cell(10.0, 20.0, 10.0, 20.0)));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(cell(40.4, 40.6, -74.0, -73.5)));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(cell(41.2, 41.3, -74.85, -74.7)));
+
+  EXPECT_THROW(GeoPolygonQuery("geo", std::span(outer).first(2), {}),
+               std::invalid_argument);
+  std::array<geo::LatLon, 3> badLat{{{0.0, 0.0}, {91.0, 0.0}, {0.0, 1.0}}};
+  EXPECT_THROW(GeoPolygonQuery("geo", badLat, {}), std::invalid_argument);
+}
+
+TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
+  constexpr int32_t N = 1500;
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& singleHandler = inverter.getIndexHandler("geo_single");
+  auto& multiHandler = inverter.getIndexHandler("geo_multi");
+  EncodedPoints single(N), multi(N);
+  SplitMix64 rng(0x70f1a6b3);
+  auto makePoint = [&](int32_t salt) {
+    if (salt % 2 == 0) {
+      return GeoPoint{40.7 + (unitDouble(rng) - 0.5) * 2.0,
+                      -74.0 + (unitDouble(rng) - 0.5) * 2.0};
+    }
+    return GeoPoint{-90.0 + unitDouble(rng) * 180.0, -180.0 + unitDouble(rng) * 360.0};
+  };
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    GeoPoint point = makePoint(doc);
+    singleHandler.index(inverter, point.latitude, point.longitude);
+    addEncoded(single, doc, point.latitude, point.longitude);
+    std::array<GeoPoint, 2> values{{makePoint(doc + 1), makePoint(doc)}};
+    multiHandler.index(inverter, std::span<const GeoPoint>(values));
+    for (const auto& value : values) addEncoded(multi, doc, value.latitude, value.longitude);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+
+  std::array<geo::LatLon, 8> concave{{{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0},
+                                      {41.0, -73.0}, {41.0, -74.5}, {40.5, -74.5},
+                                      {40.5, -73.0}, {40.0, -73.0}}};
+  std::array<geo::LatLon, 3> hole{{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}};
+  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
+  std::array<geo::LatLon, 5> large{{{-60.0, -170.0}, {70.0, -150.0}, {80.0, 20.0},
+                                    {10.0, 175.0}, {-70.0, 60.0}}};
+  for (std::string_view field : {"geo_single", "geo_multi"}) {
+    const EncodedPoints& points = field == "geo_single" ? single : multi;
+    GeoPolygonQuery withHole(field, concave, holes);
+    GeoPolygonQuery world(field, large, {});
+    for (GeoPolygonQuery* query : {&withHole, &world}) {
+      auto expected = relationOracle(points, query->makeRelation());
+      EXPECT_FALSE(expected.empty()) << field;
+      EXPECT_EQ(expected, runQuery(*reader, *query, false, false)) << field;
+      EXPECT_EQ(expected, runQuery(*reader, *query, true, true)) << field;
+    }
+  }
+}
+// The public request path: a geo_polygon query, with the geo fields
+// projected back as [lon, lat].
+TEST_F(GeoPolygonQueryTest, protoQueryAndPointProjection) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  CollectionHelper::UpdateBuilder update;
+  addWireDoc(update, "ny", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {-74.0060, 40.7128});
+  });
+  addWireDoc(update, "london", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {-0.1278, 51.5074});
+  });
+  addWireDoc(update, "tour", "geo_multi", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 2, [](api::Val& point, size_t i, auto& innerMr) {
+      if (i == 0) setDoubles(point, innerMr, {-74.0, 40.7});
+      else setDoubles(point, innerMr, {151.2093, -33.8688});
+    });
+  });
+  update.commit();
+  ASSERT_EQ(IndexResult::Status::OK, helper.submit(update).status);
+
+  auto search = [&](std::string_view field) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.rawQuery() = qb::geoPolygon(cur.mr(), field,
+        {{40.0, -75.0}, {41.0, -75.0}, {41.0, -73.0}, {40.0, -73.0}});
+    cur.fields({"id", "geo_single", "geo_multi"}).limit(10);
+    req->execute();
+    EXPECT_OK(req);
+    return req->getDocs();
+  };
+  auto single = search("geo_single");
+  ASSERT_EQ(1u, single.size());
+  EXPECT_EQ("ny", std::get<std::string>(*find(single[0], "id")));
+  auto lonLat = std::get<std::vector<double>>(*find(single[0], "geo_single"));
+  ASSERT_EQ(2u, lonLat.size());
+  EXPECT_NEAR(-74.0060, lonLat[0], 1e-7);
+  EXPECT_NEAR(40.7128, lonLat[1], 1e-7);
+
+  auto multi = search("geo_multi");
+  ASSERT_EQ(1u, multi.size());
+  EXPECT_EQ("tour", std::get<std::string>(*find(multi[0], "id")));
+  auto pairs = std::get<std::vector<double>>(*find(multi[0], "geo_multi"));
+  ASSERT_EQ(4u, pairs.size());
+  EXPECT_NEAR(-74.0, pairs[0], 1e-7);
+  EXPECT_NEAR(40.7, pairs[1], 1e-7);
+  EXPECT_NEAR(151.2093, pairs[2], 1e-7);
+  EXPECT_NEAR(-33.8688, pairs[3], 1e-7);
+  EXPECT_EQ(nullptr, find(multi[0], "geo_single"));
 }

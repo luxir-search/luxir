@@ -179,6 +179,52 @@ public:
   }
 };
 
+// Polygon over decoded point coordinates. A cell outside the polygon's
+// bounding box is OUTSIDE. Otherwise a cell that no ring edge touches lies
+// wholly inside or wholly outside the polygon, and one corner decides which.
+// The cell is widened by a tiny margin for the edge test so rounding cannot
+// call a cell INSIDE while a point in it tests outside.
+struct BKDPolygonRelation {
+  static constexpr double EDGE_MARGIN = 1e-9;
+
+  geo::Polygon polygon;
+  int32_t latMin;
+  int32_t latMax;
+  int32_t lonMin;
+  int32_t lonMax;
+
+  explicit BKDPolygonRelation(const geo::Polygon& polygon)
+      : polygon(polygon),
+        latMin(geo::encodeLatitudeCeil(polygon.box.minLat)),
+        latMax(geo::encodeLatitude(polygon.box.maxLat)),
+        lonMin(geo::encodeLongitudeCeil(polygon.box.minLon)),
+        lonMax(geo::encodeLongitude(polygon.box.maxLon)) {}
+
+  BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                      int32_t cellLonMin, int32_t cellLonMax) const {
+    if (cellLatMax < latMin || latMax < cellLatMin
+        || cellLonMax < lonMin || lonMax < cellLonMin) {
+      return BKDRelation::OUTSIDE;
+    }
+    double minLat = geo::decodeLatitude(cellLatMin);
+    double maxLat = geo::decodeLatitude(cellLatMax);
+    double minLon = geo::decodeLongitude(cellLonMin);
+    double maxLon = geo::decodeLongitude(cellLonMax);
+    if (polygon.edgeTouches(minLat - EDGE_MARGIN, maxLat + EDGE_MARGIN,
+                            minLon - EDGE_MARGIN, maxLon + EDGE_MARGIN)) {
+      return BKDRelation::CROSSES;
+    }
+    return polygon.contains(minLat, minLon)
+        ? BKDRelation::INSIDE : BKDRelation::OUTSIDE;
+  }
+
+  bool matches(int32_t lat, int32_t lon) const {
+    return latMin <= lat && lat <= latMax && lonMin <= lon && lon <= lonMax
+        && polygon.contains(geo::decodeLatitude(lat),
+                            geo::decodeLongitude(lon));
+  }
+};
+
 class BKDReader {
 public:
   using InnerNode = BKDWriter::InnerNode;

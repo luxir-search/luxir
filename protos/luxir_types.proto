@@ -344,6 +344,7 @@ message Query {
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
+    GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside a polygon
   }
 }
 
@@ -618,6 +619,28 @@ message GeoDistanceQuery {
   double lat = 2;           // center latitude, degrees in [-90, 90]
   double lon = 3;           // center longitude, degrees in [-180, 180]
   double radius_meters = 4; // inclusive radius, finite and non-negative
+}
+
+// A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the
+// VALUE array contract [x, y] = [lon, lat] does not apply.
+message GeoLatLon {
+  double lat = 1; // degrees in [-90, 90]
+  double lon = 2; // degrees in [-180, 180]
+}
+
+message GeoRing {
+  repeated GeoLatLon points = 1; // at least 3 distinct vertices
+}
+
+// Matches when at least one GEO_POINT value is inside the polygon: inside the
+// outer ring and inside no hole, each by the even-odd rule. Edges are straight
+// lines in latitude/longitude and do not cross the dateline (split such a
+// polygon into two queries under a boolean should). A ring may repeat its
+// first vertex at the end. Points exactly on an edge may match either way.
+message GeoPolygonQuery {
+  string field = 1;
+  repeated GeoLatLon points = 2; // outer ring, at least 3 distinct vertices
+  repeated GeoRing holes = 3;    // optional holes inside the outer ring
 }
 
 message Filter {

@@ -63,6 +63,7 @@ enum class QueryKind : uint8_t {
   EXISTS,
   GEO_BOX,
   GEO_DISTANCE,
+  GEO_POLYGON,
   ALL,
   NONE,
   RESCORE,
