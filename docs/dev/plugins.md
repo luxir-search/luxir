@@ -84,6 +84,16 @@ Each directory is added with `add_subdirectory`, under `build/<preset>/plugins/<
 The configure step prints the configured plugin names, and the server logs them at
 startup. The generated sources live in `build/<preset>/generated/`.
 
+A listed directory that does not call `luxir_add_plugin` (for example a plugin that
+skips itself when a dependency is missing) fails the configure. Every compiled-in
+runtime plugin also embeds the string `luxir-plugin-compiled:<name>`, so
+`grep -a` on a binary shows which plugins it contains.
+
+For ARM64 builds, `tools/build-arm64` installs extra vcpkg manifest features named in
+`LUXIR_VCPKG_FEATURES` (comma-separated; for example `icu` for plugins that link ICU).
+`deps/make_deps.sh` reads the same variable for the native install, so plugins link ICU
+statically there too.
+
 Plugin targets see the include directories `luxir_lib` keeps private (generated
 protos, hash maps) and link TBB, so a plugin can build on engine internals such as
 search ops, readers and `QueryPrep`.
