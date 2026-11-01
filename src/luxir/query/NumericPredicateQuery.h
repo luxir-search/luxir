@@ -52,6 +52,8 @@ public:
   // Observe actual verification, not column decoding or metadata navigation.
   // Tests install this only after the product has been built.
   static inline thread_local void (*verificationObserver)(const NumericPredicateQuery&, int32_t) = nullptr;
+  // Rank-to-document selects on sparse docsWithValue in zone fills.
+  static inline thread_local int64_t rankSelectsForTests = 0;
 #endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
@@ -766,7 +768,13 @@ public:
     IntColReader& reader;
     BlockPlans& blockPlans;
     std::span<const BlockPlan> plans;
+    // Sparse docsWithValue only. docs sits on the first document with a
+    // value at or after docsTarget; fills step walk from rank to rank and
+    // select only to jump past an OUTSIDE run.
     screaming::BitSet::Selector* selector = nullptr;
+    screaming::BitSet::Iterator* docs = nullptr;
+    screaming::BitSet::Iterator* walk = nullptr;
+    int32_t docsTarget = -1;
     CrossingValues crossing;
     std::span<uint64_t> iterBits;
     const NumericPredicateQuery& query;
@@ -804,29 +812,64 @@ public:
       words[(size_t)lastWord] |= lastMask;
     }
 
-    int32_t docForRank(int32_t rank) const {
-      return selector == nullptr ? rank : selector->select(rank);
-    }
-
-    std::pair<int32_t, int32_t> firstDocRank(int32_t min) const {
-      if (reader.denseDocsWithValue()) {
-        if (min >= reader.docsWithValue()) return {PostingsReader::END, 0};
-        return {min, min};
+    // The first document with a value at or after target, and its rank; past
+    // the last one, {END, docsWithValue}. Sparse: from the docs cursor, which
+    // a target below docsTarget rewinds.
+    template <bool SPARSE>
+    LUXIR_INLINE std::pair<int32_t, int32_t> firstDocRank(int32_t target) {
+      if constexpr (SPARSE) {
+        if (target < docsTarget) docs->reset();
+        docsTarget = target;
+        int32_t doc = target > docs->val() ? docs->advance(target) : docs->val();
+        if (doc != screaming::BitSet::END) return {doc, docs->rank()};
+      } else if (target < reader.docsWithValue()) {
+        return {target, target};
       }
-      screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
-      int32_t doc = iter.advance(min);
-      if (doc == screaming::BitSet::END) return {PostingsReader::END, 0};
-      return {doc, iter.rank()};
+      return {PostingsReader::END, reader.docsWithValue()};
     }
 
-    // Separate functions keep each loop's per-value work inlined and its
+    // Position walk on doc, a document with a value.
+    void walkTo(int32_t doc) {
+      if (doc < walk->val()) walk->reset();
+      if (doc > walk->val()) walk->advance(doc);
+    }
+
+    // The document of rank, the rank after the one a fill just visited.
+    template <bool SPARSE>
+    LUXIR_INLINE int32_t nextDoc(int32_t rank) {
+      if constexpr (SPARSE) {
+        return walk->next();
+      } else {
+        return rank;
+      }
+    }
+
+    // The document of rank, past an OUTSIDE run. Sparse: a select; past max,
+    // walk stays behind for the next window.
+    template <bool SPARSE>
+    LUXIR_INLINE int32_t jumpDoc(int32_t rank, int32_t max) {
+      if constexpr (SPARSE) {
+#ifndef NDEBUG
+        rankSelectsForTests++;
+#endif
+        int32_t doc = selector->select(rank);
+        if (doc < max) walk->advance(doc);
+        return doc;
+      } else {
+        return rank;
+      }
+    }
+
+    // One source per loop, instantiated per docsWithValue density: dense
+    // fills step doc with rank and set INSIDE runs whole, sparse fills step
+    // walk. Separate functions keep each loop's per-value work inlined and its
     // registers independent of the other loop. Pin the start alignment: zone
     // fills dominate column-only range filters, and a 16-byte shift from
     // unrelated edits cost frange2 r01_old10 TOP_10 11-18% more cycles at
     // identical instruction counts (hugin, 2026-10-29).
+    template <bool SPARSE>
     [[gnu::aligned(64)]] LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
-                                   int32_t max) {
-      auto [doc, rank] = firstDocRank(min);
+                                   int32_t max, int32_t doc, int32_t rank) {
       int64_t nvals = reader.numValues();
       while (doc < max && rank < nvals) {
         int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
@@ -837,21 +880,17 @@ public:
         if (run.relation == BlockRelation::OUTSIDE) {
           rank = (int32_t)runEnd;
           if (rank >= nvals) break;
-          doc = docForRank(rank);
+          doc = jumpDoc<SPARSE>(rank, max);
           continue;
         }
-        if (run.relation == BlockRelation::INSIDE
-            && reader.denseDocsWithValue()) {
+        if (!SPARSE && run.relation == BlockRelation::INSIDE) {
           int32_t insideEnd = (int32_t)std::min<int64_t>(runEnd, max);
           setRun(words, min, doc, insideEnd);
           rank = insideEnd;
           doc = insideEnd;
           continue;
         }
-
-        while (rank < runEnd) {
-          doc = docForRank(rank);
-          if (doc >= max) return;
+        while (rank < runEnd && doc < max) {
 #ifndef NDEBUG
           if (run.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
             verificationObserver(query, doc);
@@ -862,14 +901,14 @@ public:
             setBit(words, min, doc);
           }
           rank++;
+          doc = nextDoc<SPARSE>(rank);
         }
-        if (rank < nvals) doc = docForRank(rank);
       }
     }
 
+    template <bool SPARSE>
     LUXIR_NOINLINE void fillMulti(std::span<uint64_t> words, int32_t min,
-                                  int32_t max) {
-      auto [doc, docRank] = firstDocRank(min);
+                                  int32_t max, int32_t doc, int32_t docRank) {
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
 #ifndef NDEBUG
@@ -881,8 +920,45 @@ public:
         }
         docRank++;
         if (docRank >= reader.docsWithValue()) break;
-        doc = docForRank(docRank);
+        doc = nextDoc<SPARSE>(docRank);
       }
+    }
+
+    // Once per eager scorer. Out of line so both fill instantiations share one
+    // call to all(): a call in each made GCC outline all() at every site,
+    // which moved Supplier::exactCount's count loop across a line boundary
+    // (range_col COUNT +6% at equal instructions, hugin, 2026-11-01).
+    LUXIR_NOINLINE void classifyAllPlans() { plans = blockPlans.all(); }
+
+    template <bool SPARSE>
+    LUXIR_INLINE void fillWindow(std::span<uint64_t> words, int32_t min, int32_t max) {
+      auto [doc, rank] = firstDocRank<SPARSE>(min);
+      if (doc >= max) return;
+      if (eager) {
+        if (plans.empty()) classifyAllPlans();
+      } else {
+        int32_t lastRank = firstDocRank<SPARSE>(max).second;
+        int64_t begin = rank;
+        int64_t end = lastRank;
+        if (reader.multiValued()) {
+          begin = reader.getStartValueRank(rank);
+          end = reader.getStartValueRank(lastRank);
+        }
+        if (begin == end) return;
+        plans = blockPlans.forValues(begin, end);
+      }
+      if constexpr (SPARSE) walkTo(doc);
+      if (reader.multiValued()) fillMulti<SPARSE>(words, min, max, doc, rank);
+      else fillSingle<SPARSE>(words, min, max, doc, rank);
+    }
+
+    // Out of line, so fillWindowBits' dense entry carries no sparse code: an
+    // entry shared at run time cost short dense fills 20% more cycles at
+    // equal instructions, in branch mispredictions (frange_ts_old50 COUNT,
+    // hugin, 2026-10-31).
+    LUXIR_NOINLINE void fillSparseWindow(std::span<uint64_t> words, int32_t min,
+                                         int32_t max) {
+      fillWindow<true>(words, min, max);
     }
 
     int32_t findInIterationWindow(int32_t target) const {
@@ -928,6 +1004,11 @@ public:
       docid = -1;
       maxDoc = initialMaxDoc;
       iterWindowStart = iterWindowEnd = 0;
+      if (docs != nullptr) {
+        docs->reset();
+        walk->reset();
+      }
+      docsTarget = -1;
     }
 
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
@@ -942,6 +1023,8 @@ public:
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
             bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+        docs = pool.make<screaming::BitSet::Iterator>(bits);
+        walk = pool.make<screaming::BitSet::Iterator>(bits);
       }
       std::fill(iterBits.begin(), iterBits.end(), 0);
     }
@@ -955,24 +1038,8 @@ public:
                         int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
       if (min == max) return;
-      if (eager) {
-        if (plans.empty()) plans = blockPlans.all();
-      } else {
-        auto [firstDoc, firstRank] = firstDocRank(min);
-        if (firstDoc >= max) return;
-        auto [lastDoc, lastRank] = firstDocRank(max);
-        if (lastDoc == PostingsReader::END) lastRank = reader.docsWithValue();
-        int64_t begin = firstRank;
-        int64_t end = lastRank;
-        if (reader.multiValued()) {
-          begin = reader.getStartValueRank(firstRank);
-          end = reader.getStartValueRank(lastRank);
-        }
-        if (begin == end) return;
-        plans = blockPlans.forValues(begin, end);
-      }
-      if (reader.multiValued()) fillMulti(words, min, max);
-      else fillSingle(words, min, max);
+      if (selector == nullptr) fillWindow<false>(words, min, max);
+      else fillSparseWindow(words, min, max);
     }
 
     int32_t next() override {
@@ -2048,7 +2115,8 @@ public:
     }
 
     Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
-                                               IndexReader::Segment& segment) {
+                                               IndexReader::Segment& segment,
+                                               bool eager = true) {
       const auto* segInfo = segmentInfo(segment);
       if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
@@ -2060,7 +2128,7 @@ public:
       auto* plans = targetPool.make<BlockPlans>(targetPool, *reader, query);
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, *plans, query,
-          segment.maxDoc(), constantScore, true);
+          segment.maxDoc(), constantScore, eager);
     }
 
   };
