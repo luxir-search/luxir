@@ -117,6 +117,10 @@ private:
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
   std::map<CollectionId, Slot> slots;
+  // Policy setters and final publication serialize independently of searches.
+  std::mutex cachePolicyMutex;
+  size_t cacheDefaultBytes;
+  std::map<CollectionId, size_t> cacheExceptions;
   // Announced collections by tenant and name, changed only with their
   // announcements, so a listing reads its tenant without visiting the others.
   std::mutex listingMutex;
@@ -129,6 +133,10 @@ private:
   // under a new incarnation. Returns the incarnation to open.
   std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
   void observe(const CollectionId& id, Collection& collection);
+  // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
+  size_t cacheBytes(const CollectionId& id) const;
+  void applyCachePolicy(const CollectionId& id, const std::shared_ptr<Collection>& collection);
+  void listCollection(const CollectionId& id, const std::shared_ptr<Collection>& collection);
   // Lists and announces a registration, or a removal.
   void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
   void removed(const CollectionId& id);
@@ -159,6 +167,10 @@ public:
   // Announced collections in tenant and name order: all, or one tenant's.
   std::vector<Entry> entries();
   std::vector<Entry> entries(std::string_view tenant);
+  // Changes session policy and resizes the current selection. Empty selectors
+  // change the default for future collections and clear individual exceptions.
+  // Named unavailable collections are selectable; unknown names are refused.
+  std::vector<Entry> setCacheBytes(std::string_view tenant, std::string_view collection, size_t bytes);
   // Tenants with an announced collection, in order.
   std::vector<std::string> tenants();
 

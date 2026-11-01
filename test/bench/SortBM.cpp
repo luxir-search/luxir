@@ -5,6 +5,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/query/QueryPrep.h"
@@ -41,7 +42,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
   for (auto _ : state) {
     auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("string_sort_bm");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(100)
         .fields({"id", "short_u10k_s"});
     qb::sort(top, "short_u10k_s", direction);
     req->execute(false);
@@ -421,3 +422,72 @@ INT_SORT_SHAPE_CAPTURES(and_01_10, IntSortShape::AND_01_10)
 INT_SORT_SHAPE_CAPTURES(and_10_10, IntSortShape::AND_10_10)
 INT_SORT_SHAPE_CAPTURES(phrase_mid, IntSortShape::PHRASE_MID)
 INT_SORT_SHAPE_CAPTURES(phrase_hh, IntSortShape::PHRASE_HH)
+
+// A multi-valued int sort over one segment of docs holding eight random
+// values each: SET edge reads and ARRAY scans, bare fields and reducers.
+static void BM_MultiIntSort(benchmark::State& state, const char* sortExpr,
+                            qb::SortDir direction, bool array) {
+  int64_t nDocs = 2'000'000;
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
+  std::string collection = std::format("multi_int_sort_bm_{}_{}", array ? "array" : "set", nDocs);
+  CollectionHelper helper(collection);
+  std::vector<int32_t> docsPerSeg{(int32_t)nDocs};
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("many_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    auto iw = helper.getIndexWriter();
+    Inverter& inverter = iw->obtainInverter();
+    Inverter::InputHandler& id = inverter.getIndexHandler("id");
+    Inverter::InputHandler& many = inverter.getIndexHandler("many_is");
+    int64_t values[8];
+    for (int64_t doc = 0; doc < nDocs; doc++) {
+      SplitMix64 r(doc);
+      inverter.startDoc();
+      id.index(inverter, std::to_string(doc));
+      for (int64_t& value : values) value = r.rint(1'000'000'000);
+      many.index(inverter, std::span<const int64_t>(values));
+      inverter.finishDoc();
+    }
+    iw->releaseInverter(inverter, true);
+    helper.commit();
+  }
+
+  std::optional<uint64_t> fingerprint;
+  for (auto _ : state) {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
+    qb::sort(top, sortExpr, direction);
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    uint64_t current = 0;
+    for (const auto& batch : req->responses) {
+      const auto* list = batch->proto.ops.at("q")->docList();
+      for (const auto& docId : std::get<api::ColStr>(list->columns.at("id").kind).v) {
+        current = current * 31 + java_string_hashcode(docId);
+      }
+    }
+    benchmark::DoNotOptimize(current);
+    if (fingerprint) {
+      ASSERT_EQ(*fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["fp"] = (int64_t)fingerprint.value_or(0);
+  state.counters["reused"] = reused;
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_asc, "many_is", qb::ASC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_desc, "many_is", qb::DESC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, min_asc, "min(many_is)", qb::ASC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, max_desc, "max(many_is)", qb::DESC, false);
+
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_asc, "many_is", qb::ASC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_desc, "many_is", qb::DESC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_min_asc, "min(many_is)", qb::ASC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_max_desc, "max(many_is)", qb::DESC, true);

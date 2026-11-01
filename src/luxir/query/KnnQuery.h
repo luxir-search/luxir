@@ -9,18 +9,22 @@
 #include <faiss/MetricType.h>
 #include <faiss/impl/IDSelector.h>
 #include <faiss/impl/DistanceComputer.h>
+#include <faiss/impl/RaBitQUtils.h>
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -30,9 +34,11 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
+#include "KnnIntervalCollector.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/RowReadAhead.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
@@ -57,22 +63,17 @@ namespace luxir {
 ///   2. Build one engine slot per segment behind the VectorEngine seam:
 ///      SegmentFlatColumnVectorEngine (exact brute-force over the mmapped
 ///      column - the default and the below-IVF-threshold fallback) or
-///      SegmentFaissVectorEngine (IVF+RaBitQ or IVF+PQ aux, approximate).  All slots are
+///      SegmentIvfScanner (IVF+RaBitQ or IVF+PQ aux, approximate).  All slots are
 ///      wrapped in one CompositeVectorEngine, which owns global IVF list
 ///      allocation across segments (see its class comment).
-///   3. WIDEN: the host loop below re-enters engine->search() until enough
-///      distinct live docs are pooled, deepening along two axes (candidate
-///      depth, then IVF breadth).  All widening runs on engine scores; exact
-///      rescore never influences the loop.  Each search() round scans its
-///      (segment, list-range) work units on parallel TBB tasks when the
-///      request is parallel (PrepareContext.parallel), merging through an
-///      AtomicMerger accumulator; the round itself is a barrier, so the
-///      deepen decisions stay sequential.
-///   4. REFINE once: a single terminal pass rescores the pooled candidates
-///      from the full-precision column (one ordered sparse pass per segment,
-///      parallel across segments), collapses multi-valued hits to docs, and
-///      cuts the global top-k.  Hits are then bucketed per segment in docId
-///      order for the segment-parallel TopDocsReq pipeline.
+///   3. WIDEN: satisfy the bounded channel's document budget and reach k
+///      distinct units. DEPTH uses a fresh bounded cut; BREADTH carries
+///      interval records and witnesses into newly selected lists. Shared
+///      floors span chunks and segments, with a barrier between rounds.
+///   4. REFINE: read distinct-unit seeds and mandatory bounded candidates,
+///      then the remaining competitive interval values. Both read sets are
+///      ordered by segment/value rank and reuse exact scores. Collapse to
+///      exact unit representatives and materialize per-segment hit arrays.
 ///
 /// Request knobs (see KnnQuery message in luxir_types.proto for the wire
 /// contract): k = selected units to return (docs by default, groups with a
@@ -88,8 +89,8 @@ namespace luxir {
 /// live-filtered (liveDocs intersected with any enclosing filter clauses),
 /// and a null domain means no deletes and no filters.  The column engine
 /// checks it directly while scanning docs.  FAISS aux engines pick the
-/// cheapest selector per segment: none at all when the domain is null (the
-/// scanner's per-vector check compiles out), a cached rank-space liveness
+/// cheapest selector per segment: none when the domain is null, a cached
+/// rank-space liveness
 /// bitmap when the domain is exactly liveDocs (built once per liveDocs
 /// generation, shared across queries), or a resolve-based IDSelector for
 /// per-query filtered domains.
@@ -98,8 +99,8 @@ namespace luxir {
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
 /// engine collapses a doc's vectors while scanning and returns one best vector
 /// per doc.  Approximate aux engines return vector candidates instead; the
-/// host pools them and the terminal refine collapses.  Above maxKnnCandidates
-/// the result is best-effort.
+/// host pools them and the terminal refine collapses. Bounded selection is
+/// best-effort at maxKnnCandidates; intervals use the request-memory ceiling.
 class KnnQuery final : public luxir::Query {
   std::string_view field;
   const VectorFieldType& fieldType;
@@ -147,6 +148,9 @@ public:
 
   struct Stats {
     std::atomic<int64_t> lists{0}, vectors{0}, bytes{0}, rounds{0};
+    // Selector-passing codes, including those rejected by the 1-bit gate.
+    std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0};
+    std::atomic<int64_t> retainedPeak{0}, retainedTerminal{0}, seedReads{0}, remainingReads{0};
   };
   static inline Stats* statsForTests = nullptr;
   // Test/benchmark seam only. Zero selects the measured default; positive
@@ -178,34 +182,34 @@ public:
   // degenerates into a per-tiny-list task (a PQ list scan is only a few
   // microseconds at default sizing).  Per-list live sizes are already priced
   // by the allocator, so chunking is exact, not estimated.  Chunk boundaries
-  // are identical in serial and parallel mode - the knob changes scheduling,
-  // never results.  Mutable for tests.
+  // are identical in serial and parallel mode. Shared confidence pruning
+  // can change work and rare approximate misses with scheduling. Mutable for tests.
   static inline int64_t scanTaskGrainVectors = 8192;
+
+  static constexpr float RABITQ_GATE_EPSILON = 1.9f;
+  static constexpr float RABITQ_SELECTION_EPSILON = 1.9f;
 
   // Terminal-rescore task sizing: a segment's candidate bucket runs as its
   // own task only at or above this many pooled candidates; smaller buckets
   // fold inline on the calling thread.  Mutable for tests.
   static inline int64_t rescoreTaskGrainCandidates = 256;
 
-  // Approximate ANN engines over-fetch vector candidates before exact
-  // full-precision rescore.  Default sizing is affine with a DECAYING ratio:
-  //   kReq = count + k * max(REFINE_MIN_RATIO, log2(REFINE_UNITY_K / k))
-  // (same shape as Solr's distributed-faceting overrequest, count +
-  // ratio*limit, with the ratio shrinking as k grows).  Rationale: PQ
-  // mis-ranking displaces a true neighbor by an absolute number of impostors
-  // that does not scale with k, so small k needs the fixed headroom - while
-  // large k is shotgun retrieval whose near-tied tail nobody can rank
-  // meaningfully (and no benchmark measures recall that deep), so the
-  // multiplier decays to REFINE_MIN_RATIO by k = REFINE_UNITY_K instead of
-  // inflating the rescore pool and the engine's result heap.  An explicit
-  // request refine_candidates pins the pool size directly (clamped up to k -
-  // an absolute count like nprobe, not a multiplier).  defaultAnnRefineRatio:
-  // 0 = the adaptive decay; > 0 pins a fixed default ratio (tests use this
-  // to emulate a pure multiplier).  Mutable for tests / benches.
-  static inline int32_t defaultAnnRefineCount = 128;
-  static inline int32_t defaultAnnRefineRatio = 0;
-  static constexpr double REFINE_UNITY_K = 1000.0;
-  static constexpr double REFINE_MIN_RATIO = 1.1;
+  // Cover the vectors whose estimate error can swap them with the k-th
+  // neighbor; that band holds sublinearly more vectors as k grows. Constants
+  // measured on 1024-d IP, PQ M=128 x 8 bits: within 0.001 recall of the
+  // scanned-list ceiling for k=1..1000 at default effort and nprobe=256.
+  // An explicit refine_candidates replaces this default (clamped up to k).
+  // Fitted on one corpus. Larger estimate error relative to neighbor gaps
+  // (960-d L2 descriptors, 768/1536-d text with real queries) leaves recall
+  // that larger counts recover. RaBitQ interval selection does not use this.
+  static int64_t boundedDefaultCandidates(int64_t k, int64_t cap) {
+    assert(k > 0 && cap >= 0);
+    if (k >= cap) return cap;
+    double headroom = 24.0 + std::ceil(15.0 * std::pow((double)k, 0.8));
+    // Check before conversion/addition, including when cap is INT64_MAX.
+    if (headroom >= (double)(cap - k)) return cap;
+    return k + (int64_t)headroom;
+  }
 
   // Dimension-aware default IVF effort.  The nprobe=0 scan fraction
   // (1/sqrt(referenceBreadth), see defaultBudget) is scaled by
@@ -292,10 +296,11 @@ public:
 
   /// Strict total order on engine hits: score desc, then (segOrd, valueRank)
   /// asc.  Being total makes every bounded top-N cut deterministic regardless
-  /// of scan or merge order - the property the parallel scan accumulator
-  /// relies on for parallel == serial results.  Totality requires non-NaN
-  /// scores: the query vector is validated finite up front, and finiteScore
-  /// maps any NaN arising from stored vectors to the worst finite score.
+  /// of arrival order for a given candidate set. Confidence pruning can
+  /// change that set with scheduling. Totality requires non-NaN
+  /// scores: query and stored vectors share VectorFieldType::inputError's
+  /// bounds, which keep distances finite, and finiteScore maps any NaN that
+  /// still arises to the worst finite score.
   static bool betterHit(const VectorEngineHit& a, const VectorEngineHit& b) noexcept {
     if (a.score != b.score) return a.score > b.score;
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
@@ -369,8 +374,10 @@ public:
       truncated = true;
       return Better(hit, state->heap.top());
     }
-    const T* floor() const requires Groups {
-      return limit > 0 && (int64_t)state->heap.size() == limit ? &state->heap.top() : nullptr;
+    const T* floor() const {
+      if (limit <= 0 || (int64_t)size() != limit) return nullptr;
+      if constexpr (Groups) return &state->heap.top();
+      else return &docs.front();
     }
     int32_t document(const T& hit) const requires Groups {
       if constexpr (std::is_same_v<T, DocHit>) return hit.docId;
@@ -418,6 +425,119 @@ public:
         for (const auto& hit : state->heap.span()) result.push_back(hit);
         return result;
       }
+    }
+  };
+
+  template <bool Groups> class UnitKeyReader {
+    std::conditional_t<Groups, std::optional<CollapseKeyReader>, NoGroupState> reader;
+    uint64_t docKey;
+    int32_t segment = -1;
+  public:
+    explicit UnitKeyReader(const CollapsePlan* plan) {
+      if constexpr (Groups) reader.emplace(*plan);
+    }
+    auto read(int32_t segOrd, int32_t doc) {
+      if constexpr (Groups) {
+        if (segment != segOrd) { reader->setSegment(segOrd); segment = segOrd; }
+        return reader->read(segOrd, doc);
+      } else {
+        docKey = packSegDoc(segOrd, doc);
+        return &docKey;
+      }
+    }
+  };
+
+  template <bool Groups>
+  class BoundedScanCut {
+  public:
+    static constexpr size_t BATCH_SIZE = 64;
+    struct GroupKeys {
+      std::array<CollapseKey, BATCH_SIZE> keys;
+      std::array<int32_t, BATCH_SIZE> docs;
+    };
+    struct Batch {
+      std::array<VectorEngineHit, BATCH_SIZE> hits;
+      [[no_unique_address]] std::conditional_t<Groups, GroupKeys, NoGroupState> groups;
+      size_t size = 0;
+    };
+
+  private:
+    int64_t limit;
+    BoundedHits<Groups, VectorEngineHit, betterHit> approximate;
+    std::vector<VectorEngineHit> exact;
+    std::mutex mutex;
+    std::atomic<float> publishedFloor{-std::numeric_limits<float>::infinity()};
+    int64_t approximateVisited = 0;
+    bool anyApproximate = false;
+    bool partsExhausted = true;
+
+    void publish() {
+      if (const auto* floor = approximate.floor()) {
+        // The cut never changes within an epoch; serialized heap updates
+        // only raise its floor. Readers need no access to the heap itself.
+        publishedFloor.store(floor->score, std::memory_order_relaxed);
+      }
+    }
+
+  public:
+    BoundedScanCut(int64_t limit, const CollapsePlan* plan,
+                   std::span<const SegV2D> v2d, size_t perKey)
+        : limit(limit), approximate(limit, plan, v2d, perKey) {
+      assert(limit > 0);
+    }
+
+    float floorScore() const { return publishedFloor.load(std::memory_order_relaxed); }
+    size_t batchSize() const { return (size_t)std::min(limit, (int64_t)BATCH_SIZE); }
+
+    void offer(Batch& batch) {
+      std::lock_guard lock(mutex);
+      for (size_t i = 0; i < batch.size; i++) {
+        if constexpr (Groups) {
+          approximate.offerKey(batch.hits[i], batch.groups.keys[i], batch.groups.docs[i]);
+        } else approximate.offer(batch.hits[i]);
+      }
+      publish();
+      batch.size = 0;
+    }
+
+    void finishScan(int64_t scanned) {
+      std::lock_guard lock(mutex);
+      approximateVisited += scanned;
+      anyApproximate = true;
+    }
+
+    void foldPart(const VectorSearchResult& part) {
+      std::lock_guard lock(mutex);
+      if (part.scoresAreExact) {
+        exact.insert(exact.end(), part.hits.begin(), part.hits.end());
+      } else {
+        anyApproximate = true;
+        approximateVisited += (int64_t)part.hits.size();
+        for (const auto& hit : part.hits) approximate.offer(hit);
+        publish();
+      }
+      if constexpr (Groups) {
+        if (!part.scoresAreExact) partsExhausted &= (part.boundedSelection == VectorSelection::COMPLETE);
+      } else partsExhausted &= (part.boundedSelection == VectorSelection::COMPLETE);
+    }
+
+    // Called after the task barrier. Exact hits bypass the approximate cut.
+    VectorSearchResult take() {
+      VectorSearchResult result;
+      result.scoresAreExact = !anyApproximate;
+      result.boundedSelection = partsExhausted && (Groups
+          ? !approximate.truncated && approximate.size() < (size_t)limit
+          : approximateVisited <= limit) ? VectorSelection::COMPLETE : VectorSelection::MORE_DEPTH;
+      if (!result.scoresAreExact) {
+        for (const auto& hit : exact) result.exactSegOrds.push_back(hit.segOrd);
+        std::sort(result.exactSegOrds.begin(), result.exactSegOrds.end());
+        result.exactSegOrds.erase(std::unique(result.exactSegOrds.begin(), result.exactSegOrds.end()),
+                                  result.exactSegOrds.end());
+      }
+      result.hits = approximate.take();
+      result.hits.insert(result.hits.end(), exact.begin(), exact.end());
+      std::sort(result.hits.begin(), result.hits.end(), betterHit);
+      return result;
     }
   };
 
@@ -555,11 +675,9 @@ public:
     // selection is visible here and key equality remains self-contained.
     out.appendInt64(std::max((int64_t)1, maxKnnCandidates));
     out.appendInt32(std::max(0, maxKnnBreadth));
-    out.appendInt32(defaultAnnRefineCount);
-    out.appendInt32(defaultAnnRefineRatio);
     out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
-    // contract. Production engines are deterministic for a pinned reader.
+    // contract.
     return engineWrapperForTests || groups != nullptr ? FilterKeyScope::UNCACHEABLE
                                  : FilterKeyScope::READER_STABLE;
   }
@@ -672,13 +790,13 @@ public:
       uint8_t queryBits;
     };
 
-    template <bool Groups> class SegmentFaissVectorEngine;
+    template <bool Groups> class SegmentIvfScanner;
 
     template <bool Groups> struct EngineSlot {
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
       int64_t liveVectorCount = 0;
-      SegmentFaissVectorEngine<Groups>* ivfEngine = nullptr;
+      std::unique_ptr<SegmentIvfScanner<Groups>> ivfEngine;
     };
 
   public:
@@ -738,7 +856,7 @@ public:
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
 
-      int64_t totalDocsWithValue = 0;
+      int64_t boundedDocsWithValue = 0, boundedVectors = 0, boundedLiveVectors = 0;
       bool anyMultiValued = false;
       int32_t dims = (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
@@ -763,10 +881,12 @@ public:
                 "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",
                 dims, vr.dims(), query.getField()));
             }
-            totalDocsWithValue += vr.docsWithValue();
+            bool bounded = vauxPerSeg[i] != nullptr
+                && (!vauxPerSeg[i]->isRaBitQ() || query.getRefineCandidates() > 0);
+            if (bounded) { boundedDocsWithValue += vr.docsWithValue(); boundedVectors += segCount; }
             segVectorCounts[i] = segCount;
             if (vr.isMultiValued()) {
-              anyMultiValued = true;
+              anyMultiValued |= bounded;
               // valueRank -> docId comes straight off the column's reverse map.
               MonoReader* mr = vr.strColReader().getValDocReader();
               if (mr == nullptr) {
@@ -804,6 +924,7 @@ public:
             } else {
               segLiveVectorCounts[i] = liveVectorUpperBound(seg, vr);
             }
+            if (bounded) boundedLiveVectors += segLiveVectorCounts[i];
           }
         }
       }
@@ -833,26 +954,22 @@ public:
       std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
 
       int64_t kDocs = query.getK();
-      int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
-      // exact is a contract: the maxKnnCandidates host heuristic must not
-      // silently truncate the requested k (the explicit knob wins).  ntotal
-      // still bounds it - fewer stored docs than k is not a violation, the
-      // true top-k is simply all of them.
-      if (query.getExact()) cap = std::min(ntotal, std::max(cap, kDocs));
+      bool boundedEngine = boundedVectors > 0;
+      KnnIntervalCollector<Groups> intervals(kDocs, context.planningContext().memoryTracker, query.getField());
       std::vector<EngineSlot<Groups>> slots;
       slots.reserve(numSegs);
-      bool approximateEngine = false;
+      bool intervalEngine = false;
       // RaBitQ overlays index the rotated space: the query is rotated once
       // per distinct rotation (overlays of one dims share one interned
-      // matrix) and outlives every engine built below.  Each inner buffer
+      // transform) and outlives every engine built below.  Each inner buffer
       // keeps its address when the outer vector grows.
-      std::vector<std::pair<const faiss::LinearTransform*, std::vector<float>>> rotatedQueries;
-      auto rotatedQuery = [&](const faiss::LinearTransform* rotation) -> const float* {
+      std::vector<std::pair<const VectorRotation*, std::vector<float>>> rotatedQueries;
+      auto rotatedQuery = [&](const VectorRotation* rotation) -> const float* {
         for (const auto& [rot, buf] : rotatedQueries) {
           if (rot == rotation) return buf.data();
         }
         auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
-        rotation->apply_noalloc(1, queryPtr, entry.second.data());
+        rotation->apply(queryPtr, entry.second.data());
         return entry.second.data();
       };
       // RaBitQ query quantization is a search-time knob: the current
@@ -891,26 +1008,21 @@ public:
           }
           // Both codecs are IVF; each segment is served by its own overlay's
           // meta, so segments built with different codecs mix freely.
-          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ
-            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFRABITQ;
-          approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          auto* ivf = dynamic_cast<faiss::IndexIVF*>(idx);
+          if (ivf == nullptr) throw std::runtime_error("KnnQuery: vector aux is not an IVF index");
+          bool interval = vaux->isRaBitQ() && query.getRefineCandidates() == 0;
+          intervalEngine |= interval;
           const float* indexQuery = vaux->getRotation() != nullptr
             ? rotatedQuery(vaux->getRotation())
             : queryPtr;
-          // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
-          // loop's foldSeen() seeds the eligible bitmaps from it.
-          auto faissEngine = std::make_unique<SegmentFaissVectorEngine<Groups>>(
-            *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
-            rankLivePerSeg[i],
-            metric, vaux->scoresAreExact(), isIvf,
-            vaux->getNList(), query.groups, v2dSpan,
-            PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits});
-          SegmentFaissVectorEngine<Groups>* ivfEngine = isIvf ? faissEngine.get() : nullptr;
           slots.push_back({
-            .engine = std::move(faissEngine),
+            .engine = nullptr,
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
-            .ivfEngine = ivfEngine,
+            .ivfEngine = std::make_unique<SegmentIvfScanner<Groups>>(
+                *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
+                metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
+                vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -927,39 +1039,36 @@ public:
         return emptyResult();
       }
 
-      int64_t avgMult = (!Groups && approximateEngine && anyMultiValued && totalDocsWithValue > 0)
-        ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
+      // The bounded policy retains its existing work cap. Interval retention
+      // has only the request's opt-in byte ceiling, regardless of input size.
+      int64_t cap = query.getExact() || (intervalEngine && !boundedEngine) ? ntotal
+          : std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
+      int64_t selectedLimit = intervalEngine || query.getExact() ? kDocs : std::min(kDocs, cap);
+
+      int64_t avgMult = (!Groups && boundedEngine && anyMultiValued && boundedDocsWithValue > 0)
+        ? ceilDivClamped(boundedVectors, boundedDocsWithValue, cap)
         : 1;
       int64_t baseReq = kDocs;
-      if (approximateEngine) {
-        // Explicit refine_candidates pins the candidate pool size (an
-        // absolute count, clamped up to k); the absent-knob default is
-        // affine with a k-decaying ratio (see defaultAnnRefineCount above).
+      if (boundedEngine) {
         if (query.getRefineCandidates() > 0) {
           baseReq = std::min(cap, std::max(kDocs, (int64_t)query.getRefineCandidates()));
         } else {
-          double ratio = defaultAnnRefineRatio > 0
-            ? (double)defaultAnnRefineRatio
-            : std::max(REFINE_MIN_RATIO, std::log2(REFINE_UNITY_K / (double)kDocs));
-          baseReq = std::min(cap, (int64_t)defaultAnnRefineCount
-                                    + (int64_t)((double)kDocs * ratio));
+          baseReq = boundedDefaultCandidates(kDocs, cap);
         }
         baseReq = std::max(baseReq, kDocs);
       }
       int64_t kReq = Groups ? std::min(baseReq, cap) : mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return emptyResult();
-      int64_t targetDocReq = approximateEngine
-        ? std::min<int64_t>(liveNTotal, std::max(kDocs, baseReq))
-        : kDocs;
+      int64_t targetDocReq = boundedEngine
+        ? std::min<int64_t>(boundedLiveVectors, std::max(kDocs, baseReq))
+        : 0;
 
-      std::vector<VectorEngineHit> candidateHits;
+      std::vector<VectorEngineHit> candidateHits, exactCandidates;
       std::conditional_t<Groups, std::unique_ptr<BoundedHits<true, VectorEngineHit, betterHit>>, NoGroupState> groupPool;
-      std::conditional_t<Groups, std::unique_ptr<BoundedHits<true, VectorEngineHit, betterHit>>, NoGroupState> exactPool;
       int64_t perKey = 1;
       if constexpr (Groups) {
-        perKey = approximateEngine ? membersPerGroup(baseReq, kDocs) : 1;
+        perKey = boundedEngine ? membersPerGroup(baseReq, kDocs) : 1;
         groupPool = std::make_unique<BoundedHits<true, VectorEngineHit, betterHit>>(std::min(baseReq, cap), query.groups, v2dSpan, (size_t)perKey);
-        exactPool = std::make_unique<BoundedHits<true, VectorEngineHit, betterHit>>(std::min(kDocs, cap), query.groups, v2dSpan);
       }
       boost::unordered_flat_set<uint64_t> seenVectors;
       std::vector<DocHit> docHits;
@@ -976,8 +1085,8 @@ public:
       if constexpr (!Groups) seenDocs.reserve(maxDocHits);
 
       std::unique_ptr<VectorEngine> baseEngine =
-        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ntotal, liveNTotal, kDocs,
-                                                metric, ctx.parallel, query.groups, v2dSpan);
+        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), liveNTotal, kDocs,
+                                                metric, ctx.parallel, query.groups, v2dSpan, intervals);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
@@ -995,7 +1104,6 @@ public:
         ? query.getNProbe()
         : std::max(0, maxKnnBreadth);
       bool candidatePoolSorted = true;
-      bool candidateScoresExact = true;
 
       // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
       // common only round) uses the small seenVectors hash set and passes no
@@ -1079,20 +1187,9 @@ public:
 
       bool candidatesExhausted = true;
 
-      // WIDEN loop: pool candidates until targetDocReq distinct live docs (or
-      // a pool/breadth/cap limit).  Two deepen axes, tried in order:
-      //   DEPTH   - the engine pool was not exhausted at this candidate count:
-      //             grow kReq (more candidates from the same lists / scan).
-      //   BREADTH - pool exhausted but more IVF lists remain: grow breadth
-      //             (the engine allocates the next globally-best lists).
-      // The whole loop runs on ENGINE scores (exact for column slots,
-      // approximate for IVF overlays, possibly above 1 for L2): the stopping
-      // condition is a distinct-doc COUNT, which approximate scores answer
-      // just as well, so exact rescore
-      // is deferred to one terminal pass after the loop.  Deliberately not
-      // overlapped with rescore: interleaving would re-read column vectors
-      // for segments that later rounds add candidates to, trading throughput
-      // under load for latency.
+      // Bounded DEPTH and IVF BREADTH are independent obligations. Interval
+      // state persists across breadth rounds and never asks for more depth.
+      // Exact reads remain terminal, after all scanning has finished.
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
@@ -1106,7 +1203,7 @@ public:
         VectorSearchResult result = engine->search(request);
         if (statsForTests) statsForTests->rounds++;
 
-        candidatesExhausted = result.poolExhausted && result.breadthExhausted;
+        candidatesExhausted = (result.boundedSelection == VectorSelection::COMPLETE) && result.breadthExhausted;
         size_t appendStart = candidateHits.size();
         bool freshDocuments = false;
         std::vector<char> roundExactSeg;
@@ -1117,30 +1214,24 @@ public:
           }
         }
         for (const auto& hit : result.hits) {
+          bool exactHit = result.scoresAreExact || (!roundExactSeg.empty() && roundExactSeg[(size_t)hit.segOrd]);
+          if (exactHit) {
+            exactCandidates.push_back(hit);
+            continue;
+          }
           if constexpr (!Groups) if (candidateHits.size() >= maxVectorHits) break;
           if (markSeen(hit.segOrd, hit.valueRank)) {
             if constexpr (Groups) {
               freshDocuments = true;
-              bool exactHit = result.scoresAreExact || (!roundExactSeg.empty() && roundExactSeg[(size_t)hit.segOrd]);
-              if (exactHit) exactPool->offer(hit);
-              else groupPool->offer(hit);
-            }
-            else candidateHits.push_back(hit);
-            if (!result.scoresAreExact
-                && (roundExactSeg.empty() || !roundExactSeg[(size_t)hit.segOrd])) {
-              segApproxInPool[(size_t)hit.segOrd] = 1;
-            }
+              groupPool->offer(hit);
+            } else candidateHits.push_back(hit);
+            segApproxInPool[(size_t)hit.segOrd] = 1;
           }
         }
-        if constexpr (Groups) {
-          candidateHits = groupPool->take();
-          auto exactHits = exactPool->take();
-          candidateHits.insert(candidateHits.end(), exactHits.begin(), exactHits.end());
-        }
+        if constexpr (Groups) candidateHits = groupPool->take();
         bool appended = Groups ? freshDocuments : candidateHits.size() != appendStart;
         if (appended) {
           candidatePoolSorted = false;
-          if (!result.scoresAreExact) candidateScoresExact = false;
         }
 
         if (!candidatePoolSorted) {
@@ -1154,12 +1245,22 @@ public:
         // two channels without reaching k groups under the approximate cap.
         int64_t pooled = (int64_t)docHits.size();
         size_t poolSize = candidateHits.size();
-        if constexpr (Groups) if (approximateEngine) {
+        if constexpr (Groups) if (boundedEngine) {
           pooled = (int64_t)groupPool->size();
           poolSize = groupPool->size();
         }
-        if (pooled >= targetDocReq) break;
-        if (poolSize >= maxVectorHits) break;
+        bool boundedDone = !boundedEngine || pooled >= targetDocReq || poolSize >= maxVectorHits;
+        intervals.resetBoundedUnits();
+        UnitKeyReader<Groups> keyReader(query.groups);
+        for (const auto& hit : candidateHits) {
+          int32_t doc = v2dSpan[(size_t)hit.segOrd].resolve(hit.valueRank);
+          const auto* key = keyReader.read(hit.segOrd, doc);
+          if (key) intervals.observeBounded(*key);
+        }
+        intervals.compact();
+        bool unitsFilled = intervals.unitCount() >= (size_t)kDocs;
+        if (boundedDone && unitsFilled) break;
+        if (!intervalEngine && poolSize >= maxVectorHits) break;
 
         // DEPTH: document mode projects the pool size needed for targetDocReq
         // docs from observed docs-per-candidate yield, then requests only
@@ -1170,8 +1271,8 @@ public:
         // degenerate projection still progresses.  `appended` is the
         // termination backstop: a round that added nothing fresh and still
         // claims an unexhausted pool (a conforming engine cannot - fresh
-        // hits or poolExhausted) must not loop at the same shape.
-        if (!result.poolExhausted && appended
+        // hits or bounded completion) must not loop at the same shape.
+        if (!boundedDone && result.boundedSelection == VectorSelection::MORE_DEPTH && appended
             && (int64_t)poolSize < cap) {
           if constexpr (Groups) {
             // A deficit-sized fresh cut can spend every slot on keys already
@@ -1189,43 +1290,29 @@ public:
           continue;
         }
 
-        if (result.poolExhausted && !result.breadthExhausted && breadth < maxBreadth) {
+        if ((boundedDone || result.boundedSelection == VectorSelection::COMPLETE) && !result.breadthExhausted && breadth < maxBreadth) {
           int32_t nextBreadth = result.nextBreadth > breadth ? result.nextBreadth : breadth + 1;
           breadth = std::min(nextBreadth, maxBreadth);
-          foldSeen();
+          if (boundedEngine) foldSeen();
           continue;
         }
 
         break;
       }
 
-      // REFINE: one terminal exact pass over the whole pooled candidate set.
-      // Running it once (instead of per widen round) means each segment's
-      // sorted sparse column read happens exactly once, and no incremental
-      // "already rescored" bookkeeping is needed.  The full pool (not just
-      // targetDocReq docs) feeds the rescore, so exact scores can promote any
-      // pooled vector into the final top-k.  All-exact pools skip it; their
-      // loop-time collapse used targetDocReq, so re-cut to kDocs if larger.
-      if (!candidateScoresExact && !candidateHits.empty()) {
-        rescoreAndCollapseCandidates<Groups>(candidateHits,
-                                     reader,
-                                     segInfos,
-                                     v2dSpan,
-                                     std::span<const char>(segApproxInPool.data(), segApproxInPool.size()),
-                                     queryPtr, dims, metric, normalizeColumnOnCosineRescore,
-                                     kDocs, docHits, ctx.parallel, query.groups);
-      } else if constexpr (Groups) {
-        // All-exact parts still require a global cap-one group cut. Reuse
-        // the exact pool instead of materializing another collection ladder.
-        docHits.clear();
-        for (const auto& hit : exactPool->take()) docHits.push_back({hit.segOrd, v2dSpan[(size_t)hit.segOrd].resolve(hit.valueRank), hit.score});
-        std::sort(docHits.begin(), docHits.end(), betterDoc);
-      } else if ((int64_t)docHits.size() > kDocs) {
-        collapseCandidates(candidateHits, v2dSpan, kDocs, docHits, seenDocs);
+      // Both terminal stages read in segment/value-rank order. Bounded
+      // candidates are mandatory seed reads; interval records bypass their cut.
+      candidateHits.insert(candidateHits.end(), exactCandidates.begin(), exactCandidates.end());
+      if (statsForTests && intervalEngine) {
+        statsForTests->retainedPeak += (int64_t)intervals.peakRetained();
+        statsForTests->retainedTerminal += (int64_t)intervals.retained().size();
       }
+      rescoreAndCollapseCandidates<Groups>(candidateHits, intervals, reader, segInfos, v2dSpan,
+          segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
+          selectedLimit, docHits, ctx.parallel, query.groups);
 
       if constexpr (Groups) {
-        candidatesExhausted &= !groupPool->truncated && !exactPool->truncated;
+        candidatesExhausted &= !groupPool->truncated && selectedLimit >= kDocs;
         if ((int64_t)docHits.size() < kDocs && ctx.warnings) {
           ctx.warnings->warnOnce("knn_group_underfill", std::format(
               "field '{}': returned {} of k={} groups; candidates_exhausted={}",
@@ -1287,20 +1374,13 @@ public:
     }
 
   private:
-    /// Per-segment adapter over a deserialized FAISS aux index.  FAISS ids are
-    /// segment-local valueRanks, mapped to docIds through SegV2D by the
-    /// selector and by the host after collapse.
-    ///
-    /// IVF indexes do not drive themselves: the CompositeVectorEngine's global
-    /// allocator calls coarseRun() (full sorted centroid ranking) and
-    /// liveListSize() to pick lists across ALL segments, then hands the chosen
-    /// lists back through searchSelectedLists().  The plain search() override
-    /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
-    /// exists today (both codecs are IVF), so it is reserved seam
-    /// surface, not a live code path.
-    template <bool Groups> class SegmentFaissVectorEngine final : public VectorEngine {
+    // The composite allocates lists across segments; each scanner owns only
+    // immutable segment/query inputs. Distance computers and key readers are
+    // task-local, while the bounded cut spans every chunk and segment.
+    template <bool Groups> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
-      std::span<const SegV2D> groupV2d;
+      RaBitQAmplitudes amplitudes;
+      KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
       /// domain (the PrepareContext contract: a present domain already
@@ -1309,8 +1389,7 @@ public:
       /// this is the slow path - it is only used for per-query (filtered)
       /// domains; the unfiltered-with-deletes case uses the cached
       /// rank-space bitmap via faiss::IDSelectorBitmap instead, and the
-      /// no-deletes no-filter case passes no selector at all (the scanner's
-      /// per-vector check compiles out).
+      /// no-deletes no-filter case passes no selector.
       class LocalDomainSelector final : public faiss::IDSelector {
         const SegV2D& v2d;
         DocSet* domain;
@@ -1338,8 +1417,8 @@ public:
         }
       };
 
-      faiss::Index& index;
-      faiss::IndexIVF* ivf;
+      faiss::IndexIVF& ivf;
+      faiss::IndexIVFRaBitQ* rabitq;
       int32_t segOrd;
       const SegV2D& v2d;
       LiveDocs* liveDocs;
@@ -1354,17 +1433,13 @@ public:
       DocSet* domain;
       bool domainIsLive;
       int32_t metric;
-      bool exactScores;
-      bool isIvf;
-      int32_t nlist;
       // Owned by prepareUnit(): canonical for PQ, rotated for RaBitQ.
       const PreparedQuery preparedQuery;
 
       /// The ONLY selector policy: built per scan call from (domain,
       /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
       /// rounds cannot drift apart.  Cheapest selector wins:
-      ///   no domain, no eligible      -> null (FAISS compiles the per-vector
-      ///                                  check out)
+      ///   no domain, no eligible      -> null
       ///   domain == liveDocs          -> IDSelectorBitmap over rankLive, or
       ///                                  over eligible once present (it is
       ///                                  seeded from rankLive, so liveness
@@ -1373,15 +1448,15 @@ public:
       ///                                  eligible bit test (when present)
       ///                                  with the resolve-based check
       /// Per-call construction is two stores; owns the selector storage, so
-      /// keep it alive across the FAISS call (copy/move deleted to enforce
-      /// that selPtr never outlives the optionals it points into).
+      /// keep it alive throughout the scan so selPtr never outlives the
+      /// optionals it points into.
       class RoundSelector {
         std::optional<faiss::IDSelectorBitmap> bitmap;
         std::optional<LocalDomainSelector> domainSel;
         const faiss::IDSelector* selPtr = nullptr;
 
       public:
-        RoundSelector(const SegmentFaissVectorEngine& eng,
+        RoundSelector(const SegmentIvfScanner& eng,
                       const VectorSearchRequest& request) {
           std::span<const uint8_t> elig =
             (size_t)eng.segOrd < request.eligible.size()
@@ -1402,114 +1477,135 @@ public:
         RoundSelector(const RoundSelector&) = delete;
         RoundSelector& operator=(const RoundSelector&) = delete;
 
-        // FAISS declares sel as a mutable pointer but only calls const
-        // members on it during search.
-        faiss::IDSelector* get() const {
-          return const_cast<faiss::IDSelector*>(selPtr);
-        }
+        const faiss::IDSelector* get() const { return selPtr; }
       };
 
-      struct ScanContext {
-        RoundSelector selector;
-        const float* const query;
-        // PQ ignores the RaBitQ fields. sel points into selector, so this
-        // context must stay at its construction address throughout the scan.
-        faiss::IVFRaBitQSearchParameters params;
-
-        ScanContext(const SegmentFaissVectorEngine& eng,
-                    const VectorSearchRequest& request, size_t listCount)
-            : selector(eng, request), query(eng.preparedQuery.query) {
-          params.sel = selector.get();
-          params.nprobe = listCount;
-          params.qb = eng.preparedQuery.queryBits;
-          // max_codes stays 0: scan every selected list in full.
-        }
-
-        ScanContext(const ScanContext&) = delete;
-        ScanContext& operator=(const ScanContext&) = delete;
-        ScanContext(ScanContext&&) = delete;
-        ScanContext& operator=(ScanContext&&) = delete;
-      };
-
-      ScanContext prepareScan(const VectorSearchRequest& request, size_t listCount) const {
-        return ScanContext(*this, request, listCount);
-      }
-
-      struct GroupResultHandler final : faiss::ResultHandler {
-        BoundedHits<true, VectorEngineHit, betterHit>& heap;
+      class BoundedResultHandler final : public faiss::ResultHandler {
+        BoundedScanCut<Groups>& cut;
+        typename BoundedScanCut<Groups>::Batch batch;
         int32_t metric, segment;
-        GroupResultHandler(decltype(heap) heap, int32_t metric, int32_t segment)
-            : heap(heap), metric(metric), segment(segment) { updateThreshold(); }
+        float lastFloor = NAN;
+        const SegV2D& v2d;
+        struct GroupState {
+          CollapseKeyReader reader;
+          BoundedHits<true, VectorEngineHit, betterHit> local;
+          GroupState(const CollapsePlan& plan, int32_t segment, int64_t limit, size_t perKey)
+              : reader(plan), local(limit, &plan, {}, perKey) { reader.setSegment(segment); }
+        };
+        [[no_unique_address]] std::conditional_t<Groups,
+            std::unique_ptr<GroupState>, NoGroupState> groups;
+
+      public:
+        BoundedResultHandler(BoundedScanCut<Groups>& cut, int32_t metric, int32_t segment,
+                             const SegV2D& v2d, const CollapsePlan* plan,
+                             int64_t localLimit, size_t perKey)
+            : cut(cut), metric(metric), segment(segment), v2d(v2d) {
+          if constexpr (Groups) {
+            groups = std::make_unique<GroupState>(*plan, segment, localLimit, perKey);
+          }
+          updateThreshold();
+        }
         void updateThreshold() {
-          const auto* floor = heap.floor();
-          threshold = metric == (int32_t)api::VectorMetric::L2
-              ? std::numeric_limits<float>::infinity() : -std::numeric_limits<float>::infinity();
-          if (floor == nullptr) return;
-          // FAISS's strict distance test must admit equal exposed scores
-          // for our document tie. Invert one score ULP outward, then round
-          // the distance outward too (L2's score conversion rounds twice).
-          float score = std::nextafter(floor->score, -std::numeric_limits<float>::infinity());
-          if (metric == (int32_t)api::VectorMetric::L2) {
-            if (score > 0) {
-              float distance = score >= 1.0f ? 1.0f - score : 1.0f / score - 1.0f;
-              threshold = std::nextafter(distance, std::numeric_limits<float>::infinity());
-            }
-          } else threshold = score;
+          float score = cut.floorScore();
+          if constexpr (Groups) {
+            if (const auto* local = groups->local.floor()) score = std::max(score, local->score);
+          }
+          if (score != lastFloor) {
+            threshold = distanceThreshold(score, metric);
+            lastFloor = score;
+          }
+        }
+        void flush() {
+          if (batch.size != 0) cut.offer(batch);
+          updateThreshold();
         }
         bool add_result(float distance, faiss::idx_t rank) override {
-          bool admitted = heap.offer({scoreFromDist(distance, metric), segment, rank});
-          if (admitted) updateThreshold();
-          return admitted;
+          float score = scoreFromDist(distance, metric);
+          if (score < cut.floorScore()) return false;
+          if constexpr (Groups) {
+            int32_t doc = v2d.resolve(rank);
+            const auto* key = groups->reader.read(segment, doc);
+            if (key == nullptr) return false;
+            // A capped local top-R contains every possible global winner.
+            // Reject hot-group members before copying keys or locking the cut.
+            if (!groups->local.offerKey({score, segment, rank}, *key, doc)) return false;
+            batch.groups.keys[batch.size] = *key;
+            batch.groups.docs[batch.size] = doc;
+          }
+          batch.hits[batch.size++] = {score, segment, rank};
+          if (batch.size == cut.batchSize()) flush();
+          else updateThreshold();
+          return true;
+        }
+      };
+
+      class IntervalResultHandler {
+        KnnIntervalCollector<Groups>& collector;
+        typename KnnIntervalCollector<Groups>::Batch batch;
+        int32_t metric, segment;
+        float lastFloor = NAN;
+        const SegV2D& v2d;
+        UnitKeyReader<Groups> reader;
+      public:
+        float threshold;
+        IntervalResultHandler(KnnIntervalCollector<Groups>& collector, int32_t metric, int32_t segment,
+                              const SegV2D& v2d, const CollapsePlan* plan)
+            : collector(collector), batch(collector.memoryResource()), metric(metric), segment(segment),
+              v2d(v2d), reader(plan) {
+          batch.reserve(64);
+          updateThreshold();
+        }
+        float floorScore() const { return collector.floorScore(); }
+        void updateThreshold() {
+          float score = floorScore();
+          if (score != lastFloor) {
+            threshold = distanceThreshold(score, metric);
+            lastFloor = score;
+          }
+        }
+        void flush() {
+          if (!batch.empty()) collector.offer(batch);
+          updateThreshold();
+        }
+        void offer(float score, float lower, float upper, int64_t rank) {
+          if (upper < floorScore()) return;
+          int32_t doc = v2d.resolve(rank);
+          const auto* key = reader.read(segment, doc);
+          if (key == nullptr) return;
+          batch.emplace_back(VectorEngineHit{score, segment, rank}, lower, upper, *key,
+                             collector.memoryResource());
+          if (batch.size() == 64) flush();
         }
       };
 
     public:
-      SegmentFaissVectorEngine(faiss::Index& index,
-                               int32_t segOrd,
-                               IndexReader::Segment& seg,
-                               const SegV2D& v2d,
-                               DocSet* domain,
-                               std::shared_ptr<const RankLiveBitmap> rankLive,
-                               int32_t metric,
-                               bool exactScores,
-                               bool isIvf,
-                               int32_t nlist, const CollapsePlan* groupPlan,
-                               std::span<const SegV2D> groupV2d,
-                               PreparedQuery preparedQuery)
-        : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
-          ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
-          segOrd(segOrd),
-          v2d(v2d),
-          liveDocs(seg.liveDocs()),
-          rankLive(std::move(rankLive)),
-          domain(domain),
-          domainIsLive(domain != nullptr && liveDocs != nullptr
-                       && domain == &liveDocs->docset()),
-          metric(metric),
-          exactScores(exactScores),
-          isIvf(isIvf),
-          nlist(nlist),
-          preparedQuery(preparedQuery) {
+      SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
+                        IndexReader::Segment& seg, const SegV2D& v2d, DocSet* domain,
+                        std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
+                        const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
+                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
+          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+            segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
+                                        && domain == &liveDocs->docset()),
+            metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
-        if (isIvf && ivf == nullptr) {
-          throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
-        }
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
       }
 
-      int32_t getNList() const noexcept { return nlist; }
+      bool usesIntervals() const { return intervals != nullptr; }
+      int32_t getNList() const noexcept { return (int32_t)ivf.nlist; }
 
       void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
                      std::vector<float>& centroidDists) const {
-        assert(ivf != nullptr);
-        assert(dims == index.d);
+        assert(dims == ivf.d);
         unused(dims);
-        listIds.assign((size_t)nlist, (faiss::idx_t)-1);
-        centroidDists.assign((size_t)nlist, 0.0f);
+        listIds.assign(ivf.nlist, (faiss::idx_t)-1);
+        centroidDists.assign(ivf.nlist, 0.0f);
         // The rotation is orthonormal, so these distances compare directly
         // with other segments' (rotated or not) in the global list ranking.
-        ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
+        ivf.quantizer->search(1, preparedQuery.query, (faiss::idx_t)ivf.nlist, centroidDists.data(), listIds.data());
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -1520,176 +1616,127 @@ public:
       /// liveness only (not the query domain), matching the live-N
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId) const {
-        assert(ivf != nullptr);
-        if (listId < 0 || listId >= nlist) return 0;
-        size_t rawSize = ivf->invlists->list_size((size_t)listId);
+        if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
+        size_t rawSize = ivf.invlists->list_size((size_t)listId);
         if (rawSize == 0) return 0;
         if (liveDocs == nullptr) return (int64_t)rawSize;
 
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
-        const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
+        const faiss::idx_t* listIds = ivf.invlists->get_ids((size_t)listId);
         for (size_t i = 0; i < rawSize; i++) {
           uint64_t r = (uint64_t)listIds[i];
           liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
-        ivf->invlists->release_ids((size_t)listId, listIds);
+        ivf.invlists->release_ids((size_t)listId, listIds);
         return liveSize;
       }
 
-      /// Scan a contiguous run of pre-selected IVF lists.  const and
-      /// thread-safe: the composite engine runs several disjoint list-ranges
-      /// of one segment as concurrent tasks, so all scratch is local and the
-      /// shared state (index, selector, v2d) is read-only.  rangeLiveVectors
-      /// is the live count of exactly the lists in listIds.
-      VectorSearchResult searchSelectedLists(const VectorSearchRequest& request,
-                                             std::span<const faiss::idx_t> listIds,
-                                             std::span<const float> centroidDists,
-                                             int64_t rangeLiveVectors) const {
-        assert(ivf != nullptr);
-        assert(request.query != nullptr);
-        assert(request.dims == index.d);
-
-        VectorSearchResult result;
-        result.scoresAreExact = exactScores;
-        result.breadthExhausted = true;
-        if (request.candidates <= 0 || listIds.empty()) {
-          result.poolExhausted = true;
-          return result;
-        }
-
-        auto scan = prepareScan(request, listIds.size());
-        if constexpr (Groups) {
-          std::unique_ptr<faiss::InvertedListScanner> scanner(
-              ivf->get_InvertedListScanner(false, scan.params.sel, &scan.params));
-          scanner->set_query(scan.query);
-          BoundedHits<true, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d,
-              exactScores ? 1 : (size_t)request.perKey);
-          GroupResultHandler handler(heap, metric, segOrd);
-          for (size_t list = 0; list < listIds.size(); list++) {
-            auto id = listIds[list];
-            if (id < 0) continue;
-            scanner->set_list(id, centroidDists[list]);
-            faiss::InvertedLists::ScopedIds ids(ivf->invlists, (size_t)id);
-            faiss::InvertedLists::ScopedCodes codes(ivf->invlists, (size_t)id);
-            size_t count = ivf->invlists->list_size((size_t)id);
-            // IVFPQ applies its selector and threshold in the optimized loop.
-            scanner->scan_codes(count, codes.get(), ids.get(), handler);
-          }
-          if (statsForTests) {
-            statsForTests->lists += (int64_t)listIds.size();
-            statsForTests->vectors += (int64_t)handler.stats.scan_cnt;
-            statsForTests->bytes += (int64_t)handler.stats.scan_cnt * (int64_t)ivf->code_size;
-          }
-          // Codes pruned inside FAISS cannot have improved this cut, but a
-          // deeper round could admit them. Conservatively retain that signal.
-          heap.truncated |= heap.size() == (size_t)request.candidates;
-          result.hits = heap.take();
-          std::sort(result.hits.begin(), result.hits.end(), betterHit);
-          result.poolExhausted = !heap.truncated;
-          return result;
-        }
-
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
-
-        // Local stats sink, discarded: with a null stats argument FAISS does
-        // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
-        // concurrent chunk tasks of one query would race on it.
-        faiss::IndexIVFStats stats;
-        ivf->search_preassigned(1, scan.query, request.candidates,
-                                listIds.data(), centroidDists.data(),
-                                dists.data(), ids.data(), false, &scan.params,
-                                &stats);
-        if (statsForTests) {
-          statsForTests->lists += (int64_t)listIds.size();
-          statsForTests->vectors += (int64_t)stats.ndis;
-          statsForTests->bytes += (int64_t)stats.ndis * (int64_t)ivf->code_size;
-        }
-
-        result.hits.reserve((size_t)request.candidates);
-        int64_t liveHits = 0;
-        for (int64_t i = 0; i < request.candidates; i++) {
-          faiss::idx_t fid = ids[(size_t)i];
-          if (fid < 0) continue;
-          liveHits++;
-          result.hits.push_back({
-            .score = scoreFromDist(dists[(size_t)i], metric),
-            .segOrd = segOrd,
-            .valueRank = (int64_t)fid,
-          });
-        }
-
-        // Drained if FAISS could not fill the heap (fewer selector-passing
-        // members than requested) or if every live vector in the scanned
-        // lists already fit.  Range-local semantics; the composite's
-        // accumulator derives the ROUND's poolExhausted from per-chunk
-        // counters (foldPart), so this flag only describes this list range.
-        result.poolExhausted = liveHits < request.candidates
-          || rangeLiveVectors <= request.candidates;
-        return result;
+      void searchSelectedLists(const VectorSearchRequest& request,
+                               std::span<const faiss::idx_t> listIds,
+                               std::span<const float> centroidDists,
+                               int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut) const {
+        if (intervals) scanLists<true>(request, listIds, centroidDists, rangeLiveVectors, cut);
+        else scanLists<false>(request, listIds, centroidDists, rangeLiveVectors, cut);
       }
 
-      VectorSearchResult search(const VectorSearchRequest& request) override {
-        // Flat (non-IVF) FAISS path only.  IVF aux indexes are always routed
-        // through CompositeVectorEngine::searchSelectedLists() after global list
-        // allocation, so they never reach this method - there is no per-segment
-        // IVF breadth fallback here (that would be a second, divergent deepen
-        // policy competing with the host allocator).
-        assert(!isIvf);
-        assert(request.query != nullptr);
-        assert(request.dims == index.d);
-        if (request.candidates <= 0) {
-          VectorSearchResult empty;
-          empty.scoresAreExact = exactScores;
-          empty.poolExhausted = true;
-          empty.breadthExhausted = true;
-          return empty;
+    private:
+      template <bool Interval>
+      void scanLists(const VectorSearchRequest& request,
+                               std::span<const faiss::idx_t> listIds,
+                               std::span<const float> centroidDists,
+                               int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut) const {
+        assert(request.query != nullptr && request.dims == ivf.d);
+        RoundSelector selector(*this, request);
+        const auto* sel = selector.get();
+        auto handler = [&]() {
+          if constexpr (Interval) return IntervalResultHandler(*intervals, metric, segOrd, v2d, groupPlan);
+          else return BoundedResultHandler(cut, metric, segOrd, v2d, groupPlan,
+              std::min(request.candidates, rangeLiveVectors), request.perKey);
+        }();
+        std::unique_ptr<faiss::InvertedListScanner> pqScanner;
+        std::vector<float> centroid;
+        if (rabitq != nullptr) centroid.resize((size_t)ivf.d);
+        else {
+          pqScanner.reset(ivf.get_InvertedListScanner(false, sel));
+          pqScanner->set_query(preparedQuery.query);
         }
+        int64_t scanned = 0, extra = 0, rejected = 0;
+        bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
+        bool keepMax = metric != (int32_t)api::VectorMetric::L2;
+        for (size_t list = 0; list < listIds.size(); list++) {
+          auto id = listIds[list];
+          if (id < 0) continue;
+          faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
+          faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
+          size_t count = ivf.invlists->list_size((size_t)id);
+          std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
+          faiss::RaBitQDistanceComputer* dc = nullptr;
+          if (rabitq != nullptr) {
+            ivf.quantizer->reconstruct(id, centroid.data());
+            distanceComputer.reset(rabitq->rabitq.get_distance_computer(
+                preparedQuery.queryBits, centroid.data()));
+            distanceComputer->set_query(preparedQuery.query);
+            dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(distanceComputer.get());
+            assert(dc != nullptr);
+          } else pqScanner->set_list(id, centroidDists[list]);
+          const float* listAmplitudes = nullptr;
+          if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
+          double gateScale = dc ? (double)dc->g_error * (RABITQ_GATE_EPSILON / 1.9f) : 0;
+          double selectionScale = dc ? (double)dc->g_error * RABITQ_SELECTION_EPSILON : 0;
 
-        if constexpr (Groups) {
-          RoundSelector selector(*this, request);
-          BoundedHits<true, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d,
-              exactScores ? 1 : (size_t)request.perKey);
-          GroupResultHandler handler(heap, metric, segOrd);
-          faiss::SearchParameters params;
-          params.sel = selector.get();
-          index.search1(request.query, handler, &params);
-          heap.truncated |= heap.size() == (size_t)request.candidates;
-          VectorSearchResult result;
-          result.hits = heap.take();
-          std::sort(result.hits.begin(), result.hits.end(), betterHit);
-          result.scoresAreExact = exactScores;
-          result.poolExhausted = !heap.truncated;
-          return result;
+          // Keep the PQ kernel, refreshing the shared floor between blocks
+          // even when no result reaches the handler. RaBitQ uses the same
+          // handler after its separate 1-bit and extra-bit stages.
+          for (size_t begin = 0; begin < count; begin += 256) {
+            size_t end = std::min(count, begin + 256);
+            handler.updateThreshold();
+            if (dc == nullptr) {
+              if constexpr (!Interval) pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
+                                    ids.get() + begin, handler);
+            } else for (size_t i = begin; i < end; i++) {
+              if (sel != nullptr && !sel->is_member(ids[i])) continue;
+              const uint8_t* code = codes.get() + i * ivf.code_size;
+              scanned++;
+              float distance = dc->distance_to_code_1bit(code);
+              if (multiBit) {
+                // f_error is beside the sign factors, already touched by the
+                // 1-bit kernel. It includes FAISS's 1.9 and the L2 factor.
+                float fError;
+                std::memcpy(&fError, code + (ivf.d + 7) / 8 + 2 * sizeof(float), sizeof(fError));
+                double error = fError * gateScale;
+                double optimistic = keepMax ? (double)distance + error : (double)distance - error;
+                bool reject = keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold;
+                if (reject) { rejected++; continue; }
+                distance = dc->distance_to_code_full(code);
+                extra++;
+              }
+              if constexpr (Interval) {
+                double error = listAmplitudes[i] * selectionScale;
+                double optimistic = keepMax ? (double)distance + error : (double)distance - error;
+                if (keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold) continue;
+                auto [lower, upper] = scoreInterval(distance, error, metric);
+                handler.offer(scoreFromDist(distance, metric), lower, upper, ids[i]);
+              } else if (keepMax ? distance > handler.threshold : distance < handler.threshold) {
+                handler.add_result(distance, ids[i]);
+              }
+            }
+          }
+          handler.flush();
         }
-
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
-
-        RoundSelector roundSel(*this, request);
-        faiss::SearchParameters flatParams;
-        flatParams.sel = roundSel.get();
-        index.search(1, request.query, request.candidates, dists.data(), ids.data(), &flatParams);
-
-        VectorSearchResult result;
-        result.hits.reserve((size_t)request.candidates);
-        int64_t liveHits = 0;
-        for (int64_t i = 0; i < request.candidates; i++) {
-          faiss::idx_t fid = ids[(size_t)i];
-          if (fid < 0) continue;  // FAISS pad - no more live results.
-          liveHits++;
-          result.hits.push_back({
-            .score = scoreFromDist(dists[(size_t)i], metric),
-            .segOrd = segOrd,
-            .valueRank = (int64_t)fid,
-          });
+        if constexpr (!Interval) {
+          if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
+          cut.finishScan(scanned);
         }
-
-        result.scoresAreExact = exactScores;
-        result.poolExhausted = liveHits < request.candidates || request.candidates >= index.ntotal;
-        result.breadthExhausted = true;
-        return result;
+        if (statsForTests) {
+          int64_t distances = multiBit ? extra : scanned;
+          statsForTests->lists += (int64_t)listIds.size();
+          statsForTests->vectors += distances;
+          statsForTests->bytes += distances * (int64_t)ivf.code_size;
+          statsForTests->scanned += scanned;
+          statsForTests->extraBitEvaluations += extra;
+          statsForTests->gateRejections += rejected;
+        }
       }
     };
 
@@ -1733,7 +1780,7 @@ public:
         result.scoresAreExact = true;
         result.breadthExhausted = true;
         if (request.candidates <= 0) {
-          result.poolExhausted = true;
+          result.boundedSelection = VectorSelection::COMPLETE;
           return result;
         }
 
@@ -1741,13 +1788,13 @@ public:
         int64_t eligibleDocs = 0;
         int64_t scanned = 0;
         if (segInfo == nullptr) {
-          result.poolExhausted = true;
+          result.boundedSelection = VectorSelection::COMPLETE;
           return result;
         }
         VectorReader vr(seg.postingsReader(), *segInfo);
         int64_t numVals = vr.numVectors();
         if (numVals == 0) {
-          result.poolExhausted = true;
+          result.boundedSelection = VectorSelection::COMPLETE;
           return result;
         }
         if (vr.dims() != dims) {
@@ -1762,9 +1809,8 @@ public:
         // best vector is already in the host pool and nothing else in the
         // run can ever improve the doc - skip it whole.  (A segment is
         // served by exactly one slot, so cleared ranks here are exactly
-        // this engine's prior emissions.)  Skipped docs do not count toward
-        // eligibleDocs: poolExhausted means "a deeper request adds nothing",
-        // and pooled docs never will.
+        // this engine's prior emissions.) Skipped docs do not count toward
+        // eligibleDocs, the exact column work count.
         std::span<const uint8_t> elig =
           (size_t)segOrd < request.eligible.size()
             ? request.eligible[(size_t)segOrd]
@@ -1775,6 +1821,31 @@ public:
             if (((elig[(size_t)(r >> 3)] >> (r & 7)) & 1) == 0) return true;
           }
           return false;
+        };
+
+        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
+        // of eligible docs, resolved through its own valDoc cursor (windows
+        // ascend).  Reads that cursor causes count as the window's cold pages,
+        // which only leans toward staying on.
+        StrColReader& col = vr.strColReader();
+        RowReadAhead::Gate gate;
+        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
+                           (size_t)col.fixedValueSize(), numVals);
+        std::optional<MonoReader::BulkValues> aheadValDoc;
+        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+        int32_t aheadDoc = -1;
+        bool aheadEligible = false;
+        auto eligibleRank = [&](int64_t r) {
+          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+          if (doc != aheadDoc) {
+            aheadDoc = doc;
+            aheadEligible = docEligible(doc);
+          }
+          return aheadEligible;
+        };
+        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+          if (domain == nullptr) ahead.scanAt(rank);
+          else ahead.scanAt(rank, eligibleRank);
         };
 
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
@@ -1794,6 +1865,7 @@ public:
                 idx = valDoc.next();
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
+              readAhead(rank);
               if (docEligible(docId) && !pooledInRun(rank, end)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
@@ -1810,6 +1882,7 @@ public:
           } else {
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
+              readAhead(rank);
               if (pooledInRun(rank, rank + 1)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
@@ -1846,8 +1919,7 @@ public:
         }
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
-        if constexpr (Groups) result.poolExhausted = !heap.truncated;
-        else result.poolExhausted = eligibleDocs <= request.candidates;
+        result.boundedSelection = VectorSelection::COMPLETE;
         return result;
       }
 
@@ -1879,23 +1951,22 @@ public:
     ///   - Scheduling: each round's work is a flat worklist of (segment,
     ///     list-range) scan units - IVF tails chunked by live-vector cost to
     ///     scanTaskGrainVectors, whole slots for non-IVF engines - run on TBB
-    ///     tasks when the request is parallel and folded through an
-    ///     AtomicMerger accumulator.  The unit is deliberately NOT the
-    ///     segment: affinity-driven allocation concentrates budget in one
+    ///     tasks when the request is parallel, sharing one bounded cut.
+    ///     The unit is deliberately NOT the segment: affinity-driven allocation concentrates budget in one
     ///     segment, so per-segment tasks would serialize exactly the hot
-    ///     case.  Chunk boundaries are computed identically in serial and
-    ///     parallel mode, so results are bit-identical either way.
+    ///     case. Chunk boundaries do not depend on execution mode, but the
+    ///     order of confidence pruning can affect rare approximate misses.
     ///
     /// SINGLE-SHOT lifecycle: coarseReady, cursors, watermarks and
     /// lastScannedBreadth mutate across search() rounds of
     /// ONE query.  prepare() builds a fresh instance per query; reusing one
     /// across queries would silently serve the old query's coarse ranking.
     template <bool Groups> class CompositeVectorEngine final : public VectorEngine {
+      KnnIntervalCollector<Groups>& intervals;
       const CollapsePlan* groupPlan;
       std::span<const SegV2D> groupV2d;
 
       std::vector<EngineSlot<Groups>> slots;
-      int64_t totalVectors;
       int64_t liveTotalVectors;
       int64_t kDocs;
       int32_t metric;
@@ -1929,8 +2000,8 @@ public:
       // discipline the doc collectors use.  selected* accumulate the
       // allocation in global pop order; selectedCentroidDists and
       // selectedListLiveSizes stay 1:1 with selectedListIds because
-      // search_preassigned consumes the first pair positionally and the
-      // scan-task chunker prices ranges off the third.
+      // scanners consume the first pair positionally and the scan-task
+      // chunker prices ranges off the third.
       std::vector<CoarseRun> runs;
       std::vector<size_t> cursors;
       std::vector<CoarseHead> heads;
@@ -1953,21 +2024,7 @@ public:
       int32_t referenceBreadth = 1;
       bool coarseReady = false;
       bool hasIvfSlots = false;
-
-      // Candidate count for a FLAT (exact) slot: its proportional share of the
-      // request, floored at kDocs so a small segment can still supply all k
-      // docs by itself.  Deliberately smaller than the IVF slots' full kReq:
-      // the over-fetch headroom in kReq exists so approximate scores can be
-      // reordered by the exact rescore, and flat scores are already exact -
-      // a flat slot's top-kDocs are final, no reorder headroom needed.
-      int64_t candidatesForSlot(int64_t requested, int64_t n) const {
-        if (requested <= 0 || n <= 0) return 0;
-        long double proportional = ((long double)requested * (long double)n)
-          / (long double)std::max<int64_t>(1, totalVectors);
-        int64_t bySize = (int64_t)std::ceil(proportional);
-        int64_t floor = std::min(kDocs, n);
-        return std::min(n, std::max(bySize, floor));
-      }
+      bool coarseScanned = false;
 
       CoarseHead makeHead(int32_t slotOrd) const {
         const auto& run = runs[(size_t)slotOrd];
@@ -1996,7 +2053,7 @@ public:
         heapIndexes.reserve(slots.size());
 
         for (size_t i = 0; i < slots.size(); i++) {
-          auto* ivf = slots[i].ivfEngine;
+          auto* ivf = slots[i].ivfEngine.get();
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
           ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
           while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
@@ -2122,103 +2179,44 @@ public:
         size_t listBegin;
         size_t listEnd;
         int64_t live;
-        int64_t candidates;
-        bool ivfChunk;
       };
 
-      /// One round's scan-merge state.  Each task folds its sub-result here
-      /// via AtomicMerger obtain/release, so live accumulators are bounded by
-      /// actual concurrency and a serial round degenerates to one
-      /// accumulator, one pass.  Approximate hits pass through a bounded
-      /// top-(request.candidates) heap - the same global cut a single
-      /// shard-level IVF index would apply (recall-equal to the uncut union:
-      /// for disjoint lists, top-k of the union is contained in the union of
-      /// per-range top-k).  Exact-claimed hits BYPASS the cut: an exact score
-      /// evicted by an inflated approximate score could never be restored by
-      /// the terminal rescore, breaking the mixed-composition ground-truth
-      /// contract.
-      struct ScanAccumulator : MergeableData {
-        int64_t heapLimit;
-        // Bounded keep-best heap over approximate hits (vector-backed, see
-        // offerBounded) so merge() and the final drain read it in place.
-        BoundedHits<Groups, VectorEngineHit, betterHit> approxHeap;
-        std::vector<VectorEngineHit> exactHits;
-        // Pre-cut count of approximate hits offered to the heap; together
-        // with partsExhausted it decides the round's poolExhausted.
-        int64_t approxReturned = 0;
-        bool anyApprox = false;
-        bool partsExhausted = true;
-
-        ScanAccumulator(int64_t heapLimit, const CollapsePlan* plan, std::span<const SegV2D> v2d, size_t perKey)
-            : heapLimit(heapLimit), approxHeap(heapLimit, plan, v2d, perKey) {}
-
-        static ScanAccumulator* merge(ScanAccumulator* a, ScanAccumulator* b) {
-          if (a->approxHeap.size() < b->approxHeap.size()) std::swap(a, b);
-          a->approxHeap.merge(b->approxHeap);
-          a->exactHits.insert(a->exactHits.end(), b->exactHits.begin(), b->exactHits.end());
-          a->approxReturned += b->approxReturned;
-          a->anyApprox = a->anyApprox || b->anyApprox;
-          a->partsExhausted = a->partsExhausted && b->partsExhausted;
-          return a;
-        }
-      };
-
-      VectorSearchResult scanUnit(const ScanUnit& unit, const VectorSearchRequest& request) const {
+      void scanUnit(const ScanUnit& unit, const VectorSearchRequest& request,
+                    BoundedScanCut<Groups>& cut) const {
         const auto& slot = slots[(size_t)unit.slotOrd];
-        VectorSearchRequest subReq = request;
-        subReq.candidates = unit.candidates;
-        if (!unit.ivfChunk) {
-          return slot.engine->search(subReq);
+        if (slot.ivfEngine == nullptr) {
+          VectorSearchRequest subReq = request;
+          subReq.candidates = std::min(kDocs, slot.vectorCount);
+          auto part = slot.engine->search(subReq);
+          if (part.scoresAreExact) {
+            UnitKeyReader<Groups> keyReader(groupPlan);
+            for (const auto& hit : part.hits) {
+              int32_t doc = groupV2d[(size_t)hit.segOrd].resolve(hit.valueRank);
+              const auto* key = keyReader.read(hit.segOrd, doc);
+              if (key) intervals.offerExact(hit, *key);
+            }
+          }
+          cut.foldPart(part);
+          return;
         }
-        // search_preassigned requires centroid distances aligned 1:1 with
-        // list ids; the arrays are only coupled by adjacent push_backs in
-        // allocateToBudget.
         assert(selectedListIds[(size_t)unit.slotOrd].size()
                == selectedCentroidDists[(size_t)unit.slotOrd].size());
-        return slot.ivfEngine->searchSelectedLists(
-          subReq,
+        slot.ivfEngine->searchSelectedLists(
+          request,
           std::span<const faiss::idx_t>(
             selectedListIds[(size_t)unit.slotOrd].data() + unit.listBegin,
             unit.listEnd - unit.listBegin),
           std::span<const float>(
             selectedCentroidDists[(size_t)unit.slotOrd].data() + unit.listBegin,
-            unit.listEnd - unit.listBegin),
-          unit.live);
-      }
-
-      /// Hits route by result-claimed exactness (exactness is a property of
-      /// RESULTS, not engine construction): exact-claimed hits bypass the
-      /// bounded cut, approximate hits go through it.  Exhaustion is one
-      /// identity for every unit shape: AND of each part's own poolExhausted.
-      /// A list-range chunk's flag (searchSelectedLists) is false exactly
-      /// when it filled its heap with live vectors to spare - the per-chunk
-      /// "more depth could help" signal; hits dropped by the MERGED cut are
-      /// accounted separately via approxReturned in search().
-      static void foldPart(ScanAccumulator& acc, const VectorSearchResult& part) {
-        if (part.scoresAreExact) {
-          acc.exactHits.insert(acc.exactHits.end(), part.hits.begin(), part.hits.end());
-        } else {
-          acc.anyApprox = true;
-          acc.approxReturned += (int64_t)part.hits.size();
-          for (const auto& hit : part.hits) {
-            acc.approxHeap.offer(hit);
-          }
-        }
-        // Group exact parts already return their local top k groups. More
-        // exact depth cannot improve the global exact bank, and must not
-        // delay breadth deepening of an exhausted approximate part.
-        if constexpr (Groups) {
-          if (!part.scoresAreExact) acc.partsExhausted &= part.poolExhausted;
-        } else acc.partsExhausted &= part.poolExhausted;
+            unit.listEnd - unit.listBegin), unit.live, cut);
       }
 
     public:
-      CompositeVectorEngine(std::vector<EngineSlot<Groups>>&& slots, int64_t totalVectors,
+      CompositeVectorEngine(std::vector<EngineSlot<Groups>>&& slots,
                             int64_t liveTotalVectors, int64_t kDocs, int32_t metric,
                             bool parallel, const CollapsePlan* groupPlan,
-                            std::span<const SegV2D> groupV2d) noexcept
-        : groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
-          totalVectors(totalVectors),
+                            std::span<const SegV2D> groupV2d, KnnIntervalCollector<Groups>& intervals) noexcept
+        : intervals(intervals), groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
           liveTotalVectors(liveTotalVectors),
           kDocs(kDocs),
           metric(metric),
@@ -2227,52 +2225,15 @@ public:
       VectorSearchResult search(const VectorSearchRequest& request) override {
         VectorSearchResult merged;
         merged.scoresAreExact = true;
-        merged.poolExhausted = true;
+        merged.boundedSelection = VectorSelection::COMPLETE;
         merged.breadthExhausted = true;
         if (request.candidates <= 0) return merged;
 
         allocateToBudget(request);
 
-        // The host re-enters search() to deepen along one of two axes per round:
-        //   DEPTH  - breadth unchanged: need more candidates from the SAME
-        //            lists.  FAISS has no resumable list cursor, so re-scan all
-        //            selected lists; request.eligible excludes everything the
-        //            host already pooled, so the re-scan returns only fresh
-        //            hits and the round's candidate count is a FRESH budget,
-        //            not a cumulative depth (it may repeat or shrink, which is
-        //            why breadth - the host grows exactly one axis per round -
-        //            is the depth-round signal, not the candidate count).
-        //   BREADTH - allocateToBudget appended new lists: only the freshly
-        //            allocated tail needs scanning, since prior lists' hits
-        //            are already unioned into the host pool.
-        // Scanning only the new tail on breadth rounds keeps total IVF list
-        // scanning O(lists). A breadth round is only entered
-        // after a poolExhausted=true round (host loop), so every prior list is
-        // already drained at this depth - omitting them from this round's
-        // exhaustion accounting is correct.  Flat (below-threshold) engines are
-        // breadth-independent and small, so they are simply re-run; they honor
-        // request.eligible like every engine (a doc whose pooled best vector is
-        // excluded can never improve an exact score, so the whole doc is
-        // skipped), which keeps search() a pure function of its arguments (the
-        // bitmaps are arguments; test oracles rely on the purity).
-        //
-        // RECALL SAFETY: IVF lists are disjoint, and for disjoint sets A, B
-        // the global top-k of (A union B) is contained in top-k(A) union
-        // top-k(B).  So the host's union of per-round top-k subsets is a
-        // SUPERSET of what one global pass over all selected lists would
-        // return - PROVIDED every list was scanned at the final candidate
-        // count, which is exactly what the depth-round full re-scan maintains.
-        // What must NOT happen on the depth axis is skipping already-scanned
-        // lists - that silently loses recall. EXCLUDING the host's
-        // already-POOLED ranks (request.eligible) is safe, and is also what
-        // makes the smaller fresh-budget heaps sound: if x is in
-        // top-(pooled+k)(P) and x is not pooled, fewer than k members of
-        // (P minus pooled) beat x, so x is in top-k(P minus pooled) - the
-        // banked pool plus a k-deep fresh scan covers a (pooled+k)-deep
-        // cumulative scan exactly.  (Pooled is what the host KEPT -
-        // merge-cut hits were never pooled, stay eligible, and come back on
-        // the next round.)  The same lemma is why per-chunk scanning below
-        // loses nothing: every chunk scans at the full round candidate count.
+        // DEPTH rescans only bounded slots, excluding banked identities and
+        // starting a fresh cut. BREADTH visits new list tails for both policies.
+        // Exact slots run once; their top-k witnesses survive every round.
         bool depthGrew = request.breadth == lastScannedBreadth;
         lastScannedBreadth = request.breadth;
 
@@ -2286,17 +2247,9 @@ public:
           auto& slot = slots[i];
           if (slot.ivfEngine != nullptr) {
             size_t total = selectedListIds[i].size();
-            size_t start = depthGrew ? 0 : scannedListCount[i];
+            size_t start = depthGrew && !slot.ivfEngine->usesIntervals() ? 0 : scannedListCount[i];
             scannedListCount[i] = total;
             if (start >= total) continue;
-            int64_t candidates = std::min(request.candidates, slot.vectorCount);
-            if (candidates <= 0) continue;
-            // Per-chunk candidates are capped by the chunk's live count: a
-            // chunk can never return more hits than it has live vectors, and
-            // the uncapped slot-wide count would size every chunk's FAISS
-            // heap and ids/dists scratch at the full request depth -
-            // multiplied by the number of concurrent chunks on large-k
-            // queries.
             int64_t grain = std::max<int64_t>(1, scanTaskGrainVectors);
             size_t firstUnit = units.size();
             size_t chunkBegin = start;
@@ -2304,8 +2257,7 @@ public:
             for (size_t l = start; l < total; l++) {
               chunkLive += selectedListLiveSizes[i][l];
               if (chunkLive >= grain) {
-                units.push_back({(int32_t)i, chunkBegin, l + 1, chunkLive,
-                                 std::min(candidates, chunkLive), true});
+                units.push_back({(int32_t)i, chunkBegin, l + 1, chunkLive});
                 chunkBegin = l + 1;
                 chunkLive = 0;
               }
@@ -2314,76 +2266,31 @@ public:
               if (units.size() > firstUnit) {
                 units.back().listEnd = total;
                 units.back().live += chunkLive;
-                units.back().candidates = std::min(candidates, units.back().live);
               } else {
-                units.push_back({(int32_t)i, chunkBegin, total, chunkLive,
-                                 std::min(candidates, chunkLive), true});
+                units.push_back({(int32_t)i, chunkBegin, total, chunkLive});
               }
             }
-          } else {
-            int64_t candidates = candidatesForSlot(request.candidates, slot.vectorCount);
-            if (candidates <= 0) continue;
-            units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount, candidates, false});
+          } else if (!coarseScanned) {
+            units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount});
           }
         }
 
         if (!units.empty()) {
-          AtomicMerger<ScanAccumulator> merger(
-            [&, limit = request.candidates]() { return new ScanAccumulator(limit, groupPlan, groupV2d, request.perKey); },
-            [](ScanAccumulator* acc) { delete acc; });
-          // Each search() round is a barrier: the host's deepen decision
-          // needs the whole merged pool. The caller runs the final unit;
-          // TaskGroupRunner cancels and drains siblings if it throws.
+          // A new cut is a fresh epoch, including DEPTH rounds that exclude
+          // the banked hits. Carrying their previous floor would starve it.
+          BoundedScanCut<Groups> cut(request.candidates, groupPlan, groupV2d, request.perKey);
           bool spawnTasks = parallel && units.size() > 1;
-          if (spawnTasks) {
-            parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
-          }
+          if (spawnTasks) parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           TaskGroupRunner runner;
-          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(),
-              [&](size_t i) {
-            return [this, unit = units[i], &request, &merger]() {
-              VectorSearchResult part = scanUnit(unit, request);
-              // Guard the accumulator until it is parked in the merger.
-              std::unique_ptr<ScanAccumulator> acc(merger.obtain());
-              foldPart(*acc, part);
-              merger.release(acc.release());
-            };
+          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(), [&](size_t i) {
+            return [this, unit = units[i], &request, &cut]() { scanUnit(unit, request, cut); };
           });
           runner.join();
-
-          ScanAccumulator* acc = merger.getData();
-          merged.scoresAreExact = !acc->anyApprox;
-          // "More depth on the same lists cannot add hits": every part
-          // reported itself drained AND the merged approximate cut dropped
-          // nothing.  The second term can hold poolExhausted=false when all
-          // parts drained individually but their union exceeded the cut; the
-          // host then takes depth rounds (full re-scans) to pull the cut
-          // hits through the bounded heap before breadth can advance - a
-          // bounded latency cost that is semantically required, since only
-          // a deeper round can surface those hits.
-          merged.poolExhausted = acc->partsExhausted
-            && (Groups ? !acc->approxHeap.truncated : acc->approxReturned <= request.candidates);
-          // Sub-results are per-segment, so exactness IS segment-attributable
-          // here: report the exact parts' segments (derived from the hits
-          // themselves) so the host's terminal rescore (run when this merge
-          // is approximate overall) can keep their scores instead of
-          // re-reading their columns.
-          if (!merged.scoresAreExact && !acc->exactHits.empty()) {
-            std::vector<int32_t> segs;
-            segs.reserve(acc->exactHits.size());
-            for (const auto& hit : acc->exactHits) segs.push_back(hit.segOrd);
-            std::sort(segs.begin(), segs.end());
-            segs.erase(std::unique(segs.begin(), segs.end()), segs.end());
-            merged.exactSegOrds = std::move(segs);
-          }
-          merged.hits = acc->approxHeap.take();
-          merged.hits.insert(merged.hits.end(),
-                             acc->exactHits.begin(), acc->exactHits.end());
-          // betterHit is a strict total order, so a plain sort is
-          // deterministic no matter what order tasks folded in.
-          std::sort(merged.hits.begin(), merged.hits.end(), betterHit);
+          merged = cut.take();
         }
 
+        coarseScanned = true;
+        intervals.compact();
         if (hasIvfSlots) {
           merged.breadthExhausted = heapSize <= 0;
           if (!merged.breadthExhausted) {
@@ -2566,168 +2473,184 @@ private:
     return {bestPos, bestScore};
   }
 
-  /// Terminal-rescore merge state: per-segment bucket tasks offer their
-  /// doc-collapsed exact hits into a bounded top-kDocs heap.  betterDoc is a
-  /// strict total order, so the retained set is independent of task order.
-  template <bool Groups> struct RescoreAccumulator : MergeableData {
-    int64_t limit;
-    BoundedHits<Groups, DocHit, betterDoc> heap;
-
-    RescoreAccumulator(int64_t limit, const CollapsePlan* plan) : limit(limit), heap(limit, plan) {}
-
-    static RescoreAccumulator* merge(RescoreAccumulator* a, RescoreAccumulator* b) {
-      if (a->heap.size() < b->heap.size()) std::swap(a, b);
-      a->heap.merge(b->heap);
-      return a;
-    }
-  };
-
-  /// Terminal refine: collapse the pooled candidates to the top kDocs docs,
-  /// exact-rescoring approximate segments' vectors from the column.
-  /// Candidates are sorted by (segOrd, valueRank) first so the column is read
-  /// in ONE ordered sparse pass per segment (sequential mmap access instead
-  /// of score-order random access), and because valueRank order groups a
-  /// doc's vectors contiguously, the multi-valued max-sim collapse (bestInRun,
-  /// shared with the flat column engine's full scan) happens inline during
-  /// that same pass.  Collapsing before the score sort is legal precisely
-  /// because the surviving scores are exact - the engine's approximate
-  /// ranking no longer matters.  Candidates from segments NOT marked in
-  /// segApprox already carry exact scores: they keep them (no column read)
-  /// but still run-collapse, since a flat FAISS aux returns per-vector hits.
-  /// An empty segApprox rescores everything.
-  ///
-  /// Each segment's bucket is an independent column pass, so buckets run as
-  /// parallel tasks (runs never span segments).  Parallelism is bounded by
-  /// the segments the pool landed in - few, under affinity - which is
-  /// acceptable because rescore is cheap relative to the scan; buckets under
-  /// rescoreTaskGrainCandidates fold inline on the calling thread.
+  // Terminal selection has two disjoint read sets, both sorted by segment and
+  // value rank. Exact slots reuse their scores; bounded group nominations read
+  // the whole document. Interval records never acquire that bounded expansion.
   template <bool Groups = false>
   static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
+                                           KnnIntervalCollector<Groups>& collector,
                                            IndexReader& reader,
                                            IndexReader::FieldSegments segInfos,
                                            std::span<const SegV2D> v2dPerSeg,
                                            std::span<const char> segApprox,
-                                           const float* queryPtr,
-                                           int32_t dims,
-                                           int32_t metric,
+                                           const float* queryPtr, int32_t dims, int32_t metric,
                                            bool normalizeColumnOnCosineRescore,
-                                           int64_t kDocs,
-                                           std::vector<DocHit>& docHits,
+                                           int64_t kDocs, std::vector<DocHit>& docHits,
                                            bool parallel, const CollapsePlan* groupPlan = nullptr) {
-    docHits.clear();
-    if (candidates.empty() || kDocs <= 0) return;
-
-    std::sort(candidates.begin(), candidates.end(),
-        [](const VectorEngineHit& a, const VectorEngineHit& b) {
-          if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
-          return a.valueRank < b.valueRank;
-        });
-
-    AtomicMerger<RescoreAccumulator<Groups>> merger(
-      [kDocs, groupPlan]() { return new RescoreAccumulator<Groups>(kDocs, groupPlan); },
-      [](RescoreAccumulator<Groups>* acc) { delete acc; });
-
-    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd) {
-      int32_t segOrd = candidates[bucketBegin].segOrd;
-      if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
-        throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
-      }
-      const SegFieldInfo* info = segInfos.at((size_t)segOrd);
-      if (info == nullptr) {
-        throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
-      }
-      const SegV2D& v2d = v2dPerSeg[(size_t)segOrd];
-      int64_t rescored = 0;
-      bool keepEngineScores = !segApprox.empty() && !segApprox[(size_t)segOrd];
-      std::optional<VectorReader> vr;
-      if (!keepEngineScores) {
-        vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
-      }
-
-      [[no_unique_address]] std::conditional_t<Groups,
-          std::optional<VectorReader::Iterator>, NoGroupState> fullDocs;
-      if constexpr (Groups) if (vr && vr->isMultiValued()) fullDocs.emplace(vr->strColReader());
-
-      // unique_ptr guards the obtained accumulator against a throw before
-      // release (same idiom as FacetOp).
-      std::unique_ptr<RescoreAccumulator<Groups>> acc(merger.obtain());
-      for (size_t i = bucketBegin; i < bucketEnd;) {
-        int32_t docId = v2d.resolve(candidates[i].valueRank);
-        size_t runEnd = i + 1;
-        while (runEnd < bucketEnd && v2d.resolve(candidates[runEnd].valueRank) == docId) {
-          runEnd++;
-        }
-
-        float bestScore;
-        if (keepEngineScores) {
-          bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
-            return candidates[(size_t)c].score;
-          }).second;
-        } else {
-          if constexpr (Groups) {
-            // A PQ witness nominates a document, not one of its values.
-            // Restore its full per-document max before group admission.
-            int64_t begin = candidates[i].valueRank, end = begin + 1;
-            if (fullDocs) {
-              if (fullDocs->docId() < docId) fullDocs->advance(docId);
-              assert(fullDocs->docId() == docId);
-              auto range = fullDocs->valueRange();
-              begin = range.first;
-              end = range.second;
-            }
-            bestScore = bestInRun(begin, end, [&](int64_t rank) {
-              rescored++;
-              return exactScore(queryPtr, vr->vectorAtRank(rank), dims, metric,
-                  normalizeColumnOnCosineRescore, 0.0f);
-            }).second;
-          } else {
-            bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
-              return exactScore(queryPtr, vr->vectorAtRank(candidates[(size_t)c].valueRank),
-                  dims, metric, normalizeColumnOnCosineRescore, candidates[(size_t)c].score);
-            }).second;
-          }
-        }
-        acc->heap.offer(DocHit{segOrd, docId, bestScore});
-        i = runEnd;
-      }
-      if (statsForTests) {
-        int64_t count = Groups ? rescored : keepEngineScores ? 0 : (int64_t)(bucketEnd - bucketBegin);
-        statsForTests->vectors += count;
-        statsForTests->bytes += count * dims * (int64_t)sizeof(float);
-      }
-      merger.release(acc.release());
+    auto rankOrder = [](const VectorEngineHit& a, const VectorEngineHit& b) {
+      return a.segOrd != b.segOrd ? a.segOrd < b.segOrd : a.valueRank < b.valueRank;
     };
-
-    // Cancel and drain published buckets if a caller-side bucket throws.
-    int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
-    std::vector<std::pair<size_t, size_t>> tasks, local;
-    for (size_t b = 0; b < candidates.size();) {
-      size_t e = b + 1;
-      while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
-      if (!parallel) rescoreBucket(b, e);
-      else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
-      else local.emplace_back(b, e);
-      b = e;
+    std::sort(candidates.begin(), candidates.end(), rankOrder);
+    UnitKeyReader<Groups> keyReader(groupPlan);
+    for (size_t begin = 0; begin < candidates.size();) {
+      int32_t segOrd = candidates[begin].segOrd;
+      size_t end = begin + 1;
+      while (end < candidates.size() && candidates[end].segOrd == segOrd) end++;
+      bool exact = !segApprox[(size_t)segOrd];
+      std::optional<VectorReader> column;
+      std::optional<VectorReader::Iterator> docs;
+      if constexpr (Groups) if (!exact) {
+        column.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd));
+        if (column->isMultiValued()) docs.emplace(column->strColReader());
+      }
+      int32_t lastDoc = -1;
+      for (size_t i = begin; i < end; i++) {
+        auto hit = candidates[i];
+        int32_t doc = v2dPerSeg[(size_t)segOrd].resolve(hit.valueRank);
+        const auto* key = keyReader.read(segOrd, doc);
+        if (key == nullptr) continue;
+        if (docs) {
+          if (lastDoc == doc) continue;
+          lastDoc = doc;
+          if (docs->docId() < doc) docs->advance(doc);
+          auto [first, last] = docs->valueRange();
+          for (int64_t rank = first; rank < last; rank++) {
+            collector.mandatory({hit.score, segOrd, rank}, *key, false);
+          }
+        } else collector.mandatory(hit, *key, exact);
+      }
+      begin = end;
     }
-    TaskGroupRunner runner;
-    task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
-      auto [b, e] = tasks[i];
-      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
-    });
-    for (auto [b, e] : local) rescoreBucket(b, e);
-    runner.join();
 
-    RescoreAccumulator<Groups>* acc = merger.getData();
-    docHits = acc->heap.take();
+    auto& records = collector.retained();
+    std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
+      if (rankOrder(a.hit, b.hit)) return true;
+      if (rankOrder(b.hit, a.hit)) return false;
+      return a.exact > b.exact;
+    });
+    records.erase(std::unique(records.begin(), records.end(), [](const auto& a, const auto& b) {
+      return a.hit.segOrd == b.hit.segOrd && a.hit.valueRank == b.hit.valueRank;
+    }), records.end());
+    for (auto& record : records) record.unit->seed = KnnIntervalCollector<Groups>::NO_SLOT;
+    for (size_t i = 0; i < records.size(); i++) {
+      auto& record = records[i];
+      size_t& best = record.unit->seed;
+      if (best == KnnIntervalCollector<Groups>::NO_SLOT || betterHit(record.hit, records[best].hit)) best = i;
+      record.selected = record.mandatory || record.exact;
+    }
+    auto* resource = collector.memoryResource();
+    std::pmr::vector<size_t> seeds(resource);
+    auto betterSeed = [&](size_t a, size_t b) { return betterHit(records[a].hit, records[b].hit); };
+    for (size_t i = 0; i < records.size(); i++) {
+      if (records[i].unit->seed != i) continue;
+      if ((int64_t)seeds.size() < kDocs) { seeds.push_back(i); std::push_heap(seeds.begin(), seeds.end(), betterSeed); }
+      else if (betterSeed(i, seeds.front())) {
+        std::pop_heap(seeds.begin(), seeds.end(), betterSeed);
+        seeds.back() = i;
+        std::push_heap(seeds.begin(), seeds.end(), betterSeed);
+      }
+    }
+    for (size_t i : seeds) records[i].selected = true;
+    float pessimisticFloor = collector.floorScore();
+
+    auto readStage = [&](bool seed, float floor) {
+      std::pmr::vector<size_t> selected(resource);
+      for (size_t i = 0; i < records.size(); i++) {
+        auto& record = records[i];
+        if (record.exact) continue;
+        if (seed ? record.selected : record.upper >= std::max(floor, record.unit->exact.load(std::memory_order_relaxed))) {
+          selected.push_back(i);
+        }
+      }
+      std::pmr::vector<std::pair<size_t, size_t>> buckets(resource);
+      for (size_t b = 0; b < selected.size();) {
+        size_t e = b + 1;
+        while (e < selected.size() && records[selected[e]].hit.segOrd == records[selected[b]].hit.segOrd) e++;
+        buckets.emplace_back(b, e);
+        b = e;
+      }
+      auto readBucket = [&](size_t bucket) {
+        return [&, bucket]() {
+          auto [b, e] = buckets[bucket];
+          int32_t segOrd = records[selected[b]].hit.segOrd;
+          VectorReader column(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd));
+          RowReadAhead::Gate gate;
+          RowReadAhead ahead(gate, column.strColReader());
+          auto rankAt = [&](int64_t i) { return records[selected[b + (size_t)i]].hit.valueRank; };
+          int64_t count = (int64_t)(e - b), reads = 0;
+          ahead.probe({rankAt(count / 4), rankAt(count / 2 + count / 4)});
+          for (size_t i = b; i < e; i++) {
+            auto& record = records[selected[i]];
+            // Other values of this unit, including values in another segment,
+            // may already have established a better exact member.
+            if (!seed && record.upper < record.unit->exact.load(std::memory_order_relaxed)) continue;
+            ahead.sparseAt((int64_t)(i - b), count, [&](int64_t pos) { auto rank = rankAt(pos); ahead.queueRows(rank, rank + 1); });
+            float score = exactScore(queryPtr, column.vectorAtRank(record.hit.valueRank), dims,
+                metric, normalizeColumnOnCosineRescore, record.hit.score);
+            record.hit.score = score;
+            record.exact = true;
+            float best = record.unit->exact.load(std::memory_order_relaxed);
+            while (score > best && !record.unit->exact.compare_exchange_weak(best, score, std::memory_order_relaxed)) {}
+            reads++;
+          }
+          if (statsForTests) {
+            (seed ? statsForTests->seedReads : statsForTests->remainingReads) += reads;
+            statsForTests->vectors += reads;
+            statsForTests->bytes += reads * dims * (int64_t)sizeof(float);
+          }
+        };
+      };
+      std::pmr::vector<size_t> tasks(resource), local(resource);
+      for (size_t i = 0; i < buckets.size(); i++) {
+        if (parallel && ((int64_t)(buckets[i].second - buckets[i].first) >= rescoreTaskGrainCandidates
+                         || i + 1 == buckets.size())) tasks.push_back(i);
+        else local.push_back(i);
+      }
+      TaskGroupRunner runner;
+      task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(),
+                       [&](size_t i) { return readBucket(tasks[i]); });
+      for (size_t i : local) readBucket(i)();
+      runner.join();
+    };
+    readStage(true, KnnIntervalCollector<Groups>::NO_FLOOR);
+    std::pmr::vector<float> exactWitnesses(resource);
+    for (size_t i = 0; i < records.size(); i++) {
+      if (records[i].unit->seed != i) continue;
+      float score = records[i].unit->exact.load(std::memory_order_relaxed);
+      if (score == KnnIntervalCollector<Groups>::NO_FLOOR) continue;
+      if ((int64_t)exactWitnesses.size() < kDocs) {
+        exactWitnesses.push_back(score);
+        std::push_heap(exactWitnesses.begin(), exactWitnesses.end(), std::greater<float>{});
+      } else if (score > exactWitnesses.front()) {
+        std::pop_heap(exactWitnesses.begin(), exactWitnesses.end(), std::greater<float>{});
+        exactWitnesses.back() = score;
+        std::push_heap(exactWitnesses.begin(), exactWitnesses.end(), std::greater<float>{});
+      }
+    }
+    float exactFloor = (int64_t)exactWitnesses.size() == kDocs ? exactWitnesses.front() : KnnIntervalCollector<Groups>::NO_FLOOR;
+    readStage(false, std::max(pessimisticFloor, exactFloor));
+
+    auto docHit = [&](size_t i) {
+      const auto& hit = records[i].hit;
+      return DocHit{hit.segOrd, v2dPerSeg[(size_t)hit.segOrd].resolve(hit.valueRank), hit.score};
+    };
+    for (auto& record : records) record.unit->seed = KnnIntervalCollector<Groups>::NO_SLOT;
+    for (size_t i = 0; i < records.size(); i++) if (records[i].exact) {
+      size_t& best = records[i].unit->seed;
+      if (best == KnnIntervalCollector<Groups>::NO_SLOT || betterDoc(docHit(i), docHit(best))) best = i;
+    }
+    docHits.clear();
+    for (size_t i = 0; i < records.size(); i++) {
+      if (records[i].unit->seed == i) offerBounded(docHits, docHit(i), kDocs, betterDoc);
+    }
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
+  // Query and stored vectors share inputError's element bound, which keeps
+  // every exact and FAISS distance finite.  A NaN score would break the
+  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
+  // cuts deterministic and std::sort defined, so any NaN that slips past the
+  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
   // minCompetitiveVal starts at lowest() and admits only strictly greater
   // scores, and a kNN hit must rank last, not be counted in matches yet
   // vanish from the returned docs.
@@ -2791,6 +2714,31 @@ private:
         if ((int64_t)docHits.size() == kDocs) break;
       }
     }
+  }
+
+  static std::pair<float, float> scoreInterval(float distance, double error, int32_t metric) {
+    float lo = std::nextafter((float)((double)distance - error), -INFINITY);
+    float hi = std::nextafter((float)((double)distance + error), INFINITY);
+    bool l2 = metric == (int32_t)api::VectorMetric::L2;
+    if (l2) {
+      lo = std::max(0.0f, lo);
+      hi = std::max(0.0f, hi);
+      std::swap(lo, hi);
+    }
+    float upper = std::nextafter(scoreFromDist(hi, metric), INFINITY);
+    return {std::nextafter(scoreFromDist(lo, metric), -INFINITY), l2 ? std::min(1.0f, upper) : upper};
+  }
+
+  // Invert a score floor outward, admitting equal scores and outward-rounded
+  // interval endpoints. Only floor changes pay for these rounding operations.
+  static float distanceThreshold(float floor, int32_t metric) {
+    float score = std::nextafter(std::nextafter(floor, -INFINITY), -INFINITY);
+    if (metric != (int32_t)api::VectorMetric::L2) return std::nextafter(score, -INFINITY);
+    if (!(score > 0)) return std::numeric_limits<float>::infinity();
+    // Inverting the rounded denominator needs its own outward step.
+    float denominator = std::nextafter((float)(1.0 / (double)score), INFINITY);
+    float distance = score >= 1.0f ? 1.0f - score : (float)((double)denominator - 1.0);
+    return std::nextafter(std::nextafter(distance, INFINITY), INFINITY);
   }
 
   // Convert FAISS's per-metric distance to an internal "higher is better" score.

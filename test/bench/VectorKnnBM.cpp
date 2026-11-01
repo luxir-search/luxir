@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -82,7 +83,7 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   auto& multi = b.templ("_vs");
   multi.type = api::FieldDef_::FieldClass::VECTOR;
   multi.column = true;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   multi.dims = dims;
   multi.metric = metric;
   setBenchAnn(multi, dims, codec);
@@ -106,15 +107,21 @@ float nextFloat(SplitMix64& rng) {
 // Forces eligibility so the benchmark measures the aux path. Real runs keep
 // the production training floors; unit-test mode shrinks them for tiny corpora.
 struct IvfBenchGuard {
-  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
+  SearchOverridesGuard<int64_t, int64_t, int64_t, int64_t> saved{
     VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
-    VectorIndexBuilder::ivfBuildThresholdScanCost};
+    VectorIndexBuilder::ivfBuildThresholdScanCost, VectorIndexBuilder::ivfBuildMinRowsPerTask};
 
   IvfBenchGuard() {
     VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
     if (luxir::unit_tests) {
       VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
       VectorIndexBuilder::ivfRaBitQMinTrainingVectors = 16;
+    }
+    // LUXIR_BENCH_IVF_MIN_ROWS overrides the row floor of the build's TBB
+    // partitions: a value above any corpus runs row work on the calling
+    // thread for A/B comparison. PQ codebooks still train per sub-quantizer.
+    if (const char* rows = std::getenv("LUXIR_BENCH_IVF_MIN_ROWS")) {
+      VectorIndexBuilder::ivfBuildMinRowsPerTask = std::atoll(rows);
     }
   }
 };
@@ -235,7 +242,7 @@ LocalReq* makeKnnBenchReq(SearchEngine& engine, std::string_view field,
   req->collection("main").requestId("vector-bench");
 
   auto& cur = req->topDocs();
-  cur.limit(k).getNumber().fields({"id"});
+  cur.limit(k).countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
   if (groups) {
     std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";
@@ -593,6 +600,13 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec,
   state.counters["cand"] = Counter((double)cand, Counter::kAvgThreads);
   state.counters["lists"] = (double)stats.lists.load() / nQueries;
   state.counters["vectors"] = (double)stats.vectors.load() / nQueries;
+  state.counters["scanned"] = (double)stats.scanned.load() / nQueries;
+  state.counters["extra_bits"] = (double)stats.extraBitEvaluations.load() / nQueries;
+  state.counters["gate_rejections"] = (double)stats.gateRejections.load() / nQueries;
+  state.counters["retained_peak"] = (double)stats.retainedPeak.load() / nQueries;
+  state.counters["retained_terminal"] = (double)stats.retainedTerminal.load() / nQueries;
+  state.counters["seed_reads"] = (double)stats.seedReads.load() / nQueries;
+  state.counters["remaining_reads"] = (double)stats.remainingReads.load() / nQueries;
   state.counters["bytes_read"] = (double)stats.bytes.load() / nQueries;
   state.counters["rounds"] = (double)stats.rounds.load() / nQueries;
   state.counters["exact"] = exact;
@@ -961,6 +975,13 @@ BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segments"})
     // Both training and add exceed the production 16 MiB transform chunk.
     ->Args({RABITQ1, 50'000, 128, 1})->Args({PQ, 50'000, 128, 1})
     ->UseManualTime()->Iterations(3);
+// Production-shaped corpora for build-parallelism measurements: at 768 dims
+// L2 PQ takes M=32 (24-wide sub-vectors), the BLAS encoding path, and every
+// GEMM step is far above FAISS's BLAS threshold.  Compare against
+// LUXIR_BENCH_IVF_MIN_ROWS=1000000000 (serial GEMMs on the calling thread).
+TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segments"})
+    ->Args({PQ, 300'000, 768, 1})->Args({RABITQ1, 300'000, 768, 1})
+    ->UseManualTime()->Iterations(2);
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 

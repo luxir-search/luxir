@@ -79,7 +79,7 @@ stage dependencies env -u CC -u CXX "$vcpkg/vcpkg" install --x-manifest-root="$r
     --clean-buildtrees-after-build --clean-packages-after-build
 stage lapack-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
     --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -pthread \
-    -static-libstdc++ -static-libgcc .devcontainer/check-lapack.cpp \
+    -static-libstdc++ -static-libgcc test/blas_lapack_test.cpp \
     build/arm64-deps/arm64-linux-luxir/lib/libopenblas.a -lm \
     -o "$checks/check-lapack"
 if [[ -n $qemu ]]; then

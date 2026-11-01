@@ -143,7 +143,7 @@ POST /collections/books/_search
 {
   "query": "title_t:kings",
   "fields": ["id", "title_t", "author_name", "year_i"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 
@@ -176,7 +176,7 @@ setting picks the placement there too.)
 
 ### Counts are exact
 
-Add `get_number` and `found` is the total number of matching documents,
+Add `count_limit: -1` and `found` is the total number of matching documents,
 regardless of `limit`:
 
 ```http
@@ -185,7 +185,7 @@ POST /collections/books/_search
 {
   "query": {"match": {"author_name": "sanderson"}},
   "fields": ["id", "title_t"],
-  "get_number": true,
+  "count_limit": -1,
   "limit": 2
 }
 ```
@@ -222,7 +222,7 @@ POST /collections/books/_search
     "simple_query": {"q": "kings | radiance", "fields": ["title_t"]}
   },
   "fields": ["id", "title_t"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 
@@ -255,7 +255,7 @@ POST /collections/books/_search
 {
   "query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2013]",
   "fields": ["id", "title_t"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 
@@ -290,7 +290,7 @@ POST /collections/books/_search
   },
   "fields": ["id", "title_t", "price_f"],
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "series": {
       "field_facet": {
@@ -317,11 +317,11 @@ POST /collections/books/_search
     {
       "id": "2",
       "title_t": "Words of Radiance",
-      "price_f": 15
+      "price_f": 15.0
     }
   ],
   "ops": {
-    "average_price": 12,
+    "average_price": 12.0,
     "series": {
       "buckets": [
         {
@@ -397,7 +397,7 @@ POST /collections/books/_search?format=docs
 {"id":"5","title_t":"The Well of Ascension"}
 ```
 
-With `get_number`, a `_header_` line starts the stream so a consumer knows
+With `count_limit: -1`, a `_header_` line starts the stream so a consumer knows
 the total before reading the documents: `{"_header_":{"found":5}}`.
 Execution warnings, when there are any, also arrive in a `_header_` line.
 
@@ -433,7 +433,7 @@ POST /collections/movies/_search
 {
   "query": {"match": {"title_t": "ugly"}},
   "fields": ["id", "title_t"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 

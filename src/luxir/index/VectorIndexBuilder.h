@@ -21,7 +21,7 @@ namespace luxir {
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
 /// Flat kNN is served directly from the vector column.  Aux builds produce an
-/// IVF ANN index (the field's "ann" codec: IVF+PQ by default, or opt-in IVF+RaBitQ)
+/// IVF ANN index (the field's "ann" codec: IVF+RaBitQ by default, or explicit IVF+PQ)
 /// when enough vectors are present and the segment is large enough to be
 /// worth indexing.
 ///
@@ -61,13 +61,17 @@ public:
   static std::atomic<int64_t> ivfBuildCountForTests;
   static std::atomic<int64_t> ivfMergeBuildCountForTests;
   static size_t ivfTrainingSampleBytes;
-  // Per-buffer transform budget, capped by available vectors with a minimum
-  // of one vector. Training rotation uses one buffer; add uses up to two for
-  // raw cosine plus rotation. Untransformed PQ add passes column bytes directly to FAISS.
+  // Add chunk input-byte target. Chunks also hold at least four row tasks
+  // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
+  // Training coarse assignment, training rotation and the complete add
+  // pipeline split rows across TBB tasks. 0 derives the row floor from
+  // ceil(FAISS distance_compute_blas_threshold / dims) to retain BLAS.
+  // PQ codebooks train independently per sub-quantizer regardless of this floor.
+  static int64_t ivfBuildMinRowsPerTask;
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
-  // dims shares one matrix (deduplicated in RAM by internVectorRotation).
+  // dims shares one transform (deduplicated in RAM by internVectorRotation).
   static constexpr int RABITQ_ROTATION_SEED = 0x5ab17;
 
 

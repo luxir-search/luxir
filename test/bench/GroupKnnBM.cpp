@@ -118,7 +118,7 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
     std::string collapse = key == 0 ? R"("product_s")" : key == 1 ? R"("product_i")"
         : R"({"field":["product_s","catalog_i"]})";
     std::string json = R"({"collection":")" + name
-        + R"(","limit":10,"get_scores":true,"get_number":true,"fields":["id","product_s"],"document_format":"rows",)"
+        + R"(","limit":10,"get_scores":true,"count_limit":-1,"fields":["id","product_s"],"document_format":"rows",)"
         + (groups ? R"("collapse":)" + collapse + ',' : "")
         + R"("query":{"knn":{"field":"vec_v","unit":")" + (groups ? "groups" : "docs") + R"(","query":)" + vectors[query]
         + R"(,"k":10,"refine_candidates":160,"exact":)" + (forceExact ? "true" : "false")
@@ -160,6 +160,13 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
   state.counters["probes_requested"] = probes;
   state.counters["lists"] = (double)stats.lists.load() / (double)queryCount;
   state.counters["vectors"] = (double)stats.vectors.load() / (double)queryCount;
+  state.counters["scanned"] = (double)stats.scanned.load() / (double)queryCount;
+  state.counters["extra_bits"] = (double)stats.extraBitEvaluations.load() / (double)queryCount;
+  state.counters["gate_rejections"] = (double)stats.gateRejections.load() / (double)queryCount;
+  state.counters["retained_peak"] = (double)stats.retainedPeak.load() / (double)queryCount;
+  state.counters["retained_terminal"] = (double)stats.retainedTerminal.load() / (double)queryCount;
+  state.counters["seed_reads"] = (double)stats.seedReads.load() / (double)queryCount;
+  state.counters["remaining_reads"] = (double)stats.remainingReads.load() / (double)queryCount;
   state.counters["bytes_read"] = (double)stats.bytes.load() / (double)queryCount;
   state.counters["rounds"] = (double)stats.rounds.load() / (double)queryCount;
   state.counters["underfill"] = underfill / (double)queryCount;

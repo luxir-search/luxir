@@ -117,10 +117,21 @@ void appendJsonString(std::string& out, std::string_view s) {
 // to_chars into a stack buffer, not std::format_to(back_inserter): identical
 // bytes, but format's per-call machinery measured ~2x slower for whole-doc
 // rendering (see BM_JsonRender).
-void appendInt(std::string& out, int64_t v) {
+template <bool Int64Str, typename Integer>
+void appendInt(std::string& out, Integer v) {
+  [[maybe_unused]] bool quote = false;
+  if constexpr (Int64Str) {
+    constexpr int64_t safe = (int64_t{1} << 53) - 1;
+    if constexpr (std::is_signed_v<Integer>) quote = v < -safe || v > safe;
+    else quote = v > (uint64_t)safe;
+    if (quote) out += '"';
+  }
   char buf[24];
   auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), v);
   out.append(buf, p);
+  if constexpr (Int64Str) {
+    if (quote) out += '"';
+  }
 }
 
 template <typename F>
@@ -130,6 +141,8 @@ void appendFloating(std::string& out, F v) {
   char buf[40];
   auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), v);
   out.append(buf, p);
+  // Keep floating tokens floating when parsed back, including signed zero.
+  if (std::find(buf, p, '.') == p && std::find(buf, p, 'e') == p) out += ".0";
 }
 
 template <typename Repeated, typename Emit>
@@ -144,6 +157,7 @@ void appendArray(std::string& out, const Repeated& v, Emit&& emit) {
   out += ']';
 }
 
+template <bool Int64Str>
 void appendOpVal(std::string& out, const luxir::api::Val& val);
 
 // Per-cell renderers, one per column kind.  Missing renders as null: scalar
@@ -160,9 +174,10 @@ void str(std::string& out, const luxir::api::Column& col, size_t i) {
   if (i < c.v.size() && c.v[i] != c.missing_val) appendJsonString(out, c.v[i]);
   else out += "null";
 }
+template <bool Int64Str>
 void int64(std::string& out, const luxir::api::Column& col, size_t i) {
   auto& c = std::get<luxir::api::ColInt>(col.kind);
-  if (i < c.v.size() && c.v[i] != c.missing_val) appendInt(out, c.v[i]);
+  if (i < c.v.size() && c.v[i] != c.missing_val) appendInt<Int64Str>(out, c.v[i]);
   else out += "null";
 }
 void flt(std::string& out, const luxir::api::Column& col, size_t i) {
@@ -181,10 +196,11 @@ void arrStr(std::string& out, const luxir::api::Column& col, size_t i) {
     appendArray(out, c.v[i].v, [&out](const auto& s){ appendJsonString(out, s); });
   else out += "null";
 }
+template <bool Int64Str>
 void arrInt(std::string& out, const luxir::api::Column& col, size_t i) {
   auto& c = std::get<luxir::api::ArrArrInt>(col.kind);
   if (i < c.v.size() && !c.v[i].v.empty())
-    appendArray(out, c.v[i].v, [&out](int64_t x){ appendInt(out, x); });
+    appendArray(out, c.v[i].v, [&out](int64_t x){ appendInt<Int64Str>(out, x); });
   else out += "null";
 }
 void arrFlt(std::string& out, const luxir::api::Column& col, size_t i) {
@@ -214,24 +230,26 @@ void multiVec(std::string& out, const luxir::api::Column& col, size_t i) {
     });
   } else out += "null";
 }
+template <bool Int64Str>
 void val(std::string& out, const luxir::api::Column& col, size_t i) {
   auto& c = std::get<luxir::api::ColVal>(col.kind);
-  if (i < c.v.size() && !c.v[i].isNull()) appendOpVal(out, c.v[i]);
+  if (i < c.v.size() && !c.v[i].isNull()) appendOpVal<Int64Str>(out, c.v[i]);
   else out += "null";
 }
 void nul(std::string& out, const luxir::api::Column&, size_t) { out += "null"; }
 } // namespace cell
 
+template <bool Int64Str>
 CellFn resolveCellFn(const luxir::api::Column& col) {
   if (std::holds_alternative<luxir::api::ColStr>(col.kind)) return cell::str;
-  if (std::holds_alternative<luxir::api::ColInt>(col.kind)) return cell::int64;
+  if (std::holds_alternative<luxir::api::ColInt>(col.kind)) return cell::int64<Int64Str>;
   if (std::holds_alternative<luxir::api::ColFloat>(col.kind)) return cell::flt;
   if (std::holds_alternative<luxir::api::ColDouble>(col.kind)) return cell::dbl;
   if (std::holds_alternative<luxir::api::ArrArrStr>(col.kind)) return cell::arrStr;
-  if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) return cell::arrInt;
+  if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) return cell::arrInt<Int64Str>;
   if (std::holds_alternative<luxir::api::ArrArrFloat>(col.kind)) return cell::arrFlt;
   if (std::holds_alternative<luxir::api::ArrArrDouble>(col.kind)) return cell::arrDbl;
-  if (std::holds_alternative<luxir::api::ColVal>(col.kind)) return cell::val;
+  if (std::holds_alternative<luxir::api::ColVal>(col.kind)) return cell::val<Int64Str>;
   if (std::holds_alternative<luxir::api::ColVector>(col.kind)) return cell::vec;
   if (std::holds_alternative<luxir::api::MultiVector>(col.kind)) return cell::multiVec;
   return cell::nul;
@@ -239,15 +257,24 @@ CellFn resolveCellFn(const luxir::api::Column& col) {
 
 // Facet bucket IDs are always present. Unlike document columns, their Column
 // storage does not use missing_val sentinels.
+template <bool Int64Str>
 void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
   if (auto* c = std::get_if<luxir::api::ColInt>(&col.kind)) {
-    if (i < c->v.size()) appendInt(out, c->v[i]);
+    if (i < c->v.size()) appendInt<Int64Str>(out, c->v[i]);
     else out += "null";
   } else if (auto* c = std::get_if<luxir::api::ColStr>(&col.kind)) {
     if (i < c->v.size()) appendJsonString(out, c->v[i]);
     else out += "null";
+  } else if (auto* c = std::get_if<luxir::api::ColFloat>(&col.kind)) {
+    if (i < c->v.size()) appendFloating(out, c->v[i]);
+    else out += "null";
+  } else if (auto* c = std::get_if<luxir::api::ColDouble>(&col.kind)) {
+    if (i < c->v.size()) appendFloating(out, c->v[i]);
+    else out += "null";
+  } else if (std::holds_alternative<luxir::api::ArrArrStr>(col.kind)) {
+    cell::arrStr(out, col, i);
   } else if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) {
-    cell::arrInt(out, col, i);
+    cell::arrInt<Int64Str>(out, col, i);
   } else if (std::holds_alternative<luxir::api::ArrArrFloat>(col.kind)) {
     cell::arrFlt(out, col, i);
   } else if (std::holds_alternative<luxir::api::ArrArrDouble>(col.kind)) {
@@ -257,6 +284,7 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
   }
 }
 
+template <bool Int64Str>
 void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i);
 
 // Document i is the merge of columns row i and docs[i] (see the DocList
@@ -275,6 +303,7 @@ struct ColPlan {
   const luxir::api::Column* col;
 };
 
+template <bool Int64Str>
 std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
   std::vector<ColPlan> plan;
   plan.reserve(docs.columns.size());
@@ -283,7 +312,7 @@ std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
     if (plan.size() > 1) p.key += ',';
     appendJsonString(p.key, name);
     p.key += ':';
-    p.fn = resolveCellFn(col);
+    p.fn = resolveCellFn<Int64Str>(col);
     p.col = &col;
   }
   return plan;
@@ -291,7 +320,7 @@ std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
 
 // One document object: the merge of the planned dense columns and doc i's
 // sparse row map (a field name never appears in both).
-template <bool Collapsed>
+template <bool Int64Str, bool Collapsed>
 void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
                      const luxir::api::DocList& docs, size_t i) {
   out += '{';
@@ -306,7 +335,7 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       first = false;
       appendJsonString(out, name);
       out += ':';
-      appendOpVal(out, *val);
+      appendOpVal<Int64Str>(out, *val);
     }
   }
   if constexpr (Collapsed) {
@@ -323,32 +352,33 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
         if (c) out += ',';
         const auto& value = group.component[c].value;
         if (const auto* str = std::get_if<std::string_view>(&value)) appendJsonString(out, *str);
-        else if (const auto* number = std::get_if<int64_t>(&value)) appendInt(out, *number);
+        else if (const auto* number = std::get_if<int64_t>(&value)) appendInt<Int64Str>(out, *number);
         else out += "null";
       }
       if (tuple) out += ']';
     }
     if (!docs.groups->counts.empty()) {
       out += R"(,"count":)";
-      appendInt(out, docs.groups->counts[i]);
+      appendInt<Int64Str>(out, docs.groups->counts[i]);
     }
     if (!docs.groups->ranks.empty() && !docs.groups->ranks[i].v.empty()) {
       out += R"(,"rank":)";
       luxir::api::Val rank;
       rank.kind = docs.groups->ranks[i];
-      appendOpVal(out, rank);
+      appendOpVal<Int64Str>(out, rank);
     }
     for (const auto& [name, column] : docs.groups->ops) {
       out += ',';
       appendJsonString(out, name);
       out += ':';
-      appendFacetSlot(out, *column, i);
+      appendFacetSlot<Int64Str>(out, *column, i);
     }
     out += '}';
   }
   out += '}';
 }
 
+template <bool Int64Str>
 void appendDocs(std::string& out, const luxir::api::DocList& docs) {
   size_t numDocs = (size_t)docs.row_count;
   out += '[';
@@ -356,11 +386,11 @@ void appendDocs(std::string& out, const luxir::api::DocList& docs) {
     out += ']';
     return;
   }
-  auto plan = buildColPlan(docs);
+  auto plan = buildColPlan<Int64Str>(docs);
   auto appendRows = [&]<bool Collapsed>() {
     for (size_t i = 0; i < numDocs; i++) {
       if (i) out += ',';
-      appendDocObject<Collapsed>(out, plan, docs, i);
+      appendDocObject<Int64Str, Collapsed>(out, plan, docs, i);
     }
   };
   if (!docs.groups) appendRows.template operator()<false>();
@@ -396,6 +426,7 @@ void appendError(std::string& out, const luxir::api::Error& error) {
   appendError(out, luxir::errorKindName((luxir::ErrorKind)error.kind), error.code, error.message);
 }
 
+template <bool Int64Str>
 void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile& profile) {
   out += R"({"ops":[)";
   for (size_t opIndex = 0; opIndex < profile.ops.size(); opIndex++) {
@@ -410,25 +441,25 @@ void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile
       out += R"({"kind":)";
       appendJsonString(out, piece.kind);
       out += R"(,"segment":)";
-      appendInt(out, piece.segment);
+      appendInt<Int64Str>(out, piece.segment);
       out += R"(,"max_doc":)";
-      appendInt(out, piece.max_doc);
+      appendInt<Int64Str>(out, piece.max_doc);
       if (!piece.strategy.empty()) {
         out += R"(,"strategy":)";
         appendJsonString(out, piece.strategy);
       }
       if (piece.cardinality.has_value()) {
         out += R"(,"cardinality":)";
-        appendInt(out, *piece.cardinality);
+        appendInt<Int64Str>(out, *piece.cardinality);
       }
       if (piece.domain_size.has_value()) {
         out += R"(,"domain_size":)";
-        appendInt(out, *piece.domain_size);
+        appendInt<Int64Str>(out, *piece.domain_size);
       }
       out += R"(,"thread_id":)";
-      appendInt(out, piece.thread_id);
+      appendInt<Int64Str>(out, piece.thread_id);
       out += R"(,"elapsed_us":)";
-      appendInt(out, (int64_t)piece.elapsed_us);
+      appendInt<Int64Str>(out, piece.elapsed_us);
       if (!piece.details.empty()) {
         out += R"(,"details":[)";
         for (std::size_t d = 0; d < piece.details.size(); d++) {
@@ -444,6 +475,7 @@ void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile
   out += "]}";
 }
 
+template <bool Int64Str>
 void appendOps(std::string& out,
                const luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>& ops) {
   out += '{';
@@ -453,44 +485,48 @@ void appendOps(std::string& out,
     first = false;
     appendJsonString(out, name);
     out += ':';
-    appendOpVal(out, *val);
+    appendOpVal<Int64Str>(out, *val);
   }
   out += '}';
 }
 
 // Members shared by a named DocList and an unwrapped shorthand response.
+template <bool Int64Str>
 void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
   // "found" is opt-in: omit it when absent so "not requested" is distinct
   // from "zero found".
   if (docs.found.has_value()) {
     out += R"("found":)";
-    appendInt(out, *docs.found);
+    appendInt<Int64Str>(out, *docs.found);
     out += ',';
+    if (docs.found_gte) out += R"("found_gte":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
-    appendInt(out, *docs.found_docs);
+    appendInt<Int64Str>(out, *docs.found_docs);
     out += ',';
   }
   if (docs.found_groups.has_value()) {
     out += R"("found_groups":)";
-    appendInt(out, *docs.found_groups);
+    appendInt<Int64Str>(out, *docs.found_groups);
     out += ',';
   }
   out += R"("docs":)";
-  appendDocs(out, docs);
+  appendDocs<Int64Str>(out, docs);
   if (!docs.ops.empty()) {
     out += R"(,"ops":)";
-    appendOps(out, docs.ops);
+    appendOps<Int64Str>(out, docs.ops);
   }
 }
 
+template <bool Int64Str>
 void appendDocList(std::string& out, const luxir::api::DocList& docs) {
   out += '{';
-  appendDocListMembers(out, docs);
+  appendDocListMembers<Int64Str>(out, docs);
   out += '}';
 }
 
+template <bool Int64Str>
 void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i) {
   if (auto* arr = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
     if (i < arr->v.size()) appendFloating(out, arr->v[i]);
@@ -499,44 +535,46 @@ void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i) {
     if (i < arr->v.size()) appendFloating(out, arr->v[i]);
     else out += "null";
   } else if (auto* arr = std::get_if<luxir::api::ArrInt>(&val.kind)) {
-    if (i < arr->v.size()) appendInt(out, arr->v[i]);
+    if (i < arr->v.size()) appendInt<Int64Str>(out, arr->v[i]);
     else out += "null";
   } else if (auto* arr = std::get_if<luxir::api::ArrStr>(&val.kind)) {
     if (i < arr->v.size()) appendJsonString(out, arr->v[i]);
     else out += "null";
   } else if (auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind)) {
-    if (i < arr->v.size()) appendOpVal(out, arr->v[i]);
+    if (i < arr->v.size()) appendOpVal<Int64Str>(out, arr->v[i]);
     else out += "null";
   } else {
     out += "null";
   }
 }
 
+template <bool Int64Str>
 void appendFacetResult(std::string& out, const luxir::api::FacetResult& facet) {
   out += R"({"buckets":[)";
   for (size_t i = 0; i < facet.counts.size(); i++) {
     if (i) out += ',';
     out += R"({"val":)";
-    if (facet.bucket_ids.has_value()) appendBucketId(out, *facet.bucket_ids, i);
+    if (facet.bucket_ids.has_value()) appendBucketId<Int64Str>(out, *facet.bucket_ids, i);
     else out += "null";
     out += R"(,"count":)";
-    appendInt(out, facet.counts[i]);
+    appendInt<Int64Str>(out, facet.counts[i]);
     for (const auto& [name, val] : facet.ops) {
       out += ',';
       appendJsonString(out, name);
       out += ':';
-      appendFacetSlot(out, *val, i);
+      appendFacetSlot<Int64Str>(out, *val, i);
     }
     out += '}';
   }
   out += ']';
   if (facet.missing.has_value()) {
     out += R"(,"missing":)";
-    appendInt(out, *facet.missing);
+    appendInt<Int64Str>(out, *facet.missing);
   }
   out += '}';
 }
 
+template <bool Int64Str>
 void appendOpVal(std::string& out, const luxir::api::Val& val) {
   if (std::holds_alternative<std::monostate>(val.kind) ||
       std::holds_alternative<google::protobuf::NullValue>(val.kind)) {
@@ -544,7 +582,7 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
   } else if (auto* s = std::get_if<std::string_view>(&val.kind)) {
     appendJsonString(out, *s);
   } else if (auto* i = std::get_if<int64_t>(&val.kind)) {
-    appendInt(out, *i);
+    appendInt<Int64Str>(out, *i);
   } else if (auto* d = std::get_if<double>(&val.kind)) {
     appendFloating(out, *d);
   } else if (auto* f = std::get_if<float>(&val.kind)) {
@@ -552,10 +590,24 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
   } else if (auto* b = std::get_if<bool>(&val.kind)) {
     out += *b ? "true" : "false";
   } else if (auto* docs = std::get_if<luxir::api::DocList>(&val.kind)) {
-    appendDocList(out, *docs);
+    appendDocList<Int64Str>(out, *docs);
   } else if (auto* facet = std::get_if<luxir::api::FacetResult>(&val.kind)) {
-    appendFacetResult(out, *facet);
+    appendFacetResult<Int64Str>(out, *facet);
   } else {
+    if constexpr (Int64Str) {
+      if (auto* integers = std::get_if<luxir::api::ArrInt>(&val.kind)) {
+        appendArray(out, integers->v, [&](int64_t value) { appendInt<Int64Str>(out, value); });
+        return;
+      }
+      if (auto* values = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+        appendArray(out, values->v, [&](const auto& value) { appendOpVal<Int64Str>(out, value); });
+        return;
+      }
+      if (auto* map = std::get_if<luxir::api::Map>(&val.kind)) {
+        appendOps<Int64Str>(out, map->fields);
+        return;
+      }
+    }
     // The generated Val writer starts at offset zero, so serialize into a
     // temporary before appending the canonical form of the remaining arms.
     std::string tmp;
@@ -564,8 +616,7 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
   }
 }
 
-} // namespace
-
+template <bool Int64Str>
 std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, bool shorthand) {
   std::string out;
   out += '{';
@@ -606,10 +657,10 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   if (docs) {
     if (!first) out += ',';
     first = false;
-    appendDocListMembers(out, *docs);
+    appendDocListMembers<Int64Str>(out, *docs);
   } else if (!resp.ops.empty()) {
     appendKey("ops");
-    appendOps(out, resp.ops);
+    appendOps<Int64Str>(out, resp.ops);
   }
   if (!resp.warnings.empty()) {
     // declared degradations (the request was served, but not exactly as written)
@@ -618,7 +669,7 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   }
   if (resp.profile.has_value()) {
     appendKey("profile");
-    appendExecutionProfile(out, *resp.profile);
+    appendExecutionProfile<Int64Str>(out, *resp.profile);
   }
   if (resp.more) {
     appendKey("more");
@@ -628,16 +679,17 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   return out;
 }
 
+template <bool Int64Str>
 std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
   std::vector<DocRun> runs;
   for (const auto& [name, val] : resp.ops) {
     if (const auto* dl = std::get_if<luxir::api::DocList>(&val->kind)) {
       auto& run = runs.emplace_back(DocRun{name, dl, {}});
       if (dl->row_count > 0) {
-        auto plan = buildColPlan(*dl);
+        auto plan = buildColPlan<Int64Str>(*dl);
         auto appendRows = [&]<bool Collapsed>() {
           for (size_t i = 0; i < (size_t)dl->row_count; i++) {
-            appendDocObject<Collapsed>(run.body, plan, *dl, i);
+            appendDocObject<Int64Str, Collapsed>(run.body, plan, *dl, i);
             run.body += '\n';
           }
         };
@@ -649,6 +701,7 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
   return runs;
 }
 
+template <bool Int64Str>
 bool frameDocRun(const DocRun& run, DocLinesState& state,
                  std::span<const luxir::api::Warning> warnings, std::string& marker) {
   const luxir::api::DocList& docs = *run.docs;
@@ -658,7 +711,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   // Found goes out with the op's first run; request warnings and the request
   // id with the stream's first header. Degraded execution must not be silent,
   // and neither may correlation, so either forces a header even without
-  // get_number.
+  // nonzero count_limit.
   bool haveFound = firstForOp && docs.found.has_value();
   bool haveFoundDocs = firstForOp && docs.found_docs.has_value();
   bool haveFoundGroups = firstForOp && docs.found_groups.has_value();
@@ -685,19 +738,20 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
     if (haveFound) {
       if (!first) marker += ',';
       marker += R"("found":)";
-      appendInt(marker, *docs.found);
+      appendInt<Int64Str>(marker, *docs.found);
+      if (docs.found_gte) marker += R"(,"found_gte":true)";
       first = false;
     }
     if (haveFoundDocs) {
       if (!first) marker += ',';
       marker += R"("found_docs":)";
-      appendInt(marker, *docs.found_docs);
+      appendInt<Int64Str>(marker, *docs.found_docs);
       first = false;
     }
     if (haveFoundGroups) {
       if (!first) marker += ',';
       marker += R"("found_groups":)";
-      appendInt(marker, *docs.found_groups);
+      appendInt<Int64Str>(marker, *docs.found_groups);
       first = false;
     }
     if (haveWarnings) {
@@ -711,6 +765,25 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   if (firstForOp) state.headeredOps.push_back(run.op);
   state.currentOp = run.op;
   return true;
+}
+
+} // namespace
+
+std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, bool shorthand,
+                                    JsonResponseOptions options) {
+  return options.int64Str ? renderSearchResponseBody<true>(resp, shorthand)
+                          : renderSearchResponseBody<false>(resp, shorthand);
+}
+
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, JsonResponseOptions options) {
+  return options.int64Str ? renderDocRuns<true>(resp) : renderDocRuns<false>(resp);
+}
+
+bool frameDocRun(const DocRun& run, DocLinesState& state,
+                 std::span<const luxir::api::Warning> warnings, std::string& marker,
+                 JsonResponseOptions options) {
+  return options.int64Str ? frameDocRun<true>(run, state, warnings, marker)
+                          : frameDocRun<false>(run, state, warnings, marker);
 }
 
 std::string renderErrorBody(const ErrorInfo& info, std::string_view requestId) {

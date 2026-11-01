@@ -76,6 +76,9 @@ class ProtobufQueryParser {
   Query* parseConstantScore(const luxir::api::ConstantScoreQuery& constantScoreQuery);
   Query* parseBoost(const luxir::api::BoostQuery& boostQuery);
   Query* parseRescore(const luxir::api::RescoreQuery& rescoreQuery);
+  Query* parseMultiMatch(const luxir::api::MultiMatchQuery& query);
+  Query* parseDisMax(const luxir::api::DisMaxQuery& query);
+  Query* parsePlugin(const luxir::api::PluginQuery& query);
 
   static std::optional<float> constantOutput(const ValueProgram& program);
   static bool exactlyRepresented(const ValueResult& result, float value);

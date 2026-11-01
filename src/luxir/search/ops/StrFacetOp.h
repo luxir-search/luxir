@@ -751,7 +751,8 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        if (found && data.counts.acceptsKeyedBatches()) {
+        if (found && !(segFieldInfo->flags & FieldType::MULTI_ARRAY)
+            && data.counts.acceptsKeyedBatches()) {
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
@@ -1051,9 +1052,10 @@ public:
               std::vector<int32_t> localCounts((size_t)nTerms);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
+                  thisOp().req.memoryTracker, thisOp().facetName,
                   [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
-                    // Multi-valued ord columns hold distinct ords per doc, so
+                    // The membership walk dedups ARRAY ords per doc, so
                     // this counts the same doc-term pairs as docFreq.
                     localCounts[(size_t)localOrd]++;
                   });
@@ -1071,6 +1073,7 @@ public:
               hits.reserve((size_t)domainView.compCard);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
+                  thisOp().req.memoryTracker, thisOp().facetName,
                   [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
                     hits.push_back((int32_t)localOrd);
@@ -1105,6 +1108,7 @@ public:
               SkinnyCounter<uint8_t, int32_t, int32_t> local((size_t)nTerms);
               forEachComplementOrdValue(
                   domainView, poolGuard.pool(), ordColReader, compMissing,
+                  thisOp().req.memoryTracker, thisOp().facetName,
                   [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                     unused(docid);
                     local.increment((int32_t)localOrd);
@@ -1467,9 +1471,8 @@ public:
     // intersection per bucket.  Indexed [segment * numBuckets + owner], which is
     // what the bucket-domain executor asks for.
     //
-    // A document reaches a builder at most once: ord columns carry each doc's
-    // distinct terms, and the segment-to-global mapping is injective, so no two
-    // stored ords of one document route to the same owner.  DocSetBuilder's
+    // A document reaches a builder at most once: the membership walk dedups
+    // ARRAY terms; the segment-to-global mapping is injective.  DocSetBuilder's
     // debug monotonicity assert covers the claim.
     std::vector<DomainHandle> ordColumnBucketDomains(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
@@ -1497,9 +1500,9 @@ public:
           int64_t missing_num = 0;
           DocSet* domain = input[segnum].get();
           selectedMap.visit([&](const auto& ownerOfOrd) {
-            forEachOrdValue(
+            forEachOrdDocument(
                 domain, ordColReader, OrdMap::SegToGlobal::identity(), maxDoc,
-                missing_num,
+                missing_num, thisOp().req.memoryTracker, thisOp().facetName,
                 [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                   int32_t owner = StrFacetSelectedOrdMap::owner(
                       ownerOfOrd, localOrd);
@@ -1650,7 +1653,7 @@ public:
         : Calculator(child, &parent, -1, numSlots), child(child) {}
 
     luxir::api::Val* getTargetForSub(
-        SearchResponse* resp, Calculator* sub) override {
+        SearchResponse* resp, SearchOp& sub) override {
       unused(resp);
       unused(sub);
       return nullptr;
@@ -1715,11 +1718,27 @@ public:
     int64_t maxDocs = 0;
     int64_t expectedUpdates = 0;
 
+    using ArrayChildOrds = boost::unordered_flat_set<int32_t, boost::hash<int32_t>,
+        std::equal_to<int32_t>, std::pmr::polymorphic_allocator<int32_t>>;
+
+    template <typename Visit>
+    static bool LUXIR_NOINLINE visitArrayChildOrds(
+        OrdColReader& column, OrdColReader::Iterator& iter,
+        const OrdMap::SegToGlobal& mapping, ArrayChildOrds& seen, Visit&& visit) {
+      auto [start, end] = column.getStartEndValueRank(iter.rank());
+      seen.clear();
+      for (int64_t rank = start; rank < end; rank++) {
+        int32_t ord = iter.values().valueAt(rank);
+        if (seen.insert(ord).second) visit(mapping.globalOrd((int64_t)ord - 1));
+      }
+      return start != end;
+    }
+
     template <bool ChildMulti, typename Visit>
     static bool visitChildOrds(
         int32_t docid, OrdColReader& childColumn,
         OrdColReader::Iterator& childIterator,
-        const OrdMap::SegToGlobal& childMapping,
+        const OrdMap::SegToGlobal& childMapping, ArrayChildOrds* arraySeen,
         Visit&& visit) {
       if (childIterator.docId() < docid) childIterator.advance(docid);
       if (childIterator.docId() != docid) return false;
@@ -1729,6 +1748,11 @@ public:
         visit(childMapping.globalOrd((int64_t)storedOrd - 1));
         return true;
       } else {
+        if (childColumn.multiArray()) {
+          assert(arraySeen != nullptr);
+          return visitArrayChildOrds(childColumn, childIterator, childMapping, *arraySeen,
+                                    std::forward<Visit>(visit));
+        }
         auto [start, end] = childColumn.getStartEndValueRank(
             childIterator.rank());
         for (int64_t rank = start; rank < end; rank++) {
@@ -1747,17 +1771,17 @@ public:
         OrdColReader* childColumn, OrdColReader::Iterator* childIterator,
         const OrdMap::SegToGlobal* childMapping,
         std::vector<int64_t>& missingCounts,
-        int64_t& routedDocs, int64_t& routedValues) {
+        int64_t& routedDocs, int64_t& routedValues, ArrayChildOrds* arraySeen = nullptr) {
       int64_t numChildOrds = child.ordMap->numOrds();
       forEachSelectedBucketDoc(
-          domain, parentColumn, maxDoc, selectedMap,
+          domain, parentColumn, maxDoc, selectedMap, child.req.memoryTracker, child.facetName,
           [&](int32_t docid,
               std::span<const int32_t> owners) LUXIR_INLINE {
             if constexpr (TrackProfile) routedDocs++;
             bool haveChildValue = false;
             if constexpr (ChildPresent) {
               haveChildValue = visitChildOrds<ChildMulti>(
-                  docid, *childColumn, *childIterator, *childMapping,
+                  docid, *childColumn, *childIterator, *childMapping, arraySeen,
                   [&](int64_t ord) LUXIR_INLINE {
                     for (int32_t owner : owners) {
                       StrFacetReplayBank::increment(
@@ -1774,6 +1798,19 @@ public:
               }
             }
           });
+    }
+
+    template <bool TrackProfile, typename Bank, typename SelectedMap>
+    void LUXIR_NOINLINE replayArrayValues(
+        Bank& bank, const SelectedMap& selectedMap,
+        OrdColReader& parentColumn, int32_t maxDoc, DocSet* domain,
+        OrdColReader& childColumn, OrdColReader::Iterator& childIterator,
+        const OrdMap::SegToGlobal& childMapping, std::vector<int64_t>& missingCounts,
+        int64_t& routedDocs, int64_t& routedValues) {
+      FacetCountResource resource(child.req.memoryTracker, child.facetName, "facet document dedup");
+      ArrayChildOrds seen(&resource);
+      replayValues<TrackProfile, true, true>(bank, selectedMap, parentColumn, maxDoc, domain,
+          &childColumn, &childIterator, &childMapping, missingCounts, routedDocs, routedValues, &seen);
     }
 
     template <bool TrackProfile, typename Bank>
@@ -1822,6 +1859,11 @@ public:
               bank, selectedMap, parentColumn, maxDoc, domain,
               nullptr, nullptr, nullptr, missingCounts,
               routedDocs, routedValues);
+        } else if (childColumn->multiValued() && childColumn->multiArray()) {
+          replayArrayValues<TrackProfile>(
+              bank, selectedMap, parentColumn, maxDoc, domain,
+              *childColumn, *childIterator, childMapping,
+              missingCounts, routedDocs, routedValues);
         } else if (childColumn->multiValued()) {
           replayValues<TrackProfile, true, true>(
               bank, selectedMap, parentColumn, maxDoc, domain,

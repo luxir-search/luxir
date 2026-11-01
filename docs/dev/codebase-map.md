@@ -114,7 +114,8 @@ locations, browse `src/luxir/<area>/`.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (PQ by default, or opt-in RaBitQ) aux overlays for ANN
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN
+   - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
    - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 
@@ -140,6 +141,23 @@ locations, browse `src/luxir/<area>/`.
      and introduction/segment generations for conservative coverage
    - `FieldSignature`: Effective properties for schema introduction history and
      the resolved view; `SchemaInfo` persists authored definitions and introductions
+   - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
+     token filters, char filters, plus named analyzers) is the only path from an authored
+     `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
+     more before the registry freezes. `Analyzer::compile` expands a named analyzer into
+     its definition (the canonical JSON, and so segment metadata, never names the preset)
+     and builds an immutable plan; `createChain` instantiates a per-thread `TokenChain`
+     (char filters, tokenizer, token filters). All callers feed text through
+     `TokenChain::setValue`, which runs the char filters; `sourceOffset` maps token offsets back
+
+9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
+   - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by
+     `initPlugins()` at startup, then frozen. Plugins are CMake targets added with
+     `luxir_add_plugin` and selected at build time via `LUXIR_PLUGIN_DIRS`.
+   - Extension registries: `QueryRegistry` (`src/luxir/query/`, the `plugin` Query arm),
+     `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm) and
+     `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
+   - See [plugins.md](plugins.md).
 
 ## Data Organization
 

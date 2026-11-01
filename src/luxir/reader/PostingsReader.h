@@ -12,6 +12,7 @@
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
 #include "SegFieldInfo.h"
+#include "StoredFieldsMetadata.h"
 #include "VersionRuns.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
@@ -57,6 +58,11 @@ public:
     // Field-sort planning reads every segment's leaf bounds. Keep the view
     // with the header rather than rebuilding it for each request.
     std::optional<NumColumnFormat::LeafMeta> leafMeta;
+    std::unique_ptr<const StoredFieldsMetadata> stored;
+
+    size_t allocatedBytes() const {
+      return sizeof(*this) + (stored ? stored->allocatedBytes() : 0);
+    }
     const NumColumnFormat::LeafMeta* numericLeafMeta() const noexcept {
       return leafMeta ? &*leafMeta : nullptr;
     }
@@ -115,6 +121,7 @@ public:
   struct FieldCacheStats {
     size_t pages = 0;
     size_t entries = 0;
+    size_t entryBytes = 0;
     size_t bytes = 0;
   };
   FieldCacheStats fieldCacheStats() const noexcept;

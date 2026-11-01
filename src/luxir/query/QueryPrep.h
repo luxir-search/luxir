@@ -324,6 +324,10 @@ public:
       .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
       .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
       .directDocSet = Query::DirectDocSetAccess::SUPPORTED,
+      .membershipConsumption = buildContext.membershipConsumption
+              == Query::MembershipConsumption::CANDIDATES
+          ? Query::MembershipConsumption::CANDIDATES
+          : Query::MembershipConsumption::WINDOWS,
     };
   }
 

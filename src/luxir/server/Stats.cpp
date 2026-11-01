@@ -158,6 +158,7 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.document_errors = errorKinds(counts.documentErrors, resource);
   fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
   fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);
+  fillActivity(dst.delete_pass, counts, metricActivity(MetricStage::DELETE_PASS), resource);
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
@@ -396,7 +397,9 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
-  if (!request.collection.empty()) {
+  if (request.max_bytes) {
+    entries =node.collections().setCacheBytes(request.tenant, request.collection, (size_t)*request.max_bytes);
+  } else if (!request.collection.empty()) {
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {

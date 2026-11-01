@@ -258,6 +258,8 @@ public:
   struct EstimateResult {
     uint64_t estimatedCount;
     uint64_t upperBound;
+    // Points of the crossing leaves, which an intersection tests one by one.
+    uint64_t crossingPoints = 0;
   };
 
   struct Scratch {
@@ -777,6 +779,7 @@ public:
   EstimateResult estimateIntersect(Relation&& relation) const {
     uint64_t estimated = 0;
     uint64_t upper = 0;
+    uint64_t crossing = 0;
     auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
       for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
         uint64_t count = leafInfo(leaf).count;
@@ -824,11 +827,12 @@ public:
       } else if (tight == BKDRelation::CROSSES) {
         estimated += ((uint64_t)info.count + 1) / 2;
         upper += info.count;
+        crossing += info.count;
       }
     };
     visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
           INT32_MIN, INT32_MAX);
-    return {estimated, upper};
+    return {estimated, upper, crossing};
   }
 
   template <class Relation>

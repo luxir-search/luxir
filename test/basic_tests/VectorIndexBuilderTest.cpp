@@ -217,7 +217,7 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
                                   int32_t nprobe = 0, int32_t refineCandidates = 0,
                                   bool exact = false) {
   auto req = localReq(engine);
-  auto& cur = req->collection("main").topDocs("q").getNumber().fields({"id"});
+  auto& cur = req->collection("main").topDocs("q").countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
 
   req->execute();
@@ -1348,7 +1348,7 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     ASSERT_EQ(index->ntotal, 80);
     ASSERT_NE(aux->getRotation(), nullptr);
     std::vector<float> query(4, 0.5f), rotated(4);
-    aux->getRotation()->apply_noalloc(1, query.data(), rotated.data());
+    aux->getRotation()->apply(query.data(), rotated.data());
     faiss::IVFRaBitQSearchParameters params;
     params.nprobe = aux->getNList();
     params.qb = 0;
@@ -1400,12 +1400,41 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
   EXPECT_EQ(meta.pqBits, 2);
 }
 
-TEST_F(VectorIndexBuilderTest, automaticPqMScalesWithDimensionsForInnerProduct) {
+TEST_F(VectorIndexBuilderTest, defaultRaBitQBitsUseStoredDimensions) {
+  IvfTestGuard guard;
+  for (int dims : {128, 383, 384, 768}) {
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    // Exercise both inferred dimensions and a truncated stored dimension.
+    if (dims == 128) { f.dims = 768; f.truncate_dims = dims; }
+    b.set(h.collection());
+    for (int i = 0; i < 80; ++i) {
+      std::vector<float> v(dims == 128 ? 768 : dims);
+      for (size_t j = 0; j < v.size(); ++j) v[j] = (float)((i * 7 + j * 3) % 31);
+      h.index(flatdoc("id", std::to_string(i), "embedding_v", v));
+    }
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto meta = readVectorAuxMeta(onlyVectorOverlay(info));
+    EXPECT_EQ(meta.engine, VectorAuxMeta::ENGINE_IVFRABITQ);
+    EXPECT_EQ(meta.dims, dims);
+    EXPECT_EQ(meta.rabitqBits, dims < 384 ? 2 : 1);
+    EXPECT_EQ(meta.rotationKind, VectorRotation::FHT_KAC);
+    EXPECT_EQ(meta.rotationSeed, VectorIndexBuilder::RABITQ_ROTATION_SEED);
+  }
+}
+
+TEST_F(VectorIndexBuilderTest, automaticPqMScalesWithDimensionsForEveryMetric) {
   IvfTestGuard guard;
   struct Case { api::VectorMetric metric; int32_t dims, configuredM, expectedM; };
   for (const auto& c : {Case{api::VectorMetric::COSINE, 320, 0, 40},
                         Case{api::VectorMetric::IP, 320, 0, 40},
-                        Case{api::VectorMetric::L2, 320, 0, 32},
+                        Case{api::VectorMetric::L2, 320, 0, 40},
+                        Case{api::VectorMetric::L2, 960, 0, 120},
                         Case{api::VectorMetric::COSINE, 256, 0, 32},
                         Case{api::VectorMetric::COSINE, 768, 0, 96},
                         Case{api::VectorMetric::COSINE, 320, 16, 16}}) {

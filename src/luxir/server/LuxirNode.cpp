@@ -6,18 +6,49 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
 
+#include <omp.h>
+
 namespace luxir {
 
+void PluginNodeStates::create(LuxirNode& node, const PluginRegistry& plugins) {
+  if (!states.empty()) throw std::logic_error("plugin node states have already been created");
+  states.reserve(plugins.plugins().size());
+  try {
+    for (const auto& plugin : plugins.plugins()) {
+      states.emplace_back(plugin->info().name, nullptr);
+      states.back().second = plugin->createNodeState(node);
+    }
+  } catch (...) {
+    clear();
+    throw;
+  }
+}
+
+void PluginNodeStates::clear() noexcept {
+  while (!states.empty()) {
+    states.back().second.reset();
+    states.pop_back();
+  }
+}
+
+PluginNodeState* PluginNodeStates::find(std::string_view name) const {
+  for (const auto& [key, state] : states) {
+    if (key == name) return state.get();
+  }
+  return nullptr;
+}
+
 // One arena slot per thread that enters the task arena from outside: each
-// HTTP shard and gRPC thread the configured servers run, plus the embedding
-// (main or test) thread.
+// HTTP shard the configured server runs, plus the embedding (main or test)
+// thread.  gRPC threads never enter: they enqueue their work.
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
-  return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1;
 }
 
 // TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
@@ -50,13 +81,22 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
     LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads and server.grpc.threads; excess entrants can block behind arena work",
+             "server.http.threads; excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
 
+void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
+  omp_set_num_threads(1);
+  if (!worker) return;
+  char name[16];
+  snprintf(name, sizeof(name), "%s%d", prefix,
+           oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
+  nameThisThread(name);
+}
+
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
-  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+  : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
@@ -113,9 +153,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
+  pluginStates.create(*this, PluginRegistry::global());
 }
 
 LuxirNode::~LuxirNode() {
+  pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();

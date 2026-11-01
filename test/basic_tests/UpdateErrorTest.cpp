@@ -325,6 +325,7 @@ TEST_F(UpdateErrorTest, rollbackRestoresLocalOccupantAndWatermark) {
     LuxirNode node;
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
+    node.getIndexRamBudget().setTotalBytes(0); // uncapped: no delete pass, the packet waits for the commit
     auto original = helper.index(flatdoc("id", "x", "text_w", "original"), UpdateMessage::NO_COMMIT, true);
     ASSERT_TRUE(original.success);
     CollectionHelper::UpdateBuilder request;

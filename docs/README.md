@@ -80,14 +80,21 @@ state, and commits are crash-safe on immutable segments.
   execution, and native vector integration.
 - [Vector search design](design/vector-search.md) covers segment overlays and
   the ANN execution model.
+- [Storage and object stores](design/storage.md) lays out the storage
+  roadmap: object-store durability, nodes reading from the store through a
+  local cache, and the publication contract both use.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
   and runtime time-zone data.
 - [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
   compiler and dependency environment, including ASan.
+- [Vector comparison](dev/vector-comparison.md) explains dependency images and
+  interleaved HTTP measurements across source refs.
 - [Building a release](dev/releases.md) covers branches, tags, CPU tiers,
   validation, and binary packaging.
+- [Plugins](dev/plugins.md) explains the compiled-in plugin model and how to
+  build an engine with out-of-tree plugins.
 - [Documentation](dev/documentation.md) covers editing the guides and
   regenerating the API reference.
 

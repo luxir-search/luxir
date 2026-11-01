@@ -78,7 +78,7 @@ void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetr
   auto& v = b.templ("_vs");
   v.type = api::FieldDef::FieldClass::VECTOR;
   v.column = true;
-  v.multi = true;
+  v.multi = api::FieldDef::MultiMode::DEFAULT;
   v.dims = dims;
   v.metric = metric;
   v.ann = ann;
@@ -91,7 +91,7 @@ protected:
   auto run(std::string_view collection, std::string_view body, int32_t parallel = 1, bool ok = true) {
     auto request = localReq(luxirNode->getSearchEngine());
     std::string json = R"({"collection":")" + std::string(collection)
-        + R"(","get_scores":true,"get_number":true,"document_format":"rows","batch_size":10000,)"
+        + R"(","get_scores":true,"count_limit":-1,"document_format":"rows","batch_size":10000,)"
         + std::string(body) + '}';
     if (!api::read_json(request->rawRequest(), json, request->mr)) throw std::runtime_error(json);
     request->execute(parallel);
@@ -294,6 +294,33 @@ TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
   }
 }
 
+TEST_F(GroupKnnTest, sharedFloorRespectsMemberCapsAcrossSegments) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard grain(KnnQuery::scanTaskGrainVectors);
+  KnnQuery::scanTaskGrainVectors = 1;
+  CollectionHelper helper;
+  schema(helper, api::VectorMetric::L2, rabitqAnn(4, 4));
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 32; i++) {
+      float x = (float)(segment * 100 + i + 1);
+      docs.push_back(flatdoc("id", std::to_string(segment * 32 + i),
+          "key_s", segment == 0 ? "near" : "far", "vec_vs",
+          std::vector<std::vector<float>>{{x, 0, 0, 0}, {x + 0.25f, 0, 0, 0}}));
+    }
+    helper.indexAll(docs);
+    helper.commit({"*"});
+  }
+  std::string collapse = R"(,"collapse":{"field":"key_s"})";
+  auto expected = rows(*run("main", R"("limit":2,"query":)" + knn(2, true) + collapse));
+  ASSERT_EQ(expected.size(), 2u);
+  for (int32_t parallel : {1, -1}) {
+    auto actual = run("main", R"("limit":2,"query":)"
+        + knn(2, true, false, R"(,"refine_candidates":8,"ivf":{"nprobe":1000})") + collapse, parallel);
+    EXPECT_EQ(rows(*actual), expected);
+  }
+}
+
 TEST_F(GroupKnnTest, rabitqQueryBitsChangeBoundedGroupedSelection) {
   IvfTestGuard ivf;
   CollectionHelper helper;
@@ -491,7 +518,7 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
       VectorSearchResult result;
       for (const auto& row : heap.span()) result.hits.push_back(row);
       result.scoresAreExact = false;
-      result.poolExhausted = true;
+      result.boundedSelection = VectorSelection::COMPLETE;
       return result;
     }
   };
@@ -524,7 +551,7 @@ TEST_F(GroupKnnTest, enrichmentReplaysOnlyAdmittedMembers) {
       UpdateMessage::COMMIT).success);
   for (bool groups : {false, true}) for (int parallel : {1, -1}) {
     auto actual = run("main", R"("limit":-1,"fields":["id"],"query":)" + knn(3, groups)
-        + R"(,"collapse":{"field":"key_s","get_number":true,"head_sort":"price_i asc","ops":{"members":{"top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}}}})", parallel);
+        + R"(,"collapse":{"field":"key_s","get_count":true,"head_sort":"price_i asc","ops":{"members":{"top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}}}})", parallel);
     ASSERT_TRUE(actual->ok()) << actual->errorMsg();
     auto result = rows(*actual);
     ASSERT_EQ(2u, result.size());
@@ -626,7 +653,7 @@ TEST_F(GroupKnnTest, selectionBucketsReevaluateAndResetQueriesUseTheirScope) {
     std::string domain = filter ? R"("query":"*:*","filter":[)" + knn(2, false) + ']'
         : R"("query":)" + knn(2, false);
     auto actual = run("main", R"("fields":["id"],"query":)" + knn(1, groups)
-        + R"(,"collapse":{"field":"key_s","get_number":true,"ops":{"members":{
+        + R"(,"collapse":{"field":"key_s","get_count":true,"ops":{"members":{
         "top_docs":{"sort":"price_i asc","limit":-1,"fields":["id"],"document_format":"rows"}
         ,"domain":{)"
         + domain + R"(}},"inherited":{"top_docs":{"limit":-1,"fields":["id"]}
@@ -757,14 +784,49 @@ TEST_F(GroupKnnTest, resetAllExtraKeepsItsScopedOwner) {
   for (int parallel : {1, -1}) {
     auto actual = run("main", R"("limit":0,"ops":{"f":{"query_facet":{"buckets":{"all":"*:*"},
       "ops":{"t":{"top_docs":{"query":)" + knn(2, false) + R"(,"filter":["id:*"],"limit":0,
-        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},
+        "ops":{"n":{"top_docs":{"limit":0,"count_limit":-1},
           "domain":{"query":"*:*","filter":["*:*"],"apply_parent_filters":true}},
-          "near":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":)"
+          "near":{"top_docs":{"limit":0,"count_limit":-1},"domain":{"query":)"
         + knn(1, false) + R"(}}}}}}}}})", parallel);
     ASSERT_TRUE(actual->ok()) << actual->errorMsg();
     const auto& facet = *actual->docList()->ops.at("f")->facetResult();
     const auto& top = *std::get<api::ArrVal>(facet.ops.at("t")->kind).v[0].docList();
     EXPECT_EQ(2, top.ops.at("n")->docList()->found.value_or(-1));
     EXPECT_EQ(1, top.ops.at("near")->docList()->found.value_or(-1));
+  }
+}
+
+TEST_F(GroupKnnTest, intervalsPruneMembersWithinDistinctUnits) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::maxKnnCandidates, KnnQuery::scanTaskGrainVectors, KnnQuery::statsForTests);
+  KnnQuery::maxKnnCandidates = 1;
+  KnnQuery::scanTaskGrainVectors = 1;
+  CollectionHelper helper;
+  schema(helper, api::VectorMetric::L2, rabitqAnn(4, 8));
+  for (int part = 0; part < 2; part++) {
+    for (int doc = 0; doc < 32; doc++) {
+      std::vector<std::vector<float>> values;
+      for (int value = 0; value < 8; value++) values.push_back({(float)(part + doc * 8 + value), 0, 0, 0});
+      auto entry = flatdoc("id", std::to_string(part * 32 + doc), "eligible_s", doc % 2 ? "no" : "yes", "vec_vs", values);
+      if (doc % 3) entry.emplace_back("key_s", "popular");
+      helper.index(entry);
+    }
+    helper.commit({"*"});
+  }
+  for (auto missing : {"group", "drop", "expand"}) for (bool filtered : {false, true}) {
+    std::vector<std::string> fields{"key_s"};
+    std::string prefix = R"("limit":-1,"collapse":)" + keySpec(fields, missing) + ","
+        + (filtered ? R"("filter":["eligible_s:yes"],)" : "") + R"("query":)";
+    auto expected = rows(*run("main", prefix + knn(4, true)));
+    for (int parallel : {1, -1}) {
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      auto actual = run("main", prefix + knn(4, true, false, R"(,"ivf":{"min_scan_fraction":1})"), parallel);
+      EXPECT_EQ(rows(*actual), expected);
+      EXPECT_LE(stats.seedReads.load(), 4);
+      EXPECT_LT(stats.retainedTerminal.load(), stats.scanned.load() / 2);
+      EXPECT_LE(stats.seedReads.load() + stats.remainingReads.load(), stats.retainedTerminal.load());
+      KnnQuery::statsForTests = nullptr;
+    }
   }
 }
