@@ -443,6 +443,66 @@ storage to the request's existing opt-in byte ceiling. Exceeding it throws
 precede destruction of shared state. Old bounded candidate and breadth limits
 remain separate existing policies.
 
+### Filtered Search: Exact or IVF
+
+A filter reaches kNN as a materialized per-segment domain, so its size is
+known before any scan. IVF budgets breadth against every live vector and
+widens until enough eligible units appear: with a fraction s of the vectors
+eligible it scans about need / s codes, each paying the selector's value-rank
+resolve and domain probe. Exact search scores only the eligible vectors and
+probes the domain once per column vector. `KnnQuery::chooseExactSegments`
+prices both per overlay segment, in units of one dimension of an exact score:
+
+- exact: eligible vectors x dims, plus a domain probe per column vector;
+- IVF: centroid ranking (nlist x dims) plus the expected scan fraction x live
+  vectors x (a cost per code byte + the selector cost).
+
+The constants were fitted from forced IVF and forced exact runs of
+`Tuning/BM_VectorKnnFiltered` (500k 128-d vectors, k=10, filters keeping 0.01%
+to 10%). There the choice picked the faster arm at every PQ point: exact up to
+0.1% (2.1 ms against 2.5 ms for IVF, and 1.5 ms against 5.3 ms at 0.01%) and
+IVF from 0.3%. RaBitQ used IVF from 0.1%; at 0.01% it picked exact at 1.5 ms
+and recall 1.0 over IVF at 0.84 ms and recall 0.87. At these sizes the exact
+arm is dominated by the per-vector domain probe of the column walk.
+
+The same benchmark reads real corpora through `LUXIR_VECTOR_DATASET`, and its
+`scan` argument pins `min_scan_fraction` to find the IVF effort a filter needs
+for a given recall. Under selective filters IVF's default effort loses recall
+(recall@10 of 0.58 to 0.87 below 1% on the corpora below), because the k nearest
+filtered vectors lie much deeper than the k nearest overall. The fair rival of
+exact search is therefore IVF at the least effort reaching recall 0.95. On
+Deep 5M (96-d) and Cohere, GIST and arXiv 1M (768 to 1536-d), four segments,
+both codecs and filters keeping 0.01% to 3%:
+
+- 768 to 1536-d: exact is cheaper up to about 0.3% to 1%, and the choice
+  takes it there; above, it takes IVF.
+- Deep: IVF is cheaper at every selectivity, since the probe walk over 5M
+  vectors costs about 19 ms; the choice takes IVF except with PQ at 0.01%.
+
+Against those recall-matched costs the choices averaged 1.05x the cheaper
+strategy (geometric mean), at most 1.9x: exact for Deep PQ at 0.01% (18.9 ms
+against IVF's 10.3 ms at recall 0.99), and default-effort IVF for arXiv RaBitQ
+at 1% (recall 0.93; 0.95 would cost 17.9 ms against exact's 9.5 ms). Refitting
+the constants to those corpora's measured nanosecond costs did not improve on
+this. The same runs show default deepening (one list per round) can cost more
+than a pinned full scan, for example 19.4 ms against 6.7 ms for Cohere PQ at
+0.01%.
+
+The expected scan fraction is the breadth budget, raised to need / eligible,
+where need is the bounded pool (or k units for RaBitQ intervals) in vectors and
+eligible counts the eligible vectors of the segments still on IVF. Moving a segment to exact
+shrinks that pool for the rest, so the choice repeats until stable. Eligible
+vectors are the domain's documents times the segment's vectors per document,
+exact for dense single-valued fields. Unfiltered segments stay on IVF, since
+a code costs less than a full-precision vector.
+
+The estimate assumes the filter is spread across lists. A filter correlated
+against the query (its documents far from it) makes IVF deepen through lists
+with no match. The composite engine accounts scanned codes and centroid
+rankings in the same units, and when a widen round would deepen after spending
+more than exact search of the IVF segments costs, prepare restarts with those
+segments exact. The restart bounds a query at about twice the cheaper strategy.
+
 ## Parallel Execution
 
 A single query's scan and rescore run in parallel when the request executes in

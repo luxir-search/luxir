@@ -339,7 +339,9 @@ Anywhere a query goes, it can be a structured object or an expression string.
   candidates are rescored at full precision straight from the column, so the
   recall recovery costs no extra storage.
 - Filtered kNN applies filters inside the vector search and adaptively deepens
-  ANN breadth instead of post-filtering. `exact: true` gives the exact
+  ANN breadth instead of post-filtering. Each segment picks exact search over
+  the filtered vectors when a selective filter makes it cheaper than ANN, and
+  ANN that deepens past that cost restarts exact. `exact: true` gives the exact
   filtered top-k, which also serves as the ground truth for measuring recall.
 - Multi-valued vector fields collapse to one hit per document at its best
   similarity, with adaptive over-fetch so `k` documents still come back.

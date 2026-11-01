@@ -3074,3 +3074,104 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     EXPECT_EQ(a.hash(), c.hash());
   }
 }
+
+TEST_F(KnnQueryTest, chooseExactSegmentsPricesFilteredSegments) {
+  // A: unfiltered. B: a filter keeping 10 of 1000 vectors. C: no overlay.
+  std::vector<KnnQuery::SegmentCost> segs{
+    {.liveVectors = 1000, .eligibleVectors = 1000, .exactCost = 64000,
+     .coarseCost = 256, .codeCost = 16, .ivf = true},
+    {.liveVectors = 1000, .eligibleVectors = 10, .exactCost = 640 + 2000,
+     .coarseCost = 256, .codeCost = 32, .ivf = true},
+    {.liveVectors = 1000, .eligibleVectors = 1000},
+  };
+  std::vector<char> exact(3, 0);
+  KnnQuery::chooseExactSegments(segs, /*budget=*/0.1, /*need=*/100, exact);
+  EXPECT_EQ((std::vector<char>{0, 1, 0}), exact);
+
+  // Without A, B alone must deliver `need` from its 10 eligible vectors.
+  segs[0].ivf = false;
+  segs[1].exactCost = 1e6;
+  std::fill(exact.begin(), exact.end(), 0);
+  KnnQuery::chooseExactSegments(segs, 0.1, 100, exact);
+  EXPECT_EQ((std::vector<char>{0, 0, 0}), exact) << "exact cost above a full IVF scan";
+}
+
+TEST_F(KnnQueryTest, selectiveFilterScoresOverlaySegmentExactly) {
+  IvfTestGuard guard(/*minTraining=*/16);
+  VectorEngine::costBasedExact = true;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "color_s", i % 40 == 0 ? "red" : "blue",
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr);
+  }
+
+  auto run = [&](bool exact, bool filtered) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, "embedding_v", {100.0f, 0.0f, 0.0f, 0.0f}, 3, 0, 0, exact);
+    if (filtered) addMatchFilter(cur, "color_s", "red");
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    return ids;
+  };
+  auto chosen = [&](bool filtered) {
+    int64_t before = KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed);
+    auto ids = run(false, filtered);
+    EXPECT_EQ(run(true, filtered), ids);
+    return KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed) - before;
+  };
+  EXPECT_EQ(0, chosen(false));
+  EXPECT_EQ(1, chosen(true));
+  EXPECT_EQ((std::vector<std::string>{"d80", "d120", "d40"}), run(false, true));
+
+  VectorEngine::costBasedExact = false;
+  EXPECT_EQ(0, chosen(true));
+}
+
+// The filter keeps 5% of the vectors, all in the list farthest from the
+// query: the up-front estimate (filtered vectors spread over every list)
+// picks IVF, which then deepens through lists without a match until it has
+// spent the cost of exact search and restarts exact.
+TEST_F(KnnQueryTest, ivfDeepeningPastExactCostRestartsExact) {
+  IvfTestGuard guard(/*minTraining=*/16);
+  VectorEngine::costBasedExact = true;
+  CollectionHelper h("main");
+  constexpr int32_t dims = 64;
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(4), dims);
+  for (int i = 0; i < 1000; i++) {
+    std::vector<float> vec(dims, 0.0f);
+    vec[0] = (float)i;
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "color_s", i >= 950 ? "red" : "blue", "embedding_v", vec));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr);
+  }
+
+  auto run = [&](bool exact) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, "embedding_v", std::vector<float>(dims, 0.0f), 3, 0, 0, exact);
+    addMatchFilter(cur, "color_s", "red");
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    return ids;
+  };
+  int64_t chosen = KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed);
+  int64_t fallbacks = KnnQuery::exactFallbacksForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ((std::vector<std::string>{"d950", "d951", "d952"}), run(false));
+  EXPECT_EQ(chosen, KnnQuery::exactSegmentsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(fallbacks + 1, KnnQuery::exactFallbacksForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(run(true), run(false));
+}

@@ -345,6 +345,15 @@ later filter would have discarded. With an approximate index, the search
 deepens its breadth automatically when a filter or multi-value collapse leaves
 too few documents.
 
+A selective filter makes the approximate search scan many vectors to find a
+few that pass, while an exact scan scores only the vectors that pass. Each
+indexed segment therefore compares the two costs from the filter's size and
+uses the exact column scan when it is cheaper, which also returns the exact
+filtered top-k for that segment. When the filtered documents sit far from the
+query, so deepening costs more than the estimate predicted, the search restarts
+as an exact scan once it has spent what that scan would cost. A filtered
+search therefore costs at most about twice the cheaper of the two.
+
 The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket.
@@ -910,11 +919,10 @@ bit-identical results to a serial run of the same query.
   no HNSW yet.
 - An `ann` change does not rebuild existing overlays; only segments built
   afterwards use it (see [Index settings](#index-settings)).
-- Filters are always applied inside the vector search. There is no cost-based
-  choice between filtered approximate search and exact search over the
-  filtered set, and no automatic exact fallback when a selective filter still
-  starves the approximate search after breadth deepening. Use `exact: true`
-  when exact filtered top-k is the required contract.
+- The choice between filtered approximate search and exact search is a cost
+  estimate, not a recall guarantee: a filter that keeps the approximate search
+  can still return approximate results. Use `exact: true` when exact filtered
+  top-k is the required contract.
 - There is no public command to remove or rebuild an overlay that a segment
   already has. New and merged segments build from their columns, and a segment
   without an overlay can receive one through a later selected commit.
