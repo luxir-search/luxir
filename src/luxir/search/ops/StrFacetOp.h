@@ -17,6 +17,7 @@
 #include "FacetExecution.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
+#include "luxir/reader/DocsReader.h"
 #include "luxir/search/SearchOverrides.h"
 #include "SpanCounter.h"
 #include "StrFacetPlanning.h"
@@ -1700,7 +1701,7 @@ public:
         }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));
-        emitBuckets(facetResultProto, countVec, mr);
+        emitBuckets(facetResultProto, countVec, mr, child.valueType);
         if (child.missing) {
           facetResultProto.missing = missingCounts[(size_t)owner];
         }

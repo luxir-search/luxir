@@ -605,7 +605,8 @@ public:
       int32_t targetBase = target & BUCKET_MASK_UPPERBITS;
       if (targetBase != bucketBase) {
         if (!advanceBucket(targetBase)) {
-          return END;
+          curr = END;
+          return curr;
         }
         if (bucketBase > targetBase) {
           // the current block we advanced to is larger than the target, so just return first doc of that block.

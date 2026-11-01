@@ -600,6 +600,7 @@ public:
           req.reader->field(field.physicalName), type.type() == FieldType::DATE
               ? dateValueNature(DateFieldType::unitOf(type))
               : ValueNature::NUMBER});
+      collapse->fields.back().ip = type.logical == FieldType::Logical::IP;
     }
     return collapse;
   }
@@ -750,6 +751,7 @@ public:
     if (facet == nullptr) {
       throw std::runtime_error("Unknown facet field type: " + std::string(facetField));
     }
+    facet->valueType = ftype;
     configureMeasure(*facet, measure);
     return facet;
   }
@@ -1037,9 +1039,19 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (root.kind == ValueNodeKind::COLUMN) {
-        auto* fieldTypePtr = req.schema->physical(root.text);
-        out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
+      // A bare DECIMAL field parses as column / 10^scale; the scaled column
+      // sorts the same, so it keeps the field sort.
+      const ValueNode* column = &root;
+      if (root.kind == ValueNodeKind::FUNCTION && root.opcode == ValueOpcode::DIV) {
+        const ValueNode& dividend = program->nodes[root.children[0]];
+        if (dividend.kind == ValueNodeKind::COLUMN
+            && req.schema->physical(dividend.text)->logical == FieldType::Logical::DECIMAL) {
+          column = &dividend;
+        }
+      }
+      if (column->kind == ValueNodeKind::COLUMN) {
+        auto* fieldTypePtr = req.schema->physical(column->text);
+        out.clauses.emplace_back(SortField(column->text, *fieldTypePtr, order, missing));
       } else if (root.kind == ValueNodeKind::SCORE) {
         out.clauses.emplace_back(SortClause::SCORE, order);
         out.rankNeedsScores = true;

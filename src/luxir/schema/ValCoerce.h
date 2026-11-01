@@ -11,6 +11,8 @@
 #include <cassert>
 #include <charconv>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -42,6 +44,81 @@ inline std::optional<double> parseDouble(std::string_view s) {
   auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
   if (ec != std::errc() || ptr != s.data() + s.size()) return std::nullopt;
   return v;
+}
+
+// Exact decimal text (optional sign, digits, optional fraction and
+// exponent: "-12.50", "1e-3") scaled by 10^scale into an int64, without a
+// round trip through binary floating point and without allocating. Returns
+// nullopt with error set to a reason when the text is malformed, needs more
+// than scale fractional digits, or overflows int64.
+inline std::optional<int64_t> parseScaledDecimal(std::string_view s, int32_t scale,
+                                                 const char*& error) {
+  // The mantissa is accumulated with its leading zeros dropped and its
+  // trailing zeros deferred (they only shift the value). More than 19
+  // significant digits cannot fit: either the integer part overflows or the
+  // fraction exceeds any scale up to 18.
+  static constexpr int32_t MAX_SIGNIFICANT = 19;
+  size_t i = 0;
+  bool negative = false;
+  if (i < s.size() && (s[i] == '-' || s[i] == '+')) negative = s[i++] == '-';
+  unsigned __int128 mantissa = 0;
+  int32_t significant = 0;    // digits in mantissa, after the leading zeros
+  int32_t pendingZeros = 0;   // zeros after the last nonzero digit, not yet in mantissa
+  int32_t fracDigits = 0;
+  bool sawDigit = false, sawPoint = false, tooLong = false;
+  for (; i < s.size(); i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9') {
+      sawDigit = true;
+      if (sawPoint) fracDigits++;
+      if (c == '0') {
+        if (significant != 0) pendingZeros++;
+      } else {
+        if (significant + pendingZeros + 1 > MAX_SIGNIFICANT) {
+          tooLong = true;
+        } else {
+          for (; pendingZeros > 0; pendingZeros--) mantissa *= 10;
+          mantissa = mantissa * 10 + (unsigned)(c - '0');
+          significant++;
+        }
+      }
+    } else if (c == '.' && !sawPoint) {
+      sawPoint = true;
+    } else {
+      break;
+    }
+  }
+  error = "not a decimal number";
+  if (!sawDigit) return std::nullopt;
+  int32_t exponent = 0;
+  if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+    i++;
+    bool expNegative = false;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) expNegative = s[i++] == '-';
+    size_t start = i;
+    for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; i++) {
+      if (exponent < 10000) exponent = exponent * 10 + (s[i] - '0');
+    }
+    if (i == start) return std::nullopt;
+    if (expNegative) exponent = -exponent;
+  }
+  if (i != s.size()) return std::nullopt;
+  if (significant == 0) return 0;
+  // value = mantissa * 10^shift once the deferred zeros, the fraction and
+  // the exponent are applied.
+  int32_t shift = pendingZeros + exponent - fracDigits + scale;
+  if (shift < 0 || tooLong) {
+    // A mantissa past the digit limit is out of range unless it also needs
+    // rounding; say the more useful of the two.
+    error = shift < 0 ? "has more fractional digits than the field's scale" : "is out of range";
+    return std::nullopt;
+  }
+  error = "is out of range";
+  if (significant + shift > 19) return std::nullopt;
+  for (int32_t k = 0; k < shift; k++) mantissa *= 10;
+  unsigned __int128 limit = (unsigned __int128)std::numeric_limits<int64_t>::max() + (negative ? 1 : 0);
+  if (mantissa > limit) return std::nullopt;
+  return negative ? (int64_t)(0 - (uint64_t)mantissa) : (int64_t)mantissa;
 }
 
 // Explicit null (JSON null) and an unset oneof both mean "no value".

@@ -37,6 +37,7 @@ struct AggregateExprOptions {
 
 class AggregateExprParser {
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
+  static constexpr uint32_t NO_UNIT = UINT32_MAX;
 
   const AggregateExprOptions& opts;
   google::protobuf::Arena& arena;
@@ -263,6 +264,15 @@ private:
       fail(pos, fmt::format("{}() requires a numeric expression", name));
     }
 
+    // sum, avg, min and max of a DECIMAL aggregate its exact scaled integers
+    // and divide once per bucket, so totals do not depend on document order.
+    uint32_t decimalUnit = NO_UNIT;
+    if (input != nullptr && input->root().decimalScale >= 0
+        && (name == "sum" || name == "avg" || name == "min" || name == "max")) {
+      decimalUnit = input->root().children[1];
+      input->rootNode = input->root().children[0];
+    }
+
     ResolvedAggregate resolved;
     try {
       resolved = function.resolve(
@@ -284,7 +294,14 @@ private:
     node.nature = resolved.nature;
     node.aggregate = leafIndex;
     node.sourcePos = pos;
-    return program->addNode(node);
+    uint32_t aggregate = program->addNode(node);
+    if (decimalUnit == NO_UNIT) return aggregate;
+    AggregateNode unit;
+    unit.type = BucketValueType::DOUBLE;
+    unit.doubleValue = input->nodes[decimalUnit].doubleValue;
+    unit.sourcePos = pos;
+    std::array<uint32_t, 2> args{aggregate, program->addNode(unit)};
+    return makeFunction("div", pos, args);
   }
 
   AggregateConstant parseAggregateConstant() {

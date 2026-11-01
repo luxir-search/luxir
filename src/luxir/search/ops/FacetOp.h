@@ -81,14 +81,25 @@ public:
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
   ValueNature outputNature = ValueNature::NUMBER;
-  FieldType::Type valueType = FieldType::NONE;
+  // The faceted field's schema type: renders logical-type bucket keys (see
+  // emitBuckets) and picks the column decoder. Set by the constructor/parser.
+  const FieldType* valueType = nullptr;
+
+  FieldType::Type valueKind() const {
+    return valueType ? const_cast<FieldType*>(valueType)->type() : FieldType::NONE;
+  }
 
   // Hands `emit` the decoder from an encoded column value to its output:
-  // sortable bits back to float/double, date ticks in the request's date
-  // mode, integers as stored.
+  // sortable bits back to float/double, decimals scaled to double, date
+  // ticks in the request's date mode, integers as stored.
   template <typename Emit>
   void withValueOutput(std::pmr::memory_resource& mr, Emit emit) const {
-    switch (valueType) {
+    if (valueType && valueType->logical == FieldType::Logical::DECIMAL) {
+      double unit = static_cast<const DecimalFieldType*>(valueType)->unit;
+      emit([unit](int64_t value) { return (double)value / unit; });
+      return;
+    }
+    switch (valueKind()) {
       case FieldType::FLOAT:
         emit([](int64_t value) { return sortableInt32ToFloat((int32_t)value); });
         break;
@@ -106,10 +117,14 @@ public:
                         const std::vector<std::pair<Label, int64_t>>& buckets,
                         std::pmr::memory_resource& mr) const {
     if constexpr (std::is_same_v<Label, int64_t>) {
+      if (valueType && valueType->logical != FieldType::Logical::NONE) {
+        emitLogicalBuckets(result, buckets, mr, valueType);
+        return;
+      }
       withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
-    } else emitBuckets(result, buckets, mr);
+    } else emitBuckets(result, buckets, mr, valueType);
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
@@ -122,7 +137,7 @@ public:
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
-      valueType = type.type();
+      valueType = &type;
       if (type.type() == FieldType::DATE) {
         outputNature = dateValueNature(DateFieldType::unitOf(type));
       }
@@ -2040,6 +2055,8 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
 public:
   static inline bool disablePointsRangeFacetForTests = false;
   static inline bool disableZoneRangeFacetForTests = false;
+
+  // 10^scale for a DECIMAL field, whose bounds are emitted decoded; 0 otherwise.
 
   std::span<const int64_t> bucketFences() const { return fences; }
 

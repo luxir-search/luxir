@@ -103,6 +103,12 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
       fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
       fieldInfo.valDocMetaOff = fieldIS.readVlong();
+      if ((fieldInfo.flags & FieldType::BOOL_BITSETS) != 0) {
+        fieldInfo.trueDocs = fieldIS.readVint();
+        fieldInfo.trueDocsEndLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.falseDocs = fieldIS.readVint();
+        fieldInfo.falseDocsEndLoc = fieldIS.readVal<seg_location>();
+      }
     }
   }
 
