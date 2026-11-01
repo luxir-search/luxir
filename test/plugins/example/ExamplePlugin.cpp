@@ -12,6 +12,7 @@
 
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "ExampleSort.h"
 #include "luxir/api/build.h"
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
@@ -458,6 +459,7 @@ public:
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");

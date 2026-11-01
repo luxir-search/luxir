@@ -3,6 +3,8 @@
 
 #include "CollapseMembers.h"
 #include "luxir/reader/StrColReader.h"
+#include "luxir/search/EmitDocs.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/value/ValueExpr.h"
 #include "luxir/util/NumericUtils.h"
 
@@ -25,6 +27,7 @@ void renderSortRanks(std::span<const api::ArrVal> ranks, const SortPlan& sort,
       }
     }
     withDateOutput(nature, flags, mr, [&] {
+      if (clause.getKind() == SortClause::PLUGIN) return std::string(clause.getSortKindName());
       return clause.getKind() == SortClause::EXPR
           ? clause.getValueProgram().describeDateSources(clause.getValueProgram().rootNode)
           : clause.getSortField().getFieldName();
@@ -63,6 +66,9 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         }
         break;
       }
+      case SortClause::PLUGIN:
+        clause.getSortKind().value(reader, segment, doc.docId(), value, mr);
+        break;
       case SortClause::COLUMN: {
         const auto& field = clause.getSortField();
         auto* found = reader.field(field.getFieldName()).at(segment);
@@ -100,5 +106,12 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
       }
     }
   }
+}
+DocSortValues sortValuesUnder(const SortPlan& sort, IndexReader& reader, uint64_t flags) {
+  return [sort = &sort, reader = &reader, flags](luxir::api::ArrVal& out, segdoc doc, float score,
+                                                 std::pmr::memory_resource& mr) {
+    emitCollapseRank(out, *sort, *reader, doc, score, mr);
+    renderSortRanks(std::span<const luxir::api::ArrVal>(&out, 1), *sort, flags, mr);
+  };
 }
 } // namespace luxir

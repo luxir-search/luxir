@@ -254,7 +254,8 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.emitCount, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.documentFormat, emission, std::move(metadata), false, {},
+    sortValuesUnder(settings.sort, *qr.req.reader, qr.flags));
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
@@ -321,7 +322,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, false, {}, sortValuesUnder(qr.sortPlan, *qr.req.reader, qr.flags));
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();

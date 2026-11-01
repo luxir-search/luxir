@@ -15,6 +15,7 @@
 
 #include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchOpRegistry.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
@@ -1021,7 +1022,21 @@ public:
     if (sorts.empty()) return out;
     out.useFieldSort = true;
     out.rankNeedsScores = false;
+    ArenaResource arenaResource(&req.arena);
     for (const auto& sortSpec : sorts) {
+      // A call a plugin claims (SortKindRegistry) sorts with the plugin's
+      // comparator; every other expression is a value expression.
+      if (auto call = parseSortKindCall(globalSortKindRegistry(), sortSpec.expr,
+                                        sortSpec.vars, arenaResource)) {
+        SortField::SortOrder order = sortSpec.dir == luxir::api::SortSpec_::SortDir::DESC
+            ? SortField::DESC : SortField::ASC;
+        SortKindContext context(call->name, sortSpec.expr, call->mode, order == SortField::DESC,
+                                call->args, *req.schema, fields);
+        auto source = (*call->maker)(context);
+        if (source == nullptr) context.fail(std::string(call->name) + "() made no sort");
+        out.clauses.emplace_back(std::move(source), call->name, order);
+        continue;
+      }
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
       options.fieldResolver = &fields;
       options.opName = "sort";

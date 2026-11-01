@@ -301,6 +301,14 @@ struct SkipStats {
   static inline int64_t fieldSortSeedFillAborts = 0;
   static inline int64_t fieldSortSeedRounds = 0;
   static inline int64_t fieldSortSeedPass2Skips = 0;
+  // Plugin seed windows (FieldComparator::seedWindows): segments seeded,
+  // and the windows run before their sweep; the seeded segments that ran
+  // through a pull scorer (no match-window product); the rounds after the
+  // first one asked for more windows because the heap was not full.
+  static inline int64_t fieldSortSeedWindowActivations = 0;
+  static inline int64_t fieldSortSeedWindows = 0;
+  static inline int64_t fieldSortSeedWindowPullActivations = 0;
+  static inline int64_t fieldSortSeedWindowRounds = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -602,6 +610,10 @@ struct SkipStats {
     fieldSortSeedFillAborts = 0;
     fieldSortSeedRounds = 0;
     fieldSortSeedPass2Skips = 0;
+    fieldSortSeedWindowActivations = 0;
+    fieldSortSeedWindows = 0;
+    fieldSortSeedWindowPullActivations = 0;
+    fieldSortSeedWindowRounds = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;
