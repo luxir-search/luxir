@@ -238,6 +238,7 @@ struct UpdateResponse {
   std::span<const std::string_view> ids;
   std::span<const DocError> errors;
   int64_t total_errors = 0;
+  uint64_t took_us = 0;
   std::optional<Error> error;
   Status status = Status::UNKNOWN;                              // align 4 (enum)
 };
@@ -1072,6 +1073,7 @@ struct SearchResponse {
   std::optional<Error> error;
   std::span<const Warning> warnings;
   std::optional<ExecutionProfile> profile;
+  std::uint64_t took_us = 0;
   bool more = false;
 };
 struct Match {
