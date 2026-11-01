@@ -338,6 +338,7 @@ struct CachedTermInfo {
 struct CachedFieldInfo {
   IndexReader::FieldSegments segInfos;
   Similarity::FieldStats fieldStats = {};
+  Bm25Params bm25;  // from the reader's schema; defaults for fields it does not list
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
 
@@ -1503,6 +1504,7 @@ public:
         result.segInfos = topReader.field(field);
         if (result.segInfos.exists()) {
           result.fieldStats = result.segInfos.stats();
+          result.bm25 = topReader.bm25(field);
           result.termsEnums = pool.make_span_zeroed<TermsEnum*>(numSegments());
         }
       }

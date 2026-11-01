@@ -93,6 +93,13 @@ public:
 
 //
 // The same tradeoffs, quantization, and order-of-operations were used as Lucene here to make scores compatible.
+// Per-field BM25 parameters: k1 bounds term frequency saturation, b scales
+// length normalization (0 none, 1 full).
+struct Bm25Params {
+  float k1 = 1.2f;
+  float b = 0.75f;
+};
+
 // See the Lucene javadoc for BM25Similarity for more info.
 //
 class Similarity {
@@ -112,8 +119,12 @@ public:
   const float k1;
   const float b;
 
-  Similarity(float k1=1.2f, float b=0.75f)
+  Similarity(float k1=Bm25Params{}.k1, float b=Bm25Params{}.b)
   : k1(k1), b(b) {
+  }
+
+  explicit Similarity(const Bm25Params& params)
+  : k1(params.k1), b(params.b) {
   }
 
   /// Stats for the field, used in scoring. Represents the stats for a field across the entire collection.
