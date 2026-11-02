@@ -40,10 +40,19 @@ protected:
     loc.type = api::FieldDef::FieldClass::GEO_POINT;
     loc.index = api::FieldDef::IndexMode::RANGE;
     loc.column = true;
+    auto& multi = b.field("locs_p");
+    multi.type = api::FieldDef::FieldClass::GEO_POINT;
+    multi.multi = api::FieldDef::MultiMode::DEFAULT;
+    multi.column = true;
+    auto& noColumn = b.field("no_column_p");
+    noColumn.type = api::FieldDef::FieldClass::GEO_POINT;
+    noColumn.index = api::FieldDef::IndexMode::NONE;
+    noColumn.column = false;
     b.set(helper.collection());
     helper.index(flatdoc("id_s", "a", "body_w", "alpha", "x_i", 2, "v_d", 10.0,
                          "vals_ds", vec(10.0, 40.0), "when_dt", int64_t{1000},
-                         "loc_p", std::vector<double>{0.0, 0.5}),
+                         "loc_p", std::vector<double>{0.0, 0.5},
+                         "locs_p", vecs("0.5,0", "1,0")),
                  UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id_s", "b", "body_w", "alpha", "x_i", -1, "v_d", 130.0,
                          "vals_ds", vec(70.0), "when_dt", int64_t{5000}),
@@ -232,8 +241,34 @@ TEST_F(FunctionScoreTest, decayFunctionsMatchElasticsearch) {
   expectParseError("gauss(v_d, 0, 1, -1)", "offset must be non-negative");
   expectParseError("exp(v_d, 0, 1, 0, 1)", "decay must be strictly between");
   expectParseError("linear(v_d, 0, x_i)", "scale must be a constant numeric scalar");
-  expectParseError("geo_distance(v_d, 0, 0)", "not a GEO_POINT field");
+  expectParseError("geo_distance(v_d, 0, 0)", "not a GEO_POINT value");
   expectParseError("geo_distance(loc_p, 91, 0)", "latitude");
+}
+
+TEST_F(FunctionScoreTest, geoOperandsUseTheRegistryAndStayNonNumeric) {
+  auto* distance = parse("geo_distance(col(\"loc_p\"), 0, 0)");
+  EXPECT_EQ(ValueNature::NUMBER, distance->root().nature);
+  EXPECT_EQ(ValueOpcode::GEO_DISTANCE, distance->root().opcode);
+  EXPECT_EQ(eval("geo_distance(loc_p, 0, 0)"), eval("geo_distance(col(\"loc_p\"), 0, 0)"));
+  EXPECT_EQ(eval("geo_distance(loc_p, 0, 0)"), eval("min(geo_distance(locs_p, 0, 0))"));
+  for (auto expression : {"loc_p", "loc_p + 1", "abs(loc_p)", "pow(loc_p, 2)", "loc_p == loc_p",
+                          "def(loc_p, 0)", "count(locs_p)", "if(1, loc_p, loc_p)",
+                          "random(7, loc_p)", "min(locs_p)"}) {
+    expectParseError(expression, "GEO_POINT is not numeric");
+  }
+  expectParseError("geo_distance(no_column_p, 0, 0)", "no column values");
+  expectParseError("geo_distance(loc_p, x_i, 0)", "argument 2 must be a constant numeric scalar");
+  expectParseError("geo_distance(loc_p, 0, 181)", "longitude");
+  auto aggregate = localReq(helper.getSearchEngine());
+  aggregate->collection("main").expr("bad", "sum(loc_p)");
+  aggregate->execute(false);
+  EXPECT_FALSE(aggregate->ok());
+  EXPECT_NE(std::string(aggregate->errorMsg()).find("use geo_distance()"), std::string::npos);
+  auto rescore = localReq(helper.getSearchEngine());
+  rescore->collection("main").topDocs("q").exprQuery("rescore(body_w:alpha, expr=loc_p)");
+  rescore->execute(false);
+  EXPECT_FALSE(rescore->ok());
+  EXPECT_NE(std::string(rescore->errorMsg()).find("use geo_distance()"), std::string::npos);
 }
 
 TEST_F(FunctionScoreTest, rescoreRanksByDecay) {

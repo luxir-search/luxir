@@ -171,7 +171,7 @@ private:
       args[convert].nature = ValueNature::DATE_NS;
     }
     try {
-      return function.resolve(
+      return function.resolveOperands(
           std::span<const ResolvedValue>(args.data(), children.size()));
     } catch (const std::exception& error) {
       fail(pos, error.what());
