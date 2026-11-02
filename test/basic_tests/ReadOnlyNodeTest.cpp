@@ -12,6 +12,7 @@
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/store/Directory.h"
+#include "luxir/util/ParamReader.h"
 #include "test/GrpcClient.h"
 #include "luxir/server/RpcStatus.h"
 #include "test/HttpReq.h"
@@ -185,12 +186,14 @@ TEST_F(ReadOnlyNodeTest, startupTouchesNothing) {
   EXPECT_FALSE(std::filesystem::exists(data.path() / "node"));
 }
 
-// There is no existing data directory to serve without the fs backend.
-TEST_F(ReadOnlyNodeTest, readOnlyRequiresTheFsBackend) {
-  LuxirConfig config;
-  config.read_only = true;
-  config.store.backend = "ram";
-  EXPECT_THROW(config.normalize(), std::runtime_error);
+TEST_F(ReadOnlyNodeTest, fsRejectsUnknownOptions) {
+  DataDir data("luxir_fs_options");
+  auto config = fsConfig(data);
+  config.store.options = {{"fs", {{"anything", "1"}}}};
+  try { LuxirNode node(config); FAIL() << "accepted an unknown backend key"; }
+  catch (const ParamError& e) {
+    EXPECT_STREQ("store backend 'fs': unknown parameter 'anything'; it takes no parameters", e.what());
+  }
 }
 
 } // namespace luxir::test

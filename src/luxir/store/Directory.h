@@ -182,10 +182,7 @@ public:
     auto data = input->read();
     auto file = createFile(name);
     OutputStream out(file.get());
-    constexpr size_t kChunk = 1 << 20;
-    for (size_t offset = 0; offset < data.size(); offset += kChunk) {
-      out.write(data.data() + offset, std::min(kChunk, data.size() - offset));
-    }
+    out.write(data.data(), data.size());
     out.close();
     finishFile(*file);
   }

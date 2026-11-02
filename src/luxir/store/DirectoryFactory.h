@@ -27,6 +27,15 @@ public:
   virtual std::string describe() const = 0;
   // Local path for disk statistics, or empty for a backend without one.
   virtual std::string diskPath() const { return {}; }
+  // The wrapped factory, or null for a backend. find<T>() walks the stack, so a
+  // plugin reaches its own factory (and state kept there) through the core wrappers.
+  virtual DirectoryFactory* inner() { return nullptr; }
+  template <class T> T* find() {
+    for (auto* factory = this; factory; factory = factory->inner()) {
+      if (auto* found = dynamic_cast<T*>(factory)) return found;
+    }
+    return nullptr;
+  }
   uint64_t storageBytes() { auto account = memory(); return account ? account->bytes() : 0; }
 
   static std::string checkedPath(StorageRoot root, std::string_view path) {

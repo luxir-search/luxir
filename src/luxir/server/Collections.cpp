@@ -94,10 +94,24 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
       verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   // Backend, then plugin layers (innermost first), then the core wrappers below.
-  const auto& storage = globalStorageRegistry();
-  StorageContext storageContext{config, config.store.options, [this] { return reclaimStorage(); }};
-  factory = storage.makeBackend(config.store.backend, storageContext);
-  for (const auto& layer : config.store.layers) factory = storage.makeLayer(layer, std::move(factory), storageContext);
+  const auto& storage = StorageRegistry::global();
+  // Before any maker runs, so a mistyped component fails before a backend takes its lock.
+  for (const auto& [component, params] : config.store.options) {
+    if (component == config.store.backend || std::ranges::find(config.store.layers, component) != config.store.layers.end()) continue;
+    std::string configured = config.store.backend;
+    for (const auto& layer : config.store.layers) configured += ", " + layer;
+    throw ParamError("store options for unconfigured component '" + component + "'; configured components: " + configured);
+  }
+  StorageOptions options(config.store);
+  std::vector<ParamReader> readers;
+  readers.reserve(1 + config.store.layers.size());
+  readers.push_back(options.reader(config.store.backend, "store backend '" + config.store.backend + "'"));
+  factory = storage.makeBackend(config.store.backend, {config, readers.back(), [this] { return reclaimStorage(); }});
+  for (const auto& layer : config.store.layers) {
+    readers.push_back(options.reader(layer, "store layer '" + layer + "'"));
+    factory = storage.makeLayer(layer, std::move(factory), {config, readers.back(), [this] { return reclaimStorage(); }});
+  }
+  for (const auto& reader : readers) reader.rejectUnknown();
   if (config.store.checked_dir.sync != "off") {
     auto mode = config.store.checked_dir.sync == "throw" ? CheckedDirMode::THROW : CheckedDirMode::WARN;
     factory = std::make_unique<CheckedDirFactory>(std::move(factory), mode);

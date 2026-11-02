@@ -79,8 +79,8 @@ struct StoreConfig {
   std::string data_dir = "luxir_data";
   // Layers wrapped around the backend, innermost first, inside checked_dir and read_only.
   std::vector<std::string> layers;
-  // Free-form KEY=VALUE settings for backends and layers (StorageContext::options).
-  std::map<std::string, std::string> options;
+  // COMPONENT.KEY=VALUE settings, grouped by backend or layer name.
+  std::map<std::string, std::map<std::string, std::string>> options;
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
   // Before a collection serves at startup: none trusts the manifest footer and

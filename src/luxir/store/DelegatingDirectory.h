@@ -7,14 +7,12 @@
 
 namespace luxir {
 
-/// A Directory that forwards every virtual to another one. Wrappers (layers)
+/// A Directory that forwards every virtual to another one. Plugin layers
 /// derive from it and override only what they change.
 ///
-/// Forwarding is total, including the createFile overload with options,
-/// expectSynced, publishFile, readPublished, deleteDurably, deletePrefix, sync,
-/// underlying, linkFile, openChecksum, clear
-/// and capabilities. A wrapper that must not let a new virtual through (see
-/// ReadOnlyDirectory) overrides it explicitly.
+/// Core wrappers that refuse or track mutations implement the bare interface;
+/// layers derive from the delegating bases. New virtuals must not silently
+/// bypass the core wrappers' checks.
 class DelegatingDirectory : public Directory {
 protected:
   std::shared_ptr<Directory> delegate;
@@ -68,6 +66,7 @@ public:
   std::shared_ptr<StorageMemory> memory() override { return delegate->memory(); }
   std::string describe() const override { return delegate->describe(); }
   std::string diskPath() const override { return delegate->diskPath(); }
+  DirectoryFactory* inner() override { return delegate.get(); }
 };
 
 } // namespace luxir

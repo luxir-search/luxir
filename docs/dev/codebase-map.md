@@ -140,8 +140,10 @@ locations, browse `src/luxir/<area>/`.
      loads the STATE-selected candidate; filenames carry the creating writer
      epoch, including later live-doc and overlay generations
    - `StorageRegistry` (`StorageRegistry.h`): named backends and layers resolved by `Collections`
-     from `store.backend` / `store.layers`; `DelegatingDirectory` / `DelegatingDirFactory` forward
-     everything, so a layer overrides only what it changes (Checked and ReadOnly are built on them);
+     from `store.backend` / `store.layers`, with scoped options validated through `ParamReader`;
+     `DelegatingDirectory` / `DelegatingDirFactory` forward everything for plugin layers.
+     CheckedDirectory and the read-only wrappers implement the bare interfaces; CheckedDirFactory
+     delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.

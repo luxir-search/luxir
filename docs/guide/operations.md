@@ -77,12 +77,13 @@ restore should start a new lineage.
 `--store.backend` names the storage backend: `ram` and `fs` are built in, and a
 plugin build may add more (an unknown name fails startup with the list of
 registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
-backend in layers a plugin provides, such as a cache. `--store.option KEY=VALUE`
-(repeatable) passes free-form settings to the backend and layers; the plugin
-documents its keys.
+backend in layers a plugin provides, such as a cache.
+`--store.option COMPONENT.KEY=VALUE` (repeatable) passes settings to the named
+backend or layer; the plugin documents its keys. Unknown keys and components
+that are not configured fail startup. The built-in `ram` and `fs` take no options.
 
 ```bash
-./luxir --store.backend=s3 --store.option bucket=search-data --store.layer=cache
+./luxir --store.backend=s3 --store.option s3.bucket=search-data --store.layer=cache --store.option cache.bytes=10G
 ```
 
 Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit

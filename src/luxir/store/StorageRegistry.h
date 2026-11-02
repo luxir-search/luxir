@@ -7,34 +7,32 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <optional>
+#include <memory_resource>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "luxir/LuxirConfig.h"
 #include "luxir/store/DirectoryFactory.h"
+#include "luxir/util/ParamReader.h"
 
 namespace luxir {
 
+// Owns the typed CLI values behind maker readers, for the duration of stack construction.
+class StorageOptions {
+  std::pmr::monotonic_buffer_resource arena;
+  std::map<std::string, api::Map, std::less<>> components;
+public:
+  explicit StorageOptions(const StoreConfig& config);
+  ParamReader reader(std::string_view component, std::string owner) const;
+};
+
 /// What a backend or layer maker may read when the node builds its storage.
+/// References are valid only for the duration of the maker call.
 struct StorageContext {
   const LuxirConfig& config;                            // the whole node config (data_dir, read_only, ...)
-  const std::map<std::string, std::string>& options;    // config.store.options
+  const ParamReader& params;                            // only this component's options
   std::function<bool()> reclaim;                        // RAM pressure callback; false when nothing was freed
-
-  std::optional<std::string> option(const std::string& key) const {
-    auto it = options.find(key);
-    if (it == options.end()) return std::nullopt;
-    return it->second;
-  }
-  std::string optionOr(const std::string& key, std::string fallback) const {
-    auto value = option(key);
-    return value ? *value : std::move(fallback);
-  }
-  // A byte count: digits with an optional K, M or G suffix (also KB/KiB, ...; all powers of 1024).
-  // Throws std::invalid_argument naming the option when the value is malformed.
-  uint64_t optionBytes(const std::string& key, uint64_t fallback) const;
 };
 
 /// Named storage backends and layers. A backend builds the root DirectoryFactory
@@ -52,7 +50,7 @@ private:
   bool isFrozen = false;
 
 public:
-  // The node-wide registry, seeded with the built-in backends (ram, fs).
+  // The process-wide registry, seeded with the built-in backends (ram, fs).
   static StorageRegistry& global();
 
   // Throw std::invalid_argument on a bad or duplicate name, std::logic_error after freeze.
@@ -74,8 +72,5 @@ public:
 
 // Registers the built-in backends: ram and fs. Called when the global registry is built.
 void registerBuiltinStorage(StorageRegistry& registry);
-
-// Read-only access to the node-wide registry.
-const StorageRegistry& globalStorageRegistry();
 
 }  // namespace luxir

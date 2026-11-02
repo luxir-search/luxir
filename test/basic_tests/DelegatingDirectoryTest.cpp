@@ -101,6 +101,10 @@ TEST(DelegatingDirectoryTest, everyVirtualForwards) {
 
 TEST(DelegatingDirectoryTest, factoryForwardsEverything) {
   DelegatingDirFactory factory(std::make_unique<RAMDirFactory>(64 * 1024));
+  EXPECT_EQ(factory.inner(), factory.find<RAMDirFactory>());
+  EXPECT_EQ(nullptr, factory.inner()->inner());
+  EXPECT_EQ(&factory, factory.find<DelegatingDirFactory>());
+  EXPECT_EQ(nullptr, factory.find<FSDirFactory>());
   auto memory = factory.memory();
   ASSERT_TRUE(memory);
   EXPECT_EQ(64u * 1024, memory->limitBytes());

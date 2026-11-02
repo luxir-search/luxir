@@ -21,7 +21,8 @@ enum class CheckedDirMode {
 ///
 /// Files that already existed in the directory before this wrapper was created
 /// (e.g. from a previous session) are assumed to have been properly synced.
-class CheckedDirectory : public DelegatingDirectory {
+class CheckedDirectory : public Directory {
+  std::shared_ptr<Directory> delegate;
   CheckedDirMode mode_;
   bool verbose_;
 
@@ -40,7 +41,14 @@ class CheckedDirectory : public DelegatingDirectory {
 
 public:
   CheckedDirectory(std::shared_ptr<Directory> inner, CheckedDirMode mode, bool verbose = false)
-      : DelegatingDirectory(std::move(inner)), mode_(mode), verbose_(verbose) {}
+      : delegate(std::move(inner)), mode_(mode), verbose_(verbose) {}
+
+  void listFiles(std::vector<FileInfo>& target) override { delegate->listFiles(target); }
+  Directory& underlying() override { return delegate->underlying(); }
+  Capabilities capabilities() const override { return delegate->capabilities(); }
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return delegate->openChecksum(name, direct);
+  }
 
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
     if (expectSynced) {
@@ -173,6 +181,7 @@ public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> inner, CheckedDirMode mode, bool verbose = false)
       : DelegatingDirFactory(std::move(inner)), mode_(mode), verbose_(verbose) {}
   std::string describe() const override { return "checked(" + delegate->describe() + ")"; }
+  DirectoryFactory* inner() override { return delegate.get(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));
     auto dir = delegate->directory(root, path, std::move(options));
