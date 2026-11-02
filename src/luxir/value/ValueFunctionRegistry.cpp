@@ -591,11 +591,7 @@ BucketScalar evalBucketOperation(
   assert(args.size() == Arity);
   BucketValueType bucketType = type == ValueType::DOUBLE
       ? BucketValueType::DOUBLE : BucketValueType::INT128;
-  for (const BucketScalar& arg : args) {
-    if (arg.failure != AggregateFailure::NONE) {
-      return BucketScalar::failed(bucketType, nature, arg.failure);
-    }
-  }
+  if (!args[0].valid) return BucketScalar::missing(bucketType, nature);
   ScalarKernelValue<__int128> result;
   if constexpr (Arity == 1) {
     result = evalUnaryKernel(
@@ -613,9 +609,31 @@ BucketScalar evalBucketOperation(
     return BucketScalar::failed(bucketType, nature,
                                 AggregateFailure::NON_FINITE_EXPRESSION);
   }
-  if (!result.valid) return BucketScalar::missing(bucketType, nature);
+  if (!result.valid) {
+    for (const BucketScalar& arg : args) {
+      if (arg.failure != AggregateFailure::NONE) {
+        return BucketScalar::failed(bucketType, nature, arg.failure);
+      }
+    }
+    return BucketScalar::missing(bucketType, nature);
+  }
   return result.floating ? BucketScalar::floating(result.doubleValue, nature)
                          : BucketScalar::integer(result.intValue, nature);
+}
+
+BucketScalar evalIfBucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) {
+  BucketValueType bucketType = type == ValueType::DOUBLE
+      ? BucketValueType::DOUBLE : BucketValueType::INT128;
+  if (!args[0].valid) return BucketScalar::missing(bucketType, nature);
+  const BucketScalar& selected = args[kernelTruthy(kernelValue(args[0])) ? 1 : 2];
+  if (selected.failure != AggregateFailure::NONE) {
+    return BucketScalar::failed(bucketType, nature, selected.failure);
+  }
+  if (!selected.valid) return BucketScalar::missing(bucketType, nature);
+  if (type == ValueType::DOUBLE) {
+    return BucketScalar::floating(kernelDouble(kernelValue(selected)), nature);
+  }
+  return BucketScalar::integer(selected.intValue, nature);
 }
 
 bool unaryOpcode(ValueOpcode opcode) {
@@ -1600,7 +1618,7 @@ constexpr ValueFunction FUNCTIONS[] = {
      logicalBounds, evalScalarOnlyElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NOT, 1>},
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
-     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, nullptr},
+     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
      randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
@@ -1659,6 +1677,17 @@ static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunc
 }
 
 } // namespace
+
+BucketScalar ValueFunction::bucket(
+    std::span<const BucketScalar> args, ValueType type, ValueNature nature) const {
+  for (size_t i = 0; i < args.size(); i++) {
+    if (!operands[i].lazy && args[i].failure != AggregateFailure::NONE) {
+      return BucketScalar::failed(type == ValueType::DOUBLE
+          ? BucketValueType::DOUBLE : BucketValueType::INT128, nature, args[i].failure);
+    }
+  }
+  return evalBucketScalar(args, type, nature);
+}
 
 ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args) const {
   for (size_t i = 0; i < args.size(); i++) {

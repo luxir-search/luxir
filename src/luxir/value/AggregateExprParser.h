@@ -77,18 +77,18 @@ public:
                         std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     assert(function != nullptr);
-    if (function->evalBucketScalar == nullptr || args.size() > 2) {
+    if (function->evalBucketScalar == nullptr) {
       fail(pos, fmt::format(
           "{}() is a per-document value function and is not valid on bucket values",
           name));
     }
-    std::array<uint32_t, 2> indices{};
+    std::array<uint32_t, VALUE_MAX_ARITY> indices{};
     std::copy(args.begin(), args.end(), indices.begin());
     std::span<uint32_t> children(indices.data(), args.size());
     ResolvedValue resolved = resolveFunction(*function, pos, children);
     AggregateNode node;
-    node.kind = children.size() == 1
-        ? AggregateNodeKind::UNARY : AggregateNodeKind::BINARY;
+    node.kind = AggregateNodeKind::FUNCTION;
+    node.childCount = (uint8_t)children.size();
     node.type = valueDouble(resolved.type)
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
@@ -123,7 +123,7 @@ public:
     }
     if (lookup.value != nullptr
         && lookup.value->evalBucketScalar != nullptr) {
-      std::array<uint32_t, 2> args{};
+      std::array<uint32_t, VALUE_MAX_ARITY> args{};
       uint8_t count = grammar.parseArguments(
           name, pos, lookup.value->minArity, lookup.value->maxArity,
           [&](uint8_t argument) {
@@ -150,7 +150,7 @@ public:
 private:
   ResolvedValue resolveFunction(const ValueFunction& function, size_t pos,
                                 std::span<uint32_t> children) {
-    std::array<ResolvedValue, 2> args{};
+    std::array<ResolvedValue, VALUE_MAX_ARITY> args{};
     for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
       args[i] = {

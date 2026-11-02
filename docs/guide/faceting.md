@@ -335,6 +335,11 @@ A composite metric is a single expression:
 "weighted_price": "sum(price_f * qty_i) / sum(qty_i)"
 ```
 
+Bucket expressions also support comparisons, `&&`, `||`, and `if`/`?:` with
+the same [conditional semantics](searching.md#sort-expressions-in-detail) as
+document expressions. For example, `sum(price_f) > 0 ? log(sum(price_f)) : 0`
+avoids a math-domain failure for a non-positive sum.
+
 Distinct counts, percentiles, and the percentage of prices at or below a bound
 are scalar metrics too:
 

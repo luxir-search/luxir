@@ -248,8 +248,8 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   EXPECT_EQ(ValueOpcode::MIN, bucketMinimum->root().function->opcode);
   expectParseError(memory, *schema, "def(sum(price_i), 0)",
                    "def() is a per-document value function");
-  expectParseError(memory, *schema, "sum(price_i) > 0 ? 1 : 2",
-                   "if() is a per-document value function");
+  auto* conditional = parseAggregate(memory, *schema, "sum(price_i) > 0 ? 1 : 2");
+  EXPECT_EQ(ValueOpcode::IF, conditional->root().function->opcode);
   AggregateProgram* comparison = parseAggregate(
       memory, *schema, "sum(price_i) >= 1 && exp(avg(price_i)) > 0");
   EXPECT_EQ(ValueOpcode::AND, comparison->root().function->opcode);
@@ -316,6 +316,71 @@ TEST_F(AggregateExprTest, documentConstantExpressionsKeepExactIntegerSeeds) {
   auto* input = program->producers[0].input;
   EXPECT_EQ(INT64_C(9007199254740993), input->root().intValue);
   EXPECT_TRUE(evaluate(*program, *reader, reader->segments()[0]).valid);
+}
+
+TEST_F(AggregateExprTest, bucketConditionalsSelectResultsAndFailures) {
+  CollectionHelper helper;
+  SchemaBuilder builder;
+  auto& stamp = builder.field("stamp");
+  stamp.type = api::FieldDef::FieldClass::DATE;
+  stamp.unit = api::FieldDef::DateUnit::NS;
+  builder.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("x_i", -5, "when_dt", 2, "stamp", 1000000),
+                           UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  struct Example {
+    const char* expression;
+    double expected;
+    ValueNature nature = ValueNature::NUMBER;
+  };
+  for (const auto& example : {
+      Example{"sum(x_i) > 0 && log(sum(x_i)) > 0", 0},
+      {"sum(x_i) < 0 || log(sum(x_i)) > 0", 1},
+      {"sum(x_i) > 0 ? log(sum(x_i)) : 0", 0},
+      {"if(sum(x_i) < 0, sum(x_i), log(sum(x_i)))", -5},
+      {"sum(x_i) > 0 ? log(sum(x_i)) : sum(x_i) < 0 ? 7 : 8", 7},
+      {"if(sum(x_i) < 0, max(when_dt), max(stamp))", 2000000, ValueNature::DATE_NS},
+      {"sum(x_i) > 0 ? max(when_dt) : max(stamp)", 1000000, ValueNature::DATE_NS}}) {
+    SCOPED_TRACE(example.expression);
+    auto* program = parseAggregate(memory, *schema, example.expression);
+    auto result = evaluate(*program, *reader, reader->segments()[0]);
+    ASSERT_TRUE(result.valid);
+    EXPECT_EQ(AggregateFailure::NONE, result.failure);
+    EXPECT_EQ(example.nature, result.nature);
+    EXPECT_DOUBLE_EQ(example.expected, result.type == BucketValueType::DOUBLE
+        ? result.doubleValue : (double)result.intValue);
+  }
+  for (auto expression : {"sum(x_i) < 0 && log(sum(x_i)) > 0",
+                          "sum(x_i) > 0 || log(sum(x_i)) > 0",
+                          "log(sum(x_i)) > 0 && 0", "log(sum(x_i)) > 0 || 1",
+                          "if(log(sum(x_i)), 1, 0)", "if(0, 0, log(sum(x_i)))"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseAggregate(memory, *schema, expression);
+    auto result = evaluate(*program, *reader, reader->segments()[0]);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(AggregateFailure::NON_FINITE_EXPRESSION, result.failure);
+  }
+  for (auto expression : {"sum(absent_i) && log(sum(x_i))", "sum(absent_i) || log(sum(x_i))",
+                          "if(sum(absent_i), log(sum(x_i)), log(sum(x_i)))",
+                          "sum(x_i) < 0 ? sum(absent_i) : 1"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseAggregate(memory, *schema, expression);
+    auto result = evaluate(*program, *reader, reader->segments()[0]);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(AggregateFailure::NONE, result.failure);
+  }
+  auto* wide = parseAggregate(memory, *schema,
+      "if(sum(x_i) < 0, 9223372036854775807 + 1, 0) - 1");
+  auto result = evaluate(*wide, *reader, reader->segments()[0]);
+  ASSERT_TRUE(result.valid);
+  EXPECT_EQ(BucketValueType::INT128, result.type);
+  EXPECT_EQ((__int128)INT64_MAX, result.intValue);
+  auto* conditional = parseAggregate(memory, *schema, "if(0, sum(x_i), 1)");
+  AggregateAccumulator accumulator(*conditional);
+  accumulator.fail(AggregateFailure::VALUE_EVALUATION);
+  EXPECT_EQ(AggregateFailure::VALUE_EVALUATION, accumulator.finish().failure);
 }
 
 TEST_F(AggregateExprTest, dateRulesAreResolvedAcrossBothLevels) {
@@ -485,13 +550,13 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
   for (std::string_view name : {
            "add", "sub", "mul", "div", "neg", "abs", "sqrt", "log",
            "log1p", "floor", "min", "max", "exp", "pow", "lt", "lte",
-           "gt", "gte", "eq", "ne", "and", "or", "not"}) {
+           "gt", "gte", "eq", "ne", "and", "or", "not", "if"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_NE(nullptr, function->evalBucketScalar) << name;
   }
   for (std::string_view name : {
-           "def", "avg", "sum", "count", "if", "random", "geo_distance"}) {
+           "def", "avg", "sum", "count", "random", "geo_distance"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_EQ(nullptr, function->evalBucketScalar) << name;
@@ -2537,9 +2602,11 @@ TEST_F(AggregateExprTest, dateUnitIsPartOfProducerIdentityAndSameUnitTreesAreUnc
     auto schema = builder.build(base.get());
     auto* program = parseAggregate(memory, *schema, "max(stamp)-min(stamp)");
     ASSERT_EQ(3u, program->nodes.size());
-    EXPECT_EQ(AggregateNodeKind::BINARY, program->root().kind);
+    EXPECT_EQ(AggregateNodeKind::FUNCTION, program->root().kind);
     EXPECT_EQ(ValueFunctionRegistry::find("sub"), program->root().function);
-    EXPECT_EQ((std::array<uint32_t, 2>{0, 1}), program->root().children);
+    EXPECT_EQ(2, program->root().childCount);
+    EXPECT_EQ(0, program->root().children[0]);
+    EXPECT_EQ(1, program->root().children[1]);
     for (int i = 0; i < 2; i++) {
       EXPECT_EQ(AggregateNodeKind::AGGREGATE, program->nodes[i].kind);
       EXPECT_EQ(nanos ? ValueNature::DATE_NS : ValueNature::DATE_MS, program->nodes[i].nature);

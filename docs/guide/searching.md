@@ -774,6 +774,11 @@ to its following value. The function spellings remain available:
 - Conditionals: `cond ? then : else`, or `if(cond, then, else)`, evaluates
   only the selected branch, so `x_i > 0 ? log(x_i) : 0` is safe for
   non-positive values. Both branches must be numbers or both DATE values.
+  Bucket expressions also support comparisons, logical operators, and `if`/`?:`:
+  `sum(x_i) > 0 ? log(sum(x_i)) : 0` returns zero for a negative sum.
+  Failures in an unselected branch do not affect the result. Bucket scalar
+  evaluation is eager, so this selection does not skip aggregate collection;
+  collection-level failures still fail the expression.
 - `random(seed, value)` is a deterministic per-document number in `[0, 1)`
   hashed from an integer seed and the value's first element (a field such as
   `id_i`), like Elasticsearch `random_score` with `seed` and `field`. A
