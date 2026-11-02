@@ -782,7 +782,7 @@ public:
     out.appendInt32((int32_t)routing);
     for (double cost : plannerCosts.units) out.appendDouble(cost);
     out.appendDouble(plannerCosts.requestCost);
-    out.appendDouble(plannerCosts.extraBitFraction);
+    out.appendDouble(plannerCosts.extraBitSurvival128);
     out.appendDouble(plannerCosts.intervalReadFraction);
     out.appendDouble(flatDomainDensityThreshold);
     out.appendDouble(filteredCoverageAlpha);
@@ -1400,7 +1400,7 @@ public:
           if (input.codec == KnnPlanner::Codec::PQ) w.pqScores = w.selectorPasses;
           else {
             w.oneBitScores = w.selectorPasses;
-            double survival = spent.oneBitScores ? (double)spent.extraBitScores / spent.oneBitScores : plannerCosts.extraBitFraction;
+            double survival = spent.oneBitScores ? (double)spent.extraBitScores / spent.oneBitScores : plannerCosts.extraBitSurvival(input.dims);
             if (input.rabitqBits > 1) w.extraBitScores = (int64_t)std::ceil(w.oneBitScores * survival);
           }
           double marginal = plannerCosts.price(KnnPlanner::actualWork(input, w));
