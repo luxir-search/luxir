@@ -135,17 +135,19 @@ private:
           const auto& childBounds = bounds[node.children[child]];
           if (!childBounds.has_value()) {
             independent = false;
-            break;
+            children[child] = ValueBounds::unbounded(
+                program->nodes[node.children[child]].type, true);
+            continue;
           }
           children[child] = *childBounds;
         }
-        if (independent) {
-          ValueBounds value = node.function->boundsPropagate(
-              node, std::span<const ValueBounds>(
-                        children.data(), node.childCount));
-          if (value.certainty != BoundsCertainty::INVALID) {
-            bounds[index] = value;
-          }
+        ValueBounds value = node.function->bounds(
+            node, std::span<const ValueBounds>(children.data(), node.childCount));
+        if (value.certainty == BoundsCertainty::INVALID) {
+          if (value.invalidNode == UINT32_MAX) value.invalidNode = index;
+          bounds[index] = value;
+        } else if (independent) {
+          bounds[index] = value;
         }
       }
     }
@@ -414,26 +416,13 @@ private:
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
-    if (node.opcode == ValueOpcode::IF) {
-      markGuarded(args[1]);
-      markGuarded(args[2]);
-    } else if (node.opcode == ValueOpcode::AND || node.opcode == ValueOpcode::OR) {
-      markGuarded(args[1]);
-    } else if (node.opcode == ValueOpcode::RANDOM) {
+    if (node.opcode == ValueOpcode::RANDOM) {
       // ES random_score without a seed: a fresh seed for every request.
       node.intValue = count == 0
           ? (int64_t)(((uint64_t)std::random_device{}() << 32) | std::random_device{}())
           : (int64_t)constantArg(args[0], "random", "seed", true);
     }
     return append(node);
-  }
-
-  void markGuarded(uint32_t index) {
-    ValueNode& node = program->nodes[index];
-    node.guarded = true;
-    for (uint8_t child = 0; child < node.childCount; child++) {
-      markGuarded(node.children[child]);
-    }
   }
 
   // A literal or scalar $variable argument, as a double. With integral, it

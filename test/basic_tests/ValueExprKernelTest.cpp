@@ -406,6 +406,96 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
   }
 }
 
+TEST_F(ValueExprKernelTest, lazyInvaliditySurvivesUntilItsBranchIsSelected) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "x_i", 2, "c_i", 1),
+                               flatdoc("id", "b", "c_i", 0)}, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto expression : {"def(x_i, log(-1))", "if(c_i, x_i, log(-1))"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    auto value = bound->evalPoint(0, 0);
+    ASSERT_TRUE(value.valid);
+    EXPECT_DOUBLE_EQ(2, value.doubleValue);
+    EXPECT_THROW(bound->evalPoint(1, 0), ValueEvaluationError);
+  }
+  for (auto [expression, expected] : {
+      std::pair{"if(0, log(-1), 7)", 7}, {"if(1, 7, log(-1))", 7},
+      {"def(7, log(-1))", 7}, {"0 && log(-1)", 0}, {"1 || log(-1)", 1}}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    ASSERT_TRUE(program->constantScalar.has_value());
+    auto value = *program->constantScalar;
+    EXPECT_DOUBLE_EQ(expected, value.type == ValueType::DOUBLE ? value.doubleValue : (double)value.intValue);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_TRUE(bound->firstUnboundedNode().empty());
+  }
+  for (auto expression : {"if(0, log(-1), score)", "def(score, log(-1))",
+                          "if(1, score, log(-1))", "(0 && log(-1)) + score",
+                          "(1 || log(-1)) * score"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_EQ("score", bound->firstUnboundedNode());
+    auto bounds = bound->boundsForScore(ValueBounds::floating(2, 3));
+    EXPECT_EQ(BoundsCertainty::BOUNDED, bounds.certainty);
+    EXPECT_TRUE(bound->firstUnboundedNode().empty());
+    bound->boundsForScore(ValueBounds::unbounded(ValueType::DOUBLE));
+    EXPECT_EQ("score", bound->firstUnboundedNode());
+  }
+  auto* logarithm = parseValue(memory, *schema, "log(score)");
+  auto* bound = logarithm->bind(pool, reader->segments()[0], logarithm->resolveFields(pool, *reader));
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floating(2, 3)).certainty);
+  EXPECT_THROW(bound->boundsForScore(ValueBounds::floating(-1, -1)), ValueEvaluationError);
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floating(2, 3)).certainty);
+}
+
+TEST_F(ValueExprKernelTest, strictInvalidityKeepsTheOriginalDiagnostic) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("x_i", 2), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (std::string operand : {"log(-1)", "sqrt(-1)", "log1p(-2)",
+                               "add(9223372036854775807, 1)", "mul(1e308, 1e308)"}) {
+    std::string expected;
+    for (auto expression : {operand, "count(" + operand + ")", "def(" + operand + ", 0)",
+                            "if(" + operand + ", 0, 1)", "pow(1, " + operand + ")",
+                            operand + " + score"}) {
+      SCOPED_TRACE(expression);
+      auto* program = parseValue(memory, *schema, expression);
+      EXPECT_FALSE(program->constantScalar.has_value());
+      try {
+        program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+        FAIL() << "expected invalid bounds";
+      } catch (const ValueEvaluationError& error) {
+        if (expected.empty()) expected = error.what();
+        EXPECT_EQ(expected, error.what());
+      }
+    }
+  }
+  for (const auto& function : ValueFunctionRegistry::entries()) {
+    for (uint8_t operand = 0; operand < function.maxArity; operand++) {
+      if (function.operands[operand].lazy) continue;
+      SCOPED_TRACE(function.name);
+      ValueNode node;
+      node.type = ValueType::DOUBLE;
+      std::array<ValueBounds, VALUE_MAX_ARITY> args;
+      args.fill(ValueBounds::floating(1, 1));
+      args[operand] = ValueBounds::invalid(ValueType::DOUBLE, BoundsInvalidity::DOMAIN_ERROR);
+      args[operand].invalidNode = 42;
+      auto result = function.bounds(node, {args.data(), function.maxArity});
+      EXPECT_EQ(BoundsCertainty::INVALID, result.certainty);
+      EXPECT_EQ(42, result.invalidNode);
+    }
+  }
+}
+
 TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "x_i", 2), UpdateMessage::COMMIT);

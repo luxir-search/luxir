@@ -57,6 +57,7 @@ struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
+    bool lazy = false;
   };
 
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
@@ -85,6 +86,10 @@ struct ValueFunction {
   uint8_t maxArity = 0;
   std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
+
+  // Strict INVALID operands make the result INVALID; only lazy operands reach
+  // boundsPropagate possibly INVALID.
+  ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) const;
 
   // Shared DATE operands use ns when any of them uses ns. RAW operands keep
   // their native numeric representation.
