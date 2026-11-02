@@ -779,12 +779,16 @@ to its following value. The function spellings remain available:
   Failures in an unselected branch do not affect the result. Bucket scalar
   evaluation is eager, so this selection does not skip aggregate collection;
   collection-level failures still fail the expression.
-- `random(seed, value)` is a deterministic per-document number in `[0, 1)`
-  hashed from an integer seed and the value's first element (a field such as
-  `id_i`), like Elasticsearch `random_score` with `seed` and `field`. A
-  document without the value is missing. `random(seed)` hashes the document's
-  position in the index instead, which changes when segments merge, and
-  `random()` picks a fresh seed for every request.
+- `random()` returns a per-document number in `[0, 1)` from a fresh seed for
+  each request. `random(seed, key)` is deterministic, like Elasticsearch
+  `random_score` with `seed` and `field`: the seed is an integer constant and
+  the key a single-valued numeric column such as `id_i`, so a document keeps
+  its value across merges. A document without the key is missing. Equal keys
+  get equal values, with float keys compared as exact queries compare them
+  (`-0.0` and `0.0` differ), and distinct keys can tie (the value has 24
+  random bits).
+  `random(seed)` alone is rejected, because document positions change when
+  segments merge.
 - `geo_distance(field, lat, lon)` is the haversine distance in meters from a
   point to each value of a GEO_POINT field, the same distance `geo_distance`
   queries use.
@@ -886,7 +890,7 @@ Elasticsearch's `function_score` maps onto value expressions as follows:
 |---|---|
 | `gauss`, `exp`, `linear` decay | `gauss_decay(...)`, `exp_decay(...)`, `linear_decay(...)`; `geo_distance(...)` for geo fields |
 | `field_value_factor` | `def(field, missing) * factor` inside the modifier: `sqrt(...)`, `pow(..., 2)`, or `log(...) / log(10)` for the base-10 `log` |
-| `random_score` with `seed` and `field` | `random(seed, field)` |
+| `random_score` with `seed` and `field` | `random(seed, key)` with a scalar numeric column key |
 | `script_score` | the expression itself, with `?:`, comparisons, `exp`, and `pow` |
 | `weight`, `boost_mode`, `score_mode` | arithmetic over `score` and the function terms, `min`, `max` |
 | `filter` on a function | `cond ? f : 1` when the filter is expressible as a column predicate |

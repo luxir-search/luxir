@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -205,10 +206,25 @@ ResolvedValue ifResolve(std::span<const ResolvedValue> args) {
 
 ResolvedValue randomResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  if (!args.empty() && valueArray(args[0].type)) {
-    throw std::runtime_error("the seed must be a scalar");
+  if (args.size() == 1) {
+    throw std::runtime_error(
+        "a seed requires a scalar numeric column key; docids are not stable across merges");
   }
   return {ValueType::DOUBLE, ValueNature::NUMBER};
+}
+
+void prepareRandom(ValueNode& node, std::span<const ValueNode* const> args) {
+  if (args.empty()) {
+    node.intValue = (int64_t)(((uint64_t)std::random_device{}() << 32) | std::random_device{}());
+    return;
+  }
+  if (args[0]->type != ValueType::INT64) {
+    throw std::runtime_error("seed must be an integer constant expression");
+  }
+  if (args[1]->kind != ValueNodeKind::COLUMN || valueArray(args[1]->type)) {
+    throw std::runtime_error("key must be a scalar numeric column");
+  }
+  node.intValue = args[0]->intValue;
 }
 
 ResolvedValue geoDistanceResolve(std::span<const ResolvedValue> args) {
@@ -832,25 +848,25 @@ uint64_t mix64(uint64_t z) {
   return z ^ (z >> 31);
 }
 
-// node.intValue holds the seed. The hashed key is the value expression's
-// (first) value when one is given, else the reader-global document number.
+// node.intValue holds the seed. Seeded calls hash the column's numeric bits;
+// unseeded calls hash the reader-global document number with a fresh seed.
 // 24 bits keep the result exact as a float score and below 1.
 ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
                             int32_t docid, float score) {
   uint64_t key;
-  if (node.childCount < 2) {
+  if (node.childCount == 0) {
     key = (uint64_t)(program.segment.base + docid);
   } else {
     ValueResult value = program.evalNode(node.children[1], docid, score);
-    if (value.valid && valueArray(value.type)) {
-      value = value.array.size == 0
-          ? ValueResult::missing(valueScalarType(value.type))
-          : program.evalArrayElement(value.array, 0);
-    }
     if (!value.valid) return ValueResult::missing(node.type);
-    key = value.type == ValueType::DOUBLE
-        ? std::bit_cast<uint64_t>(value.doubleValue == 0.0 ? 0.0 : value.doubleValue)
-        : (uint64_t)value.intValue;
+    // Keys hash by their stored bits, the identity exact queries and facets
+    // use: NaN is canonical in the column, and -0.0 differs from 0.0.
+    if (program.program.nodes[node.children[1]].columnType == FieldType::FLOAT) {
+      key = std::bit_cast<uint32_t>((float)value.doubleValue);
+    } else {
+      key = value.type == ValueType::DOUBLE ? std::bit_cast<uint64_t>(value.doubleValue)
+                                            : (uint64_t)value.intValue;
+    }
   }
   uint64_t hash = mix64((uint64_t)node.intValue ^ mix64(key));
   return ValueResult::floating((double)(hash >> 40) * 0x1p-24);
@@ -1602,7 +1618,7 @@ ValueBounds randomBounds(const ValueNode& node, std::span<const ValueBounds> arg
   if (args.size() == 2) {
     if (invalid(args[1])) return retag(args[1], node.type);
     if (args[1].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-    mayMissing = args[1].mayBeMissing || valueArray(args[1].type);
+    mayMissing = args[1].mayBeMissing;
   }
   ValueBounds out = ValueBounds::floating(0.0, 1.0 - 0x1p-24, mayMissing);
   out.minAttained = false;
@@ -1750,7 +1766,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
      ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
-     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr},
+     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
      evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3,
      {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, prepareGeoDistance},
