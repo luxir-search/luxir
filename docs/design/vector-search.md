@@ -438,9 +438,36 @@ query-local vector storage, like bounded pooled exclusions; it is not charged to
 the interval collector's request-memory tracker. Fold counters count mapped docs
 and initialized/copied words; `selectorBitmap` counts rank probes. Provisional
 costs are 3 ns per fold doc (plus sparse/multi mapping), 0.5 ns per word and
-0.75 ns per rank probe. The benchmark's `selector` seam selects AUTO, RESOLVE or
+2.11 ns per rank probe (refitted on folded scans). The benchmark's `selector` seam selects AUTO, RESOLVE or
 FOLD (0/1/2) for round one only; all modes fold on deepen. Later-round pricing
 adds the fold and any copy needed for borrowed bounded domains.
+
+At each joined round boundary, the host previews the next allocation without
+advancing its cursors. Physical list sizes and setups are exact; score work uses
+the remaining eligible fraction and observed extra-bit survival. Cached live-list
+sizes avoid repeating deletion checks between preview and dispatch. If a slot's
+cumulative IVF cost plus its next-round cost exceeds its full-domain exact cost,
+the slot completes exactly. Profiles distinguish a next round that alone exceeds
+the exact cost from the cumulative trigger. This is a cost rule, not a regret bound.
+Explicit probe pins disable completion, and idle slots never trigger it.
+
+Completion removes the slot from allocation, recomputes effort over active IVF
+slots, then runs a single exact top-k pass without pooled exclusions. A separate
+completion round supplies exact witnesses before termination is considered; it
+can run with no IVF work. Existing interval records and lower-bound witnesses
+remain valid and retain their request-memory accounting. Bounded nominees are
+retired, and the active bounded pool starts a fresh epoch with covered lists
+rescanned and exclusions reopened. This also restores Groups members previously
+evicted under keys shared with completed slots. Original routing diagnostics stay
+unchanged; profiles add the completion round, reason and three costs. Work counters
+include both the abandoned IVF work and exact completion.
+
+The test/benchmark `completion` seam is AUTO (0) by default, OFF (1) for measuring
+IVF without completion, or FORCE (2) to complete every IVF slot at its first
+boundary, even if no further work was needed. FORCE still honors probe pins.
+Forced-arm calibration registrations use OFF; correlation sweeps compare AUTO
+with OFF and report switches per query. The routing planner does not speculate
+about future completions.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
