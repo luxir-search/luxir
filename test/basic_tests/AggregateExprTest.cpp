@@ -306,6 +306,18 @@ TEST_F(AggregateExprTest, lazyInvalidDocumentInputsBindBeforeBucketEvaluation) {
   EXPECT_THROW(evaluate(*invalid, *reader, reader->segments()[0]), ValueEvaluationError);
 }
 
+TEST_F(AggregateExprTest, documentConstantExpressionsKeepExactIntegerSeeds) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("x_i", 2), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "sum(random(9007199254740992 + 1, x_i))");
+  auto* input = program->producers[0].input;
+  EXPECT_EQ(INT64_C(9007199254740993), input->root().intValue);
+  EXPECT_TRUE(evaluate(*program, *reader, reader->segments()[0]).valid);
+}
+
 TEST_F(AggregateExprTest, dateRulesAreResolvedAcrossBothLevels) {
   auto schema = Schema::createDefaultSchema();
   ArenaOwner memory;

@@ -58,6 +58,7 @@ struct ValueFunction {
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
     bool lazy = false;
+    bool constant = false;
   };
 
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);

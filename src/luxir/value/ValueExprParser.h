@@ -37,12 +37,80 @@ struct ValueExprOptions {
 };
 
 class ValueExprParser {
+  class ValueConstantAnalysis {
+    std::vector<std::optional<ValueBounds>> bounds;
+    std::vector<ValueType> types;
+
+  public:
+    void clear() {
+      bounds.clear();
+      types.clear();
+    }
+
+    void append(const ValueNode& node, std::optional<ValueBounds> literal = std::nullopt) {
+      uint32_t index = (uint32_t)bounds.size();
+      std::optional<ValueBounds> result = literal;
+      if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
+        if (node.type == ValueType::INT64) {
+          result = ValueBounds::integer(node.intValue, node.intValue);
+        } else if (node.type == ValueType::DOUBLE) {
+          result = ValueBounds::floating(node.doubleValue, node.doubleValue);
+        }
+      } else if (node.kind == ValueNodeKind::FUNCTION) {
+        std::array<ValueBounds, VALUE_MAX_ARITY> children;
+        bool independent = true;
+        for (uint8_t child = 0; child < node.childCount; child++) {
+          const auto& childBounds = bounds[node.children[child]];
+          if (!childBounds.has_value()) {
+            independent = false;
+            children[child] = ValueBounds::unbounded(
+                types[node.children[child]], true);
+            continue;
+          }
+          children[child] = *childBounds;
+        }
+        ValueBounds value = node.function->bounds(
+            node, std::span<const ValueBounds>(children.data(), node.childCount));
+        if (value.certainty == BoundsCertainty::INVALID) {
+          if (value.invalidNode == UINT32_MAX) value.invalidNode = index;
+          result = value;
+        } else if (independent) {
+          result = value;
+        }
+      }
+      bounds.push_back(result);
+      types.push_back(node.type);
+    }
+
+    std::optional<ValueResult> scalar(uint32_t index) const {
+      const auto& rootBounds = bounds[index];
+      ValueType rootType = rootBounds.has_value() ? rootBounds->type : ValueType::COLUMN_ONLY;
+      if (!rootBounds.has_value()
+          || rootBounds->certainty != BoundsCertainty::BOUNDED
+          || rootBounds->mayBeMissing || rootBounds->alwaysMissing
+          || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
+        return std::nullopt;
+      }
+      if (rootType == ValueType::INT64
+          && rootBounds->intMin == rootBounds->intMax) {
+        return ValueResult::integer(rootBounds->intMin);
+      }
+      if (rootType == ValueType::DOUBLE
+          && rootBounds->doubleMin == rootBounds->doubleMax
+          && std::isfinite(rootBounds->doubleMin)) {
+        return ValueResult::floating(rootBounds->doubleMin);
+      }
+      return std::nullopt;
+    }
+  };
+
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
 
   const ValueExprOptions& opts;
   google::protobuf::Arena& arena;
   Cursor* cur = nullptr;
   ValueProgram* program = nullptr;
+  ValueConstantAnalysis constants;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
@@ -68,11 +136,12 @@ public:
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
+    constants.clear();
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
-    program->constantScalar = findConstantScalar();
+    program->constantScalar = constants.scalar(program->rootNode);
     return program;
   }
 
@@ -98,82 +167,12 @@ public:
   }
 
 private:
-  std::optional<ValueResult> findConstantScalar() const {
-    std::vector<std::optional<ValueBounds>> bounds(program->nodes.size());
-    for (uint32_t index = 0; index < program->nodes.size(); index++) {
-      const ValueNode& node = program->nodes[index];
-      if (node.kind == ValueNodeKind::CONSTANT
-          || node.kind == ValueNodeKind::VARIABLE) {
-        if (node.type == ValueType::INT64) {
-          bounds[index] = ValueBounds::integer(node.intValue, node.intValue);
-        } else if (node.type == ValueType::DOUBLE) {
-          bounds[index] =
-              ValueBounds::floating(node.doubleValue, node.doubleValue);
-        } else if (node.arraySize != 0) {
-          if (node.type == ValueType::INT64_ARRAY) {
-            auto begin = program->intArrays.begin() + node.arrayOffset;
-            auto extrema =
-                std::minmax_element(begin, begin + node.arraySize);
-            ValueBounds value =
-                ValueBounds::integer(*extrema.first, *extrema.second);
-            value.type = node.type;
-            bounds[index] = value;
-          } else {
-            auto begin = program->doubleArrays.begin() + node.arrayOffset;
-            auto extrema =
-                std::minmax_element(begin, begin + node.arraySize);
-            ValueBounds value =
-                ValueBounds::floating(*extrema.first, *extrema.second);
-            value.type = node.type;
-            bounds[index] = value;
-          }
-        }
-      } else if (node.kind == ValueNodeKind::FUNCTION) {
-        std::array<ValueBounds, VALUE_MAX_ARITY> children;
-        bool independent = true;
-        for (uint8_t child = 0; child < node.childCount; child++) {
-          const auto& childBounds = bounds[node.children[child]];
-          if (!childBounds.has_value()) {
-            independent = false;
-            children[child] = ValueBounds::unbounded(
-                program->nodes[node.children[child]].type, true);
-            continue;
-          }
-          children[child] = *childBounds;
-        }
-        ValueBounds value = node.function->bounds(
-            node, std::span<const ValueBounds>(children.data(), node.childCount));
-        if (value.certainty == BoundsCertainty::INVALID) {
-          if (value.invalidNode == UINT32_MAX) value.invalidNode = index;
-          bounds[index] = value;
-        } else if (independent) {
-          bounds[index] = value;
-        }
-      }
-    }
-
-    const auto& rootBounds = bounds[program->rootNode];
-    ValueType rootType = program->root().type;
-    if (!rootBounds.has_value()
-        || rootBounds->certainty != BoundsCertainty::BOUNDED
-        || rootBounds->mayBeMissing || rootBounds->alwaysMissing
-        || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
-      return std::nullopt;
-    }
-    if (rootType == ValueType::INT64
-        && rootBounds->intMin == rootBounds->intMax) {
-      return ValueResult::integer(rootBounds->intMin);
-    }
-    if (rootType == ValueType::DOUBLE
-        && rootBounds->doubleMin == rootBounds->doubleMax) {
-      return ValueResult::floating(rootBounds->doubleMin);
-    }
-    return std::nullopt;
-  }
-
   uint32_t append(ValueNode node) {
     program->addNode(node);
-    return (uint32_t)program->nodes.size() - 1;
+    uint32_t index = (uint32_t)program->nodes.size() - 1;
+    constants.append(node, node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE
+        ? std::optional<ValueBounds>(program->constantBounds(index)) : std::nullopt);
+    return index;
   }
 
   template <class Grammar>
@@ -386,6 +385,12 @@ private:
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
     }
+    for (uint8_t i = 0; i < count; i++) {
+      if (function->operands[i].constant && !foldConstant(args[i])) {
+        fail(program->nodes[args[i]].sourcePos, fmt::format(
+            "{}() argument {} must be a constant numeric scalar", function->name, i + 1));
+      }
+    }
     auto conversions = function->dateConversionOperands(
         std::span<const ResolvedValue>(resolvedArgs.data(), count));
     for (size_t convert = 0; convert < count; convert++) {
@@ -420,24 +425,36 @@ private:
       // ES random_score without a seed: a fresh seed for every request.
       node.intValue = count == 0
           ? (int64_t)(((uint64_t)std::random_device{}() << 32) | std::random_device{}())
-          : (int64_t)constantArg(args[0], "random", "seed", true);
+          : program->nodes[args[0]].intValue;
+      if (count != 0 && program->nodes[args[0]].type != ValueType::INT64) {
+        fail(pos, "random() seed must be an integer constant expression");
+      }
     }
     return append(node);
   }
 
-  // A literal or scalar $variable argument, as a double. With integral, it
-  // must be an int64 literal or variable.
+  bool foldConstant(uint32_t index) {
+    auto value = constants.scalar(index);
+    if (!value.has_value()) return false;
+    ValueNode& node = program->nodes[index];
+    ValueNode literal;
+    literal.type = value->type;
+    literal.nature = node.nature;
+    literal.sourcePos = node.sourcePos;
+    literal.text = node.text;
+    literal.intValue = value->intValue;
+    literal.doubleValue = value->doubleValue;
+    node = literal;
+    return true;
+  }
+
   double constantArg(uint32_t index, std::string_view function,
-                     std::string_view argument, bool integral = false) {
-    const ValueNode& node = program->nodes[index];
-    bool constant = node.kind == ValueNodeKind::CONSTANT
-        || node.kind == ValueNodeKind::VARIABLE;
-    if (!constant || valueArray(node.type)
-        || (integral && node.type != ValueType::INT64)) {
-      fail(node.sourcePos, fmt::format(
-          "{}() {} must be a{} literal or scalar $variable", function, argument,
-          integral ? "n integer" : " numeric"));
+                     std::string_view argument) {
+    if (!foldConstant(index)) {
+      fail(program->nodes[index].sourcePos, fmt::format(
+          "{}() {} must be a constant numeric scalar", function, argument));
     }
+    const ValueNode& node = program->nodes[index];
     return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
   }
 
