@@ -24,6 +24,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -285,6 +286,7 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
 
 void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
                   bool skew = false) {
+  ForceIvfGuard forceIvf;
   int64_t nDocs = luxir::unit_tests
       ? LuxirTest::scaleTestWork(240)
       : state.range(0);
@@ -547,6 +549,12 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
   const auto& ids = std::get<api::ColStr>(idCol->kind);
   out.assign(ids.v.begin(), ids.v.end());
   return true;
+}
+
+void forceIvfBenchmark(benchmark::Benchmark* bench) {
+  static std::optional<ForceIvfGuard> routing;
+  bench->Setup([](const benchmark::State&) { routing.emplace(); });
+  bench->Teardown([](const benchmark::State&) { routing.reset(); });
 }
 
 void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec,
@@ -1029,7 +1037,8 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     builtCodec = codec;
   }
-  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::routing);
+  KnnQuery::routing = (KnnQuery::Routing)state.range(4);
   KnnQuery::filteredCoverageAlpha = (double)state.range(3) / 100;
   auto run = [&](int q, bool exact, std::vector<std::string>& ids) {
     auto req = localReq(helper.getSearchEngine());
@@ -1081,6 +1090,43 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   }
   double queries = (double)data.queries.size();
   state.SetLabel(std::string(benchCodecName(codec)) + "/" + (correlation == 0 ? "independent" : correlation == 1 ? "near" : correlation == 2 ? "far" : "median"));
+  state.counters["planned_exact"] = stats.plannedExact.load() / queries;
+  state.counters["planned_ivf"] = stats.plannedIvf.load() / queries;
+  state.counters["request_cost"] = KnnQuery::plannerCosts.requestCost;
+  state.counters["predicted_cost"] = stats.predictedCost.load() / queries;
+  state.counters["actual_cost"] = stats.modeledActualCost.load() / queries;
+  for (size_t i = 0; i < KnnPlanner::NUM_UNITS; i++)
+    state.counters["unit_" + std::string(KnnPlanner::unitNames[i])] = stats.costWork[i].load() / queries;
+  state.counters["work_listSetups"] = stats.work.listSetups / queries;
+  state.counters["work_physicalEntries"] = stats.work.physicalEntries / queries;
+  state.counters["work_selectorPasses"] = stats.work.selectorPasses / queries;
+  state.counters["work_newListSelectorPasses"] = stats.work.newListSelectorPasses / queries;
+  state.counters["work_newListLiveVectors"] = stats.work.newListLiveVectors / queries;
+  state.counters["work_depthEntries"] = stats.work.depthEntries / queries;
+  state.counters["work_pqScores"] = stats.work.pqScores / queries;
+  state.counters["work_oneBitScores"] = stats.work.oneBitScores / queries;
+  state.counters["work_extraBitScores"] = stats.work.extraBitScores / queries;
+  state.counters["work_gateRejections"] = stats.work.gateRejections / queries;
+  state.counters["work_exactVectors"] = stats.work.exactVectors / queries;
+  state.counters["work_domainDocs"] = stats.work.domainDocs / queries;
+  state.counters["work_domainProbes"] = stats.work.domainProbes / queries;
+  state.counters["work_seedReads"] = stats.work.seedReads / queries;
+  state.counters["work_remainingReads"] = stats.work.remainingReads / queries;
+  state.counters["work_scoreBytes"] = stats.work.scoreBytes / queries;
+  state.counters["work_rankVisits"] = stats.work.rankVisits / queries;
+  state.counters["work_sparseMaps"] = stats.work.sparseMaps / queries;
+  state.counters["work_multiMaps"] = stats.work.multiMaps / queries;
+  state.counters["work_coarseDims"] = stats.work.coarseDims / queries;
+  state.counters["work_ivfRounds"] = stats.work.ivfRounds / queries;
+  state.counters["work_rounds"] = stats.work.rounds / queries;
+  state.counters["work_selectorNone"] = stats.work.selectorNone / queries;
+  state.counters["work_selectorBitmap"] = stats.work.selectorBitmap / queries;
+  state.counters["work_resolveIdentity"] = stats.work.resolveIdentity / queries;
+  state.counters["work_resolveSelect"] = stats.work.resolveSelect / queries;
+  state.counters["work_resolveMono"] = stats.work.resolveMono / queries;
+  state.counters["work_bitProbes"] = stats.work.bitProbes / queries;
+  state.counters["work_allocatorEntries"] = stats.work.allocatorEntries / queries;
+  state.counters["work_arraySteps"] = stats.work.arraySteps / queries;
   state.counters["exact_us"] = exactMicros;
   state.counters["recall@10"] = recall / queries;
   state.counters["recall_pass"] = recall / queries >= 0.95;
@@ -1106,6 +1152,7 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
 }
 
 void BM_VectorAnnDataset(benchmark::State& state) {
+  ForceIvfGuard forceIvf;
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
   int32_t codec = (int32_t)state.range(0);
@@ -1245,18 +1292,21 @@ TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segmen
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
-LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100"})
+LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode"})
     ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selectivity : {100, 1000})
-        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50});
+        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50, 0});
     });
 
-TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100"})
+TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode"})
     ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1})
         for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
-          for (int correlation : {0, 1, 2, 3}) for (int alpha : {0, 25, 50, 100})
-            b->Args({codec, selectivity, correlation, alpha});
+          for (int correlation : {0, 1, 2, 3}) {
+            for (int alpha : {0, 25, 50, 100}) b->Args({codec, selectivity, correlation, alpha, 1});
+            b->Args({codec, selectivity, correlation, 50, 0});
+            b->Args({codec, selectivity, correlation, 50, 2});
+          }
     });
 
 LUXIR_BENCHMARK(BM_VectorKnnFlatDomain)->ArgNames({"shape", "basis_points", "arm"})
@@ -1292,7 +1342,7 @@ static void recallSweep(benchmark::Benchmark* b, int64_t codec) {
     // Note recall granularity is 1/(16*k): coarse at k=1.
     ->Args({0, 0, 1, codec})->Args({0, 0, 100, codec})->Args({0, 0, 1000, codec});
 }
-LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k", "codec"})
+LUXIR_BENCHMARK(BM_VectorKnnRecall)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Apply([](benchmark::Benchmark* b) {
       recallSweep(b, RABITQ1);
       recallSweep(b, PQ);
@@ -1301,24 +1351,24 @@ LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k", "codec"})
 // Parallel-execution latency points: default knobs, a wide-breadth probe
 // (more selected lists = more scan tasks), and a deep-k pool (bigger
 // rescore buckets).
-LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k", "codec"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->Args({16, 0, 10, RABITQ1})->Args({1 << 20, 0, 10, RABITQ1})
     ->Args({0, 0, 1000, RABITQ1});
 
-LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k", "codec"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);
-LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k", "codec"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);
 
 // Matched query-path cells: same clustered corpus, explicit probe and pool
 // budgets. Exact requests use the column while sharing the PQ-built fixture.
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_serial, false)
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_serial, false)->Apply(forceIvfBenchmark)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_parallel, true)
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_parallel, true)->Apply(forceIvfBenchmark)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_serial, false, true)
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_serial, false, true)->Apply(forceIvfBenchmark)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_parallel, true, true)
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_parallel, true, true)->Apply(forceIvfBenchmark)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, rabitq_groups, false, false, true)
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, rabitq_groups, false, false, true)->Apply(forceIvfBenchmark)
     ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, RABITQ1});

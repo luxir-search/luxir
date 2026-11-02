@@ -29,6 +29,7 @@
 #include "test/LuxirTest.h"
 #include "test/TaskSpawnCounter.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -846,7 +847,7 @@ TEST_F(KnnQueryTest, multiValuedFillsAfterDeletingTopDoc) {
   req->done();
 }
 
-TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
+TEST_F(KnnQueryTest, flatMultiValuedIgnoresCandidateCap) {
   MaxKnnCandidatesGuard guard(3);
   CollectionHelper h("main");
   installMultiVecSchema(h.collection(), api::VectorMetric::L2);
@@ -862,17 +863,15 @@ TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
   h.commit({"*"});
 
   auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 4);
-  {
-    ExpectLog quiet("at candidate cap");
-    req->execute();
-  }
+  req->execute();
 
-  EXPECT_EQ(req->getMatchCount(), 3);
+  EXPECT_EQ(req->getMatchCount(), 4);
   auto ids = resultIds(*req);
-  ASSERT_EQ(ids.size(), 3u);
+  ASSERT_EQ(ids.size(), 4u);
   EXPECT_EQ(ids[0], "a");
   EXPECT_EQ(ids[1], "b");
   EXPECT_EQ(ids[2], "c");
+  EXPECT_EQ(ids[3], "d");
 
   req->done();
 }
@@ -1393,6 +1392,7 @@ TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
 }
 
 TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -1425,6 +1425,7 @@ TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
 }
 
 TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -1464,6 +1465,7 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
 // only A - the outlier, the true nearest doc by a 2x margin, is structurally
 // invisible to the approximate path.  exact must recover it.
 TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 2, 2), 4);
@@ -1514,6 +1516,7 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
 }
 
 TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 2, 2), 4);
@@ -1569,6 +1572,7 @@ TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
 // min_scan_fraction=1 over the same request recovers it, confirming the corpus
 // would reveal a full scan if one happened.
 TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 2, 2), 4);
@@ -1615,6 +1619,7 @@ TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
   EXPECT_DOUBLE_EQ(2.0, KnnQuery::defaultAnnBreadthDimFactor(512));
   EXPECT_EQ(KnnQuery::ANN_BREADTH_MAX_DIM_FACTOR, KnnQuery::defaultAnnBreadthDimFactor(8192));
 
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   constexpr int32_t dims = 512;
@@ -1656,6 +1661,7 @@ TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
 }
 
 TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha);
   CollectionHelper h("main");
@@ -1743,6 +1749,7 @@ TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
 }
 
 TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha);
   for (bool interval : {false, true}) {
@@ -1802,6 +1809,7 @@ TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
 }
 
 TEST_F(KnnQueryTest, filteredBreadthProjectsFromEligibleYield) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   ScanGrainGuard grains(32, 1);
   SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha,
@@ -1895,6 +1903,7 @@ TEST_F(KnnQueryTest, filteredBreadthProjectsFromEligibleYield) {
 }
 
 TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/2);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 1, 1), 4);
@@ -1931,6 +1940,7 @@ TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
 }
 
 TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 2, 2), 4);
@@ -1983,6 +1993,7 @@ TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
 // one aux-less flat segment), sparse no-vector docs, and post-build deletes
 // all ride along.
 TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
@@ -2062,6 +2073,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
 // buckets all interact.  A small refine_candidates pin makes the bounded
 // approximate cut actually bite (kReq well below the pooled vector count).
 TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
@@ -2123,6 +2135,7 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
 // single-threaded (results are identical either way, so the spawn counter is
 // the only observable).
 TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
@@ -2168,6 +2181,7 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
 // both generations (the bitmap IS the eligibility filtering here - a stale
 // or mis-keyed cache would surface deleted docs).
 TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2232,6 +2246,7 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
 // engines never re-check liveDocs - a violation would surface the deleted
 // doc here.
 TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2282,6 +2297,7 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
 }
 
 TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2586,6 +2602,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
 }
 
 TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2620,6 +2637,7 @@ TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
 }
 
 TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2704,8 +2722,7 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
 }
 
 // The maxKnnCandidates host cap is a heuristic; exact is a contract and must
-// not be silently truncated by it.  Without exact, the same capped request
-// returns only cap docs.
+// not be silently truncated by it. Flat-only routing has the same contract.
 TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   MaxKnnCandidatesGuard guard(2);
 
@@ -2718,11 +2735,8 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   h.commit({"*"});
 
   auto* capped = makeKnnReq(*luxirNode, "embedding_v", {0, 0, 0, 0}, 5);
-  {
-    ExpectLog quiet("at candidate cap");  // non-exact falls short of k at the cap
-    capped->execute();
-  }
-  EXPECT_EQ(capped->getMatchCount(), 2) << "non-exact respects the host cap";
+  capped->execute();
+  EXPECT_EQ(capped->getMatchCount(), 5) << "all-exact routing ignores the bounded cap";
   capped->done();
 
   auto* req = makeKnnReq(*luxirNode, "embedding_v", {0, 0, 0, 0}, 5,
@@ -2738,6 +2752,7 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
 }
 
 TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2782,6 +2797,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
 // (two vectors - both ranks must drop) and the no-vector doc "g" (the
 // deleted-doc-without-field skip) must leave the survivors matching exact.
 TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -2842,6 +2858,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
 // pool (refine_candidates=8 -> targetDocReq=8 docs, round 1 yields ~1);
 // the loop must still surface the runner-up docs and match exact.
 TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4), rabitqAnn(4, 4)}) {
@@ -2934,6 +2951,7 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
 }
 
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchemaCosineRaw(h.collection(), pqAnn(4, 2, 2), 4);
@@ -2969,6 +2987,7 @@ TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
 }
 
 TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(2, 2, 2), 4);
@@ -3173,6 +3192,7 @@ TEST_F(KnnQueryTest, l2Scores) {
 }
 
 TEST_F(KnnQueryTest, intervalWitnessesCountDocumentsNotValues) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   ScanGrainGuard grains(1, 1);
   CollectionHelper h("main");
@@ -3208,6 +3228,7 @@ TEST_F(KnnQueryTest, intervalWitnessesCountDocumentsNotValues) {
 }
 
 TEST_F(KnnQueryTest, intervalBreadthCarriesWitnessesWithoutRescanningLists) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper h("main");
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 8), 4);
@@ -3533,6 +3554,7 @@ TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
 }
 
 TEST_F(KnnQueryTest, emptyVectorDomainSkipsOverlayLoad) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 1), 4);
@@ -3641,6 +3663,7 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
 }
 
 TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
@@ -3701,4 +3724,140 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     EXPECT_TRUE(a.equals(c));
     EXPECT_EQ(a.hash(), c.hash());
   }
+}
+
+TEST_F(KnnQueryTest, plannerUsesHasVectorIntersectionWithoutLoadingAnn) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::routing, KnnQuery::statsForTests);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 1), 4);
+  for (int i = 0; i < 1000; i++) {
+    auto doc = flatdoc("id", std::to_string(i), "keep_s", i % 10 == 0 ? "yes" : "no");
+    if (i % 10 == 0) doc.emplace_back("embedding_v", std::vector<float>{(float)i, 0, 0, 0});
+    h.index(doc);
+  }
+  h.commit({"*"});
+  ASSERT_NE(h.getIndexWriter()->snapshots.readers.getReader()->segments()[0].getAuxReader("vec.embedding_v"), nullptr);
+  h.deleteByIds(std::vector<std::string>{"0"}, UpdateMessage::COMMIT);
+  for (auto mode : {KnnQuery::Routing::AUTO, KnnQuery::Routing::FORCE_EXACT, KnnQuery::Routing::FORCE_IVF}) {
+    KnnQuery::routing = mode;
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile();
+    auto& cur = req->topDocs("q");
+    configKnn(cur, "embedding_v", {0, 0, 0, 0}, 3, 0, 0, false, 1);
+    addMatchFilter(cur, "keep_s", "yes");
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"10", "20", "30"}));
+    bool exact = mode != KnnQuery::Routing::FORCE_IVF;
+    EXPECT_EQ(stats.faissIndexCalls.load(), exact ? 0 : 1);
+    EXPECT_EQ(stats.plannedExact.load(), exact ? 1 : 0);
+    EXPECT_EQ(stats.plannedIvf.load(), exact ? 0 : 1);
+    ASSERT_TRUE(req->responses.back()->proto.profile.has_value());
+    bool found = false;
+    for (const auto& op : req->responses.back()->proto.profile->ops) for (const auto& piece : op.pieces) {
+      if (piece.kind != "knn") continue;
+      found = true;
+      EXPECT_EQ(piece.cardinality, 99);
+      EXPECT_EQ(piece.domain_size, 99);
+      EXPECT_EQ(piece.strategy, exact ? "exact" : "ivf");
+      bool eligible = false;
+      for (auto note : piece.details) eligible |= note.find("eligible_vectors=99;") != std::string_view::npos;
+      EXPECT_TRUE(eligible);
+    }
+    EXPECT_TRUE(found);
+    if (!exact) {
+      EXPECT_GT(stats.work.resolveSelect, 0);
+      EXPECT_GT(stats.work.allocatorEntries, 0);
+      EXPECT_EQ(stats.costWork[KnnPlanner::ENTRY_BITMAP].load(),
+                stats.work.selectorBitmap + stats.work.allocatorEntries);
+    }
+    EXPECT_GT(stats.predictedCost.load(), 0);
+    EXPECT_GT(stats.modeledActualCost.load(), 0);
+  }
+}
+
+TEST_F(KnnQueryTest, emptyAnnIndexUsesNonemptyColumn) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 1), 4);
+  for (int i = 0; i < 128; i++) h.index(flatdoc("id", std::to_string(i),
+      "embedding_v", std::vector<float>{(float)i, 0, 0, 0}));
+  h.commit({"*"});
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+  ASSERT_NE(aux, nullptr);
+  auto* index = ((VectorAuxReader*)aux.get())->getFaissIndex();
+  SearchOverridesGuard empty(index->ntotal, KnnQuery::statsForTests);
+  index->ntotal = 0;
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto req = localReq(h.getSearchEngine());
+  configKnn(req->collection("main").topDocs("q"), "embedding_v", {0, 0, 0, 0}, 3);
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"0", "1", "2"}));
+  EXPECT_EQ(stats.plannedExact.load(), 1);
+  EXPECT_EQ(stats.vectorsScored.load(), 128);
+  EXPECT_EQ(stats.scanned.load(), 0);
+}
+
+TEST_F(KnnQueryTest, autoCanKeepIvfAndReportsWorkUnits) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::plannerCosts, KnnQuery::routing, KnnQuery::statsForTests);
+  KnnQuery::routing = KnnQuery::Routing::AUTO;
+  // Make exact vector scoring expensive, with a bounded terminal pool.
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 1000;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(8, 2, 2), 4);
+  for (int i = 0; i < 512; i++) h.index(flatdoc("id", std::to_string(i),
+      "embedding_v", std::vector<float>{(float)i, 0, 0, 0}));
+  h.commit({"*"});
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto req = localReq(h.getSearchEngine());
+  configKnn(req->collection("main").topDocs("q"), "embedding_v", {0, 0, 0, 0}, 3, 0, 12);
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(stats.plannedIvf.load(), 1);
+  EXPECT_EQ(stats.faissIndexCalls.load(), 1);
+  EXPECT_EQ(stats.work.coarseDims, 32);
+  EXPECT_EQ(stats.work.selectorNone, stats.work.physicalEntries);
+  EXPECT_EQ(stats.work.resolveIdentity, 0);
+  EXPECT_GT(stats.costWork[KnnPlanner::PQ_SUBCODE].load(), 0);
+}
+
+TEST_F(KnnQueryTest, autoMixesExactOverlayAndIvf) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::plannerCosts, KnnQuery::statsForTests, KnnQuery::routing);
+  KnnQuery::routing = KnnQuery::Routing::AUTO;
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 1000;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(8, 2, 1), 4);
+  for (int segment = 0; segment < 2; segment++) {
+    for (int i = 0; i < (segment ? 512 : 128); i++) h.index(flatdoc(
+        "id", std::to_string(segment * 1000 + i), "keep_s", segment || i == 0 ? "yes" : "no",
+        "embedding_v", std::vector<float>{(float)(segment ? i : 1000 + i), 0, 0, 0}));
+    h.commit({"*"});
+  }
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(reader->segments().size(), 2u);
+  for (auto& seg : reader->segments()) ASSERT_NE(seg.getAuxReader("vec.embedding_v"), nullptr);
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto req = localReq(h.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  configKnn(cur, "embedding_v", {0, 0, 0, 0}, 3, 0, 12);
+  addMatchFilter(cur, "keep_s", "yes");
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(stats.plannedExact.load(), 1);
+  EXPECT_EQ(stats.plannedIvf.load(), 1);
+  EXPECT_EQ(stats.faissIndexCalls.load(), 1);
+  EXPECT_EQ(stats.work.exactVectors, 1);
+  EXPECT_EQ(stats.work.coarseDims, 32);
+  EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"1000", "1001", "1002"}));
 }

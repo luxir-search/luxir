@@ -5,6 +5,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/index/VectorIndexBuilder.h"
@@ -260,9 +261,8 @@ TEST_F(GroupKnnTest, reportsExhaustionAndCapsAndRejectsMissingScope) {
   SearchOverridesGuard guard(KnnQuery::maxKnnCandidates);
   KnnQuery::maxKnnCandidates = 2;
   auto capped = run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(5, true, false));
-  EXPECT_EQ(2u, rows(*capped).size());
-  ASSERT_EQ(1u, capped->responses.back()->proto.warnings.size());
-  EXPECT_NE(std::string_view::npos, capped->responses.back()->proto.warnings[0].message.find("candidates_exhausted=false"));
+  EXPECT_EQ(5u, rows(*capped).size()); // Flat-only routing has no bounded pool.
+  EXPECT_TRUE(capped->responses.back()->proto.warnings.empty());
   auto exact = run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(5, true));
   EXPECT_EQ(5u, rows(*exact).size()); // exact overrides the heuristic cap.
 }
@@ -283,6 +283,7 @@ TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
       }
       helper.indexAll(docs, UpdateMessage::COMMIT);
     }
+    ForceIvfGuard forceIvf;
     IvfTestGuard ivf(/*minTraining=*/16);
     helper.commit({"vec.vec_vs"});
     // A later segment has no aux, and the same near group straddles all three.
@@ -313,6 +314,7 @@ TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
 }
 
 TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper helper;
   constexpr int dims = 16;
@@ -354,6 +356,7 @@ TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
 }
 
 TEST_F(GroupKnnTest, sharedFloorRespectsMemberCapsAcrossSegments) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   SearchOverridesGuard grain(KnnQuery::scanTaskGrainVectors);
   KnnQuery::scanTaskGrainVectors = 1;
@@ -381,6 +384,7 @@ TEST_F(GroupKnnTest, sharedFloorRespectsMemberCapsAcrossSegments) {
 }
 
 TEST_F(GroupKnnTest, rabitqQueryBitsChangeBoundedGroupedSelection) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper helper;
   constexpr int dims = 16;
@@ -458,6 +462,7 @@ TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
 }
 
 TEST_F(GroupKnnTest, annAdmissionPrecedesTheVectorCutForIpAndCosine) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(/*minTraining=*/16);
   for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
     std::string name = "group_metric_" + std::to_string((int)metric);
@@ -540,6 +545,7 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
     helper.index(flatdoc("id", std::to_string(group * 2 + member), "key_s", "g" + std::to_string(group),
         "vec_vs", std::vector<std::vector<float>>{{(float)group + (float)member * 0.1f, 0, 0, 0}}));
   }
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf(/*minTraining=*/8);
   helper.commit({"vec.vec_vs"});
   auto truth = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(3, true)));
@@ -856,6 +862,7 @@ TEST_F(GroupKnnTest, resetAllExtraKeepsItsScopedOwner) {
 }
 
 TEST_F(GroupKnnTest, intervalsPruneMembersWithinDistinctUnits) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   SearchOverridesGuard saved(KnnQuery::maxKnnCandidates, KnnQuery::scanTaskGrainVectors, KnnQuery::statsForTests);
   KnnQuery::maxKnnCandidates = 1;

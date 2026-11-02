@@ -354,17 +354,18 @@ explicit build succeeds.
 ## Query Execution
 
 `KnnQuery` creates one vector engine per segment. A segment uses its
-`vec.<field>` FAISS overlay when present, or scans the vector column exactly
-when no overlay exists. The engines search inside the per-segment prepare
-domain, which is live-filtered and already holds every enclosing restriction:
-a boolean folds its `filter` clauses and, when a `required` or `optional`
-clause selects inside that domain (kNN, directly or nested), its `prohibited`
-(must_not) clauses into the domain it hands its children (outer AND filters
-AND NOT prohibited). The folded domain then replaces the
-boolean's prohibited scorers as its required domain supplier, so each
-exclusion is materialized once, through the same filter cache uses as a
-filter clause. Scoring siblings are not folded: they intersect with the
-kNN's top-k after it ran. FAISS ids are segment-local vector value ranks, so the
+`vec.<field>` FAISS overlay when the work model prefers IVF, or scans the
+vector column exactly. Segments without an overlay, and nonempty columns with
+an empty ANN index, use the exact engine. The engines search inside the
+per-segment prepare domain, which is live-filtered and already holds every
+enclosing restriction: a boolean folds its `filter` clauses and, when a
+`required` or `optional` clause selects inside that domain (kNN, directly or
+nested), its `prohibited` (must_not) clauses into the domain it hands its
+children (outer AND filters AND NOT prohibited). The folded domain then
+replaces the boolean's prohibited scorers as its required domain supplier, so
+each exclusion is materialized once, through the same filter cache uses as a
+filter clause. Scoring siblings are not folded: they intersect with the kNN's
+top-k after it ran. FAISS ids are segment-local vector value ranks, so the
 query path maps each returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
@@ -372,6 +373,52 @@ IndexReader opens and pins overlay files eagerly when it opens an index
 version, so cleanup can unlink old files without breaking existing readers.
 The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
+
+Routing uses column and overlay metadata before loading FAISS or rank-liveness
+state. `KnnPlanner` prices predicted work with one calibrated unit-cost table:
+exact dimensions, domain visits and rank mapping; IVF selector classes, codec
+scores, list setup, coarse centroid dimensions and terminal reads. Costs are
+exact-score-dimension equivalents, not time predictions. For a configuration
+of IVF slots, predicted coverage is the maximum of initial coverage, bounded
+fill and the remaining document-unit obligation, capped at one. Explicit
+`nprobe` pins the prediction to initial coverage. Filter placement is assumed
+independent of centroid order; large multi-valued domains retain their explicit
+eligible-vector estimate. Group diversity is not predicted from doc counts.
+
+Each IVF slot has an affine scan price `coverage * A + B`. Global terms add
+terminal reads and IVF slot-round overhead. Walk and terminal dimensions have
+separate costs; RaBitQ list setup scales with dimensions, while PQ list setup
+has its own coefficient. Predicted rounds are one at initial coverage, otherwise
+`1 + ceil(log2(coverage / initial_coverage))`. A shared request constant is paid
+once by either arm. Calibration uses nanoseconds divided by 0.135 ns per exact
+walk dimension; counters expose the same work units.
+
+The bounded terminal allowance is one shared pool, capped by eligible vector
+dimensions. Its multiplicity estimate is fixed from all bounded segments before
+routing; actual admission can favor higher-multiplicity docs. Interval terminal
+reads use 0.11 of examined dimensions (pooled measured ratio 0.107; independent
+filters alone 0.004). Extra-bit survival retains its provisional 0.35 fraction.
+
+The planner compares all-IVF and all-exact with forward substitution sweeps
+from three seeds: all-IVF, every bounded segment exact, and every interval
+segment exact. Only strict drops in total cost are accepted. Identical seeds
+are skipped. The channel seeds handle the coverage drop when the last bounded
+slot leaves. Running sums make trials constant-time; sorting costs
+O(segments log segments). Pinned effort is optimized exactly by separately
+minimizing the two additive objectives of the capped bounded terminal term.
+Ties retain IVF. The adaptive search is a heuristic, tested against exhaustive
+search; it is not a global optimizer. Reverse and single-flip passes remain
+available to tests for comparing search quality and cost. `exact:true`
+overrides routing. Exact slots contribute neither IVF fill nor its denominator.
+
+Cold-page effects, multiplicity and filter correlation still require
+measurement; predicted cost is not a latency or recall guarantee.
+`profile:true` includes per-segment choices, eligibility, modeled costs,
+reasons and executed work. `BM_VectorKnnFiltered` exposes AUTO, forced IVF and
+forced exact modes (0/1/2), with raw counters and cost features for calibration.
+Size-weighted array probes count calls times `bit_width(domain size)`, not
+instrumented comparisons in the DocSet search. The model does not try to fit
+the nonlinear misprediction cost of large array-domain probes.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
@@ -407,7 +454,8 @@ Default-probe queries also examine at least `P0 * eligibleVectors` selector-pass
 codes on newly scanned lists, where `P0` is the initial fraction. Depth rescans
 and exact slots do not contribute. This is the eligible yield expected from an
 independent filter at `P0`; unfiltered scans already satisfy it through coverage.
-Exhaustion or explicit probe pins end widening even if obligations remain unmet.
+Exhaustion, a full candidate pool or explicit probe pins end widening even if
+obligations remain unmet.
 
 The host owns cumulative scan fractions and explicitly requests depth or breadth.
 For each unmet count obligation, it projects `covered * need / have * 1.25`, or
@@ -422,7 +470,8 @@ query state: physical entries, selector passes (with new-list passes separate),
 PQ scores, RaBitQ one-bit and extra-bit scores, list setups, depth revisits,
 flat scores and domain visits. Terminal scoring adds its column reads after
 each read-stage barrier. These count scoring work, not physical page IO;
-allocator liveness probes are separate metadata work.
+allocator liveness probes are counted separately and priced as rank-bitmap
+work, including the next-list lookahead under deletes.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop

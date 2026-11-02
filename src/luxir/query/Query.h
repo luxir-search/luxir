@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
@@ -1215,17 +1216,18 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
         std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr,
-        RequestMemTracker* memoryTracker = nullptr)
+        RequestMemTracker* memoryTracker = nullptr, ExecutionProfileSink* profiles = nullptr)
       : memoryTracker(memoryTracker ? *memoryTracker : standaloneMemoryTracker),
         pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext), limits(limits),
-        warnings(warnings) {
+        warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       auto* filterCache = topReader.filterCache();
