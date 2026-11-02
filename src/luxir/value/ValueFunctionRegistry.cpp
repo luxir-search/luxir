@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -298,8 +299,32 @@ bool compareValues(ValueOpcode opcode, T a, T b) {
     case ValueOpcode::GE: return a >= b;
     case ValueOpcode::EQ: return a == b;
     case ValueOpcode::NE: return a != b;
-    default: throw std::logic_error("invalid comparison ValueExpr opcode");
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::ADD:
+    case ValueOpcode::SUB:
+    case ValueOpcode::MUL:
+    case ValueOpcode::DIV:
+    case ValueOpcode::NEG:
+    case ValueOpcode::ABS:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::MIN:
+    case ValueOpcode::MAX:
+    case ValueOpcode::AVG:
+    case ValueOpcode::EXP:
+    case ValueOpcode::POW:
+    case ValueOpcode::AND:
+    case ValueOpcode::OR:
+    case ValueOpcode::NOT:
+    case ValueOpcode::IF:
+    case ValueOpcode::RANDOM:
+    case ValueOpcode::GEO_DISTANCE:
+      throw std::logic_error("invalid comparison ValueExpr opcode");
   }
+  std::unreachable();
 }
 
 template <class Int>
@@ -321,7 +346,28 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::LOG1P: output = std::log1p(value); break;
       case ValueOpcode::FLOOR: output = std::floor(value); break;
       case ValueOpcode::EXP: output = std::exp(value); break;
-      default:
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::ADD:
+      case ValueOpcode::SUB:
+      case ValueOpcode::MUL:
+      case ValueOpcode::DIV:
+      case ValueOpcode::MIN:
+      case ValueOpcode::MAX:
+      case ValueOpcode::AVG:
+      case ValueOpcode::POW:
+      case ValueOpcode::LT:
+      case ValueOpcode::LE:
+      case ValueOpcode::GT:
+      case ValueOpcode::GE:
+      case ValueOpcode::EQ:
+      case ValueOpcode::NE:
+      case ValueOpcode::AND:
+      case ValueOpcode::OR:
+      case ValueOpcode::NOT:
+      case ValueOpcode::IF:
+      case ValueOpcode::RANDOM:
+      case ValueOpcode::GEO_DISTANCE:
         throw std::logic_error("invalid unary ValueExpr opcode");
     }
     if (!std::isfinite(output)
@@ -341,7 +387,33 @@ ScalarKernelValue<Int> evalUnaryKernel(
       if (input.intValue >= 0) return integerKernelValue(input.intValue);
       overflow = __builtin_sub_overflow((Int)0, input.intValue, &output);
       break;
-    default:
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::ADD:
+    case ValueOpcode::SUB:
+    case ValueOpcode::MUL:
+    case ValueOpcode::DIV:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::MIN:
+    case ValueOpcode::MAX:
+    case ValueOpcode::AVG:
+    case ValueOpcode::EXP:
+    case ValueOpcode::POW:
+    case ValueOpcode::LT:
+    case ValueOpcode::LE:
+    case ValueOpcode::GT:
+    case ValueOpcode::GE:
+    case ValueOpcode::EQ:
+    case ValueOpcode::NE:
+    case ValueOpcode::AND:
+    case ValueOpcode::OR:
+    case ValueOpcode::NOT:
+    case ValueOpcode::IF:
+    case ValueOpcode::RANDOM:
+    case ValueOpcode::GEO_DISTANCE:
       throw std::logic_error("invalid integer unary ValueExpr opcode");
   }
   return overflow
@@ -381,7 +453,28 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
       case ValueOpcode::POW: output = std::pow(a, b); break;
-      default:
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::NEG:
+      case ValueOpcode::ABS:
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
+      case ValueOpcode::FLOOR:
+      case ValueOpcode::AVG:
+      case ValueOpcode::EXP:
+      case ValueOpcode::LT:
+      case ValueOpcode::LE:
+      case ValueOpcode::GT:
+      case ValueOpcode::GE:
+      case ValueOpcode::EQ:
+      case ValueOpcode::NE:
+      case ValueOpcode::AND:
+      case ValueOpcode::OR:
+      case ValueOpcode::NOT:
+      case ValueOpcode::IF:
+      case ValueOpcode::RANDOM:
+      case ValueOpcode::GEO_DISTANCE:
         throw std::logic_error("invalid binary ValueExpr opcode");
     }
     if (!std::isfinite(output)
@@ -412,7 +505,30 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::MAX:
       output = std::max(left.intValue, right.intValue);
       break;
-    default:
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::DIV:
+    case ValueOpcode::NEG:
+    case ValueOpcode::ABS:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::AVG:
+    case ValueOpcode::EXP:
+    case ValueOpcode::POW:
+    case ValueOpcode::LT:
+    case ValueOpcode::LE:
+    case ValueOpcode::GT:
+    case ValueOpcode::GE:
+    case ValueOpcode::EQ:
+    case ValueOpcode::NE:
+    case ValueOpcode::AND:
+    case ValueOpcode::OR:
+    case ValueOpcode::NOT:
+    case ValueOpcode::IF:
+    case ValueOpcode::RANDOM:
+    case ValueOpcode::GEO_DISTANCE:
       throw std::logic_error("invalid integer binary ValueExpr opcode");
   }
   return overflow
@@ -866,8 +982,8 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     return ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
 
-  double outLow;
-  double outHigh;
+  double outLow = 0.0;
+  double outHigh = 0.0;
   switch (node.opcode) {
     case ValueOpcode::NEG:
       outLow = -high;
@@ -898,7 +1014,28 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
       outLow = std::exp(low);
       outHigh = std::exp(high);
       break;
-    default:
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::ADD:
+    case ValueOpcode::SUB:
+    case ValueOpcode::MUL:
+    case ValueOpcode::DIV:
+    case ValueOpcode::MIN:
+    case ValueOpcode::MAX:
+    case ValueOpcode::AVG:
+    case ValueOpcode::POW:
+    case ValueOpcode::LT:
+    case ValueOpcode::LE:
+    case ValueOpcode::GT:
+    case ValueOpcode::GE:
+    case ValueOpcode::EQ:
+    case ValueOpcode::NE:
+    case ValueOpcode::AND:
+    case ValueOpcode::OR:
+    case ValueOpcode::NOT:
+    case ValueOpcode::IF:
+    case ValueOpcode::RANDOM:
+    case ValueOpcode::GEO_DISTANCE:
       throw std::runtime_error("invalid unary ValueExpr opcode");
   }
   if (!std::isfinite(outLow) || !std::isfinite(outHigh)) {
@@ -967,7 +1104,30 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
         low = std::max(amin, bmin);
         high = std::max(amax, bmax);
         break;
-      default:
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::DIV:
+      case ValueOpcode::NEG:
+      case ValueOpcode::ABS:
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
+      case ValueOpcode::FLOOR:
+      case ValueOpcode::AVG:
+      case ValueOpcode::EXP:
+      case ValueOpcode::POW:
+      case ValueOpcode::LT:
+      case ValueOpcode::LE:
+      case ValueOpcode::GT:
+      case ValueOpcode::GE:
+      case ValueOpcode::EQ:
+      case ValueOpcode::NE:
+      case ValueOpcode::AND:
+      case ValueOpcode::OR:
+      case ValueOpcode::NOT:
+      case ValueOpcode::IF:
+      case ValueOpcode::RANDOM:
+      case ValueOpcode::GEO_DISTANCE:
         throw std::runtime_error("invalid binary ValueExpr opcode");
     }
     if (low < std::numeric_limits<int64_t>::min() ||
@@ -989,8 +1149,8 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
   double amax = boundMaxAsDouble(left);
   double bmin = boundMinAsDouble(right);
   double bmax = boundMaxAsDouble(right);
-  double low;
-  double high;
+  double low = 0.0;
+  double high = 0.0;
   switch (node.opcode) {
     case ValueOpcode::ADD:
       low = amin + bmin;
@@ -1029,7 +1189,29 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
       low = std::max(amin, bmin);
       high = std::max(amax, bmax);
       break;
-    default:
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::NEG:
+    case ValueOpcode::ABS:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::AVG:
+    case ValueOpcode::EXP:
+    case ValueOpcode::POW:
+    case ValueOpcode::LT:
+    case ValueOpcode::LE:
+    case ValueOpcode::GT:
+    case ValueOpcode::GE:
+    case ValueOpcode::EQ:
+    case ValueOpcode::NE:
+    case ValueOpcode::AND:
+    case ValueOpcode::OR:
+    case ValueOpcode::NOT:
+    case ValueOpcode::IF:
+    case ValueOpcode::RANDOM:
+    case ValueOpcode::GEO_DISTANCE:
       throw std::runtime_error("invalid binary ValueExpr opcode");
   }
   if ((!std::isfinite(low) || !std::isfinite(high))
@@ -1159,8 +1341,32 @@ ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds>
       case ValueOpcode::GE: return amin >= bmax ? 1 : amax < bmin ? 0 : -1;
       case ValueOpcode::EQ: return equal ? 1 : disjoint ? 0 : -1;
       case ValueOpcode::NE: return equal ? 0 : disjoint ? 1 : -1;
-      default: throw std::logic_error("invalid comparison ValueExpr opcode");
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::ADD:
+      case ValueOpcode::SUB:
+      case ValueOpcode::MUL:
+      case ValueOpcode::DIV:
+      case ValueOpcode::NEG:
+      case ValueOpcode::ABS:
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
+      case ValueOpcode::FLOOR:
+      case ValueOpcode::MIN:
+      case ValueOpcode::MAX:
+      case ValueOpcode::AVG:
+      case ValueOpcode::EXP:
+      case ValueOpcode::POW:
+      case ValueOpcode::AND:
+      case ValueOpcode::OR:
+      case ValueOpcode::NOT:
+      case ValueOpcode::IF:
+      case ValueOpcode::RANDOM:
+      case ValueOpcode::GEO_DISTANCE:
+        throw std::logic_error("invalid comparison ValueExpr opcode");
     }
+    std::unreachable();
   };
   int truth = valueDouble(left.type) || valueDouble(right.type)
       ? decide(boundMinAsDouble(left), boundMaxAsDouble(left),
