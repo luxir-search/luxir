@@ -616,4 +616,29 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
   }
 }
 
+// Each document holds at most one id term, so a multi-term query's accepted
+// terms count disjoint documents: the supplier resolves their docFreq sum
+// exactly. Analyzed text can repeat a document across terms and iterates.
+TEST_P(CountShortcutTest, multiTermCountsOneTermPerDocumentFields) {
+  for (bool deleted : {false, true}) {
+    if (deleted) deleteSome();
+    PrefixQuery ids("id", "1"), noIds("id", "x"), text("body_w", "a"), absent("missing_s", "a");
+    check(ids, Query::CountHow::SUPPLIER);
+    check(noIds, Query::CountHow::SUPPLIER);
+    check(text, Query::CountHow::ITERATE);
+    check(absent, Query::CountHow::METADATA);
+
+    CountStats stats;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& op = req->topDocs("q").limit(0).countLimit();
+    op.rawQuery() = qb::prefix(op.mr(), "id", "1");
+    req->execute(false);
+    ASSERT_OK(req);
+    // 1, 10..19 and 100..199, less the deleted 162.
+    EXPECT_EQ(deleted ? 110 : 111, req->getMatchCount());
+    EXPECT_EQ(deleted ? 0 : 3, SkipStats::wholeCountConstant);
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(CacheModes, CountShortcutTest, ::testing::Bool());

@@ -220,6 +220,18 @@ public:
     }
 
   private:
+    // At most one indexed term per document: an unanalyzed field that is
+    // single-valued, or multi-valued with one column value per document in
+    // this segment. Distinct terms then match disjoint documents, so the
+    // accepted terms' docFreqs sum to the exact match count.
+    static bool oneTermPerDocument(const SegFieldInfo& info) {
+      if (info.type != FieldType::STRING && info.type != FieldType::ID) return false;
+      if ((info.flags & FieldType::MULTI_VALUED) == 0) return true;
+      return (info.flags & FieldType::COLUMN_STORED) != 0
+          && info.numValues == info.docsWithField
+          && info.sumDocFreq <= info.docsWithField;
+    }
+
     static ExpansionMode chooseAutoMode(
         size_t termCount, size_t maxStateBytes) {
       size_t maxStates =
@@ -593,11 +605,27 @@ public:
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
+        if (bulkContext.requireConstantCount) {
+          // The count is the expansion's docFreq sum (see countShortcut);
+          // the walk fills the memo every weight of this query shares.
+          auto* info = weight.cachedFieldInfo == nullptr ? nullptr
+              : weight.cachedFieldInfo->segInfos.at(segment.ord);
+          if (info == nullptr) {
+            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                    BulkAnswer::NO, nullptr, 0};
+          }
+          if (segment.liveDocs() != nullptr || !oneTermPerDocument(*info)) return {};
+          const ExpansionFacts& facts = weight.expansionFacts(
+              scratchPool, segment, Weight::scorerBuildContext(
+                  Query::Demand::fromLeadCost(
+                      std::numeric_limits<int64_t>::max(), use)));
+          return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                  BulkAnswer::NO, nullptr, facts.sumDocFreq};
+        }
         // Keep pruned consumers on the lazy union. Eager consumers already
         // pay to materialize membership, so preserve that set through COUNT
         // and window collection instead of enumerating its bits again.
-        if (weight.canUseLazy || bulkContext.requireConstantCount
-            || bulkContext.requireFilterConsumption) {
+        if (weight.canUseLazy || bulkContext.requireFilterConsumption) {
           return {};
         }
         auto* state = scratchPool.make<BulkState>(*this, use);
@@ -631,6 +659,20 @@ public:
     };
 
   public:
+    // A missing field matches nothing. On a field with at most one term per
+    // document the supplier resolves the exact count from the expansion
+    // (deletes and domains still need iteration); otherwise it is a bound.
+    CountShortcut countShortcut(IndexReader::Segment& segment,
+                                DocSet* domain) override {
+      auto* info = cachedFieldInfo == nullptr ? nullptr
+          : cachedFieldInfo->segInfos.at(segment.ord);
+      if (info == nullptr) return {0, CountHow::METADATA};
+      auto shortcut = countBound(segment, domain, segment.maxDoc(),
+          oneTermPerDocument(*info) ? CountHow::SUPPLIER : CountHow::ITERATE);
+      if (shortcut.how == CountHow::SUPPLIER) shortcut.resolver = this;
+      return shortcut;
+    }
+
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
