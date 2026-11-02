@@ -490,7 +490,7 @@ public:
     }
   }
 
-  bool get(int32_t doc) {
+  LUXIR_INLINE bool get(int32_t doc) {
     if (words != nullptr) {
       return (words[(uint32_t) doc >> 6] >> (doc & 63)) & 1;
     }

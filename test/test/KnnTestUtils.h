@@ -7,11 +7,11 @@
 namespace luxir::test {
 // Routing is independent of the tiny-corpus IVF build policy.
 class ForceIvfGuard {
-  SearchOverridesGuard<KnnQuery::Routing, KnnQuery::Completion> saved{KnnQuery::routing, KnnQuery::completion};
+  SearchOverridesGuard<KnnQuery::Routing, KnnQuery::Completion> saved{KnnQuery::tuning.routing, KnnQuery::tuning.completion};
 public:
   ForceIvfGuard() {
-    KnnQuery::routing = KnnQuery::Routing::FORCE_IVF;
-    KnnQuery::completion = KnnQuery::Completion::OFF; // Mechanics/calibration must stay on IVF.
+    KnnQuery::tuning.routing = KnnQuery::Routing::FORCE_IVF;
+    KnnQuery::tuning.completion = KnnQuery::Completion::OFF; // Mechanics/calibration must stay on IVF.
   }
 };
 }

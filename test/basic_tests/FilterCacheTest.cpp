@@ -6172,17 +6172,17 @@ TEST(FilterKeyTest, preservesNonFiniteFloatBitPatterns) {
 }
 
 TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
-  luxir::test::SearchOverridesGuard routing(KnnQuery::routing, KnnQuery::plannerCosts);
+  luxir::test::SearchOverridesGuard routing(KnnQuery::tuning.routing, KnnQuery::tuning.plannerCosts);
   struct PolicyRestore {
     int64_t candidates = KnnQuery::maxKnnCandidates;
-    double alpha = KnnQuery::filteredCoverageAlpha, headroom = KnnQuery::breadthHeadroom, growth = KnnQuery::breadthGrowth;
+    double alpha = KnnQuery::tuning.filteredCoverageAlpha, headroom = KnnQuery::tuning.breadthHeadroom, growth = KnnQuery::tuning.breadthGrowth;
     decltype(KnnQuery::engineWrapperForTests) wrapper =
         KnnQuery::engineWrapperForTests;
     ~PolicyRestore() {
       KnnQuery::maxKnnCandidates = candidates;
-      KnnQuery::filteredCoverageAlpha = alpha;
-      KnnQuery::breadthHeadroom = headroom;
-      KnnQuery::breadthGrowth = growth;
+      KnnQuery::tuning.filteredCoverageAlpha = alpha;
+      KnnQuery::tuning.breadthHeadroom = headroom;
+      KnnQuery::tuning.breadthGrowth = growth;
       KnnQuery::engineWrapperForTests = std::move(wrapper);
     }
   } restore;
@@ -6216,25 +6216,25 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   EXPECT_NE(baseKey, keyFor(KnnQuery(
       "vec", vectorType, vector, 7, 3, 11, 0.25f, true)));
 
-  KnnQuery::routing = KnnQuery::Routing::FORCE_IVF;
+  KnnQuery::tuning.routing = KnnQuery::Routing::FORCE_IVF;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::routing = KnnQuery::Routing::AUTO;
-  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM]++;
+  KnnQuery::tuning.routing = KnnQuery::Routing::AUTO;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM]++;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM]--;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM]--;
   EXPECT_EQ(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates++;
   EXPECT_NE(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates = restore.candidates;
-  KnnQuery::filteredCoverageAlpha += 0.1;
+  KnnQuery::tuning.filteredCoverageAlpha += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::filteredCoverageAlpha = restore.alpha;
-  KnnQuery::breadthHeadroom += 0.1;
+  KnnQuery::tuning.filteredCoverageAlpha = restore.alpha;
+  KnnQuery::tuning.breadthHeadroom += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::breadthHeadroom = restore.headroom;
-  KnnQuery::breadthGrowth += 0.1;
+  KnnQuery::tuning.breadthHeadroom = restore.headroom;
+  KnnQuery::tuning.breadthGrowth += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::breadthGrowth = restore.growth;
+  KnnQuery::tuning.breadthGrowth = restore.growth;
 
   KnnQuery::engineWrapperForTests = [](VectorEngine&) {
     return std::unique_ptr<VectorEngine>();

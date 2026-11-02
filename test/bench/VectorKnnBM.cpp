@@ -378,7 +378,7 @@ void BM_VectorKnnFlatDomain(benchmark::State& state) {
   DocSet* domain = count * (int)sizeof(int32_t) < nDocs / 8 ? (DocSet*)&array : &bitmap;
   const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr(field);
   auto vector = makeQueryVector(dims);
-  SearchOverridesGuard saved(KnnQuery::flatDomainDensityThreshold, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::tuning.flatDomainDensityThreshold, KnnQuery::statsForTests);
   auto run = [&]() {
     MemPool pool;
     Query::Context context(pool, *reader);
@@ -393,11 +393,11 @@ void BM_VectorKnnFlatDomain(benchmark::State& state) {
       fp = fp * 131 + (uint64_t)doc;
     return fp;
   };
-  KnnQuery::flatDomainDensityThreshold = -1;
+  KnnQuery::tuning.flatDomainDensityThreshold = -1;
   uint64_t expected = run();
-  KnnQuery::flatDomainDensityThreshold = INFINITY;
+  KnnQuery::tuning.flatDomainDensityThreshold = INFINITY;
   if (run() != expected) { state.SkipWithError("flat traversal arms disagree"); return; }
-  KnnQuery::flatDomainDensityThreshold = arm ? INFINITY : -1;
+  KnnQuery::tuning.flatDomainDensityThreshold = arm ? INFINITY : -1;
   KnnQuery::Stats stats;
   KnnQuery::statsForTests = &stats;
   run();
@@ -1037,11 +1037,11 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     builtCodec = codec;
   }
-  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::routing, KnnQuery::selector, KnnQuery::completion);
-  KnnQuery::routing = (KnnQuery::Routing)state.range(4);
-  KnnQuery::selector = (KnnPlanner::Selector)state.range(5);
-  KnnQuery::completion = (KnnQuery::Completion)state.range(6);
-  KnnQuery::filteredCoverageAlpha = (double)state.range(3) / 100;
+  SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion);
+  KnnQuery::tuning.routing = (KnnQuery::Routing)state.range(4);
+  KnnQuery::tuning.selector = (KnnPlanner::Selector)state.range(5);
+  KnnQuery::tuning.completion = (KnnQuery::Completion)state.range(6);
+  KnnQuery::tuning.filteredCoverageAlpha = (double)state.range(3) / 100;
   auto run = [&](int q, bool exact, std::vector<std::string>& ids) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("filtered_vectors").topDocs();
@@ -1094,7 +1094,7 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   state.SetLabel(std::string(benchCodecName(codec)) + "/" + (correlation == 0 ? "independent" : correlation == 1 ? "near" : correlation == 2 ? "far" : "median"));
   state.counters["planned_exact"] = stats.plannedExact.load() / queries;
   state.counters["planned_ivf"] = stats.plannedIvf.load() / queries;
-  state.counters["request_cost"] = KnnQuery::plannerCosts.requestCost;
+  state.counters["request_cost"] = KnnQuery::tuning.plannerCosts.requestCost;
   state.counters["predicted_cost"] = stats.predictedCost.load() / queries;
   state.counters["actual_cost"] = stats.modeledActualCost.load() / queries;
   for (size_t i = 0; i < KnnPlanner::NUM_UNITS; i++)

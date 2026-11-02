@@ -149,7 +149,7 @@ TEST_F(GroupKnnTest, exactMatchesExhaustiveDocumentOracle) {
 }
 
 TEST_F(GroupKnnTest, filteredFlatCosineMatchesBruteForceGroups) {
-  SearchOverridesGuard saved(KnnQuery::flatDomainDensityThreshold);
+  SearchOverridesGuard saved(KnnQuery::tuning.flatDomainDensityThreshold);
   for (int shape : {0, 1, 2, 3}) {
     CollectionHelper helper("main");
     helper.clear();
@@ -192,7 +192,7 @@ TEST_F(GroupKnnTest, filteredFlatCosineMatchesBruteForceGroups) {
       std::sort(expected.begin(), expected.end(), [](const Row& a, const Row& b) { return a.second > b.second; });
       if (expected.size() > 7) expected.resize(7);
       for (double threshold : {-1.0, std::numeric_limits<double>::infinity()}) for (bool exact : {false, true}) {
-        KnnQuery::flatDomainDensityThreshold = threshold;
+        KnnQuery::tuning.flatDomainDensityThreshold = threshold;
         auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":[")"
             + std::string(tiny ? "tiny_s:yes" : "wide_s:yes") + R"("],"query":)"
             + knn(7, true, exact, {}, "[1,0,0,0]"));
@@ -900,7 +900,7 @@ TEST_F(GroupKnnTest, intervalsPruneMembersWithinDistinctUnits) {
 TEST_F(GroupKnnTest, foldedDomainMatchesResolve) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
-  SearchOverridesGuard saved(KnnQuery::selector, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::tuning.selector, KnnQuery::statsForTests);
   for (auto ann : {pqAnn(4, 2, 2), rabitqAnn(4, 4)}) for (int shape : {0, 1, 2, 3}) {
     CollectionHelper h("main");
     h.clear();
@@ -927,7 +927,7 @@ TEST_F(GroupKnnTest, foldedDomainMatchesResolve) {
         std::vector<Row> expected;
         for (auto selector : {KnnPlanner::Selector::RESOLVE, KnnPlanner::Selector::FOLD}) {
           SCOPED_TRACE(::testing::Message() << (int)*ann.codec << shape << deletes << tiny << (int)selector);
-          KnnQuery::selector = selector;
+          KnnQuery::tuning.selector = selector;
           KnnQuery::Stats stats;
           KnnQuery::statsForTests = &stats;
           auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":[")"
@@ -947,7 +947,7 @@ TEST_F(GroupKnnTest, foldedDomainMatchesResolve) {
 TEST_F(GroupKnnTest, filteredWidenFoldsBothChannels) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
-  SearchOverridesGuard saved(KnnQuery::selector, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::tuning.selector, KnnQuery::statsForTests);
   for (auto ann : {pqAnn(16, 2, 2), rabitqAnn(16, 8)}) {
     CollectionHelper h("main");
     h.clear();
@@ -960,7 +960,7 @@ TEST_F(GroupKnnTest, filteredWidenFoldsBothChannels) {
     h.deleteByIds({"149"}, UpdateMessage::COMMIT);
     std::vector<Row> expected;
     for (auto selector : {KnnPlanner::Selector::RESOLVE, KnnPlanner::Selector::FOLD}) {
-      KnnQuery::selector = selector;
+      KnnQuery::tuning.selector = selector;
       KnnQuery::Stats stats;
       KnnQuery::statsForTests = &stats;
       auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":["keep_s:yes"],"query":)"
@@ -982,7 +982,7 @@ TEST_F(GroupKnnTest, filteredWidenFoldsBothChannels) {
 TEST_F(GroupKnnTest, forcedCompletionMatchesExactWithSharedKeys) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
-  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
   for (auto ann : {pqAnn(8, 2, 2), rabitqAnn(8), rabitqAnn(8, 4)}) {
     CollectionHelper h("main");
     h.clear();
@@ -1003,7 +1003,7 @@ TEST_F(GroupKnnTest, forcedCompletionMatchesExactWithSharedKeys) {
       auto expected = rows(*run("main", prefix + knn(7, true)));
       KnnQuery::Stats stats;
       KnnQuery::statsForTests = &stats;
-      KnnQuery::completion = KnnQuery::Completion::FORCE;
+      KnnQuery::tuning.completion = KnnQuery::Completion::FORCE;
       EXPECT_EQ(expected, rows(*run("main", prefix + knn(7, true, false), parallel)));
       ASSERT_EQ(2u, stats.completions.size());
       for (const auto& event : stats.completions)
@@ -1016,12 +1016,12 @@ TEST_F(GroupKnnTest, forcedCompletionMatchesExactWithSharedKeys) {
 TEST_F(GroupKnnTest, completionReopensEvictedActiveMembers) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
-  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests, KnnQuery::plannerCosts, KnnQuery::selector);
-  KnnQuery::completion = KnnQuery::Completion::AUTO;
-  KnnQuery::selector = KnnPlanner::Selector::FOLD;
-  KnnQuery::plannerCosts.units.fill(0);
-  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 500;
-  KnnQuery::plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests, KnnQuery::tuning.plannerCosts, KnnQuery::tuning.selector);
+  KnnQuery::tuning.completion = KnnQuery::Completion::AUTO;
+  KnnQuery::tuning.selector = KnnPlanner::Selector::FOLD;
+  KnnQuery::tuning.plannerCosts.units.fill(0);
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM] = 500;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
   CollectionHelper h("main");
   schema(h, api::VectorMetric::L2, pqAnn(8, 2, 2));
   for (int i = 0; i < 128; i++)

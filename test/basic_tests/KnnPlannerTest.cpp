@@ -1,7 +1,6 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 #include <gtest/gtest.h>
-#include <chrono>
 #include <random>
 #include <format>
 #include "luxir/query/KnnPlanner.h"
@@ -81,8 +80,8 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
   std::mt19937 random(519);
   KnnPlanner::Costs costs;
   for (int family = 0; family < 3; family++) {
-    std::array<int, 4> misses{};
-    std::array<double, 4> worst{1, 1, 1, 1};
+    int misses = 0;
+    double worst = 1;
     for (int trial = 0; trial < 400; trial++) {
       bool pinned = family == 0, adversarial = family == 2;
       int n = (adversarial ? 2 : 1) + (int)(random() % (adversarial ? 6 : 7));
@@ -108,24 +107,22 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
           .nprobe = pinned ? 16 : 0, .referenceBreadth = 1024};
       double best = INFINITY;
       for (uint64_t mask = 0; mask < (1ull << n); mask++) best = std::min(best, cost(segments, req, costs, mask));
-      for (int variant = 0; variant < 4; variant++) {
-        SCOPED_TRACE(std::format("family={} trial={} variant={} k={} target={}", family, trial, variant, k, target));
-        auto plan = KnnPlanner::choose(segments, req, costs, KnnPlanner::Routing::AUTO, (KnnPlanner::Search)variant);
+      {
+        SCOPED_TRACE(std::format("family={} trial={} k={} target={}", family, trial, k, target));
+        auto plan = KnnPlanner::choose(segments, req, costs);
         double tolerance = 1e-7 + best * 1e-12;
         ASSERT_LE(plan.cost, std::min(plan.allIvfCost, plan.allExactCost) + tolerance);
         uint64_t chosen = 0;
         for (int i = 0; i < n; i++) chosen |= (uint64_t)plan.ivf[(size_t)i] << i;
         ASSERT_NEAR(plan.cost, cost(segments, req, costs, chosen), tolerance);
-        misses[(size_t)variant] += plan.cost > best + tolerance;
-        worst[(size_t)variant] = std::max(worst[(size_t)variant], plan.cost / best);
+        misses += plan.cost > best + tolerance;
+        worst = std::max(worst, plan.cost / best);
         if (pinned) { ASSERT_NEAR(plan.cost, best, tolerance); }
-        else if (variant == (int)KnnPlanner::DEFAULT_SEARCH) { ASSERT_LE(plan.cost, best * 1.1 + tolerance); }
+        else { ASSERT_LE(plan.cost, best * 1.1 + tolerance); }
       }
     }
-    for (int variant = 0; variant < 4; variant++) {
-      RecordProperty(std::format("family{}_variant{}_misses", family, variant), misses[(size_t)variant]);
-      RecordProperty(std::format("family{}_variant{}_ratio", family, variant), std::format("{:.6f}", worst[(size_t)variant]));
-    }
+    RecordProperty(std::format("family{}_misses", family), misses);
+    RecordProperty(std::format("family{}_ratio", family), std::format("{:.6f}", worst));
   }
 }
 
@@ -138,27 +135,6 @@ TEST(KnnPlannerTest, tiesAndMandatoryExact) {
   EXPECT_EQ(plan.ivf, (std::vector<char>{true, false, false}));
   EXPECT_EQ(KnnPlanner::choose(segments, {}, costs, KnnPlanner::Routing::FORCE_EXACT).ivf,
             (std::vector<char>{false, false, false}));
-}
-
-TEST(KnnPlannerTest, planningTime) {
-  KnnPlanner::Request req{.k = 20, .boundedTarget = 240, .referenceBreadth = 1024};
-  double checksum = 0;
-  for (int n : {1, 4, 32, 256, 1000}) {
-    std::vector<KnnPlanner::Segment> segments;
-    for (int i = 0; i < n; i++) {
-      auto s = segment(1 + (i * 719 + 300) % 100000);
-      if (i % 2) { s.codec = KnnPlanner::Codec::RABITQ; s.bounded = false; s.rabitqBits = 2; }
-      segments.push_back(s);
-    }
-    for (int variant = 0; variant < 4; variant++) {
-      auto start = std::chrono::steady_clock::now();
-      for (int i = 0; i < 100; i++) checksum += KnnPlanner::choose(segments, req, {},
-          KnnPlanner::Routing::AUTO, (KnnPlanner::Search)variant).cost;
-      double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 100;
-      RecordProperty(std::format("segments{}_variant{}_us", n, variant), std::format("{:.2f}", us));
-    }
-  }
-  EXPECT_GT(checksum, 0);
 }
 
 TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {

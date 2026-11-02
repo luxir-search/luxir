@@ -22,9 +22,6 @@ struct KnnPlanner {
   enum class Routing { AUTO, FORCE_IVF, FORCE_EXACT };
   enum class Codec { FLAT, PQ, RABITQ };
   enum class Selector { AUTO, RESOLVE, FOLD }; // Round one only; deepen always folds.
-  // Cumulative search variants, also used by the planner benchmark.
-  enum class Search { FORWARD, SEEDED, REVERSE, IMPROVE };
-  static constexpr Search DEFAULT_SEARCH = Search::SEEDED;
   enum Unit { EXACT_DIM, TERMINAL_DIM, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
               ENTRY_NONE, ENTRY_BITMAP, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
@@ -74,7 +71,7 @@ struct KnnPlanner {
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0;
     Codec codec = Codec::FLAT;
     bool domain = false, arrayDomain = false, unfiltered = true, deletes = false;
-    bool sparse = false, multi = false, bounded = false, vectorsEstimated = false;
+    bool sparse = false, multi = false, bounded = false;
   };
   struct Request {
     int64_t k = 0, boundedTarget = 0;
@@ -138,7 +135,7 @@ struct KnnPlanner {
     double docs = (double)(foldComplement(s) ? s.maxDoc - s.domainSize : s.domainSize);
     w[FOLD_DOC] = docs; w[FOLD_WORD] = (double)((s.vectors + 63) / 64);
     if (s.sparse) w[SPARSE_MAP] = docs;
-    if (s.multi) w[MULTI_MAP] = docs;
+    if (s.multi) w[MULTI_MAP] = (double)(foldComplement(s) ? s.docsWithValue - s.eligibleDocs : s.eligibleDocs);
     return w;
   }
   static double resolveCost(const Segment& s, const Costs& costs) {
@@ -165,7 +162,7 @@ struct KnnPlanner {
     p.exact[DOMAIN_DOC] = walk ? (double)s.domainSize : 0;
     p.exact[RANK_VISIT] = walk ? 0 : (double)s.vectors;
     p.exact[FLAT_PROBE] = !walk && s.domain ? (double)s.docsWithValue : 0;
-    p.exact[SPARSE_MAP] = s.sparse && (walk || !s.multi) ? (double)(walk ? s.eligibleDocs : s.vectors) : 0;
+    p.exact[SPARSE_MAP] = s.sparse && (walk || !s.multi) ? (double)(walk ? s.domainSize : s.vectors) : 0;
     p.exact[MULTI_MAP] = s.multi ? (double)(walk ? s.eligibleDocs : s.vectors) : 0;
     p.exactCost = costs.price(p.exact);
     if (!canIvf(s)) return p;
@@ -287,8 +284,7 @@ struct KnnPlanner {
     }
   };
   static Result choose(std::span<const Segment> segments, const Request& request,
-                       const Costs& costs, Routing routing = Routing::AUTO,
-                       Search search = DEFAULT_SEARCH) {
+                       const Costs& costs, Routing routing = Routing::AUTO) {
     Result result;
     result.prices.reserve(segments.size());
     for (const auto& s : segments) result.prices.push_back(price(s, request, costs));
@@ -349,17 +345,16 @@ struct KnnPlanner {
       std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
         double x = savings[a], y = savings[b]; return x != y ? x < y : a < b;
       });
-      auto flip = [&](Totals& t, double& currentCost, size_t i) {
+      auto tryExact = [&](Totals& t, double& currentCost, size_t i) {
         Totals trial = t;
-        int sign = modes[i] ? -1 : 1;
-        addIvf(trial, segments[i], result.prices[i], sign);
-        selectors.add(i, result.prices[i], sign);
+        addIvf(trial, segments[i], result.prices[i], -1);
+        selectors.add(i, result.prices[i], -1);
         double trialCost = cost(trial);
-        if (trialCost < currentCost) { t = trial; currentCost = trialCost; modes[i] = !modes[i]; }
-        else selectors.add(i, result.prices[i], -sign);
+        if (trialCost < currentCost) { t = trial; currentCost = trialCost; modes[i] = false; }
+        else selectors.add(i, result.prices[i], 1);
       };
       // Forward sweeps from all-IVF and the two channel-removal seeds.
-      for (int seed = 0; seed < (search >= Search::SEEDED ? 3 : 1); seed++) {
+      for (int seed = 0; seed < 3; seed++) {
         if (seed && (all.boundedDims == 0 || all.intervalDims == 0)) continue;
         Totals t = exact;
         selectors.clear();
@@ -369,24 +364,7 @@ struct KnnPlanner {
           if (selected) { modes[i] = true; addIvf(t, segments[i], result.prices[i], 1); selectors.add(i, result.prices[i], 1); }
         }
         double currentCost = cost(t);
-        for (size_t i : order) if (modes[i]) flip(t, currentCost, i);
-        keep(t, modes);
-      }
-      if (search >= Search::REVERSE) {
-        Totals t = exact;
-        selectors.clear();
-        std::fill(modes.begin(), modes.end(), false);
-        double currentCost = result.allExactCost;
-        for (auto it = order.rbegin(); it != order.rend(); ++it) flip(t, currentCost, *it);
-        keep(t, modes);
-      }
-      if (search >= Search::IMPROVE) {
-        Totals t = best;
-        modes = result.ivf;
-        selectors.clear();
-        for (size_t i : order) if (modes[i]) selectors.add(i, result.prices[i], 1);
-        double currentCost = result.cost;
-        for (size_t i : order) flip(t, currentCost, i);
+        for (size_t i : order) if (modes[i]) tryExact(t, currentCost, i);
         keep(t, modes);
       }
     }
