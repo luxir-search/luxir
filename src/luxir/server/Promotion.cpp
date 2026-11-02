@@ -76,6 +76,7 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
     output << "Promote failed: " << dataDir.string() << " is not a follower data directory\n";
     return false;
   }
+  // Offline tool for a follower filesystem data directory, so it opens the FS backend directly.
   FSDirFactory factory(dataDir);
   TenantCatalog::initialize(factory, true);
   auto metadata = factory.directory(StorageRoot::NODE_PRIVATE, "");

@@ -72,6 +72,23 @@ a new epoch there; it does not fence the original namespace. Do not combine the
 subsequent histories of independently written copies. Use promotion when a
 restore should start a new lineage.
 
+### Backends, layers and options
+
+`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
+plugin build may add more (an unknown name fails startup with the list of
+registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
+backend in layers a plugin provides, such as a cache. `--store.option KEY=VALUE`
+(repeatable) passes free-form settings to the backend and layers; the plugin
+documents its keys.
+
+```bash
+./luxir --store.backend=s3 --store.option bucket=search-data --store.layer=cache
+```
+
+Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
+outside the layers. The effective stack is logged at startup as
+`storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
+
 ## Read-only nodes
 
 A data directory has exactly one writer, which holds `node/write.lock` from startup

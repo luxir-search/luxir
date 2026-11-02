@@ -551,6 +551,7 @@ private:
 public:
   // Listings hide scratch files. Owned factories remove dead processes' temps.
   static bool isPublishTemp(std::string_view name) { return name.starts_with(publishTempPrefix); }
+  Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
 
   void linkFile(Directory& source, std::string_view name) override {
     std::filesystem::create_directories(basePath_);

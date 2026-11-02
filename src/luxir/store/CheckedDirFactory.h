@@ -4,7 +4,7 @@
 #pragma once
 
 #include <boost/unordered/unordered_flat_set.hpp>
-#include "DirectoryFactory.h"
+#include "DelegatingDirectory.h"
 #include "luxir/util/Signal.h"
 
 namespace luxir {
@@ -21,8 +21,7 @@ enum class CheckedDirMode {
 ///
 /// Files that already existed in the directory before this wrapper was created
 /// (e.g. from a previous session) are assumed to have been properly synced.
-class CheckedDirectory : public Directory {
-  std::shared_ptr<Directory> delegate_;
+class CheckedDirectory : public DelegatingDirectory {
   CheckedDirMode mode_;
   bool verbose_;
 
@@ -40,12 +39,8 @@ class CheckedDirectory : public Directory {
   }
 
 public:
-  CheckedDirectory(std::shared_ptr<Directory> delegate, CheckedDirMode mode, bool verbose = false)
-      : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
-
-  void listFiles(std::vector<FileInfo>& target) override {
-    delegate_->listFiles(target);
-  }
+  CheckedDirectory(std::shared_ptr<Directory> inner, CheckedDirMode mode, bool verbose = false)
+      : DelegatingDirectory(std::move(inner)), mode_(mode), verbose_(verbose) {}
 
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
     if (expectSynced) {
@@ -56,11 +51,7 @@ public:
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
-    return delegate_->openFile(name, expectSynced);
-  }
-
-  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
-    return delegate_->openChecksum(name, direct);
+    return delegate->openFile(name, expectSynced);
   }
 
   // Readers share an open segment rather than reopening it, so most reads
@@ -76,7 +67,7 @@ public:
     // A non-null test listener result injects a file creation failure.
     if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
     if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({})", name);
-    return delegate_->createFile(name);
+    return delegate->createFile(name);
   }
 
   std::unique_ptr<File> createFile(
@@ -84,7 +75,7 @@ public:
     if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
     if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({}, ramDelegating={})",
                             name, options.ramDelegating);
-    return delegate_->createFile(name, std::move(options));
+    return delegate->createFile(name, std::move(options));
   }
 
   bool deleteFile(std::string_view name) override {
@@ -93,7 +84,7 @@ public:
       unsyncedFiles_.erase(std::string(name));
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: deleteFile({})", name);
-    return delegate_->deleteFile(name);
+    return delegate->deleteFile(name);
   }
 
   void deletePrefix(std::string_view prefix) override {
@@ -108,11 +99,11 @@ public:
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: deletePrefix({})", prefix);
-    delegate_->deletePrefix(prefix);
+    delegate->deletePrefix(prefix);
   }
 
   void finishFile(File& file) override {
-    delegate_->finishFile(file);
+    delegate->finishFile(file);
     {
       std::lock_guard lock(mu_);
       unsyncedFiles_.insert(std::string(file.name()));
@@ -122,7 +113,7 @@ public:
 
   std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
     std::optional<PublicationVersion> applied;
-    try { applied = delegate_->publishFile(name, bytes, condition); }
+    try { applied = delegate->publishFile(name, bytes, condition); }
     catch (...) {
       std::lock_guard lock(mu_);
       unsyncedFiles_.insert(std::string(name)); // installation may have preceded the failure
@@ -136,16 +127,16 @@ public:
     return applied;
   }
 
-  std::optional<Publication> readPublished(std::string_view name) override { return delegate_->readPublished(name); }
+  std::optional<Publication> readPublished(std::string_view name) override { return delegate->readPublished(name); }
 
   void deleteDurably(std::span<const std::string> names) override {
-    delegate_->deleteDurably(names);
+    delegate->deleteDurably(names);
     std::lock_guard lock(mu_);
     for (const auto& name : names) unsyncedFiles_.erase(name);
   }
 
   void sync(std::span<const std::string> filenames) override {
-    delegate_->sync(filenames);
+    delegate->sync(filenames);
     {
       std::lock_guard lock(mu_);
       for (auto& name : filenames) {
@@ -161,41 +152,37 @@ public:
       unsyncedFiles_.clear();
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: clear()");
-    delegate_->clear();
+    delegate->clear();
   }
 
-  /// Access the underlying directory.
-  Directory& underlying() override { return delegate_->underlying(); }
   void linkFile(Directory& source, std::string_view name) override {
     source.openFile(name, true);
-    delegate_->linkFile(source, name);
+    delegate->linkFile(source, name);
   }
 };
 
 
 /// Factory wrapper that creates CheckedDirectory instances around another factory's directories.
-class CheckedDirFactory : public DirectoryFactory {
-  std::unique_ptr<DirectoryFactory> delegate_;
+class CheckedDirFactory : public DelegatingDirFactory {
   CheckedDirMode mode_;
   bool verbose_;
   std::mutex mu_;
   // Reopening must not forget unsynced files until the namespace is removed.
   std::map<std::pair<StorageRoot, std::string>, std::shared_ptr<CheckedDirectory>> opened_;
 public:
-  CheckedDirFactory(std::unique_ptr<DirectoryFactory> delegate, CheckedDirMode mode, bool verbose = false)
-      : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
-  std::shared_ptr<StorageMemory> memory() override { return delegate_->memory(); }
+  CheckedDirFactory(std::unique_ptr<DirectoryFactory> inner, CheckedDirMode mode, bool verbose = false)
+      : DelegatingDirFactory(std::move(inner)), mode_(mode), verbose_(verbose) {}
+  std::string describe() const override { return "checked(" + delegate->describe() + ")"; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));
-    auto dir = delegate_->directory(root, path, std::move(options));
+    auto dir = delegate->directory(root, path, std::move(options));
     std::lock_guard lock(mu_);
     auto& checked = opened_[key];
     if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
     return checked;
   }
-  std::vector<Child> children(StorageRoot root, std::string_view path) override { return delegate_->children(root, path); }
   void removeTree(StorageRoot root, std::string_view path) override {
-    delegate_->removeTree(root, path);
+    delegate->removeTree(root, path);
     std::lock_guard lock(mu_);
     std::erase_if(opened_, [&](const auto& entry) {
       return entry.first.first == root && (entry.first.second == path || entry.first.second.starts_with(std::string(path) + '/'));

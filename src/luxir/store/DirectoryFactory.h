@@ -24,6 +24,9 @@ public:
   // Removes a subtree durably. Missing subtrees are allowed; roots cannot be removed.
   virtual void removeTree(StorageRoot root, std::string_view path) = 0;
   virtual std::shared_ptr<StorageMemory> memory() { return {}; }
+  virtual std::string describe() const = 0;
+  // Local path for disk statistics, or empty for a backend without one.
+  virtual std::string diskPath() const { return {}; }
   uint64_t storageBytes() { auto account = memory(); return account ? account->bytes() : 0; }
 
   static std::string checkedPath(StorageRoot root, std::string_view path) {
@@ -50,6 +53,7 @@ class RAMDirFactory : public DirectoryFactory {
 public:
   explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
       : account(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
+  std::string describe() const override { return "ram"; }
   std::shared_ptr<StorageMemory> memory() override { return account; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));
@@ -132,6 +136,8 @@ public:
       lock.emplace(basePath / "node" / "write.lock");
     }
   }
+  std::string describe() const override { return "fs:" + basePath.string(); }
+  std::string diskPath() const override { return basePath.string(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view relative, ViewOptions options = {}) override {
     auto path = pathOf(root, relative);
     if (!unowned && std::filesystem::is_directory(path)) {

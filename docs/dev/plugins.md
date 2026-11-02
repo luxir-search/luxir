@@ -349,3 +349,70 @@ A schema then uses the plugin by name (`"analyzer": "example"`) or composes its 
 (`"analyzer": {"tokenizer": "whitespace", "filters": ["reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+## Storage backends and layers
+
+`Registries::storage` (`src/luxir/store/StorageRegistry.h`) holds named storage
+backends and layers. `ram` and `fs` are built in and registered before plugins.
+
+- A **backend** builds the root `DirectoryFactory` from the node configuration. It
+  is selected by `--store.backend NAME`.
+- A **layer** wraps the factory built so far. Layers are selected by
+  `--store.layer NAME` (repeatable, innermost first) and sit between the backend and
+  the core wrappers: `checked_dir` and `read_only` stay outermost, so a mutation is
+  refused before any layer sees it.
+
+Both makers receive a `StorageContext`: the whole `LuxirConfig`, the free-form
+`options` map (`--store.option KEY=VALUE`, read directly or through `option()`,
+`optionOr()` and `optionBytes()`), and `reclaim`, the callback RAM backends call
+under memory pressure. Unknown names fail when the node opens its storage, with a
+message listing the registered names.
+
+```cpp
+void registerComponents(luxir::Registries& r) override {
+  r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
+    return std::make_unique<S3DirFactory>(ctx.option("bucket").value_or(""));
+  });
+  r.storage.addLayer("cache", [](std::unique_ptr<luxir::DirectoryFactory> inner, const luxir::StorageContext& ctx) {
+    return std::make_unique<CacheLayer>(std::move(inner), ctx.optionBytes("cache_bytes", 1ULL << 30));
+  });
+}
+```
+
+A backend implements `DirectoryFactory` over two roots: `AUTHORITATIVE` for the
+portable `LAYOUT` and `t/` tree, and `NODE_PRIVATE` for local files such as
+`write.lock` and `replication.json`. `directory(root, path, options)` opens a
+relative path view without creating namespace entries; `children(root, path)`
+lists children, and `removeTree(root, path)` removes a subtree durably. Paths
+cannot escape their root. Collection names, catalogs and incarnations are engine
+logic over these views, not backend primitives.
+
+`memory()` exposes the backend's `StorageMemory` account when it has one. A view
+receives its opaque accounting scope in `ViewOptions::account`, and reopening
+must not charge the same bytes twice. `describe()` supplies one line for the
+startup log; `diskPath()` supplies a local path for disk statistics, or empty.
+FS uses `node/` for its node-private root and reserves it from authoritative views.
+
+A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
+`directory()` to hand out `DelegatingDirectory` subclasses. Both
+bases forward every virtual, including `createFile` with options, `expectSynced`,
+`publishFile`, `readPublished`, `deleteDurably`, `deletePrefix`, `sync`,
+`underlying`, `linkFile`, `openChecksum` and `capabilities`.
+A wrapper that changes the semantics of a mutator must override it explicitly.
+
+### Capabilities
+
+`Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
+shares bytes), `ATOMIC_RENAME` (the backing store supports atomic name
+replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
+(`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
+selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
+linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
+masks `HARD_LINK`) overrides `capabilities()`.
+
+### The example plugin
+
+`test/plugins/example` registers a `counting_ram` backend (RAM storage counting
+directory view opens by path) and a `counting` layer (counting file
+opens and creates). `StorageExampleTest` runs a node on both and asserts the counters
+(`CountingStorage::count`).

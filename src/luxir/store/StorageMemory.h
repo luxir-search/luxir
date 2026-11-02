@@ -40,6 +40,7 @@ public:
     }
     return result;
   }
+  uint64_t limitBytes() const { return limit; }
   uint64_t bytes() const { return used.load(std::memory_order_relaxed); }
   void reserve(uint64_t bytes) {
     if (parent) parent->reserve(bytes);

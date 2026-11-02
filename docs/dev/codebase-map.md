@@ -139,6 +139,11 @@ locations, browse `src/luxir/<area>/`.
      reservation creates STATE; deleting STATE fences prior writers. `Manifest`
      loads the STATE-selected candidate; filenames carry the creating writer
      epoch, including later live-doc and overlay generations
+   - `StorageRegistry` (`StorageRegistry.h`): named backends and layers resolved by `Collections`
+     from `store.backend` / `store.layers`; `DelegatingDirectory` / `DelegatingDirFactory` forward
+     everything, so a layer overrides only what it changes (Checked and ReadOnly are built on them);
+     `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
+     `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
