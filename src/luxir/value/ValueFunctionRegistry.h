@@ -48,10 +48,11 @@ enum class ValueOpcode : uint8_t {
   IF,
   RANDOM,
   GEO_DISTANCE,
+  DECAY,
 };
 
-// Most children any one value-function node has (if(cond, then, else)).
-inline constexpr size_t VALUE_MAX_ARITY = 3;
+// Decays take a value, origin, scale, offset, and decay.
+inline constexpr size_t VALUE_MAX_ARITY = 5;
 
 struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
@@ -63,7 +64,7 @@ struct ValueFunction {
     Kind kind = Kind::NUMERIC;
   };
 
-  using Validate = void (*)(std::span<const ValueNode* const> args);
+  using Prepare = void (*)(ValueNode& node, std::span<const ValueNode* const> args);
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                     int32_t docid, float score);
@@ -90,7 +91,7 @@ struct ValueFunction {
   uint8_t maxArity = 0;
   std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
-  Validate validate = nullptr;
+  Prepare prepare = nullptr;
 
   // Strict failures propagate before the bucket kernel selects lazy operands.
   BucketScalar bucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) const;

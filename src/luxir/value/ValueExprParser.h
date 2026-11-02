@@ -5,7 +5,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <initializer_list>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -339,9 +338,6 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
-    if (name == "gauss" || name == "linear" || name == "exp") {
-      return parseDecayOrExp(grammar, name, pos);
-    }
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -420,10 +416,10 @@ private:
           std::span<const ResolvedValue>(resolvedArgs.data(), count));
       node.type = resolved.type;
       node.nature = resolved.nature;
-      if (function->validate != nullptr) {
+      if (function->prepare != nullptr) {
         std::array<const ValueNode*, VALUE_MAX_ARITY> operands{};
         for (uint8_t i = 0; i < count; i++) operands[i] = &program->nodes[args[i]];
-        function->validate({operands.data(), count});
+        function->prepare(node, {operands.data(), count});
       }
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
@@ -455,84 +451,6 @@ private:
     return true;
   }
 
-  double constantArg(uint32_t index, std::string_view function,
-                     std::string_view argument) {
-    if (!foldConstant(index)) {
-      fail(program->nodes[index].sourcePos, fmt::format(
-          "{}() {} must be a constant numeric scalar", function, argument));
-    }
-    const ValueNode& node = program->nodes[index];
-    return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
-  }
-
-  uint32_t constantDouble(double value, size_t pos) {
-    ValueNode node;
-    node.kind = ValueNodeKind::CONSTANT;
-    node.type = ValueType::DOUBLE;
-    node.doubleValue = value;
-    node.sourcePos = pos;
-    node.text = program->copyString(fmt::format("{}", value));
-    return append(node);
-  }
-
-  uint32_t call(std::string_view name, size_t pos,
-                std::initializer_list<uint32_t> children) {
-    return makeFunction(name, pos, std::span<const uint32_t>(children.begin(), children.size()));
-  }
-
-  // Elasticsearch decay functions over a numeric, DATE, or geo_distance()
-  // value, expanded into primitives:
-  //   d = max(0, |value - origin| - offset)   (min over a multi-valued field)
-  //   gauss:  exp(ln(decay) * (d / scale)^2)
-  //   exp:    exp(ln(decay) * d / scale)
-  //   linear: max(0, 1 - d / (scale / (1 - decay)))
-  // A document without a value scores 1, as in Elasticsearch. exp() with one
-  // argument is the exponential function.
-  template <class Grammar>
-  uint32_t parseDecayOrExp(Grammar& grammar, std::string_view name, size_t pos) {
-    std::array<uint32_t, 5> args{};
-    bool math = name == "exp";
-    uint8_t count = grammar.parseArguments(
-        name, pos, math ? 1 : 3, 5,
-        [&](uint8_t argument) { args[argument] = grammar.parseExpression(); });
-    if (math && count == 1) {
-      std::array<uint32_t, VALUE_MAX_ARITY> unary{args[0]};
-      return appendFunction(ValueFunctionRegistry::find("exp"), pos, unary, 1);
-    }
-    if (count < 3) {
-      fail(pos, "exp() expects 1 argument (the exponential) or 3 to 5 "
-                "(a decay: value, origin, scale, offset, decay)");
-    }
-    double scale = constantArg(args[2], name, "scale");
-    double offset = count > 3 ? constantArg(args[3], name, "offset") : 0.0;
-    double decay = count > 4 ? constantArg(args[4], name, "decay") : 0.5;
-    if (!(scale > 0.0)) fail(pos, fmt::format("{}() scale must be positive", name));
-    if (!(offset >= 0.0)) fail(pos, fmt::format("{}() offset must be non-negative", name));
-    if (!(decay > 0.0 && decay < 1.0)) {
-      fail(pos, fmt::format("{}() decay must be strictly between 0 and 1", name));
-    }
-    if (valueArray(program->nodes[args[1]].type)) {
-      fail(pos, fmt::format("{}() origin must be a scalar", name));
-    }
-
-    uint32_t distance = call("abs", pos, {call("sub", pos, {args[0], args[1]})});
-    if (valueArray(program->nodes[distance].type)) distance = call("min", pos, {distance});
-    if (offset > 0.0) {
-      distance = call("max", pos, {call("sub", pos, {distance, constantDouble(offset, pos)}),
-                                   constantDouble(0.0, pos)});
-    }
-    uint32_t score;
-    if (name == "linear") {
-      uint32_t ratio = call("div", pos, {distance, constantDouble(scale / (1.0 - decay), pos)});
-      score = call("max", pos, {call("sub", pos, {constantDouble(1.0, pos), ratio}),
-                                constantDouble(0.0, pos)});
-    } else {
-      uint32_t ratio = call("div", pos, {distance, constantDouble(scale, pos)});
-      if (name == "gauss") ratio = call("mul", pos, {ratio, ratio});
-      score = call("exp", pos, {call("mul", pos, {constantDouble(std::log(decay), pos), ratio})});
-    }
-    return call("def", pos, {score, constantDouble(1.0, pos)});
-  }
 };
 
 } // namespace luxir

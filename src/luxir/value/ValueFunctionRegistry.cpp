@@ -324,6 +324,7 @@ bool compareValues(ValueOpcode opcode, T a, T b) {
     case ValueOpcode::NOT:
     case ValueOpcode::IF:
     case ValueOpcode::RANDOM:
+    case ValueOpcode::DECAY:
     case ValueOpcode::GEO_DISTANCE:
       throw std::logic_error("invalid comparison ValueExpr opcode");
   }
@@ -370,6 +371,7 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::NOT:
       case ValueOpcode::IF:
       case ValueOpcode::RANDOM:
+      case ValueOpcode::DECAY:
       case ValueOpcode::GEO_DISTANCE:
         throw std::logic_error("invalid unary ValueExpr opcode");
     }
@@ -416,6 +418,7 @@ ScalarKernelValue<Int> evalUnaryKernel(
     case ValueOpcode::NOT:
     case ValueOpcode::IF:
     case ValueOpcode::RANDOM:
+    case ValueOpcode::DECAY:
     case ValueOpcode::GEO_DISTANCE:
       throw std::logic_error("invalid integer unary ValueExpr opcode");
   }
@@ -477,6 +480,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::NOT:
       case ValueOpcode::IF:
       case ValueOpcode::RANDOM:
+      case ValueOpcode::DECAY:
       case ValueOpcode::GEO_DISTANCE:
         throw std::logic_error("invalid binary ValueExpr opcode");
     }
@@ -531,6 +535,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::NOT:
     case ValueOpcode::IF:
     case ValueOpcode::RANDOM:
+    case ValueOpcode::DECAY:
     case ValueOpcode::GEO_DISTANCE:
       throw std::logic_error("invalid integer binary ValueExpr opcode");
   }
@@ -855,7 +860,7 @@ double constantNumber(const ValueNode& node) {
   return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
 }
 
-void validateGeoDistance(std::span<const ValueNode* const> args) {
+void prepareGeoDistance(ValueNode&, std::span<const ValueNode* const> args) {
   geo::checkLatitude(constantNumber(*args[1]));
   geo::checkLongitude(constantNumber(*args[2]));
 }
@@ -885,6 +890,87 @@ ValueResult evalGeoDistanceElement(BoundValueProgram& program, const ValueNode& 
   ValueResult point = program.evalArrayElement(points.array, index);
   if (!point.valid) return ValueResult::missing(ValueType::DOUBLE);
   return ValueResult::floating(geoMeters(program, node, point.intValue));
+}
+
+ResolvedValue decayResolve(std::span<const ResolvedValue> args) {
+  requireNumeric(args);
+  return {ValueType::DOUBLE, ValueNature::NUMBER};
+}
+
+enum class DecayShape : uint8_t { GAUSS, EXP, LINEAR };
+
+// A decay node keeps its shape in intValue and its precomputed coefficient
+// (1 - decay for linear, ln(decay) otherwise) in doubleValue.
+template <DecayShape Shape>
+void prepareDecay(ValueNode& node, std::span<const ValueNode* const> args) {
+  double origin = constantNumber(*args[1]);
+  double scale = constantNumber(*args[2]);
+  double offset = args.size() > 3 ? constantNumber(*args[3]) : 0.0;
+  double decay = args.size() > 4 ? constantNumber(*args[4]) : 0.5;
+  if (!std::isfinite(origin)) throw std::runtime_error("origin must be finite");
+  if (!(scale > 0.0) || !std::isfinite(scale)) {
+    throw std::runtime_error("scale must be positive and finite");
+  }
+  if (!(offset >= 0.0) || !std::isfinite(offset)) {
+    throw std::runtime_error("offset must be non-negative and finite");
+  }
+  if (!(decay > 0.0 && decay < 1.0)) {
+    throw std::runtime_error("decay must be strictly between 0 and 1");
+  }
+  node.intValue = (int64_t)Shape;
+  node.doubleValue = Shape == DecayShape::LINEAR ? 1.0 - decay : std::log(decay);
+}
+
+double decayDistance(const ValueResult& value, const ValueResult& origin, double offset) {
+  double distance;
+  if (value.type == ValueType::INT64 && origin.type == ValueType::INT64) {
+    __int128 delta = (__int128)value.intValue - origin.intValue;
+    distance = (double)(delta < 0 ? -delta : delta);
+  } else {
+    double v = value.type == ValueType::DOUBLE ? value.doubleValue : (double)value.intValue;
+    double o = origin.type == ValueType::DOUBLE ? origin.doubleValue : (double)origin.intValue;
+    distance = std::abs(v - o);
+  }
+  return std::max(0.0, distance - offset);
+}
+
+double decayScore(const ValueNode& node, double distance, double scale) {
+  double ratio = distance / scale;
+  switch ((DecayShape)node.intValue) {
+    case DecayShape::GAUSS: return std::exp(node.doubleValue * (ratio * ratio));
+    case DecayShape::EXP: return std::exp(node.doubleValue * ratio);
+    case DecayShape::LINEAR: return std::max(0.0, 1.0 - ratio * node.doubleValue);
+  }
+  std::unreachable();
+}
+
+ValueResult evalDecayPoint(BoundValueProgram& program, const ValueNode& node,
+                           int32_t docid, float score) {
+  const auto& nodes = program.program.nodes;
+  const ValueNode& originNode = nodes[node.children[1]];
+  ValueResult origin = originNode.type == ValueType::INT64
+      ? ValueResult::integer(originNode.intValue) : ValueResult::floating(originNode.doubleValue);
+  double scale = constantNumber(nodes[node.children[2]]);
+  double offset = node.childCount > 3 ? constantNumber(nodes[node.children[3]]) : 0.0;
+  ValueResult value = program.evalNode(node.children[0], docid, score);
+  if (!value.valid) return ValueResult::floating(1.0);
+  auto distance = [&](const ValueResult& element) {
+    return decayDistance(element, origin, offset);
+  };
+  double closest = std::numeric_limits<double>::infinity();
+  bool present = false;
+  if (valueArray(value.type)) {
+    for (int64_t i = 0; i < value.array.size; i++) {
+      ValueResult element = program.evalArrayElement(value.array, i);
+      if (!element.valid || (element.type == ValueType::DOUBLE && std::isnan(element.doubleValue))) continue;
+      closest = std::min(closest, distance(element));
+      present = true;
+    }
+  } else if (value.type != ValueType::DOUBLE || !std::isnan(value.doubleValue)) {
+    closest = distance(value);
+    present = true;
+  }
+  return ValueResult::floating(present ? decayScore(node, closest, scale) : 1.0);
 }
 
 ValueResult evalScalarOnlyElement(BoundValueProgram& program, const ValueNode& node,
@@ -1061,6 +1147,7 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::NOT:
     case ValueOpcode::IF:
     case ValueOpcode::RANDOM:
+    case ValueOpcode::DECAY:
     case ValueOpcode::GEO_DISTANCE:
       throw std::runtime_error("invalid unary ValueExpr opcode");
   }
@@ -1153,6 +1240,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
       case ValueOpcode::NOT:
       case ValueOpcode::IF:
       case ValueOpcode::RANDOM:
+      case ValueOpcode::DECAY:
       case ValueOpcode::GEO_DISTANCE:
         throw std::runtime_error("invalid binary ValueExpr opcode");
     }
@@ -1237,6 +1325,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     case ValueOpcode::NOT:
     case ValueOpcode::IF:
     case ValueOpcode::RANDOM:
+    case ValueOpcode::DECAY:
     case ValueOpcode::GEO_DISTANCE:
       throw std::runtime_error("invalid binary ValueExpr opcode");
   }
@@ -1389,6 +1478,7 @@ ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds>
       case ValueOpcode::NOT:
       case ValueOpcode::IF:
       case ValueOpcode::RANDOM:
+      case ValueOpcode::DECAY:
       case ValueOpcode::GEO_DISTANCE:
         throw std::logic_error("invalid comparison ValueExpr opcode");
     }
@@ -1531,6 +1621,46 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
   return out;
 }
 
+ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args) {
+  const ValueBounds& input = args[0];
+  if (input.alwaysMissing) return ValueBounds::floating(1.0, 1.0);
+  if (!bounded(input)) {
+    ValueBounds out = ValueBounds::floating(0.0, 1.0);
+    out.minAttained = out.maxAttained = false;
+    return out;
+  }
+  ValueResult origin = args[1].type == ValueType::INT64
+      ? ValueResult::integer(args[1].intMin) : ValueResult::floating(args[1].doubleMin);
+  ValueResult low = valueDouble(input.type)
+      ? ValueResult::floating(input.doubleMin) : ValueResult::integer(input.intMin);
+  ValueResult high = valueDouble(input.type)
+      ? ValueResult::floating(input.doubleMax) : ValueResult::integer(input.intMax);
+  double scale = boundMinAsDouble(args[2]);
+  double offset = args.size() > 3 ? boundMinAsDouble(args[3]) : 0.0;
+  double a = decayDistance(low, origin, offset);
+  double b = decayDistance(high, origin, offset);
+  double near = std::min(a, b);
+  double far = std::max(a, b);
+  bool nearAttained = (a == near && input.minAttained) || (b == near && input.maxAttained);
+  bool farAttained = (a == far && input.minAttained) || (b == far && input.maxAttained);
+  bool spansOrigin = low.type == ValueType::INT64 && origin.type == ValueType::INT64
+      ? low.intValue <= origin.intValue && origin.intValue <= high.intValue
+      : boundMinAsDouble(input) <= boundMinAsDouble(args[1])
+          && boundMinAsDouble(args[1]) <= boundMaxAsDouble(input);
+  if (spansOrigin && near != 0.0) {
+    near = 0.0;
+    nearAttained = false;
+  }
+  ValueBounds out = ValueBounds::floating(decayScore(node, far, scale), decayScore(node, near, scale));
+  out.minAttained = farAttained && !valueArray(input.type);
+  out.maxAttained = nearAttained;
+  if (input.mayBeMissing && out.doubleMax != 1.0) {
+    out.doubleMax = 1.0;
+    out.maxAttained = false;
+  }
+  return out;
+}
+
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
 constexpr ValueFunction::Operand GEO_POINT{
     .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
@@ -1623,7 +1753,19 @@ constexpr ValueFunction FUNCTIONS[] = {
      randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
      evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3,
-     {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, validateGeoDistance},
+     {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, prepareGeoDistance},
+    {ValueOpcode::DECAY, "gauss_decay", decayResolve, evalDecayPoint, evalFunctionBatch,
+     decayBounds, evalScalarOnlyElement, 3, 5,
+     {RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW}, nullptr,
+     prepareDecay<DecayShape::GAUSS>},
+    {ValueOpcode::DECAY, "exp_decay", decayResolve, evalDecayPoint, evalFunctionBatch,
+     decayBounds, evalScalarOnlyElement, 3, 5,
+     {RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW}, nullptr,
+     prepareDecay<DecayShape::EXP>},
+    {ValueOpcode::DECAY, "linear_decay", decayResolve, evalDecayPoint, evalFunctionBatch,
+     decayBounds, evalScalarOnlyElement, 3, 5,
+     {RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW, CONSTANT_RAW}, nullptr,
+     prepareDecay<DecayShape::LINEAR>},
 };
 
 consteval std::string_view unsetOperandUnitFunction() {
