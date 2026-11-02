@@ -51,7 +51,15 @@ struct KnnPlanner {
     // word costs were too small to identify there; they keep 3 ns per
     // visited doc and 0.5 ns per initialized/copied 64-bit word.
     double requestCost = 16600 / NS_PER_DIM; // Common to both arms, once per query.
-    double extraBitFraction = 0.35;
+    // Fraction of one-bit RaBitQ candidates that pass the gate to the
+    // extra-bit pass, for an independent filter at the selectivities where
+    // IVF is chosen: 0.04-0.06 at 128-d (SIFT) and ~0.011 at 768-d (miracl),
+    // i.e. about 0.046 * (128 / dims)^0.8. The runtime completion guard
+    // uses the observed survival once a segment has scanned.
+    double extraBitSurvival128 = 0.046;
+    double extraBitSurvival(int32_t dims) const {
+      return std::min(1.0, extraBitSurvival128 * std::pow(128.0 / std::max(1, dims), 0.8));
+    }
     // Dimension-weighted terminal reads / new-list passes across the
     // calibration corpora was 0.107; independent filters alone were 0.004.
     // Correlation is unknown at prepare, so keep the pooled estimate.
@@ -181,7 +189,7 @@ struct KnnPlanner {
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
     } else {
       p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
-      if (s.rabitqBits > 1) p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitFraction;
+      if (s.rabitqBits > 1) p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
     }
     if (s.codec == Codec::PQ) p.linear[PQ_LIST_SETUP] = s.nlist;
     else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
