@@ -37,9 +37,14 @@ Content-Type: application/json
   "request_id": "load-42",
   "update_version": 1,
   "status": "ok",
-  "ids": ["b1", "b2"]
+  "ids": ["b1", "b2"],
+  "took_us": 2140
 }
 ```
+
+`took_us` is the server-side wall time, in microseconds, from receiving the
+complete request to sending the response, including any commit and replica
+wait.
 
 One request can add documents, delete by id, and commit. The request fields
 are:
@@ -130,7 +135,9 @@ Content-Type: application/x-ndjson
 {"request_id":"nonfiction","update_version":4,"status":"ok"}
 ```
 
-The response is NDJSON too, one update response per completed group. The URL
+The response is NDJSON too, one update response per completed group. Each
+line's `took_us` (left out of these examples) counts from the arrival of the stream's
+request headers, so it grows down the stream. The URL
 collection is the default; a control object can set
 `"collection":"archive"` for the following group, so one connection can feed
 several collections.

@@ -27,7 +27,7 @@ using tcp = net::ip::tcp;
 // Synchronous one-shot HTTP request against a locally running HttpServer.
 // Returns the full (de-chunked) response so NDJSON bodies arrive as one string.
 inline http::response<http::string_body>
-httpRequest(int port, http::verb method, std::string_view target, std::string body = {},
+httpRequestRaw(int port, http::verb method, std::string_view target, std::string body = {},
             std::string_view contentType = "application/json") {
   net::io_context ioc;
   tcp::resolver resolver(ioc);
@@ -50,6 +50,32 @@ httpRequest(int port, http::verb method, std::string_view target, std::string bo
 
   beast::error_code ec;
   stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+  return res;
+}
+
+// Removes every "took_us" member (and its separating comma) from a JSON body.
+inline void stripTook(std::string& body) {
+  constexpr std::string_view key = "\"took_us\":";
+  for (auto pos = body.find(key); pos != std::string::npos; pos = body.find(key, pos)) {
+    auto end = pos + key.size();
+    while (end < body.size() && (body[end] == ' ' || (body[end] >= '0' && body[end] <= '9'))) end++;
+    if (end < body.size() && body[end] == ',') {
+      end++;
+    } else {  // last member: drop the comma before it (pretty output puts whitespace between)
+      auto comma = body.find_last_not_of(" \n", pos - 1);
+      if (comma != std::string::npos && body[comma] == ',') pos = comma;
+    }
+    body.erase(pos, end - pos);
+  }
+}
+
+// httpRequestRaw with took_us removed: tests compare whole bodies across
+// requests, and the timing differs every time.
+inline http::response<http::string_body>
+httpRequest(int port, http::verb method, std::string_view target, std::string body = {},
+            std::string_view contentType = "application/json") {
+  auto res = httpRequestRaw(port, method, target, std::move(body), contentType);
+  stripTook(res.body());
   return res;
 }
 

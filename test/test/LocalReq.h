@@ -149,6 +149,8 @@ public:
 
   ReplyStatus reply(SearchResponse& response) override {
     responses.push_back(&response);  // retain; the response's arena stays alive until done()
+    // took_us differs on every execution; tests compare whole responses.
+    response.proto.took_us = 0;
     return ReplyStatus::OK;
   }
   void replyCallback(SearchResponse& response) override { unused(response); }
