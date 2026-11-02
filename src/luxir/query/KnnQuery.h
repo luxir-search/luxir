@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <functional>
 #include <iterator>
@@ -151,8 +152,60 @@ public:
     // Selector-passing codes, including those rejected by the 1-bit gate.
     std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0};
     std::atomic<int64_t> retainedPeak{0}, retainedTerminal{0}, seedReads{0}, remainingReads{0};
+    // Flat search work; excludes metadata counting and terminal rereads.
+    std::atomic<int64_t> domainDocsVisited{0}, domainProbes{0}, vectorsScored{0};
+    std::atomic<int64_t> slotsBuilt{0}, faissIndexCalls{0};
   };
   static inline Stats* statsForTests = nullptr;
+  // Dense single-valued filter density above which flat search walks ranks.
+  // Sparse and multi-valued columns walk the domain. Test/bench seam: -1
+  // forces sequential for every shape, infinity forces the domain walk.
+  static inline double flatDomainDensityThreshold = 0.6;
+  static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
+
+  struct SegmentEligibility {
+    int64_t eligibleDocs = 0;
+    int64_t eligibleVectors = 0;
+    bool vectorsEstimated = false;
+    // No filter: selectivity is one. Counts are physical column totals,
+    // including deleted docs/vectors; do not recount deletions per query.
+    bool unfiltered = true;
+  };
+
+  static SegmentEligibility countEligible(VectorReader& vr, DocSet* domain, LiveDocs* live) {
+    SegmentEligibility counts{vr.docsWithValue(), vr.numVectors()};
+    if (domain == nullptr || (live != nullptr && domain == &live->docset())) return counts;
+    counts = {0, 0, false, false};
+    int64_t card = domain->card();
+    if (card == 0) return counts;
+    auto& col = vr.strColReader();
+    const auto& docs = col.docsReader();
+    // Arrays already require a member walk. Small bitsets also make exact
+    // multi-value range sums cheap; large ones count words and estimate runs.
+    bool sumRanges = vr.isMultiValued() && (domain->type == DocSet::ARRAY || card <= 1024);
+    if (sumRanges || (docs.hasBitset() && domain->type == DocSet::ARRAY)) {
+      StrColReader::DocIterator values(col);
+      domain->forEach([&](int32_t doc) {
+        if (values.docId() < doc) values.advance(doc);
+        if (values.docId() != doc) return;
+        counts.eligibleDocs++;
+        if (sumRanges) {
+          auto [begin, end] = values.valueRange();
+          counts.eligibleVectors += end - begin;
+        }
+      });
+    } else {
+      counts.eligibleDocs = docs.hasBitset()
+          ? docs.bitset().intersectionCardinality(((const BitDocSet*)domain)->bits()) : card;
+    }
+    if (!vr.isMultiValued()) counts.eligibleVectors = counts.eligibleDocs;
+    else if (counts.eligibleDocs == vr.docsWithValue()) counts.eligibleVectors = vr.numVectors();
+    else if (!sumRanges && counts.eligibleDocs > 0) {
+      counts.eligibleVectors = counts.eligibleDocs * vr.numVectors() / vr.docsWithValue();
+      counts.vectorsEstimated = true;
+    }
+    return counts;
+  }
   // Test/benchmark seam only. Zero selects the measured default; positive
   // values are clamped to R/k so k groups remain reachable in R documents.
   static inline int32_t membersPerGroupForTests = 0;
@@ -832,6 +885,7 @@ public:
       std::vector<SegV2D> v2dPerSeg(numSegs);
       std::vector<int64_t> segVectorCounts(numSegs, 0);
       std::vector<int64_t> segLiveVectorCounts(numSegs, 0);
+      std::vector<SegmentEligibility> eligibilityPerSeg(numSegs);
       std::vector<VectorAuxReader*> vauxPerSeg(numSegs, nullptr);
       std::string auxName("vec.");
       auxName.append(query.getField());
@@ -857,7 +911,7 @@ public:
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
 
       int64_t boundedDocsWithValue = 0, boundedVectors = 0, boundedLiveVectors = 0;
-      bool anyMultiValued = false;
+      bool anyMultiValued = false, anyEligible = false;
       int32_t dims = (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
         throw std::runtime_error(std::format(
@@ -881,12 +935,14 @@ public:
                 "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",
                 dims, vr.dims(), query.getField()));
             }
-            bool bounded = vauxPerSeg[i] != nullptr
-                && (!vauxPerSeg[i]->isRaBitQ() || query.getRefineCandidates() > 0);
-            if (bounded) { boundedDocsWithValue += vr.docsWithValue(); boundedVectors += segCount; }
+            auto& seg = reader.segments()[i];
+            DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+            eligibilityPerSeg[i] = countEligible(vr, domain, seg.liveDocs());
             segVectorCounts[i] = segCount;
+            segLiveVectorCounts[i] = liveVectorUpperBound(seg, vr);
+            if (eligibilityPerSeg[i].eligibleDocs == 0) continue;
+            anyEligible = true;
             if (vr.isMultiValued()) {
-              anyMultiValued |= bounded;
               // valueRank -> docId comes straight off the column's reverse map.
               MonoReader* mr = vr.strColReader().getValDocReader();
               if (mr == nullptr) {
@@ -907,25 +963,29 @@ public:
                 v2dPerSeg[i].sel = makeValueDocSelector(scratch, dr.bitset());
               }
             }
-            IndexReader::Segment& seg = reader.segments()[i];
-            if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
-              // Rank-space liveness bitmap, cached on the aux reader per
-              // liveDocs generation; fetched here so a (rare) rebuild runs
-              // while the scratch column readers it walks are alive.
-              // liveListSize accounting always reads it, for an unfiltered
-              // query (domain == the liveDocs docset) it doubles as the
-              // whole FAISS eligibility selector, and it carries this
-              // segment's EXACT live vector count.
-              rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(
-                seg.segInfo.live_gen, [&]() {
-                  return buildRankLiveBitmap(seg, vr, segCount);
-                });
-              segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
-            } else {
-              segLiveVectorCounts[i] = liveVectorUpperBound(seg, vr);
-            }
-            if (bounded) boundedLiveVectors += segLiveVectorCounts[i];
           }
+        }
+      }
+      if (!anyEligible) return emptyResult();
+      for (size_t i = 0; i < numSegs; i++) {
+        // Empty domains retain the cheap live-vector upper bound for the
+        // reference budget, without fetching or building rank-space liveness.
+        if (segVectorCounts[i] == 0 || eligibilityPerSeg[i].eligibleDocs == 0) continue;
+        auto& seg = reader.segments()[i];
+        if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
+          // Unfiltered IVF also uses this bitmap as its whole selector.
+          rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
+            VectorReader vr(seg.postingsReader(), *segInfos.at(i));
+            return buildRankLiveBitmap(seg, vr, segVectorCounts[i]);
+          });
+          segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
+        }
+        if (eligibilityPerSeg[i].eligibleDocs > 0 && segLiveVectorCounts[i] > 0 && vauxPerSeg[i] != nullptr
+            && (!vauxPerSeg[i]->isRaBitQ() || query.getRefineCandidates() > 0)) {
+          boundedDocsWithValue += segInfos.at(i)->docsWithField;
+          boundedVectors += segVectorCounts[i];
+          boundedLiveVectors += segLiveVectorCounts[i];
+          anyMultiValued |= monoHolders[i].has_value();
         }
       }
       int64_t ntotal = 0;
@@ -977,7 +1037,7 @@ public:
       int32_t rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
-        if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
+        if (segCount <= 0 || segLiveVectorCounts[i] == 0 || eligibilityPerSeg[i].eligibleDocs == 0) continue;
         IndexReader::Segment& seg = reader.segments()[i];
         DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
         // Domain contract (Query.h): a present domain is live-filtered and
@@ -999,6 +1059,7 @@ public:
           }
           normalizeColumnOnCosineRescore =
             normalizeColumnOnCosineRescore || vaux->shouldNormalizeColumnOnCosineRescore();
+          if (statsForTests) statsForTests->faissIndexCalls++;
           faiss::Index* idx = vaux->getFaissIndex();
           if (idx == nullptr || idx->ntotal == 0) continue;
           if (idx->ntotal != segCount) {
@@ -1038,6 +1099,7 @@ public:
       if (slots.empty()) {
         return emptyResult();
       }
+      if (statsForTests) statsForTests->slotsBuilt += (int64_t)slots.size();
 
       // The bounded policy retains its existing work cap. Interval retention
       // has only the request's opt-in byte ceiling, regardless of input size.
@@ -1786,7 +1848,6 @@ public:
 
         BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
         int64_t eligibleDocs = 0;
-        int64_t scanned = 0;
         if (segInfo == nullptr) {
           result.boundedSelection = VectorSelection::COMPLETE;
           return result;
@@ -1823,75 +1884,196 @@ public:
           return false;
         };
 
-        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
-        // of eligible docs, resolved through its own valDoc cursor (windows
-        // ascend).  Reads that cursor causes count as the window's cold pages,
-        // which only leans toward staying on.
         StrColReader& col = vr.strColReader();
         RowReadAhead::Gate gate;
-        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
-                           (size_t)col.fixedValueSize(), numVals);
-        std::optional<MonoReader::BulkValues> aheadValDoc;
-        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
-        int32_t aheadDoc = -1;
-        bool aheadEligible = false;
-        auto eligibleRank = [&](int64_t r) {
-          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
-          if (doc != aheadDoc) {
-            aheadDoc = doc;
-            aheadEligible = docEligible(doc);
-          }
-          return aheadEligible;
-        };
-        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
-          if (domain == nullptr) ahead.scanAt(rank);
-          else ahead.scanAt(rank, eligibleRank);
-        };
+        int64_t domainDocsVisited = 0, domainProbes = 0, vectorsScored = 0;
+        bool walkDomain = domain != nullptr && flatDomainDensityThreshold >= 0
+            && (vr.isMultiValued() || col.docsReader().hasBitset()
+                || (double)domain->card() / vr.docsWithValue() <= flatDomainDensityThreshold);
 
-        // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
-        // monotonic; sparse select and dense identity likewise), so a doc's
-        // vectors form a contiguous run and max-sim collapse falls out of one
-        // pass.  liveDocs/domain are applied as a per-run predicate.
+        // Read-ahead keeps one state per walk. The domain arm queues only
+        // eligible runs through a second forward cursor; the sequential arm
+        // uses an independent membership probe over its rank windows.
         auto scan = [&](auto emit) {
+          // Value ranks are doc-ordered, so each doc's vectors form one
+          // contiguous run and max-sim collapse falls out of a single pass.
+          auto scoreRun = [&]<bool Multi>(int32_t doc, int64_t begin, int64_t end) LUXIR_INLINE {
+            eligibleDocs++;
+            emit(doc, [&]() LUXIR_INLINE {
+              vectorsScored += end - begin;
+              if constexpr (Multi) {
+                auto [rank, score] = bestInRun(begin, end, [&](int64_t r) {
+                  return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                    normalizeColumnOnCosineRescore, 0.0f);
+                });
+                return VectorEngineHit{score, segOrd, rank};
+              } else {
+                return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(begin), dims, metric,
+                    normalizeColumnOnCosineRescore, 0.0f), segOrd, begin};
+              }
+            });
+          };
+          if (walkDomain) {
+            int64_t count = domain->card();
+            if (count == 0) return;
+            domainDocsVisited = count;
+            const auto* bits = domain->type == DocSet::BITSET ? &((const BitDocSet*)domain)->bits() : nullptr;
+            std::span<const int32_t> docs = domain->type == DocSet::ARRAY
+                ? ((const ArrDocSet*)domain)->docs() : std::span<const int32_t>{};
+            auto walk = [&]<bool Multi, bool Sparse>() {
+              screaming::BitSet::Iterator fieldDocs(col.docsReader().bitset()), aheadFieldDocs(col.docsReader().bitset());
+              int32_t fieldDoc = -1, aheadFieldDoc = -1, aheadBase = 0;
+              uint64_t aheadWord = 0;
+              auto docRank = [&](int32_t doc, auto& cursor, int32_t& current) LUXIR_INLINE -> int64_t {
+                if constexpr (Sparse) {
+                  if (current < doc) current = cursor.advance(doc);
+                  return current == doc ? cursor.rank() : -1;
+                } else return doc;
+              };
+              std::optional<MonoReader::BulkValues> ranges;
+              if constexpr (Multi) {
+                if ((double)count / vr.docsWithValue() >= FLAT_RANGE_POINT_DENSITY)
+                  ranges.emplace(*col.getEndValueRankReader());
+              }
+              auto valueRange = [&](int64_t rank) LUXIR_INLINE {
+                if constexpr (Multi) {
+                  if (!ranges) return col.getStartEndValueRank((int32_t)rank);
+                  int64_t begin = rank == 0 ? 0 : ranges->valueAt(rank - 1);
+                  return std::pair<int64_t, int64_t>{begin, ranges->valueAt(rank)};
+                } else return std::pair<int64_t, int64_t>{rank, rank + 1};
+              };
+              struct QueuedRange { int64_t pos, begin, end; };
+              // Only cold read-ahead allocates this queue. Scoring consumes
+              // its ranges so the end-rank stream is decoded once, in order.
+              std::optional<std::deque<QueuedRange>> queuedRanges;
+              RowReadAhead ahead(gate, col);
+              // Probe at most two domain members once, then let the gate
+              // observe faults. Probing must not move the read-ahead cursor.
+              screaming::BitSet::Iterator probeFieldDocs(col.docsReader().bitset());
+              int32_t probeFieldDoc = -1, probeWord = 0;
+              int64_t probeBase = 0;
+              auto probeRank = [&](int fraction) -> int64_t {
+                int64_t target = count * fraction / 4;
+                int32_t doc;
+                if (bits) {
+                  uint64_t word = bits->words[probeWord];
+                  for (;;) {
+                    int n = std::popcount(word);
+                    if (target < probeBase + n) break;
+                    probeBase += n;
+                    word = bits->words[++probeWord];
+                  }
+                  for (int64_t skip = target - probeBase; skip > 0; skip--) word &= word - 1;
+                  doc = (probeWord << 6) + std::countr_zero(word);
+                } else doc = docs[(size_t)target];
+                int64_t rank = docRank(doc, probeFieldDocs, probeFieldDoc);
+                if (rank < 0) return -1;
+                auto [begin, end] = Multi ? col.getStartEndValueRank((int32_t)rank)
+                    : std::pair<int64_t, int64_t>{rank, rank + 1};
+                return pooledInRun(begin, end) ? -1 : begin;
+              };
+              int64_t first = probeRank(1), second = probeRank(3);
+              ahead.probe({first, second});
+              int64_t pos = 0;
+              domain->forEach([&](int32_t doc) LUXIR_INLINE {
+                ahead.sparseAt(pos, count, [&](int64_t p) {
+                  int32_t aheadDoc;
+                  if (bits) {
+                    if (p == pos) {
+                      aheadBase = doc & ~63;
+                      aheadWord = bits->words[aheadBase >> 6] & (~(uint64_t)0 << (doc & 63));
+                    }
+                    while (aheadWord == 0) {
+                      aheadBase += 64;
+                      aheadWord = bits->words[aheadBase >> 6];
+                    }
+                    aheadDoc = aheadBase + std::countr_zero(aheadWord);
+                    aheadWord &= aheadWord - 1;
+                  } else aheadDoc = docs[(size_t)p];
+                  int64_t rank = docRank(aheadDoc, aheadFieldDocs, aheadFieldDoc);
+                  if (rank < 0) return;
+                  auto [begin, end] = valueRange(rank);
+                  if constexpr (Multi) {
+                    if (!queuedRanges) queuedRanges.emplace();
+                    queuedRanges->push_back({p, begin, end});
+                  }
+                  if (!pooledInRun(begin, end)) ahead.queueRows(begin, end);
+                });
+                int64_t currentPos = pos++;
+                if constexpr (Multi) {
+                  if (queuedRanges && !queuedRanges->empty() && queuedRanges->front().pos == currentPos) {
+                    auto run = queuedRanges->front();
+                    queuedRanges->pop_front();
+                    if (!pooledInRun(run.begin, run.end)) scoreRun.template operator()<true>(doc, run.begin, run.end);
+                    return;
+                  }
+                }
+                int64_t rank = docRank(doc, fieldDocs, fieldDoc);
+                if (rank < 0) return;
+                auto [begin, end] = valueRange(rank);
+                if (!pooledInRun(begin, end)) scoreRun.template operator()<Multi>(doc, begin, end);
+              });
+            };
+            // Single-valued docs have one-vector runs: dense rank = doc;
+            // sparse ranks come from the forward has-field cursor.
+            if (vr.isMultiValued()) {
+              if (col.docsReader().hasBitset()) walk.template operator()<true, true>();
+              else walk.template operator()<true, false>();
+            } else {
+              if (col.docsReader().hasBitset()) walk.template operator()<false, true>();
+              else walk.template operator()<false, false>();
+            }
+            return;
+          }
+
+          // The dense arm walks ranks sequentially. Independent forward
+          // probes keep array domains linear for both scoring and read-ahead.
+          DocSetProbe probe(domain), aheadProbe(domain);
+          RowReadAhead ahead(gate, col);
+          std::optional<MonoReader::BulkValues> aheadValDoc;
+          if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+          int32_t aheadDoc = -1;
+          bool aheadEligible = false;
+          auto eligibleRank = [&](int64_t r) {
+            int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+            if (doc != aheadDoc) {
+              aheadDoc = doc;
+              domainProbes++;
+              aheadEligible = aheadProbe.get(doc);
+            }
+            return aheadEligible;
+          };
+          auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+            if (domain == nullptr) ahead.scanAt(rank);
+            else ahead.scanAt(rank, eligibleRank);
+          };
+          auto eligibleDoc = [&](int32_t doc) {
+            if (domain != nullptr) domainProbes++;
+            return probe.get(doc);
+          };
           if (v2d.mono != nullptr) {
             MonoReader::BulkValues valDoc(*v2d.mono);
-            int64_t idx = valDoc.next();
+            valDoc.next();
             int64_t rank = 0;
             while (rank < numVals) {
-              int32_t docId = (int32_t)valDoc.value();
+              int32_t doc = (int32_t)valDoc.value();
               int64_t end = rank;
               do {
                 end++;
-                idx = valDoc.next();
-              } while (end < numVals && (int32_t)valDoc.value() == docId);
-              unused(idx);
+                valDoc.next();
+              } while (end < numVals && (int32_t)valDoc.value() == doc);
               readAhead(rank);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
-                eligibleDocs++;
-                emit(docId, [&]() LUXIR_INLINE {
-                  if constexpr (Groups) scanned += end - rank;
-                  auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
-                    return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                      normalizeColumnOnCosineRescore, 0.0f);
-                  });
-                  return VectorEngineHit{bestScore, segOrd, bestRank};
-                });
-              }
+              if (eligibleDoc(doc) && !pooledInRun(rank, end)) scoreRun.template operator()<true>(doc, rank, end);
               rank = end;
             }
           } else {
-            // Single-valued (dense identity or sparse select): one-vector runs.
+            // Single-valued ranks are one-vector runs. Exclude pooled ranks
+            // before paying for the sparse rank-to-doc select.
             for (int64_t rank = 0; rank < numVals; rank++) {
               readAhead(rank);
               if (pooledInRun(rank, rank + 1)) continue;
-              int32_t docId = v2d.resolve(rank);
-              if (!docEligible(docId)) continue;
-              eligibleDocs++;
-              emit(docId, [&]() LUXIR_INLINE {
-                if constexpr (Groups) scanned++;
-                return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
-                    normalizeColumnOnCosineRescore, 0.0f), segOrd, rank};
-              });
+              int32_t doc = v2d.resolve(rank);
+              if (eligibleDoc(doc)) scoreRun.template operator()<false>(doc, rank, rank + 1);
             }
           }
         };
@@ -1913,7 +2095,10 @@ public:
         });
 
         if (statsForTests) {
-          int64_t count = Groups ? scanned : eligibleDocs;
+          int64_t count = Groups ? vectorsScored : eligibleDocs;
+          statsForTests->domainDocsVisited += domainDocsVisited;
+          statsForTests->domainProbes += domainProbes;
+          statsForTests->vectorsScored += vectorsScored;
           statsForTests->vectors += count;
           statsForTests->bytes += count * dims * (int64_t)sizeof(float);
         }
@@ -1921,14 +2106,6 @@ public:
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         result.boundedSelection = VectorSelection::COMPLETE;
         return result;
-      }
-
-    private:
-      // The domain, when present, is live-filtered and is the complete
-      // eligibility predicate (PrepareContext contract); null means the
-      // segment has no deletes and no filters.
-      bool docEligible(int32_t docId) const {
-        return domain == nullptr || domain->get(docId);
       }
     };
 

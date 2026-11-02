@@ -338,6 +338,81 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
     / (double)state.iterations();
 }
 
+// Isolate flat traversal and preparation with an already-materialized domain.
+// shape: dense single, sparse single (one doc in four), multi (four values).
+// arm: 0 = sequential ranks, 1 = domain members. Corpus reuse keeps the
+// small unit-test sweep cheap and avoids rebuilding between paired arms.
+void BM_VectorKnnFlatDomain(benchmark::State& state) {
+  int shape = (int)state.range(0), basisPoints = (int)state.range(1), arm = (int)state.range(2);
+  int nDocs = luxir::unit_tests ? 240 : 200'000;
+  int dims = luxir::unit_tests ? 8 : 128;
+  CollectionHelper helper("flat_domain_" + std::to_string(shape));
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  if (reader->segments().empty()) {
+    installVectorBenchSchema(helper.collection(), dims);
+    std::vector<Doc> docs;
+    for (int i = 0; i < nDocs; i++) {
+      auto doc = shape == 1 && i % 4 != 0 ? flatdoc("id", std::to_string(i))
+          : makeVectorDoc(i, dims, shape == 2 ? 4 : 1, false);
+      docs.push_back(std::move(doc));
+      if (docs.size() == 256 || i + 1 == nDocs) { helper.indexAll(docs); docs.clear(); }
+    }
+    helper.commit();
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  }
+  if (reader->segments().size() != 1) { state.SkipWithError("expected one flat segment"); return; }
+  std::string field = shape == 2 ? "bench_vs" : "bench_v";
+  auto& seg = reader->segments()[0];
+  if (seg.getAuxReader("vec." + field)) { state.SkipWithError("unexpected vector overlay"); return; }
+  int withValue = shape == 1 ? nDocs / 4 : nDocs;
+  int count = std::max(1, withValue * basisPoints / 10000);
+  std::vector<int32_t> members;
+  for (int i = 0; i < count; i++) members.push_back((int)((int64_t)i * withValue / count) * (shape == 1 ? 4 : 1));
+  ArrDocSet array(std::move(members));
+  RAMBitDocSet bitmap(nDocs);
+  array.forEach([&](int doc) { bitmap.mutableBits().set(doc); });
+  // Match the normal array/bitset storage crossover, including a present
+  // full domain so the 100% point still compares both filtered arms.
+  DocSet* domain = count * (int)sizeof(int32_t) < nDocs / 8 ? (DocSet*)&array : &bitmap;
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr(field);
+  auto vector = makeQueryVector(dims);
+  SearchOverridesGuard saved(KnnQuery::flatDomainDensityThreshold, KnnQuery::statsForTests);
+  auto run = [&]() {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    KnnQuery query(field, type, vector, 10);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    std::array<DocSet*, 1> domains{domain};
+    Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+    auto prepared = weight->prepare(prepare);
+    auto* scorer = prepared->createScorer(pool, seg);
+    uint64_t fp = 0;
+    if (scorer) for (int doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next())
+      fp = fp * 131 + (uint64_t)doc;
+    return fp;
+  };
+  KnnQuery::flatDomainDensityThreshold = -1;
+  uint64_t expected = run();
+  KnnQuery::flatDomainDensityThreshold = INFINITY;
+  if (run() != expected) { state.SkipWithError("flat traversal arms disagree"); return; }
+  KnnQuery::flatDomainDensityThreshold = arm ? INFINITY : -1;
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  run();
+  KnnQuery::statsForTests = nullptr;
+  for (auto _ : state) {
+    uint64_t fp = run();
+    benchmark::DoNotOptimize(fp);
+    if (fp != expected) { state.SkipWithError("flat traversal fingerprint changed"); break; }
+  }
+  state.counters["domain_density"] = (double)count / withValue;
+  state.counters["domain_docs"] = (double)stats.domainDocsVisited.load();
+  state.counters["domain_probes"] = (double)stats.domainProbes.load();
+  state.counters["vectors_scored"] = (double)stats.vectorsScored.load();
+  state.counters["nDocs"] = nDocs;
+  state.counters["dims"] = dims;
+}
+
 // ---------------------------------------------------------------------------
 // IVF+PQ recall benchmark.
 //
@@ -984,6 +1059,12 @@ TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segmen
     ->UseManualTime()->Iterations(2);
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
+
+LUXIR_BENCHMARK(BM_VectorKnnFlatDomain)->ArgNames({"shape", "basis_points", "arm"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int shape : {0, 1, 2}) for (int density : {1, 10, 100, 1000, 5000, 10000})
+        for (int arm : {0, 1}) b->Args({shape, density, arm});
+    });
 
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivf, false, true)->Arg(50'000);

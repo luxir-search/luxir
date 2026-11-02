@@ -147,6 +147,65 @@ TEST_F(GroupKnnTest, exactMatchesExhaustiveDocumentOracle) {
   }
 }
 
+TEST_F(GroupKnnTest, filteredFlatCosineMatchesBruteForceGroups) {
+  SearchOverridesGuard saved(KnnQuery::flatDomainDensityThreshold);
+  for (int shape : {0, 1, 2, 3}) {
+    CollectionHelper helper("main");
+    helper.clear();
+    SchemaBuilder b;
+    auto& f = b.field("vec_vs");
+    f.type = api::FieldDef::FieldClass::VECTOR;
+    f.column = true;
+    f.dims = 4;
+    f.metric = api::VectorMetric::COSINE;
+    f.normalize_on_write = false;
+    if (shape >= 2) f.multi = api::FieldDef::MultiMode::DEFAULT;
+    b.set(helper.collection());
+    std::vector<Doc> docs;
+    std::vector<std::vector<std::vector<float>>> vectors(256);
+    for (int i = 0; i < 256; i++) {
+      auto doc = flatdoc("id", std::to_string(i), "key_s", std::to_string(i % 11),
+                        "tiny_s", i % 83 == 1 ? "yes" : "no", "wide_s", i % 3 ? "yes" : "no");
+      if (shape % 2 == 0 || i % 4) {
+        vectors[i].push_back({(float)(i + 1), (float)(257 - i), 2, 0});
+        if (shape >= 2) vectors[i].push_back({(float)(i + 7), (float)(256 - i), 1, 0});
+        if (shape >= 2) doc.emplace_back("vec_vs", vectors[i]);
+        else doc.emplace_back("vec_vs", vectors[i][0]);
+      }
+      docs.push_back(std::move(doc));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+    helper.deleteByIds({"1", "254"}, UpdateMessage::COMMIT);
+    for (bool tiny : {false, true}) {
+      std::map<int, Row> best;
+      for (int i = 0; i < 256; i++) {
+        if (i == 1 || i == 254 || !(tiny ? i % 83 == 1 : i % 3 != 0)) continue;
+        for (const auto& v : vectors[i]) {
+          float score = v[0] / std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+          auto& row = best[i % 11];
+          if (score > row.second) row = {std::to_string(i), score};
+        }
+      }
+      std::vector<Row> expected;
+      for (const auto& [key, row] : best) expected.push_back(row);
+      std::sort(expected.begin(), expected.end(), [](const Row& a, const Row& b) { return a.second > b.second; });
+      if (expected.size() > 7) expected.resize(7);
+      for (double threshold : {-1.0, std::numeric_limits<double>::infinity()}) for (bool exact : {false, true}) {
+        KnnQuery::flatDomainDensityThreshold = threshold;
+        auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":[")"
+            + std::string(tiny ? "tiny_s:yes" : "wide_s:yes") + R"("],"query":)"
+            + knn(7, true, exact, {}, "[1,0,0,0]"));
+        auto actual = rows(*req);
+        ASSERT_EQ(expected.size(), actual.size());
+        for (size_t i = 0; i < expected.size(); i++) {
+          EXPECT_EQ(expected[i].first, actual[i].first);
+          EXPECT_NEAR(expected[i].second, actual[i].second, 1e-6);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(GroupKnnTest, adversarialGroupsPagingWrappersAndWitnessDomains) {
   CollectionHelper helper;
   schema(helper);
