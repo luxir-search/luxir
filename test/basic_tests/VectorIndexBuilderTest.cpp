@@ -8,6 +8,7 @@
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/UpdateMessage.h"
 #include "luxir/index/VectorIndexBuilder.h"
@@ -239,6 +240,7 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
 // query vectors search it after the same truncation, for both codecs and for
 // a raw (normalize_on_write=false) prefix column.
 TEST_F(VectorIndexBuilderTest, truncatedFieldBuildsOverlayOnPrefix) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   struct Case { api::VectorAnnDef ann; bool normalizeOnWrite; };
   for (const auto& c : {Case{pqAnn(2, 2, 1), true}, Case{pqAnn(2, 2, 1), false},
@@ -294,6 +296,7 @@ TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {
 }
 
 TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -351,6 +354,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
 // open.  This is the FSDirectory leg of the zero-copy list path (the rest of
 // the suite runs on RAMDir).
 TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -424,6 +428,7 @@ TEST_F(VectorIndexBuilderTest, noBuildWhenSelectorsEmpty) {
 // Multiple segments - ntotal must equal the live-doc count across segments,
 // and the metric file's mapping should round-trip (segId, localDoc) correctly.
 TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 0, 1));
@@ -478,6 +483,7 @@ TEST_F(VectorIndexBuilderTest, selectorMiss) {
 // so the vector aux index built for the previous commit remains valid and is
 // carried forward (its files are not deleted).
 TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -511,6 +517,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
 // per-segment overlays.  The old segment carries its entry; the new segment
 // serves flat until a build is requested and passes thresholds.
 TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 0, 1));
@@ -543,6 +550,7 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
 // the merge-private phase.  Full auto-maintenance is the future background
 // builder's job.
 TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -571,6 +579,7 @@ TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
 }
 
 TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -621,6 +630,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
 }
 
 TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -658,6 +668,7 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
 }
 
 TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -704,6 +715,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
 
 // A merge drops old segment overlays and builds one for the merged segment.
 TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -745,6 +757,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
 }
 
 TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayBeforePublish) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -798,6 +811,7 @@ TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayB
 }
 
 TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -839,6 +853,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
 }
 
 TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
@@ -876,6 +891,7 @@ TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
 }
 
 TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcessMerge) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
@@ -910,6 +926,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcess
 }
 
 TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
@@ -941,6 +958,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge)
 }
 
 TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -968,6 +986,7 @@ TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
 }
 
 TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
@@ -1012,6 +1031,7 @@ TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
 }
 
 TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverlays) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -1045,6 +1065,7 @@ TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverla
 }
 
 TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGate) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -1088,6 +1109,7 @@ TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGat
 }
 
 TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndCleansOutput) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -1138,6 +1160,7 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
 }
 
 TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -1227,6 +1250,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
 // Cosine metric normalizes on column write by default.  The FAISS builder can
 // add the already-normalized column bytes directly as inner-product vectors.
 TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
 
@@ -1258,6 +1282,7 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
 // normalized=true: writer and builder trust vectors are already unit-length and
 // skip renormalization.
 TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
 
@@ -1289,6 +1314,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
 // still valid) should NOT rewrite the file - the carried-forward entry's
 // existing files survive untouched.
 TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
@@ -1316,6 +1342,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
 }
 
 TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   SearchOverridesGuard chunks(VectorIndexBuilder::ivfAddChunkBytes);
   // Three vectors per chunk leaves two in the final training and add chunk.
@@ -1364,6 +1391,7 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(4, 2, 2), 4);
@@ -1401,6 +1429,7 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
 }
 
 TEST_F(VectorIndexBuilderTest, defaultRaBitQBitsUseStoredDimensions) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   for (int dims : {128, 383, 384, 768}) {
     CollectionHelper h("main");
@@ -1429,6 +1458,7 @@ TEST_F(VectorIndexBuilderTest, defaultRaBitQBitsUseStoredDimensions) {
 }
 
 TEST_F(VectorIndexBuilderTest, automaticPqMScalesWithDimensionsForEveryMetric) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   struct Case { api::VectorMetric metric; int32_t dims, configuredM, expectedM; };
   for (const auto& c : {Case{api::VectorMetric::COSINE, 320, 0, 40},
@@ -1465,6 +1495,7 @@ TEST_F(VectorIndexBuilderTest, automaticPqMScalesWithDimensionsForEveryMetric) {
 }
 
 TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/128);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(4, 2, 4), 4);
@@ -1481,6 +1512,7 @@ TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
 }
 
 TEST_F(VectorIndexBuilderTest, skipPolicyPrecedesProgrammaticPqMSelection) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(1, 0, 1));
@@ -1530,6 +1562,7 @@ TEST_F(VectorIndexBuilderTest, metricNoneIsIneligible) {
 }
 
 TEST_F(VectorIndexBuilderTest, overlayGenerationSurvivesPublishedDropAndRestart) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   auto path = std::filesystem::temp_directory_path() / "luxir-overlay-restart";
   std::filesystem::remove_all(path);

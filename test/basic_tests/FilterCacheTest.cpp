@@ -6172,6 +6172,7 @@ TEST(FilterKeyTest, preservesNonFiniteFloatBitPatterns) {
 }
 
 TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
+  luxir::test::SearchOverridesGuard routing(KnnQuery::routing, KnnQuery::plannerCosts);
   struct PolicyRestore {
     int64_t candidates = KnnQuery::maxKnnCandidates;
     double alpha = KnnQuery::filteredCoverageAlpha, headroom = KnnQuery::breadthHeadroom, growth = KnnQuery::breadthGrowth;
@@ -6215,6 +6216,13 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   EXPECT_NE(baseKey, keyFor(KnnQuery(
       "vec", vectorType, vector, 7, 3, 11, 0.25f, true)));
 
+  KnnQuery::routing = KnnQuery::Routing::FORCE_IVF;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::routing = KnnQuery::Routing::AUTO;
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM]++;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM]--;
+  EXPECT_EQ(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates++;
   EXPECT_NE(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates = restore.candidates;

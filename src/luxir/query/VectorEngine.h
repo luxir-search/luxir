@@ -21,6 +21,11 @@ struct VectorSearchWork {
   int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
   int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
   int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
+  int64_t rankVisits = 0, sparseMaps = 0, multiMaps = 0, coarseDims = 0, rounds = 0, ivfRounds = 0;
+  int64_t selectorNone = 0, selectorBitmap = 0, resolveIdentity = 0, resolveSelect = 0, resolveMono = 0;
+  // arraySteps is resolve calls times bit_width(domain card), a size-weighted
+  // probe count, not instrumented comparisons inside the DocSet search.
+  int64_t bitProbes = 0, arraySteps = 0, allocatorEntries = 0;
 
   VectorSearchWork& operator+=(const VectorSearchWork& other) {
     listSetups += other.listSetups;
@@ -39,6 +44,12 @@ struct VectorSearchWork {
     seedReads += other.seedReads;
     remainingReads += other.remainingReads;
     scoreBytes += other.scoreBytes;
+    rankVisits += other.rankVisits; sparseMaps += other.sparseMaps; multiMaps += other.multiMaps;
+    coarseDims += other.coarseDims; rounds += other.rounds; ivfRounds += other.ivfRounds;
+    selectorNone += other.selectorNone; selectorBitmap += other.selectorBitmap;
+    resolveIdentity += other.resolveIdentity; resolveSelect += other.resolveSelect; resolveMono += other.resolveMono;
+    bitProbes += other.bitProbes; arraySteps += other.arraySteps;
+    allocatorEntries += other.allocatorEntries;
     return *this;
   }
 };
