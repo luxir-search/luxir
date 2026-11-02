@@ -9,7 +9,7 @@
 
 namespace luxir {
 
-enum class VectorSearchRound { BREADTH, DEPTH };
+enum class VectorSearchRound { BREADTH, DEPTH, COMPLETION };
 
 // One task's work, reduced at barriers into query-owned per-segment totals.
 // New-list passes are disjoint across breadth rounds; depth revisits never
@@ -61,7 +61,8 @@ struct VectorSearchWork {
 /// One round of WIDEN. Bounded collectors receive a fresh candidate budget
 /// and exclude already returned ranks. Interval collectors persist witnesses
 /// and retained records for the query: DEPTH never rescans them; BREADTH scans
-/// only newly selected lists. Exact slots supply distinct-unit top-k witnesses.
+/// only newly selected lists. COMPLETION runs pending exact slots without IVF.
+/// Exact slots supply distinct-unit top-k witnesses.
 struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;

@@ -4006,3 +4006,253 @@ TEST_F(KnnQueryTest, borrowedDomainCopiesOnlyForPooledClears) {
   EXPECT_EQ(0, stats.work.resolveIdentity);
   EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"0", "145", "146"}));
 }
+
+TEST_F(KnnQueryTest, completionRecoversUnpooledMaximumBeyondCandidateCap) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests, KnnQuery::maxKnnCandidates);
+  KnnQuery::completion = KnnQuery::Completion::FORCE;
+  KnnQuery::maxKnnCandidates = 1;
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 128; i++)
+    h.index(flatdoc("id", std::to_string(i), "emb_vs", std::vector<std::vector<float>>{
+        {(float)i + 1.05f, 0, 0, 0}, {(float)i + 1, 0, 0, 0}}));
+  h.commit({"*"});
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  std::vector<RecordedVectorRound> rounds;
+  EngineWrapperGuard wrapper([&](VectorEngine& engine) { return std::make_unique<RecordingVectorEngine>(engine, rounds); });
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3, 0, 1, false, 1);
+  req->execute();
+  EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"0", "1", "2"}));
+  EXPECT_NEAR(resultScores(*req)[0], 0.5f, 1e-6);
+  req->done();
+  ASSERT_EQ(2u, rounds.size());
+  ASSERT_EQ(1u, rounds[0].result.hits.size());
+  EXPECT_EQ(0, rounds[0].result.hits[0].valueRank); // The second value is the true maximum.
+  EXPECT_EQ(VectorSearchRound::COMPLETION, rounds[1].kind);
+  EXPECT_EQ(0, rounds[1].result.work.physicalEntries);
+  EXPECT_EQ(256, stats.vectorsScored.load());
+  EXPECT_EQ(1, stats.switches.load());
+}
+
+TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests);
+  for (auto ann : {pqAnn(8, 2, 2), rabitqAnn(8), rabitqAnn(8, 4)}) for (bool multi : {false, true}) {
+    CollectionHelper h("main");
+    h.clear();
+    h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+    std::string field = multi ? "emb_vs" : "emb_v";
+    if (multi) installMultiVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
+    else installVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
+    for (int seg = 0; seg < 3; seg++) {
+      for (int i = 0; i < 256; i++) {
+        int id = seg * 256 + i;
+        auto doc = flatdoc("id", std::to_string(id), "keep_s", id % 3 ? "yes" : "no");
+        if (id % 5) {
+          std::vector<float> v{(float)(id + 1), (float)(id % 11), 0, 0};
+          if (multi) doc.emplace_back(field, std::vector<std::vector<float>>{v, {v[0] + 0.5f, 1, 0, 0}});
+          else doc.emplace_back(field, v);
+        }
+        h.index(doc);
+      }
+      if (seg < 2) h.commit({"*"}); else h.commit(); // Include a flat slot.
+    }
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(3u, reader->segments().size());
+    for (int seg = 0; seg < 2; seg++) ASSERT_NE(nullptr, reader->segments()[seg].getAuxReader("vec." + field));
+    ASSERT_EQ(nullptr, reader->segments()[2].getAuxReader("vec." + field));
+    h.deleteByIds({"1", "257"}, UpdateMessage::COMMIT);
+    for (bool filter : {false, true}) for (int parallel : {1, -1}) {
+      std::vector<std::string> expected;
+      std::vector<float> scores;
+      for (bool exact : {true, false}) {
+        KnnQuery::Stats stats;
+        KnnQuery::statsForTests = &stats;
+        KnnQuery::completion = KnnQuery::Completion::FORCE;
+        auto req = localReq(h.getSearchEngine());
+        auto& cur = req->collection("main").topDocs("q");
+        configKnn(cur, field, {0, 0, 0, 0}, 7, 0, 0, exact);
+        if (filter) addMatchFilter(cur, "keep_s", "yes");
+        req->execute(parallel);
+        ASSERT_OK(req);
+        if (exact) { expected = resultIds(*req); scores = resultScores(*req); }
+        else {
+          EXPECT_EQ(expected, resultIds(*req)); EXPECT_EQ(scores, resultScores(*req));
+          ASSERT_EQ(2u, stats.completions.size()) << "ivf=" << stats.plannedIvf << " shape=" << multi << " codec=" << (int)*ann.codec;
+          for (const auto& event : stats.completions) {
+            EXPECT_EQ(1, event.round);
+            EXPECT_EQ(event.entries, stats.segmentWork[(size_t)event.segment].physicalEntries);
+            EXPECT_EQ(event.ivfRounds, stats.segmentWork[(size_t)event.segment].ivfRounds);
+            EXPECT_GT(stats.segmentWork[(size_t)event.segment].exactVectors, 0);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 4), 4);
+  for (int i = 0; i < 512; i++)
+    h.index(flatdoc("id", std::to_string(i), "far_s", i >= 460 ? "yes" : "no",
+        "independent_s", i % 10 == 0 ? "yes" : "no", "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  for (std::string filter : {"far_s", "independent_s", ""}) for (int nprobe : {0, 1}) {
+    KnnQuery::completion = KnnQuery::Completion::AUTO;
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile();
+    auto& cur = req->topDocs("q");
+    configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, nprobe);
+    if (!filter.empty()) addMatchFilter(cur, filter, "yes");
+    req->execute(false);
+    ASSERT_OK(req);
+    if (filter == "far_s" && !nprobe) {
+      ASSERT_EQ(1u, stats.completions.size());
+      EXPECT_EQ(1, stats.completions[0].round);
+      EXPECT_STREQ("marginal", stats.completions[0].reason);
+      EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"460", "461", "462"}));
+      bool diagnosed = false;
+      for (const auto& op : req->responses.back()->proto.profile->ops) for (const auto& piece : op.pieces)
+        for (auto detail : piece.details) diagnosed |= detail.find("completion_round=1;") != std::string_view::npos;
+      EXPECT_TRUE(diagnosed);
+    } else EXPECT_EQ(0, stats.switches.load()) << filter << nprobe;
+  }
+}
+
+TEST_F(KnnQueryTest, completionRetiresBoundedQuotaAndRefillsActiveSlot) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests, KnnQuery::plannerCosts, KnnQuery::selector);
+  KnnQuery::completion = KnnQuery::Completion::AUTO;
+  KnnQuery::selector = KnnPlanner::Selector::FOLD;
+  KnnQuery::plannerCosts.units.fill(0);
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 500;
+  KnnQuery::plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(8, 2, 2), 4);
+  for (int i = 0; i < 128; i++)
+    h.index(flatdoc("id", "a" + std::to_string(i), "keep_s", i == 0 ? "yes" : "no", "emb_vs",
+        std::vector<std::vector<float>>(40, {(float)i + 1, 0, 0, 0})));
+  h.commit({"*"});
+  for (int i = 0; i < 1024; i++)
+    h.index(flatdoc("id", "b" + std::to_string(i), "keep_s", "yes", "emb_vs",
+        std::vector<std::vector<float>>{{1000 + (float)i, 0, 0, 0}}));
+  h.commit({"*"});
+  std::vector<std::string> expected;
+  for (bool exact : {true, false}) {
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, "emb_vs", {0, 0, 0, 0}, 7, 0, 0, exact);
+    addMatchFilter(cur, "keep_s", "yes");
+    req->execute(false);
+    ASSERT_OK(req);
+    if (exact) expected = resultIds(*req);
+    else {
+      EXPECT_EQ(expected, resultIds(*req));
+      ASSERT_EQ(1u, stats.completions.size()) << "ivf=" << stats.plannedIvf << " entries=" << stats.work.physicalEntries
+          << " bitmap=" << stats.work.selectorBitmap << " rounds=" << stats.rounds << " budget=" << stats.initialBudget
+          << " target=" << stats.targetDocs << " reads=" << stats.terminalReads;
+      EXPECT_EQ(0, stats.completions[0].segment);
+      EXPECT_EQ(stats.completions[0].entries, stats.segmentWork[0].physicalEntries);
+      EXPECT_GE(stats.segmentWork[1].seedReads, stats.targetDocs.load());
+      EXPECT_EQ(0, stats.segmentWork[1].exactVectors);
+    }
+  }
+}
+
+TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests, KnnQuery::plannerCosts);
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 1e9; // Preview, but decline every automatic switch.
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 4), 4);
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 512; i++)
+      h.index(flatdoc("id", std::to_string(seg * 512 + i), "keep_s", i >= 460 ? "yes" : "no",
+          "emb_v", std::vector<float>{(float)i + 1 + seg * 0.1f, 0, 0, 0}));
+    h.commit({"*"});
+  }
+  h.deleteByIds({"10", "20", "500", "700"}, UpdateMessage::COMMIT);
+  for (int nprobe : {0, 1}) {
+    std::vector<std::string> expected;
+    std::vector<RecordedVectorRound> baseline;
+    int64_t allocatorEntries = 0;
+    for (auto mode : {KnnQuery::Completion::OFF, nprobe ? KnnQuery::Completion::FORCE : KnnQuery::Completion::AUTO}) {
+      KnnQuery::completion = mode;
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      std::vector<RecordedVectorRound> rounds;
+      EngineWrapperGuard wrapper([&](VectorEngine& engine) { return std::make_unique<RecordingVectorEngine>(engine, rounds); });
+      auto req = localReq(h.getSearchEngine());
+      auto& cur = req->collection("main").topDocs("q");
+      configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, nprobe);
+      addMatchFilter(cur, "keep_s", "yes");
+      req->execute(false);
+      ASSERT_OK(req);
+      EXPECT_EQ(0, stats.switches.load());
+      if (mode == KnnQuery::Completion::OFF) {
+        expected = resultIds(*req); baseline = rounds; allocatorEntries = stats.work.allocatorEntries;
+        if (!nprobe) { EXPECT_GT(rounds.size(), 1u); }
+      } else {
+        EXPECT_EQ(expected, resultIds(*req));
+        ASSERT_EQ(baseline.size(), rounds.size());
+        EXPECT_EQ(allocatorEntries, stats.work.allocatorEntries);
+        for (size_t r = 0; r < rounds.size(); r++) {
+          EXPECT_EQ(baseline[r].kind, rounds[r].kind);
+          EXPECT_EQ(baseline[r].target, rounds[r].target);
+          EXPECT_EQ(baseline[r].result.work.listSetups, rounds[r].result.work.listSetups);
+          EXPECT_EQ(baseline[r].result.work.physicalEntries, rounds[r].result.work.physicalEntries);
+          EXPECT_EQ(baseline[r].result.work.selectorPasses, rounds[r].result.work.selectorPasses);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(KnnQueryTest, completionIgnoresOverlayWithNoLiveVectors) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests);
+  KnnQuery::completion = KnnQuery::Completion::FORCE;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 1), 4);
+  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  std::vector<std::string> deleted;
+  for (int i = 0; i < 256; i++) {
+    auto doc = flatdoc("id", "a" + std::to_string(i));
+    if (i % 2 == 0) {
+      doc.emplace_back("emb_v", std::vector<float>{(float)i, 0, 0, 0});
+      deleted.push_back("a" + std::to_string(i));
+    }
+    h.index(doc);
+  }
+  h.commit({"*"});
+  for (int i = 0; i < 256; i++)
+    h.index(flatdoc("id", "b" + std::to_string(i), "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  h.deleteByIds(deleted, UpdateMessage::COMMIT);
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto* req = makeKnnReq(*luxirNode, "emb_v", {0, 0, 0, 0}, 3);
+  req->execute(false);
+  EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"b0", "b1", "b2"}));
+  req->done();
+  ASSERT_EQ(1u, stats.completions.size());
+  EXPECT_EQ(1, stats.completions[0].segment);
+  EXPECT_EQ(1, stats.slotsBuilt.load());
+  EXPECT_EQ(0, stats.segmentWork[0].physicalEntries);
+  EXPECT_EQ(0, stats.segmentWork[0].exactVectors);
+}

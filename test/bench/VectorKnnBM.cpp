@@ -1037,9 +1037,10 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     builtCodec = codec;
   }
-  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::routing, KnnQuery::selector);
+  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::routing, KnnQuery::selector, KnnQuery::completion);
   KnnQuery::routing = (KnnQuery::Routing)state.range(4);
   KnnQuery::selector = (KnnPlanner::Selector)state.range(5);
+  KnnQuery::completion = (KnnQuery::Completion)state.range(6);
   KnnQuery::filteredCoverageAlpha = (double)state.range(3) / 100;
   auto run = [&](int q, bool exact, std::vector<std::string>& ids) {
     auto req = localReq(helper.getSearchEngine());
@@ -1127,6 +1128,7 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   state.counters["work_resolveMono"] = stats.work.resolveMono / queries;
   state.counters["work_bitProbes"] = stats.work.bitProbes / queries;
   state.counters["work_allocatorEntries"] = stats.work.allocatorEntries / queries;
+  state.counters["switches"] = stats.switches.load() / queries;
   state.counters["work_foldDocs"] = stats.work.foldDocs / queries;
   state.counters["work_foldWords"] = stats.work.foldWords / queries;
   state.counters["folded_eligible"] = stats.foldedEligible.load() / queries;
@@ -1297,23 +1299,26 @@ TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segmen
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
-LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector"})
+LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
     ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selectivity : {100, 1000})
-        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50, 0, 0});
+        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50, 0, 0, 0});
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selector : {1, 2})
-        b->Args({codec, 1000, 0, 50, 1, selector});
+        b->Args({codec, 1000, 0, 50, 1, selector, 1});
+      for (int codec : {PQ, RABITQ2, RABITQ1}) b->Args({codec, 1000, 2, 50, 1, 0, 0});
     });
 
-TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector"})
+TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
     ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1})
         for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
           for (int correlation : {0, 1, 2, 3}) {
-            for (int alpha : {0, 25, 50, 100}) b->Args({codec, selectivity, correlation, alpha, 1, 0});
-            b->Args({codec, selectivity, correlation, 50, 0, 0});
-            b->Args({codec, selectivity, correlation, 50, 2, 0});
-            for (int selector : {1, 2}) b->Args({codec, selectivity, correlation, 50, 1, selector});
+            for (int alpha : {0, 25, 50, 100}) b->Args({codec, selectivity, correlation, alpha, 1, 0, 1});
+            b->Args({codec, selectivity, correlation, 50, 0, 0, 0});
+            b->Args({codec, selectivity, correlation, 50, 0, 0, 1});
+            b->Args({codec, selectivity, correlation, 50, 1, 0, 0});
+            b->Args({codec, selectivity, correlation, 50, 2, 0, 0});
+            for (int selector : {1, 2}) b->Args({codec, selectivity, correlation, 50, 1, selector, 1});
           }
     });
 

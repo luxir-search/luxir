@@ -978,3 +978,73 @@ TEST_F(GroupKnnTest, filteredWidenFoldsBothChannels) {
     }
   }
 }
+
+TEST_F(GroupKnnTest, forcedCompletionMatchesExactWithSharedKeys) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests);
+  for (auto ann : {pqAnn(8, 2, 2), rabitqAnn(8), rabitqAnn(8, 4)}) {
+    CollectionHelper h("main");
+    h.clear();
+    schema(h, api::VectorMetric::L2, ann);
+    for (int seg = 0; seg < 2; seg++) {
+      for (int i = 0; i < 160; i++) {
+        int id = seg * 160 + i;
+        h.index(flatdoc("id", std::to_string(id), "key_s", std::to_string(i % 17),
+            "keep_s", i % 3 ? "yes" : "no", "vec_vs", std::vector<std::vector<float>>{
+                {(float)id + 1.1f, 0, 0, 0}, {(float)id + 1, 0, 0, 0}}));
+      }
+      h.commit({"*"});
+    }
+    h.deleteByIds({"1", "162"}, UpdateMessage::COMMIT);
+    for (bool filtered : {false, true}) for (int parallel : {1, -1}) {
+      std::string prefix = R"("limit":-1,"collapse":"key_s",)"
+          + std::string(filtered ? R"("filter":["keep_s:yes"],)" : "") + R"("query":)";
+      auto expected = rows(*run("main", prefix + knn(7, true)));
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      KnnQuery::completion = KnnQuery::Completion::FORCE;
+      EXPECT_EQ(expected, rows(*run("main", prefix + knn(7, true, false), parallel)));
+      ASSERT_EQ(2u, stats.completions.size());
+      for (const auto& event : stats.completions)
+        EXPECT_EQ(event.entries, stats.segmentWork[(size_t)event.segment].physicalEntries);
+      KnnQuery::statsForTests = nullptr;
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, completionReopensEvictedActiveMembers) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::completion, KnnQuery::statsForTests, KnnQuery::plannerCosts, KnnQuery::selector);
+  KnnQuery::completion = KnnQuery::Completion::AUTO;
+  KnnQuery::selector = KnnPlanner::Selector::FOLD;
+  KnnQuery::plannerCosts.units.fill(0);
+  KnnQuery::plannerCosts.units[KnnPlanner::EXACT_DIM] = 500;
+  KnnQuery::plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
+  CollectionHelper h("main");
+  schema(h, api::VectorMetric::L2, pqAnn(8, 2, 2));
+  for (int i = 0; i < 128; i++)
+    h.index(flatdoc("id", "a" + std::to_string(i), "key_s", "0", "keep_s", i == 0 ? "yes" : "no",
+        "vec_vs", std::vector<std::vector<float>>(40, {i == 0 ? 1.0f : 10000 + (float)i, 0, 0, 0})));
+  h.commit({"*"});
+  for (int i = 0; i < 1024; i++)
+    h.index(flatdoc("id", "b" + std::to_string(i), "key_s", std::to_string(i % 7), "keep_s", "yes",
+        "vec_vs", std::vector<std::vector<float>>{{1000 + (float)i, 0, 0, 0}}));
+  h.commit({"*"});
+  std::string prefix = R"("limit":-1,"collapse":"key_s","filter":["keep_s:yes"],"query":)";
+  auto expected = rows(*run("main", prefix + knn(3, true)));
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto actual = run("main", prefix + knn(3, true, false));
+  EXPECT_EQ(expected, rows(*actual));
+  ASSERT_EQ(1u, stats.completions.size()) << "ivf=" << stats.plannedIvf << " entries=" << stats.work.physicalEntries
+      << " bitmap=" << stats.work.selectorBitmap << " rounds=" << stats.rounds << " budget=" << stats.initialBudget
+      << " target=" << stats.targetDocs << " reads=" << stats.terminalReads;
+  EXPECT_EQ(0, stats.completions[0].segment);
+  EXPECT_GT(stats.completions[0].round, 1);
+  EXPECT_STREQ("cumulative", stats.completions[0].reason);
+  EXPECT_EQ(stats.completions[0].entries, stats.segmentWork[0].physicalEntries);
+  EXPECT_GT(stats.segmentWork[1].depthEntries, 0);
+  EXPECT_EQ(0, stats.segmentWork[1].exactVectors);
+}
