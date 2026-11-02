@@ -6,6 +6,7 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,6 +22,7 @@ namespace luxir {
 
 class PostingsReader;
 class FieldReader;
+class SegmentSummary;
 class TermsEnum;
 class DocsEnum;
 
@@ -36,6 +38,10 @@ class PostingsReader {
   // spilled filesystem/object-store keys stable.
   std::vector<std::shared_ptr<InputFile>> files;
   std::vector<InputStream> inputStreams;
+  // The segment's summary sidecar, when the opener had a valid one: header
+  // facts it records (column bounds) are taken from it instead of the
+  // segment's data files. Null proves nothing; the data files answer.
+  std::shared_ptr<const SegmentSummary> summary;
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
   VersionRuns versions;
@@ -54,18 +60,23 @@ public:
     struct ColumnBounds {
       int64_t min, max;
     };
+    // From the segment summary when it records them, else from the column
+    // header; opening a field never reads column data when the summary has them.
     std::optional<ColumnBounds> columnBounds;
-    // Field-sort planning reads every segment's leaf bounds. Keep the view
-    // with the header rather than rebuilding it for each request.
-    std::optional<NumColumnFormat::LeafMeta> leafMeta;
     std::unique_ptr<const StoredFieldsMetadata> stored;
+    // Field-sort planning reads every segment's leaf bounds. Keep the view
+    // with the header rather than rebuilding it for each request; it is built
+    // on first use, which reads the column header.
+    PostingsReader* reader = nullptr;
+    mutable std::once_flag leafMetaOnce;
+    mutable std::optional<NumColumnFormat::LeafMeta> leafMeta;
 
     size_t allocatedBytes() const {
       return sizeof(*this) + (stored ? stored->allocatedBytes() : 0);
     }
-    const NumColumnFormat::LeafMeta* numericLeafMeta() const noexcept {
-      return leafMeta ? &*leafMeta : nullptr;
-    }
+    // Null when the field has no leaf-bounded numeric column. May throw on
+    // the first call when the column header cannot be read.
+    const NumColumnFormat::LeafMeta* numericLeafMeta() const;
   };
 
   // used as a sentinel value for docs and positions iterators in a single segment.
@@ -89,7 +100,10 @@ public:
   // Static factory method to create PostingsReader with optional handling of missing files.
   // Returns nullptr if missingFileOK=true and any required files are missing.
   // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
-  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false, bool expectSynced = false);
+  // `summary`, when given, must be the segment's own (seg_id and max_doc checked).
+  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false,
+                                                bool expectSynced = false,
+                                                std::shared_ptr<const SegmentSummary> summary = nullptr);
 
   explicit PostingsReader(Directory& dir, uint64_t segId);
   ~PostingsReader();
@@ -102,6 +116,8 @@ private:
 
   // Initialize from files, returns false if missing files and missingFileOK=true
   bool initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced = false);
+  // The column bounds the summary records for `field`, if any.
+  std::optional<Field::ColumnBounds> summaryColumnBounds(const Field& field) const;
 
 public:
 

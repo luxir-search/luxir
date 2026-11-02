@@ -3,6 +3,7 @@
 
 #include "luxir/reader/FieldReader.h"
 #include "luxir/index/PostingsWriter.h"
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
 #include "test/LuxirTest.h"
@@ -259,6 +260,43 @@ TEST_F(FieldMetadataTest, columnBoundsIncludeSparseAndMultipleValues) {
     EXPECT_EQ(low, field->columnBounds->min);
     EXPECT_EQ(high, field->columnBounds->max);
   }
+}
+
+TEST_F(FieldMetadataTest, columnBoundsComeFromTheSummary) {
+  test::CollectionHelper helper;
+  helper.index(test::flatdoc("id", "one", "dense_i", INT64_MIN + 5,
+      "sparse_i", -4, "multi_is", std::vector<int64_t>{-100, 300}), UpdateMessage::NO_COMMIT);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "two", "dense_i", INT64_MAX - 7,
+      "multi_is", std::vector<int64_t>{4, 4}), UpdateMessage::COMMIT).success);
+  auto writer = helper.getIndexWriter();
+  uint64_t segId = writer->snapshots.readers.getReader()->segments()[0].segInfo.seg_id;
+  auto summary = SegmentSummary::open(writer->dir, SegmentSummary::overlayFileName(segId));
+  ASSERT_NE(nullptr, summary);
+
+  // The summary's bounds are the column's own.
+  auto fromColumn = PostingsReader::create(writer->dir, segId);
+  auto fromSummary = PostingsReader::create(writer->dir, segId, false, false, summary);
+  for (auto name : {"dense_i", "sparse_i", "multi_is"}) {
+    auto* expected = fromColumn->fieldInfo(name);
+    auto* actual = fromSummary->fieldInfo(name);
+    ASSERT_TRUE(expected->columnBounds && actual->columnBounds) << name;
+    EXPECT_EQ(expected->columnBounds->min, actual->columnBounds->min) << name;
+    EXPECT_EQ(expected->columnBounds->max, actual->columnBounds->max) << name;
+  }
+
+  // The column is not consulted when the summary records them; a record of
+  // another type is not the field's and the column answers.
+  std::vector<api::FieldSummary> records(summary->fields().begin(), summary->fields().end());
+  for (auto& record : records) {
+    if (record.fieldname == "dense_i") record.num_min = 1, record.num_max = 2;
+    if (record.fieldname == "sparse_i") record.type = (uint32_t)FieldType::TEXT;
+  }
+  auto crafted = PostingsReader::create(writer->dir, segId, false, false,
+                                        SegmentSummary::fromAggregate(records, true));
+  EXPECT_EQ(1, crafted->fieldInfo("dense_i")->columnBounds->min);
+  EXPECT_EQ(2, crafted->fieldInfo("dense_i")->columnBounds->max);
+  EXPECT_EQ(-4, crafted->fieldInfo("sparse_i")->columnBounds->min);
+  EXPECT_EQ(-4, crafted->fieldInfo("sparse_i")->columnBounds->max);
 }
 
 TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {

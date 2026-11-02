@@ -133,9 +133,12 @@ class SegmentBase : public SegmentPart<PostingsReader> {
 public:
   const uint64_t segId;
   const int32_t maxDoc;
-  SegmentBase(uint64_t segId, int32_t maxDoc, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+  const std::shared_ptr<const SegmentSummary> summary;  // handed to the reader it opens; may be null
+  SegmentBase(uint64_t segId, int32_t maxDoc, std::unique_ptr<HeldFiles> files,
+              std::shared_ptr<const SegmentSummary> summary, std::shared_ptr<Metrics> metrics,
               std::shared_ptr<const UnreadableHook> onUnreadable)
-      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), maxDoc(maxDoc) {}
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), maxDoc(maxDoc),
+        summary(std::move(summary)) {}
   SegmentBase(uint64_t segId, int32_t maxDoc, std::shared_ptr<PostingsReader> opened)
       : SegmentPart(std::move(opened)), segId(segId), maxDoc(maxDoc) {}
   std::shared_ptr<PostingsReader> get();

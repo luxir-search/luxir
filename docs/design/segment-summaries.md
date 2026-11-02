@@ -358,6 +358,17 @@ pruned segments changes which plan, and which cache admissions, it picks,
 so it is left for the per-node enforcement work. Planning never reads
 overlays.
 
+Such a base open decodes the field's catalog entry, not its column. The
+base takes the segment's summary when it opens, and a numeric field's
+column bounds (`PostingsReader::Field::columnBounds`, which count shortcuts
+and facet range sizing read) come from the summary record; they are the
+column writer's own minimum and maximum, so they equal the column header's.
+Only a field without a numeric record, or a reader opened without a
+summary (one handed over by the writer, a direct open), reads the column
+header. The column's leaf metadata (`numericLeafMeta`, for field-sort
+planning) is built on its first use. On a backend that fetches bytes on
+first touch, planning a numeric count thus fetches no column data.
+
 First-use fallbacks remain for paths that need a segment outside that
 point, each materializing only the part it touches:
 
