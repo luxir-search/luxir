@@ -23,6 +23,9 @@ namespace {
 
 void requireNumeric(std::span<const ResolvedValue> args) {
   for (const ResolvedValue& arg : args) {
+    if (arg.nature == ValueNature::GEO_POINT) {
+      throw std::runtime_error("GEO_POINT is not numeric; use geo_distance()");
+    }
     if (arg.type == ValueType::COLUMN_ONLY) {
       throw std::runtime_error(
           "a non-numeric column is only valid as the complete sort expression");
@@ -209,7 +212,7 @@ ResolvedValue randomResolve(std::span<const ResolvedValue> args) {
 }
 
 ResolvedValue geoDistanceResolve(std::span<const ResolvedValue> args) {
-  requireNumeric(args);
+  requireNumeric(args.subspan(1));
   return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
           ValueNature::NUMBER};
 }
@@ -832,6 +835,11 @@ ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
 
 double constantNumber(const ValueNode& node) {
   return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
+}
+
+void validateGeoDistance(std::span<const ValueNode* const> args) {
+  geo::checkLatitude(constantNumber(*args[1]));
+  geo::checkLongitude(constantNumber(*args[2]));
 }
 
 double geoMeters(BoundValueProgram& program, const ValueNode& node, int64_t packed) {
@@ -1506,6 +1514,8 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 }
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+constexpr ValueFunction::Operand GEO_POINT{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
 constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
 constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
 constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
@@ -1594,7 +1604,8 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
      randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
-     evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3, {RAW, RAW, RAW}, nullptr},
+     evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3,
+     {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, validateGeoDistance},
 };
 
 consteval std::string_view unsetOperandUnitFunction() {
@@ -1649,6 +1660,19 @@ static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunc
 
 } // namespace
 
+ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args) const {
+  for (size_t i = 0; i < args.size(); i++) {
+    if (operands[i].kind == Kind::GEO_POINT) {
+      if (args[i].nature != ValueNature::GEO_POINT) {
+        throw std::runtime_error(fmt::format("argument {} is not a GEO_POINT value", i + 1));
+      }
+    } else {
+      requireNumeric(args.subspan(i, 1));
+    }
+  }
+  return resolve(args);
+}
+
 ValueBounds ValueFunction::bounds(
     const ValueNode& node, std::span<const ValueBounds> args) const {
   for (size_t i = 0; i < args.size(); i++) {
@@ -1697,7 +1721,7 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
   for (const ValueFunction& function : FUNCTIONS) {
     if (function.minArity > 1 || function.maxArity < 1) continue;
     try {
-      ResolvedValue resolved = function.resolve(array);
+      ResolvedValue resolved = function.resolveOperands(array);
       if (!valueArray(resolved.type)
           && resolved.type != ValueType::COLUMN_ONLY) {
         names.push_back(function.name);

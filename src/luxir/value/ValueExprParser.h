@@ -18,7 +18,6 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/util/Cursor.h"
-#include "luxir/util/geo.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
 #include "luxir/value/ValueExpr.h"
@@ -141,6 +140,9 @@ public:
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
+    if (program->root().nature == ValueNature::GEO_POINT) {
+      fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance()");
+    }
     program->constantScalar = constants.scalar(program->rootNode);
     return program;
   }
@@ -307,7 +309,8 @@ private:
     bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
                    field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
     bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING;
-    if (!numeric && !stringSortable) fail(pos, fmt::format("field '{}' is not sortable", name));
+    bool geo = field->type() == FieldType::GEO_POINT;
+    if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));
     if (!field->hasColumn()) {
       fail(pos, fmt::format("field '{}' has no column values", name));
     }
@@ -317,7 +320,7 @@ private:
     node.columnType = field->type();
     node.columnMultiValued = field->multiValued();
     node.columnIndexed = field->indexed();
-    if (!numeric) {
+    if (!numeric && !geo) {
       node.type = ValueType::COLUMN_ONLY;
     } else {
       bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
@@ -326,7 +329,7 @@ private:
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->type() == FieldType::DATE
           ? dateValueNature(DateFieldType::unitOf(*field))
-          : ValueNature::NUMBER;
+          : geo ? ValueNature::GEO_POINT : ValueNature::NUMBER;
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
@@ -336,7 +339,6 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
-    if (name == "geo_distance") return parseGeoDistance(grammar, pos);
     if (name == "gauss" || name == "linear" || name == "exp") {
       return parseDecayOrExp(grammar, name, pos);
     }
@@ -414,10 +416,15 @@ private:
     node.sourcePos = pos;
     node.text = function->name;
     try {
-      ResolvedValue resolved = function->resolve(
+      ResolvedValue resolved = function->resolveOperands(
           std::span<const ResolvedValue>(resolvedArgs.data(), count));
       node.type = resolved.type;
       node.nature = resolved.nature;
+      if (function->validate != nullptr) {
+        std::array<const ValueNode*, VALUE_MAX_ARITY> operands{};
+        for (uint8_t i = 0; i < count; i++) operands[i] = &program->nodes[args[i]];
+        function->validate({operands.data(), count});
+      }
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
@@ -471,60 +478,6 @@ private:
   uint32_t call(std::string_view name, size_t pos,
                 std::initializer_list<uint32_t> children) {
     return makeFunction(name, pos, std::span<const uint32_t>(children.begin(), children.size()));
-  }
-
-  // geo_distance(field, lat, lon): meters from (lat, lon) to each point of a
-  // GEO_POINT field, by the haversine formula geo_distance queries use.
-  template <class Grammar>
-  uint32_t parseGeoDistance(Grammar& grammar, size_t pos) {
-    std::array<uint32_t, VALUE_MAX_ARITY> args{};
-    grammar.parseArguments("geo_distance", pos, 3, 3, [&](uint8_t argument) {
-      if (argument != 0) {
-        args[argument] = grammar.parseExpression();
-        return;
-      }
-      cur->skipWs();
-      size_t fieldPos = cur->position();
-      std::string_view name = cur->peek() == '"' || cur->peek() == '\''
-          ? value::lex::scanQuoted(
-                *cur, program->resource,
-                [&](size_t at, std::string_view message) { fail(at, message); })
-          : value::lex::scanIdentifier(*cur);
-      if (name.empty()) fail(fieldPos, "geo_distance() expects a GEO_POINT field name first");
-      args[0] = parseGeoColumn(name, fieldPos);
-    });
-    double latitude = constantArg(args[1], "geo_distance", "latitude");
-    double longitude = constantArg(args[2], "geo_distance", "longitude");
-    try {
-      geo::checkLatitude(latitude);
-      geo::checkLongitude(longitude);
-    } catch (const std::invalid_argument& error) {
-      fail(pos, fmt::format("geo_distance(): {}", error.what()));
-    }
-    return appendFunction(ValueFunctionRegistry::find("geo_distance"), pos, args, 3);
-  }
-
-  uint32_t parseGeoColumn(std::string_view name, size_t pos) {
-    ResolvedFieldHandle target;
-    try {
-      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
-          : opts.schema->resolveFor(name, OpClass::VALUE);
-    } catch (const RequestError& e) {
-      fail(pos, e.what());
-    }
-    FieldType* field = target.fieldType;
-    if (field->type() != FieldType::GEO_POINT || !field->hasColumn()) {
-      fail(pos, fmt::format("geo_distance(): field '{}' is not a GEO_POINT field with column values",
-                            name));
-    }
-    ValueNode node;
-    node.kind = ValueNodeKind::COLUMN;
-    node.columnType = FieldType::GEO_POINT;
-    node.columnMultiValued = field->multiValued();
-    node.type = field->multiValued() ? ValueType::INT64_ARRAY : ValueType::INT64;
-    node.sourcePos = pos;
-    node.text = program->copyString(target.physicalName);
-    return append(node);
   }
 
   // Elasticsearch decay functions over a numeric, DATE, or geo_distance()

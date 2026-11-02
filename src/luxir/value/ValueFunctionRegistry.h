@@ -55,12 +55,15 @@ inline constexpr size_t VALUE_MAX_ARITY = 3;
 
 struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
+  enum class Kind : uint8_t { NUMERIC, GEO_POINT };
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
     bool lazy = false;
     bool constant = false;
+    Kind kind = Kind::NUMERIC;
   };
 
+  using Validate = void (*)(std::span<const ValueNode* const> args);
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                     int32_t docid, float score);
@@ -87,6 +90,9 @@ struct ValueFunction {
   uint8_t maxArity = 0;
   std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
+  Validate validate = nullptr;
+
+  ResolvedValue resolveOperands(std::span<const ResolvedValue> args) const;
 
   // Strict INVALID operands make the result INVALID; only lazy operands reach
   // boundsPropagate possibly INVALID.

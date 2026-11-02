@@ -33,11 +33,13 @@ enum class ValueNature : uint8_t {
   NUMBER,
   DATE_MS,
   DATE_NS,
+  GEO_POINT,
 };
 
 inline std::string_view valueNatureName(ValueNature nature) {
   switch (nature) {
     case ValueNature::NUMBER: return "number";
+    case ValueNature::GEO_POINT: return "GEO_POINT";
     case ValueNature::DATE_MS: return "DATE unit 'ms'";
     case ValueNature::DATE_NS: return "DATE unit 'ns'";
   }
