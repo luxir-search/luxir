@@ -148,7 +148,7 @@ TEST_F(FunctionScoreTest, randomIsDeterministicPerSeedAndValue) {
   EXPECT_EQ(first, eval("random(42, x_i)"));
   EXPECT_NE(first, eval("random(43, x_i)"));
   EXPECT_FALSE(first[2].has_value());
-  for (std::string_view expression : {"random()", "random(7)", "random(42, x_i)"}) {
+  for (std::string_view expression : {"random()", "random(42, x_i)"}) {
     for (auto value : eval(expression)) {
       if (!value) continue;
       EXPECT_GE(*value, 0.0) << expression;
@@ -156,13 +156,58 @@ TEST_F(FunctionScoreTest, randomIsDeterministicPerSeedAndValue) {
       EXPECT_EQ(*value, (double)(float)*value) << expression;
     }
   }
-  EXPECT_EQ(eval("random(5)"), eval("random(5)"));
+  EXPECT_EQ(eval("random(5, x_i)"), eval("random(5, x_i)"));
   EXPECT_EQ(eval("random(1000 * 60, x_i)"), eval("random(60000, x_i)"));
   EXPECT_EQ(eval("random(0 - 5, x_i)"), eval("random(-5, x_i)"));
   EXPECT_EQ(eval("random(if(0, 3, 7), x_i)"), eval("random(7, x_i)"));
   expectParseError("random(x_i, x_i)", "argument 1 must be a constant numeric scalar");
   expectParseError("random(log(-1), x_i)", "argument 1 must be a constant numeric scalar");
-  expectParseError("random(1.5)", "must be an integer");
+  expectParseError("random(1.5, x_i)", "must be an integer");
+  expectParseError("random(5)", "docids are not stable across merges");
+  for (auto expression : {"random(5, vals_ds)", "random(5, x_i + 0)", "random(5, 1)",
+                          "random(5, score)", "random(5, _docid_)"}) {
+    expectParseError(expression, "key must be a scalar numeric column");
+  }
+  expectParseError("random(5, id_s)", "non-numeric column");
+  auto* unseeded = parse("random()");
+  auto* bound = unseeded->bind(pool, reader->segments()[0], unseeded->resolveFields(pool, *reader));
+  EXPECT_DOUBLE_EQ(bound->evalPoint(0, 0).doubleValue, bound->evalPoint(0, 0).doubleValue);
+}
+
+TEST_F(FunctionScoreTest, randomKeysUseNativeBitsWithoutOtherSalts) {
+  CollectionHelper h("random_keys");
+  ASSERT_TRUE(h.indexAll({
+      flatdoc("id", "a", "key_i", INT64_C(9007199254740992), "copy_i", INT64_C(9007199254740992),
+              "key_d", 0.0, "key_f", 1.0f),
+      flatdoc("id", "b", "key_i", INT64_C(9007199254740993), "copy_i", INT64_C(9007199254740993),
+              "key_d", -0.0, "key_f", 1.0f),
+      flatdoc("id", "c", "key_i", INT64_C(9007199254740992), "copy_i", INT64_C(9007199254740992))},
+      UpdateMessage::COMMIT).success);
+  auto index = h.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = h.collection().getSchema();
+  google::protobuf::Arena arena;
+  MemPool memory;
+  auto values = [&](std::string_view field) {
+    ValueExprOptions options{schema.get(), {}};
+    auto* program = ValueExprParser(options, arena).parse(fmt::format("random(7, {})", field));
+    auto* bound = program->bind(memory, index->segments()[0], program->resolveFields(memory, *index));
+    std::array<ValueResult, 3> results;
+    std::array<int32_t, 3> docs{0, 1, 2};
+    bound->evalBatch(docs, {}, results);
+    for (int32_t doc : docs) EXPECT_EQ(results[doc].valid, bound->evalPoint(doc, 0).valid);
+    return results;
+  };
+  auto integers = values("key_i");
+  auto copies = values("copy_i");
+  EXPECT_NE(integers[0].doubleValue, integers[1].doubleValue);
+  EXPECT_EQ(integers[0].doubleValue, integers[2].doubleValue);
+  for (int i = 0; i < 3; i++) EXPECT_EQ(integers[i].doubleValue, copies[i].doubleValue);
+  auto doubles = values("key_d");
+  EXPECT_NE(doubles[0].doubleValue, doubles[1].doubleValue);
+  EXPECT_FALSE(doubles[2].valid);
+  auto floats = values("key_f");
+  EXPECT_EQ(floats[0].doubleValue, floats[1].doubleValue);
+  EXPECT_FALSE(floats[2].valid);
 }
 
 TEST_F(FunctionScoreTest, integerSeedsPreserveBitsAboveDoublePrecision) {

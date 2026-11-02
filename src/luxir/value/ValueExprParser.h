@@ -5,7 +5,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -423,15 +422,6 @@ private:
       }
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
-    }
-    if (node.opcode == ValueOpcode::RANDOM) {
-      // ES random_score without a seed: a fresh seed for every request.
-      node.intValue = count == 0
-          ? (int64_t)(((uint64_t)std::random_device{}() << 32) | std::random_device{}())
-          : program->nodes[args[0]].intValue;
-      if (count != 0 && program->nodes[args[0]].type != ValueType::INT64) {
-        fail(pos, "random() seed must be an integer constant expression");
-      }
     }
     return append(node);
   }
