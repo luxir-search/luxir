@@ -11,7 +11,7 @@ using namespace luxir;
 namespace {
 KnnPlanner::Segment segment(int64_t eligible = 1000) {
   return {.vectors = 100000, .liveVectors = 100000, .docsWithValue = 100000,
-      .eligibleDocs = eligible, .eligibleVectors = eligible, .domainSize = eligible,
+      .eligibleDocs = eligible, .eligibleVectors = eligible, .domainSize = eligible, .maxDoc = 100000,
       .dims = 128, .nlist = 256, .pqM = 32, .pqBits = 8,
       .codec = KnnPlanner::Codec::PQ, .domain = true, .unfiltered = false, .bounded = true};
 }
@@ -39,7 +39,18 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
   double reads = std::min(boundedDims, req.boundedTarget * physicalDims / std::max((int64_t)1, physicalDocs))
       + coverage * intervalDims * costs.intervalReadFraction;
   double rounds = slots == 0 ? 0 : coverage <= p0 ? 1 : 1 + std::ceil(std::log2(coverage / p0));
-  return costs.requestCost + exact + coverage * linear + fixed + reads * costs.units[KnnPlanner::TERMINAL_DIM]
+  double selectors = 0;
+  for (size_t i = 0; i < segments.size(); i++) if ((mask >> i & 1) && KnnPlanner::canIvf(segments[i])) {
+    const auto& s = segments[i];
+    if (s.unfiltered) continue;
+    double fold = costs.price(KnnPlanner::foldWork(s));
+    bool folded = KnnPlanner::foldFirst(s, p0, req.selector, costs);
+    if (coverage > p0 && KnnPlanner::borrowDomain(s) && s.bounded)
+      selectors += ((s.vectors + 63) / 64) * costs.units[KnnPlanner::FOLD_WORD];
+    selectors += (folded || coverage > p0 ? fold : 0)
+        + (folded ? 0 : KnnPlanner::predictedChecks(s, p0) * (KnnPlanner::resolveCost(s, costs) - costs.units[KnnPlanner::ENTRY_BITMAP]));
+  }
+  return costs.requestCost + selectors + exact + coverage * linear + fixed + reads * costs.units[KnnPlanner::TERMINAL_DIM]
       + slots * rounds * costs.units[KnnPlanner::ROUND];
 }
 }
@@ -48,11 +59,12 @@ TEST(KnnPlannerTest, substitutionMustLowerWholeConfiguration) {
   // A local substitution raises coverage on the other slot. Keep all-IVF
   // when that increase costs more than the local saving.
   std::vector<KnnPlanner::Segment> segments{segment(500), segment(1000)};
-  KnnPlanner::Request req{.k = 20, .boundedTarget = 300, .referenceBreadth = 1024, .alpha = 0};
+  KnnPlanner::Request req{.k = 20, .boundedTarget = 300, .referenceBreadth = 1024, .alpha = 0, .selector = KnnPlanner::Selector::RESOLVE};
   KnnPlanner::Costs costs;
   costs.units.fill(0);
   costs.units[KnnPlanner::EXACT_DIM] = 1;
   costs.units[KnnPlanner::ENTRY_NONE] = 0;
+  costs.units[KnnPlanner::ENTRY_BITMAP] = 3.3;
   costs.units[KnnPlanner::BIT_PROBE] = 3.3;
   costs.units[KnnPlanner::PQ_SUBCODE] = 1;
   auto plan = KnnPlanner::choose(segments, req, costs);
@@ -83,7 +95,8 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
         int64_t vectors = adversarial ? i < small ? 1000 + random() % 4000 : 100000 + random() % 900000
             : std::array<int64_t, 3>{1000, 10000, 100000}[random() % 3];
         auto s = segment(1 + random() % (adversarial && i < small ? std::min(vectors, target) : vectors));
-        s.vectors = s.liveVectors = s.docsWithValue = vectors;
+        s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = vectors;
+        s.domainSize = s.eligibleDocs;
         s.dims = dims; s.nlist = 16 << (random() % 5);
         s.arrayDomain = random() % 2; s.sparse = random() % 2;
         if (adversarial ? i >= small : random() % 4 == 0) {
@@ -205,4 +218,30 @@ TEST(KnnPlannerTest, pinnedSharedPoolWithUnequalMultiplicity) {
     auto result = KnnPlanner::choose(segments, req, costs);
     ASSERT_NEAR(result.cost, best, best * 1e-12 + 1e-7) << trial;
   }
+}
+
+TEST(KnnPlannerTest, selectorCrossoverAndDeepenCost) {
+  auto s = segment(25000);
+  s.sparse = true;
+  KnnPlanner::Costs costs;
+  KnnPlanner::Request req;
+  auto price = KnnPlanner::price(s, req, costs);
+  KnnPlanner::SelectorSums sums(std::span(&price, 1));
+  sums.add(0, price, 1);
+  ASSERT_GT(price.foldThreshold, 0);
+  ASSERT_LT(price.foldThreshold, 1);
+  for (double p : {price.foldThreshold * 0.5, price.foldThreshold, price.foldThreshold * 2}) {
+    EXPECT_EQ(p > price.foldThreshold, KnnPlanner::foldFirst(s, p, req.selector, costs));
+    for (bool deepen : {false, true}) {
+      KnnPlanner::Effort effort{p, deepen ? 1 : p, 1};
+      EXPECT_NEAR(KnnPlanner::selectorCost(price, p, deepen), sums.cost(effort), 1e-7);
+    }
+  }
+  s.sparse = false;
+  EXPECT_TRUE(KnnPlanner::foldFirst(s, 0, req.selector, costs));
+  EXPECT_EQ(0, costs.price(KnnPlanner::foldWork(s)));
+  s.multi = true; s.domainSize = 99999;
+  EXPECT_EQ(1, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
+  s.arrayDomain = true;
+  EXPECT_EQ(99999, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
 }

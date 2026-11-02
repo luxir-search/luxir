@@ -385,7 +385,8 @@ fill and the remaining document-unit obligation, capped at one. Explicit
 independent of centroid order; large multi-valued domains retain their explicit
 eligible-vector estimate. Group diversity is not predicted from doc counts.
 
-Each IVF slot has an affine scan price `coverage * A + B`. Global terms add
+Each IVF slot has a scan price `coverage * A + B`, with a piecewise selector
+correction for resolving the first round or folding its domain. Global terms add
 terminal reads and IVF slot-round overhead. Walk and terminal dimensions have
 separate costs; RaBitQ list setup scales with dimensions, while PQ list setup
 has its own coefficient. Predicted rounds are one at initial coverage, otherwise
@@ -403,9 +404,10 @@ The planner compares all-IVF and all-exact with forward substitution sweeps
 from three seeds: all-IVF, every bounded segment exact, and every interval
 segment exact. Only strict drops in total cost are accepted. Identical seeds
 are skipped. The channel seeds handle the coverage drop when the last bounded
-slot leaves. Running sums make trials constant-time; sorting costs
-O(segments log segments). Pinned effort is optimized exactly by separately
-minimizing the two additive objectives of the capped bounded terminal term.
+slot leaves. Scalar running sums price the additive work. Prefix sums over
+selector crossover fractions price each trial in O(log segments); the whole
+search remains O(segments log segments). Pinned effort is optimized exactly by
+separately minimizing the two additive objectives of the capped bounded terminal term.
 Ties retain IVF. The adaptive search is a heuristic, tested against exhaustive
 search; it is not a global optimizer. Reverse and single-flip passes remain
 available to tests for comparing search quality and cost. `exact:true`
@@ -419,6 +421,26 @@ forced exact modes (0/1/2), with raw counters and cost features for calibration.
 Size-weighted array probes count calls times `bit_width(domain size)`, not
 instrumented comparisons in the DocSet search. The model does not try to fit
 the nonlinear misprediction cost of large array-domain probes.
+
+Filtered IVF round one chooses resolution or a rank-domain bitmap when
+`predicted_checks * (resolve_cost - bitmap_cost)` exceeds the fold cost. Planning
+and execution share the rule and predict checks as coverage times physical
+vectors. Dense single-valued bitset domains already are rank bitmaps and are
+borrowed without allocation. Other folds map doc IDs through forward column
+cursors; arrays walk members, bitsets use the smaller of members and nonmembers.
+Multi-valued docs contribute their full vector ranges.
+
+Every deepen folds filtered domains, including interval-only breadth widening.
+Pooled ranks are then cleared, so subsequent scans use one bitmap probe without
+resolving IDs. Borrowed words are copied only on the first pooled clear. Original
+and remaining rank cardinalities stay separate. Bitmap backing uses ordinary
+query-local vector storage, like bounded pooled exclusions; it is not charged to
+the interval collector's request-memory tracker. Fold counters count mapped docs
+and initialized/copied words; `selectorBitmap` counts rank probes. Provisional
+costs are 3 ns per fold doc (plus sparse/multi mapping), 0.5 ns per word and
+0.75 ns per rank probe. The benchmark's `selector` seam selects AUTO, RESOLVE or
+FOLD (0/1/2) for round one only; all modes fold on deepen. Later-round pricing
+adds the fold and any copy needed for borrowed bounded domains.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment

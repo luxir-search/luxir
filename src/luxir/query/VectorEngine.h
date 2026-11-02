@@ -26,6 +26,9 @@ struct VectorSearchWork {
   // arraySteps is resolve calls times bit_width(domain card), a size-weighted
   // probe count, not instrumented comparisons inside the DocSet search.
   int64_t bitProbes = 0, arraySteps = 0, allocatorEntries = 0;
+  // Fold mapping includes nonmembers visited by the complement walk.
+  // Words count bitmap initialization/copy traffic, not pooled-bit clears.
+  int64_t foldDocs = 0, foldWords = 0;
 
   VectorSearchWork& operator+=(const VectorSearchWork& other) {
     listSetups += other.listSetups;
@@ -50,6 +53,7 @@ struct VectorSearchWork {
     resolveIdentity += other.resolveIdentity; resolveSelect += other.resolveSelect; resolveMono += other.resolveMono;
     bitProbes += other.bitProbes; arraySteps += other.arraySteps;
     allocatorEntries += other.allocatorEntries;
+    foldDocs += other.foldDocs; foldWords += other.foldWords;
     return *this;
   }
 };
@@ -69,26 +73,16 @@ struct VectorSearchRequest {
   // Domain filtering is supplied by engine construction.
   double scanFraction = 0.0;
   VectorSearchRound round = VectorSearchRound::BREADTH;
-  // Bounded-channel exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
-  // indexed by segOrd; empty (or an empty per-segment span) until the host's
-  // first deepen round, when the host folds its pooled-hit set into them.
-  // Contract:
-  //   - A CLEARED bit means the rank is already in the host pool and MUST
-  //     NOT be returned.  This is a return filter only: whether cleared
-  //     ranks are visited or scored during traversal is engine business.
-  //     An engine that cannot push the filter down may drop cleared ranks
-  //     from its returned hits ONLY if the result heap is then refilled
-  //     with non-cleared ranks (scan past the pooled prefix) or the drops
-  //     are folded into its exhaustion answer - post-filtering a
-  //     fixed-depth scan under-returns fresh hits while still reporting an
-  //     unexhausted pool, which starves the host's depth axis (and never
-  //     trips the stale-hit counter, because the pooled hits never arrive).
-  //   - A SET bit promises NOTHING: not liveness, not domain membership.
-  //     The host seeds these bitmaps from per-query copies of the liveness
-  //     bitmap only where one exists; an engine's own domain/liveness
-  //     filtering still applies in full.
-  //   - The spans are valid only for the duration of this search() call.
-  //     The host mutates the backing bytes between rounds; never cache them.
+  // Rank bitmaps (LSB-first, indexed by segOrd), valid for this call only.
+  // IVF spans contain the complete live domain minus pooled ranks, so one
+  // bitmap probe replaces both domain resolution and pooled exclusion.
+  // An empty span leaves domain/liveness filtering to the scanner. Filtered
+  // IVF slots always have a complete bitmap from the first deepen onward.
+  // Flat slots use these only for pooled exclusion, and still check their
+  // domain. A cleared rank excludes its whole document: flat emits max-sim.
+  // Cleared ranks must not be returned. Dropping them from a fixed-depth
+  // heap without refilling (or reporting exhaustion) starves the depth axis.
+  // The host mutates backing bytes between rounds; never cache the spans.
   std::span<const std::span<const uint8_t>> eligible;
   // Bounded group policy only; interval collectors have no member cap.
   int64_t perKey = 1;
