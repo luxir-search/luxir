@@ -54,6 +54,9 @@ public:
 
   virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
 
+  /// Visit members in ascending document order.
+  template <typename Visitor> void forEach(Visitor&& visitor) const;
+
   // Heap bytes owned by this DocSet, including capacity rather than logical
   // cardinality. Cache accounting uses this after immutable publication.
   virtual size_t ramBytesUsed() const = 0;
@@ -271,6 +274,16 @@ public:
   }
 
 };
+
+template <typename Visitor>
+void DocSet::forEach(Visitor&& visitor) const {
+  if (type == ARRAY) {
+    for (int32_t doc : ((const ArrDocSet*)this)->docs()) visitor(doc);
+  } else {
+    const auto& bits = ((const BitDocSet*)this)->bits();
+    FixedBitSet::visitOnes(bits.words, FixedBitSet::sizeInWords(bits.size()), std::forward<Visitor>(visitor));
+  }
+}
 
 /// AND a window-local bitset (bit 0 == windowStart) with a segment-wide
 /// FixedBitSet (bit 0 == doc 0). Words outside [windowStart, windowEnd) are
