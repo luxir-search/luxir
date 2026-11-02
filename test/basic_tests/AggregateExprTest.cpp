@@ -289,6 +289,23 @@ TEST_F(AggregateExprTest, bitDomainWalkIncludesLastDocument) {
   EXPECT_EQ((std::vector<int32_t>{0, 31, MAX_DOC - 1}), docs);
 }
 
+TEST_F(AggregateExprTest, lazyInvalidDocumentInputsBindBeforeBucketEvaluation) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("x_i", 2), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  for (auto expression : {"sum(def(x_i, log(-1)))", "sum(if(x_i, x_i, log(-1)))"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseAggregate(memory, *schema, expression);
+    auto result = evaluate(*program, *reader, reader->segments()[0]);
+    ASSERT_TRUE(result.valid);
+    EXPECT_DOUBLE_EQ(2, result.doubleValue);
+  }
+  auto* invalid = parseAggregate(memory, *schema, "sum(count(log(-1)))");
+  EXPECT_THROW(evaluate(*invalid, *reader, reader->segments()[0]), ValueEvaluationError);
+}
+
 TEST_F(AggregateExprTest, dateRulesAreResolvedAcrossBothLevels) {
   auto schema = Schema::createDefaultSchema();
   ArenaOwner memory;

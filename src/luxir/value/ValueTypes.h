@@ -193,6 +193,8 @@ struct ValueBounds {
   ValueType type = ValueType::INT64;
   BoundsCertainty certainty = BoundsCertainty::UNBOUNDED;
   BoundsInvalidity invalidity = BoundsInvalidity::NONE;
+  // Origin of a proof of invalidity, assigned during program propagation.
+  uint32_t invalidNode = UINT32_MAX;
   bool mayBeMissing = false;
   bool alwaysMissing = false;
   bool minAttained = false;

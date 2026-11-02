@@ -1230,6 +1230,11 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
   return out;
 }
 
+// A lazily evaluated operand's invalidity proves nothing about the result.
+ValueBounds lazyOperand(const ValueBounds& bounds) {
+  return invalid(bounds) ? ValueBounds::unbounded(bounds.type, true) : bounds;
+}
+
 ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (node.opcode == ValueOpcode::DEF) {
     const ValueBounds& first = args[0];
@@ -1237,21 +1242,21 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
     if (invalid(first)) return retag(first, node.type);
     if (first.alwaysMissing) return promoteBounds(second, node.type);
     if (!first.mayBeMissing) return promoteBounds(first, node.type);
-    if (invalid(second)) return retag(second, node.type);
-    bool mayMissing = first.mayBeMissing && second.mayBeMissing;
-    bool alwaysMissing = first.alwaysMissing && second.alwaysMissing;
-    if (!bounded(first) || !bounded(second)) {
+    ValueBounds fallback = lazyOperand(second);
+    bool mayMissing = first.mayBeMissing && fallback.mayBeMissing;
+    bool alwaysMissing = first.alwaysMissing && fallback.alwaysMissing;
+    if (!bounded(first) || !bounded(fallback)) {
       return ValueBounds::unbounded(node.type, mayMissing, alwaysMissing);
     }
     if (valueDouble(node.type)) {
       ValueBounds out = ValueBounds::floating(
-          std::min(boundMinAsDouble(first), boundMinAsDouble(second)),
-          std::max(boundMaxAsDouble(first), boundMaxAsDouble(second)), mayMissing);
+          std::min(boundMinAsDouble(first), boundMinAsDouble(fallback)),
+          std::max(boundMaxAsDouble(first), boundMaxAsDouble(fallback)), mayMissing);
       out.type = node.type;
       return out;
     }
-    ValueBounds out = ValueBounds::integer(std::min(first.intMin, second.intMin),
-                                           std::max(first.intMax, second.intMax), mayMissing);
+    ValueBounds out = ValueBounds::integer(std::min(first.intMin, fallback.intMin),
+                                           std::max(first.intMax, fallback.intMax), mayMissing);
     out.type = node.type;
     return out;
   }
@@ -1314,11 +1319,6 @@ ValueBounds truthBounds(int truth, bool mayBeMissing) {
   out.minAttained = false;
   out.maxAttained = false;
   return out;
-}
-
-// A lazily evaluated operand's invalidity proves nothing about the result.
-ValueBounds lazyOperand(const ValueBounds& bounds) {
-  return invalid(bounds) ? ValueBounds::unbounded(bounds.type, true) : bounds;
 }
 
 ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds> args) {
@@ -1507,10 +1507,12 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
 constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
+constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
+constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED}, nullptr},
+     propagateBounds, evalFunctionElement, 2, 2, {SHARED, LAZY_SHARED}, nullptr},
     {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::ADD, 2>},
@@ -1578,16 +1580,16 @@ constexpr ValueFunction FUNCTIONS[] = {
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::NE, 2>},
     {ValueOpcode::AND, "and", truthResolve, evalLogicalPoint, evalFunctionBatch,
-     logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, RAW},
+     logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, LAZY_RAW},
      evalBucketOperation<ValueOpcode::AND, 2>},
     {ValueOpcode::OR, "or", truthResolve, evalLogicalPoint, evalFunctionBatch,
-     logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, RAW},
+     logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, LAZY_RAW},
      evalBucketOperation<ValueOpcode::OR, 2>},
     {ValueOpcode::NOT, "not", truthResolve, evalFunctionPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NOT, 1>},
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
-     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, SHARED, SHARED}, nullptr},
+     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, nullptr},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
      randomBounds, evalScalarOnlyElement, 0, 2, {RAW, RAW}, nullptr},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
@@ -1655,6 +1657,14 @@ ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
 }
 
 } // namespace
+
+ValueBounds ValueFunction::bounds(
+    const ValueNode& node, std::span<const ValueBounds> args) const {
+  for (size_t i = 0; i < args.size(); i++) {
+    if (!operands[i].lazy && invalid(args[i])) return retag(args[i], node.type);
+  }
+  return boundsPropagate(node, args);
+}
 
 const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
   for (const ValueFunction& function : FUNCTIONS) {
@@ -1819,6 +1829,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
 }
 
 void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
+  boundsCached = false;
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
@@ -1830,16 +1841,15 @@ void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
       for (uint8_t child = 0; child < node.childCount; child++) {
         children[child] = nodes[node.children[child]].bounds;
       }
-      bound.bounds = node.function->boundsPropagate(
+      bound.bounds = node.function->bounds(
           node, std::span<const ValueBounds>(children.data(), node.childCount));
     }
-    if (bound.bounds.certainty == BoundsCertainty::INVALID && node.guarded) {
-      bound.bounds = ValueBounds::unbounded(node.type, true);
-    }
-    if (bound.bounds.certainty == BoundsCertainty::INVALID) {
-      throwBindInvalid(program, node, bound.bounds);
+    if (invalid(bound.bounds) && bound.bounds.invalidNode == UINT32_MAX) {
+      bound.bounds.invalidNode = index;
     }
   }
+  const ValueBounds& root = nodes[program.rootNode].bounds;
+  if (invalid(root)) throwBindInvalid(program, program.nodes[root.invalidNode], root);
   cachedScoreBounds = scoreBounds;
   boundsCached = true;
 }
@@ -1858,14 +1868,37 @@ std::string_view BoundValueProgram::firstUnboundedNode() const {
       && !root.mayBeMissing && !root.alwaysMissing) {
     return {};
   }
-  for (uint32_t index = 0; index < program.nodes.size(); index++) {
-    const ValueBounds& valueBounds = nodes[index].bounds;
-    if (valueBounds.certainty != BoundsCertainty::BOUNDED
-        || valueBounds.mayBeMissing || valueBounds.alwaysMissing) {
-      return program.nodes[index].text;
+  std::vector<bool> visited(program.nodes.size());
+  auto visit = [&](auto&& self, uint32_t index) -> std::string_view {
+    if (visited[index]) return {};
+    visited[index] = true;
+    const ValueBounds& value = nodes[index].bounds;
+    if (bounded(value) && !value.mayBeMissing && !value.alwaysMissing) return {};
+    const ValueNode& node = program.nodes[index];
+    std::array<bool, VALUE_MAX_ARITY> contributes{};
+    std::fill_n(contributes.begin(), node.childCount, true);
+    if (node.opcode == ValueOpcode::DEF) {
+      const ValueBounds& first = nodes[node.children[0]].bounds;
+      contributes[0] = !first.alwaysMissing;
+      contributes[1] = first.mayBeMissing || first.alwaysMissing;
+    } else if (node.opcode == ValueOpcode::IF) {
+      const ValueBounds& condition = nodes[node.children[0]].bounds;
+      int truth = boundsTruth(condition);
+      contributes[1] = !condition.alwaysMissing && truth != 0;
+      contributes[2] = !condition.alwaysMissing && truth != 1;
+    } else if (node.opcode == ValueOpcode::AND || node.opcode == ValueOpcode::OR) {
+      const ValueBounds& left = nodes[node.children[0]].bounds;
+      int shortCircuit = node.opcode == ValueOpcode::AND ? 0 : 1;
+      contributes[1] = !left.alwaysMissing && boundsTruth(left) != shortCircuit;
     }
-  }
-  return {};
+    for (uint8_t child = 0; child < node.childCount; child++) {
+      if (!contributes[child]) continue;
+      std::string_view blocker = self(self, node.children[child]);
+      if (!blocker.empty()) return blocker;
+    }
+    return node.text;
+  };
+  return visit(visit, program.rootNode);
 }
 
 ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float score) const {
