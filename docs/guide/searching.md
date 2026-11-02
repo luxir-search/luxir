@@ -1010,10 +1010,12 @@ beside `ops` in the full form:
 - `profile: true` returns an execution profile on the final response.
 
 Every final response carries `took_us`: the server-side wall time, in
-microseconds, from receiving the complete request to sending that response.
-It includes parsing, any `min_commit` wait, execution, and earlier streamed
-batches, but not network transfer. Responses with `more: true` omit it, as does
-the `format=docs` document stream, which has no envelope to carry it.
+microseconds, from receipt of the complete request message until its final
+response is ready to serialize. It includes parsing, any `min_commit` wait,
+execution, and earlier streamed batches, including any pause while the client
+reads them. It excludes serializing, queueing, and sending the final response.
+Responses with `more: true` omit it, as does the `format=docs` document stream,
+which has no envelope to carry it; a pre-output JSON error still carries it.
 
 Profiling is opt-in and request-wide, and operations adopt instrumentation
 independently; string field facets are the currently instrumented operation.

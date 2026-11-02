@@ -69,7 +69,10 @@ several `SearchRequest` messages. Each request may produce several
 client another response belongs to the same logical request. Set `request_id`
 when several requests share a call and use the echoed value for correlation.
 The final response of each request carries `took_us`, the server-side wall
-time in microseconds from receiving the request message to sending that
+time in microseconds from receipt of the complete request message until its
+final response is ready to serialize. It includes parsing, any `min_commit`
+wait, execution, and earlier streamed batches, including any pause while the
+client reads them. It excludes serializing, queueing, and sending the final
 response.
 
 One request contains:
@@ -131,9 +134,10 @@ for each. Each message has its own overwrite, atomicity, return-ID, and commit
 settings; all-or-none never spans messages.
 `request_id` is echoed so responses can be associated without depending on
 completion timing. Responses may complete out of request order. Each
-response's `took_us` is the server-side wall time in microseconds from
-receiving its request message to sending the response, commit and replica
-waits included.
+response's `took_us` is the server-side wall time in microseconds from receipt
+of its complete request message until the response is ready to serialize,
+including parsing and any commit and replica wait. It excludes serializing,
+queueing, and sending the response.
 
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).

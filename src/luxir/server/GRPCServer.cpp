@@ -670,7 +670,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     std::unique_ptr<HppRequestState<SearchReqProto>> requestState;
 
     GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena,
-                      RequestClock::time_point startTime)
+                      std::chrono::steady_clock::time_point startTime)
       : SearchRequest(engine, proto, arena, startTime) {}
 
     ReplyStatus reply(SearchResponse& response) override {
@@ -708,7 +708,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   };
 
   // The message is fully read; took_us covers parsing onward.
-  auto startTime = RequestClock::now();
+  auto startTime = std::chrono::steady_clock::now();
   auto* arena = createArena();
   auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
   if (!parseRequest(readBuf, *requestState, "Search")) {
@@ -749,7 +749,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 
 // Unary Update and streaming UpdateStream share asynchronous completion.
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  auto startTime = RequestClock::now();
+  auto startTime = std::chrono::steady_clock::now();
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
   if (!parseRequest(readBuf, *request, "Update")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
@@ -764,25 +764,27 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
     GenericCallData* parent;
     const std::stop_token waitToken;
+    const std::chrono::steady_clock::time_point startTime;
     Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent,
-           RequestClock::time_point startTime)
-      : ProtoUpdateMessage(&requestState->proto, startTime), request(std::move(requestState)), parent(parent),
+           std::chrono::steady_clock::time_point startTime)
+      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent),
         // Admission runs on the completion queue thread, as does enabling
         // cancellation. Worker completions never read the mutable stop source.
-        waitToken(parent->waitCancellation.get_token()) {}
+        waitToken(parent->waitCancellation.get_token()), startTime(startTime) {}
     virtual void done(IndexWriter& iw) override {
       unused(iw);
       auto completed = takeCompletion(parent->server.getLuxirNode());
       auto* call = parent;
       auto stop = waitToken;
+      auto start = startTime;
       delete this;
-      completed->await(call->server.getLuxirNode(), [call](auto result) {
-        call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
+      completed->await(call->server.getLuxirNode(), [call, start](auto result) {
+        call->server.getLuxirNode().getTaskArena().enqueue([call, result, start] {
           try {
-            result->response.took_us = elapsedMicros(result->startTime);
             // A unary update fails only when nothing was applied.
             if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
               call->metricError(ProtoUpdateMessage::failureKind(result->response));
+            result->response.took_us = microsSince(start);
             call->respondRaw(serializeToByteBuffer(result->response), 1);
           } catch (const std::exception& e) {
             call->finishWithError(classifyException(e, ErrorKind::INTERNAL));
