@@ -896,3 +896,85 @@ TEST_F(GroupKnnTest, intervalsPruneMembersWithinDistinctUnits) {
     }
   }
 }
+
+TEST_F(GroupKnnTest, foldedDomainMatchesResolve) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::selector, KnnQuery::statsForTests);
+  for (auto ann : {pqAnn(4, 2, 2), rabitqAnn(4, 4)}) for (int shape : {0, 1, 2, 3}) {
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.field("vec_vs");
+    f.type = api::FieldDef::FieldClass::VECTOR; f.column = true;
+    f.dims = 4; f.metric = api::VectorMetric::L2; f.ann = ann;
+    if (shape >= 2) f.multi = api::FieldDef::MultiMode::DEFAULT;
+    b.set(h.collection());
+    for (int i = 0; i < 320; i++) {
+      auto doc = flatdoc("id", std::to_string(i), "key_s", std::to_string(i % 19),
+                        "tiny_s", i % 79 == 1 ? "yes" : "no", "wide_s", i % 4 != 2 ? "yes" : "no");
+      if (shape % 2 == 0 || i % 4) {
+        std::vector<float> v{(float)i, (float)(i % 7), 0, 0};
+        if (shape >= 2) doc.emplace_back("vec_vs", std::vector<std::vector<float>>(i == 1 ? 40 : 2, v));
+        else doc.emplace_back("vec_vs", v);
+      }
+      h.index(doc);
+    }
+    h.commit({"*"});
+    for (bool deletes : {false, true}) {
+      if (deletes) h.deleteByIds({"13", "100"}, UpdateMessage::COMMIT);
+      for (bool tiny : {false, true}) {
+        std::vector<Row> expected;
+        for (auto selector : {KnnPlanner::Selector::RESOLVE, KnnPlanner::Selector::FOLD}) {
+          SCOPED_TRACE(::testing::Message() << (int)*ann.codec << shape << deletes << tiny << (int)selector);
+          KnnQuery::selector = selector;
+          KnnQuery::Stats stats;
+          KnnQuery::statsForTests = &stats;
+          auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":[")"
+              + std::string(tiny ? "tiny_s:yes" : "wide_s:yes") + R"("],"query":)"
+              + knn(7, true, false, R"(,"ivf":{"min_scan_fraction":1})"));
+          if (selector == KnnPlanner::Selector::RESOLVE) expected = rows(*req);
+          else {
+            EXPECT_EQ(expected, rows(*req));
+            EXPECT_EQ(0, stats.work.resolveIdentity + stats.work.resolveSelect + stats.work.resolveMono);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, filteredWidenFoldsBothChannels) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::selector, KnnQuery::statsForTests);
+  for (auto ann : {pqAnn(16, 2, 2), rabitqAnn(16, 8)}) {
+    CollectionHelper h("main");
+    h.clear();
+    schema(h, api::VectorMetric::L2, ann);
+    for (int i = 0; i < 160; i++)
+      h.index(flatdoc("id", std::to_string(i), "key_s", std::to_string(i % 7),
+          "keep_s", i == 0 || i >= 145 ? "yes" : "no", "vec_vs",
+          std::vector<std::vector<float>>{{(float)i + 1, 0, 0, 0}, {(float)i + 1.25f, 0, 0, 0}}));
+    h.commit({"*"});
+    h.deleteByIds({"149"}, UpdateMessage::COMMIT);
+    std::vector<Row> expected;
+    for (auto selector : {KnnPlanner::Selector::RESOLVE, KnnPlanner::Selector::FOLD}) {
+      KnnQuery::selector = selector;
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      auto req = run("main", R"("limit":-1,"collapse":"key_s","filter":["keep_s:yes"],"query":)"
+          + knn(3, true, false));
+      ASSERT_EQ(3u, rows(*req).size());
+      EXPECT_GT(stats.rounds.load(), 1);
+      EXPECT_GT(stats.work.selectorBitmap, 0);
+      if (selector == KnnPlanner::Selector::RESOLVE) {
+        expected = rows(*req);
+        EXPECT_GT(stats.work.resolveMono, 0);
+      } else {
+        EXPECT_EQ(expected, rows(*req));
+        EXPECT_EQ(0, stats.work.resolveMono);
+      }
+    }
+  }
+}

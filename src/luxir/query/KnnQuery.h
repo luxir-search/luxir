@@ -161,6 +161,7 @@ public:
     std::atomic<int64_t> newListSelectorPasses{0}, depthEntries{0}, pqScores{0}, oneBitScores{0}, terminalReads{0};
     std::atomic<double> initialBudget{0}, coveredFraction{0}, targetExamined{0};
     std::atomic<int64_t> plannedExact{0}, plannedIvf{0};
+    std::atomic<int64_t> foldedEligible{0}, foldedRemaining{0};
     std::atomic<double> predictedCost{0}, modeledActualCost{0};
     std::array<std::atomic<double>, KnnPlanner::NUM_UNITS> costWork{};
     VectorSearchWork work;  // Updated under workMutex after query barriers.
@@ -191,6 +192,7 @@ public:
   static inline Stats* statsForTests = nullptr;
   using Routing = KnnPlanner::Routing;
   static inline Routing routing = Routing::AUTO;
+  static inline KnnPlanner::Selector selector = KnnPlanner::Selector::AUTO;
   static inline KnnPlanner::Costs plannerCosts;  // Test/benchmark calibration seam.
 
   // Dense single-valued filter density above which flat search walks ranks.
@@ -996,7 +998,7 @@ public:
             input.vectors = segCount; input.liveVectors = segLiveVectorCounts[i];
             input.docsWithValue = vr.docsWithValue(); input.eligibleDocs = eligible.eligibleDocs;
             input.eligibleVectors = std::min(eligible.unfiltered ? input.liveVectors : eligible.eligibleVectors, input.liveVectors);
-            input.domainSize = domain ? domain->card() : seg.maxDoc();
+            input.domainSize = domain ? domain->card() : seg.maxDoc(); input.maxDoc = seg.maxDoc();
             input.dims = dims; input.domain = domain != nullptr;
             input.arrayDomain = domain && domain->type == DocSet::ARRAY;
             input.unfiltered = eligible.unfiltered; input.deletes = seg.liveDocs() != nullptr;
@@ -1061,7 +1063,7 @@ public:
             : std::max((int64_t)query.getK(), boundedDefaultCandidates(query.getK(), planCap)),
         .nprobe = query.getNProbe(), .referenceBreadth = defaultIvfNList(liveNTotal),
         .minScanFraction = query.getMinScanFraction(), .dimFactor = defaultAnnBreadthDimFactor(dims),
-        .alpha = filteredCoverageAlpha, .flatDensity = flatDomainDensityThreshold};
+        .alpha = filteredCoverageAlpha, .flatDensity = flatDomainDensityThreshold, .selector = selector};
       auto plan = KnnPlanner::choose(planSegments, planRequest, plannerCosts,
                                     query.getExact() ? Routing::FORCE_EXACT : routing);
       ExecutionProfileRun* profile = context.planningContext().profiles
@@ -1278,83 +1280,69 @@ public:
       bool firstRound = true;
       bool candidatePoolSorted = true;
 
-      // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
-      // common only round) uses the small seenVectors hash set and passes no
-      // eligible bitmaps.  The FIRST deepen of either axis folds the seen set
-      // into per-segment rank-space "eligible" bitmaps (init: the segment's
-      // cached rank-live bitmap when it has one, else all-ones; pooled ranks
-      // cleared), which then serve double duty: the host's dedup structure
-      // (O(1) bit test instead of a hash probe, and bounded at numVectors/8
-      // bytes where the hash set would grow toward the candidate cap), and
-      // the engines' NOT-pooled exclusion filter via request.eligible - so
-      // every post-fold round spends its whole result heap on fresh hits
-      // (the resumable cursor FAISS does not provide), and kReq switches
-      // from cumulative pool depth to a per-round fresh budget.  A segment
-      // with no liveness seed gets its span only once something of its is
-      // pooled (markSeen activates it), so untouched no-delete segments
-      // keep FAISS's compiled-out no-selector fast path.  Fold cost is
-      // O(ntotal/8 + seen), paid only by queries that deepen.
-      std::vector<std::vector<uint8_t>> eligibleStore;
-      std::vector<std::span<const uint8_t>> eligibleSpans;
+      // Rank domains can be borrowed in round one. Only pooled exclusion
+      // needs a writable copy. The first deepen folds every filtered IVF
+      // domain, including interval-only slots, then retires the seen hash.
+      // Flat slots retain their doc-granular pooled-exclusion semantics.
+      std::vector<RankEligibility> rankEligibility(numSegs);
+      std::vector<std::span<const uint8_t>> eligibleSpans(numSegs);
+      auto foldDomainAt = [&](size_t i) {
+        auto& ranks = rankEligibility[i];
+        if (!ranks.bits.empty()) return;
+        auto& seg = reader.segments()[i];
+        DocSet* domain = ctx.domainPerSeg[i];
+        VectorReader vr(seg.postingsReader(), *segInfos.at(i));
+        if (KnnPlanner::borrowDomain(planSegments[i])) {
+          static_assert(std::endian::native == std::endian::little);
+          ranks.bits = {(const uint8_t*)((BitDocSet*)domain)->bits().words,
+                        ((size_t)segVectorCounts[i] + 7) / 8};
+          ranks.original = domain->card();
+        } else {
+          ranks.original = foldDomain(vr, *domain, seg.maxDoc(), ranks.owned, workBySeg[i]);
+          ranks.bits = ranks.owned;
+        }
+        ranks.remaining = ranks.original;
+        eligibleSpans[i] = ranks.bits;
+      };
+      for (size_t i = 0; i < numSegs; i++) {
+        if (plan.ivf[i] && !eligibilityPerSeg[i].unfiltered
+            && KnnPlanner::foldFirst(planSegments[i], initialFraction, selector, plannerCosts)) foldDomainAt(i);
+      }
       bool seenFolded = false;
       auto foldSeen = [&]() {
         if (seenFolded) return;
         seenFolded = true;
         seenFoldsForTests.fetch_add(1, std::memory_order_relaxed);
-        eligibleStore.resize(numSegs);
-        eligibleSpans.assign(numSegs, {});
-        std::vector<char> cleared(numSegs, 0);
         for (size_t i = 0; i < numSegs; i++) {
-          int64_t n = segVectorCounts[i];
-          if (n <= 0) continue;
-          auto& bits = eligibleStore[i];
-          if (rankLivePerSeg[i] != nullptr) {
-            size_t numBytes = ((size_t)n + 7) / 8;
-            assert(rankLivePerSeg[i]->numBytes == numBytes);
-            bits.assign(rankLivePerSeg[i]->bits, rankLivePerSeg[i]->bits + numBytes);
-          } else {
-            // No cached liveness (no deletes, or a flat slot): not-pooled
-            // only.  Flat engines filter the domain themselves, so for them
-            // the bit means just "not pooled yet" - same dedup semantics.
-            fillAllRanksSet(bits, n);
+          if (plan.ivf[i] && !eligibilityPerSeg[i].unfiltered) foldDomainAt(i);
+          auto& ranks = rankEligibility[i];
+          if (ranks.original < 0) {
+            auto& live = rankLivePerSeg[i];
+            ranks.original = live ? live->liveVectors : segVectorCounts[i];
+            if (live) ranks.bits = {live->bits, live->numBytes};
           }
+          ranks.remaining = ranks.original;
+          eligibleSpans[i] = ranks.bits;
         }
         for (uint64_t key : seenVectors) {
-          size_t seg = (size_t)(key >> PACK_RANK_BITS);
-          uint64_t r = key & (((uint64_t)1 << PACK_RANK_BITS) - 1);
-          eligibleStore[seg][(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
-          cleared[seg] = 1;
-        }
-        // Hand engines a span only where it can exclude something: a
-        // liveness seed or at least one pooled rank. An all-ones span would
-        // demote a selector-free scan to a per-vector always-true probe.
-        for (size_t i = 0; i < numSegs; i++) {
-          if (!eligibleStore[i].empty()
-              && (rankLivePerSeg[i] != nullptr || cleared[i])) {
-            eligibleSpans[i] = eligibleStore[i];
-          }
+          size_t i = (size_t)(key >> PACK_RANK_BITS);
+          int64_t rank = (int64_t)(key & (((uint64_t)1 << PACK_RANK_BITS) - 1));
+          bool fresh = rankEligibility[i].clear(rank, segVectorCounts[i], workBySeg[i]);
+          assert(fresh);
+          eligibleSpans[i] = rankEligibility[i].bits;
         }
         seenVectors = boost::unordered_flat_set<uint64_t>{};
       };
-      // Mark a hit seen; true if it was fresh.  Post-fold every engine
-      // returns only fresh hits (eligible is binding), so a stale hit here
-      // means a broken engine/selector wiring - counted for tests.  The
-      // first pooled rank of a span-less segment activates its span for the
-      // next round.
       auto markSeen = [&](int32_t segOrd, int64_t valueRank) -> bool {
+        size_t i = (size_t)segOrd;
         if (!seenFolded) {
-          return seenVectors.insert(packSegRank(segOrd, valueRank)).second;
+          bool fresh = seenVectors.insert(packSegRank(segOrd, valueRank)).second;
+          if (fresh && rankEligibility[i].original >= 0) rankEligibility[i].remaining--;
+          return fresh;
         }
-        auto& bits = eligibleStore[(size_t)segOrd];
-        size_t byteIdx = (size_t)(valueRank >> 3);
-        uint8_t mask = (uint8_t)(1u << (valueRank & 7));
-        bool fresh = (bits[byteIdx] & mask) != 0;
-        bits[byteIdx] &= (uint8_t)~mask;
-        if (!fresh) {
-          staleHitsForTests.fetch_add(1, std::memory_order_relaxed);
-        } else if (eligibleSpans[(size_t)segOrd].empty()) {
-          eligibleSpans[(size_t)segOrd] = bits;
-        }
+        bool fresh = rankEligibility[i].clear(valueRank, segVectorCounts[i], workBySeg[i]);
+        eligibleSpans[i] = rankEligibility[i].bits;
+        if (!fresh) staleHitsForTests.fetch_add(1, std::memory_order_relaxed);
         return fresh;
       };
 
@@ -1488,7 +1476,7 @@ public:
           // soon as the capped fraction is reached, just as in round one.
           scanFraction = std::min(target, maxFraction);
           round = VectorSearchRound::BREADTH;
-          if (boundedEngine) foldSeen();
+          foldSeen();
           continue;
         }
 
@@ -1508,13 +1496,21 @@ public:
       if (statsForTests) {
         statsForTests->coveredFraction += coveredFraction;
         for (const auto& work : workBySeg) statsForTests->addWork(work);
+        for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i] && rankEligibility[i].original >= 0) {
+          statsForTests->foldedEligible += rankEligibility[i].original;
+          statsForTests->foldedRemaining += rankEligibility[i].remaining;
+        }
       }
 
       if (statsForTests || profile) {
         auto modeled = KnnPlanner::exactTotals(planSegments, plan.prices, planRequest);
         for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i])
           KnnPlanner::addIvf(modeled, planSegments[i], plan.prices[i], 1);
-        plan.cost = KnnPlanner::totalCost(modeled, planRequest, plannerCosts);
+        auto effort = KnnPlanner::effort(modeled, planRequest);
+        double selectors = 0;
+        for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i])
+          selectors += KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial);
+        plan.cost = KnnPlanner::totalCost(modeled, planRequest, plannerCosts, selectors);
         if (statsForTests) {
           statsForTests->predictedCost += plan.cost;
           statsForTests->modeledActualCost += plannerCosts.requestCost;
@@ -1535,9 +1531,10 @@ public:
             piece.wire.max_doc = reader.segments()[i].maxDoc();
             piece.wire.strategy = plan.ivf[i] ? "ivf" : "exact";
             piece.wire.cardinality = input.eligibleDocs; piece.wire.domain_size = input.domainSize;
-            piece.details.push_back(std::format("reason={}; eligible_vectors={}{}; exact_cost={}; ivf_scan_cost_at_all_ivf_coverage={}; ivf_linear={}; ivf_fixed={}",
+            piece.details.push_back(std::format("reason={}; eligible_vectors={}{}; exact_cost={}; ivf_scan_cost_at_predicted_coverage={}; ivf_linear={}; ivf_fixed={}",
                 reasons[i], input.eligibleVectors, input.vectorsEstimated ? " (estimated)" : "",
-                plan.prices[i].exactCost, plan.allIvfCoverage * plan.prices[i].a + plan.prices[i].b,
+                plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
+                    + KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial),
                 plan.prices[i].a, plan.prices[i].b));
             piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
                 KnnPlanner::coverage(modeled, planRequest), plan.cost, KnnPlanner::rounds(modeled, planRequest),
@@ -1633,33 +1630,19 @@ public:
       class LocalDomainSelector final : public faiss::IDSelector {
         const SegV2D& v2d;
         DocSet* domain;
-        // Optional rank-space eligibility bits (request.eligible): tested
-        // before the resolve so already-pooled ranks cost one bit probe, no
-        // doc resolution.  Out-of-range ids are rejected, mirroring
-        // faiss::IDSelectorBitmap's byte-bound guard, so a corrupt id from
-        // the zero-copy mmapped lists cannot read past the bitmap.  Empty
-        // when the host has not folded yet.
-        std::span<const uint8_t> eligible;
         mutable int64_t resolves = 0;
 
       public:
-        LocalDomainSelector(const SegV2D& v2d, DocSet* domain,
-                            std::span<const uint8_t> eligible = {}) noexcept
-          : v2d(v2d), domain(domain), eligible(eligible) {}
+        LocalDomainSelector(const SegV2D& v2d, DocSet* domain) noexcept
+          : v2d(v2d), domain(domain) {}
 
         bool is_member(faiss::idx_t id) const final {
           if (id < 0) return false;
-          uint64_t r = (uint64_t)id;
-          if (!eligible.empty()) {
-            if ((r >> 3) >= eligible.size()) return false;
-            if (((eligible[r >> 3] >> (r & 7)) & 1) == 0) return false;
-          }
           resolves++;
           return domain->get(v2d.resolve((int64_t)id));
         }
         void addWork(VectorSearchWork& work) const {
           (v2d.mono ? work.resolveMono : v2d.sel ? work.resolveSelect : work.resolveIdentity) += resolves;
-          if (!eligible.empty()) work.selectorBitmap += work.physicalEntries;
           if (domain->type == DocSet::ARRAY)
             work.arraySteps += resolves * (int64_t)KnnPlanner::arraySteps(domain->card());
           else work.bitProbes += resolves;
@@ -1685,20 +1668,9 @@ public:
       // Owned by prepareUnit(): canonical for PQ, rotated for RaBitQ.
       const PreparedQuery preparedQuery;
 
-      /// The ONLY selector policy: built per scan call from (domain,
-      /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
-      /// rounds cannot drift apart.  Cheapest selector wins:
-      ///   no domain, no eligible      -> null
-      ///   domain == liveDocs          -> IDSelectorBitmap over rankLive, or
-      ///                                  over eligible once present (it is
-      ///                                  seeded from rankLive, so liveness
-      ///                                  rides along - one bit probe)
-      ///   filtered domain             -> LocalDomainSelector, composing the
-      ///                                  eligible bit test (when present)
-      ///                                  with the resolve-based check
-      /// Per-call construction is two stores; owns the selector storage, so
-      /// keep it alive throughout the scan so selPtr never outlives the
-      /// optionals it points into.
+      // A supplied rank domain is complete: no resolution follows a bitmap
+      // probe. Before folding, only the filtered round-one path resolves.
+      // Own selector storage for the duration of each scan task.
       class RoundSelector {
         std::optional<faiss::IDSelectorBitmap> bitmap;
         std::optional<LocalDomainSelector> domainSel;
@@ -1711,12 +1683,13 @@ public:
             (size_t)eng.segOrd < request.eligible.size()
               ? request.eligible[(size_t)eng.segOrd]
               : std::span<const uint8_t>{};
-          if (eng.domain != nullptr && !eng.domainIsLive) {
-            domainSel.emplace(eng.v2d, eng.domain, elig);
-            selPtr = &*domainSel;
-          } else if (!elig.empty()) {
+          if (!elig.empty()) {
             bitmap.emplace(elig.size(), elig.data());
             selPtr = &*bitmap;
+          } else if (eng.domain != nullptr && !eng.domainIsLive) {
+            assert(request.round == VectorSearchRound::BREADTH);
+            domainSel.emplace(eng.v2d, eng.domain);
+            selPtr = &*domainSel;
           } else if (eng.domainIsLive) {
             bitmap.emplace(eng.rankLive->numBytes, eng.rankLive->bits);
             selPtr = &*bitmap;
@@ -2687,14 +2660,95 @@ private:
     }
   }
 
+  // Query-owned rank domain. Original cardinality survives pooled clears;
+  // remaining also subtracts pending seen-hash entries before their first
+  // fold. Both counts are exact once the domain is mapped, even for multi.
+  // As with the former eligibleStore, bitmap storage is query-local vector
+  // memory, outside the interval collector's request-memory accounting.
+  struct RankEligibility {
+    std::vector<uint8_t> owned;
+    std::span<const uint8_t> bits;
+    int64_t original = -1, remaining = -1;
+
+    bool clear(int64_t rank, int64_t numVectors, VectorSearchWork& work) {
+      if (owned.empty()) {
+        if (bits.empty()) fillAllRanksSet(owned, numVectors);
+        else owned.assign(bits.begin(), bits.end());
+        bits = owned;
+        work.foldWords += (numVectors + 63) / 64;
+      }
+      uint8_t mask = (uint8_t)(1u << (rank & 7));
+      auto& byte = owned[(size_t)(rank >> 3)];
+      bool fresh = (byte & mask) != 0;
+      byte &= (uint8_t)~mask;
+      remaining -= fresh;
+      return fresh;
+    }
+  };
+
+  // Map a doc-ordered domain (or its smaller complement) to vector ranges.
+  // The live-filtered domain subsumes rankLive, including deleted docs that
+  // have no field. Arrays always walk members; bitsets walk set/clear bits.
+  static int64_t foldDomain(VectorReader& vr, DocSet& domain, int32_t maxDoc,
+                            std::vector<uint8_t>& bits, VectorSearchWork& work) {
+    auto& col = vr.strColReader();
+    bool complement = domain.type != DocSet::ARRAY && domain.card() > maxDoc - domain.card();
+    int64_t visited = complement ? maxDoc - domain.card() : domain.card();
+    int64_t count = complement ? vr.numVectors() : 0;
+    if (complement) fillAllRanksSet(bits, vr.numVectors());
+    else bits.assign(((size_t)vr.numVectors() + 7) / 8, 0);
+    work.foldWords += (vr.numVectors() + 63) / 64;
+    StrColReader::DocIterator docs(col);
+    std::optional<MonoReader::BulkValues> ranges;
+    if (vr.isMultiValued() && (double)visited / std::max((int64_t)1, (int64_t)vr.docsWithValue()) >= FLAT_RANGE_POINT_DENSITY)
+      ranges.emplace(*col.getEndValueRankReader());
+    auto map = [&](int32_t doc) {
+      if (doc >= maxDoc) return;
+      work.foldDocs++;
+      if (col.docsReader().hasBitset()) work.sparseMaps++;
+      if (docs.docId() < doc) docs.advance(doc);
+      if (docs.docId() != doc) return;
+      int64_t begin = docs.rank(), end = begin + 1;
+      if (vr.isMultiValued()) {
+        work.multiMaps++;
+        if (ranges) {
+          int64_t rank = begin;
+          begin = rank == 0 ? 0 : ranges->valueAt(rank - 1);
+          end = ranges->valueAt(rank);
+        } else std::tie(begin, end) = docs.valueRange();
+      }
+      count += complement ? begin - end : end - begin;
+      // A document can hold many vectors; fill its interior bytes in bulk.
+      while (begin < end && (begin & 7)) {
+        uint8_t mask = (uint8_t)(1u << (begin & 7));
+        if (complement) bits[(size_t)(begin >> 3)] &= (uint8_t)~mask;
+        else bits[(size_t)(begin >> 3)] |= mask;
+        begin++;
+      }
+      if (end - begin >= 8) {
+        std::fill(bits.begin() + (begin >> 3), bits.begin() + (end >> 3), complement ? 0 : 0xff);
+        begin = end & ~(int64_t)7;
+      }
+      while (begin < end) {
+        uint8_t mask = (uint8_t)(1u << (begin & 7));
+        if (complement) bits[(size_t)(begin >> 3)] &= (uint8_t)~mask;
+        else bits[(size_t)(begin >> 3)] |= mask;
+        begin++;
+      }
+    };
+    if (complement) {
+      auto& domainBits = ((const BitDocSet&)domain).bits();
+      screaming::FixedBitSet::visitZeroes(domainBits.words, (int32_t)screaming::FixedBitSet::sizeInWords(maxDoc), map);
+    } else domain.forEach(map);
+    return count;
+  }
+
   /// Build the RankLiveBitmap (rank-space liveness + exact live vector
   /// count) for one segment's vector field.  Run once per liveDocs
   /// generation (cached on the VectorAuxReader), and sized by the segment's
-  /// DELETED docs rather than its vectors: start all-live, walk the zero
-  /// bits of liveDocs, and clear each deleted doc's rank(s), resolving
-  /// doc -> rank through the has-field bitset (advance + rank) and, for
-  /// multi-valued, the forward start/end-rank map - the engines' reverse
-  /// (valueRank -> docId) map is never consulted.  Dense single-valued
+  /// smaller of live/deleted docs rather than its vectors, using the same
+  /// forward doc-to-rank fold as query domains. The engines' reverse
+  /// (valueRank -> docId) map is never consulted. Dense single-valued
   /// needs no walk at all: valueRank == docId, so the liveDocs words
   /// themselves are the bitmap (borrowed and pinned via backing) and the
   /// segment's cached live count is the cardinality.
@@ -2717,44 +2771,10 @@ private:
     }
 
     auto owned = std::make_shared<std::vector<uint8_t>>();
-    std::vector<uint8_t>& bits = *owned;
-    fillAllRanksSet(bits, numVectors);
-    int64_t cleared = 0;
-    auto clearRanks = [&bits, &cleared](int64_t begin, int64_t end) {
-      for (int64_t r = begin; r < end; r++) {
-        bits[(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
-      }
-      cleared += end - begin;
-    };
-
-    const int32_t maxDoc = live.size();
-    const int32_t numWords = (int32_t)screaming::FixedBitSet::sizeInWords(maxDoc);
-    if (dr.hasBitset()) {
-      screaming::BitSet::Iterator fieldDocs(dr.bitset());
-      int32_t fieldDoc = -1;  // last doc-with-field landed on (END once drained)
-      screaming::FixedBitSet::visitZeroes(liveBits.words, numWords, [&](int32_t d) {
-        if (d >= maxDoc) return;  // zero tail bits of the last word are not docs
-        if (fieldDoc < d) fieldDoc = fieldDocs.advance(d);
-        if (fieldDoc != d) return;  // deleted doc holds no vectors
-        int32_t docRank = fieldDocs.rank();
-        if (multi) {
-          auto [begin, end] = col.getStartEndValueRank(docRank);
-          clearRanks(begin, end);
-        } else {
-          clearRanks(docRank, docRank + 1);
-        }
-      });
-    } else {
-      // Every doc has the field, so docRank == docId.  Multi-valued only:
-      // the dense single-valued case borrowed liveDocs above.
-      screaming::FixedBitSet::visitZeroes(liveBits.words, numWords, [&](int32_t d) {
-        if (d >= maxDoc) return;
-        auto [begin, end] = col.getStartEndValueRank(d);
-        clearRanks(begin, end);
-      });
-    }
-    const uint8_t* data = bits.data();
-    return {data, numBytes, numVectors - cleared, std::move(owned)};
+    VectorSearchWork work;
+    int64_t liveVectors = foldDomain(vr, live.docset(), live.size(), *owned, work);
+    const uint8_t* data = owned->data();
+    return {data, numBytes, liveVectors, std::move(owned)};
   }
 
   /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
