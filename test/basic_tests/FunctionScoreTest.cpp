@@ -147,7 +147,40 @@ TEST_F(FunctionScoreTest, randomIsDeterministicPerSeedAndValue) {
     }
   }
   EXPECT_EQ(eval("random(5)"), eval("random(5)"));
+  EXPECT_EQ(eval("random(1000 * 60, x_i)"), eval("random(60000, x_i)"));
+  EXPECT_EQ(eval("random(0 - 5, x_i)"), eval("random(-5, x_i)"));
+  EXPECT_EQ(eval("random(if(0, 3, 7), x_i)"), eval("random(7, x_i)"));
+  expectParseError("random(x_i, x_i)", "argument 1 must be a constant numeric scalar");
+  expectParseError("random(log(-1), x_i)", "argument 1 must be a constant numeric scalar");
   expectParseError("random(1.5)", "must be an integer");
+}
+
+TEST_F(FunctionScoreTest, integerSeedsPreserveBitsAboveDoublePrecision) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 32; i++) {
+    docs.push_back(flatdoc("id_s", std::to_string(i), "body_w", "seeded", "x_i", i));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto order = [&](std::string_view seed) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .exprQuery(fmt::format("rescore(body_w:seeded, expr=random({}, x_i))", seed))
+        .fields({"id_s"}).limit(-1);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::string> ids;
+    if (!req->ok()) return ids;
+    for (auto id : std::get<api::ColStr>(req->docList()->columns.at("id_s").kind).v) {
+      ids.emplace_back(id);
+    }
+    return ids;
+  };
+  auto first = order("9007199254740992");
+  ASSERT_EQ(32, first.size());
+  EXPECT_NE(first, order("9007199254740993"));
+  EXPECT_EQ(order("9007199254740993"), order("9007199254740992 + 1"));
+  auto* maximum = parse("random(9223372036854775807, x_i)");
+  EXPECT_EQ(INT64_MAX, maximum->root().intValue);
 }
 
 TEST_F(FunctionScoreTest, decayFunctionsMatchElasticsearch) {
@@ -191,10 +224,14 @@ TEST_F(FunctionScoreTest, decayFunctionsMatchElasticsearch) {
   EXPECT_GE(bounds.doubleMin, 0.0);
   EXPECT_LE(bounds.doubleMax, 1.0);
 
+  EXPECT_EQ(eval("gauss(v_d, 0, 1000 * 60)"), eval("gauss(v_d, 0, 60000)"));
+  EXPECT_EQ(eval("gauss(v_d, 0, pow(2, 10))"), eval("gauss(v_d, 0, 1024)"));
+  EXPECT_EQ(eval("geo_distance(loc_p, 1 - 1, pow(2, 3) - 8)"),
+            eval("geo_distance(loc_p, 0, 0)"));
   expectParseError("gauss(v_d, 0, 0)", "scale must be positive");
   expectParseError("gauss(v_d, 0, 1, -1)", "offset must be non-negative");
   expectParseError("exp(v_d, 0, 1, 0, 1)", "decay must be strictly between");
-  expectParseError("linear(v_d, 0, x_i)", "scale must be a numeric literal");
+  expectParseError("linear(v_d, 0, x_i)", "scale must be a constant numeric scalar");
   expectParseError("geo_distance(v_d, 0, 0)", "not a GEO_POINT field");
   expectParseError("geo_distance(loc_p, 91, 0)", "latitude");
 }

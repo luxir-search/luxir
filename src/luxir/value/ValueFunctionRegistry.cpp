@@ -1506,6 +1506,7 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 }
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
 constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
 constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
 constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
@@ -1591,7 +1592,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
      ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, nullptr},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
-     randomBounds, evalScalarOnlyElement, 0, 2, {RAW, RAW}, nullptr},
+     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
      evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3, {RAW, RAW, RAW}, nullptr},
 };
@@ -1609,27 +1610,17 @@ consteval std::string_view unsetOperandUnitFunction() {
 
 static_assert(unsetOperandUnitFunction().empty(), unsetOperandUnitFunction());
 
-ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
-  const ValueNode& node = program.nodes[index];
-  if (node.type == ValueType::INT64) return ValueBounds::integer(node.intValue, node.intValue);
-  if (node.type == ValueType::DOUBLE) return ValueBounds::floating(node.doubleValue, node.doubleValue);
-  if (node.arraySize == 0) {
-    ValueBounds out = ValueBounds::unbounded(node.type, true, true);
-    return out;
+consteval std::string_view constantBucketOperandFunction() {
+  for (const ValueFunction& function : FUNCTIONS) {
+    if (function.evalBucketScalar == nullptr) continue;
+    for (uint8_t i = 0; i < function.maxArity; i++) {
+      if (function.operands[i].constant) return function.name;
+    }
   }
-  if (node.type == ValueType::INT64_ARRAY) {
-    auto begin = program.intArrays.begin() + node.arrayOffset;
-    auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-    ValueBounds out = ValueBounds::integer(*min, *max);
-    out.type = node.type;
-    return out;
-  }
-  auto begin = program.doubleArrays.begin() + node.arrayOffset;
-  auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-  ValueBounds out = ValueBounds::floating(*min, *max);
-  out.type = node.type;
-  return out;
+  return {};
 }
+
+static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunction());
 
 [[noreturn]] void throwBindInvalid(const ValueProgram& program, const ValueNode& node,
                                    const ValueBounds& bounds) {
@@ -1664,6 +1655,28 @@ ValueBounds ValueFunction::bounds(
     if (!operands[i].lazy && invalid(args[i])) return retag(args[i], node.type);
   }
   return boundsPropagate(node, args);
+}
+
+ValueBounds ValueProgram::constantBounds(uint32_t index) const {
+  const ValueNode& node = nodes[index];
+  if (node.type == ValueType::INT64) return ValueBounds::integer(node.intValue, node.intValue);
+  if (node.type == ValueType::DOUBLE) return ValueBounds::floating(node.doubleValue, node.doubleValue);
+  if (node.arraySize == 0) {
+    ValueBounds out = ValueBounds::unbounded(node.type, true, true);
+    return out;
+  }
+  if (node.type == ValueType::INT64_ARRAY) {
+    auto begin = intArrays.begin() + node.arrayOffset;
+    auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
+    ValueBounds out = ValueBounds::integer(*min, *max);
+    out.type = node.type;
+    return out;
+  }
+  auto begin = doubleArrays.begin() + node.arrayOffset;
+  auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
+  ValueBounds out = ValueBounds::floating(*min, *max);
+  out.type = node.type;
+  return out;
 }
 
 const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
@@ -1781,7 +1794,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
     if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
-      bound.bounds = constantBounds(program, index);
+      bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
     } else if (node.kind == ValueNodeKind::DOCID) {

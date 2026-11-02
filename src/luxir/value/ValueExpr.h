@@ -97,6 +97,7 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
+  ValueBounds constantBounds(uint32_t index) const;
   bool structurallyEqual(const ValueProgram& other) const;
   std::string describeDateSources(uint32_t node) const;
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
