@@ -17,6 +17,21 @@
 
 namespace luxir {
 
+// Norm tables for one field weight vector, shared by the request's
+// CombinedFieldQuery weights. Per field, 256 entries each: weighted decoded
+// lengths, and their encoded norms for a segment where that field alone has
+// norms. A two-field vector adds the pair table of
+// CombinedFieldQuery::fillPairNorms once its weights' estimated pair
+// evaluations reach the build threshold.
+struct CombinedNormTables {
+  std::span<const float> weights;
+  const double* lengths;
+  const uint8_t* singleNorms;
+  const uint8_t* pairNorms;
+  int64_t pairEvaluations;
+  CombinedNormTables* next;
+};
+
 // BM25F over (field, term) entries, scored as if the fields were a
 // single combined field. One field with several terms is a synonym query.
 // Each field's weight multiplies its term frequency and its document length,
@@ -65,7 +80,13 @@ public:
     for (const auto& term : terms) {
       assert(term.field < fields.size() && term.weight > 0.0f && term.weight <= 1.0f);
     }
+    for (float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
   }
+
+  // Estimated pair-table evaluations that amortize building it: the 64K
+  // encodings cost about as much as this many summed-length evaluations.
+  static constexpr int64_t PAIR_TABLE_MIN_EVALUATIONS = 50000;
+  static inline int64_t pairTableMinEvaluationsForTests = PAIR_TABLE_MIN_EVALUATIONS;
 
   std::span<const std::string_view> getFields() const { return fields; }
   std::span<const float> getWeights() const { return weights; }
@@ -118,14 +139,41 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
+  // The combined length rounded half away from zero, clamped to int32 and
+  // encoded like a norm. Bit-identical to std::round for the non-negative,
+  // finite lengths a scorer produces, without the libm call.
+  static uint8_t encodeLength(double length) {
+    constexpr int32_t maxLength = std::numeric_limits<int32_t>::max();
+    if (!(length < (double)maxLength)) return SmallFloat::intToByte4(maxLength);
+    auto whole = (int64_t)length;
+    if (length - (double)whole >= 0.5) whole++;
+    return SmallFloat::intToByte4((int32_t)whole);
+  }
+
+  // Final norms of a two-field document, indexed by code0 << 8 | code1.
+  static void fillPairNorms(std::span<uint8_t> out, float weight0, float weight1) {
+    assert(out.size() == 256 * 256);
+    double lengths0[256], lengths1[256];
+    for (size_t code = 0; code < 256; code++) {
+      lengths0[code] = (double)weight0 * (double)SmallFloat::decodeLengthByte((uint8_t)code);
+      lengths1[code] = (double)weight1 * (double)SmallFloat::decodeLengthByte((uint8_t)code);
+    }
+    for (size_t code0 = 0; code0 < 256; code0++) {
+      for (size_t code1 = 0; code1 < 256; code1++) {
+        out[code0 << 8 | code1] = encodeLength(lengths0[code0] + lengths1[code1]);
+      }
+    }
+  }
+
   class Scorer final : public Query::Scorer {
   public:
     struct Postings {
       DocsFreqEnum* docs;
       float weight;
     };
+    // lengths[code] is the field weight times the decoded field length.
     struct Norms {
-      float weight;
+      const double* lengths;
       const uint8_t* flat = nullptr;
       NormsReader::Iterator* sparse = nullptr;
     };
@@ -134,6 +182,10 @@ public:
     std::span<Postings> postings;
     std::span<Norms> norms;
     Similarity::BM25Scorer* simScorer;
+    // Set when one field has norms in this segment: maps its code to the final norm.
+    const uint8_t* singleNorms;
+    // Set when both fields of a two-field query have norms; see fillPairNorms.
+    const uint8_t* pairNorms;
     int32_t doc = -1;
     float freq = 0.0f;
 
@@ -149,27 +201,32 @@ public:
       return doc;
     }
 
+    // A document without the field reads as code 0, which decodes to length 0.
+    uint8_t code(Norms& n) {
+      if (n.flat != nullptr) return n.flat[doc];
+      if (n.sparse->docId() < doc) n.sparse->advance(doc);
+      return n.sparse->docId() == doc ? n.sparse->value() : 0;
+    }
+
+    // Sums in field order, as the reference sum_f w_f * length_f(d) does. A
+    // missing field adds +0.0, which leaves the non-negative sum unchanged.
     int64_t combinedNorm() {
+      if (pairNorms != nullptr) return pairNorms[(size_t)code(norms[0]) << 8 | code(norms[1])];
+      if (singleNorms != nullptr) return singleNorms[code(norms[0])];
       double length = 0.0;
-      for (auto& n : norms) {
-        uint8_t code;
-        if (n.flat != nullptr) {
-          code = n.flat[doc];
-        } else {
-          if (n.sparse->docId() < doc) n.sparse->advance(doc);
-          if (n.sparse->docId() != doc) continue;
-          code = n.sparse->value();
-        }
-        length += (double)n.weight * (double)SmallFloat::decodeLengthByte(code);
-      }
-      double rounded = std::min(std::round(length), (double)std::numeric_limits<int32_t>::max());
-      return (int64_t)SmallFloat::intToByte4((int32_t)rounded);
+      for (auto& n : norms) length += n.lengths[code(n)];
+      return encodeLength(length);
     }
 
   public:
     Scorer(std::span<Postings> postings, std::span<Norms> norms,
-           Similarity::BM25Scorer* simScorer)
-      : postings(postings), norms(norms), simScorer(simScorer) {}
+           Similarity::BM25Scorer* simScorer, const uint8_t* singleNorms,
+           const uint8_t* pairNorms)
+      : postings(postings), norms(norms), simScorer(simScorer),
+        singleNorms(singleNorms), pairNorms(pairNorms) {
+      assert(singleNorms == nullptr || norms.size() == 1);
+      assert(pairNorms == nullptr || norms.size() == 2);
+    }
 
     int32_t docId() override { return doc; }
 
@@ -213,7 +270,68 @@ public:
     std::span<CachedTermInfo*> termInfos;
     Similarity::TermStats termStats;
     Similarity::BM25Scorer* simScorer = nullptr;
+    CombinedNormTables* normTables = nullptr;
     bool hasNorms = false;
+
+    // Finds or builds the tables for this field weight vector. A two-field
+    // vector builds the 64K-entry pair table once the estimated evaluations of
+    // all its weights amortize it. Construction is serial, so every weight,
+    // including earlier ones, reads the table when it creates scorers.
+    void useNormTables(Context& context) {
+      auto bits = [](float weight) { return std::bit_cast<uint32_t>(weight); };
+      auto sameWeights = [&](std::span<const float> weights) {
+        return std::ranges::equal(weights, query.weights, {}, bits, bits);
+      };
+      for (auto* tables = context.combinedNormTables; tables != nullptr; tables = tables->next) {
+        if (sameWeights(tables->weights)) {
+          normTables = tables;
+          break;
+        }
+      }
+      if (normTables == nullptr) {
+        size_t n = query.weights.size();
+        auto lengths = context.pool.make_span<double>(n * 256);
+        auto singleNorms = context.pool.make_span<uint8_t>(n * 256);
+        for (size_t i = 0; i < n; i++) {
+          for (size_t code = 0; code < 256; code++) {
+            double length = (double)query.weights[i] * (double)SmallFloat::decodeLengthByte((uint8_t)code);
+            lengths[i * 256 + code] = length;
+            singleNorms[i * 256 + code] = encodeLength(length);
+          }
+        }
+        normTables = context.pool.make<CombinedNormTables>(
+            query.weights, lengths.data(), singleNorms.data(), nullptr, 0, context.combinedNormTables);
+        context.combinedNormTables = normTables;
+      }
+      if (query.weights.size() != 2 || normTables->pairNorms != nullptr) return;
+      int64_t threshold = pairTableMinEvaluationsForTests;
+      normTables->pairEvaluations += pairEvaluations(context, threshold - normTables->pairEvaluations);
+      if (normTables->pairEvaluations >= threshold) {
+        auto pairNorms = context.pool.make_span<uint8_t>(256 * 256);
+        fillPairNorms(pairNorms, query.weights[0], query.weights[1]);
+        normTables->pairNorms = pairNorms.data();
+      }
+    }
+
+    // Norm evaluations this weight may make through a pair table: in each
+    // segment where both fields have norms, its matches capped at maxDoc.
+    // Counts no further than limit.
+    int64_t pairEvaluations(Context& context, int64_t limit) const {
+      auto fieldHasNorms = [&](size_t field, const IndexReader::Segment& segment) {
+        if (fieldInfos[field] == nullptr) return false;
+        const SegFieldInfo* segInfo = fieldInfos[field]->segInfos.at(segment);
+        return segInfo != nullptr && segInfo->normsFormat != SegFieldInfo::NORMS_NONE
+            && segInfo->normsLen > 0;
+      };
+      int64_t evaluations = 0;
+      for (auto& segment : context.topReader.segments()) {
+        if (evaluations >= limit) break;
+        if (fieldHasNorms(0, segment) && fieldHasNorms(1, segment)) {
+          evaluations += std::min<int64_t>(segment.maxDoc(), segmentCost(segment));
+        }
+      }
+      return evaluations;
+    }
 
     int64_t segmentCost(IndexReader::Segment& segment) const {
       int64_t cost = 0;
@@ -274,6 +392,7 @@ public:
         simScorer = context.pool.make<Similarity::BM25Scorer>(
             multiplier, similarity.k1, similarity.b, idf, avgdl, hasNorms);
       }
+      if (simScorer != nullptr && hasNorms) useNormTables(context);
     }
 
     const Similarity::TermStats& getTermStats() const { return termStats; }
@@ -346,23 +465,29 @@ public:
         }
       }
       auto norms = targetPool.make_span<Scorer::Norms>(hasNorms ? n : 0);
+      size_t lastNormsField = 0;
       for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
         const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
         assert(segInfo->type == FieldType::TEXT);
-        float weight = query.weights[i];
         if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
+        lastNormsField = i;
+        const double* lengths = normTables->lengths + i * 256;
         if (reader->isFlat()) {
-          norms[numNorms++] = {.weight = weight, .flat = reader->flatBase()};
+          norms[numNorms++] = {.lengths = lengths, .flat = reader->flatBase()};
         } else {
-          norms[numNorms++] = {.weight = weight, .sparse = targetPool.make<NormsReader::Iterator>(*reader)};
+          norms[numNorms++] = {.lengths = lengths, .sparse = targetPool.make<NormsReader::Iterator>(*reader)};
         }
       }
       if (numPostings == 0) return nullptr;
-      return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer);
+      // Only a two-field query has a pair table, so two norms are fields 0 and 1.
+      const uint8_t* singleNorms = numNorms == 1 ? normTables->singleNorms + lastNormsField * 256 : nullptr;
+      const uint8_t* pairNorms = numNorms == 2 ? normTables->pairNorms : nullptr;
+      return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer,
+                                     singleNorms, pairNorms);
     }
   };
 

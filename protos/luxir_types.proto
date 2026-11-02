@@ -795,8 +795,9 @@ enum SelectionMode {
 }
 
 // Buckets of distinct field values, using the field's value binding.
-// STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
-// counts, limits, mincount, missing, and selections.
+// STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount,
+// missing, selections, sub-operations, and metric sorts. Distinct counts are
+// supported except on TEXT; metric sorts with distinct counts are unsupported.
 message FieldFacet {
   enum CountUnit {
     DOCS = 0; // Count documents.
@@ -810,7 +811,7 @@ message FieldFacet {
 
   // Minimum bucket count. Unset includes only buckets with matches.
   // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
-  // INT/DATE require a positive value when set.
+  // INT/DATE/FLOAT/DOUBLE require a positive value when set.
   optional int64 mincount = 3;
   bool missing = 4; // Return the count without a value, in the chosen count unit.
 
@@ -1077,6 +1078,7 @@ message DocList {
 
 
 message FacetResult {
+  // Always-present bucket labels; Column.missing_val sentinels do not apply.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
   optional int64 missing = 4; // the number of documents that do not have this field
@@ -1363,6 +1365,7 @@ message ColStr {
 // Vector and value columns use the missing-value rules described on their
 // fields.  Every returned field type has a column form: a type with no typed
 // arm uses col_val.
+// In FacetResult.bucket_ids, every value is present and missing_val is ignored.
 message Column {
   oneof kind {
     ColStr col_s = 1;
@@ -2234,14 +2237,15 @@ message VectorAnnDef {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
   }
-  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
+  optional Codec codec = 1;  // absent: rabitq; pq requires explicit selection
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.
   optional int32 nlist = 2;
 
   message RaBitQ {
-    // Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a
+    // Bits per dimension, 0..9. Absent or 0: 2 below 384 stored dims,
+    // 1 at or above. Above 1 (extended RaBitQ) a
     // 1-bit pass prunes with the error bound and survivors are re-estimated
     // with the extra bits.
     optional int32 bits = 1;
@@ -2250,18 +2254,18 @@ message VectorAnnDef {
     // overlays.
     optional int32 query_bits = 2;
   }
-  RaBitQ rabitq = 3;  // requires explicit codec rabitq
+  RaBitQ rabitq = 3;  // codec rabitq (the default) only
 
   message Pq {
     // Sub-quantizers. Positive m requires positive effective (inherited)
     // dims and must divide it. Absent or 0: automatic, including inferred
     // dims. Choose the largest divisor leaving at least 4 dimensions per
-    // sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2.
+    // sub-quantizer, capped at max(32, dims / 8) for every metric.
     // If none does, choose the largest divisor under the same cap.
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }
-  Pq pq = 4;  // codec pq only
+  Pq pq = 4;  // requires explicit codec pq
 }
 
 // A field, template, or variant definition, named by its enclosing map key.
