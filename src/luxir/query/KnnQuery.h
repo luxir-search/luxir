@@ -1766,7 +1766,7 @@ public:
         LocalDomainSelector(const SegV2D& v2d, DocSet* domain) noexcept
           : v2d(v2d), domain(domain) {}
 
-        bool is_member(faiss::idx_t id) const final {
+        LUXIR_INLINE bool is_member(faiss::idx_t id) const final {
           if (id < 0) return false;
           resolves++;
           return domain->get(v2d.resolve((int64_t)id));
@@ -1830,6 +1830,22 @@ public:
         RoundSelector& operator=(const RoundSelector&) = delete;
 
         const faiss::IDSelector* get() const { return selPtr; }
+
+        // RaBitQ dispatches once per scan, keeping selector kind and virtual
+        // membership calls out of its per-code loop. PQ still uses get().
+        template <class Scan>
+        VectorSearchWork withProbe(int64_t numVectors, Scan&& scan) const {
+          if (bitmap) return scan([bits = bitmap->bitmap, numVectors](faiss::idx_t id) LUXIR_INLINE {
+            assert(id >= 0 && id < numVectors);
+            unused(numVectors);
+            return (bits[(size_t)id >> 3] >> (id & 7)) & 1;
+          });
+          if (domainSel) return scan([sel = &*domainSel](faiss::idx_t id) LUXIR_INLINE {
+            return sel->is_member(id);
+          });
+          return scan(nullptr);
+        }
+
         void addWork(VectorSearchWork& work) const {
           if (domainSel) domainSel->addWork(work);
           else if (bitmap) work.selectorBitmap += work.physicalEntries;
@@ -2007,7 +2023,19 @@ public:
                                int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut) const {
         assert(request.query != nullptr && request.dims == ivf.d);
         RoundSelector selector(*this, request);
-        const auto* sel = selector.get();
+        auto scan = [&](auto probe) {
+          return scanListsWithProbe<Interval>(request, listIds, centroidDists, rangeLiveVectors, cut, selector, probe);
+        };
+        if (rabitq == nullptr) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
+        return selector.withProbe(ivf.ntotal, scan);
+      }
+
+      template <bool Interval, class Probe>
+      LUXIR_NOINLINE VectorSearchWork scanListsWithProbe(const VectorSearchRequest& request,
+                               std::span<const faiss::idx_t> listIds,
+                               std::span<const float> centroidDists,
+                               int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut,
+                               const RoundSelector& selector, Probe probe) const {
         auto handler = [&]() {
           if constexpr (Interval) return IntervalResultHandler(*intervals, metric, segOrd, v2d, groupPlan);
           else return BoundedResultHandler(cut, metric, segOrd, v2d, groupPlan,
@@ -2017,7 +2045,7 @@ public:
         std::vector<float> centroid;
         if (rabitq != nullptr) centroid.resize((size_t)ivf.d);
         else {
-          pqScanner.reset(ivf.get_InvertedListScanner(false, sel));
+          pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
           pqScanner->set_query(preparedQuery.query);
         }
         int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
@@ -2055,7 +2083,9 @@ public:
               if constexpr (!Interval) pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
                                     ids.get() + begin, handler);
             } else for (size_t i = begin; i < end; i++) {
-              if (sel != nullptr && !sel->is_member(ids[i])) continue;
+              if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
+                if (!probe(ids[i])) continue;
+              }
               const uint8_t* code = codes.get() + i * ivf.code_size;
               scanned++;
               float distance = dc->distance_to_code_1bit(code);

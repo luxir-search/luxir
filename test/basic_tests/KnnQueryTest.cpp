@@ -4028,6 +4028,52 @@ TEST_F(KnnQueryTest, borrowedDomainCopiesOnlyForPooledClears) {
   EXPECT_EQ(resultIds(*req), (std::vector<std::string>{"0", "145", "146"}));
 }
 
+TEST_F(KnnQueryTest, rabitqSelectorKindsMatchExact) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::tuning.selector, KnnQuery::statsForTests);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(4, 2), 4);
+  for (int i = 0; i < 257; i++)
+    h.index(flatdoc("id", std::to_string(i), "keep_s", i % 10 == 0 ? "yes" : "no", "emb_vs",
+        std::vector<std::vector<float>>{{(float)i + 1, 0, 0, 0}, {(float)i + 1.25f, 0, 0, 0}}));
+  h.commit({"*"});
+  for (bool deletes : {false, true}) {
+    if (deletes) h.deleteByIds({"0", "250"}, UpdateMessage::COMMIT);
+    // None (rankLive under deletes), resolve, owned folded bitmap.
+    for (int mode : {0, 1, 2}) for (int refine : {0, 512}) {
+      SCOPED_TRACE(::testing::Message() << deletes << '/' << mode << '/' << refine);
+      KnnQuery::tuning.selector = mode == 2 ? KnnPlanner::Selector::FOLD : KnnPlanner::Selector::RESOLVE;
+      std::vector<std::string> expectedIds;
+      std::vector<uint32_t> expectedScores;
+      for (bool exact : {true, false}) {
+        KnnQuery::Stats stats;
+        KnnQuery::statsForTests = &stats;
+        auto req = localReq(h.getSearchEngine());
+        auto& cur = req->collection("main").topDocs("q");
+        configKnn(cur, "emb_vs", {0, 0, 0, 0}, 5, 0, refine, exact, 1);
+        if (mode) addMatchFilter(cur, "keep_s", "yes");
+        req->execute(false);
+        ASSERT_OK(req);
+        std::vector<uint32_t> scores;
+        for (float score : resultScores(*req)) scores.push_back(std::bit_cast<uint32_t>(score));
+        if (exact) { expectedIds = resultIds(*req); expectedScores = scores; }
+        else {
+          EXPECT_EQ(expectedIds, resultIds(*req));
+          EXPECT_EQ(expectedScores, scores);
+          EXPECT_EQ(1, stats.plannedIvf);
+          EXPECT_EQ(1, stats.rounds);
+          EXPECT_EQ(514, stats.work.physicalEntries);
+          EXPECT_EQ(mode ? 52 - (deletes ? 4 : 0) : 514 - (deletes ? 4 : 0), stats.work.selectorPasses);
+          EXPECT_EQ(mode == 1 ? 514 : 0, stats.work.resolveMono);
+          EXPECT_EQ(mode == 2 || (mode == 0 && deletes) ? 514 : 0, stats.work.selectorBitmap);
+          EXPECT_EQ(mode == 0 && !deletes ? 514 : 0, stats.work.selectorNone);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(KnnQueryTest, completionRecoversUnpooledMaximumBeyondCandidateCap) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
