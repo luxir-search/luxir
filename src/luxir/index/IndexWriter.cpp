@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/FieldReader.h"
+#include "luxir/reader/IdFilterReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -3502,6 +3503,10 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     int32_t docId;
     uint64_t deleteVersion;
   };
+  // Ids inside the segment's range are further pruned by its id membership
+  // filter before any term is sought.
+  IdFilterReader idFilter(reader, *idFieldInfo);
+  std::atomic<int64_t> probes = 0;
   const size_t chunk = deleteApplyChunkEntries;
   assert(chunk > 0);
   auto drain = [&](std::vector<DeleteCandidate>& hits, IndexRamBudget::Guard& scratch) {
@@ -3532,10 +3537,14 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
     std::vector<DeleteCandidate> hits;
     auto scratch = indexRamBudget->forceAcquire(0);
+    int64_t probed = 0;
     for (auto& entry : span) {
       uint64_t deleteVersion = entry.val().deleteWatermark;
       if (deleteVersion == 0) continue;
       std::string_view deleteId = (std::string_view)entry;
+      // Skipping a target is safe: seekForward only needs ascending targets.
+      if (!idFilter.mayContain(deleteId)) continue;
+      probed++;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
                deleteId, deleteVersion, seg.segId);
@@ -3554,6 +3563,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       } // end if termsEnum.seek()
     }
     drain(hits, scratch);
+    probes.fetch_add(probed, std::memory_order_relaxed);
   };
   // Split large spans into id-ordered chunks so a few big segments still use every
   // worker; each chunk seeks forward from its own enum.
@@ -3575,6 +3585,9 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     }
     tg.wait();
   }
+  // Test hook: (segId, number of ids that passed the id filter and were sought).
+  luxir::Signal::emit("deleteIdsProbed", (void*)(int64_t)seg.segId,
+                      (void*)probes.load(std::memory_order_relaxed));
 
   // If we found any new documents to delete, write a new delete generation
   if (int32_t deleted = newDeletesCount.load(std::memory_order_relaxed); deleted > 0) {

@@ -21,6 +21,7 @@
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/util/BlockBloomFilter.h"
 #include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
@@ -585,6 +586,10 @@ private:
       fieldOutput.writeVlong(finfo.mono2MetaOff);
       fieldOutput.writeVal(finfo.valDocLoc);
       fieldOutput.writeVlong(finfo.valDocMetaOff);
+      if ((finfo.flags & FieldType::ID_FILTER) != 0) {
+        fieldOutput.writeVal(finfo.idFilterLoc);
+        fieldOutput.writeVlong(finfo.idFilterLen);
+      }
     }
 
     // Now write the start of each fieldInfo
@@ -815,6 +820,8 @@ private:
   int64_t sumDocFreq = 0; // updated in endTerm
   int64_t numTerms; // currently only updated in flushTerms
   bool mayHaveFitted = false; // set in endTerm for kept terms of MIN_FITTED_LEN bytes or more
+  // Id membership filter, fed with the XXH3 term hashes written to each term block.
+  std::optional<BlockBloomFilter> idFilter;
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1253,6 +1260,13 @@ public:
     startField(finfo);
   }
 
+  /// Build an id membership filter for this field (see IdFilterReader).
+  /// maxTerms bounds the number of terms the field will write and sizes the
+  /// filter.  Call after startField(); not supported for term-range runs.
+  void buildIdFilter(int64_t maxTerms) {
+    idFilter.emplace(maxTerms);
+  }
+
   void startField(PostingsWriter::IndexFieldInfo* finfo) {
     if (termsLoc == -1) {
       throw std::runtime_error("startField called twice!");
@@ -1572,7 +1586,9 @@ public:
     // now write hashes of the terms
     for (int i=0; i<nTerms; i++) {
       auto term = termList[i];
-      termOutput.write((char)XXH3_64bits(term.data(), term.size()));
+      uint64_t hash = XXH3_64bits(term.data(), term.size());
+      termOutput.write((char)hash);
+      if (idFilter) idFilter->add(hash);
     }
 
     termOutput.write(prefixLens.data(), prefixLens.size());
@@ -1844,7 +1860,7 @@ public:
 
     if ((std::string_view)fieldInfo->fieldname == "id") {
       postingsWriter.idDictionaryBlocks = result.nBlocks;
-      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+      postingsWriter.idRange = IdRange{result.firstTerm, result.lastTerm, result.nTerms == 0};
     }
 
     // write index into the blocks of the terms dict
@@ -1891,6 +1907,22 @@ public:
                      result.termBlockOffsets.size() * sizeof(result.termBlockOffsets[0]));
     fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
     termOutput.write(trieBytes.data(), trieBytes.size());
+
+    if (idFilter) {
+      // Format: [numBlocks: vint][min term: str][max term: str]
+      //         [numBlocks x 32-byte BlockBloomFilter blocks]
+      // The min/max terms come free from the run; the filter holds every
+      // term written, so it has no false negatives.
+      size_t start = termOutput.size();
+      fieldInfo->idFilterLoc = seg_location(termOutput.streamNumber, start);
+      termOutput.writeVint(idFilter->numBlocks());
+      termOutput.writeStr(result.firstTerm.data(), (uint32_t)result.firstTerm.size());
+      termOutput.writeStr(result.lastTerm.data(), (uint32_t)result.lastTerm.size());
+      termOutput.write(idFilter->words.data(), idFilter->sizeInBytes());
+      fieldInfo->idFilterLen = (int64_t)(termOutput.size() - start);
+      fieldInfo->flags |= FieldType::ID_FILTER;
+      idFilter.reset();
+    }
 
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
     fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);

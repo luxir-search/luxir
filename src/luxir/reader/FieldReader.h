@@ -103,6 +103,13 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
       fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
       fieldInfo.valDocMetaOff = fieldIS.readVlong();
+      if ((fieldInfo.flags & FieldType::ID_FILTER) != 0) {
+        fieldInfo.idFilterLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.idFilterLen = fieldIS.readVlong();
+      } else {
+        fieldInfo.idFilterLoc = {0, 0};
+        fieldInfo.idFilterLen = 0;
+      }
     }
   }
 
