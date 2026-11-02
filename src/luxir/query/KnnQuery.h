@@ -149,12 +149,15 @@ public:
 
   struct Stats {
     std::atomic<int64_t> lists{0}, vectors{0}, bytes{0}, rounds{0};
-    // Selector-passing codes, including those rejected by the 1-bit gate.
-    std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0};
+    // Selector-passing codes, including those rejected by the 1-bit gate;
+    // codesVisited counts physical list entries, including depth rescans.
+    std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0}, codesVisited{0};
     std::atomic<int64_t> retainedPeak{0}, retainedTerminal{0}, seedReads{0}, remainingReads{0};
     // Flat search work; excludes metadata counting and terminal rereads.
     std::atomic<int64_t> domainDocsVisited{0}, domainProbes{0}, vectorsScored{0};
     std::atomic<int64_t> slotsBuilt{0}, faissIndexCalls{0};
+    std::atomic<int64_t> firstRoundLists{0}, firstRoundLiveVectors{0}, targetDocs{0}, targetUnits{0};
+    std::atomic<double> initialBudget{0};
   };
   static inline Stats* statsForTests = nullptr;
   // Dense single-valued filter density above which flat search walks ranks.
@@ -162,6 +165,8 @@ public:
   // forces sequential for every shape, infinity forces the domain walk.
   static inline double flatDomainDensityThreshold = 0.6;
   static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
+  // Test/benchmark seam for default filtered coverage; zero disables expansion.
+  static inline double filteredCoverageAlpha = 0.5;
 
   struct SegmentEligibility {
     int64_t eligibleDocs = 0;
@@ -849,6 +854,7 @@ public:
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
       int64_t liveVectorCount = 0;
+      int64_t eligibleVectorCount = 0;
       std::unique_ptr<SegmentIvfScanner<Groups>> ivfEngine;
     };
 
@@ -1014,6 +1020,7 @@ public:
       std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
 
       int64_t kDocs = query.getK();
+      int64_t allEligibleDocs = 0, boundedEligibleDocs = 0;
       bool boundedEngine = boundedVectors > 0;
       KnnIntervalCollector<Groups> intervals(kDocs, context.planningContext().memoryTracker, query.getField());
       std::vector<EngineSlot<Groups>> slots;
@@ -1080,6 +1087,7 @@ public:
             .engine = nullptr,
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
+            .eligibleVectorCount = eligibilityPerSeg[i].unfiltered ? segLiveVectorCounts[i] : eligibilityPerSeg[i].eligibleVectors,
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
@@ -1092,9 +1100,20 @@ public:
               dims, metric, normalizeColumnOnCosineRescore, query.groups, v2dSpan),
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
+            .eligibleVectorCount = eligibilityPerSeg[i].unfiltered ? segLiveVectorCounts[i] : eligibilityPerSeg[i].eligibleVectors,
             .ivfEngine = nullptr,
           });
         }
+        // Filtered counts are exact. Unfiltered sparse/multi columns under
+        // deletes retain a conservative cap when no exact count is at hand;
+        // do not add a per-query metadata walk just to tighten that cap.
+        int64_t docs = eligibilityPerSeg[i].eligibleDocs;
+        if (eligibilityPerSeg[i].unfiltered) {
+          if (seg.liveDocs()) docs = std::min(docs, (int64_t)seg.liveDocs()->numLive());
+          if (!monoHolders[i]) docs = std::min(docs, segLiveVectorCounts[i]);
+        }
+        allEligibleDocs += docs;
+        if (vaux != nullptr && (!vaux->isRaBitQ() || query.getRefineCandidates() > 0)) boundedEligibleDocs += docs;
       }
       if (slots.empty()) {
         return emptyResult();
@@ -1122,8 +1141,13 @@ public:
       int64_t kReq = Groups ? std::min(baseReq, cap) : mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return emptyResult();
       int64_t targetDocReq = boundedEngine
-        ? std::min<int64_t>(boundedLiveVectors, std::max(kDocs, baseReq))
+        ? std::min({boundedLiveVectors, boundedEligibleDocs, std::max(kDocs, baseReq)})
         : 0;
+      int64_t unitTarget = Groups ? kDocs : std::min(kDocs, allEligibleDocs);
+      if (statsForTests) {
+        statsForTests->targetDocs += targetDocReq;
+        statsForTests->targetUnits += unitTarget;
+      }
 
       std::vector<VectorEngineHit> candidateHits, exactCandidates;
       std::conditional_t<Groups, std::unique_ptr<BoundedHits<true, VectorEngineHit, betterHit>>, NoGroupState> groupPool;
@@ -1320,7 +1344,7 @@ public:
           if (key) intervals.observeBounded(*key);
         }
         intervals.compact();
-        bool unitsFilled = intervals.unitCount() >= (size_t)kDocs;
+        bool unitsFilled = intervals.unitCount() >= (size_t)unitTarget;
         if (boundedDone && unitsFilled) break;
         if (!intervalEngine && poolSize >= maxVectorHits) break;
 
@@ -1723,7 +1747,7 @@ public:
           pqScanner.reset(ivf.get_InvertedListScanner(false, sel));
           pqScanner->set_query(preparedQuery.query);
         }
-        int64_t scanned = 0, extra = 0, rejected = 0;
+        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
         bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         for (size_t list = 0; list < listIds.size(); list++) {
@@ -1732,6 +1756,7 @@ public:
           faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
           faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
           size_t count = ivf.invlists->list_size((size_t)id);
+          visited += (int64_t)count;
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
           faiss::RaBitQDistanceComputer* dc = nullptr;
           if (rabitq != nullptr) {
@@ -1796,6 +1821,7 @@ public:
           statsForTests->vectors += distances;
           statsForTests->bytes += distances * (int64_t)ivf.code_size;
           statsForTests->scanned += scanned;
+          statsForTests->codesVisited += visited;
           statsForTests->extraBitEvaluations += extra;
           statsForTests->gateRejections += rejected;
         }
@@ -2120,7 +2146,7 @@ public:
     ///     the next merge through no data change.
     ///   - Allocation: every IVF segment contributes its full centroid-sorted
     ///     list ranking; a lazy k-way merge pops the globally best list and
-    ///     charges its live size / liveN until P is spent.  Small segments
+    ///     charges its live size / ivfLiveN until P is spent.  Small segments
     ///     thus get small (or zero) shares instead of equal work.
     ///   - Deepening: the merge heap and per-slot cursors persist across
     ///     search() calls; a breadth round just keeps popping where the last
@@ -2145,6 +2171,7 @@ public:
 
       std::vector<EngineSlot<Groups>> slots;
       int64_t liveTotalVectors;
+      int64_t ivfLiveTotal = 0, ivfEligibleVectors = 0;
       int64_t kDocs;
       int32_t metric;
       bool parallel;
@@ -2267,6 +2294,11 @@ public:
         double p = request.breadth > 0
           ? (double)request.breadth / (double)std::max(1, referenceBreadth)
           : defaultBudget(request.dims);
+        if (request.breadth == 0 && ivfLiveTotal > 0 && ivfEligibleVectors < ivfLiveTotal) {
+          // Large multi-valued domains can contribute estimated vector counts.
+          double s = (double)ivfEligibleVectors / (double)ivfLiveTotal;
+          p *= std::pow(std::max(s, std::numeric_limits<double>::min()), -filteredCoverageAlpha);
+        }
         p = std::max(p, (double)request.minScanFraction);
         return std::clamp(p, 0.0, 1.0);
       }
@@ -2282,7 +2314,7 @@ public:
 
       // Extend the global allocation until the requested scan fraction is
       // covered.  Lazy k-way merge over all slots' centroid-sorted runs: pop
-      // the globally closest list, charge its live size / liveN, advance that
+      // the globally closest list, charge its live size / ivfLiveN, advance that
       // slot's cursor (replace-top, one sift), repeat.  Resumable: cursors
       // and allocatedCost persist, so a deepen round allocates only the
       // increment.  The epsilon absorbs float accumulation when a fraction
@@ -2308,8 +2340,8 @@ public:
           selectedCentroidDists[(size_t)slotOrd].push_back(
             runs[(size_t)slotOrd].centroidDists[cursors[(size_t)slotOrd]]);
           selectedListLiveSizes[(size_t)slotOrd].push_back(liveSize);
-          if (liveTotalVectors > 0) {
-            allocatedCost += (double)liveSize / (double)liveTotalVectors;
+          if (ivfLiveTotal > 0) {
+            allocatedCost += (double)liveSize / (double)ivfLiveTotal;
           }
 
           cursors[(size_t)slotOrd]++;
@@ -2340,8 +2372,8 @@ public:
           heapSize);
         int32_t slotOrd = pq.indexOfTop();
         int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(pq.top().listId);
-        double nextCost = liveTotalVectors > 0
-          ? (double)liveSize / (double)liveTotalVectors
+        double nextCost = ivfLiveTotal > 0
+          ? (double)liveSize / (double)ivfLiveTotal
           : 0.0;
         double minStep = 1.0 / (double)std::max(1, referenceBreadth);
         int32_t next = breadthForBudget(std::min(1.0, allocatedCost + std::max(nextCost, minStep)));
@@ -2397,7 +2429,12 @@ public:
           liveTotalVectors(liveTotalVectors),
           kDocs(kDocs),
           metric(metric),
-          parallel(parallel) {}
+          parallel(parallel) {
+        for (const auto& slot : this->slots) if (slot.ivfEngine) {
+          ivfLiveTotal += slot.liveVectorCount;
+          ivfEligibleVectors += std::min(slot.eligibleVectorCount, slot.liveVectorCount);
+        }
+      }
 
       VectorSearchResult search(const VectorSearchRequest& request) override {
         VectorSearchResult merged;
@@ -2406,7 +2443,17 @@ public:
         merged.breadthExhausted = true;
         if (request.candidates <= 0) return merged;
 
+        // Complete coverage before any host fill test, even when exact
+        // witnesses already supply k units. Integer breadth remains the
+        // reference-index coordinate; only allocation uses the IVF total.
         allocateToBudget(request);
+        if (!coarseScanned && statsForTests) {
+          statsForTests->initialBudget += budgetForRequest(request);
+          for (size_t i = 0; i < selectedListIds.size(); i++) {
+            statsForTests->firstRoundLists += (int64_t)selectedListIds[i].size();
+            for (int64_t n : selectedListLiveSizes[i]) statsForTests->firstRoundLiveVectors += n;
+          }
+        }
 
         // DEPTH rescans only bounded slots, excluding banked identities and
         // starting a fresh cut. BREADTH visits new list tails for both policies.

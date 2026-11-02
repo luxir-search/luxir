@@ -920,6 +920,169 @@ struct VectorDataset {
   std::vector<float> query(int32_t q) const { return row(nBase + q); }
 };
 
+// Fixed query anchors have exact distance-rank fields. Near/far range
+// filters therefore have real vector-space correlation and exact cardinality;
+// a shuffled rank field supplies the independent control. Rank fields and
+// exact filtered answers are shared across codecs and alpha settings.
+struct FilteredVectorCorpus {
+  const VectorDataset* dataset = nullptr;
+  int64_t size;
+  int dims, segments;
+  api::VectorMetric metric;
+  std::vector<float> synthetic;
+  std::vector<std::vector<float>> queries;
+  std::vector<std::vector<int32_t>> nearRanks;
+  std::vector<int32_t> randomRank;
+  std::map<std::pair<int, int>, std::vector<std::vector<std::string>>> truth;
+
+  std::span<const float> row(int64_t i) const {
+    const auto& data = dataset ? dataset->data : synthetic;
+    return {data.data() + i * dims, (size_t)dims};
+  }
+
+  FilteredVectorCorpus() {
+    auto env = [](const char* key, int fallback) { const char* v = getenv(key); return v ? std::stoi(v) : fallback; };
+    if (!luxir::unit_tests) dataset = VectorDataset::get();
+    if (!luxir::unit_tests && getenv("LUXIR_VECTOR_DATASET") && !dataset)
+      throw std::runtime_error("cannot read LUXIR_VECTOR_DATASET");
+    size = luxir::unit_tests ? 512 : dataset ? dataset->nBase : env("LUXIR_VECTOR_N", 500'000);
+    dims = luxir::unit_tests ? 16 : dataset ? dataset->dims : env("LUXIR_VECTOR_DIMS", 128);
+    segments = luxir::unit_tests ? 1 : dataset ? dataset->segments : env("LUXIR_VECTOR_SEGMENTS", 1);
+    metric = dataset ? dataset->metric : api::VectorMetric::L2;
+    int nq = luxir::unit_tests ? 2 : std::min(8, dataset ? dataset->nQueries : env("LUXIR_VECTOR_QUERIES", 8));
+    if (size <= 0 || size > INT32_MAX || dims <= 0 || nq <= 0 || segments <= 0)
+      throw std::runtime_error("invalid filtered vector corpus shape");
+    int clusters = luxir::unit_tests ? 8 : 100;
+    if (!dataset) {
+      synthetic.reserve((size_t)size * dims);
+      for (int64_t i = 0; i < size; i++) {
+        auto v = makeClusteredVector(i, dims, clusters);
+        synthetic.insert(synthetic.end(), v.begin(), v.end());
+      }
+    }
+    randomRank.resize((size_t)size);
+    std::vector<int32_t> order((size_t)size);
+    for (int32_t i = 0; i < size; i++) order[(size_t)i] = i;
+    SplitMix64 rng(0x2468ace);
+    for (int64_t i = size - 1; i > 0; i--) std::swap(order[(size_t)i], order[(size_t)rng.rint(i + 1)]);
+    for (int32_t i = 0; i < size; i++) randomRank[(size_t)order[(size_t)i]] = i;
+    for (int q = 0; q < nq; q++) {
+      queries.push_back(dataset ? dataset->query(q) : makeClusteredQuery(q, dims, clusters));
+      const auto& query = queries.back();
+      float qnorm = faiss::fvec_inner_product(query.data(), query.data(), dims);
+      std::vector<std::pair<float, int32_t>> ranked;
+      ranked.reserve((size_t)size);
+      for (int32_t i = 0; i < size; i++) {
+        auto v = row(i);
+        float score = metric == api::VectorMetric::L2 ? -faiss::fvec_L2sqr(query.data(), v.data(), dims)
+            : faiss::fvec_inner_product(query.data(), v.data(), dims);
+        if (metric == api::VectorMetric::COSINE) {
+          float norm = qnorm * faiss::fvec_inner_product(v.data(), v.data(), dims);
+          score = norm > 0 ? score / std::sqrt(norm) : 0;
+        }
+        ranked.emplace_back(score, i);
+      }
+      std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+      });
+      auto& ranks = nearRanks.emplace_back((size_t)size);
+      for (int32_t i = 0; i < size; i++) ranks[(size_t)ranked[(size_t)i].second] = i;
+    }
+  }
+};
+
+void BM_VectorKnnFiltered(benchmark::State& state) {
+  static std::optional<FilteredVectorCorpus> corpus;
+  if (!corpus) corpus.emplace();
+  auto& data = *corpus;
+  int codec = (int)state.range(0), permyriad = (int)state.range(1), correlation = (int)state.range(2);
+  int64_t selected = std::max((int64_t)1, data.size * permyriad / 10000);
+  CollectionHelper helper("filtered_vectors");
+  static int builtCodec = -1;
+  if (builtCodec != codec) {
+    helper.clear();
+    installVectorBenchSchema(helper.collection(), data.dims, data.metric, codec);
+    std::vector<Doc> docs;
+    int64_t perSegment = (data.size + data.segments - 1) / data.segments;
+    for (int64_t i = 0; i < data.size; i++) {
+      auto v = data.row(i);
+      auto doc = flatdoc("id", "d" + std::to_string(i), "bench_v", std::vector<float>(v.begin(), v.end()),
+                        "random_i", (int64_t)data.randomRank[(size_t)i]);
+      for (size_t q = 0; q < data.queries.size(); q++)
+        doc.emplace_back("near" + std::to_string(q) + "_i", (int64_t)data.nearRanks[q][(size_t)i]);
+      docs.push_back(std::move(doc));
+      bool commit = (i + 1) % perSegment == 0 || i + 1 == data.size;
+      if (docs.size() == 256 || commit) { helper.indexAll(docs); docs.clear(); }
+      if (commit) helper.commit();
+    }
+    IvfBenchGuard guard;
+    helper.commit({"vec.bench_v"});
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    for (const auto& seg : reader->segments()) {
+      if (!seg.getAuxReader("vec.bench_v")) {
+        state.SkipWithError("filtered benchmark segment has no IVF overlay; increase corpus size");
+        return;
+      }
+    }
+    builtCodec = codec;
+  }
+  SearchOverridesGuard saved(KnnQuery::filteredCoverageAlpha, KnnQuery::statsForTests);
+  KnnQuery::filteredCoverageAlpha = (double)state.range(3) / 100;
+  auto run = [&](int q, bool exact, std::vector<std::string>& ids) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("filtered_vectors").topDocs();
+    cur.limit(10).countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "bench_v", data.queries[(size_t)q], 10, 0, exact);
+    std::string field = correlation == 0 ? "random_i" : "near" + std::to_string(q) + "_i";
+    auto* bound = qb::valI64(cur.mr(), correlation == 2 ? data.size - selected : selected);
+    cur.filter(qb::range(cur.mr(), field, correlation == 2 ? bound : nullptr, nullptr,
+                        nullptr, correlation == 2 ? nullptr : bound));
+    req->execute(false);
+    std::string error;
+    if (!responseIds(*req, ids, error)) { state.SkipWithError(error.c_str()); return false; }
+    return true;
+  };
+  auto key = std::pair{permyriad, correlation};
+  auto it = data.truth.find(key);
+  if (it == data.truth.end()) {
+    std::vector<std::vector<std::string>> truth(data.queries.size());
+    for (int q = 0; q < (int)data.queries.size(); q++) if (!run(q, true, truth[(size_t)q])) return;
+    it = data.truth.emplace(key, std::move(truth)).first;
+  }
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  double recall = 0;
+  for (int q = 0; q < (int)data.queries.size(); q++) {
+    std::vector<std::string> ids;
+    if (!run(q, false, ids)) return;
+    const auto& expected = it->second[(size_t)q];
+    int hits = 0;
+    for (const auto& id : ids) hits += std::ranges::find(expected, id) != expected.end();
+    recall += expected.empty() ? 1.0 : (double)hits / expected.size();
+  }
+  KnnQuery::statsForTests = nullptr;
+  int q = 0;
+  for (auto _ : state) {
+    std::vector<std::string> ids;
+    if (!run(q, false, ids)) break;
+    benchmark::DoNotOptimize(ids);
+    q = (q + 1) % (int)data.queries.size();
+  }
+  double queries = (double)data.queries.size();
+  state.SetLabel(std::string(benchCodecName(codec)) + "/" + (correlation == 0 ? "independent" : correlation == 1 ? "near" : "far"));
+  state.counters["recall@10"] = recall / queries;
+  state.counters["recall_pass"] = recall / queries >= 0.95;
+  state.counters["rounds"] = stats.rounds.load() / queries;
+  state.counters["codes_visited"] = stats.codesVisited.load() / queries;
+  state.counters["selector_passes"] = stats.scanned.load() / queries;
+  state.counters["codes_scored"] = (stats.scanned.load() - stats.gateRejections.load()) / queries;
+  state.counters["budget"] = stats.initialBudget.load() / queries;
+  state.counters["selectivity"] = (double)selected / data.size;
+  state.counters["nBase"] = (double)data.size;
+  state.counters["queries"] = queries;
+  state.counters["dims"] = data.dims;
+}
+
 void BM_VectorAnnDataset(benchmark::State& state) {
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
@@ -1059,6 +1222,14 @@ TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segmen
     ->UseManualTime()->Iterations(2);
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
+
+LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int codec : {PQ, RABITQ2, RABITQ1})
+        for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
+          for (int correlation : {0, 1, 2}) for (int alpha : {0, 25, 50, 100})
+            b->Args({codec, selectivity, correlation, alpha});
+    });
 
 LUXIR_BENCHMARK(BM_VectorKnnFlatDomain)->ArgNames({"shape", "basis_points", "arm"})
     ->Apply([](benchmark::Benchmark* b) {

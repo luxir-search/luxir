@@ -1635,6 +1635,140 @@ TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
   EXPECT_LE(scaledDefault, plainDefault * 3) << plainDefault;
 }
 
+TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
+  std::mt19937 rng(32);
+  std::normal_distribution<float> gauss;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 1024; i++) docs.push_back(flatdoc("id", std::to_string(i),
+      "all_s", "yes", "keep_s", i % 8 == 0 ? "yes" : "no", "tiny_s", i < 3 ? "yes" : "no",
+      "embedding_v", std::vector<float>{gauss(rng), gauss(rng), gauss(rng), gauss(rng)}));
+  h.indexAll(docs);
+  h.commit({"*"});
+  struct Result { std::vector<std::string> ids; int64_t lists, live, target, units, rounds; double budget; };
+  auto run = [&](double alpha, std::string_view filter, int nprobe = 0, float floor = 0, int k = 5) {
+    KnnQuery::filteredCoverageAlpha = alpha;
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs();
+    configKnn(cur, "embedding_v", {0, 0, 0, 0}, k, nprobe, 12, false, floor);
+    if (!filter.empty()) addMatchFilter(cur, filter, "yes");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    KnnQuery::statsForTests = nullptr;
+    return Result{resultIds(*req), stats.firstRoundLists.load(), stats.firstRoundLiveVectors.load(),
+        stats.targetDocs.load(), stats.targetUnits.load(), stats.rounds.load(), stats.initialBudget.load()};
+  };
+  auto old = run(0, ""), unchanged = run(0.5, ""), all = run(0.5, "all_s");
+  for (const auto& r : {unchanged, all}) {
+    EXPECT_EQ(old.ids, r.ids);
+    EXPECT_EQ(old.lists, r.lists);
+    EXPECT_EQ(old.live, r.live);
+    EXPECT_DOUBLE_EQ(old.budget, r.budget);
+    EXPECT_EQ(1, r.rounds);
+  }
+  // Independently reproduce the unfiltered allocation against the real IVF.
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+  auto* index = dynamic_cast<faiss::IndexIVF*>(((VectorAuxReader*)aux.get())->getFaissIndex());
+  ASSERT_NE(nullptr, index);
+  std::vector<float> distances(index->nlist);
+  std::vector<faiss::idx_t> lists(index->nlist);
+  std::array<float, 4> q{};
+  index->quantizer->search(1, q.data(), (faiss::idx_t)index->nlist, distances.data(), lists.data());
+  int64_t expectedLists = 0, expectedLive = 0;
+  double cost = 0;
+  while (cost + 1e-15 < old.budget && expectedLists < (int64_t)lists.size()) {
+    int64_t size = (int64_t)index->invlists->list_size((size_t)lists[(size_t)expectedLists++]);
+    expectedLive += size;
+    cost += (double)size / 1024;
+  }
+  EXPECT_EQ(expectedLists, old.lists);
+  EXPECT_EQ(expectedLive, old.live);
+  auto lean = run(0, "keep_s"), expanded = run(0.5, "keep_s");
+  EXPECT_DOUBLE_EQ(std::min(1.0, old.budget * std::sqrt(8.0)), expanded.budget);
+  EXPECT_GT(expanded.live, lean.live);
+  auto pin = run(0, "keep_s", 2), pinScaled = run(0.5, "keep_s", 2);
+  EXPECT_EQ(pin.ids, pinScaled.ids);
+  EXPECT_EQ(pin.live, pinScaled.live);
+  EXPECT_EQ(pin.lists, pinScaled.lists);
+  EXPECT_DOUBLE_EQ(pin.budget, pinScaled.budget);
+  auto floored = run(0.5, "keep_s", 0, 0.9f);
+  EXPECT_GE(floored.live, 1024 * 0.9);
+  auto tiny = run(0.5, "tiny_s", 0, 0, 10);
+  EXPECT_EQ(3, tiny.target);
+  EXPECT_EQ(3, tiny.units);
+  EXPECT_EQ(3u, tiny.ids.size());
+  EXPECT_EQ(1, tiny.rounds);
+  auto quarter = run(0, "", 1, 0.25f);
+  docs.clear();
+  for (int i = 0; i < 1024; i++) docs.push_back(flatdoc("id", "flat" + std::to_string(i),
+      "embedding_v", std::vector<float>{1000, 1000, 1000, 1000}));
+  h.indexAll(docs, UpdateMessage::COMMIT);
+  auto mixed = run(0.5, "", 1, 0.25f);
+  EXPECT_EQ(quarter.live, mixed.live);
+  EXPECT_EQ(quarter.lists, mixed.lists);
+  EXPECT_EQ(quarter.ids, mixed.ids);
+  EXPECT_DOUBLE_EQ(0.25, mixed.budget);
+  h.deleteByIds({"0", "1", "2"}, UpdateMessage::COMMIT);
+  auto live = run(0, ""), liveScaled = run(0.5, "");
+  EXPECT_EQ(live.ids, liveScaled.ids);
+  EXPECT_EQ(live.lists, liveScaled.lists);
+  EXPECT_EQ(live.live, liveScaled.live);
+  EXPECT_DOUBLE_EQ(live.budget, liveScaled.budget);
+}
+
+TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha);
+  for (bool interval : {false, true}) {
+    CollectionHelper h("main");
+    h.clear();
+    installVecSchema(h.collection(), api::VectorMetric::L2, interval ? rabitqAnn(4, 2) : pqAnn(4, 2, 1), 4);
+    std::vector<Doc> docs;
+    for (int i = 0; i < 1600; i++) docs.push_back(flatdoc("id", "b" + std::to_string(i),
+        "keep_s", i >= 400 && i < 560 ? "yes" : "no", "embedding_v",
+        std::vector<float>{(float)(i / 400 * 100) + (float)(i % 400) * 0.001f, 0, 0, 0}));
+    h.indexAll(docs);
+    h.commit({"*"});
+    docs.clear();
+    for (int i = 0; i < 10; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i),
+        "keep_s", "yes", "embedding_v", std::vector<float>{10000.0f + (float)i, 0, 0, 0}));
+    h.indexAll(docs, UpdateMessage::COMMIT);
+    auto run = [&](bool exact, int nprobe) {
+      auto req = localReq(luxirNode->getSearchEngine());
+      auto& cur = req->collection("main").topDocs();
+      configKnn(cur, "embedding_v", {0, 0, 0, 0}, 5, nprobe, interval ? 0 : 10, exact);
+      addMatchFilter(cur, "keep_s", "yes");
+      req->execute();
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      return resultIds(*req);
+    };
+    auto exact = run(true, 0);
+    KnnQuery::filteredCoverageAlpha = 0.5;
+    KnnQuery::Stats pinned;
+    KnnQuery::statsForTests = &pinned;
+    auto pinIds = run(false, 1);
+    EXPECT_EQ(1, pinned.firstRoundLists.load());
+    EXPECT_EQ(0, pinned.scanned.load());
+    ASSERT_EQ(5u, pinIds.size());
+    for (const auto& id : pinIds) { EXPECT_EQ('a', id[0]); }
+    KnnQuery::Stats scaled;
+    KnnQuery::statsForTests = &scaled;
+    auto ids = run(false, 0);
+    EXPECT_GE(scaled.firstRoundLiveVectors.load() + 1e-9, scaled.initialBudget.load() * 1600);
+    EXPECT_GE(scaled.firstRoundLists.load(), 2);
+    EXPECT_GT(scaled.scanned.load(), 0);
+    EXPECT_EQ(exact, ids);
+    EXPECT_EQ(1, scaled.rounds.load());
+    KnnQuery::statsForTests = nullptr;
+  }
+}
+
 TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
   IvfTestGuard guard(/*minTraining=*/2);
   CollectionHelper h("main");

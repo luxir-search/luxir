@@ -793,7 +793,7 @@ every index type.
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Select the bounded candidate policy for every approximate codec, with this document budget clamped up to `k`. Unset: RaBitQ uses intervals; PQ uses the count formula below. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
-| `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
+| `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned in the searched IVF segments, in `[0,1]`; `0.001` means 0.1%. |
 
 An explicit `refine_candidates` selects bounded collection for every approximate
 segment, including RaBitQ. Without it, PQ uses
@@ -834,6 +834,14 @@ measurements on GIST and Cohere embeddings showed recall@10 rising from
 0.82-0.87 to about 0.95. Selected lists are always traversed in full. Within
 them, multi-bit RaBitQ skips the extra-bit evaluation for vectors that cannot
 compete, and candidate selection decides which vectors are read exactly.
+
+The reference size includes all live vectors; the scan fraction is charged
+only against segments searched through IVF. With default probes, a filter
+expands that fraction by `1 / sqrt(s)`, capped at one, where `s` is the eligible
+fraction of vectors in those IVF segments. Multi-valued fields may estimate
+this fraction from eligible documents and average multiplicity. Explicit
+`nprobe` keeps its pin and receives no filter expansion. This is an effort
+heuristic; filters correlated with vector distance can still need more coverage.
 
 ### Scoring
 
