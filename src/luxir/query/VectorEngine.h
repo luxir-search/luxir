@@ -21,6 +21,7 @@ struct VectorSearchWork {
   int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
   int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
   int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
+  // Logical scan mappings/probes exclude optional read-ahead metadata work.
   int64_t rankVisits = 0, sparseMaps = 0, multiMaps = 0, coarseDims = 0, rounds = 0, ivfRounds = 0;
   int64_t selectorNone = 0, selectorBitmap = 0, resolveIdentity = 0, resolveSelect = 0, resolveMono = 0;
   // arraySteps is resolve calls times bit_width(domain card), a size-weighted
