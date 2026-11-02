@@ -104,6 +104,26 @@ public:
   }
 };
 
+// Observe production rounds without replacing allocation, scoring or selection.
+struct RecordedVectorRound {
+  double target;
+  VectorSearchRound kind;
+  VectorSearchResult result;
+};
+
+class RecordingVectorEngine final : public VectorEngine {
+  VectorEngine& inner;
+  std::vector<RecordedVectorRound>& rounds;
+public:
+  RecordingVectorEngine(VectorEngine& inner, std::vector<RecordedVectorRound>& rounds)
+      : inner(inner), rounds(rounds) {}
+  VectorSearchResult search(const VectorSearchRequest& request) override {
+    auto result = inner.search(request);
+    rounds.push_back({request.scanFraction, request.round, result});
+    return result;
+  }
+};
+
 class KnnQueryTest : public LuxirTest {
 protected:
   struct TopDocsFilterFoldGuard {
@@ -130,7 +150,7 @@ protected:
 
   struct EngineWrapperGuard {
     explicit EngineWrapperGuard(
-        std::function<std::unique_ptr<VectorEngine>(VectorEngine&, int64_t)> f) {
+        std::function<std::unique_ptr<VectorEngine>(VectorEngine&)> f) {
       KnnQuery::engineWrapperForTests = std::move(f);
     }
     ~EngineWrapperGuard() {
@@ -1736,7 +1756,7 @@ TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
     h.indexAll(docs);
     h.commit({"*"});
     docs.clear();
-    for (int i = 0; i < 10; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i),
+    for (int i = 0; i < 100; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i),
         "keep_s", "yes", "embedding_v", std::vector<float>{10000.0f + (float)i, 0, 0, 0}));
     h.indexAll(docs, UpdateMessage::COMMIT);
     auto run = [&](bool exact, int nprobe) {
@@ -1755,6 +1775,8 @@ TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
     auto pinIds = run(false, 1);
     EXPECT_EQ(1, pinned.firstRoundLists.load());
     EXPECT_EQ(0, pinned.scanned.load());
+    EXPECT_EQ(0, pinned.newListSelectorPasses.load());
+    EXPECT_EQ(100, pinned.vectorsScored.load());
     ASSERT_EQ(5u, pinIds.size());
     for (const auto& id : pinIds) { EXPECT_EQ('a', id[0]); }
     KnnQuery::Stats scaled;
@@ -1765,7 +1787,110 @@ TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
     EXPECT_GT(scaled.scanned.load(), 0);
     EXPECT_EQ(exact, ids);
     EXPECT_EQ(1, scaled.rounds.load());
+    // Even without initial expansion, exact witnesses cannot replace the
+    // expected IVF yield. The flat population alone exceeds that target.
+    KnnQuery::filteredCoverageAlpha = 0;
+    KnnQuery::Stats lean;
+    KnnQuery::statsForTests = &lean;
+    EXPECT_EQ(exact, run(false, 0));
+    EXPECT_GT(lean.rounds.load(), 1);
+    EXPECT_GT(100, lean.targetExamined.load());
+    EXPECT_GE(lean.newListSelectorPasses.load(), lean.targetExamined.load());
+    EXPECT_EQ(100, lean.vectorsScored.load());
     KnnQuery::statsForTests = nullptr;
+  }
+}
+
+TEST_F(KnnQueryTest, filteredBreadthProjectsFromEligibleYield) {
+  IvfTestGuard ivf(16);
+  ScanGrainGuard grains(32, 1);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::filteredCoverageAlpha,
+                            KnnQuery::breadthHeadroom, KnnQuery::breadthGrowth);
+  for (bool interval : {false, true}) {
+    SCOPED_TRACE(interval);
+    CollectionHelper h("main");
+    h.clear();
+    installVecSchema(h.collection(), api::VectorMetric::L2, interval ? rabitqAnn(64, 2) : pqAnn(64, 2, 4), 4);
+    std::vector<Doc> docs;
+    for (int i = 0; i < 4096; i++) docs.push_back(flatdoc("id", std::to_string(i),
+        "far_s", i >= 3584 ? "yes" : "no", "tail_s", i >= 4091 ? "yes" : "no",
+        "spread_s", i % 8 == 0 ? "yes" : "no", "embedding_v", std::vector<float>{(float)i, 0, 0, 0}));
+    h.indexAll(docs);
+    h.commit({"*"});
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    auto aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+    ASSERT_NE(nullptr, aux);
+    auto* index = dynamic_cast<faiss::IndexIVF*>(((VectorAuxReader*)aux.get())->getFaissIndex());
+    ASSERT_NE(nullptr, index);
+    std::array<float, 4> query{};
+    std::vector<float> distances(index->nlist);
+    std::vector<faiss::idx_t> lists(index->nlist);
+    index->quantizer->search(1, query.data(), (faiss::idx_t)index->nlist, distances.data(), lists.data());
+    std::vector<RecordedVectorRound> rounds;
+    EngineWrapperGuard wrapper([&](VectorEngine& engine) { return std::make_unique<RecordingVectorEngine>(engine, rounds); });
+    auto run = [&](std::string_view filter, bool exact = false, int nprobe = 0) {
+      rounds.clear();
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      auto req = localReq(h.getSearchEngine());
+      auto& cur = req->collection("main").topDocs();
+      configKnn(cur, "embedding_v", {0, 0, 0, 0}, 5, nprobe, interval ? 0 : 64, exact);
+      addMatchFilter(cur, filter, "yes");
+      req->execute(-1);
+      EXPECT_OK(req);
+      KnnQuery::statsForTests = nullptr;
+      if (!exact) {
+        int64_t selected = 0, visited = 0, passed = 0;
+        std::set<int64_t> pooled;
+        for (const auto& round : rounds) {
+          EXPECT_EQ(VectorSearchRound::BREADTH, round.kind);
+          int64_t physical = 0;
+          for (int64_t i = 0; i < round.result.work.listSetups; i++)
+            physical += (int64_t)index->invlists->list_size((size_t)lists[(size_t)selected++]);
+          EXPECT_EQ(physical, round.result.work.physicalEntries);
+          EXPECT_EQ(round.result.work.selectorPasses, round.result.work.newListSelectorPasses);
+          visited += physical;
+          passed += round.result.work.newListSelectorPasses;
+          EXPECT_NEAR((double)visited / 4096, round.result.coveredFraction, 1e-12);
+          for (const auto& hit : round.result.hits) pooled.insert(hit.valueRank);
+        }
+        EXPECT_EQ(visited, stats.codesVisited.load());
+        EXPECT_EQ(passed, stats.newListSelectorPasses.load());
+        EXPECT_EQ(0, stats.depthEntries.load());
+        EXPECT_EQ(interval ? passed : 0, stats.oneBitScores.load());
+        EXPECT_EQ(interval ? 0 : passed, stats.pqScores.load());
+        if (!interval) { EXPECT_EQ((int64_t)pooled.size(), stats.terminalReads.load()); }
+        if (nprobe == 0) {
+          EXPECT_TRUE(passed + 1e-9 >= stats.targetExamined.load() || rounds.back().result.breadthExhausted);
+        } else { EXPECT_EQ(1u, rounds.size()); }
+      }
+      return resultIds(*req);
+    };
+    KnnQuery::filteredCoverageAlpha = 0.5;
+    KnnQuery::breadthHeadroom = 1.25;
+    KnnQuery::breadthGrowth = 2;
+    auto exact = run("far_s", true);
+    EXPECT_EQ(exact, run("far_s"));
+    ASSERT_GT(rounds.size(), 1u);
+    EXPECT_EQ(0, rounds.front().result.work.newListSelectorPasses);
+    EXPECT_TRUE(run("far_s", false, 1).empty());
+    run("spread_s");
+    EXPECT_EQ(1u, rounds.size());
+
+    // Disable initial expansion to isolate growth. Both policies must reach
+    // the last list for these five docs; only the number of rounds differs.
+    KnnQuery::filteredCoverageAlpha = 0;
+    auto tail = run("tail_s", true);
+    KnnQuery::breadthHeadroom = KnnQuery::breadthGrowth = 0;
+    EXPECT_EQ(tail, run("tail_s"));
+    size_t oneListRounds = rounds.size();
+    double coverage = rounds.back().result.coveredFraction;
+    KnnQuery::breadthHeadroom = 1.25;
+    KnnQuery::breadthGrowth = 2;
+    EXPECT_EQ(tail, run("tail_s"));
+    EXPECT_NEAR(coverage, rounds.back().result.coveredFraction, 1e-12);
+    EXPECT_LE(rounds.size(), 5u);
+    EXPECT_GT(oneListRounds, rounds.size() * 3);
   }
 }
 
@@ -2752,6 +2877,11 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     std::vector<std::string> dels{"del"};
     h.deleteByIds(dels, UpdateMessage::COMMIT);
 
+    std::vector<RecordedVectorRound> rounds;
+    EngineWrapperGuard wrapper([&](VectorEngine& engine) { return std::make_unique<RecordingVectorEngine>(engine, rounds); });
+    KnnQuery::Stats stats;
+    SearchOverridesGuard counters(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
     int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
     int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
     auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
@@ -2760,6 +2890,24 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     req->execute();
     auto ids = resultIds(*req);
     req->done();
+    KnnQuery::statsForTests = nullptr;
+    ASSERT_GT(rounds.size(), 1u);
+    EXPECT_EQ(VectorSearchRound::BREADTH, rounds[0].kind);
+    std::set<int64_t> pooled;
+    for (size_t i = 0; i < rounds.size(); i++) {
+      const auto& round = rounds[i];
+      EXPECT_EQ(200, round.result.work.physicalEntries);
+      if (i > 0) {
+        EXPECT_EQ(VectorSearchRound::DEPTH, round.kind);
+        EXPECT_EQ(0, round.result.work.newListSelectorPasses);
+        EXPECT_EQ(200, round.result.work.depthEntries);
+      }
+      for (const auto& hit : round.result.hits) pooled.insert(hit.valueRank);
+    }
+    EXPECT_EQ(198, stats.newListSelectorPasses.load());
+    EXPECT_EQ((int64_t)rounds.size() * 200, stats.codesVisited.load());
+    EXPECT_EQ((int64_t)(rounds.size() - 1) * 200, stats.depthEntries.load());
+    EXPECT_EQ((int64_t)pooled.size(), stats.terminalReads.load());
     int64_t folds1 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
     EXPECT_GT(folds1, folds0) << "query never deepened; fold path unexercised";
     // The eligible contract is binding: post-fold rounds must return only
@@ -3092,7 +3240,7 @@ TEST_F(KnnQueryTest, intervalBreadthCarriesWitnessesWithoutRescanningLists) {
 // from the full-precision column, sort, then collapse.  Without the rescore
 // the inverted order collapses to the wrong docs (a, d, c) at bucket scores.
 TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
-  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+  EngineWrapperGuard guard([](VectorEngine& flat) {
     return std::make_unique<QuantizingEngine>(flat);
   });
   CollectionHelper h("main");
@@ -3133,7 +3281,7 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
 // the quantized segment's hits coming back at full precision proves the
 // rescore still ran where needed.
 TEST_F(KnnQueryTest, mixedExactSegmentsSkipColumnRescore) {
-  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+  EngineWrapperGuard guard([](VectorEngine& flat) {
     return std::make_unique<PartiallyExactEngine>(flat, 0, 0.25f);
   });
   CollectionHelper h("main");
@@ -3175,7 +3323,7 @@ TEST_F(KnnQueryTest, mixedExactSegmentsSkipColumnRescore) {
 // rescore; correct cosine order AND scores prove the raw-column normalization
 // ran (without it, rescore would return raw dot products like 5.0).
 TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
-  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+  EngineWrapperGuard guard([](VectorEngine& flat) {
     return std::make_unique<QuantizingEngine>(flat);
   });
   CollectionHelper h("main");
@@ -3369,7 +3517,7 @@ TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
                      std::vector<std::vector<float>>{{3, 0}})}, UpdateMessage::COMMIT);
   SearchOverridesGuard saved(KnnQuery::flatDomainDensityThreshold, KnnQuery::statsForTests);
   KnnQuery::flatDomainDensityThreshold = INFINITY;
-  EngineWrapperGuard wrapper([](VectorEngine& engine, int64_t) { return std::make_unique<ExcludingEngine>(engine); });
+  EngineWrapperGuard wrapper([](VectorEngine& engine) { return std::make_unique<ExcludingEngine>(engine); });
   KnnQuery::Stats stats;
   KnnQuery::statsForTests = &stats;
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
@@ -3458,7 +3606,7 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
           SCOPED_TRACE(::testing::Message() << segments << " units, parallel=" << parallel
                        << ", approximate=" << approximate << ", grain=" << grain);
           ScanGrainGuard grains(1, grain);
-          EngineWrapperGuard wrapper([](VectorEngine& engine, int64_t) {
+          EngineWrapperGuard wrapper([](VectorEngine& engine) {
             return std::make_unique<QuantizingEngine>(engine);
           });
           if (!approximate) KnnQuery::engineWrapperForTests = nullptr;

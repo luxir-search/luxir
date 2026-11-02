@@ -6174,12 +6174,14 @@ TEST(FilterKeyTest, preservesNonFiniteFloatBitPatterns) {
 TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   struct PolicyRestore {
     int64_t candidates = KnnQuery::maxKnnCandidates;
-    int32_t breadth = KnnQuery::maxKnnBreadth;
+    double alpha = KnnQuery::filteredCoverageAlpha, headroom = KnnQuery::breadthHeadroom, growth = KnnQuery::breadthGrowth;
     decltype(KnnQuery::engineWrapperForTests) wrapper =
         KnnQuery::engineWrapperForTests;
     ~PolicyRestore() {
       KnnQuery::maxKnnCandidates = candidates;
-      KnnQuery::maxKnnBreadth = breadth;
+      KnnQuery::filteredCoverageAlpha = alpha;
+      KnnQuery::breadthHeadroom = headroom;
+      KnnQuery::breadthGrowth = growth;
       KnnQuery::engineWrapperForTests = std::move(wrapper);
     }
   } restore;
@@ -6216,11 +6218,17 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   KnnQuery::maxKnnCandidates++;
   EXPECT_NE(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates = restore.candidates;
-  KnnQuery::maxKnnBreadth++;
+  KnnQuery::filteredCoverageAlpha += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::maxKnnBreadth = restore.breadth;
+  KnnQuery::filteredCoverageAlpha = restore.alpha;
+  KnnQuery::breadthHeadroom += 0.1;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::breadthHeadroom = restore.headroom;
+  KnnQuery::breadthGrowth += 0.1;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::breadthGrowth = restore.growth;
 
-  KnnQuery::engineWrapperForTests = [](VectorEngine&, int64_t) {
+  KnnQuery::engineWrapperForTests = [](VectorEngine&) {
     return std::unique_ptr<VectorEngine>();
   };
   EXPECT_FALSE(optionalKeyFor(base).has_value());

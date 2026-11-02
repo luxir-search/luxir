@@ -582,7 +582,7 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
     }
   };
   SearchOverridesGuard wrapper(KnnQuery::engineWrapperForTests);
-  KnnQuery::engineWrapperForTests = [&](VectorEngine&, int64_t) { return std::make_unique<ReversedSiblings>(plan, vectors); };
+  KnnQuery::engineWrapperForTests = [&](VectorEngine&) { return std::make_unique<ReversedSiblings>(plan, vectors); };
   SearchOverridesGuard memberCap(KnnQuery::membersPerGroupForTests);
   for (int parallel : {1, -1}) {
     KnnQuery::membersPerGroupForTests = 1;

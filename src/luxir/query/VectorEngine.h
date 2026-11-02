@@ -9,6 +9,40 @@
 
 namespace luxir {
 
+enum class VectorSearchRound { BREADTH, DEPTH };
+
+// One task's work, reduced at barriers into query-owned per-segment totals.
+// New-list passes are disjoint across breadth rounds; depth revisits never
+// contribute to the eligible-examined obligation. scoreBytes counts scored
+// code/column bytes, not physical IO or selector/allocator metadata reads.
+struct VectorSearchWork {
+  int64_t listSetups = 0, physicalEntries = 0, selectorPasses = 0;
+  int64_t newListSelectorPasses = 0, newListLiveVectors = 0, depthEntries = 0;
+  int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
+  int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
+  int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
+
+  VectorSearchWork& operator+=(const VectorSearchWork& other) {
+    listSetups += other.listSetups;
+    physicalEntries += other.physicalEntries;
+    selectorPasses += other.selectorPasses;
+    newListSelectorPasses += other.newListSelectorPasses;
+    newListLiveVectors += other.newListLiveVectors;
+    depthEntries += other.depthEntries;
+    pqScores += other.pqScores;
+    oneBitScores += other.oneBitScores;
+    extraBitScores += other.extraBitScores;
+    gateRejections += other.gateRejections;
+    exactVectors += other.exactVectors;
+    domainDocs += other.domainDocs;
+    domainProbes += other.domainProbes;
+    seedReads += other.seedReads;
+    remainingReads += other.remainingReads;
+    scoreBytes += other.scoreBytes;
+    return *this;
+  }
+};
+
 /// One round of WIDEN. Bounded collectors receive a fresh candidate budget
 /// and exclude already returned ranks. Interval collectors persist witnesses
 /// and retained records for the query: DEPTH never rescans them; BREADTH scans
@@ -20,13 +54,10 @@ struct VectorSearchRequest {
   // IVF applies one shared bounded cut across its bounded segments and chunks
   // for this round. A fresh-only depth request starts a new cut/floor.
   int64_t candidates = 0;
-  // Domain filtering is supplied by engine construction. IVF scanners
-  // apply it through task-local selectors instead of per-request state.
-  int32_t breadth = 0;
-  // Floor on the fraction of live vectors the engine examines, in [0,1];
-  // raises the effective breadth when breadth maps below it.  1.0 forces a
-  // full scan.  Exact engines satisfy it trivially.
-  float minScanFraction = 0.0f;
+  // Cumulative fraction of the searched IVF population, chosen by the host.
+  // Domain filtering is supplied by engine construction.
+  double scanFraction = 0.0;
+  VectorSearchRound round = VectorSearchRound::BREADTH;
   // Bounded-channel exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
   // indexed by segOrd; empty (or an empty per-segment span) until the host's
   // first deepen round, when the host folds its pooled-hit set into them.
@@ -90,9 +121,11 @@ struct VectorSearchResult {
   std::vector<int32_t> exactSegOrds;
   VectorSelection boundedSelection = VectorSelection::COMPLETE;
   bool breadthExhausted = true;
-  // Engine's hint for the next useful breadth value (the smallest one that
-  // adds work).  0 = no hint; the host then steps breadth by 1.
-  int32_t nextBreadth = 0;
+  // Actual cumulative coverage (whole lists can overshoot the target),
+  // and coverage after the next globally-best list. A zero-live list can
+  // leave nextFraction equal to coveredFraction; BREADTH must still advance.
+  double coveredFraction = 0.0, nextFraction = 0.0;
+  VectorSearchWork work;
 };
 
 /// Engines return fresh bounded and exact candidates here. Query-owned interval
