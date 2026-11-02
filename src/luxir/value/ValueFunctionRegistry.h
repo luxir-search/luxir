@@ -92,6 +92,9 @@ struct ValueFunction {
   EvalBucketScalar evalBucketScalar = nullptr;
   Validate validate = nullptr;
 
+  // Strict failures propagate before the bucket kernel selects lazy operands.
+  BucketScalar bucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) const;
+
   ResolvedValue resolveOperands(std::span<const ResolvedValue> args) const;
 
   // Strict INVALID operands make the result INVALID; only lazy operands reach
