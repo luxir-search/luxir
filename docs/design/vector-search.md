@@ -383,15 +383,27 @@ host-side knobs (`k`, `refine_candidates`, `exact`) stay at the top level.
 For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan
 fraction is reached. List cost is based on that list's live vector count
-divided by the field's live vector count. This handles uneven list sizes and
-avoids applying equal work to every segment. For an IVF segment with deletions
+divided by the live vector count of the IVF slots actually searched. Flat
+slots and empty filtered segments do not consume that budget. This handles
+uneven list sizes and avoids applying equal work to every segment. For an IVF segment with deletions
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
 simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
 cheap upper bound instead (exact counting there would scan the field per
-query); the bound only errs toward slightly leaner initial effort, which
-auto-deepening recovers.
+query). It contributes only to the whole-index reference breadth; the IVF
+allocation denominator uses exact live counts.
+
+With default probes, the initial fraction expands by `1 / sqrt(s)`, where
+`s` is the eligible-vector fraction over the searched IVF slots. Large
+multi-valued domains estimate eligible vectors from exact eligible docs and
+average multiplicity. The fraction is floored by `min_scan_fraction` and capped
+at one. Explicit `nprobe` receives no selectivity expansion. All allocated lists
+are scanned before checking fill, even if exact slots already supply k units.
+Bounded document fill is capped by eligible docs in bounded IVF slots; document
+unit fill is capped by eligible docs across all slots. Unfiltered columns under
+deletes use conservative metadata caps where exact counts would require a walk.
+These are effort and fill rules, not a recall guarantee for correlated filters.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
