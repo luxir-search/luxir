@@ -2439,6 +2439,21 @@ TEST_F(AggregateExprTest, dateUnitsSurviveAggregateAndBucketResults) {
       {"min(min(stamp,when_dt))", 1, false, ValueNature::DATE_NS},
       {"max(max(when_dt,stamp))", 2000000, false, ValueNature::DATE_NS},
       {"min(min(stamp),min(when_dt))", 1, false, ValueNature::DATE_NS},
+      {"max(when_dt) > max(stamp)", 1, false, ValueNature::NUMBER},
+      {"max(when_dt) >= max(stamp)", 1, false, ValueNature::NUMBER},
+      {"max(when_dt) < max(stamp)", 0, false, ValueNature::NUMBER},
+      {"max(when_dt) <= max(stamp)", 0, false, ValueNature::NUMBER},
+      {"max(when_dt) == max(stamp)", 0, false, ValueNature::NUMBER},
+      {"max(when_dt) != max(stamp)", 1, false, ValueNature::NUMBER},
+      {"max(stamp) < max(when_dt)", 1, false, ValueNature::NUMBER},
+      {"max(stamp) <= max(when_dt)", 1, false, ValueNature::NUMBER},
+      {"max(stamp) > max(when_dt)", 0, false, ValueNature::NUMBER},
+      {"max(stamp) >= max(when_dt)", 0, false, ValueNature::NUMBER},
+      {"max(stamp) == max(when_dt)", 0, false, ValueNature::NUMBER},
+      {"max(stamp) != max(when_dt)", 1, false, ValueNature::NUMBER},
+      {"max(max(when_dt),max(stamp)) == max(when_dt)", 1, false, ValueNature::NUMBER},
+      {"avg(when_dt) > avg(stamp)", 1, false, ValueNature::NUMBER},
+      {"max(when_dt) == max(stamp) + 1999996", 1, false, ValueNature::NUMBER},
       {"max(avg(when_dt),avg(stamp))", 1500000, true, ValueNature::DATE_NS}}) {
     SCOPED_TRACE(example.expression);
     auto* program = parseAggregate(memory, *schema, example.expression);

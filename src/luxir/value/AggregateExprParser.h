@@ -158,9 +158,10 @@ private:
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
     }
-    int convert = function.dateConversionOperand(
+    auto conversions = function.dateConversionOperands(
         std::span<const ResolvedValue>(args.data(), children.size()));
-    if (convert >= 0) {
+    for (size_t convert = 0; convert < children.size(); convert++) {
+      if (!conversions[convert]) continue;
       AggregateNode scale;
       scale.intValue = 1000000;
       scale.sourcePos = pos;
