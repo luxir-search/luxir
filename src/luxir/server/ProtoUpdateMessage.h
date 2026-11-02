@@ -55,12 +55,8 @@ public:
   // target it rather than re-resolving req->collection.
   CollectionId target;
   const int64_t dateMathNowEpochMillis;
-  // When the transport received the request; the transport stamps took_us
-  // from it (carried by Completion) just before serializing the response.
-  const RequestClock::time_point startTime;
-
-  explicit ProtoUpdateMessage(const RequestProto* req, RequestClock::time_point startTime = RequestClock::now())
-    : req(req), dateMathNowEpochMillis(currentEpochMillis()), startTime(startTime) {
+  explicit ProtoUpdateMessage(const RequestProto* req)
+    : req(req), dateMathNowEpochMillis(currentEpochMillis()) {
     if (req->commit.has_value()) {
       commit = COMMIT;
       const auto& params = *req->commit;
@@ -131,7 +127,6 @@ public:
     ResponseProto response;
     std::optional<CommitId> commit;
     std::optional<CommitWaits::ReplicaWait> wait;
-    RequestClock::time_point startTime;
     void await(LuxirNode& node, std::function<void(std::shared_ptr<Completion>)> delivery, std::stop_token stop = {});
   };
   std::shared_ptr<Completion> takeCompletion(LuxirNode& node);

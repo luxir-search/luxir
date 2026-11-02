@@ -446,6 +446,12 @@ client load.
 
 ### Service and engine metrics
 
+Response `took_us` measures one complete request message through readiness to
+serialize its final response; `luxir_request_duration_seconds` also covers
+HTTP body reception and response delivery, and counts an entire gRPC stream
+as one call. `luxir_search_duration_seconds` starts later, at engine submission,
+and shares the search's final-response endpoint with `took_us`.
+
 | Metric or family | Meaning |
 | --- | --- |
 | `luxir_requests_total`, `luxir_requests_in_flight`, `luxir_request_duration_seconds` | HTTP requests or gRPC calls, by `transport`, bounded `operation`, and completion `outcome`. Duration includes body reception after HTTP headers, execution, waits, and response delivery. A gRPC stream is one call, regardless of its message count. |

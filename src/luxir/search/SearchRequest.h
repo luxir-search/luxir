@@ -83,7 +83,7 @@ struct ExecutionProfileOpState {
 class Collection;
 class SearchRequest : public ExecutionWarnings {
   friend class SearchEngine;
-  void count(MetricOutcome outcome);
+  void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
@@ -122,7 +122,7 @@ public:
   const int64_t dateMathNowEpochMillis;
   // When the transport received the request; the final response's took_us is
   // measured from here (stamped in maybeSendFinal, just before reply()).
-  const RequestClock::time_point startTime;
+  const std::chrono::steady_clock::time_point startTime;
   // Resolved eagerly from proto.time_zone. Invalid IANA/fixed specifications
   // retain an error for submitBody to surface as a whole-request failure.
   std::optional<TimeZone> timeZone;
@@ -161,7 +161,7 @@ public:
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
                 google::protobuf::Arena& arena,
-                RequestClock::time_point startTime = RequestClock::now());
+                std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());
 
   virtual ~SearchRequest();
 
