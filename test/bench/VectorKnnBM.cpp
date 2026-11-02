@@ -949,7 +949,10 @@ struct FilteredVectorCorpus {
     dims = luxir::unit_tests ? 16 : dataset ? dataset->dims : env("LUXIR_VECTOR_DIMS", 128);
     segments = luxir::unit_tests ? 1 : dataset ? dataset->segments : env("LUXIR_VECTOR_SEGMENTS", 1);
     metric = dataset ? dataset->metric : api::VectorMetric::L2;
-    int nq = luxir::unit_tests ? 2 : std::min(8, dataset ? dataset->nQueries : env("LUXIR_VECTOR_QUERIES", 8));
+    // Each anchor adds a rank column and 4*N bytes of setup memory. Bound
+    // that cost at 64 columns (1.28 GB of ranks for a 5M-vector corpus).
+    int nq = luxir::unit_tests ? 2 : std::min(64, env("LUXIR_FILTERED_QUERIES", 8));
+    if (dataset) nq = std::min(nq, dataset->nQueries);
     if (size <= 0 || size > INT32_MAX || dims <= 0 || nq <= 0 || segments <= 0)
       throw std::runtime_error("invalid filtered vector corpus shape");
     int clusters = luxir::unit_tests ? 8 : 100;
@@ -1034,9 +1037,9 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     cur.limit(10).countLimit().fields({"id"});
     cur.rawQuery() = qb::knn(cur.mr(), "bench_v", data.queries[(size_t)q], 10, 0, exact);
     std::string field = correlation == 0 ? "random_i" : "near" + std::to_string(q) + "_i";
-    auto* bound = qb::valI64(cur.mr(), correlation == 2 ? data.size - selected : selected);
-    cur.filter(qb::range(cur.mr(), field, correlation == 2 ? bound : nullptr, nullptr,
-                        nullptr, correlation == 2 ? nullptr : bound));
+    int64_t begin = correlation == 2 ? data.size - selected : correlation == 3 ? (data.size - selected) / 2 : 0;
+    cur.filter(qb::range(cur.mr(), field, qb::valI64(cur.mr(), begin), nullptr,
+                        nullptr, qb::valI64(cur.mr(), begin + selected)));
     req->execute(false);
     std::string error;
     if (!responseIds(*req, ids, error)) { state.SkipWithError(error.c_str()); return false; }
@@ -1049,6 +1052,14 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     for (int q = 0; q < (int)data.queries.size(); q++) if (!run(q, true, truth[(size_t)q])) return;
     it = data.truth.emplace(key, std::move(truth)).first;
   }
+  KnnQuery::statsForTests = nullptr;
+  auto exactStart = std::chrono::steady_clock::now();
+  for (int q = 0; q < (int)data.queries.size(); q++) {
+    std::vector<std::string> ids;
+    if (!run(q, true, ids)) return;
+  }
+  double exactMicros = std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - exactStart).count() / data.queries.size();
   KnnQuery::Stats stats;
   KnnQuery::statsForTests = &stats;
   double recall = 0;
@@ -1069,13 +1080,24 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     q = (q + 1) % (int)data.queries.size();
   }
   double queries = (double)data.queries.size();
-  state.SetLabel(std::string(benchCodecName(codec)) + "/" + (correlation == 0 ? "independent" : correlation == 1 ? "near" : "far"));
+  state.SetLabel(std::string(benchCodecName(codec)) + "/" + (correlation == 0 ? "independent" : correlation == 1 ? "near" : correlation == 2 ? "far" : "median"));
+  state.counters["exact_us"] = exactMicros;
   state.counters["recall@10"] = recall / queries;
   state.counters["recall_pass"] = recall / queries >= 0.95;
   state.counters["rounds"] = stats.rounds.load() / queries;
   state.counters["codes_visited"] = stats.codesVisited.load() / queries;
   state.counters["selector_passes"] = stats.scanned.load() / queries;
-  state.counters["codes_scored"] = (stats.scanned.load() - stats.gateRejections.load()) / queries;
+  state.counters["pq_scores"] = stats.pqScores.load() / queries;
+  state.counters["one_bit_scores"] = stats.oneBitScores.load() / queries;
+  state.counters["extra_bit_scores"] = stats.extraBitEvaluations.load() / queries;
+  state.counters["new_list_passes"] = stats.newListSelectorPasses.load() / queries;
+  state.counters["depth_entries"] = stats.depthEntries.load() / queries;
+  state.counters["list_setups"] = stats.lists.load() / queries;
+  state.counters["flat_scores"] = stats.vectorsScored.load() / queries;
+  state.counters["domain_docs"] = stats.domainDocsVisited.load() / queries;
+  state.counters["terminal_reads"] = stats.terminalReads.load() / queries;
+  state.counters["coverage"] = stats.coveredFraction.load() / queries;
+  state.counters["target_examined"] = stats.targetExamined.load() / queries;
   state.counters["budget"] = stats.initialBudget.load() / queries;
   state.counters["selectivity"] = (double)selected / data.size;
   state.counters["nBase"] = (double)data.size;
@@ -1225,9 +1247,15 @@ BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
 
 LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100"})
     ->Apply([](benchmark::Benchmark* b) {
+      for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selectivity : {100, 1000})
+        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50});
+    });
+
+TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100"})
+    ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1})
         for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
-          for (int correlation : {0, 1, 2}) for (int alpha : {0, 25, 50, 100})
+          for (int correlation : {0, 1, 2, 3}) for (int alpha : {0, 25, 50, 100})
             b->Args({codec, selectivity, correlation, alpha});
     });
 

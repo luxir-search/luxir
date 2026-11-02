@@ -157,7 +157,29 @@ public:
     std::atomic<int64_t> domainDocsVisited{0}, domainProbes{0}, vectorsScored{0};
     std::atomic<int64_t> slotsBuilt{0}, faissIndexCalls{0};
     std::atomic<int64_t> firstRoundLists{0}, firstRoundLiveVectors{0}, targetDocs{0}, targetUnits{0};
-    std::atomic<double> initialBudget{0};
+    std::atomic<int64_t> newListSelectorPasses{0}, depthEntries{0}, pqScores{0}, oneBitScores{0}, terminalReads{0};
+    std::atomic<double> initialBudget{0}, coveredFraction{0}, targetExamined{0};
+
+    void addWork(const VectorSearchWork& work) {
+      lists += work.listSetups;
+      vectors += work.pqScores + work.oneBitScores - work.gateRejections
+          + work.exactVectors + work.seedReads + work.remainingReads;
+      bytes += work.scoreBytes;
+      scanned += work.selectorPasses;
+      codesVisited += work.physicalEntries;
+      newListSelectorPasses += work.newListSelectorPasses;
+      depthEntries += work.depthEntries;
+      pqScores += work.pqScores;
+      oneBitScores += work.oneBitScores;
+      extraBitEvaluations += work.extraBitScores;
+      gateRejections += work.gateRejections;
+      vectorsScored += work.exactVectors;
+      domainDocsVisited += work.domainDocs;
+      domainProbes += work.domainProbes;
+      seedReads += work.seedReads;
+      remainingReads += work.remainingReads;
+      terminalReads += work.seedReads + work.remainingReads;
+    }
   };
   static inline Stats* statsForTests = nullptr;
   // Dense single-valued filter density above which flat search walks ranks.
@@ -167,6 +189,9 @@ public:
   static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
   // Test/benchmark seam for default filtered coverage; zero disables expansion.
   static inline double filteredCoverageAlpha = 0.5;
+  // Leave room for yield variation without repeatedly stepping one list.
+  // Both zero select next-list-only growth for tests/benchmarks.
+  static inline double breadthHeadroom = 1.25, breadthGrowth = 2.0;
 
   struct SegmentEligibility {
     int64_t eligibleDocs = 0;
@@ -230,10 +255,6 @@ public:
   // vector candidates.  Mutable so tests can shrink it for cap coverage.
   static inline int64_t maxKnnCandidates = 1000000;
 
-  // Maximum recall breadth a non-flat engine can request while deepening.
-  // Flat ignores breadth; this is a host safety cap for future engines.
-  static inline int32_t maxKnnBreadth = 1000000;
-
   // Parallel-scan task sizing.  An IVF segment's selected lists are chunked
   // into contiguous (segment, list-range) scan tasks of at least this many
   // live vectors, so one task amortizes its FAISS scanner setup and never
@@ -289,12 +310,34 @@ public:
                     std::sqrt((double)dims / (double)defaultAnnBreadthReferenceDims));
   }
 
-  // Test seam: when set, prepare() wraps the production flat engine and runs
-  // the host deepen loop against the wrapper instead.  Lets tests drive the
-  // loop with non-flat engine behaviors (breadth rounds, approximate scores)
-  // that no production engine exhibits yet.  Always null in production.
-  static inline std::function<std::unique_ptr<VectorEngine>(VectorEngine& flat, int64_t ntotal)>
+  // Test seam: wrap the production engine to observe rounds or reshape
+  // real search results before the host's pooling and terminal scoring.
+  static inline std::function<std::unique_ptr<VectorEngine>(VectorEngine& engine)>
       engineWrapperForTests;
+
+  static double initialScanFraction(int32_t nprobe, float minScanFraction, int32_t dims,
+                                    int32_t referenceBreadth, double selectivity, double alpha) {
+    // Effort is a scan fraction of a hypothetical single IVF index of
+    // nlist = referenceBreadth = defaultIvfNList(all live vectors): nprobe
+    // lists of it, or by default the sqrt(nlist) lists such an index would
+    // probe (times the dimension factor), i.e. 1 / sqrt(referenceBreadth).
+    // Depending only on the total live count makes it MERGE-STABLE: a raw
+    // per-segment list count would scan ~sqrt(2)x more before a merge than
+    // after, so a tuned query would degrade on the next merge through no
+    // data change. A per-segment sum of defaults was rejected for the same
+    // reason (sum_s sqrt(N_s) / sqrt(N) = sqrt(numSegments) >= 1).
+    double reference = (double)std::max(1, referenceBreadth);
+    double fraction = nprobe > 0 ? (double)nprobe / reference
+        : defaultAnnBreadthDimFactor(dims) / std::sqrt(reference);
+    if (nprobe == 0 && selectivity < 1) {
+      fraction *= std::pow(std::max(selectivity, std::numeric_limits<double>::min()), -alpha);
+    }
+    return std::clamp(std::max(fraction, (double)minScanFraction), 0.0, 1.0);
+  }
+
+  static double projectedScanFraction(double covered, double need, double have) {
+    return have > 0 ? covered * (need / have) * breadthHeadroom : covered * breadthGrowth;
+  }
 
   // Test observability: counts widen rounds that actually spawned parallel
   // scan tasks.  Lets tests assert that parallel mode propagates to nested
@@ -732,7 +775,9 @@ public:
     // policy-generation counter: every value that can change candidate
     // selection is visible here and key equality remains self-contained.
     out.appendInt64(std::max((int64_t)1, maxKnnCandidates));
-    out.appendInt32(std::max(0, maxKnnBreadth));
+    out.appendDouble(filteredCoverageAlpha);
+    out.appendDouble(breadthHeadroom);
+    out.appendDouble(breadthGrowth);
     out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract.
@@ -851,6 +896,7 @@ public:
     template <bool Groups> class SegmentIvfScanner;
 
     template <bool Groups> struct EngineSlot {
+      int32_t segOrd;
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
       int64_t liveVectorCount = 0;
@@ -1084,6 +1130,7 @@ public:
             ? rotatedQuery(vaux->getRotation())
             : queryPtr;
           slots.push_back({
+            .segOrd = (int32_t)i,
             .engine = nullptr,
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
@@ -1095,6 +1142,7 @@ public:
           });
         } else {
           slots.push_back({
+            .segOrd = (int32_t)i,
             .engine = std::make_unique<SegmentFlatColumnVectorEngine<Groups>>(
               (int32_t)i, seg, segInfos.at(i), v2dPerSeg[i], domain,
               dims, metric, normalizeColumnOnCosineRescore, query.groups, v2dSpan),
@@ -1170,25 +1218,36 @@ public:
       docHits.reserve(maxDocHits);
       if constexpr (!Groups) seenDocs.reserve(maxDocHits);
 
+      int64_t ivfLiveTotal = 0, ivfEligibleVectors = 0;
+      for (const auto& slot : slots) if (slot.ivfEngine) {
+        ivfLiveTotal += slot.liveVectorCount;
+        ivfEligibleVectors += std::min(slot.eligibleVectorCount, slot.liveVectorCount);
+      }
+      // Unfiltered slots contribute their live count without a domain walk.
+      // Large multi-valued filtered domains can contribute estimates.
+      double selectivity = ivfLiveTotal > 0 ? (double)ivfEligibleVectors / ivfLiveTotal : 1;
+      double initialFraction = initialScanFraction(query.getNProbe(), query.getMinScanFraction(),
+          dims, defaultIvfNList(liveNTotal), selectivity, filteredCoverageAlpha);
+      double maxFraction = query.getNProbe() > 0 ? initialFraction : 1;
+      double targetExamined = query.getNProbe() > 0 ? 0 : initialFraction * ivfEligibleVectors;
+      double scanFraction = initialFraction, coveredFraction = 0;
+      int64_t eligibleExamined = 0;
+      VectorSearchRound round = VectorSearchRound::BREADTH;
+      std::vector<VectorSearchWork> workBySeg(numSegs);
       std::unique_ptr<VectorEngine> baseEngine =
-        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), liveNTotal, kDocs,
-                                                metric, ctx.parallel, query.groups, v2dSpan, intervals);
+        std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ivfLiveTotal, kDocs,
+            metric, ctx.parallel, query.groups, v2dSpan, intervals, workBySeg);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
-        wrapperEngine = engineWrapperForTests(*baseEngine, ntotal);
+        wrapperEngine = engineWrapperForTests(*baseEngine);
         engine = wrapperEngine.get();
       }
-
-      // breadth carries the request nprobe in REFERENCE-index units (lists of
-      // a hypothetical single nlist=sqrt(N) IVF index; the composite engine
-      // converts it to a scan fraction).  Explicit nprobe pins the effort cap
-      // (breadth == maxBreadth, no deepening past it); 0 starts at the
-      // engine's adaptive default and may deepen up to maxKnnBreadth.
-      int32_t breadth = query.getNProbe() > 0 ? query.getNProbe() : 0;
-      int32_t maxBreadth = query.getNProbe() > 0
-        ? query.getNProbe()
-        : std::max(0, maxKnnBreadth);
+      if (statsForTests) {
+        statsForTests->initialBudget += initialFraction;
+        statsForTests->targetExamined += targetExamined;
+      }
+      bool firstRound = true;
       bool candidatePoolSorted = true;
 
       // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
@@ -1273,21 +1332,30 @@ public:
 
       bool candidatesExhausted = true;
 
-      // Bounded DEPTH and IVF BREADTH are independent obligations. Interval
-      // state persists across breadth rounds and never asks for more depth.
-      // Exact reads remain terminal, after all scanning has finished.
+      // Coverage, bounded fill, units and eligible-examined work are separate
+      // obligations. Interval state persists across breadth rounds and never
+      // asks for depth. Exact reads remain terminal, after scanning finishes.
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
           .dims = dims,
           .candidates = kReq,
-          .breadth = breadth,
-          .minScanFraction = query.getMinScanFraction(),
+          .scanFraction = scanFraction,
+          .round = round,
           .eligible = std::span<const std::span<const uint8_t>>(eligibleSpans),
           .perKey = perKey,
         };
         VectorSearchResult result = engine->search(request);
-        if (statsForTests) statsForTests->rounds++;
+        coveredFraction = result.coveredFraction;
+        eligibleExamined += result.work.newListSelectorPasses;
+        if (statsForTests) {
+          statsForTests->rounds++;
+          if (firstRound) {
+            statsForTests->firstRoundLists += result.work.listSetups;
+            statsForTests->firstRoundLiveVectors += result.work.newListLiveVectors;
+          }
+        }
+        firstRound = false;
 
         candidatesExhausted = (result.boundedSelection == VectorSelection::COMPLETE) && result.breadthExhausted;
         size_t appendStart = candidateHits.size();
@@ -1345,7 +1413,10 @@ public:
         }
         intervals.compact();
         bool unitsFilled = intervals.unitCount() >= (size_t)unitTarget;
-        if (boundedDone && unitsFilled) break;
+        bool examinedDone = (double)eligibleExamined + 1e-12 * std::max(1.0, targetExamined) >= targetExamined;
+        if (boundedDone && unitsFilled && examinedDone) break;
+        // A full candidate pool cannot take another hit, so wider scans would
+        // be wasted work whatever the remaining obligations.
         if (!intervalEngine && poolSize >= maxVectorHits) break;
 
         // DEPTH: document mode projects the pool size needed for targetDocReq
@@ -1373,12 +1444,22 @@ public:
                                      want - pool));
           }
           foldSeen();
+          round = VectorSearchRound::DEPTH;
           continue;
         }
 
-        if ((boundedDone || result.boundedSelection == VectorSelection::COMPLETE) && !result.breadthExhausted && breadth < maxBreadth) {
-          int32_t nextBreadth = result.nextBreadth > breadth ? result.nextBreadth : breadth + 1;
-          breadth = std::min(nextBreadth, maxBreadth);
+        if (!result.breadthExhausted && coveredFraction + 1e-15 < maxFraction) {
+          double target = result.nextFraction;
+          if (!boundedDone) target = std::max(target,
+              projectedScanFraction(coveredFraction, (double)targetDocReq, (double)pooled));
+          if (!unitsFilled) target = std::max(target,
+              projectedScanFraction(coveredFraction, (double)unitTarget, (double)intervals.unitCount()));
+          if (!examinedDone) target = std::max(target,
+              projectedScanFraction(coveredFraction, targetExamined, (double)eligibleExamined));
+          // The next whole list may overshoot the pin; allocation stops as
+          // soon as the capped fraction is reached, just as in round one.
+          scanFraction = std::min(target, maxFraction);
+          round = VectorSearchRound::BREADTH;
           if (boundedEngine) foldSeen();
           continue;
         }
@@ -1395,7 +1476,11 @@ public:
       }
       rescoreAndCollapseCandidates<Groups>(candidateHits, intervals, reader, segInfos, v2dSpan,
           segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
-          selectedLimit, docHits, ctx.parallel, query.groups);
+          selectedLimit, docHits, ctx.parallel, workBySeg, query.groups);
+      if (statsForTests) {
+        statsForTests->coveredFraction += coveredFraction;
+        for (const auto& work : workBySeg) statsForTests->addWork(work);
+      }
 
       if constexpr (Groups) {
         candidatesExhausted &= !groupPool->truncated && selectedLimit >= kDocs;
@@ -1718,17 +1803,17 @@ public:
         return liveSize;
       }
 
-      void searchSelectedLists(const VectorSearchRequest& request,
+      VectorSearchWork searchSelectedLists(const VectorSearchRequest& request,
                                std::span<const faiss::idx_t> listIds,
                                std::span<const float> centroidDists,
                                int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut) const {
-        if (intervals) scanLists<true>(request, listIds, centroidDists, rangeLiveVectors, cut);
-        else scanLists<false>(request, listIds, centroidDists, rangeLiveVectors, cut);
+        if (intervals) return scanLists<true>(request, listIds, centroidDists, rangeLiveVectors, cut);
+        return scanLists<false>(request, listIds, centroidDists, rangeLiveVectors, cut);
       }
 
     private:
       template <bool Interval>
-      void scanLists(const VectorSearchRequest& request,
+      VectorSearchWork scanLists(const VectorSearchRequest& request,
                                std::span<const faiss::idx_t> listIds,
                                std::span<const float> centroidDists,
                                int64_t rangeLiveVectors, BoundedScanCut<Groups>& cut) const {
@@ -1815,16 +1900,20 @@ public:
           if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
           cut.finishScan(scanned);
         }
-        if (statsForTests) {
-          int64_t distances = multiBit ? extra : scanned;
-          statsForTests->lists += (int64_t)listIds.size();
-          statsForTests->vectors += distances;
-          statsForTests->bytes += distances * (int64_t)ivf.code_size;
-          statsForTests->scanned += scanned;
-          statsForTests->codesVisited += visited;
-          statsForTests->extraBitEvaluations += extra;
-          statsForTests->gateRejections += rejected;
-        }
+        VectorSearchWork work;
+        work.listSetups = (int64_t)listIds.size();
+        work.physicalEntries = visited;
+        work.selectorPasses = scanned;
+        if (request.round == VectorSearchRound::BREADTH) {
+          work.newListSelectorPasses = scanned;
+          work.newListLiveVectors = rangeLiveVectors;
+        } else work.depthEntries = visited;
+        work.pqScores = rabitq == nullptr ? scanned : 0;
+        work.oneBitScores = rabitq != nullptr ? scanned : 0;
+        work.extraBitScores = extra;
+        work.gateRejections = rejected;
+        work.scoreBytes = (multiBit ? extra : scanned) * (int64_t)ivf.code_size;
+        return work;
       }
     };
 
@@ -1873,7 +1962,6 @@ public:
         }
 
         BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
-        int64_t eligibleDocs = 0;
         if (segInfo == nullptr) {
           result.boundedSelection = VectorSelection::COMPLETE;
           return result;
@@ -1924,7 +2012,6 @@ public:
           // Value ranks are doc-ordered, so each doc's vectors form one
           // contiguous run and max-sim collapse falls out of a single pass.
           auto scoreRun = [&]<bool Multi>(int32_t doc, int64_t begin, int64_t end) LUXIR_INLINE {
-            eligibleDocs++;
             emit(doc, [&]() LUXIR_INLINE {
               vectorsScored += end - begin;
               if constexpr (Multi) {
@@ -2120,14 +2207,10 @@ public:
           heap.offer(makeHit());
         });
 
-        if (statsForTests) {
-          int64_t count = Groups ? vectorsScored : eligibleDocs;
-          statsForTests->domainDocsVisited += domainDocsVisited;
-          statsForTests->domainProbes += domainProbes;
-          statsForTests->vectorsScored += vectorsScored;
-          statsForTests->vectors += count;
-          statsForTests->bytes += count * dims * (int64_t)sizeof(float);
-        }
+        result.work.domainDocs = domainDocsVisited;
+        result.work.domainProbes = domainProbes;
+        result.work.exactVectors = vectorsScored;
+        result.work.scoreBytes = vectorsScored * dims * (int64_t)sizeof(float);
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         result.boundedSelection = VectorSelection::COMPLETE;
@@ -2135,15 +2218,12 @@ public:
       }
     };
 
-    /// One VectorEngine over all per-segment slots.  Owns the cross-segment
-    /// policy so individual segments never self-allocate effort:
+    /// One VectorEngine over all per-segment slots. Allocates host-owned
+    /// effort across segments; individual segments never self-allocate:
     ///
-    ///   - Budget: request.breadth (nprobe in reference-index units) becomes
-    ///     a scan fraction P = breadth / defaultIvfNList(liveN), floored by
-    ///     min_scan_fraction.  Denominating effort in fraction-of-index makes
-    ///     it MERGE-STABLE: a raw per-segment list count would scan ~sqrt(2)x
-    ///     more before a merge than after, so a tuned query would degrade on
-    ///     the next merge through no data change.
+    ///   - Budget: the host supplies a cumulative scan fraction of the IVF
+    ///     population. Conversion from reference-index effort and selectivity
+    ///     happens once in the host; the allocator never changes the target.
     ///   - Allocation: every IVF segment contributes its full centroid-sorted
     ///     list ranking; a lazy k-way merge pops the globally best list and
     ///     charges its live size / ivfLiveN until P is spent.  Small segments
@@ -2160,8 +2240,8 @@ public:
     ///     case. Chunk boundaries do not depend on execution mode, but the
     ///     order of confidence pruning can affect rare approximate misses.
     ///
-    /// SINGLE-SHOT lifecycle: coarseReady, cursors, watermarks and
-    /// lastScannedBreadth mutate across search() rounds of
+    /// SINGLE-SHOT lifecycle: coarseReady, cursors and watermarks mutate
+    /// across search() rounds of
     /// ONE query.  prepare() builds a fresh instance per query; reusing one
     /// across queries would silently serve the old query's coarse ranking.
     template <bool Groups> class CompositeVectorEngine final : public VectorEngine {
@@ -2170,8 +2250,8 @@ public:
       std::span<const SegV2D> groupV2d;
 
       std::vector<EngineSlot<Groups>> slots;
-      int64_t liveTotalVectors;
-      int64_t ivfLiveTotal = 0, ivfEligibleVectors = 0;
+      std::span<VectorSearchWork> workBySeg;
+      int64_t ivfLiveTotal;
       int64_t kDocs;
       int32_t metric;
       bool parallel;
@@ -2217,15 +2297,10 @@ public:
       // Per-slot watermarks: how many selected lists have already been
       // scanned into the host pool, so a pure-breadth deepen round scans only
       // the freshly allocated tail instead of re-scanning every list.
-      // lastScannedBreadth detects a depth round (the host grows exactly one
-      // axis per round, so an UNCHANGED breadth means depth), which DOES
-      // force a full re-scan - candidate counts cannot stand in for this
-      // since post-fold they are per-round fresh budgets and may repeat or
-      // shrink between rounds.
+      // DEPTH explicitly requests rescans of bounded slots, independent of
+      // the fresh candidate budget (which can repeat or shrink).
       std::vector<size_t> scannedListCount;
-      int32_t lastScannedBreadth = -1;
       double allocatedCost = 0.0;
-      int32_t referenceBreadth = 1;
       bool coarseReady = false;
       bool hasIvfSlots = false;
       bool coarseScanned = false;
@@ -2245,7 +2320,6 @@ public:
       void ensureCoarseReady(const VectorSearchRequest& request) {
         if (coarseReady) return;
         coarseReady = true;
-        referenceBreadth = defaultIvfNList(liveTotalVectors);
         runs.resize(slots.size());
         cursors.assign(slots.size(), 0);
         heads.resize(slots.size());
@@ -2271,47 +2345,6 @@ public:
         heapSize = (int32_t)heapIndexes.size();
       }
 
-      double defaultBudget(int32_t dims) const {
-        // nprobe=0 default: probe as many lists as a SINGLE IVF index of
-        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist),
-        // times the dimension factor (defaultAnnBreadthDimFactor).  As
-        // a scan fraction that is sqrt(referenceBreadth) / referenceBreadth =
-        // 1 / sqrt(referenceBreadth) (= N^-0.25 for referenceBreadth=sqrt(N)).
-        // This depends only on the total live vector count, so it is
-        // MERGE-STABLE: repartitioning the same vectors into more or fewer
-        // segments does not move it.  Host auto-deepening grows breadth from
-        // this lean start when too few distinct live docs come back.
-        //
-        // A per-segment sum was rejected: sum_s sqrt(N_s) / sqrt(N) =
-        // sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
-        // per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
-        // keeps an S-dependent term that drifts on merges.
-        return defaultAnnBreadthDimFactor(dims)
-          / std::sqrt((double)std::max(1, referenceBreadth));
-      }
-
-      double budgetForRequest(const VectorSearchRequest& request) const {
-        double p = request.breadth > 0
-          ? (double)request.breadth / (double)std::max(1, referenceBreadth)
-          : defaultBudget(request.dims);
-        if (request.breadth == 0 && ivfLiveTotal > 0 && ivfEligibleVectors < ivfLiveTotal) {
-          // Large multi-valued domains can contribute estimated vector counts.
-          double s = (double)ivfEligibleVectors / (double)ivfLiveTotal;
-          p *= std::pow(std::max(s, std::numeric_limits<double>::min()), -filteredCoverageAlpha);
-        }
-        p = std::max(p, (double)request.minScanFraction);
-        return std::clamp(p, 0.0, 1.0);
-      }
-
-      int32_t breadthForBudget(double p) const {
-        if (p <= 0.0) return 1;
-        double breadth = std::ceil(p * (double)std::max(1, referenceBreadth));
-        if (breadth >= (double)std::numeric_limits<int32_t>::max()) {
-          return std::numeric_limits<int32_t>::max();
-        }
-        return std::max(1, (int32_t)breadth);
-      }
-
       // Extend the global allocation until the requested scan fraction is
       // covered.  Lazy k-way merge over all slots' centroid-sorted runs: pop
       // the globally closest list, charge its live size / ivfLiveN, advance that
@@ -2323,14 +2356,18 @@ public:
         ensureCoarseReady(request);
         if (!hasIvfSlots || heapSize <= 0) return;
 
-        double target = budgetForRequest(request);
-        if (allocatedCost + 1.0e-15 >= target) return;
+        double target = request.scanFraction;
+        // A requested breadth round must consume at least one new list,
+        // even when the next list has zero live entries after deletions.
+        bool advance = coarseScanned && request.round == VectorSearchRound::BREADTH;
+        if (!advance && allocatedCost + 1.0e-15 >= target) return;
 
         IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
           std::span<CoarseHead>(heads.data(), heads.size()),
           std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
           heapSize);
-        while (pq.size() > 0 && allocatedCost + 1.0e-15 < target) {
+        while (pq.size() > 0 && (advance || allocatedCost + 1.0e-15 < target)) {
+          advance = false;
           int32_t slotOrd = pq.indexOfTop();
           auto& head = pq.top();
           faiss::idx_t listId = head.listId;
@@ -2359,25 +2396,13 @@ public:
         heapSize = (int32_t)pq.size();
       }
 
-      // Hint for the host's next breadth round: the breadth value (in
-      // reference-index units) whose budget covers the allocation so far PLUS
-      // the next globally-best unallocated list.  Peeked off the persisted
-      // heap without popping; minStep and the +1 floor guarantee the hint
-      // makes progress even for tiny or empty lists.
-      int32_t nextBreadth(const VectorSearchRequest& request) {
-        if (!hasIvfSlots || heapSize <= 0) return 0;
+      double nextFraction() {
+        if (!hasIvfSlots || heapSize <= 0) return allocatedCost;
         IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
           std::span<CoarseHead>(heads.data(), heads.size()),
-          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
-          heapSize);
-        int32_t slotOrd = pq.indexOfTop();
-        int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(pq.top().listId);
-        double nextCost = ivfLiveTotal > 0
-          ? (double)liveSize / (double)ivfLiveTotal
-          : 0.0;
-        double minStep = 1.0 / (double)std::max(1, referenceBreadth);
-        int32_t next = breadthForBudget(std::min(1.0, allocatedCost + std::max(nextCost, minStep)));
-        return std::max(next, request.breadth + 1);
+          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()), heapSize);
+        int64_t liveSize = slots[(size_t)pq.indexOfTop()].ivfEngine->liveListSize(pq.top().listId);
+        return std::min(1.0, allocatedCost + (double)liveSize / ivfLiveTotal);
       }
 
       /// One scan task: a contiguous range of one IVF slot's selected lists
@@ -2390,8 +2415,8 @@ public:
         int64_t live;
       };
 
-      void scanUnit(const ScanUnit& unit, const VectorSearchRequest& request,
-                    BoundedScanCut<Groups>& cut) const {
+      VectorSearchWork scanUnit(const ScanUnit& unit, const VectorSearchRequest& request,
+                                BoundedScanCut<Groups>& cut) const {
         const auto& slot = slots[(size_t)unit.slotOrd];
         if (slot.ivfEngine == nullptr) {
           VectorSearchRequest subReq = request;
@@ -2406,11 +2431,11 @@ public:
             }
           }
           cut.foldPart(part);
-          return;
+          return part.work;
         }
         assert(selectedListIds[(size_t)unit.slotOrd].size()
                == selectedCentroidDists[(size_t)unit.slotOrd].size());
-        slot.ivfEngine->searchSelectedLists(
+        return slot.ivfEngine->searchSelectedLists(
           request,
           std::span<const faiss::idx_t>(
             selectedListIds[(size_t)unit.slotOrd].data() + unit.listBegin,
@@ -2422,19 +2447,12 @@ public:
 
     public:
       CompositeVectorEngine(std::vector<EngineSlot<Groups>>&& slots,
-                            int64_t liveTotalVectors, int64_t kDocs, int32_t metric,
+                            int64_t ivfLiveTotal, int64_t kDocs, int32_t metric,
                             bool parallel, const CollapsePlan* groupPlan,
-                            std::span<const SegV2D> groupV2d, KnnIntervalCollector<Groups>& intervals) noexcept
+                            std::span<const SegV2D> groupV2d, KnnIntervalCollector<Groups>& intervals,
+                            std::span<VectorSearchWork> workBySeg) noexcept
         : intervals(intervals), groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
-          liveTotalVectors(liveTotalVectors),
-          kDocs(kDocs),
-          metric(metric),
-          parallel(parallel) {
-        for (const auto& slot : this->slots) if (slot.ivfEngine) {
-          ivfLiveTotal += slot.liveVectorCount;
-          ivfEligibleVectors += std::min(slot.eligibleVectorCount, slot.liveVectorCount);
-        }
-      }
+          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), parallel(parallel) {}
 
       VectorSearchResult search(const VectorSearchRequest& request) override {
         VectorSearchResult merged;
@@ -2443,23 +2461,9 @@ public:
         merged.breadthExhausted = true;
         if (request.candidates <= 0) return merged;
 
-        // Complete coverage before any host fill test, even when exact
-        // witnesses already supply k units. Integer breadth remains the
-        // reference-index coordinate; only allocation uses the IVF total.
+        // Every allocated list is scanned before the host checks fill.
         allocateToBudget(request);
-        if (!coarseScanned && statsForTests) {
-          statsForTests->initialBudget += budgetForRequest(request);
-          for (size_t i = 0; i < selectedListIds.size(); i++) {
-            statsForTests->firstRoundLists += (int64_t)selectedListIds[i].size();
-            for (int64_t n : selectedListLiveSizes[i]) statsForTests->firstRoundLiveVectors += n;
-          }
-        }
-
-        // DEPTH rescans only bounded slots, excluding banked identities and
-        // starting a fresh cut. BREADTH visits new list tails for both policies.
-        // Exact slots run once; their top-k witnesses survive every round.
-        bool depthGrew = request.breadth == lastScannedBreadth;
-        lastScannedBreadth = request.breadth;
+        bool depthGrew = request.round == VectorSearchRound::DEPTH;
 
         // Build the round's flat worklist: IVF tails chunked by live-vector
         // cost (the allocator already priced every selected list), whole
@@ -2505,22 +2509,24 @@ public:
           BoundedScanCut<Groups> cut(request.candidates, groupPlan, groupV2d, request.perKey);
           bool spawnTasks = parallel && units.size() > 1;
           if (spawnTasks) parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
+          std::vector<VectorSearchWork> work(units.size());
           TaskGroupRunner runner;
           task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(), [&](size_t i) {
-            return [this, unit = units[i], &request, &cut]() { scanUnit(unit, request, cut); };
+            return [&, i]() { work[i] = scanUnit(units[i], request, cut); };
           });
           runner.join();
           merged = cut.take();
+          for (size_t i = 0; i < units.size(); i++) {
+            workBySeg[(size_t)slots[(size_t)units[i].slotOrd].segOrd] += work[i];
+            merged.work += work[i];
+          }
         }
 
         coarseScanned = true;
         intervals.compact();
-        if (hasIvfSlots) {
-          merged.breadthExhausted = heapSize <= 0;
-          if (!merged.breadthExhausted) {
-            merged.nextBreadth = nextBreadth(request);
-          }
-        }
+        merged.coveredFraction = std::min(1.0, allocatedCost);
+        merged.breadthExhausted = heapSize <= 0;
+        merged.nextFraction = nextFraction();
         return merged;
       }
     };
@@ -2710,7 +2716,8 @@ private:
                                            const float* queryPtr, int32_t dims, int32_t metric,
                                            bool normalizeColumnOnCosineRescore,
                                            int64_t kDocs, std::vector<DocHit>& docHits,
-                                           bool parallel, const CollapsePlan* groupPlan = nullptr) {
+                                           bool parallel, std::span<VectorSearchWork> workBySeg,
+                                           const CollapsePlan* groupPlan = nullptr) {
     auto rankOrder = [](const VectorEngineHit& a, const VectorEngineHit& b) {
       return a.segOrd != b.segOrd ? a.segOrd < b.segOrd : a.valueRank < b.valueRank;
     };
@@ -2793,6 +2800,7 @@ private:
         buckets.emplace_back(b, e);
         b = e;
       }
+      std::vector<int64_t> readsByBucket(buckets.size());
       auto readBucket = [&](size_t bucket) {
         return [&, bucket]() {
           auto [b, e] = buckets[bucket];
@@ -2817,11 +2825,7 @@ private:
             while (score > best && !record.unit->exact.compare_exchange_weak(best, score, std::memory_order_relaxed)) {}
             reads++;
           }
-          if (statsForTests) {
-            (seed ? statsForTests->seedReads : statsForTests->remainingReads) += reads;
-            statsForTests->vectors += reads;
-            statsForTests->bytes += reads * dims * (int64_t)sizeof(float);
-          }
+          readsByBucket[bucket] = reads;
         };
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
@@ -2835,6 +2839,12 @@ private:
                        [&](size_t i) { return readBucket(tasks[i]); });
       for (size_t i : local) readBucket(i)();
       runner.join();
+      for (size_t i = 0; i < buckets.size(); i++) {
+        int32_t segOrd = records[selected[buckets[i].first]].hit.segOrd;
+        auto& work = workBySeg[(size_t)segOrd];
+        (seed ? work.seedReads : work.remainingReads) += readsByBucket[i];
+        work.scoreBytes += readsByBucket[i] * dims * (int64_t)sizeof(float);
+      }
     };
     readStage(true, KnnIntervalCollector<Groups>::NO_FLOOR);
     std::pmr::vector<float> exactWitnesses(resource);

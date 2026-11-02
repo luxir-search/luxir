@@ -403,7 +403,26 @@ are scanned before checking fill, even if exact slots already supply k units.
 Bounded document fill is capped by eligible docs in bounded IVF slots; document
 unit fill is capped by eligible docs across all slots. Unfiltered columns under
 deletes use conservative metadata caps where exact counts would require a walk.
-These are effort and fill rules, not a recall guarantee for correlated filters.
+Default-probe queries also examine at least `P0 * eligibleVectors` selector-passing
+codes on newly scanned lists, where `P0` is the initial fraction. Depth rescans
+and exact slots do not contribute. This is the eligible yield expected from an
+independent filter at `P0`; unfiltered scans already satisfy it through coverage.
+Exhaustion or explicit probe pins end widening even if obligations remain unmet.
+
+The host owns cumulative scan fractions and explicitly requests depth or breadth.
+For each unmet count obligation, it projects `covered * need / have * 1.25`, or
+`covered * 2` when yield is zero. The next target is the largest projection,
+floored at the next globally ranked list's fraction and capped at one. The
+allocator reports actual coverage, including whole-list overshoot. These remain
+effort heuristics: bounded selection and empirical interval pruning can miss
+neighbors even at full coverage.
+
+Scan tasks return work totals, reduced at each round barrier into per-segment
+query state: physical entries, selector passes (with new-list passes separate),
+PQ scores, RaBitQ one-bit and extra-bit scores, list setups, depth revisits,
+flat scores and domain visits. Terminal scoring adds its column reads after
+each read-stage barrier. These count scoring work, not physical page IO;
+allocator liveness probes are separate metadata work.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
@@ -461,8 +480,8 @@ There is no interval retention cap. `RequestMemResource` charges records,
 canonical unit keys, witness heaps, pending batches and terminal selection
 storage to the request's existing opt-in byte ceiling. Exceeding it throws
 `request_memory_exceeded`, including from scan tasks; cancellation and joining
-precede destruction of shared state. Old bounded candidate and breadth limits
-remain separate existing policies.
+precede destruction of shared state. Bounded candidate limits and explicit
+probe pins remain separate policies.
 
 ## Parallel Execution
 

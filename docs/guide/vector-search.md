@@ -840,8 +840,12 @@ only against segments searched through IVF. With default probes, a filter
 expands that fraction by `1 / sqrt(s)`, capped at one, where `s` is the eligible
 fraction of vectors in those IVF segments. Multi-valued fields may estimate
 this fraction from eligible documents and average multiplicity. Explicit
-`nprobe` keeps its pin and receives no filter expansion. This is an effort
-heuristic; filters correlated with vector distance can still need more coverage.
+`nprobe` keeps its pin and receives no filter expansion. Default-probe queries
+also keep widening until newly scanned lists have yielded the number of
+filter-passing vectors expected at that initial fraction, or all lists are
+exhausted. Widening projects from observed yield instead of adding one list at
+a time. These are effort heuristics; approximate candidate selection can still
+miss neighbors even when every list is scanned.
 
 ### Scoring
 
