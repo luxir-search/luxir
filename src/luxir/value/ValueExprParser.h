@@ -384,9 +384,10 @@ private:
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
     }
-    int convert = function->dateConversionOperand(
+    auto conversions = function->dateConversionOperands(
         std::span<const ResolvedValue>(resolvedArgs.data(), count));
-    if (convert >= 0) {
+    for (size_t convert = 0; convert < count; convert++) {
+      if (!conversions[convert]) continue;
       ValueNode scale;
       scale.intValue = 1000000;
       scale.sourcePos = pos;

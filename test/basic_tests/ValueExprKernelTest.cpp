@@ -72,6 +72,59 @@ TEST_F(ValueExprKernelTest, mixedDateUnitsUseExistingPointBatchAndArrayArithmeti
   }
 }
 
+TEST_F(ValueExprKernelTest, comparisonsAndConditionalsNormalizeSharedDateOperands) {
+  CollectionHelper helper;
+  SchemaBuilder builder;
+  auto& stamp = builder.field("stamp");
+  stamp.type = api::FieldDef::FieldClass::DATE;
+  stamp.unit = api::FieldDef::DateUnit::NS;
+  builder.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("when_dt", 2, "stamp", 1000000),
+                           UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  struct Example {
+    const char* expression;
+    double expected;
+    ValueNature nature = ValueNature::NUMBER;
+  };
+  for (const auto& example : {
+      Example{"when_dt > stamp", 1}, {"when_dt >= stamp", 1},
+      {"when_dt < stamp", 0}, {"when_dt <= stamp", 0},
+      {"when_dt == stamp", 0}, {"when_dt != stamp", 1},
+      {"stamp < when_dt", 1}, {"stamp <= when_dt", 1},
+      {"stamp > when_dt", 0}, {"stamp >= when_dt", 0},
+      {"stamp == when_dt", 0}, {"stamp != when_dt", 1},
+      {"when_dt == stamp + 1000000", 1},
+      {"max(when_dt, stamp) == when_dt", 1},
+      {"if(1, when_dt, stamp)", 2000000, ValueNature::DATE_NS},
+      {"if(0, when_dt, stamp)", 1000000, ValueNature::DATE_NS},
+      {"1 ? stamp : when_dt", 1000000, ValueNature::DATE_NS},
+      {"0 ? stamp : when_dt", 2000000, ValueNature::DATE_NS},
+      {"if(stamp, when_dt, when_dt)", 2, ValueNature::DATE_MS},
+      {"if(when_dt, when_dt, stamp)", 2000000, ValueNature::DATE_NS},
+      {"when_dt * stamp", 2000000}, {"when_dt / stamp", 0.000002},
+      {"pow(stamp, when_dt)", 1e12}}) {
+    SCOPED_TRACE(example.expression);
+    auto* program = parseValue(memory, *schema, example.expression);
+    EXPECT_EQ(example.nature, program->root().nature);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    std::array<int32_t, 1> docs{0};
+    std::array<ValueResult, 1> batch;
+    bound->evalBatch(docs, {}, batch);
+    for (const auto& result : {bound->evalPoint(0, 0), batch[0]}) {
+      ASSERT_TRUE(result.valid);
+      EXPECT_DOUBLE_EQ(example.expected, result.type == ValueType::DOUBLE
+          ? result.doubleValue : (double)result.intValue);
+    }
+    if (std::string_view(example.expression) == "if(when_dt, when_dt, stamp)") {
+      EXPECT_EQ(ValueNature::DATE_MS, program->nodes[program->root().children[0]].nature);
+    }
+  }
+}
+
 TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   CollectionHelper helper;
   constexpr int64_t BIG = 9007199254740993LL;

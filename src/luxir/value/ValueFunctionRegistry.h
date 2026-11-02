@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -53,6 +54,11 @@ enum class ValueOpcode : uint8_t {
 inline constexpr size_t VALUE_MAX_ARITY = 3;
 
 struct ValueFunction {
+  enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
+  struct Operand {
+    DateUnit unit = DateUnit::UNSET;
+  };
+
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                     int32_t docid, float score);
@@ -77,16 +83,24 @@ struct ValueFunction {
   EvalElement evalElement = nullptr;
   uint8_t minArity = 0;
   uint8_t maxArity = 0;
+  std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
-  bool combinesDates = false;
 
-  // Normalize only date-combining functions; explicit scaling still uses raw
-  // numbers. Parsers insert the conversion once, before resolving the parent.
-  int dateConversionOperand(std::span<const ResolvedValue> args) const {
-    if (!combinesDates || args.size() != 2
-        || !valueDate(args[0].nature) || !valueDate(args[1].nature)
-        || args[0].nature == args[1].nature) return -1;
-    return args[0].nature == ValueNature::DATE_MS ? 0 : 1;
+  // Shared DATE operands use ns when any of them uses ns. RAW operands keep
+  // their native numeric representation.
+  std::array<bool, VALUE_MAX_ARITY> dateConversionOperands(
+      std::span<const ResolvedValue> args) const {
+    bool nanos = false;
+    for (size_t i = 0; i < args.size(); i++) {
+      if (operands[i].unit == DateUnit::SHARED
+          && args[i].nature == ValueNature::DATE_NS) nanos = true;
+    }
+    std::array<bool, VALUE_MAX_ARITY> convert{};
+    for (size_t i = 0; i < args.size(); i++) {
+      convert[i] = nanos && operands[i].unit == DateUnit::SHARED
+          && args[i].nature == ValueNature::DATE_MS;
+    }
+    return convert;
   }
 };
 
