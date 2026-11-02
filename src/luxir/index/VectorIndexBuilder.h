@@ -21,7 +21,7 @@ namespace luxir {
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
 /// Flat kNN is served directly from the vector column.  Aux builds produce an
-/// IVF ANN index (the field's "ann" codec: IVF+PQ by default, or opt-in IVF+RaBitQ)
+/// IVF ANN index (the field's "ann" codec: IVF+RaBitQ by default, or explicit IVF+PQ)
 /// when enough vectors are present and the segment is large enough to be
 /// worth indexing.
 ///
@@ -71,7 +71,7 @@ public:
   static int64_t ivfBuildMinRowsPerTask;
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
-  // dims shares one matrix (deduplicated in RAM by internVectorRotation).
+  // dims shares one transform (deduplicated in RAM by internVectorRotation).
   static constexpr int RABITQ_ROTATION_SEED = 0x5ab17;
 
 

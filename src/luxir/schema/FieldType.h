@@ -361,7 +361,7 @@ public:
 };
 
 // Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
-// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// defaults applied: RaBitQ unless explicitly selected otherwise). Build-time
 // parameters are recorded in each overlay's VectorAuxMeta, so a change only
 // affects overlays built afterwards;
 // rabitqQueryBits is a search-time parameter read from the current schema.
@@ -370,16 +370,25 @@ struct VectorAnnConfig {
     RABITQ = 0,
     PQ = 1,
   };
-  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 0;
   static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
   static constexpr int32_t DEFAULT_PQ_BITS = 8;
 
-  Codec codec = PQ;
+  Codec codec = RABITQ;
   int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
   int32_t rabitqBits = DEFAULT_RABITQ_BITS;
   int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
   int32_t pqM = 0;    // 0 = derived from dims
   int32_t pqBits = DEFAULT_PQ_BITS;
+
+  // A second bit narrows the estimate intervals, so fewer candidates need
+  // exact rescoring; the gain shrinks as dims grow. Measured k=100 latency
+  // gain of 2 bits: about 22% at 128-256 dims, 13% at 384, 9% at 512, ~1% at
+  // >= 768; at k=10 none from 384 up. Build CPU is 1.5-1.8x either way.
+  static constexpr int32_t RABITQ_ONE_BIT_MIN_DIMS = 384;
+  int32_t resolvedRabitqBits(int32_t dims) const {
+    return rabitqBits != 0 ? rabitqBits : (dims < RABITQ_ONE_BIT_MIN_DIMS ? 2 : 1);
+  }
 };
 
 // Dense float vector field.  Values are stored as fixed-size byte blobs

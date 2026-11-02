@@ -107,14 +107,15 @@ without an enclosing collapse is a request error.
 `exact: true` finds the exact nearest groups and their best members. ANN
 uses group-aware admission while scanning and refining candidates, but
 both group recall and the choice of representative can be approximate.
-`refine_candidates` counts candidate documents in both units. Group search
-limits how many candidates each group can contribute, keeping several members
-when the budget permits so full-precision rescoring can recover the best
-representative. A larger pool can improve both group and representative recall
-at a cost in work and memory. Exact segment results bypass the approximate
-candidate budget and compete with approximate candidates after rescoring.
+Explicit `refine_candidates` counts candidate documents in both units and
+selects the bounded policy. That policy limits members per group while keeping
+several when the budget permits, allowing rescore to recover the best member.
+Default RaBitQ instead retains competitive value intervals and prunes within
+each group, without a member-count cap. Exact segment results bypass the
+approximate quota and compete after rescoring.
 
-Search deepens under the existing candidate and IVF effort caps. When it
+When too few groups are found, search widens IVF effort, within the bounded
+policy's candidate limits. If it still
 returns fewer than `k` groups, the final response includes a warning with
 code `knn_group_underfill`. Its message reports the requested and returned
 counts and `candidates_exhausted`: `true` means no more eligible candidates
@@ -628,8 +629,8 @@ after changing source limits.
 
 Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes as segment overlays:
-an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
-by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
+an inverted-file (IVF) index whose lists hold RaBitQ codes by default, or
+explicit product-quantization (PQ) codes, built with FAISS. An overlay is built
 from the vector column, follows its segment through later commits and
 merges, and its candidates are always rescored from the full-precision column
 before they are returned. Building an overlay does not reindex documents.
@@ -689,17 +690,17 @@ POST /collections/books/_schema
 
 | Field | Meaning |
 |---|---|
-| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `codec` | `rabitq` (default) or explicit `pq`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
-| `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
+| `rabitq.bits` | Bits per dimension, `0` to `9`. Absent or `0` (default): automatic from the stored dimension, 2 below 384 dims and 1 at or above. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for every metric. If none does, use the largest divisor under the same cap. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
-`rabitq` settings require an explicit `"codec":"rabitq"`, for example
-`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
-Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
-`pq` settings alone; a `rabitq` object does not infer the codec. A field
+`pq` settings require an explicit `"codec":"pq"`, for example
+`"ann":{"codec":"pq","pq":{"m":96}}`.
+Omitting the codec selects RaBitQ, including for `ann:{}`, `nlist` alone, or
+`rabitq` settings alone; a `pq` object does not infer the codec. A field
 without `ann` inherits its parent's, and an `ann` object replaces the
 parent's whole definition rather than merging with it.
 
@@ -707,34 +708,40 @@ These rules also apply to inherited ANN settings and vector variants. Use
 automatic `m` when dimensions are inferred from indexed values; an explicit
 positive `m` requires dimensions pinned in the schema.
 
-**RaBitQ** (opt-in) stores each vector as one sign bit per dimension of
-its randomly rotated offset from its IVF list's centroid, plus a few
-correction factors: 104 bytes for a 768-dimension vector, about 1/30 of the
-float vector. Distances estimated from these codes come with a proven error
-bound, and the codec trains nothing beyond the IVF centroids. With `bits`
-above 1 (extended RaBitQ), each dimension gets extra magnitude bits; a scan
-then estimates every vector from its sign bits first and spends the extra bits
-only on vectors whose error bound still overlaps the current top candidates.
-`query_bits: 4` matches the 1-bit-document, 4-bit-query asymmetry other
-engines use and costs no measurable recall against `8`.
+**RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
+centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
+bytes plus a 4-byte error amplitude (108 bytes, excluding its id). Multi-bit
+codes use `ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32
+amplitude (4 bytes), stored in list order. Only the IVF centroids are trained.
 
-**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
-codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+The default candidate selection uses empirical confidence intervals. It keeps
+values whose optimistic score can still beat the k-th distinct-unit witness,
+then reads exact seed witnesses and narrows the set before the remaining exact
+reads. Multi-bit scans first use a 1-bit interval to decide whether to evaluate
+the extra bits. Gate and selection confidence constants are both 1.9; these
+are empirical choices, not recall guarantees. `query_bits: 4` is the default;
+query quantization also affects estimation error and should be checked on the
+intended corpus when changed.
+
+**PQ** (explicit) splits each vector into `m` sub-vectors and stores one learned
+codebook entry per sub-vector. PQ's automatic `m` scales with stored
 dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
-bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
+bytes at 8 bits, close to 1-bit RaBitQ's 108 including its amplitude. This improves high-dimensional recall
 over `m=32` at the cost of larger codes and more scan work; see the
 [codec measurements](../design/vector-search.md#codec-measurements).
-L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
-precomputed table at 8 bits; IP/cosine builds its lookup table per query and
-has no such resident table. Fields of up to 256 dimensions and explicit `m`
-settings keep their existing choices. PQ codebooks are retrained for every
-segment build and merge; automatic `m` depends only on dimensions and metric.
+For L2, the reader retains the `nlist * m * 2^bits`-float precomputed table
+only if it fits within the overlay's raw vector bytes (`ntotal * dims * 4`);
+otherwise FAISS computes tables per list. IP/cosine has no resident L2 table.
+PQ codebooks are retrained for every segment build and merge; automatic `m`
+depends only on stored dimensions.
 
-PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
-lists. Opt into RaBitQ for its different size/recall tradeoff.
-With 1-bit RaBitQ, recall is usually limited by how many lists are probed
-rather than by the codes, so raise `ivf.nprobe` first; extra `bits` help mainly
-when `refine_candidates` is small.
+Scan and rescore costs depend on codec, dimension, candidate policy and query.
+Higher RaBitQ bit counts generally narrow the intervals and reduce exact reads,
+while increasing code size. At low dimensions or for difficult queries, 1-bit
+selection can retain many more values. Compare end-to-end latency and recall on
+your corpus; neither codec has a universal scan-speed advantage. Raising
+`ivf.nprobe` addresses missed lists; it does not correct code-ranking error in
+a bounded candidate pool.
 
 Overlays record the settings they were built with, so a change applies to
 segments built afterwards: new flushes, merges, and segments without an
@@ -747,8 +754,9 @@ the field's identity: existing values stay searchable.
 
 The [resolved schema view](schema.md#resolved-view) exposes each vector
 representation's effective `ann` settings, including defaults and inherited
-values. It includes only the selected codec's settings. `nlist:0` and `m:0`
-remain automatic policies, rather than sizes chosen for any one segment.
+values. It includes only the selected codec's settings. `nlist:0`, `pq.m:0`
+and `rabitq.bits:0` remain automatic policies, rather than sizes chosen for
+any one segment.
 
 ### Query knobs
 
@@ -778,19 +786,33 @@ every index type.
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
-| `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
+| `refine_candidates` | Select the bounded candidate policy for every approximate codec, with this document budget clamped up to `k`. Unset: RaBitQ uses intervals; PQ uses the count formula below. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
 
-`refine_candidates` sizes the candidate-document pool in both units, whichever
-index produced the candidates. When unset, the pool is affine
-in `k`, with a multiplier that decays from about 10 at `k=1` to a small floor
-by `k=1000`: quantization mis-ranks a true neighbor by a roughly constant
-number of positions regardless of `k`, so small `k` needs fixed headroom, while
-large-`k` requests are recall-oriented retrieval whose near-tied tail does not
-benefit from extra overfetch. The final pool is always rescored from the
-full-precision column, sorted by exact score, and collapsed to one hit per
-document (or per group with `unit: "groups"`).
+An explicit `refine_candidates` selects bounded collection for every approximate
+segment, including RaBitQ. Without it, PQ uses
+`k + 24 + ceil(15 * k^0.8)`: 40 at `k=1`, 129 at `k=10`, 722 at `k=100`,
+and 4792 at `k=1000`. Multi-valued fields inflate bounded vector counts to reach
+the document budget; bounded group selection also limits members per group.
+Available candidates and bounded execution limits can reduce that pool.
+
+Default RaBitQ selection has no fixed count, average-multiplicity inflation or
+member cap. A document or group contributes only one witness, but multiple
+values can remain competitive for its best exact score. Values are also pruned
+against their own unit's best lower endpoint and, during terminal scoring,
+best known exact score. Mixed queries retain PQ bounded candidates independently
+of RaBitQ interval candidates; exact column results bypass both approximate
+quotas. The terminal pass first reads k distinct-unit seeds and all mandatory
+bounded candidates, then reads the remaining competitive interval values,
+reusing seed scores. Final scores and unit representatives are exact within
+this selected set.
+
+Interval state, witnesses and seed storage are charged to the uniform request
+memory budget. There is no interval candidate-count cap. The opt-in request
+byte ceiling fails the request with `request_memory_exceeded`; it never silently
+truncates the interval set. IVF list selection and empirical confidence pruning
+still make the search approximate.
 
 `ivf.nprobe` is interpreted as the number of lists
 Luxir would probe if the field were a single IVF index built with
@@ -804,8 +826,9 @@ reference index for fields of up to 128 stored dimensions and scales by
 dimension (`truncate_dims` when set). This effort policy applies to
 both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
 measurements on GIST and Cohere embeddings showed recall@10 rising from
-0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
-the only work limiter.
+0.82-0.87 to about 0.95. Selected lists are always traversed in full. Within
+them, multi-bit RaBitQ skips the extra-bit evaluation for vectors that cannot
+compete, and candidate selection decides which vectors are read exactly.
 
 ### Scoring
 
@@ -865,11 +888,12 @@ skipped at index time, and a kNN query with one is rejected.
 
 ### Measure recall
 
-Approximate search is approximate. Higher `ivf.nprobe` and higher
-`refine_candidates` raise recall and latency. Setting `nprobe` to at least the
+Higher `ivf.nprobe` spends more work on list coverage. Under bounded selection,
+higher `refine_candidates` spends more work on ranking uncertainty. Compare
+that bounded override with default RaBitQ intervals on your workload. Setting `nprobe` to at least the
 reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
-the search exhaustive over IVF lists, but the codec's estimated ordering still
-decides which candidates are rescored.
+the search exhaustive over IVF lists, but bounded estimates or empirical
+intervals still decide which values are rescored.
 
 `exact: true` uses a path that guarantees the true top-k and does not
 consult overlays. Everything else about

@@ -240,7 +240,7 @@ public:
           Query::PlanningContext::Limits{}, &req.warnings,
           FilterKeyContext{.schemaGen = req.schema->gen_,
                            .timeZone = req.proto.time_zone},
-          req.filterUses);
+          req.filterUses, &req.memoryTracker);
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -352,7 +352,7 @@ public:
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
         bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
             req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -695,8 +695,7 @@ public:
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
-      if (ftype->type() == FieldType::Type::DATE
-          || ftype->type() == FieldType::Type::INT) {
+      if (QueryBuilder::isNumericColumnType(ftype->type())) {
         selectedInts = preparedSelected->numericsInInputOrder();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
@@ -707,13 +706,15 @@ public:
 
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
-      // DATE stores native ticks in the int column; it terms-facets exactly
-      // like INT (distinct values). Date-histogram bucketing is a range
-      // facet, not a terms facet.
+      // Numeric columns hold raw integers, date ticks, or sortable floating
+      // bits. Field facets count distinct encoded values for all of them;
+      // date-histogram bucketing is a range facet, not a terms facet.
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
+          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedInts);
@@ -934,7 +935,7 @@ public:
       if (dataBounds) {
         auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
             facetField, facetName, std::move(grid), encodedStart, encodedEnd,
-            fieldType->type(), minCount, facetReq.missing);
+            minCount, facetReq.missing);
         configureMeasure(*facet, measure);
         return facet;
       }
@@ -947,7 +948,7 @@ public:
       });
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
-          parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+          parsed.affine, parsed.affineGap, minCount,
           facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
       return facet;
@@ -995,7 +996,7 @@ public:
     if (dataBounds) {
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
           facetField, facetName, std::move(grid), givenStart, givenEnd,
-          fieldType->type(), minCount, facetReq.missing);
+          minCount, facetReq.missing);
       configureMeasure(*facet, measure);
       return facet;
     }
@@ -1007,7 +1008,7 @@ public:
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
-        parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+        parsed.affine, parsed.affineGap, minCount,
         facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
     return facet;
@@ -1301,7 +1302,7 @@ public:
         Query::PlanningContext::Limits{}, &req.warnings,
         FilterKeyContext{.schemaGen = req.schema->gen_,
                          .timeZone = req.proto.time_zone},
-        req.filterUses);
+        req.filterUses, &req.memoryTracker);
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1694,7 +1695,7 @@ public:
       &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
-      req.filterUses);
+      req.filterUses, &req.memoryTracker);
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2200,7 +2201,7 @@ public:
       if (planningContext == nullptr) {
         planningContext = luxir::arenaCreate<Query::PlanningContext>(
             req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
       }
       return *planningContext;
     }
