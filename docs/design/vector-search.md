@@ -59,7 +59,7 @@ future work.
 
 Every overlay is an IVF index: k-means centroids route a query to inverted
 lists, and the lists hold one compact code per vector. The field's schema
-`ann` settings pick the code (PQ by default, or opt-in RaBitQ; see
+`ann` settings pick the code (RaBitQ by default, or explicit PQ; see
 [guide/vector-search.md](../guide/vector-search.md#index-settings)); the
 builder reads them when it builds an overlay and records the codec and its
 build parameters in the overlay's `VectorAuxMeta`, so the reader and query
@@ -72,50 +72,64 @@ metric space for both (see rotation below). RaBitQ query quantization
 (`query_bits`) is not an index property; it is read from the current schema at
 search time.
 
-**IVF+RaBitQ** (opt-in, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
+**IVF+RaBitQ** (default, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
 RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
 residual from the list centroid plus two float factors, and estimates
-distances from the code with a proven error bound; extended RaBitQ adds
+distances with probabilistic error bounds under its random-rotation model;
+extended RaBitQ adds
 magnitude bits per dimension. There is no codebook to train: building trains
 only the IVF centroids, unlike PQ, which retrains per-subspace k-means
 codebooks on every segment build and merge.
 
 The error bound and unbiasedness assume the codes are taken in a randomly
 rotated space. FAISS does not rotate internally: `RaBitQuantizer.h` states "It
-is assumed that the Random Matrix Rotation is performed externally", and the
-FAISS RaBitQ benchmark and tests wrap the index in
-`IndexPreTransform(RandomRotationMatrix, ...)` themselves. Luxir therefore
-builds a `RandomRotationMatrix` (orthonormal, d x d, fixed seed), rotates the
-training sample and every added vector, and serializes the header as the
-standard `IndexPreTransform(rotation, IndexIVFRaBitQ)`. The reader takes the
-wrapper apart: it keeps the IVF index (whose lists it serves from the mmapped
-file as usual) and interns the rotation in a process-wide table keyed by
-content. Because every overlay of a given dims uses the same seed, all of them
-share one matrix in RAM (d^2 floats, 2.25 MiB at 768 dims), and a query is
-rotated once per distinct matrix rather than once per segment. The rotation is
-orthonormal, so L2, inner product, and cosine (unit vectors stay unit) are
-preserved, and centroid distances stay comparable across rotated and
-unrotated segments in the global list ranking. On one real embedding corpus
-the rotation made no measurable recall difference (the embeddings are close to
-isotropic already); it is kept because the guarantee, not that corpus, is what
-the codec is chosen for.
+is assumed that the Random Matrix Rotation is performed externally". Luxir
+rotates with a seeded FHT-Kac transform (the rotator of the RaBitQ authors'
+library) in `util/VectorRotation.h`, shared by the builder and the
+reader/query code. It uses exactly d coordinates, with no padding. Four
+rounds each apply random signs, then a normalized Walsh-Hadamard transform
+on the largest power-of-two block fitting in d, alternating head and tail.
+For non-power-of-two d, each round then pairs the first floor(d/2)
+coordinates with the last floor(d/2) coordinates in orthogonal
+sum/difference Kac steps. For odd d, the middle coordinate is covered by both
+Hadamard blocks. Power-of-two d skips Kac.
+
+The signs use SplitMix64 from the recorded seed, consuming each word low bit
+first continuously across rounds; a set bit negates the coordinate. The
+rotation kind fixes this algorithm and bit ordering. Every step is orthogonal,
+so norms, inner products, cosine and centroid distances remain comparable
+with unrotated PQ segments. Application costs O(d log d), with O(d) cached
+signs, replacing the dense d x d matrix and its quadratic work. FAISS's
+HadamardRotation pads to the next power of two, adding 33% code bytes at
+768, 1536 and 3072 dimensions; avoiding that padding preserves code density.
+
+Training samples and added vectors use the same transform. Headers are bare
+`IndexIVFRaBitQ`; metadata stores rotation kind and seed, with no matrix.
+Readers intern by (kind, dims, seed), and queries rotate once per distinct
+transform. A fixed seed shares the transform across overlays of one dimension.
+Confidence intervals remain empirical, rather than a deterministic guarantee.
+On five 1M corpora (128 to 1536 dims, L2, IP and cosine) it matched the dense
+rotation's recall and latency at 1 and 2 bits, within the run-to-run
+variation of the k-means partition, and cut 1-bit build CPU by up to 23% (NQ
+1536: vector build 12.0 to 8.2 s).
 
 Each IVF engine slot binds an immutable prepared query: the canonical query
-for PQ, or the cached rotated query for RaBitQ (a Luxir matvec over the
-rotation's rows rather than FAISS's one-column SGEMM, which on x86 OpenBLAS
-takes the full packed GEMM path), plus the current schema's
+for PQ, or the cached rotated query for RaBitQ, plus the current schema's
 query quantization bits. Coarse assignment and both document and group scans
-use that same index-space query. Each scan call owns its selector and FAISS
-search parameters, including `query_bits`, so filtering, deeper rounds, and
-parallel list chunks share the same preparation policy without sharing
-mutable scanner state. Exact column scans and terminal rescoring retain the
-canonical query.
+use that same index-space query. Each scan call owns its selector and distance
+computer, with query quantization taken from the prepared query, so filtering,
+deeper rounds, and parallel list chunks share the same preparation policy
+without sharing mutable distance-computer state. Document and group scans share one traversal
+and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
+its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
+terminal rescoring retain the canonical query.
 
 RaBitQ's estimated squared L2 distance can be negative. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
-at 1. Group scanners invert this same map when setting their competitive
-distance threshold. These approximate scores may exceed the public L2 range
+at 1. The common bounded handler inverts this map outward when setting its
+competitive distance threshold, admitting equal scores for identity ties.
+These approximate scores may exceed the public L2 range
 `[0, 1]`; terminal rescoring from column vectors restores exact scores before
 the final cut, similarity filtering, and returning results. Exact column
 witnesses bypass the bounded approximate heap, so an inflated estimate cannot
@@ -125,28 +139,28 @@ FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
 at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans
 in a standalone FAISS test. It is not used yet: its lists are
 `BlockInvertedLists` (padded 32-vector blocks with per-block factor regions),
-which needs a second mmapped list layout; its `search_preassigned` rejects
-the per-call stats sink the parallel scan uses; and the vendored FAISS 1.14.3
-install omits `faiss/utils/popcount.h`, which its header includes, so it does
-not compile against the installed headers without patching the port. The
-codec is recorded per overlay, so FastScan can arrive as another engine id.
+which needs a second mmapped list layout, and its `search_preassigned` rejects
+the per-call stats sink the parallel scan uses. The codec is recorded per
+overlay, so FastScan can arrive as another engine id.
 
-**IVF+PQ** (default, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
+**IVF+PQ** (explicit, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
-largest divisor of dims under a metric-dependent cap that leaves at least
-four dimensions per sub-quantizer. The cap is `max(32, dims / 8)` for the
-FAISS inner-product metric (IP and cosine), and 32 for L2. If no divisor
-leaves four dimensions, use the largest divisor under the same cap. Explicit
-`m` is unchanged. Automatic `m` depends only on dims and metric, so it is
-stable across merges. Up to 256 dims the choices are unchanged; IP/cosine
-selects 48 / 96 / 120 / 192 / 384 at 384 / 768 / 960 / 1536 / 3072 dims.
+largest divisor of dims under `max(32, dims / 8)` that leaves at least four
+dimensions per sub-quantizer, for every metric. If none does, use the largest
+divisor under the same cap. Explicit `m` is unchanged. Automatic `m` depends
+only on stored dims, including inferred dims, so it is stable across merges
+of the same dimension. It selects 48 / 96 / 120 / 192 / 384 at
+384 / 768 / 960 / 1536 / 3072 dims.
 
-L2 retains the cap because FAISS's L2 + `by_residual` path recomputes a
-precomputed table at open and keeps it resident: `nlist * m * 256` floats
-at 8 bits. At about 121k vectors (`nlist=348`), `m=96` would mean about
-34 MB of resident table against 11.6 MB of codes. IP/cosine instead builds
-its lookup table per query, with no such index-resident table.
-`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins that distinction.
+The reader skips FAISS precomputation during deserialization. For L2 with
+`by_residual`, it explicitly enables the `nlist * m * 2^bits`-float table
+only when its bytes are at most `ntotal * dims * 4`, the raw vector bytes.
+Otherwise it disables the table and FAISS computes tables per list. This
+bypasses FAISS's global 2 GB cap. With default sqrt(N) lists and m near d/8,
+the table is about 32/sqrt(N) of raw bytes; the bound primarily constrains
+explicit large nlist. IP/cosine has no resident L2 table.
+`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins both metric behavior
+and the size boundary.
 
 The basis is the Cohere-768 cosine [measurement below](#codec-measurements):
 `m=96` improves recall over `m=32`, with code bytes and per-code scan work
@@ -155,6 +169,31 @@ work per training vector per iteration, and encode work per vector, remain
 `256 * dims` at 8 bits: splitting the dimensions into more sub-quantizers
 does not multiply that arithmetic. This does not establish unchanged
 wall-clock build time; the build measurement below used `m=32`.
+
+### Default codec
+
+RaBitQ is the default, chosen on one-segment indexes at default probes plus
+16 to 256 lists, single client: SIFT-128 L2, MIRACL-768 cosine, GIST-960 L2,
+Cohere-1024 IP, NQ-1536 cosine, Jina v5-small MS MARCO embeddings truncated
+to 256 / 384 / 512 / 1024 dims (cosine), all at 1M vectors, and OpenAI
+text-embedding-3-large 3072 IP at 500k.
+
+From 384 dims up, 1-bit RaBitQ ran at about 0.5-0.8x PQ latency at equal or
+higher recall and built with equal or less CPU (0.39x at 3072 dims). Its
+intervals size the candidate pool per query, while PQ's bounded count,
+fitted on one 1024-d IP corpus, left recall behind elsewhere: at 256 lists
+PQ reached .872 recall@10 on MIRACL (.975 with 1000 candidates), .710 on
+GIST at m=32 (.954), .949 on Jina-384 and .960 on OpenAI-3072, against
+.981-.997 for 1-bit RaBitQ. At 128 dims 1-bit RaBitQ took 1.16x / 1.30x PQ
+latency at k=10 / k=100, and 2-bit 1.03x / 1.02x at 0.55x PQ's build CPU.
+
+Automatic bits (`0`) resolve to 2 below 384 stored dims and 1 at or above.
+On the same model truncated to 256 / 384 / 512 / 1024 dims, 2 bits cut k=100
+latency by 23% / 13% / 9% / 1% (21% on SIFT-128) but k=10 latency only
+below 384, while costing 1.5-1.8x the build CPU. 4 bits never beat 2.
+
+GIST L2 with PQ m=32 topped out at .71 recall@10 at 256 of 1000 lists;
+m=120, now the automatic choice, reaches .94-.98.
 
 ### Codec measurements
 
@@ -174,13 +213,15 @@ i7-14700KF, shared with other builds). Two corpora:
   (768 dims, cosine).
 - SIFT1M (1,000,000 x 128, L2).
 
-At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
+In this historical 768-dimension campaign, the tested 1-bit pools reached the
+same recall as the higher-bit codecs: 1, 2,
 and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
-/ 128, at any rescore pool. PQ at its then-automatic `m=32` (32 code bytes) never
+/ 128, at the tested rescore pools. PQ at its then-automatic `m=32` (32 code bytes) never
 passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
-close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
-RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
-ms for `m=96`), which FastScan should largely close. At 128 dims (SIFT) the
+close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. The then-current bounded scans measured 1.2 ms for RaBitQ versus 0.66 ms for
+PQ `m=96` at default nprobe. Those measurements predate shared floors,
+interval selection and amplitude storage; they do not establish a universal
+codec ranking or that 1-bit recall is generally list-limited. At 128 dims (SIFT) the
 defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 0.999 at nprobe 128, where 2-bit RaBitQ or 500 candidates reach 0.9985 and
 0.9965) and PQ is again faster. Overlay builds, including training and
@@ -224,14 +265,10 @@ inside a segment is time ordered. The builder normalizes vectors for FAISS
 when the field uses cosine and the stored column is raw.
 
 Raw-cosine training samples are normalized in place in their owned buffer.
-RaBitQ training then uses the chunked transform helper for rotation only,
-copying each rotated chunk back into the sample; PQ needs no training
-transform call. There is no second full-size training allocation or swap.
-Each scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
-capped by the available vectors with a minimum of one vector. Training
-rotation needs one buffer, released before FAISS training. Add uses the same
-helper with up to two buffers for raw cosine plus rotation, keeping matrix
-multiply input and output disjoint. Untransformed PQ add passes column bytes
+RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
+Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
+capped by available vectors with a minimum of one vector. Add uses up to two
+buffers for raw cosine plus rotation. Untransformed PQ add passes column bytes
 directly to FAISS. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
 
@@ -258,7 +295,7 @@ so it cannot pick up an unrelated merge or flush while waiting:
   for RaBitQ, coarse-assigns with the base `IndexFlat::search`, and calls
   `encode_vectors` with list numbers. One serial `add_sa_codes` per chunk
   preserves input order within each inverted list.
-- RaBitQ training-sample rotation, into disjoint row slices of a separate buffer.
+- RaBitQ training-sample rotation, in disjoint row slices in place.
 - PQ codebook training, one task per sub-quantizer with its own sub-vector
   buffer, clustering instance and flat L2 index. This mirrors FAISS's default
   training path; residual precomputation follows after all tasks finish.
@@ -274,13 +311,28 @@ plain `IndexFlat` and `IndexIVFPQ`; readers need no build-specific types.
 ## Memory-Mapped Index Layout
 
 Index data stays memory-mapped at query time. The aux file holds a small FAISS
-header (index parameters, IVF centroids, and the PQ codebooks or RaBitQ
-rotation) followed by the inverted-list payloads (codes and vector ids) in
-Luxir's own layout; the
+header (index parameters, IVF centroids, and the PQ codebooks) followed by
+the inverted-list payloads (codes and vector ids) in Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
 RAM.
+
+RaBitQ overlays also store upward-rounded float32 error amplitudes after the
+codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
+(4 bytes/vector for every width). The multi-bit gate reads sigma1 from the
+code's own f_error; the side amplitude is read only after that gate. PQ has
+no amplitude section.
+The builder computes these in the encoding row pipeline from the rotated
+original, assigned centroid and actual code. SigmaB is the residual
+reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
+for squared L2. Sigma1 removes FAISS's fixed 1.9 confidence multiplier from
+its error factor. These amplitudes support empirical confidence intervals;
+they are not deterministic error bounds. The reader exposes a mmap view.
+The reader validates finite, non-negative amplitudes once at open and exposes
+per-list spans for sequential, unchecked scan loads. Metadata and footer
+version 3 validate the component count and file size;
+older formats fail on open and must be rebuilt.
 
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
@@ -334,20 +386,62 @@ auto-deepening recovers.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
-arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
-work limiter.
+arbitrary candidates. `nprobe` selects lists; codec gates and terminal
+selection determine the work performed on their values.
 
-Candidates are unioned across deepen rounds using approximate scores for the
-widen decision. From the first deepen round on, already-pooled vectors are
-excluded from every engine's scan: the pooled set is folded into per-query
-copies of the segments' liveness bitmaps (all-ones where a segment has no
-deletions) and handed to the scanners as an eligibility filter, so each
-round's result heap is spent entirely on new candidates and each round
-requests only the projected shortfall rather than re-requesting the whole
-pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
-the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+Candidate selection has independent bounded, interval and exact channels.
+PQ defaults to `k + 24 + ceil(15 * k^0.8)`; explicit `refine_candidates`
+selects the bounded policy for every approximate codec. Default RaBitQ uses
+intervals for every bit width. Exact column slots supply distinct-unit top-k
+results outside the approximate quota.
+
+The bounded channel uses a shared R-th estimate floor. Its fresh DEPTH epochs
+exclude banked ranks and reset that floor. Its document budget, multiplicity
+inflation and group member caps apply only to bounded candidates. Interval
+selection is complete after traversing the selected lists, independent of
+retained count, and never requests DEPTH. BREADTH visits only newly allocated
+lists and preserves interval witnesses and retained identities. A mixed query
+must satisfy the bounded channel's own obligation; interval hits cannot fill
+its quota. The result contract reports bounded completion separately from
+remaining breadth. Insufficient distinct units can trigger more breadth:
+bounded Groups continue BREADTH when the document pool is full but holds
+fewer than k groups.
+
+For RaBitQ, the query-owned collector tracks each unit's best lower endpoint
+and the k-th highest of those endpoints. A unit is a (segment, document) pair
+or a canonical CollapsePlan group key, including missing-key policy. A value
+is retained only while its upper endpoint reaches both the global witness
+floor and its own unit's lower endpoint. Multiple values of one unit can
+remain competitive. PQ point estimates never witness the true k-th score.
+Exact column scores may witness it. Document units use a flat hash map from
+packed (segment, document) to reusable stable slots; only Groups copy and hash
+canonical CollapsePlan keys. Map, slot and key storage are request-accounted.
+
+One-bit uses its single estimate with `sigma1 * g_error * 1.9`. Multi-bit first
+tests the optimistic 1-bit endpoint with gate epsilon 1.9, then constructs the
+full-bit interval with `sigmaB * g_error * 1.9`. The gate uses the witness floor
+for intervals and the R-th estimate floor for bounded collection. For L2 the
+raw distance endpoints are mapped in reverse order through the score transform,
+with outward rounding and upper scores clamped to 1. Scans reject in distance
+space against a cached outward threshold, converting only when the floor
+changes. Only admitted records pay for score mapping and outward endpoints. Both constants are empirical confidence choices,
+validated on IP at 128 and 1024 dimensions; they are not containment guarantees.
+
+Terminal scoring starts with the best estimated value per unit, choosing k
+distinct units. All bounded candidates are mandatory in this stage too (bounded
+Groups nominations expand to their whole document). Exact scores are reused.
+Then `T = max(k-th exact seed score, pessimistic witness floor)` selects the
+remaining interval values by `upper >= T`. A value whose upper score is below
+its unit's best known exact score is also skipped. Both stages read in segment
+and value-rank order, with disjoint column reads and a shared exact-score cache.
+Final unit collapse and similarity filtering use exact scores.
+
+There is no interval retention cap. `RequestMemResource` charges records,
+canonical unit keys, witness heaps, pending batches and terminal selection
+storage to the request's existing opt-in byte ceiling. Exceeding it throws
+`request_memory_exceeded`, including from scan tasks; cancellation and joining
+precede destruction of shared state. Old bounded candidate and breadth limits
+remain separate existing policies.
 
 ## Parallel Execution
 
@@ -357,10 +451,21 @@ chunks sized by their actual vector counts, and each chunk (plus each
 column-scanned segment) is scanned as an independent task; the terminal
 full-precision rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
-single-segment pool, fold inline on the calling thread). Task boundaries do
-not depend on the execution mode, and every bounded candidate cut uses a total
-order, so a parallel run returns bit-identical results to a serial run of the
-same query.
+single-segment pool, fold inline on the calling thread).
+
+All IVF chunks and segments share a bounded cut per fresh epoch and persistent
+interval witness state for the query. Task-local handlers batch admissions and
+canonical keys; group bounded handlers keep their local capped admission.
+Serialized updates publish monotone scalar floors. PQ uses its optimized
+kernel with floor refreshes between 256-code blocks. RaBitQ uses its distance
+computer in the common traversal. Peak and terminal retained counts, seed and
+remaining reads, gate rejections and extra-bit evaluations accompany the
+selector-passing scan count in the benchmark stats seam.
+
+Task boundaries do not depend on execution mode, and bounded cuts use a total
+identity order. RaBitQ confidence pruning can nevertheless change work and rare
+approximate misses with scheduling, since the floor seen during a scan depends
+on which tasks have published results.
 
 ## What This Means for Users
 
@@ -371,5 +476,6 @@ same query.
 - Segments below the training threshold, and segments whose build failed,
   are searched exactly from the column. A failed build leaves no partial
   state.
-- Parallelism is purely a speed knob: results are bit-identical to serial
-  execution.
+- Exact results retain deterministic ordering across execution modes.
+  Approximate confidence pruning can produce different candidates as task
+  scheduling changes the shared floor.

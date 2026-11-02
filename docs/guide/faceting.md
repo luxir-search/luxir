@@ -227,10 +227,11 @@ Distinct counting uses the request memory budget. Exceeding the budget fails
 the request; counts never become estimates or document counts. Use
 `count_unit: "docs"` when document counts are the intended measure.
 
-Distinct counting supports STRING/ID and INT/DATE field facets, numeric/date
+Distinct counting supports STRING/ID and numeric/date field facets, numeric/date
 range facets, and query facets, including overlapping query buckets and nested
 operations. TEXT field facets and metric sorts with distinct counts remain
-unsupported.
+unsupported. FLOAT/DOUBLE can be facet fields, but cannot be distinct key fields;
+the key types are the same as for `collapse`.
 
 ## Field facets
 
@@ -300,12 +301,16 @@ document counts in either [multi-valued mode](schema.md#multi-valued-modes).
 matches in the current result set, which keeps a sidebar stable while the user
 narrows a search.
 
-Integer and date fields facet on each distinct column value. Text fields facet
-on analyzed terms, not on the stored text: a facet on `body_t` returns
-indexed words, while a facet on `category_s` returns whole category values.
-Text facets also accept `mincount: 0`, while integer and date facets require
-a positive value when set. Use a range facet when numbers should be bucketed
-rather than enumerated.
+Integer, floating-point, and date fields facet on each distinct column value.
+FLOAT/DOUBLE keep `-0.0` and `0.0` in separate buckets, matching exact query
+equality; all NaNs share one bucket. HTTP JSON renders NaN and infinities as
+`null`, so those bucket labels cannot be sent back as selections.
+
+Text fields facet on analyzed terms, not on the stored text: a facet on
+`body_t` returns indexed words, while a facet on `category_s` returns whole
+category values. Text facets also accept `mincount: 0`, while numeric and date
+field facets require a positive value when set. Use a range facet when numbers
+should be bucketed rather than enumerated.
 
 A string facet needs indexed terms and a column. Facets return the term as
 stored. For fields with multiple representations, see
@@ -388,7 +393,7 @@ evaluated independently for each bucket and returned beside the bucket:
       "val": "hardcover",
       "count": 8,
       "average_price": 24.50,
-      "lowest_price": 15.00
+      "lowest_price": 15.0
     }
   ]
 }
@@ -946,7 +951,7 @@ POST /collections/authors/_search
 The document list holds Asher's three books, while the facet still shows all
 three authors. Selection uses the facet's resolved representation for both
 normalization and refinement, so a returned bucket value can be sent back as
-a selection.
+a selection, except for non-finite floating values rendered as JSON `null`.
 
 `selection_mode: "all"` requires every selected value instead of any of them,
 and then the facet's own buckets are counted over that strict set too.

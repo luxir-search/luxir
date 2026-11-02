@@ -140,7 +140,21 @@ gunzip -c luxir-dev-jammy-gcc16.tar.gz | docker load
 
 They still initialize the source checkout and run the same wrapper commands.
 An image can also be stored in a registry; set `LUXIR_DEV_IMAGE` to its pinned
-registry digest. No registry publication is part of the local build.
+registry digest. The Dependency image workflow publishes the full `dev` target
+as `ghcr.io/<repository-owner>/luxir-dev:<key>`. For a matching checkout, compute
+the key and use the published image to skip the first dependency build:
+
+```bash
+key=$(python3 tools/benchmarks/deps-key.py .)
+export LUXIR_DEV_IMAGE="ghcr.io/luxir-search/luxir-dev:$key"
+docker pull "$LUXIR_DEV_IMAGE"
+./tools/dev-container cmake --preset container-release
+```
+
+Use the publishing fork's owner instead of `luxir-search` when testing a fork.
+The key covers all four Dockerfile stages and their copied inputs, including
+ASan dependencies; only the `BUILD_JOBS` default is normalized. The workflow
+skips existing tags. No registry publication is part of the local build.
 
 When updating dependencies, change the manifest baseline, review the overlay
 ports against that checkout, and rebuild/test the image. Native builds share
