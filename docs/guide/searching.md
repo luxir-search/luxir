@@ -788,7 +788,7 @@ to its following value. The function spellings remain available:
 - `geo_distance(field, lat, lon)` is the haversine distance in meters from a
   point to each value of a GEO_POINT field, the same distance `geo_distance`
   queries use.
-- Decay functions `gauss`, `exp`, and `linear` (see
+- Decay functions `gauss_decay`, `exp_decay`, and `linear_decay` (see
   [Decay functions](#decay-functions)).
 - Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Missing or
   empty arrays reduce to missing except for `count`, which returns zero (and
@@ -833,14 +833,14 @@ query.
 
 ### Decay functions
 
-`gauss`, `exp`, and `linear` follow Elasticsearch's `function_score` decay
-functions. Each takes a value, an `origin`, a `scale`, and optionally an
-`offset` (default 0) and a `decay` (default 0.5):
+`gauss_decay`, `exp_decay`, and `linear_decay` follow Elasticsearch's
+`function_score` decay functions. Each takes a value, an `origin`, a `scale`,
+and optionally an `offset` (default 0) and a `decay` (default 0.5):
 
 ```
-gauss(value, origin, scale, offset, decay)
-exp(value, origin, scale, offset, decay)
-linear(value, origin, scale, offset, decay)
+gauss_decay(value, origin, scale, offset, decay)
+exp_decay(value, origin, scale, offset, decay)
+linear_decay(value, origin, scale, offset, decay)
 ```
 
 With `d = max(0, |value - origin| - offset)`, the score is `decay` at
@@ -848,18 +848,21 @@ distance `scale` beyond the offset and 1 within it:
 
 | Function | Score |
 |---|---|
-| `gauss` | `exp(ln(decay) * (d / scale)^2)` |
-| `exp` | `exp(ln(decay) * d / scale)` |
-| `linear` | `max(0, 1 - d * (1 - decay) / scale)` |
+| `gauss_decay` | `exp(ln(decay) * (d / scale)^2)` |
+| `exp_decay` | `exp(ln(decay) * d / scale)` |
+| `linear_decay` | `max(0, 1 - d * (1 - decay) / scale)` |
 
-The value is usually a numeric field, a DATE field (origin in epoch
-milliseconds, scale and offset in milliseconds), or `geo_distance(...)` with
-origin 0 and the scale and offset in meters. A multi-valued field uses its
-closest value (Elasticsearch's default `multi_value_mode` of `min`), and a
-document without a value scores 1, as in Elasticsearch. `scale`, `offset`,
-and `decay` must be literals or `$name` values; `scale` is positive, `offset`
-non-negative, and `decay` strictly between 0 and 1. `exp` with a single
-argument is the exponential function.
+The value is a numeric or DATE scalar or array, or a `geo_distance(...)`
+result. DATE parameters use the value's native unit: epoch units for origin,
+and the same unit for scale and offset. A value combining ms and ns DATE
+operands uses ns. Geo distances use meters.
+
+Only closest-value reduction is supported (Elasticsearch's default
+`multi_value_mode` of `min`). Missing inputs, empty arrays, and arrays with
+only missing values score 1. NaN is missing; an infinite distance scores 0.
+Origin, scale, offset, and decay must be finite constant expressions, including
+literals and `$name` values. Scale is positive, offset non-negative, and decay
+strictly between 0 and 1. `exp(x)` is the mathematical exponential function.
 
 Combine decays with the query score in a [rescore](query-reference.md#rescore)
 expression. This is the Elasticsearch request
@@ -871,7 +874,7 @@ expression. This is the Elasticsearch request
 {
   "rescore": {
     "query": {"match": {"title_t": "pizza"}},
-    "expr": "score * gauss(published_dt, $now, 604800000) * gauss(geo_distance(location, 40.7, -74.0), 0, 2000)",
+    "expr": "score * gauss_decay(published_dt, $now, 604800000) * gauss_decay(geo_distance(location, 40.7, -74.0), 0, 2000)",
     "vars": {"now": 1767225600000}
   }
 }
@@ -881,12 +884,12 @@ Elasticsearch's `function_score` maps onto value expressions as follows:
 
 | Elasticsearch | Value expression |
 |---|---|
-| `gauss`, `exp`, `linear` decay | `gauss(...)`, `exp(...)`, `linear(...)`; `geo_distance(...)` for geo fields |
+| `gauss`, `exp`, `linear` decay | `gauss_decay(...)`, `exp_decay(...)`, `linear_decay(...)`; `geo_distance(...)` for geo fields |
 | `field_value_factor` | `def(field, missing) * factor` inside the modifier: `sqrt(...)`, `pow(..., 2)`, or `log(...) / log(10)` for the base-10 `log` |
 | `random_score` with `seed` and `field` | `random(seed, field)` |
 | `script_score` | the expression itself, with `?:`, comparisons, `exp`, and `pow` |
 | `weight`, `boost_mode`, `score_mode` | arithmetic over `score` and the function terms, `min`, `max` |
-| `filter` on a function | `cond ? f : 1` over column values |
+| `filter` on a function | `cond ? f : 1` when the filter is expressible as a column predicate |
 
 ## Field retrieval and result shape
 

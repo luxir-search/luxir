@@ -236,9 +236,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   each score with a value expression over columns and the original score
   (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
   `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
-  and Elasticsearch-style `gauss`, `exp`, and `linear` decay functions over
-  numeric, date, and geo values. `rescore` takes an optional `min_score`
-  cut-off (the `function_score` / `script_score` counterpart).
+  and Elasticsearch-style `gauss_decay`, `exp_decay`, and `linear_decay`
+  decay functions over numeric, date, and geo values. `rescore` takes an
+  optional `min_score` cut-off (the `function_score` / `script_score`
+  counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
