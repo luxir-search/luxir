@@ -103,6 +103,13 @@ inline bool anyNeedsPrepare(std::span<Query::Weight*> weights) {
   return false;
 }
 
+inline bool anyConsumesDomain(std::span<Query::Weight*> weights) {
+  for (auto* weight : weights) {
+    if (weight->consumesDomain()) return true;
+  }
+  return false;
+}
+
 inline std::vector<PreparedSource> prepareSources(std::span<Query::Weight*> weights,
                                                   Query::Weight::PrepareContext& ctx) {
   std::vector<PreparedSource> out;
@@ -1532,45 +1539,24 @@ inline DomainHandle materializeEffectiveExclusion(
     std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DomainHandle domain) {
   DocSet* base = domain.get();
+  assert(base != nullptr || segment.liveDocs() == nullptr);
   std::vector<DomainHandle> excluded;
+  std::vector<DocSet*> ptrs;
   excluded.reserve(sources.size());
+  ptrs.reserve(sources.size());
   for (auto& source : sources) {
     DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
     if (set.get() == nullptr) {
       set = DomainHandle(materialize(
           source.segmentSource(), segment, base));
     }
-    if (set.get()->card() > 0) excluded.push_back(std::move(set));
+    if (set.get()->card() > 0) {
+      ptrs.push_back(set.get());
+      excluded.push_back(std::move(set));
+    }
   }
   if (excluded.empty() && base != nullptr) return domain;
-
-  int32_t maxDoc = segment.maxDoc();
-  auto out = std::make_unique<RAMBitDocSet>(maxDoc);
-  FixedBitSet& bits = out->mutableBits();
-  size_t numWords = FixedBitSet::sizeInWords(maxDoc);
-  if (base == nullptr) {
-    std::fill(bits.words, bits.words + numWords, ~(uint64_t)0);
-    if ((maxDoc & 63) != 0) {
-      bits.words[numWords - 1] = ((uint64_t)1 << (maxDoc & 63)) - 1;
-    }
-  } else if (base->type == DocSet::Type::BITSET) {
-    const FixedBitSet& from = ((BitDocSet*) base)->bits();
-    std::copy(from.words, from.words + numWords, bits.words);
-  } else {
-    for (int32_t doc : ((ArrDocSet*) base)->docs()) bits.set(doc);
-  }
-  for (auto& set : excluded) {
-    DocSet* docs = set.get();
-    if (docs->type == DocSet::Type::BITSET) {
-      const FixedBitSet& drop = ((BitDocSet*) docs)->bits();
-      for (size_t w = 0; w < numWords; w++) bits.words[w] &= ~drop.words[w];
-    } else {
-      for (int32_t doc : ((ArrDocSet*) docs)->docs()) {
-        bits.words[doc >> 6] &= ~((uint64_t)1 << (doc & 63));
-      }
-    }
-  }
-  return DomainHandle(std::move(out));
+  return DomainHandle(DocSet::andNot(base, ptrs, segment.maxDoc()));
 }
 
 } // namespace luxir::QueryPrep

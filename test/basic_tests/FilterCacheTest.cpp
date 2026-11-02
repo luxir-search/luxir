@@ -4209,16 +4209,19 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   auto reader = writer.snapshots.readers.getReader(0);
   auto& segment = reader->segments()[0];
 
-  auto run = [&]() {
+  auto run = [&](bool prepareMandatory) {
     MemPool pool;
     Query::Context context(pool, *reader);
     TermQuery body("text_w", "body");
     TermQuery selected("text_w", "selected");
     ForcePrepareQuery preparedSelected(&selected);
-    std::array<Query*, 1> mandatory{&body};
+    ForcePrepareQuery preparedBody(&body);
+    std::array<Query*, 1> mandatory{prepareMandatory ? (Query*)&preparedBody : &body};
     std::array<Query*, 1> prohibited{&preparedSelected};
     BooleanQuery query(mandatory, {}, prohibited, {});
     auto* weight = query.createWeight(context, 0);
+    EXPECT_TRUE(weight->needsPrepare());
+    EXPECT_FALSE(weight->consumesDomain());
     Query::Weight::PrepareContext prepareContext{
         *reader, std::span<DocSet* const>{}, false, nullptr};
     auto prepared = weight->prepare(prepareContext);
@@ -4230,14 +4233,18 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   };
 
   SkipStatsScope stats;
-  auto built = run();
+  auto built = run(false);
   ASSERT_NE(nullptr, built);
   EXPECT_EQ(1, built->card());
+  EXPECT_TRUE(built->get(1));
   EXPECT_EQ(1, SkipStats::prohibitedCachePullBuilds);
   SkipStats::reset();
-  auto hit = run();
+  // A mandatory wrapper that only needs prepare must retain lazy exclusion.
+  // Folding would bypass the prohibited supplier and its existing counter.
+  auto hit = run(true);
   ASSERT_NE(nullptr, hit);
   EXPECT_EQ(1, hit->card());
+  EXPECT_TRUE(hit->get(1));
   EXPECT_EQ(1, SkipStats::prohibitedCachePullHits);
 }
 

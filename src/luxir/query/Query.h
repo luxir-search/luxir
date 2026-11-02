@@ -1679,6 +1679,10 @@ public:
     /// bit-space from createWeight() input flags: input flags say what the
     /// parent requested, traits say what is true of the built weight.
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
+    // Selects matches inside the prepare domain, directly or through any
+    // descendant prepared in it (kNN top-k). Unlike ordinary predicates,
+    // exclusions applied after it can change that selection.
+    static constexpr int32_t CONSUMES_DOMAIN = 1 << 5;
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
@@ -1693,6 +1697,8 @@ public:
 
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
+
+    bool consumesDomain() const noexcept { return (traits & CONSUMES_DOMAIN) != 0; }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it

@@ -66,6 +66,13 @@ public:
   /// ARRAY.
   static std::unique_ptr<DocSet> union_(std::span<DocSet*> sets);
 
+  /// Base minus the union of exclusions. Null base means [0, maxDoc);
+  /// exclusions must be non-null. All inputs must be within that range and
+  /// bitsets must have size maxDoc. Always returns a new non-null set:
+  /// array bases use DocSetBuilder's density rule, bitset/null bases stay bits.
+  static std::unique_ptr<DocSet> andNot(
+      DocSet* base, std::span<DocSet*> exclusions, int32_t maxDoc);
+
   virtual ~DocSet() = default;
 };
 
@@ -861,6 +868,67 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
 
   outputDocs.shrink_to_fit();
   return std::make_unique<ArrDocSet>(std::move(outputDocs));
+}
+
+inline std::unique_ptr<DocSet> DocSet::andNot(
+    DocSet* base, std::span<DocSet*> exclusions, int32_t maxDoc) {
+  auto validate = [maxDoc](DocSet* set) {
+    if (set->type == BITSET) {
+      if (((BitDocSet*) set)->bits().size() != maxDoc) {
+        throw std::invalid_argument("DocSet bitset sizes differ");
+      }
+    } else {
+      auto docs = ((ArrDocSet*) set)->docs();
+      if (!docs.empty() && (docs.front() < 0 || docs.back() >= maxDoc)) {
+        throw std::invalid_argument("DocSet array is outside bitset range");
+      }
+    }
+  };
+  if (base != nullptr) validate(base);
+  for (DocSet* excluded : exclusions) validate(excluded);
+
+  if (base != nullptr && base->type == ARRAY) {
+    DocSetBuilder builder(maxDoc);
+    // Ascending base docs let array probes gallop forward through exclusions.
+    std::vector<DocSetProbe> probes(exclusions.begin(), exclusions.end());
+    for (int32_t doc : ((ArrDocSet*) base)->docs()) {
+      bool excluded = false;
+      for (auto& probe : probes) {
+        if (probe.get(doc)) {
+          excluded = true;
+          break;
+        }
+      }
+      if (!excluded) builder.add(doc);
+    }
+    return builder.build();
+  }
+
+  auto result = std::make_unique<RAMBitDocSet>(maxDoc);
+  auto& bits = result->mutableBits();
+  size_t numWords = FixedBitSet::sizeInWords(maxDoc);
+  if (base == nullptr) {
+    std::fill(bits.words, bits.words + numWords, ~0ULL);
+  } else {
+    const auto& from = ((BitDocSet*) base)->bits();
+    std::copy(from.words, from.words + FixedBitSet::sizeInWords(from.size()), bits.words);
+  }
+  for (DocSet* excluded : exclusions) {
+    if (excluded->type == BITSET) {
+      const auto& drop = ((BitDocSet*) excluded)->bits();
+      for (size_t word = 0; word < numWords; word++) {
+        bits.words[word] &= ~drop.words[word];
+      }
+    } else {
+      for (int32_t doc : ((ArrDocSet*) excluded)->docs()) {
+        bits.words[doc >> 6] &= ~(1ULL << (doc & 63));
+      }
+    }
+  }
+  if ((maxDoc & 63) != 0) {
+    bits.words[numWords - 1] &= (1ULL << (maxDoc & 63)) - 1;
+  }
+  return result;
 }
 
 inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {

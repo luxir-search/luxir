@@ -1195,12 +1195,28 @@ TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
   }
   h.commit({"*"});
 
-  auto run = [&](bool optional, bool filtered, bool nested) {
+  auto run = [&](bool optional, bool filtered, bool nested, int wrapper = 0) {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     cur.limit(10).countLimit().fields({"id"});
     auto& mr = cur.mr();
     std::vector<api::Query> knn{qb::knn(mr, "body_v", {0.0f, 0.0f}, 3)};
+    if (wrapper == 1) {
+      knn[0] = qb::constantScore(mr, knn[0]);
+    } else if (wrapper == 2) {
+      knn[0] = qb::rescore(mr, knn[0], "add(score,1)");
+      std::get<api::RescoreQuery>(knn[0].kind).min_score = 0.0f;
+    } else if (wrapper == 3) {
+      // Keep a scored optional alongside the kNN so this inner boolean
+      // cannot collapse to its sole mandatory child.
+      std::array<api::Query, 1> scoring{qb::match(mr, "foo_w", "apple")};
+      knn[0] = qb::boolean(mr, knn, scoring);
+    } else if (wrapper == 4) {
+      // A kNN filter clause of an inner boolean still selects inside the
+      // domain the outer boolean hands down.
+      std::vector<api::Query> noClauses, scoring{qb::match(mr, "foo_w", "apple")};
+      knn[0] = qb::boolean(mr, noClauses, scoring, noClauses, knn);
+    }
     std::vector<api::Query> blocked{qb::match(mr, "state_s", "blocked")};
     std::vector<api::Query> none, filter;
     if (filtered) filter.push_back(qb::match(mr, "foo_w", "apple"));
@@ -1225,6 +1241,12 @@ TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
     }
   }
 
+  for (int wrapper : {1, 2, 3, 4}) {
+    for (bool optional : {false, true}) {
+      EXPECT_EQ(run(optional, false, false, wrapper), (Ids{"d5", "d6", "d7"}));
+    }
+  }
+
   {
     // Without the fold, must_not post-filters the kNN top-k.
     SearchOverridesGuard fold(QueryPrep::disableProhibitedDomainFoldForTests);
@@ -1233,8 +1255,10 @@ TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
   }
 
   h.deleteById("d5", UpdateMessage::COMMIT);
-  EXPECT_EQ(run(false, false, false), (Ids{"d6", "d7", "d8"}));
-  EXPECT_EQ(run(false, true, false), (Ids{"d7", "d8", "d9"}));
+  for (int wrapper : {0, 1, 2, 3}) {
+    EXPECT_EQ(run(false, false, false, wrapper), (Ids{"d6", "d7", "d8"}));
+    EXPECT_EQ(run(false, true, false, wrapper), (Ids{"d7", "d8", "d9"}));
+  }
 }
 
 // A prohibited clause that matches everything leaves the kNN no domain: 0

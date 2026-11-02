@@ -12759,6 +12759,14 @@ public:
         QueryPrep::anyNeedsPrepare(filterWeights)) {
       traits |= NEEDS_PREPARE;
     }
+    // Every child prepares inside the domain this boolean is given, so a
+    // consumer under any clause makes this boolean one.
+    if (QueryPrep::anyConsumesDomain(mandatoryWeights) ||
+        QueryPrep::anyConsumesDomain(optionalWeights) ||
+        QueryPrep::anyConsumesDomain(prohibitedWeights) ||
+        QueryPrep::anyConsumesDomain(filterWeights)) {
+      traits |= CONSUMES_DOMAIN;
+    }
     // Boolean scoring is constant only when every match gets the same sum.
     // Optional clauses make the sum data-dependent; mandatory clauses are
     // safe only if each mandatory child is constant.
@@ -12880,16 +12888,16 @@ public:
 
     // A domain-consuming child (kNN) selects its top-k inside the child
     // domain, so an exclusion applied only to its output would act as a
-    // post-filter and return fewer than k hits. Whenever a scoring child
-    // prepares, fold the prohibited clauses into that domain as well: the
+    // post-filter and return fewer than k hits. When a mandatory/optional
+    // child consumes the domain, fold the prohibited clauses into it: the
     // domain becomes outer AND filters AND NOT prohibited, and it replaces
     // the prohibited scorers as the required domain supplier, so each
     // exclusion is evaluated once. Excluded docs can never match this
     // boolean, so narrowing the domain changes no other child's result.
     bool foldProhibited = !prohibitedSources.empty()
         && !QueryPrep::disableProhibitedDomainFoldForTests
-        && (QueryPrep::anyNeedsPrepare(mandatoryWeights)
-            || QueryPrep::anyNeedsPrepare(optionalWeights));
+        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
+            || QueryPrep::anyConsumesDomain(optionalWeights));
     if (!filterSources.empty() || foldProhibited) {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
