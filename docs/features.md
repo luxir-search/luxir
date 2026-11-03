@@ -368,8 +368,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Bounding-box queries (dateline-aware), great-circle distance queries, and
   polygon queries with holes, usable as the main query, as a non-scoring
   filter, or as a boolean clause.
-- Points are stored Morton-interleaved, so column scans skip blocks by their
-  2-D bounds, and requested geo fields come back as `[lon, lat]`.
+- Requested geo fields come back as `[lon, lat]`.
 
 ## API surfaces
 

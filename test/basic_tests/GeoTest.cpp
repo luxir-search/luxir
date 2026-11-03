@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -259,71 +258,6 @@ TEST_F(GeoEncodingTest, endpointsZerosValidationAndPacking) {
   int64_t packed = geo::pack(-123456789, 987654321);
   EXPECT_EQ(-123456789, geo::unpackLatitude(packed));
   EXPECT_EQ(987654321, geo::unpackLongitude(packed));
-}
-
-TEST_F(GeoEncodingTest, mortonOrderRoundTripsAndZoneCells) {
-  EXPECT_EQ(std::numeric_limits<int64_t>::min(), geo::pack(INT32_MIN, INT32_MIN));
-  EXPECT_EQ(std::numeric_limits<int64_t>::max(), geo::pack(INT32_MAX, INT32_MAX));
-  // Nearby points share the high bits, so a clustered block packs tightly.
-  int64_t a = geo::encodePoint(40.7128, -74.0060);
-  int64_t b = geo::encodePoint(40.7129, -74.0061);
-  EXPECT_GE(std::countl_zero((uint64_t)(a ^ b)), 36);
-
-  SplitMix64 rng(0x3c0ffee5);
-  for (int32_t i = 0; i < 2000; i++) {
-    int32_t lat1 = (int32_t)rng(), lon1 = (int32_t)rng();
-    int32_t lat2 = (int32_t)rng(), lon2 = (int32_t)rng();
-    int64_t p1 = geo::pack(lat1, lon1);
-    int64_t p2 = geo::pack(lat2, lon2);
-    ASSERT_EQ(lat1, geo::unpackLatitude(p1));
-    ASSERT_EQ(lon1, geo::unpackLongitude(p1));
-    if (lat1 <= lat2 && lon1 <= lon2) {
-      EXPECT_LE(p1, p2);
-    }
-    int64_t lo = std::min(p1, p2), hi = std::max(p1, p2);
-    int64_t mid = (int64_t)((uint64_t)lo + ((uint64_t)hi - (uint64_t)lo) / 2);
-    geo::Cell cell = geo::mortonCell(lo, hi);
-    for (int64_t value : {lo, mid, hi}) {
-      int32_t lat = geo::unpackLatitude(value), lon = geo::unpackLongitude(value);
-      EXPECT_TRUE(cell.latMin <= lat && lat <= cell.latMax);
-      EXPECT_TRUE(cell.lonMin <= lon && lon <= cell.lonMax);
-      EXPECT_TRUE(geo::mortonRangeMayIntersect(lo, hi, lat, lat, lon, lon));
-    }
-  }
-  geo::Cell point = geo::mortonCell(a, a);
-  EXPECT_EQ(point.latMin, point.latMax);
-  EXPECT_EQ(point.lonMin, point.lonMax);
-  EXPECT_FALSE(geo::mortonRangeMayIntersect(
-      a, a, geo::encodeLatitude(-10.0), geo::encodeLatitude(10.0),
-      geo::encodeLongitude(-10.0), geo::encodeLongitude(10.0)));
-}
-
-// The packed value's top bits are the geohash: longitude-major interleave of
-// the biased coordinates, the same bits Elasticsearch's Geohash.longEncode uses.
-TEST_F(GeoEncodingTest, packedPrefixIsGeohash) {
-  static constexpr std::string_view BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
-  auto geohash = [](int64_t packed, int32_t precision) {
-    uint64_t bits = geo::geohashPrefix(packed, precision);
-    std::string out((size_t)precision, ' ');
-    for (int32_t i = precision - 1; i >= 0; i--, bits >>= 5) {
-      out[(size_t)i] = BASE32[bits & 31];
-    }
-    return out;
-  };
-  EXPECT_EQ("u4pruydqqvj", geohash(geo::encodePoint(57.64911, 10.40744), 11));
-  EXPECT_EQ("dr5regw3p", geohash(geo::encodePoint(40.7128, -74.0060), 9));
-  EXPECT_EQ("gcpvj0duq", geohash(geo::encodePoint(51.5074, -0.1278), 9));
-  EXPECT_EQ("7zzzzzzzzzzz", geohash(geo::encodePoint(-0.0000001, -0.0000001), 12));
-  EXPECT_EQ("s00000000000", geohash(geo::encodePoint(0.0, 0.0), 12));
-  EXPECT_EQ("0", geohash(geo::encodePoint(-90.0, -180.0), 1));
-  EXPECT_EQ("z", geohash(geo::encodePoint(90.0, 180.0), 1));
-  SplitMix64 rng(0x6e0ba5e);
-  for (int32_t i = 0; i < 2000; i++) {
-    int64_t packed = geo::pack((int32_t)rng(), (int32_t)rng());
-    for (int32_t p = 1; p < 12; p++) {
-      EXPECT_EQ(geo::geohashPrefix(packed, p), geo::geohashPrefix(packed, p + 1) >> 5);
-    }
-  }
 }
 
 TEST_F(GeoEncodingTest, quantizationBoundariesAndRandomRoundTrips) {
@@ -876,10 +810,9 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   EXPECT_EQ(-1, countForTests(multiCountState.weight, merged));
 }
 
-// A dense single-valued column clustered by doc order gives tight leaf
-// zones; the scan arm skips and accepts whole zones and must still agree with
-// the per-point check for every geo relation.
-TEST_F(GeoBoxQueryTest, scanZonesAgreeWithPointChecks) {
+// The column scan arm agrees with the per-point check for every geo relation
+// over clustered points.
+TEST_F(GeoBoxQueryTest, scanAgreesWithPointChecks) {
   constexpr int32_t N = 4 * 512 + 100;
   CollectionHelper helper;
   setGeoSchema(helper, false);

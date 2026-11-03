@@ -55,10 +55,6 @@ POST /collections/places/_update
 
 Longitude must be within `[-180,180]` and latitude within `[-90,90]`. Luxir
 quantizes each coordinate into a 32-bit grid, roughly centimeter resolution.
-The column stores each point as the Morton (Z-order) interleave of the two
-grid coordinates, so nearby points share high bits: a block of clustered
-points compresses well, and each block's value range bounds a 2-D cell that
-lets column scans skip blocks that cannot match.
 
 The same point can be written in any of these forms, over HTTP JSON and gRPC
 alike:

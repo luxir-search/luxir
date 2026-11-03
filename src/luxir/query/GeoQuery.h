@@ -14,7 +14,6 @@
 
 #include <boost/sort/spreadsort/integer_sort.hpp>
 
-#include "luxir/codec/NumColumnFormat.h"
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
@@ -23,34 +22,12 @@
 
 namespace luxir {
 
-// How a relation stands to every packed value in a column zone [min, max]:
-// the Morton range check against the relation's encoded bounding box, then
-// the relation's own cell test on the zone's bounding quadtree cell.
-template <class Relation>
-BKDRelation zoneRelation(const Relation& relation, const NumBlockZone& zone) {
-  if (!geo::mortonRangeMayIntersect(zone.min, zone.max, relation.latMin,
-                                    relation.latMax, relation.lonMin,
-                                    relation.lonMax)) {
-    return BKDRelation::OUTSIDE;
-  }
-  geo::Cell cell = geo::mortonCell(zone.min, zone.max);
-  return relation.compare(cell.latMin, cell.latMax, cell.lonMin, cell.lonMax);
-}
-
 template <class Relation, class ColIter>
 class GeoQueryScorer final : public Query::ConstantScorer {
-  static constexpr int32_t LEAF = (int32_t)NumColumnFormat::LEAF_ZONE_SIZE;
-
   IntColReader& reader;
   ColIter iter;
   Relation relation;
   bool multi;
-  // Dense single-valued columns map doc == value rank, so each leaf zone
-  // bounds a run of LEAF docs: an OUTSIDE zone is skipped and an INSIDE one
-  // matches without decoding values.
-  bool zoned;
-  bool zoneInside = false;
-  int32_t zoneEnd = 0;
   int32_t docid = -1;
 
   bool pointMatches(int64_t packed) const {
@@ -60,7 +37,6 @@ class GeoQueryScorer final : public Query::ConstantScorer {
 
   bool valueMatches() {
     if (docid == PostingsReader::END) return false;
-    if (zoneInside) return true;
     if (!multi) return pointMatches(iter.value());
     auto [start, end] = reader.getStartEndValueRank(iter.rank());
     for (int64_t rank = start; rank < end; rank++) {
@@ -69,35 +45,19 @@ class GeoQueryScorer final : public Query::ConstantScorer {
     return false;
   }
 
-  // Classifies the zone holding docid when it enters a new one, stepping
-  // past zones that cannot match.
-  int32_t skipZones() {
-    while (zoned && docid != PostingsReader::END && docid >= zoneEnd) {
-      int64_t leaf = docid / LEAF;
-      zoneEnd = (int32_t)std::min<int64_t>((leaf + 1) * LEAF,
-                                           reader.docsWithValue());
-      BKDRelation zone =
-          zoneRelation(relation, reader.leafMeta().leafZone(leaf));
-      zoneInside = zone == BKDRelation::INSIDE;
-      if (zone == BKDRelation::OUTSIDE) docid = iter.advance(zoneEnd);
-    }
-    return docid;
-  }
-
 public:
   GeoQueryScorer(IntColReader& reader, const Relation& relation,
-                 float constantScore, bool zoned)
+                 float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
-        relation(relation), multi(reader.multiValued()),
-        zoned(zoned && reader.leafBounded()) {}
+        relation(relation), multi(reader.multiValued()) {}
 
   int32_t approximationNext() override {
     docid = iter.next();
-    return skipZones();
+    return docid;
   }
   int32_t approximationAdvance(int32_t target) override {
     docid = iter.advance(target);
-    return skipZones();
+    return docid;
   }
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
@@ -110,17 +70,14 @@ public:
   int32_t next() override {
     for (;;) {
       docid = iter.next();
-      skipZones();
       if (docid == PostingsReader::END || valueMatches()) return docid;
     }
   }
   int32_t advance(int32_t target) override {
     assert(docid < target);
     docid = iter.advance(target);
-    skipZones();
     while (docid != PostingsReader::END && !valueMatches()) {
       docid = iter.next();
-      skipZones();
     }
     return docid;
   }
@@ -312,7 +269,7 @@ public:
           skipCount(SkipStats::geoSparseVerifyArms);
           return targetPool.make<
               GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
-                  reader, relation, weight.constantScore, false);
+                  reader, relation, weight.constantScore);
         case ScorerArm::BKD:
           skipCount(SkipStats::geoBKDArms);
           return PointsMaterialize::scorerFor(
@@ -322,7 +279,7 @@ public:
           skipCount(SkipStats::geoScanArms);
           return targetPool.make<
               GeoQueryScorer<Relation, IntColReader::Iterator>>(
-                  reader, relation, weight.constantScore, true);
+                  reader, relation, weight.constantScore);
       }
       std::unreachable();
     }
@@ -481,7 +438,7 @@ public:
     if (reader->numValues() == 0) return nullptr;
     Relation relation = query.makeRelation();
     return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-        *reader, relation, constantScore, true);
+        *reader, relation, constantScore);
   }
 
 };
