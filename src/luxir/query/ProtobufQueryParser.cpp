@@ -472,9 +472,10 @@ std::optional<float> ProtobufQueryParser::constantOutput(const ValueProgram& pro
 }
 
 bool ProtobufQueryParser::exactlyRepresented(const ValueResult& result, float value) {
-  return result.type == ValueType::DOUBLE
-      ? (double)value == result.doubleValue
-      : (long double)value == (long double)result.intValue;
+  if (result.type == ValueType::DOUBLE) return (double)value == result.doubleValue;
+  // Compare as integers: a double cannot hold every int64.
+  return value >= -0x1p63f && value < 0x1p63f && std::trunc(value) == value
+      && (int64_t)value == result.intValue;
 }
 
 luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& rescoreQuery) {
