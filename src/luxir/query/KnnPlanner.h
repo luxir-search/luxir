@@ -25,12 +25,12 @@ struct KnnPlanner {
   enum Unit { EXACT_DIM, TERMINAL_DIM, TERMINAL_READ, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
-              PQ_LIST_SETUP, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD, NUM_UNITS };
+              PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
-    "pq_list_setups", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words"};
+    "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
     // Forced-arm fit after selector devirtualization, munin at 3.3 GHz:
@@ -39,13 +39,14 @@ struct KnnPlanner {
     // rows: p10/median/p90/max = 0.93/1.00/1.06/1.29; 384 exact rows: p10/p90
     // = 0.80/1.18. Fitted ns divided by NS_PER_DIM; keep unidentified seeds
     // for rank visits, flat probes, sparse/multi maps, resolve/bit/array probes,
-    // fold words and entry-none. PQ_LIST_SETUP counts L2 lists x subquantizers.
+    // fold words and entry-none. PQ_LIST_SETUP counts precomputed L2 lists x subquantizers.
+    // PQ_TABLE_DIM is seeded at EXACT_DIM cost, not fitted.
     // Open: IVF_REQUEST's shared 180.6 us remains unexplained by profiles.
     static constexpr double NS_PER_DIM = 0.135;
     Work units{1, 0.281 / NS_PER_DIM, 227 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
                1, 1.01 / NS_PER_DIM, 2.23 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
                9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.45 / NS_PER_DIM, 0,
-               0.0297 / NS_PER_DIM, 0.218 / NS_PER_DIM, 39.7 / NS_PER_DIM, 18.3 / NS_PER_DIM,
+               0.0297 / NS_PER_DIM, 0.218 / NS_PER_DIM, 39.7 / NS_PER_DIM, 1, 18.3 / NS_PER_DIM,
                0.1125 / NS_PER_DIM, 25000 / NS_PER_DIM, 180600 / NS_PER_DIM,
                4.49 / NS_PER_DIM, 0.5 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
@@ -78,6 +79,7 @@ struct KnnPlanner {
     Codec codec = Codec::FLAT;
     bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
+    bool vectorsEstimated = false, pqPerListTable = false;
   };
   struct Request {
     int64_t k = 0, boundedTarget = 0;
@@ -98,7 +100,7 @@ struct KnnPlanner {
     double boundedDims = 0, intervalDims = 0, boundedDimLimit = 0;
     double boundedReads = 0, intervalReads = 0, boundedReadLimit = 0;
     int64_t live = 0, eligibleVectors = 0, eligibleDocs = 0, exactDocs = 0;
-    int64_t boundedDocs = 0, boundedLive = 0, ivf = 0;
+    int64_t boundedDocs = 0, boundedLive = 0, ivf = 0, intervalVectors = 0;
   };
   struct Result {
     std::vector<char> ivf;
@@ -156,7 +158,7 @@ struct KnnPlanner {
         + (s.arrayDomain ? arraySteps(s.domainSize) * costs.units[ARRAY_STEP] : costs.units[BIT_PROBE]);
   }
   static double foldThreshold(const Segment& s, Selector selector, const Costs& costs) {
-    if (selector == Selector::FOLD || (selector == Selector::AUTO && borrowDomain(s))) return -1;
+    if (selector == Selector::FOLD || (selector == Selector::AUTO && (borrowDomain(s) || s.vectorsEstimated))) return -1;
     double extra = predictedChecks(s, 1) * (resolveCost(s, costs) - costs.units[ENTRY_BITMAP]);
     return selector == Selector::RESOLVE || extra <= 0 ? INFINITY : costs.price(foldWork(s)) / extra;
   }
@@ -205,8 +207,10 @@ struct KnnPlanner {
       p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
       if (s.rabitqBits > 1) p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
     }
-    if (s.codec == Codec::PQ) p.linear[PQ_LIST_SETUP] = s.l2 ? (double)s.nlist * s.pqM : 0;
-    else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
+    if (s.codec == Codec::PQ) {
+      p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
+      p.linear[PQ_TABLE_DIM] = s.pqPerListTable ? (double)s.nlist * (1 << s.pqBits) * s.dims : 0;
+    } else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
     p.a = costs.price(p.linear);
     p.b = costs.price(p.fixed);
@@ -225,7 +229,8 @@ struct KnnPlanner {
       t.boundedDims += sign * (double)s.eligibleVectors * s.dims;
       t.boundedReads += sign * (double)s.eligibleVectors;
     } else {
-      // Interval reads are a fraction of examined vectors, fixed per slot.
+      // Apply the shared k floor after summing interval slots.
+      t.intervalVectors += sign * s.eligibleVectors;
       t.intervalDims += sign * (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
       t.intervalReads += sign * (double)s.eligibleVectors * p.intervalReadFraction;
     }
@@ -248,11 +253,15 @@ struct KnnPlanner {
   }
   static double coverage(const Totals& t, const Request& request) { return effort(t, request).coverage; }
   static double rounds(const Totals& t, const Request& request) { return effort(t, request).rounds; }
-  static double terminalDims(const Totals& t, double coverage) {
-    return std::min(t.boundedDims, t.boundedDimLimit) + coverage * t.intervalDims;
+  static double intervalTerminalReads(const Totals& t, double coverage, int64_t k) {
+    return std::max(coverage * t.intervalReads, std::min((double)k, coverage * t.intervalVectors));
   }
-  static double terminalReads(const Totals& t, double coverage) {
-    return std::min(t.boundedReads, t.boundedReadLimit) + coverage * t.intervalReads;
+  static double terminalDims(const Totals& t, double coverage, int64_t k) {
+    double dims = t.intervalReads > 0 ? intervalTerminalReads(t, coverage, k) * t.intervalDims / t.intervalReads : 0;
+    return std::min(t.boundedDims, t.boundedDimLimit) + dims;
+  }
+  static double terminalReads(const Totals& t, double coverage, int64_t k) {
+    return std::min(t.boundedReads, t.boundedReadLimit) + intervalTerminalReads(t, coverage, k);
   }
   static double terminalCost(double reads, double dims, const Costs& costs) {
     return reads * costs.units[TERMINAL_READ] + dims * costs.units[TERMINAL_DIM];
@@ -261,7 +270,7 @@ struct KnnPlanner {
     auto e = effort(t, request);
     return costs.requestCost + t.exact + e.coverage * t.a + t.b + selector
         + t.ivf * e.rounds * costs.units[ROUND] + (t.ivf ? costs.units[IVF_REQUEST] : 0)
-        + terminalCost(terminalReads(t, e.coverage), terminalDims(t, e.coverage), costs);
+        + terminalCost(terminalReads(t, e.coverage, request.k), terminalDims(t, e.coverage, request.k), costs);
   }
   static Totals exactTotals(std::span<const Segment> segments, std::span<const Price> prices,
                             const Request& request) {
@@ -346,10 +355,13 @@ struct KnnPlanner {
     selectors.clear();
     keep(exact, modes);
     if (request.nprobe > 0) {
-      // Pinned effort is additive except for the shared bounded allowances
-      // and IVF request charge. Each min(sum, limit) has two additive arms;
-      // minimize their combinations, then compare against all-exact. The
-      // request charge is constant over nonempty IVF configurations.
+      // Pinned effort is additive except for the shared bounded allowances,
+      // the interval read floor and the IVF request charge. Each
+      // min(sum, limit) has two additive arms; minimize their combinations,
+      // then compare against all-exact. The request charge is constant over
+      // nonempty IVF configurations. Seeds ignore the floor and candidates
+      // are compared with it, so the choice is within k terminal reads of
+      // optimal.
       double p = result.allIvfCoverage;
       for (bool capReads : {false, true}) for (bool capDims : {false, true}) {
         Totals t = exact;
@@ -427,7 +439,8 @@ struct KnnPlanner {
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
     f[ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
-    f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 ? (double)w.listSetups * s.pqM : 0;
+    f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;
+    f[PQ_TABLE_DIM] = s.codec == Codec::PQ && s.pqPerListTable ? (double)w.listSetups * (1 << s.pqBits) * s.dims : 0;
     f[RABITQ_LIST_DIM] = s.codec == Codec::RABITQ ? (double)w.listSetups * s.dims : 0;
     f[FOLD_DOC] = (double)w.foldDocs; f[FOLD_WORD] = (double)w.foldWords;
     f[COARSE_DIM] = (double)w.coarseDims; f[ROUND] = (double)w.ivfRounds;

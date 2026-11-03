@@ -18,7 +18,7 @@ KnnPlanner::Segment segment(int64_t eligible = 1000) {
 double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Request& req,
             const KnnPlanner::Costs& costs, uint64_t mask) {
   double exact = 0, linear = 0, fixed = 0, boundedDims = 0, intervalDims = 0, physicalDims = 0;
-  double boundedReads = 0, intervalReads = 0, physicalReads = 0;
+  double boundedReads = 0, intervalReads = 0, physicalReads = 0, intervalVectors = 0;
   int64_t live = 0, eligible = 0, docs = 0, exactDocs = 0, bounded = 0, boundedLive = 0, physicalDocs = 0, slots = 0;
   for (size_t i = 0; i < segments.size(); i++) {
     const auto& s = segments[i];
@@ -33,6 +33,7 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
         bounded += s.eligibleDocs; boundedLive += s.liveVectors;
         boundedDims += (double)s.eligibleVectors * s.dims; boundedReads += (double)s.eligibleVectors;
       } else {
+        intervalVectors += s.eligibleVectors;
         intervalDims += (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
         intervalReads += (double)s.eligibleVectors * p.intervalReadFraction;
       }
@@ -43,10 +44,11 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
   if (live && !req.nprobe) coverage = std::min(1.0, std::max({coverage,
       bounded ? (double)std::min({req.boundedTarget, bounded, boundedLive}) / bounded : 0,
       (double)std::max((int64_t)0, req.k - exactDocs) / std::max((int64_t)1, docs)}));
+  double interval = std::max(coverage * intervalReads, std::min((double)req.k, coverage * intervalVectors));
   double dims = std::min(boundedDims, req.boundedTarget * physicalDims / std::max((int64_t)1, physicalDocs))
-      + coverage * intervalDims;
+      + (intervalReads > 0 ? interval * intervalDims / intervalReads : 0);
   double reads = std::min(boundedReads, req.boundedTarget * physicalReads / std::max((int64_t)1, physicalDocs))
-      + coverage * intervalReads;
+      + interval;
   double rounds = slots == 0 ? 0 : coverage <= p0 ? 1 : 1 + std::ceil(std::log2(coverage / p0));
   double selectors = 0;
   for (size_t i = 0; i < segments.size(); i++) if ((mask >> i & 1) && KnnPlanner::canIvf(segments[i])) {
@@ -128,7 +130,10 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
         ASSERT_NEAR(plan.cost, cost(segments, req, costs, chosen), tolerance);
         misses += plan.cost > best + tolerance;
         worst = std::max(worst, plan.cost / best);
-        if (pinned) { ASSERT_NEAR(plan.cost, best, tolerance); }
+        // Pinned search is exact without the interval read floor, which adds
+        // at most k terminal reads to any configuration.
+        double floor = (double)k * (costs.units[KnnPlanner::TERMINAL_READ] + dims * costs.units[KnnPlanner::TERMINAL_DIM]);
+        if (pinned) { ASSERT_LE(plan.cost, best + floor + tolerance); }
         else { ASSERT_LE(plan.cost, best * 1.1 + tolerance); }
       }
     }
@@ -155,8 +160,8 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   auto plan = KnnPlanner::choose(segments, req, costs, KnnPlanner::Routing::FORCE_IVF);
   auto totals = KnnPlanner::exactTotals(segments, plan.prices, req);
   for (int i = 0; i < 3; i++) KnnPlanner::addIvf(totals, segments[i], plan.prices[i], 1);
-  EXPECT_EQ(KnnPlanner::terminalDims(totals, KnnPlanner::coverage(totals, req)), 100 * 128);
-  EXPECT_EQ(KnnPlanner::terminalReads(totals, KnnPlanner::coverage(totals, req)), 100);
+  EXPECT_EQ(KnnPlanner::terminalDims(totals, KnnPlanner::coverage(totals, req), req.k), 100 * 128);
+  EXPECT_EQ(KnnPlanner::terminalReads(totals, KnnPlanner::coverage(totals, req), req.k), 100);
   EXPECT_EQ(plan.prices[0].linear[KnnPlanner::PQ_LIST_SETUP], 256 * 32);
   EXPECT_EQ(plan.prices[0].linear[KnnPlanner::RABITQ_LIST_DIM], 0);
   segments[0].codec = KnnPlanner::Codec::RABITQ;
@@ -229,7 +234,10 @@ TEST(KnnPlannerTest, selectorCrossoverAndDeepenCost) {
   s.sparse = false;
   EXPECT_TRUE(KnnPlanner::foldFirst(s, 0, req.selector, costs));
   EXPECT_EQ(0, costs.price(KnnPlanner::foldWork(s)));
-  s.multi = true; s.domainSize = 99999;
+  s.multi = true; s.vectorsEstimated = true;
+  EXPECT_EQ(-1, KnnPlanner::foldThreshold(s, KnnPlanner::Selector::AUTO, costs));
+  EXPECT_EQ(INFINITY, KnnPlanner::foldThreshold(s, KnnPlanner::Selector::RESOLVE, costs));
+  s.domainSize = 99999;
   EXPECT_EQ(1, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
   s.arrayDomain = true;
   EXPECT_EQ(99999, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
@@ -289,4 +297,47 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
       EXPECT_EQ(5 * 128, actual[KnnPlanner::TERMINAL_DIM]);
       EXPECT_EQ(0, KnnPlanner::actualWork(s, {})[KnnPlanner::ENTRY_MISPREDICT]);
     }
+}
+
+TEST(KnnPlannerTest, pqPerListTablePricing) {
+  auto s = segment();
+  KnnPlanner::Costs costs;
+  auto precomputed = KnnPlanner::price(s, {}, costs);
+  s.pqPerListTable = true;
+  auto perList = KnnPlanner::price(s, {}, costs);
+  double tableDims = (double)s.nlist * (1 << s.pqBits) * s.dims;
+  EXPECT_EQ(tableDims, perList.linear[KnnPlanner::PQ_TABLE_DIM]);
+  EXPECT_EQ(0, perList.linear[KnnPlanner::PQ_LIST_SETUP]);
+  EXPECT_NEAR(perList.a - precomputed.a,
+      tableDims * costs.units[KnnPlanner::PQ_TABLE_DIM]
+          - s.nlist * s.pqM * costs.units[KnnPlanner::PQ_LIST_SETUP], 1e-7);
+  EXPECT_GT(perList.a, precomputed.a);
+  VectorSearchWork work;
+  work.listSetups = s.nlist;
+  auto actual = KnnPlanner::actualWork(s, work);
+  EXPECT_EQ(tableDims, actual[KnnPlanner::PQ_TABLE_DIM]);
+  EXPECT_EQ(0, actual[KnnPlanner::PQ_LIST_SETUP]);
+}
+
+TEST(KnnPlannerTest, intervalTerminalReadsHaveSharedKFloor) {
+  auto s = segment(200);
+  s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 200;
+  s.codec = KnnPlanner::Codec::RABITQ; s.bounded = false; s.rabitqBits = 1;
+  auto second = s;
+  second.dims = 768;
+  std::array segments{s, second};
+  KnnPlanner::Request req{.k = 100};
+  auto plan = KnnPlanner::choose(segments, req, {}, KnnPlanner::Routing::FORCE_IVF);
+  auto totals = KnnPlanner::exactTotals(segments, plan.prices, req);
+  for (size_t i = 0; i < segments.size(); i++) KnnPlanner::addIvf(totals, segments[i], plan.prices[i], 1);
+  for (double coverage : {0.1, 0.5, 1.0}) {
+    double reads = std::min((double)req.k, coverage * 400);
+    EXPECT_DOUBLE_EQ(reads, KnnPlanner::terminalReads(totals, coverage, req.k));
+    EXPECT_DOUBLE_EQ(reads * totals.intervalDims / totals.intervalReads,
+        KnnPlanner::terminalDims(totals, coverage, req.k));
+  }
+  KnnPlanner::addIvf(totals, second, plan.prices[1], -1);
+  EXPECT_EQ(100, KnnPlanner::terminalReads(totals, 1, req.k));
+  KnnPlanner::addIvf(totals, s, plan.prices[0], -1);
+  EXPECT_EQ(0, totals.intervalVectors);
 }

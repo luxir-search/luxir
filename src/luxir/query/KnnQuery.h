@@ -220,6 +220,7 @@ public:
     int64_t eligibleDocs = 0;
     int64_t eligibleVectors = 0;
     bool unfiltered = true;
+    bool vectorsEstimated = false;
   };
 
   static SegmentEligibility countEligible(VectorReader& vr, DocSet* domain, LiveDocs* live, int32_t maxDoc) {
@@ -230,6 +231,14 @@ public:
       int64_t count = docs.hasBitset()
           ? docs.bitset().intersectionCardinality(((const BitDocSet*)domain)->bits()) : domain->card();
       return {count, count, unfiltered};
+    }
+    if (unfiltered) return {std::min<int64_t>(vr.docsWithValue(), live->numLive()), vr.numVectors()};
+    if (vr.isMultiValued() && domain->type != DocSet::ARRAY
+        && std::min<int64_t>(domain->card(), maxDoc - domain->card()) > 1024) {
+      const auto& docs = vr.strColReader().docsReader();
+      int64_t count = docs.hasBitset()
+          ? docs.bitset().intersectionCardinality(((const BitDocSet*)domain)->bits()) : domain->card();
+      return {count, count * vr.numVectors() / vr.docsWithValue(), false, true};
     }
     VectorSearchWork work;
     auto counts = walkDomainRanges(vr, *domain, maxDoc, work, [](int64_t, int64_t, bool) {});
@@ -329,6 +338,7 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  static inline std::atomic<int64_t> domainWalksForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
@@ -886,7 +896,6 @@ public:
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
       int64_t liveVectorCount = 0;
-      int64_t eligibleVectorCount = 0;
       std::unique_ptr<SegmentIvfScanner<Groups>> ivfEngine;
       bool flatPending = true, completing = false;
     };
@@ -982,10 +991,11 @@ public:
             segVectorCounts[i] = segCount;
             auto& input = planSegments[i];
             const auto& eligible = eligibilityPerSeg[i];
-            segLiveVectorCounts[i] = eligible.unfiltered ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr);
+            segLiveVectorCounts[i] = eligible.unfiltered && !vr.isMultiValued()
+                ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr);
             input.vectors = segCount; input.liveVectors = segLiveVectorCounts[i];
             input.docsWithValue = vr.docsWithValue(); input.eligibleDocs = eligible.eligibleDocs;
-            input.eligibleVectors = eligible.eligibleVectors;
+            input.eligibleVectors = eligible.eligibleVectors; input.vectorsEstimated = eligible.vectorsEstimated;
             input.domainSize = domain ? domain->card() : seg.maxDoc(); input.maxDoc = seg.maxDoc();
             input.dims = dims; input.l2 = metric == (int32_t)api::VectorMetric::L2; input.domain = domain != nullptr;
             input.arrayDomain = domain && domain->type == DocSet::ARRAY;
@@ -1001,6 +1011,9 @@ public:
               input.codec = vaux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ;
               input.nlist = vaux->getNList(); input.pqM = vaux->getPqM(); input.pqBits = vaux->getPqBits();
               input.rabitqBits = vaux->getRaBitQBits();
+              input.pqPerListTable = input.codec == KnnPlanner::Codec::PQ && input.l2
+                  && !VectorAuxReader::usePrecomputedTable(faiss::METRIC_L2, true,
+                      input.nlist, input.pqM, 1 << input.pqBits, segCount, dims);
               input.bounded = !vaux->isRaBitQ() || query.getRefineCandidates() > 0;
               normalizeColumnOnCosineRescore |= vaux->shouldNormalizeColumnOnCosineRescore();
             }
@@ -1144,7 +1157,6 @@ public:
             .engine = nullptr,
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
-            .eligibleVectorCount = eligibilityPerSeg[i].unfiltered ? segLiveVectorCounts[i] : eligibilityPerSeg[i].eligibleVectors,
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
@@ -1158,7 +1170,6 @@ public:
               dims, metric, normalizeColumnOnCosineRescore, query.groups, v2dSpan),
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
-            .eligibleVectorCount = eligibilityPerSeg[i].unfiltered ? segLiveVectorCounts[i] : eligibilityPerSeg[i].eligibleVectors,
             .ivfEngine = nullptr,
           });
         }
@@ -1235,37 +1246,8 @@ public:
       for (const auto& slot : slots) if (slot.ivfEngine) {
         activeIvf[(size_t)slot.segOrd] = true;
         ivfLiveTotal += slot.liveVectorCount;
-        ivfEligibleVectors += std::min(slot.eligibleVectorCount, slot.liveVectorCount);
       }
-      // Eligibility is exact, including multi-valued filtered domains.
-      double selectivity = ivfLiveTotal > 0 ? (double)ivfEligibleVectors / ivfLiveTotal : 1;
-      liveNTotal = std::accumulate(segLiveVectorCounts.begin(), segLiveVectorCounts.end(), (int64_t)0);
-      auto executionEffort = planRequest;
-      executionEffort.referenceBreadth = defaultIvfNList(liveNTotal);
-      double initialFraction = KnnPlanner::initialScanFraction(executionEffort, selectivity);
-      double maxFraction = query.getNProbe() > 0 ? initialFraction : 1;
-      double targetExamined = query.getNProbe() > 0 ? 0 : initialFraction * ivfEligibleVectors;
-      double scanFraction = initialFraction, coveredFraction = 0;
-      int64_t eligibleExamined = 0;
-      VectorSearchRound round = VectorSearchRound::BREADTH;
       std::vector<VectorSearchWork> workBySeg(numSegs);
-      auto baseEngine = std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ivfLiveTotal, kDocs,
-            metric, ctx.parallel, query.groups, v2dSpan, intervals, workBySeg);
-      VectorEngine* engine = baseEngine.get();
-      std::unique_ptr<VectorEngine> wrapperEngine;
-      if (engineWrapperForTests) {
-        wrapperEngine = engineWrapperForTests(*baseEngine);
-        engine = wrapperEngine.get();
-      }
-      if (statsForTests) {
-        statsForTests->initialBudget += initialFraction;
-        statsForTests->targetExamined += targetExamined;
-      }
-      bool firstRound = true;
-      bool candidatePoolSorted = true, resumeBoundedDepth = false;
-      int64_t roundNumber = 0;
-      std::vector<CompletionEvent> completions;
-
       // Rank domains can be borrowed in round one. Only pooled exclusion
       // needs a writable copy. The first deepen folds every filtered IVF
       // domain, including interval-only slots, then retires the seen hash.
@@ -1293,10 +1275,47 @@ public:
         ranks.remaining = ranks.original;
         eligibleSpans[i] = ranks.bits;
       };
+      auto activeEligibleVectors = [&](size_t i) {
+        if (rankEligibility[i].original >= 0) return rankEligibility[i].original;
+        const auto& input = planSegments[i];
+        return input.unfiltered ? segLiveVectorCounts[i] : std::min(input.eligibleVectors, segLiveVectorCounts[i]);
+      };
+      for (size_t i = 0; i < numSegs; i++)
+        if (activeIvf[i] && planSegments[i].vectorsEstimated && tuning.selector != KnnPlanner::Selector::RESOLVE)
+          foldDomainAt(i);
+      ivfEligibleVectors = 0;
+      for (size_t i = 0; i < numSegs; i++) if (activeIvf[i]) ivfEligibleVectors += activeEligibleVectors(i);
+      double selectivity = ivfLiveTotal > 0 ? (double)ivfEligibleVectors / ivfLiveTotal : 1;
+      liveNTotal = std::accumulate(segLiveVectorCounts.begin(), segLiveVectorCounts.end(), (int64_t)0);
+      auto executionEffort = planRequest;
+      executionEffort.referenceBreadth = defaultIvfNList(liveNTotal);
+      double initialFraction = KnnPlanner::initialScanFraction(executionEffort, selectivity);
       for (size_t i = 0; i < numSegs; i++) {
         if (activeIvf[i] && !eligibilityPerSeg[i].unfiltered
             && KnnPlanner::foldFirst(planSegments[i], initialFraction, tuning.selector, tuning.plannerCosts)) foldDomainAt(i);
       }
+      double maxFraction = query.getNProbe() > 0 ? initialFraction : 1;
+      double targetExamined = query.getNProbe() > 0 ? 0 : initialFraction * ivfEligibleVectors;
+      double scanFraction = initialFraction, coveredFraction = 0;
+      int64_t eligibleExamined = 0;
+      VectorSearchRound round = VectorSearchRound::BREADTH;
+      auto baseEngine = std::make_unique<CompositeVectorEngine<Groups>>(std::move(slots), ivfLiveTotal, kDocs,
+            metric, ctx.parallel, query.groups, v2dSpan, intervals, workBySeg);
+      VectorEngine* engine = baseEngine.get();
+      std::unique_ptr<VectorEngine> wrapperEngine;
+      if (engineWrapperForTests) {
+        wrapperEngine = engineWrapperForTests(*baseEngine);
+        engine = wrapperEngine.get();
+      }
+      if (statsForTests) {
+        statsForTests->initialBudget += initialFraction;
+        statsForTests->targetExamined += targetExamined;
+      }
+      bool firstRound = true;
+      bool candidatePoolSorted = true, resumeBoundedDepth = false;
+      int64_t roundNumber = 0;
+      std::vector<CompletionEvent> completions;
+
       auto seedRanks = [&](size_t i) {
         if (activeIvf[i] && !eligibilityPerSeg[i].unfiltered) foldDomainAt(i);
         auto& ranks = rankEligibility[i];
@@ -1336,11 +1355,6 @@ public:
         return fresh;
       };
 
-      auto activeEligibleVectors = [&](size_t i) {
-        if (rankEligibility[i].original >= 0) return rankEligibility[i].original;
-        const auto& input = planSegments[i];
-        return input.unfiltered ? segLiveVectorCounts[i] : std::min(input.eligibleVectors, segLiveVectorCounts[i]);
-      };
       // At a joined boundary, predict only the tasks the next round would
       // run. List sizes are exact; unseen-list yield assumes the remaining
       // domain is independent within the unscanned population. Depth uses
@@ -1662,15 +1676,15 @@ public:
             piece.wire.max_doc = reader.segments()[i].maxDoc();
             piece.wire.strategy = plan.ivf[i] ? "ivf" : "exact";
             piece.wire.cardinality = input.eligibleDocs; piece.wire.domain_size = input.domainSize;
-            piece.details.push_back(std::format("reason={}; eligible_vectors={}; exact_cost={}; ivf_scan_cost_at_predicted_coverage={}; ivf_linear={}; ivf_fixed={}",
-                reasons[i], input.eligibleVectors,
+            piece.details.push_back(std::format("reason={}; eligible_vectors={}{}; exact_cost={}; ivf_scan_cost_at_predicted_coverage={}; ivf_linear={}; ivf_fixed={}",
+                reasons[i], input.eligibleVectors, input.vectorsEstimated ? " (estimated)" : "",
                 plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
                     + KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial),
                 plan.prices[i].a, plan.prices[i].b));
             piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; predicted_terminal_reads={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
                 KnnPlanner::coverage(modeled, planRequest), plan.cost, KnnPlanner::rounds(modeled, planRequest),
-                KnnPlanner::terminalDims(modeled, KnnPlanner::coverage(modeled, planRequest)),
-                KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest)), work.rounds,
+                KnnPlanner::terminalDims(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k),
+                KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k), work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
             for (size_t f = 0; f < features.size(); f++)
@@ -2885,11 +2899,13 @@ private:
     return domain.type != DocSet::ARRAY && domain.card() > maxDoc - domain.card();
   }
 
-  // Count and fold share the doc-to-rank walk. Existing end-value ranks are
-  // prefix sums: sum selected ranges, or subtract the smaller complement.
+  // Cheap counts and folds share this walk. Large multi-valued domains are
+  // estimated for planning, then folded before setting the IVF stopping target.
+  // End-value ranks are prefix sums; subtract the complement when smaller.
   template <class Emit>
   static SegmentEligibility walkDomainRanges(VectorReader& vr, DocSet& domain, int32_t maxDoc,
                                               VectorSearchWork& work, Emit emit) {
+    domainWalksForTests.fetch_add(1, std::memory_order_relaxed);
     auto& col = vr.strColReader();
     bool complement = domainComplement(domain, maxDoc);
     int64_t visited = complement ? maxDoc - domain.card() : domain.card();
@@ -2985,21 +3001,11 @@ private:
     return {data, numBytes, liveVectors, std::move(owned)};
   }
 
-  /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
-  /// denominator (referenceBreadth, list-cost normalization) and the
-  /// targetDocReq cap for segments with no cached exact count: flat
-  /// (aux-less) segments under deletes.  FAISS segments under deletes use
-  /// the exact cardinality the cached RankLiveBitmap carries instead - the
-  /// count is amortized into the per-liveGen bitmap build, where computing
-  /// it here would re-walk the field on EVERY query, O(N_seg) bookkeeping
-  /// to budget a search that examines ~N^0.75 vectors at the default.  An
-  /// upper bound is the safe direction to relax: overestimating only makes
-  /// the scan fraction leaner and targetDocReq higher, and host deepening
-  /// compensates (the same stance as cost accounting ignoring the domain
-  /// filter).  UNDERestimating is not safe: targetDocReq = min(liveTotal,
-  /// ...) would stop the widen loop before K achievable docs.  Exact for
-  /// no-deletes and for dense single-valued (identity mapping => live count
-  /// == numLive).
+  /// O(1) planning and candidate-cap upper bound without a per-query rank walk.
+  /// IVF slots replace it with the cached RankLiveBitmap count under deletes
+  /// before setting execution effort. Exact slots can keep the upper bound:
+  /// their scan still checks the live domain. Exact without deletes and for
+  /// dense single-valued columns; sparse and multi-valued counts may be high.
   static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
                                       VectorReader& vr) {
     LiveDocs* live = segment.liveDocs();

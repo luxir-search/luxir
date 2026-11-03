@@ -2826,8 +2826,13 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   {
     auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 1u);
-    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
-        << "segment fell back to flat (below IVF training floor)";
+    auto* aux = (VectorAuxReader*)reader->segments()[0].getAuxReader("vec.emb_vs").get();
+    ASSERT_NE(aux, nullptr);
+    auto* pq = dynamic_cast<faiss::IndexIVFPQ*>(aux->getFaissIndex());
+    ASSERT_NE(pq, nullptr);
+    EXPECT_TRUE(pq->by_residual);
+    EXPECT_EQ(pq->use_precomputed_table, VectorAuxReader::usePrecomputedTable(
+        pq->metric_type, pq->by_residual, pq->nlist, pq->pq.M, pq->pq.ksub, pq->ntotal, pq->d) ? 1 : -1);
   }
 
   std::vector<std::string> dels{"a", "g"};
@@ -2840,13 +2845,21 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   req->execute();
   auto ids = resultIds(*req);
   req->done();
+  int64_t walks = KnnQuery::domainWalksForTests.load();
+  for (int run = 0; run < 2; run++) {
+    auto* again = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3, 0, 200, false, 1.0f);
+    again->execute();
+    EXPECT_EQ(ids, resultIds(*again));
+    again->done();
+    EXPECT_EQ(walks, KnnQuery::domainWalksForTests.load());
+  }
   auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3,
                            /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
   exact->done();
   int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
-  EXPECT_EQ(builds1, builds0 + 1) << "one bitmap build for the IVF query";
+  EXPECT_EQ(builds1, builds0 + 1) << "one bitmap build across repeated IVF queries";
 
   ASSERT_EQ(ids.size(), 3u);
   EXPECT_EQ(ids, exactIds);
@@ -3460,8 +3473,13 @@ TEST_F(KnnQueryTest, filteredFlatWalkMatchesCosineOracle) {
           if (deletes && (doc == 13 || doc == 100)) continue;
           liveDocs += !vectors[doc].empty(); liveVectors += (int64_t)vectors[doc].size();
         }
-        EXPECT_EQ(liveDocs, unfiltered.eligibleDocs);
-        EXPECT_EQ(liveVectors, unfiltered.eligibleVectors);
+        if (multi && deletes) {
+          EXPECT_GE(unfiltered.eligibleDocs, liveDocs);
+          EXPECT_EQ(vr.numVectors(), unfiltered.eligibleVectors);
+        } else {
+          EXPECT_EQ(liveDocs, unfiltered.eligibleDocs);
+          EXPECT_EQ(liveVectors, unfiltered.eligibleVectors);
+        }
         auto counts = KnnQuery::countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
         EXPECT_EQ((int64_t)expected.size(), counts.eligibleDocs);
         EXPECT_FALSE(counts.unfiltered);
@@ -4372,8 +4390,14 @@ TEST_F(KnnQueryTest, exactWorkPredictionMatchesExecution) {
         Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
         auto prepared = weight->prepare(prepare);
         EXPECT_EQ(1, stats.plannedExact);
-        for (size_t unit = 0; unit < KnnPlanner::NUM_UNITS; unit++)
-          EXPECT_EQ(stats.predictedExactWork[unit], stats.costWork[unit]) << KnnPlanner::unitNames[unit];
+        for (size_t unit = 0; unit < KnnPlanner::NUM_UNITS; unit++) {
+          if (multi && deletes && domainKind == 0
+              && (unit == KnnPlanner::EXACT_DIM || unit == KnnPlanner::MULTI_MAP)) {
+            EXPECT_GE(stats.predictedExactWork[unit], stats.costWork[unit]) << KnnPlanner::unitNames[unit];
+          } else {
+            EXPECT_EQ(stats.predictedExactWork[unit], stats.costWork[unit]) << KnnPlanner::unitNames[unit];
+          }
+        }
       }
     }
   }
@@ -4383,7 +4407,7 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.selector);
-  KnnQuery::tuning.selector = KnnPlanner::Selector::FOLD;
+  KnnQuery::tuning.selector = KnnPlanner::Selector::AUTO;
   CollectionHelper h("main");
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(64, 2, 2), 4);
   for (int i = 0; i < 4096; i++)
@@ -4398,7 +4422,8 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   auto counts = KnnQuery::countEligible(vr, &domain, nullptr, seg.maxDoc());
   ASSERT_GT(domain.card(), 1024);
   EXPECT_EQ(domain.card(), counts.eligibleDocs);
-  EXPECT_EQ(domain.card(), counts.eligibleVectors);
+  EXPECT_TRUE(counts.vectorsEstimated);
+  EXPECT_GT(counts.eligibleVectors, domain.card());
   KnnQuery::Stats stats;
   KnnQuery::statsForTests = &stats;
   std::vector<RecordedVectorRound> rounds;
@@ -4409,16 +4434,21 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   std::vector<float> q{0, 0, 0, 0};
   // The former average-multiplicity obligation at this floor was
   // unreachable, even after scanning every list.
-  EXPECT_GT(0.25 * (domain.card() * vr.numVectors() / vr.docsWithValue()), counts.eligibleVectors);
+  EXPECT_GT(0.25 * (domain.card() * vr.numVectors() / vr.docsWithValue()), domain.card());
   KnnQuery query("emb_vs", type, q, 3, 0, 8, 0.25f);
   std::array<DocSet*, 1> domains{&domain};
   Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
-  auto prepared = query.createWeight(context, Query::NEED_SCORES)->prepare(prepare);
-  EXPECT_DOUBLE_EQ(stats.initialBudget * domain.card(), stats.targetExamined);
-  EXPECT_EQ(domain.card(), stats.foldedEligible);
-  ASSERT_EQ(1u, rounds.size());
-  EXPECT_FALSE(rounds.back().result.breadthExhausted);
-  EXPECT_LT(stats.coveredFraction, 0.6);
+  int64_t walks = KnnQuery::domainWalksForTests.load();
+  for (int run = 1; run <= 2; run++) {
+    rounds.clear();
+    auto prepared = query.createWeight(context, Query::NEED_SCORES)->prepare(prepare);
+    EXPECT_EQ(walks + run, KnnQuery::domainWalksForTests.load());
+    EXPECT_DOUBLE_EQ(stats.initialBudget * domain.card(), stats.targetExamined);
+    EXPECT_EQ(run * domain.card(), stats.foldedEligible);
+    ASSERT_EQ(1u, rounds.size());
+    EXPECT_FALSE(rounds.back().result.breadthExhausted);
+    EXPECT_LT(stats.coveredFraction, run * 0.6);
+  }
 }
 
 TEST_F(KnnQueryTest, examinedSamplingSlackAvoidsExtraBreadth) {
