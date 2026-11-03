@@ -3,11 +3,9 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstring>
 #include <format>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -22,7 +20,6 @@
 #include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
-#include "luxir/query/FacetTermFilter.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
@@ -31,6 +28,7 @@
 #include "luxir/query/Query.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
+#include "luxir/query/TermPattern.h"
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
@@ -581,15 +579,15 @@ public:
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
-        prefix = normalizeLiteral(target, prefix, false);
         if (!fieldType.indexed()) {
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
         if (caseInsensitive) {
-          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field, prefix);
+          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field,
+                                         normalizeLiteral(target, prefix, false));
         }
-        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
+        return pool.make<PrefixQuery>(field, normalizePrefix(target, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
@@ -609,11 +607,13 @@ public:
     checkAutomatonField("Wildcard", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                                &folder, caseInsensitive, automaton::compileWildcard);
+      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
+          caseInsensitive, compilePattern("Wildcard", target, pattern, &folder, caseInsensitive,
+                                          automaton::compileWildcard));
     }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                              nullptr, caseInsensitive, automaton::compileWildcard);
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
+        caseInsensitive, compilePattern("Wildcard", target, pattern, nullptr, caseInsensitive,
+                                        automaton::compileWildcard));
   }
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern,
@@ -625,86 +625,31 @@ public:
   Query* createRegexQuery(const ResolvedFieldHandle& target, std::string_view pattern,
                           bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
+    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, field, pattern, caseInsensitive,
+                              compileRegexPattern(target, pattern, caseInsensitive));
+  }
+
+  // A regex compiled as createRegexQuery compiles it, for callers that test
+  // terms themselves.
+  TermPattern compileRegexPattern(const ResolvedFieldHandle& target, std::string_view pattern,
+                                  bool caseInsensitive = false) {
     checkAutomatonField("Regex", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                                &folder, caseInsensitive, automaton::compileRegex);
+      return compilePattern("Regex", target, pattern, &folder, caseInsensitive,
+                            automaton::compileRegex);
     }
-    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                              nullptr, caseInsensitive, automaton::compileRegex);
+    return compilePattern("Regex", target, pattern, nullptr, caseInsensitive,
+                          automaton::compileRegex);
   }
 
-  // Compile a FieldFacet term filter for a STRING or ID field. Literals are
-  // normalized as in prefix, regex, and any_of queries; an unset filter yields
-  // nullptr.
-  std::shared_ptr<const FacetTermFilter> createFacetTermFilter(
-      const ResolvedFieldHandle& target, const api::TermFilter& spec) {
-    auto filter = std::make_shared<FacetTermFilter>();
-    bool any = false;
-    if (!spec.prefix.empty()) {
-      auto prefix = normalizeLiteral(target, spec.prefix, false);
-      filter->prefix = PackedTerm::fitPrefix(target.fieldType->longTerms, prefix);
-      any = true;
-    }
-    if (!spec.regex.empty()) {
-      filter->regex = compileTermRegex(target, "regex", spec.regex);
-      any = true;
-    }
-    if (!spec.exclude_regex.empty()) {
-      filter->excludeRegex = compileTermRegex(target, "exclude_regex", spec.exclude_regex);
-      any = true;
-    }
-    auto collect = [&](std::span<const std::string_view> values) {
-      std::vector<std::string> out;
-      out.reserve(values.size());
-      for (std::string_view value : values) {
-        out.emplace_back(normalizeLiteral(target, value, true));
-      }
-      std::sort(out.begin(), out.end());
-      out.erase(std::unique(out.begin(), out.end()), out.end());
-      return out;
-    };
-    if (!spec.include.empty()) {
-      filter->include = collect(spec.include);
-      filter->hasInclude = true;
-      any = true;
-    }
-    if (!spec.exclude.empty()) {
-      filter->exclude = collect(spec.exclude);
-      any = true;
-    }
-    if (spec.num_partitions != 0) {
-      if (spec.partition >= spec.num_partitions) {
-        throw std::runtime_error(std::format(
-            "term_filter: partition {} must be less than num_partitions {}",
-            spec.partition, spec.num_partitions));
-      }
-      filter->partition = spec.partition;
-      filter->numPartitions = spec.num_partitions;
-      any = true;
-    } else if (spec.partition != 0) {
-      throw std::runtime_error("term_filter: partition requires num_partitions");
-    }
-    if (!any) return nullptr;
-    return filter;
+  // A prefix normalized and fitted as createPrefixQuery matches it.
+  std::string_view normalizePrefix(const ResolvedFieldHandle& target, std::string_view prefix) {
+    return PackedTerm::fitPrefix(target.fieldType->longTerms,
+                                 normalizeLiteral(target, prefix, false));
   }
 
 private:
-  automaton::ByteDfa compileTermRegex(const ResolvedFieldHandle& target, std::string_view what,
-                                      std::string_view pattern) {
-    try {
-      automaton::Budget budget;
-      if (auto* chain = fields.chain(target)) {
-        FieldCodepointFolder folder(chain);
-        return automaton::compileRegex(pattern, budget, &folder);
-      }
-      return automaton::compileRegex(pattern, budget, nullptr);
-    } catch (const std::runtime_error& e) {
-      throw std::runtime_error(std::format("term_filter {} '{}': {}", what, pattern, e.what()));
-    }
-  }
-
   FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;
@@ -729,51 +674,52 @@ private:
     return {copy, bytes.size()};
   }
 
-  Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
-                            const ResolvedFieldHandle& target,
-                            std::string_view field, std::string_view pattern,
-                            const automaton::CodepointFolder* folder, bool caseInsensitive,
-                            automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
-                                                          const automaton::CodepointFolder*, bool)) {
-    automaton::ByteDfa compiled;
+  TermPattern compilePattern(std::string_view label, const ResolvedFieldHandle& target,
+                             std::string_view pattern, const automaton::CodepointFolder* folder,
+                             bool caseInsensitive,
+                             automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                                           const automaton::CodepointFolder*, bool)) {
+    TermPattern out;
     try {
       automaton::Budget budget;
-      compiled = compile(pattern, budget, folder, caseInsensitive);
+      out.dfa = compile(pattern, budget, folder, caseInsensitive);
     } catch (const std::runtime_error& e) {
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
-                                           label, field, pattern, e.what()));
+                                           label, target.physicalName, pattern, e.what()));
     }
     // Do this before classify(), which treats languages requiring >255 bytes
     // as empty. The DFA prefix already accounts for escapes and field folding.
-    auto prefixAndState = compiled.commonPrefixAndState();
+    auto prefixAndState = out.dfa.commonPrefixAndState();
     auto kept = PackedTerm::fitPrefix(target.fieldType->longTerms, prefixAndState.first);
-    if (kept.size() < prefixAndState.first.size()) {
-      return pool.make<PrefixQuery>(field, poolCopy(kept));
-    }
-    std::string exactOrPrefix;
-    automaton::ByteDfaKind kind = compiled.classify(&exactOrPrefix);
-    if (kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
-    std::string commonPrefix;
-    std::string commonSuffix;
-    automaton::ByteDfaView::State initialState = compiled.start();
-    std::optional<TermPolicy> fittedPolicy;
-    if (kind == automaton::ByteDfaKind::NORMAL) {
+    if (kept.size() < prefixAndState.first.size()) out.fittedPrefix = std::string(kept);
+    out.kind = out.dfa.classify(&out.literal);
+    if (out.kind == automaton::ByteDfaKind::NORMAL) {
       // Exact and prefix shapes see fitted terms correctly; a general pattern
       // may test hash or truncation bytes. Planning decides whether it can.
       TermPolicy policy = target.fieldType->longTerms;
-      if (policy != TermPolicy::REJECT) fittedPolicy = policy;
-      commonPrefix = std::move(prefixAndState.first);
-      auto state = prefixAndState.second;
-      commonSuffix = compiled.commonSuffix();
-      initialState = state;
-      exactOrPrefix.clear();
+      if (policy != TermPolicy::REJECT) out.fittedPolicy = policy;
+      out.literal = std::move(prefixAndState.first);
+      out.afterLiteral = prefixAndState.second;
+      // Only an automaton query scans with it, and a fitted prefix replaces that.
+      if (!out.fittedPrefix) out.commonSuffix = out.dfa.commonSuffix();
     }
+    return out;
+  }
+
+  Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view field,
+                            std::string_view pattern, bool caseInsensitive, TermPattern compiled) {
+    if (compiled.fittedPrefix) return pool.make<PrefixQuery>(field, poolCopy(*compiled.fittedPrefix));
+    if (compiled.kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
+    bool normal = compiled.kind == automaton::ByteDfaKind::NORMAL;
     std::string_view patternCopy = poolCopy(pattern);
-    std::string_view exactOrPrefixCopy = poolCopy(exactOrPrefix);
-    DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
-    automaton::ByteDfaView frozen = compiled.freeze(pool);
-    return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen, kind,
-                                    exactOrPrefixCopy, scanPlan, fittedPolicy);
+    std::string_view exactOrPrefixCopy = normal ? std::string_view() : poolCopy(compiled.literal);
+    DfaScanPlan scanPlan{normal ? poolCopy(compiled.literal) : std::string_view(),
+                         poolCopy(compiled.commonSuffix),
+                         normal ? compiled.afterLiteral : compiled.dfa.start()};
+    automaton::ByteDfaView frozen = compiled.dfa.freeze(pool);
+    return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen,
+                                     compiled.kind, exactOrPrefixCopy, scanPlan,
+                                     compiled.fittedPolicy);
   }
 
   // An already-normalized literal, escaped and compiled without a field folder
@@ -788,8 +734,9 @@ private:
     }
     bool prefix = kind == AutomatonQuery::Kind::PREFIX;
     if (prefix) escaped.push_back('*');
-    Query* query = makeAutomatonQuery(kind, prefix ? "Prefix" : "Match",
-                                      target, field, escaped, nullptr, true, automaton::compileWildcard);
+    Query* query = makeAutomatonQuery(kind, field, escaped, true,
+        compilePattern(prefix ? "Prefix" : "Match", target, escaped, nullptr, true,
+                       automaton::compileWildcard));
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
