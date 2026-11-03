@@ -387,10 +387,10 @@ private:
     }
   }
 
-  // One ring walk: about log2 V levels of the tree, plus the test of each
-  // edge spanning the point's latitude, on average the ring's summed edge
-  // latitude extents over its own.
-  static double walkCost(const geo::EdgeTree& tree) {
+  // One ring walk: a root-to-leaf descent, about log2 V nodes, for each edge
+  // spanning the point's latitude, which averages the ring's summed edge
+  // latitude extents over its own. Lucene's EdgeTree bound is O(k log V).
+  static double walkNodes(const geo::EdgeTree& tree) {
     double low = tree.edges.front().low;
     double high = low;
     double spans = 0.0;
@@ -399,19 +399,21 @@ private:
       spans += std::abs(edge.lat1 - edge.lat2);
     }
     double stabbed = high > low ? spans / (high - low) : 0.0;
-    return std::log2((double)tree.edges.size() + 1.0) + 2.0 * stabbed;
+    return (1.0 + stabbed) * std::log2((double)tree.edges.size() + 1.0);
   }
 
-  // matches() in a box check's units (2): the box and grid lookups, plus, in
-  // the share of grid cells an edge crosses, each part's box checks and
-  // ring walks.
+  // matches() in a box check's units (2): about two box checks for the box
+  // and grid lookups, plus, in the share of grid cells an edge crosses, each
+  // part's box check and ring walks at 3 per node. Fitted on noisy circles of
+  // 100 to 100k vertices, within 25% of the measured ratio to a box check
+  // (one segment, release build, 2026-11-03).
   static float matchCostOf(std::span<const Part> parts, double crossShare) {
     double exact = 0.0;
     for (const Part& part : parts) {
-      exact += 2.0 + walkCost(part.polygon.outer);
-      for (const geo::EdgeTree& hole : part.polygon.holes) exact += walkCost(hole);
+      exact += 2.0 + 3.0 * walkNodes(part.polygon.outer);
+      for (const geo::EdgeTree& hole : part.polygon.holes) exact += 3.0 * walkNodes(hole);
     }
-    return (float)(3.0 + crossShare * exact);
+    return (float)(4.0 + crossShare * exact);
   }
 };
 
