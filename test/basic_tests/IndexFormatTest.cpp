@@ -37,22 +37,29 @@ namespace {
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
 constexpr uint64_t kReferenceVersion = 9;
-constexpr uint64_t kReferenceDigest = 0xed72bcf91de3225a;
+constexpr uint64_t kReferenceDigest = 0x07f1cf29172c53f3;
 
-// A small index over most field kinds, with two segments and a delete. Each
-// segment is one request flushed by a single inverter. Merges are left out:
-// fields merge as parallel tasks, so a merged segment's file layout varies.
+// A small index over every default field template's kind, with two segments
+// and a delete. Each segment is one request flushed by a single inverter.
+// Merges are left out: fields merge as parallel tasks, so a merged segment's
+// file layout varies.
 void buildReferenceIndex(CollectionHelper& ch) {
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "f_f", 1.5f, "d_d", 2.25,
-              "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0}),
+              "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0},
+              "code_sc", "k1", "codes_ssc", vecs("k2", "k3"), "fs_fs", std::vector<double>{0.5, -1.25},
+              "ds_ds", std::vector<double>{3.75}, "dts_dts", vecs("2026-01-02T03:04:05Z", "2024-02-29T00:00:00Z"),
+              "at_p", std::vector<double>{-74.006, 40.7128},
+              "stops_ps", std::vector<std::vector<double>>{{-0.1278, 51.5074}, {139.6503, 35.6762}}),
       flatdoc("id", "b", "title_t", "lazy dogs sleep", "tag_s", "blue", "n_i", (int64_t)-3,
-              "vec_v", std::vector<float>{0, 1}),
+              "vec_v", std::vector<float>{0, 1}, "at_p", std::vector<double>{2.3522, 48.8566}),
   }, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "c", "title_t", "quick quick fox", "tag_s", "red", "n_i", (int64_t)42,
-              "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f}),
+              "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f},
+              "at_p", std::vector<double>{151.2093, -33.8688},
+              "stops_ps", std::vector<std::vector<double>>{{-58.3816, -34.6037}}),
   }, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(ch.deleteById("b", UpdateMessage::COMMIT).success);
   // The reference vector column stores raw floats, with no normalization or ANN.
