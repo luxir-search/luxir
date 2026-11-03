@@ -375,99 +375,84 @@ The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
 Routing uses column and overlay metadata before loading FAISS or rank-liveness
-state. `KnnPlanner` prices predicted work with one calibrated unit-cost table:
-exact dimensions, domain visits and rank mapping; IVF selector classes, codec
-scores, list setup, coarse centroid dimensions and terminal reads. Costs are
-exact-score-dimension equivalents, not time predictions. For a configuration
-of IVF slots, predicted coverage is the maximum of initial coverage, bounded
-fill and the remaining document-unit obligation, capped at one. Explicit
-`nprobe` pins the prediction to initial coverage. Filter placement is assumed
-independent of centroid order; large multi-valued domains retain their explicit
-eligible-vector estimate. Group diversity is not predicted from doc counts.
+state. Eligible docs and vectors are exact for every segment: single-valued
+columns count domain members (intersected with the has-field bitset when the
+column is sparse), and multi-valued columns sum value ranges from the end-rank
+column over the domain or its smaller complement. Folding a domain into a rank
+bitmap uses the same walk.
 
-Each IVF slot has a scan price `coverage * A + B`, with a piecewise selector
-correction for resolving the first round or folding its domain. Global terms add
-terminal reads and IVF slot-round overhead. Walk and terminal dimensions have
-separate costs; RaBitQ list setup scales with dimensions, while PQ list setup
-has its own coefficient. Predicted rounds are one at initial coverage, otherwise
-`1 + ceil(log2(coverage / initial_coverage))`. A shared request constant is paid
-once by either arm. Calibration uses nanoseconds divided by 0.135 ns per exact
-walk dimension; counters expose the same work units.
+`KnnPlanner` prices predicted work with one calibrated unit-cost table. Exact
+slots pay per scored dimension, per visited domain doc and per rank mapping.
+IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
+tests the selector through a virtual call) and a branch-misprediction term
+proportional to `p(1-p)` for selector pass rate `p`; per codec score (PQ
+subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup (RaBitQ
+re-quantizes the query residual for every list, so its cost scales with
+dimensions, while PQ rebuilds its table per list only under L2, so its cost
+scales with subquantizers and is zero for inner product and cosine); per coarse
+centroid dimension; per slot-round; and per terminal read plus per terminal
+dimension. Every query pays a request constant, and any query that runs IVF
+pays a second one. Units are nanoseconds divided by the cost of one exact
+dimension; counters expose the same units, and `KnnPlanner::Costs` records what
+they were fitted on.
 
-The bounded terminal allowance is one shared pool, capped by eligible vector
-dimensions. Its multiplicity estimate is fixed from all bounded segments before
-routing; actual admission can favor higher-multiplicity docs. Interval terminal
-reads use 0.11 of examined dimensions (pooled measured ratio 0.107; independent
-filters alone 0.004). Extra-bit survival retains its provisional 0.35 fraction.
+For a configuration of IVF slots, predicted coverage is the maximum of initial
+coverage, bounded fill and the remaining document-unit obligation, capped at
+one; explicit `nprobe` pins it to initial coverage. Each IVF slot's scan price
+is `coverage * A + B` plus a piecewise selector correction for resolving or
+folding the first round. Predicted rounds are one at initial coverage,
+otherwise `1 + ceil(log2(coverage / initial_coverage))`. The bounded terminal
+allowance is one shared pool capped by eligible vectors; interval terminal
+reads are a dimension-dependent fraction of examined vectors, fitted for
+independent filters (anti-correlated filters read far more, and completion
+bounds that error). Filter placement is assumed
+independent of centroid order, and group diversity is not predicted from doc
+counts. RaBitQ extra-bit survival is a fitted function of dimensions until a
+segment has scanned; completion then uses the observed rate.
 
 The planner compares all-IVF and all-exact with forward substitution sweeps
 from three seeds: all-IVF, every bounded segment exact, and every interval
-segment exact. Only strict drops in total cost are accepted. Identical seeds
-are skipped. The channel seeds handle the coverage drop when the last bounded
-slot leaves. Scalar running sums price the additive work. Prefix sums over
-selector crossover fractions price each trial in O(log segments); the whole
-search remains O(segments log segments). Pinned effort is optimized exactly by
-separately minimizing the two additive objectives of the capped bounded terminal term.
-Ties retain IVF. The adaptive search is a heuristic, tested against exhaustive
-search; it is not a global optimizer. Reverse and single-flip passes remain
-available to tests for comparing search quality and cost. `exact:true`
-overrides routing. Exact slots contribute neither IVF fill nor its denominator.
+segment exact. The channel seeds handle the drop in bounded fill when the last
+bounded slot leaves. Only strict drops in total cost are accepted and ties
+retain IVF. Running sums, plus prefix sums over selector crossover fractions,
+keep the search O(segments log segments). Pinned effort is optimized exactly
+over the capped terminal terms. The adaptive search is a heuristic tested
+against exhaustive search, not a global optimizer. `exact:true` overrides
+routing. Exact slots contribute neither IVF fill nor its denominator.
 
-Cold-page effects, multiplicity and filter correlation still require
-measurement; predicted cost is not a latency or recall guarantee.
-`profile:true` includes per-segment choices, eligibility, modeled costs,
-reasons and executed work. `BM_VectorKnnFiltered` exposes AUTO, forced IVF and
-forced exact modes (0/1/2), with raw counters and cost features for calibration.
-Size-weighted array probes count calls times `bit_width(domain size)`, not
-instrumented comparisons in the DocSet search. The model does not try to fit
-the nonlinear misprediction cost of large array-domain probes.
+Predicted cost is not a latency or recall guarantee: filter correlation, cold
+pages and multiplicity skew are outside the model. `profile:true` reports
+per-segment choices, eligibility, modeled costs, reasons and executed work.
+`BM_VectorKnnFiltered` exposes AUTO, forced IVF and forced exact modes with the
+raw counters used for calibration.
 
 Filtered IVF round one chooses resolution or a rank-domain bitmap when
-`predicted_checks * (resolve_cost - bitmap_cost)` exceeds the fold cost. Planning
-and execution share the rule and predict checks as coverage times physical
-vectors. Dense single-valued bitset domains already are rank bitmaps and are
-borrowed without allocation. Other folds map doc IDs through forward column
-cursors; arrays walk members, bitsets use the smaller of members and nonmembers.
-Multi-valued docs contribute their full vector ranges.
-
-Every deepen folds filtered domains, including interval-only breadth widening.
-Pooled ranks are then cleared, so subsequent scans use one bitmap probe without
-resolving IDs. Borrowed words are copied only on the first pooled clear. Original
-and remaining rank cardinalities stay separate. Bitmap backing uses ordinary
-query-local vector storage, like bounded pooled exclusions; it is not charged to
-the interval collector's request-memory tracker. Fold counters count mapped docs
-and initialized/copied words; `selectorBitmap` counts rank probes. Provisional
-costs are 3 ns per fold doc (plus sparse/multi mapping), 0.5 ns per word and
-2.11 ns per rank probe (refitted on folded scans). The benchmark's `selector` seam selects AUTO, RESOLVE or
-FOLD (0/1/2) for round one only; all modes fold on deepen. Later-round pricing
-adds the fold and any copy needed for borrowed bounded domains.
+`predicted_checks * (resolve_cost - bitmap_cost)` exceeds the fold cost;
+planning and execution share the rule. Dense single-valued bitset domains
+already are rank bitmaps and are borrowed without allocation. Other folds map
+doc IDs through forward column cursors: arrays walk members, bitsets the
+smaller of members and nonmembers, and multi-valued docs contribute their full
+vector ranges. Every deepen folds filtered domains, including interval-only
+breadth widening, and clears pooled ranks, so later scans use one bitmap probe
+without resolving IDs. Borrowed words are copied on the first pooled clear, and
+owned bitmaps are charged to the request memory tracker. The RaBitQ scan
+dispatches the selector kind once per scan and tests bitmaps inline; PQ uses
+FAISS's scanner and its selector interface.
 
 At each joined round boundary, the host previews the next allocation without
-advancing its cursors. Physical list sizes and setups are exact; score work uses
-the remaining eligible fraction and observed extra-bit survival. Cached live-list
-sizes avoid repeating deletion checks between preview and dispatch. If a slot's
-cumulative IVF cost plus its next-round cost exceeds its full-domain exact cost,
-the slot completes exactly. Profiles distinguish a next round that alone exceeds
-the exact cost from the cumulative trigger. This is a cost rule, not a regret bound.
-Explicit probe pins disable completion, and idle slots never trigger it.
-
-Completion removes the slot from allocation, recomputes effort over active IVF
-slots, then runs a single exact top-k pass without pooled exclusions. A separate
-completion round supplies exact witnesses before termination is considered; it
-can run with no IVF work. Existing interval records and lower-bound witnesses
-remain valid and retain their request-memory accounting. Bounded nominees are
-retired, and the active bounded pool starts a fresh epoch with covered lists
-rescanned and exclusions reopened. This also restores Groups members previously
-evicted under keys shared with completed slots. Original routing diagnostics stay
-unchanged; profiles add the completion round, reason and three costs. Work counters
-include both the abandoned IVF work and exact completion.
-
-The test/benchmark `completion` seam is AUTO (0) by default, OFF (1) for measuring
-IVF without completion, or FORCE (2) to complete every IVF slot at its first
-boundary, even if no further work was needed. FORCE still honors probe pins.
-Forced-arm calibration registrations use OFF; correlation sweeps compare AUTO
-with OFF and report switches per query. The routing planner does not speculate
-about future completions.
+advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost
+exceeds its full-domain exact cost, the slot completes exactly. This is a cost
+rule, not a regret bound. Explicit probe pins disable completion, and idle
+slots never trigger it. Completion removes the slot from allocation,
+recomputes effort over the active IVF slots, and runs one exact top-k pass over
+the slot's full domain without pooled exclusions. Interval records and
+lower-bound witnesses stay valid. In document mode only the completed slot's
+approximate candidates are retracted: nominees never evict across slots, so the
+active pool continues and deepens only if it falls short. Group admission can
+evict another slot's members, so in group mode the active bounded pool starts
+a fresh epoch with covered lists rescanned and exclusions reopened. Profiles
+add the completion round, reason and costs; work counters include the
+abandoned IVF work and the exact pass.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
@@ -485,24 +470,21 @@ uneven list sizes and avoids applying equal work to every segment. For an IVF se
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
-cheap upper bound instead (exact counting there would scan the field per
-query). It contributes only to the whole-index reference breadth; the IVF
+simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions use a
+cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
 allocation denominator uses exact live counts.
 
 With default probes, the initial fraction expands by `1 / sqrt(s)`, where
-`s` is the eligible-vector fraction over the searched IVF slots. Large
-multi-valued domains estimate eligible vectors from exact eligible docs and
-average multiplicity. The fraction is floored by `min_scan_fraction` and capped
+`s` is the eligible-vector fraction over the searched IVF slots. The fraction is floored by `min_scan_fraction` and capped
 at one. Explicit `nprobe` receives no selectivity expansion. All allocated lists
 are scanned before checking fill, even if exact slots already supply k units.
 Bounded document fill is capped by eligible docs in bounded IVF slots; document
-unit fill is capped by eligible docs across all slots. Unfiltered columns under
-deletes use conservative metadata caps where exact counts would require a walk.
-Default-probe queries also examine at least `P0 * eligibleVectors` selector-passing
+unit fill is capped by eligible docs across all slots. Default-probe queries also examine at least `P0 * eligibleVectors` selector-passing
 codes on newly scanned lists, where `P0` is the initial fraction. Depth rescans
 and exact slots do not contribute. This is the eligible yield expected from an
 independent filter at `P0`; unfiltered scans already satisfy it through coverage.
+It allows binomial sampling slack of `2 * sqrt(target)`, at most a quarter of the
+target, so a filter independent of the lists does not pay an extra round for noise.
 Exhaustion, a full candidate pool or explicit probe pins end widening even if
 obligations remain unmet.
 
