@@ -629,6 +629,10 @@ public:
   // the candidate feed.
   static inline bool disableCandidateTermFeedForTests =
       std::getenv("LUXIR_DISABLE_CANDIDATE_TERM_FEED") != nullptr;
+  // Test/bench hook: decline the filter-led candidate route when more than
+  // one filter is present instead of probing the extra filters.
+  static inline bool disableCandidateTailFiltersForTests =
+      std::getenv("LUXIR_DISABLE_CANDIDATE_TAIL_FILTERS") != nullptr;
   // Candidate batching requires the cheapest body clause to be sufficiently
   // more expensive than the filter feed. A cached DocSet competes with a
   // cheap window mask and therefore requires the stricter ratio.
