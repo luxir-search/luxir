@@ -3955,9 +3955,9 @@ TEST_F(KnnQueryTest, foldedDomainMatchesResolve) {
           auto eligible = KnnQuery::countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
           KnnPlanner::Segment input{.vectors = vr.numVectors(), .liveVectors = vr.numVectors(), .docsWithValue = vr.docsWithValue(),
               .eligibleDocs = eligible.eligibleDocs, .eligibleVectors = eligible.eligibleVectors,
-              .domainSize = domain->card(), .maxDoc = seg.maxDoc(), .dims = vr.dims(), .nlist = aux->getNList(),
+              .domainSize = domain->card(), .maxDoc = seg.maxDoc(), .dims = vr.dims(), .nlist = aux->getNList(), .pqM = aux->getPqM(),
               .codec = aux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ,
-              .domain = true, .arrayDomain = domain->type == DocSet::ARRAY, .unfiltered = false,
+              .l2 = true, .domain = true, .arrayDomain = domain->type == DocSet::ARRAY, .unfiltered = false,
               .sparse = sparse, .multi = multi};
           auto predicted = KnnPlanner::price(input, {}, {});
           EXPECT_EQ(predicted.fixed[KnnPlanner::COARSE_DIM], stats.costWork[KnnPlanner::COARSE_DIM]);
@@ -4146,6 +4146,7 @@ TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
         if (filter) addMatchFilter(cur, "keep_s", "yes");
         req->execute(parallel);
         ASSERT_OK(req);
+        EXPECT_EQ(exact ? 0 : 1, stats.costWork[KnnPlanner::IVF_REQUEST]);
         if (exact) { expected = resultIds(*req); scores = resultScores(*req); }
         else {
           EXPECT_EQ(expected, resultIds(*req)); EXPECT_EQ(scores, resultScores(*req));

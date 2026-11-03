@@ -22,32 +22,33 @@ struct KnnPlanner {
   enum class Routing { AUTO, FORCE_IVF, FORCE_EXACT };
   enum class Codec { FLAT, PQ, RABITQ };
   enum class Selector { AUTO, RESOLVE, FOLD }; // Round one only; deepen always folds.
-  enum Unit { EXACT_DIM, TERMINAL_DIM, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
-              ENTRY_NONE, ENTRY_BITMAP, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
+  enum Unit { EXACT_DIM, TERMINAL_DIM, TERMINAL_READ, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
+              ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
-              PQ_LIST_SETUP, RABITQ_LIST_DIM, COARSE_DIM, ROUND, FOLD_DOC, FOLD_WORD, NUM_UNITS };
+              PQ_LIST_SETUP, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
-    "exact_dims", "terminal_dims", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
-    "entry_none", "entry_bitmap", "resolve_identity", "resolve_select", "resolve_mono",
+    "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
+    "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
-    "pq_list_setups", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "fold_docs", "fold_words"};
+    "pq_list_setups", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
-    // Fitted nanoseconds divided by the exact-walk dimension cost. Retain
-    // relative seeds for rank walks, sparse/multi mapping and rank bitmaps:
-    // dense filtered calibration does not identify those costs. Identity
-    // resolve rides in the probe cost; PQ bits are collinear with subcodes.
+    // Forced-arm fit after selector devirtualization, munin at 3.3 GHz:
+    // SIFT 1M (128-d L2), miracl 1M (768-d cosine), 4/16 segments, RaBitQ-1/2
+    // and PQ, 8 selectivities x 4 correlations. Predicted/actual on 384 IVF
+    // rows: p10/median/p90/max = 0.93/1.00/1.06/1.29; 384 exact rows: p10/p90
+    // = 0.80/1.18. Fitted ns divided by NS_PER_DIM; keep unidentified seeds
+    // for rank visits, flat probes, sparse/multi maps, resolve/bit/array probes,
+    // fold words and entry-none. PQ_LIST_SETUP counts L2 lists x subquantizers.
+    // Open: IVF_REQUEST's shared 180.6 us remains unexplained by profiles.
     static constexpr double NS_PER_DIM = 0.135;
-    Work units{1, 1.43 / NS_PER_DIM, 22.7 / NS_PER_DIM, 1, 4, 16, 24,
-               1, 2.11 / NS_PER_DIM, 0, 16, 24, 9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM,
-               0.62 / NS_PER_DIM, 0, 0.053 / NS_PER_DIM, 0.104 / NS_PER_DIM,
-               957 / NS_PER_DIM, 18.1 / NS_PER_DIM, 0.064 / NS_PER_DIM, 148000 / NS_PER_DIM,
-               3.0 / NS_PER_DIM, 0.5 / NS_PER_DIM};
-    // IVF units refit on fold-from-round-one scans (SIFT 128-d, miracl
-    // 768-d, 4 segments): predicted/actual p10 0.87, p90 1.12. Fold doc and
-    // word costs were too small to identify there; they keep 3 ns per
-    // visited doc and 0.5 ns per initialized/copied 64-bit word.
-    double requestCost = 16600 / NS_PER_DIM; // Common to both arms, once per query.
+    Work units{1, 0.281 / NS_PER_DIM, 227 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
+               1, 1.01 / NS_PER_DIM, 2.23 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
+               9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.45 / NS_PER_DIM, 0,
+               0.0297 / NS_PER_DIM, 0.218 / NS_PER_DIM, 39.7 / NS_PER_DIM, 18.3 / NS_PER_DIM,
+               0.1125 / NS_PER_DIM, 25000 / NS_PER_DIM, 180600 / NS_PER_DIM,
+               4.49 / NS_PER_DIM, 0.5 / NS_PER_DIM};
+    double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
     // IVF is chosen: 0.04-0.06 at 128-d (SIFT) and ~0.011 at 768-d (miracl),
@@ -57,10 +58,15 @@ struct KnnPlanner {
     double extraBitSurvival(int32_t dims) const {
       return std::min(1.0, extraBitSurvival128 * std::pow(128.0 / std::max(1, dims), 0.8));
     }
-    // Dimension-weighted terminal reads / new-list passes across the
-    // calibration corpora was 0.107; independent filters alone were 0.004.
-    // Correlation is unknown at prepare, so keep the pooled estimate.
-    double intervalReadFraction = 0.11;
+    // Interval terminal reads per new-list selector pass, for an independent
+    // filter as everywhere else in planning: 0.03-0.04 at 128-d (SIFT) and
+    // 0.003-0.004 at 768-d (miracl) at 1-30% selectivity, i.e. about
+    // 0.035 * (128 / dims)^1.3. Anti-correlated filters read far more (up to
+    // 0.8); completion bounds that IVF-side error at runtime.
+    double intervalRead128 = 0.035;
+    double intervalReadFraction(int32_t dims) const {
+      return std::min(1.0, intervalRead128 * std::pow(128.0 / std::max(1, dims), 1.3));
+    }
     double price(const Work& work) const {
       return std::inner_product(work.begin(), work.end(), units.begin(), 0.0);
     }
@@ -70,7 +76,7 @@ struct KnnPlanner {
     int64_t eligibleDocs = 0, eligibleVectors = 0, domainSize = 0, maxDoc = 0;
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0;
     Codec codec = Codec::FLAT;
-    bool domain = false, arrayDomain = false, unfiltered = true, deletes = false;
+    bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
   };
   struct Request {
@@ -85,10 +91,12 @@ struct KnnPlanner {
     // Selector correction to the bitmap-priced linear arm. The threshold
     // partitions folded first rounds from resolve-first, fold-on-deepen.
     double resolveExtra = 0, foldCost = 0, foldThreshold = -1, deepenCopy = 0;
+    double intervalReadFraction = 0;
   };
   struct Totals {
     double exact = 0, a = 0, b = 0;
-    double boundedDims = 0, intervalDims = 0, boundedReadLimit = 0;
+    double boundedDims = 0, intervalDims = 0, boundedDimLimit = 0;
+    double boundedReads = 0, intervalReads = 0, boundedReadLimit = 0;
     int64_t live = 0, eligibleVectors = 0, eligibleDocs = 0, exactDocs = 0;
     int64_t boundedDocs = 0, boundedLive = 0, ivf = 0;
   };
@@ -123,6 +131,11 @@ struct KnnPlanner {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
   }
   static double predictedChecks(const Segment& s, double fraction) { return fraction * s.vectors; }
+  static double mispredicts(double examined, double passes) {
+    if (examined <= 0) return 0;
+    double p = std::clamp(passes / examined, 0.0, 1.0);
+    return examined * p * (1 - p);
+  }
   static bool borrowDomain(const Segment& s) {
     return !s.unfiltered && !s.sparse && !s.multi && !s.arrayDomain;
   }
@@ -175,6 +188,10 @@ struct KnnPlanner {
       // A borrowed domain stays read-only until bounded pooling clears ranks.
       if (borrowDomain(s) && s.bounded) p.deepenCopy = ((s.vectors + 63) / 64) * costs.units[FOLD_WORD];
     }
+    // Both resolve and folded selectors pay these terms. They cancel in
+    // the round-one selector crossover; allocator liveness probes do not.
+    if (s.codec == Codec::PQ && (!s.unfiltered || s.deletes)) p.linear[ENTRY_PQ] = (double)s.vectors;
+    p.linear[ENTRY_MISPREDICT] = mispredicts((double)s.vectors, (double)s.eligibleVectors);
     if (s.deletes) {
       // Allocation probes physical ids for liveness too. Allow one extra
       // head list for nextFraction's lookahead at the round boundary.
@@ -188,11 +205,12 @@ struct KnnPlanner {
       p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
       if (s.rabitqBits > 1) p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
     }
-    if (s.codec == Codec::PQ) p.linear[PQ_LIST_SETUP] = s.nlist;
+    if (s.codec == Codec::PQ) p.linear[PQ_LIST_SETUP] = s.l2 ? (double)s.nlist * s.pqM : 0;
     else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
     p.a = costs.price(p.linear);
     p.b = costs.price(p.fixed);
+    p.intervalReadFraction = costs.intervalReadFraction(s.dims);
     return p;
   }
   static void addIvf(Totals& t, const Segment& s, const Price& p, int sign) {
@@ -205,7 +223,12 @@ struct KnnPlanner {
     if (s.bounded) {
       t.boundedDocs += sign * s.eligibleDocs; t.boundedLive += sign * s.liveVectors;
       t.boundedDims += sign * (double)s.eligibleVectors * s.dims;
-    } else t.intervalDims += sign * (double)s.eligibleVectors * s.dims;
+      t.boundedReads += sign * (double)s.eligibleVectors;
+    } else {
+      // Interval reads are a fraction of examined vectors, fixed per slot.
+      t.intervalDims += sign * (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
+      t.intervalReads += sign * (double)s.eligibleVectors * p.intervalReadFraction;
+    }
   }
   struct Effort {
     double initial = 0, coverage = 0, rounds = 0;
@@ -225,30 +248,39 @@ struct KnnPlanner {
   }
   static double coverage(const Totals& t, const Request& request) { return effort(t, request).coverage; }
   static double rounds(const Totals& t, const Request& request) { return effort(t, request).rounds; }
-  static double terminalDims(const Totals& t, double coverage, const Costs& costs) {
-    return std::min(t.boundedDims, t.boundedReadLimit) + coverage * t.intervalDims * costs.intervalReadFraction;
+  static double terminalDims(const Totals& t, double coverage) {
+    return std::min(t.boundedDims, t.boundedDimLimit) + coverage * t.intervalDims;
+  }
+  static double terminalReads(const Totals& t, double coverage) {
+    return std::min(t.boundedReads, t.boundedReadLimit) + coverage * t.intervalReads;
+  }
+  static double terminalCost(double reads, double dims, const Costs& costs) {
+    return reads * costs.units[TERMINAL_READ] + dims * costs.units[TERMINAL_DIM];
   }
   static double totalCost(const Totals& t, const Request& request, const Costs& costs, double selector) {
     auto e = effort(t, request);
     return costs.requestCost + t.exact + e.coverage * t.a + t.b + selector
-        + t.ivf * e.rounds * costs.units[ROUND]
-        + terminalDims(t, e.coverage, costs) * costs.units[TERMINAL_DIM];
+        + t.ivf * e.rounds * costs.units[ROUND] + (t.ivf ? costs.units[IVF_REQUEST] : 0)
+        + terminalCost(terminalReads(t, e.coverage), terminalDims(t, e.coverage), costs);
   }
   static Totals exactTotals(std::span<const Segment> segments, std::span<const Price> prices,
                             const Request& request) {
     Totals t;
-    double vectorDims = 0;
+    double vectorDims = 0, vectors = 0;
     int64_t docs = 0;
     for (size_t i = 0; i < segments.size(); i++) {
       const auto& s = segments[i];
       t.exact += prices[i].exactCost; t.exactDocs += s.eligibleDocs;
-      if (canIvf(s) && s.bounded) { vectorDims += (double)s.vectors * s.dims; docs += s.docsWithValue; }
+      if (canIvf(s) && s.bounded) {
+        vectorDims += (double)s.vectors * s.dims; vectors += (double)s.vectors; docs += s.docsWithValue;
+      }
     }
-    // One shared bounded pool. Freeze the physical average dimensions per
+    // One shared bounded pool. Freeze physical average reads/dimensions per
     // document before mode choice; do not multiply the pool by slot count.
-    // Eligible dimensions cap the allowance when fewer vectors can be read.
+    // Eligible counts cap the allowances when fewer vectors can be read.
     // Selection can favor higher-multiplicity docs, so this is an estimate.
-    t.boundedReadLimit = request.boundedTarget * vectorDims / std::max((int64_t)1, docs);
+    t.boundedDimLimit = request.boundedTarget * vectorDims / std::max((int64_t)1, docs);
+    t.boundedReadLimit = request.boundedTarget * vectors / std::max((int64_t)1, docs);
     return t;
   }
   // Routing changes P0, hence which selectors fold in round one. A Fenwick
@@ -314,19 +346,21 @@ struct KnnPlanner {
     selectors.clear();
     keep(exact, modes);
     if (request.nprobe > 0) {
-      // Pinned effort makes everything except the shared bounded allowance
-      // additive. min(sum eligible dimensions, pool limit) is the lower
-      // envelope of two additive objectives; minimize each independently.
+      // Pinned effort is additive except for the shared bounded allowances
+      // and IVF request charge. Each min(sum, limit) has two additive arms;
+      // minimize their combinations, then compare against all-exact. The
+      // request charge is constant over nonempty IVF configurations.
       double p = result.allIvfCoverage;
-      for (bool capped : {false, true}) {
+      for (bool capReads : {false, true}) for (bool capDims : {false, true}) {
         Totals t = exact;
         selectors.clear();
         std::fill(modes.begin(), modes.end(), false);
         for (size_t i : order) {
           const auto& s = segments[i]; const auto& price = result.prices[i];
-          double terminal = (double)s.eligibleVectors * s.dims
-              * (s.bounded ? capped ? 0 : 1 : p * costs.intervalReadFraction);
-          double ivf = p * price.a + price.b + selectorCost(price, p, false) + costs.units[ROUND] + terminal * costs.units[TERMINAL_DIM];
+          double reads = (double)s.eligibleVectors * (s.bounded ? capReads ? 0 : 1 : p * price.intervalReadFraction);
+          double dims = (double)s.eligibleVectors * s.dims * (s.bounded ? capDims ? 0 : 1 : p * price.intervalReadFraction);
+          double ivf = p * price.a + price.b + selectorCost(price, p, false) + costs.units[ROUND]
+              + terminalCost(reads, dims, costs);
           if (ivf <= price.exactCost) { modes[i] = true; addIvf(t, s, price, 1); selectors.add(i, price, 1); }
         }
         keep(t, modes);
@@ -336,11 +370,12 @@ struct KnnPlanner {
       std::vector<double> savings(segments.size());
       for (size_t i : order) {
         const auto& s = segments[i]; const auto& price = result.prices[i];
-        double terminal = (double)s.eligibleVectors * s.dims * (s.bounded
-            ? std::min(1.0, all.boundedReadLimit / std::max(1.0, all.boundedDims))
-            : p * costs.intervalReadFraction);
+        double dims = (double)s.eligibleVectors * s.dims * (s.bounded
+            ? std::min(1.0, all.boundedDimLimit / std::max(1.0, all.boundedDims)) : p * price.intervalReadFraction);
+        double reads = (double)s.eligibleVectors * (s.bounded
+            ? std::min(1.0, all.boundedReadLimit / std::max(1.0, all.boundedReads)) : p * price.intervalReadFraction);
         savings[i] = price.exactCost - p * price.a - price.b
-            - selectorCost(price, effort(all, request).initial, p > effort(all, request).initial) - roundCost - terminal * costs.units[TERMINAL_DIM];
+            - selectorCost(price, effort(all, request).initial, p > effort(all, request).initial) - roundCost - terminalCost(reads, dims, costs);
       }
       std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
         double x = savings[a], y = savings[b]; return x != y ? x < y : a < b;
@@ -372,21 +407,27 @@ struct KnnPlanner {
     return result;
   }
 
+  // Per-segment work only. The host adds IVF_REQUEST once for the query;
+  // segment completion must not charge that sunk, shared cost again.
   static Work actualWork(const Segment& s, const VectorSearchWork& w) {
     Work f{};
     f[EXACT_DIM] = (double)w.exactVectors * s.dims;
-    f[TERMINAL_DIM] = (double)(w.seedReads + w.remainingReads) * s.dims;
+    f[TERMINAL_READ] = (double)(w.seedReads + w.remainingReads);
+    f[TERMINAL_DIM] = f[TERMINAL_READ] * s.dims;
     f[DOMAIN_DOC] = (double)w.domainDocs; f[RANK_VISIT] = (double)w.rankVisits;
     f[FLAT_PROBE] = (double)w.domainProbes;
     f[SPARSE_MAP] = (double)w.sparseMaps; f[MULTI_MAP] = (double)w.multiMaps;
     f[ENTRY_NONE] = (double)w.selectorNone; f[ENTRY_BITMAP] = (double)(w.selectorBitmap + w.allocatorEntries);
+    if (s.codec == Codec::PQ)
+      f[ENTRY_PQ] = (double)(w.selectorBitmap + w.resolveIdentity + w.resolveSelect + w.resolveMono);
+    f[ENTRY_MISPREDICT] = mispredicts((double)w.physicalEntries, (double)w.selectorPasses);
     f[RESOLVE_IDENTITY] = (double)w.resolveIdentity; f[RESOLVE_SELECT] = (double)w.resolveSelect;
     f[RESOLVE_MONO] = (double)w.resolveMono;
     f[BIT_PROBE] = (double)w.bitProbes; f[ARRAY_STEP] = (double)w.arraySteps;
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
     f[ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
-    f[PQ_LIST_SETUP] = s.codec == Codec::PQ ? (double)w.listSetups : 0;
+    f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 ? (double)w.listSetups * s.pqM : 0;
     f[RABITQ_LIST_DIM] = s.codec == Codec::RABITQ ? (double)w.listSetups * s.dims : 0;
     f[FOLD_DOC] = (double)w.foldDocs; f[FOLD_WORD] = (double)w.foldWords;
     f[COARSE_DIM] = (double)w.coarseDims; f[ROUND] = (double)w.ivfRounds;

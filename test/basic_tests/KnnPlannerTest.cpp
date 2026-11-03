@@ -12,22 +12,30 @@ KnnPlanner::Segment segment(int64_t eligible = 1000) {
   return {.vectors = 100000, .liveVectors = 100000, .docsWithValue = 100000,
       .eligibleDocs = eligible, .eligibleVectors = eligible, .domainSize = eligible, .maxDoc = 100000,
       .dims = 128, .nlist = 256, .pqM = 32, .pqBits = 8,
-      .codec = KnnPlanner::Codec::PQ, .domain = true, .unfiltered = false, .bounded = true};
+      .codec = KnnPlanner::Codec::PQ, .l2 = true, .domain = true, .unfiltered = false, .bounded = true};
 }
 // Enumerate configurations independently of the planner's running-sum updates.
 double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Request& req,
             const KnnPlanner::Costs& costs, uint64_t mask) {
   double exact = 0, linear = 0, fixed = 0, boundedDims = 0, intervalDims = 0, physicalDims = 0;
+  double boundedReads = 0, intervalReads = 0, physicalReads = 0;
   int64_t live = 0, eligible = 0, docs = 0, exactDocs = 0, bounded = 0, boundedLive = 0, physicalDocs = 0, slots = 0;
   for (size_t i = 0; i < segments.size(); i++) {
     const auto& s = segments[i];
     auto p = KnnPlanner::price(s, req, costs);
-    if (KnnPlanner::canIvf(s) && s.bounded) { physicalDims += (double)s.vectors * s.dims; physicalDocs += s.docsWithValue; }
+    if (KnnPlanner::canIvf(s) && s.bounded) {
+      physicalDims += (double)s.vectors * s.dims; physicalReads += (double)s.vectors; physicalDocs += s.docsWithValue;
+    }
     if ((mask >> i & 1) && KnnPlanner::canIvf(s)) {
       linear += p.a; fixed += p.b; live += s.liveVectors; slots++;
       eligible += s.eligibleVectors; docs += s.eligibleDocs;
-      if (s.bounded) { bounded += s.eligibleDocs; boundedLive += s.liveVectors; boundedDims += (double)s.eligibleVectors * s.dims; }
-      else intervalDims += (double)s.eligibleVectors * s.dims;
+      if (s.bounded) {
+        bounded += s.eligibleDocs; boundedLive += s.liveVectors;
+        boundedDims += (double)s.eligibleVectors * s.dims; boundedReads += (double)s.eligibleVectors;
+      } else {
+        intervalDims += (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
+        intervalReads += (double)s.eligibleVectors * p.intervalReadFraction;
+      }
     } else { exact += p.exactCost; exactDocs += s.eligibleDocs; }
   }
   double p0 = live ? KnnPlanner::initialScanFraction(req, (double)eligible / live) : 0;
@@ -35,8 +43,10 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
   if (live && !req.nprobe) coverage = std::min(1.0, std::max({coverage,
       bounded ? (double)std::min({req.boundedTarget, bounded, boundedLive}) / bounded : 0,
       (double)std::max((int64_t)0, req.k - exactDocs) / std::max((int64_t)1, docs)}));
-  double reads = std::min(boundedDims, req.boundedTarget * physicalDims / std::max((int64_t)1, physicalDocs))
-      + coverage * intervalDims * costs.intervalReadFraction;
+  double dims = std::min(boundedDims, req.boundedTarget * physicalDims / std::max((int64_t)1, physicalDocs))
+      + coverage * intervalDims;
+  double reads = std::min(boundedReads, req.boundedTarget * physicalReads / std::max((int64_t)1, physicalDocs))
+      + coverage * intervalReads;
   double rounds = slots == 0 ? 0 : coverage <= p0 ? 1 : 1 + std::ceil(std::log2(coverage / p0));
   double selectors = 0;
   for (size_t i = 0; i < segments.size(); i++) if ((mask >> i & 1) && KnnPlanner::canIvf(segments[i])) {
@@ -49,8 +59,9 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
     selectors += (folded || coverage > p0 ? fold : 0)
         + (folded ? 0 : KnnPlanner::predictedChecks(s, p0) * (KnnPlanner::resolveCost(s, costs) - costs.units[KnnPlanner::ENTRY_BITMAP]));
   }
-  return costs.requestCost + selectors + exact + coverage * linear + fixed + reads * costs.units[KnnPlanner::TERMINAL_DIM]
-      + slots * rounds * costs.units[KnnPlanner::ROUND];
+  return costs.requestCost + selectors + exact + coverage * linear + fixed + dims * costs.units[KnnPlanner::TERMINAL_DIM]
+      + reads * costs.units[KnnPlanner::TERMINAL_READ] + slots * rounds * costs.units[KnnPlanner::ROUND]
+      + (slots ? costs.units[KnnPlanner::IVF_REQUEST] : 0);
 }
 }
 
@@ -144,8 +155,9 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   auto plan = KnnPlanner::choose(segments, req, costs, KnnPlanner::Routing::FORCE_IVF);
   auto totals = KnnPlanner::exactTotals(segments, plan.prices, req);
   for (int i = 0; i < 3; i++) KnnPlanner::addIvf(totals, segments[i], plan.prices[i], 1);
-  EXPECT_EQ(KnnPlanner::terminalDims(totals, KnnPlanner::coverage(totals, req), costs), 100 * 128);
-  EXPECT_EQ(plan.prices[0].linear[KnnPlanner::PQ_LIST_SETUP], 256);
+  EXPECT_EQ(KnnPlanner::terminalDims(totals, KnnPlanner::coverage(totals, req)), 100 * 128);
+  EXPECT_EQ(KnnPlanner::terminalReads(totals, KnnPlanner::coverage(totals, req)), 100);
+  EXPECT_EQ(plan.prices[0].linear[KnnPlanner::PQ_LIST_SETUP], 256 * 32);
   EXPECT_EQ(plan.prices[0].linear[KnnPlanner::RABITQ_LIST_DIM], 0);
   segments[0].codec = KnnPlanner::Codec::RABITQ;
   auto price = KnnPlanner::price(segments[0], req, costs);
@@ -156,6 +168,7 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   auto actual = KnnPlanner::actualWork(segments[0], work);
   EXPECT_EQ(actual[KnnPlanner::EXACT_DIM], 10 * 128);
   EXPECT_EQ(actual[KnnPlanner::TERMINAL_DIM], 5 * 128);
+  EXPECT_EQ(actual[KnnPlanner::TERMINAL_READ], 5);
   EXPECT_EQ(actual[KnnPlanner::ROUND], 0);
 }
 
@@ -220,4 +233,60 @@ TEST(KnnPlannerTest, selectorCrossoverAndDeepenCost) {
   EXPECT_EQ(1, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
   s.arrayDomain = true;
   EXPECT_EQ(99999, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
+}
+
+TEST(KnnPlannerTest, sharedIvfRequestCanFavorExact) {
+  auto s = segment(5000);
+  s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 5000;
+  s.nlist = 16; s.domain = false; s.unfiltered = true;
+  std::array segments{s};
+  KnnPlanner::Costs costs;
+  double requestCost = costs.units[KnnPlanner::IVF_REQUEST];
+  for (int nprobe : {0, 16}) {
+    KnnPlanner::Request req{.k = 3, .boundedTarget = 100, .nprobe = nprobe, .referenceBreadth = 256};
+    costs.units[KnnPlanner::IVF_REQUEST] = 0;
+    auto without = KnnPlanner::choose(segments, req, costs);
+    ASSERT_TRUE(without.ivf[0]);
+    costs.units[KnnPlanner::IVF_REQUEST] = requestCost;
+    auto with = KnnPlanner::choose(segments, req, costs);
+    EXPECT_FALSE(with.ivf[0]);
+    EXPECT_DOUBLE_EQ(without.allIvfCost + requestCost, with.allIvfCost);
+    EXPECT_DOUBLE_EQ(without.allExactCost, with.allExactCost);
+    EXPECT_DOUBLE_EQ(with.allExactCost, with.cost);
+    auto forced = KnnPlanner::choose(segments, req, costs, KnnPlanner::Routing::FORCE_EXACT);
+    EXPECT_DOUBLE_EQ(without.allExactCost, forced.cost);
+    std::array multiple{s, s, s};
+    auto all = KnnPlanner::choose(multiple, req, costs, KnnPlanner::Routing::FORCE_IVF);
+    costs.units[KnnPlanner::IVF_REQUEST] = 0;
+    auto noCharge = KnnPlanner::choose(multiple, req, costs, KnnPlanner::Routing::FORCE_IVF);
+    EXPECT_DOUBLE_EQ(noCharge.cost + requestCost, all.cost);
+  }
+}
+
+TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
+  for (auto codec : {KnnPlanner::Codec::PQ, KnnPlanner::Codec::RABITQ})
+    for (bool l2 : {false, true}) for (int selector : {0, 1, 2}) {
+      SCOPED_TRACE(::testing::Message() << (int)codec << '/' << l2 << '/' << selector);
+      auto s = segment(selector ? 10 : 100);
+      s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 100;
+      s.nlist = 3; s.pqM = 4; s.codec = codec; s.l2 = l2;
+      s.domain = selector != 0; s.unfiltered = selector == 0;
+      auto price = KnnPlanner::price(s, {}, {});
+      VectorSearchWork work;
+      work.listSetups = 3; work.physicalEntries = 100; work.selectorPasses = s.eligibleVectors;
+      work.selectorNone = selector == 0 ? 100 : 0;
+      work.selectorBitmap = selector == 1 ? 100 : 0;
+      work.resolveIdentity = selector == 2 ? 100 : 0;
+      work.seedReads = 2; work.remainingReads = 3; work.ivfRounds = 1;
+      auto actual = KnnPlanner::actualWork(s, work);
+      for (const auto& features : {price.linear, actual}) {
+        EXPECT_EQ(codec == KnnPlanner::Codec::PQ && selector ? 100 : 0, features[KnnPlanner::ENTRY_PQ]);
+        EXPECT_DOUBLE_EQ(selector ? 9 : 0, features[KnnPlanner::ENTRY_MISPREDICT]);
+        EXPECT_EQ(codec == KnnPlanner::Codec::PQ && l2 ? 12 : 0, features[KnnPlanner::PQ_LIST_SETUP]);
+        EXPECT_EQ(0, features[KnnPlanner::IVF_REQUEST]); // Shared charge stays out of completion.
+      }
+      EXPECT_EQ(5, actual[KnnPlanner::TERMINAL_READ]);
+      EXPECT_EQ(5 * 128, actual[KnnPlanner::TERMINAL_DIM]);
+      EXPECT_EQ(0, KnnPlanner::actualWork(s, {})[KnnPlanner::ENTRY_MISPREDICT]);
+    }
 }

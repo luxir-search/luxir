@@ -759,7 +759,7 @@ public:
     for (double cost : tuning.plannerCosts.units) out.appendDouble(cost);
     out.appendDouble(tuning.plannerCosts.requestCost);
     out.appendDouble(tuning.plannerCosts.extraBitSurvival128);
-    out.appendDouble(tuning.plannerCosts.intervalReadFraction);
+    out.appendDouble(tuning.plannerCosts.intervalRead128);
     out.appendDouble(tuning.flatDomainDensityThreshold);
     out.appendDouble(tuning.filteredCoverageAlpha);
     out.appendDouble(tuning.breadthHeadroom);
@@ -987,7 +987,7 @@ public:
             input.docsWithValue = vr.docsWithValue(); input.eligibleDocs = eligible.eligibleDocs;
             input.eligibleVectors = eligible.eligibleVectors;
             input.domainSize = domain ? domain->card() : seg.maxDoc(); input.maxDoc = seg.maxDoc();
-            input.dims = dims; input.domain = domain != nullptr;
+            input.dims = dims; input.l2 = metric == (int32_t)api::VectorMetric::L2; input.domain = domain != nullptr;
             input.arrayDomain = domain && domain->type == DocSet::ARRAY;
             input.unfiltered = eligible.unfiltered; input.deletes = seg.liveDocs() != nullptr;
             input.sparse = vr.strColReader().docsReader().hasBitset(); input.multi = vr.isMultiValued();
@@ -1639,11 +1639,15 @@ public:
           statsForTests->predictedCost += plan.cost;
           statsForTests->modeledActualCost += tuning.plannerCosts.requestCost;
         }
+        bool ivfRequestPending = true;
         for (size_t i = 0; i < numSegs; i++) {
           const auto& input = planSegments[i];
           const auto& work = workBySeg[i];
           if (input.eligibleDocs == 0 || input.liveVectors == 0) continue;
           auto features = KnnPlanner::actualWork(input, work);
+          // Attribute the shared request charge to the first executed IVF
+          // piece for reporting, including queries that later complete exactly.
+          if (work.ivfRounds > 0 && std::exchange(ivfRequestPending, false)) features[KnnPlanner::IVF_REQUEST] = 1;
           if (statsForTests) {
             (plan.ivf[i] ? statsForTests->plannedIvf : statsForTests->plannedExact)++;
             statsForTests->modeledActualCost += tuning.plannerCosts.price(features);
@@ -1663,9 +1667,10 @@ public:
                 plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
                     + KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial),
                 plan.prices[i].a, plan.prices[i].b));
-            piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
+            piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; predicted_terminal_reads={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
                 KnnPlanner::coverage(modeled, planRequest), plan.cost, KnnPlanner::rounds(modeled, planRequest),
-                KnnPlanner::terminalDims(modeled, KnnPlanner::coverage(modeled, planRequest), tuning.plannerCosts), work.rounds,
+                KnnPlanner::terminalDims(modeled, KnnPlanner::coverage(modeled, planRequest)),
+                KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest)), work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
             for (size_t f = 0; f < features.size(); f++)
