@@ -119,8 +119,9 @@ The same presets and setup script work with Homebrew GCC. On macOS:
   `apple-m1`. Configure with `-DLUXIR_CPU_TARGET=apple-m1` for a binary that
   runs on any Apple silicon Mac.
 - jemalloc is not yet supported; `LUXIR_JEMALLOC` defaults to `OFF`.
-- ASan works, but GCC has no LeakSanitizer there; `detect_leaks=1` is
-  accepted and finds nothing.
+- ASan works, but leave `detect_leaks` off. GCC has no working LeakSanitizer
+  there, and its exit-time check can deadlock a process that still has
+  threads, such as the `luxir` server ServerShutdownTest spawns.
 - FAISS uses Apple's Accelerate for BLAS and LAPACK instead of OpenBLAS. Its
   matrix unit runs SGEMM at about 15 times the rate of single-threaded
   OpenBLAS on an M5. Accelerate runs its own threads; `VECLIB_MAXIMUM_THREADS`
@@ -280,6 +281,9 @@ cmake --preset gcc-debug-asan
 cmake --build --preset gcc-debug-asan
 ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
+
+On macOS, run the tests without `ASAN_OPTIONS` (see
+[macOS](#macos-apple-silicon)).
 
 The binaries for every preset are under `build/<preset>/bin/`.
 
