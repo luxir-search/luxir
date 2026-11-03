@@ -15,6 +15,7 @@
 #include <google/protobuf/arena.h>
 
 #include "luxir/reader/IntColReader.h"
+#include "luxir/reader/OrdColReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/MemPool.h"
@@ -108,6 +109,9 @@ struct BoundValueNode {
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
+  // A non-numeric (string or id) column, which only count() reads.
+  std::optional<OrdColReader> ordColumn;
+  std::optional<OrdColReader::Iterator> ordIterator;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;
@@ -141,6 +145,8 @@ public:
   void evalScalarBatch(std::span<const int32_t> docids,
                        std::span<ScalarValueResult> results);
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
+  // The number of values a non-numeric column node holds for the document.
+  int64_t countOrdValues(uint32_t node, int32_t docid);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
   const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
   std::string_view firstUnboundedNode() const;

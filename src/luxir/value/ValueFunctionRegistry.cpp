@@ -165,8 +165,10 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
 }
 
+// count() also takes a string or id column, the one place a non-numeric
+// column is valid inside an expression: it counts the column's values.
 ResolvedValue countResolve(std::span<const ResolvedValue> args) {
-  requireNumeric(args);
+  unused(args);
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
@@ -699,6 +701,9 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
 
 ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
+  if (program.program.nodes[node.children[0]].type == ValueType::COLUMN_ONLY) {
+    return ValueResult::integer(program.countOrdValues(node.children[0], docid));
+  }
   ValueResult input = program.evalNode(node.children[0], docid, score);
   if (!input.valid) return ValueResult::integer(0);
   if (!valueArray(input.type)) return ValueResult::integer(1);
@@ -1418,7 +1423,7 @@ ValueBounds countBounds(const ValueNode& node,
                         std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
   if (args[0].alwaysMissing) return ValueBounds::integer(0, 0);
-  if (!valueArray(args[0].type)) {
+  if (!valueArray(args[0].type) && args[0].type != ValueType::COLUMN_ONLY) {
     if (!args[0].mayBeMissing) return ValueBounds::integer(1, 1);
     ValueBounds out = ValueBounds::integer(0, 1);
     out.minAttained = false;
@@ -2016,6 +2021,11 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       auto* fieldInfo = fields[index].at(segment);
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
+      } else if (node.type == ValueType::COLUMN_ONLY) {
+        bound.ordColumn.emplace(postings, *fieldInfo);
+        bound.ordIterator.emplace(*bound.ordColumn);
+        bound.bounds = ValueBounds::unbounded(node.type,
+            fieldInfo->docsWithField < postings.maxDoc());
       } else {
         bound.column.emplace(postings, *fieldInfo);
         bound.iterator.emplace(*bound.column);
@@ -2129,6 +2139,24 @@ ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float
   if (node.type == ValueType::INT64) return ValueResult::integer(node.intValue);
   if (node.type == ValueType::DOUBLE) return ValueResult::floating(node.doubleValue);
   return ValueResult::arrayValue(node.type, index, docid, score, node.arraySize);
+}
+
+int64_t BoundValueProgram::countOrdValues(uint32_t index, int32_t docid) {
+  BoundValueNode& bound = nodes[index];
+  if (!bound.ordColumn) return 0;
+  if (bound.ordIterator->docId() > docid) {
+    bound.ordIterator.reset();
+    bound.ordIterator.emplace(*bound.ordColumn);
+  }
+  OrdColReader::Iterator& iterator = *bound.ordIterator;
+  if (iterator.docId() < docid) iterator.advance(docid);
+  if (iterator.docId() != docid) return 0;
+  // A stored 0 is no value, as for the aggregate ord bindings.
+  if (!bound.ordColumn->multiValued()) return iterator.value() != 0 ? 1 : 0;
+  auto [start, end] = bound.ordColumn->getStartEndValueRank(iterator.rank());
+  int64_t count = 0;
+  for (int64_t i = start; i < end; i++) count += iterator.values().valueAt(i) != 0;
+  return count;
 }
 
 ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float score) {

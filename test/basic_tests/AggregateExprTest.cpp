@@ -610,6 +610,49 @@ TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
   EXPECT_GT(req->memoryTracker.peak(), 0u);
 }
 
+TEST_F(AggregateExprTest, countTakesStringAndIdColumns) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.indexAll({
+      flatdoc("id", "a", "s_s", "x", "tags_ss", vecs("p", "q", "r"), "n_i", 1),
+      flatdoc("id", "b", "tags_ss", vecs("p"), "n_i", 2)}, UpdateMessage::COMMIT);
+  helper.indexAll({
+      flatdoc("id", "c", "s_s", "y", "n_i", 1),
+      flatdoc("id", "d", "s_s", "x", "tags_ss", vecs("q", "s"), "n_i", 2)}, UpdateMessage::COMMIT);
+  helper.indexAll({flatdoc("id", "e", "n_i", 1)}, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("strings", "sum(count(s_s))");
+  root.expr("tags", "sum(count(tags_ss))");
+  root.expr("ids", "sum(count(id))");
+  root.expr("tagged", "sum(min(count(tags_ss), 1))");
+  auto& facet = root.facet("by_n", "n_i").limit(-1);
+  facet.expr("tags", "sum(count(tags_ss))");
+  facet.expr("strings", "sum(count(s_s))");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(3, req->scalar<int64_t>("strings"));
+  EXPECT_EQ(6, req->scalar<int64_t>("tags"));
+  EXPECT_EQ(5, req->scalar<int64_t>("ids"));
+  EXPECT_EQ(3, req->scalar<int64_t>("tagged"));
+  const auto* result = req->responses[0]->proto.ops.at("by_n")->facetResult();
+  ASSERT_NE(nullptr, result);
+  // n_i 1 (a, c, e) comes first, then 2 (b, d).
+  const auto& tags = std::get<api::ArrVal>(result->ops.at("tags")->kind).v;
+  const auto& strings = std::get<api::ArrVal>(result->ops.at("strings")->kind).v;
+  ASSERT_EQ(2u, tags.size());
+  EXPECT_EQ(3, tags[0].asInt());
+  EXPECT_EQ(3, tags[1].asInt());
+  EXPECT_EQ(2, strings[0].asInt());
+  EXPECT_EQ(1, strings[1].asInt());
+
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  expectParseError(memory, *schema, "sum(abs(s_s))",
+                   "a non-numeric column is only valid");
+}
+
 TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
   CollectionHelper helper;
   helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
