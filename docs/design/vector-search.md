@@ -375,24 +375,31 @@ The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
 Routing uses column and overlay metadata before loading FAISS or rank-liveness
-state. Eligible docs and vectors are exact for every segment: single-valued
-columns count domain members (intersected with the has-field bitset when the
-column is sparse), and multi-valued columns sum value ranges from the end-rank
-column over the domain or its smaller complement. Folding a domain into a rank
-bitmap uses the same walk.
+state. Single-valued eligibility counts are exact. Unfiltered multi-valued
+columns use upper bounds without a domain walk; IVF replaces their live-vector
+bound with the cached rank-liveness count. Filtered multi-valued counts sum
+value ranges for array domains or when the domain or its complement has at
+most 1024 docs. Larger bitset domains estimate vectors from eligible docs and
+average multiplicity. AUTO folds these domains in round one, obtaining the
+exact count before IVF sets selectivity and its stopping target. Cheap counts
+and rank-bitmap folds use the same doc-to-rank walk.
 
 `KnnPlanner` prices predicted work with one calibrated unit-cost table. Exact
 slots pay per scored dimension, per visited domain doc and per rank mapping.
 IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
 tests the selector through a virtual call) and a branch-misprediction term
 proportional to `p(1-p)` for selector pass rate `p`; per codec score (PQ
-subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup (RaBitQ
-re-quantizes the query residual for every list, so its cost scales with
-dimensions, while PQ rebuilds its table per list only under L2, so its cost
-scales with subquantizers and is zero for inner product and cosine); per coarse
+subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
-dimension. Every query pays a request constant, and any query that runs IVF
-pays a second one. Units are nanoseconds divided by the cost of one exact
+dimension. RaBitQ re-quantizes the query residual for every list, so its list
+setup scales with dimensions. PQ list setup is zero for inner product and
+cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
+precomputed table; without it, FAISS computes a full distance table per list,
+priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
+the exact-dimension cost. Interval terminal reads have a shared floor of
+`min(k, examined interval vectors)`, with dimensions scaled by the
+read-weighted average. Every query pays a request constant, and any query that
+runs IVF pays a second one. Units are nanoseconds divided by the cost of one exact
 dimension; counters expose the same units, and `KnnPlanner::Costs` records what
 they were fitted on.
 
