@@ -11,10 +11,13 @@
 #include <initializer_list>
 #include <limits>
 #include <memory_resource>
+#include <numbers>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "luxir/api/build.h"
@@ -31,6 +34,7 @@
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
+#include "test/LinearPolygon.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -1005,13 +1009,123 @@ TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
     GeoPolygonQuery large(world.pool, field, world.polygons);
     GeoPolygonQuery parts(several.pool, field, several.polygons);
     for (GeoPolygonQuery* query : {&concave, &large, &parts}) {
-      auto expected = relationOracle(points, query->makeRelation());
+      auto expected = relationOracle(points, LinearPolygonRelation(query->getPolygons()));
       EXPECT_FALSE(expected.empty()) << field;
       EXPECT_EQ(expected, runQuery(*reader, *query, false, false)) << field;
       EXPECT_EQ(expected, runQuery(*reader, *query, true, true)) << field;
     }
   }
 }
+// The edge trees and the grid answer exactly as a scan of every edge does,
+// for cells and for points, on random polygons that often self-intersect:
+// scattered vertices, noisy circles, vertices snapped onto a coarse grid
+// (collinear and axis-parallel edges), holes that may leave their polygon,
+// and unions of overlapping parts.
+TEST_F(GeoPolygonQueryTest, indexedRelationMatchesLinearScan) {
+  SplitMix64 rng(0x5e1f1a7e);
+  auto uniform = [&](double lo, double hi) { return lo + unitDouble(rng) * (hi - lo); };
+  auto vertex = [](double lat, double lon) {
+    return geo::LatLon{std::clamp(lat, -90.0, 90.0), std::clamp(lon, -180.0, 180.0)};
+  };
+  auto ring = [&](double lat, double lon, double radius) {
+    int32_t n = 3 + (int32_t)(rng() % 40);
+    uint64_t shape = rng() % 3;
+    Ring out;
+    for (int32_t i = 0; i < n; i++) {
+      if (shape == 0) {
+        out.push_back(vertex(lat + uniform(-radius, radius), lon + uniform(-radius, radius)));
+        continue;
+      }
+      double angle = 2.0 * std::numbers::pi * i / n;
+      double r = radius * uniform(0.4, 1.0);
+      geo::LatLon point = vertex(lat + r * std::sin(angle), lon + r * std::cos(angle));
+      if (shape == 2) {
+        double step = radius / 4.0;
+        point = vertex(std::round(point.lat / step) * step, std::round(point.lon / step) * step);
+      }
+      out.push_back(point);
+    }
+    return out;
+  };
+  auto encodedPoint = [&](double lat, double lon, int32_t jitter) {
+    auto shift = [&](int32_t value) {
+      int64_t moved = (int64_t)value + (int64_t)(rng() % (2 * (uint64_t)jitter + 1)) - jitter;
+      return (int32_t)std::clamp<int64_t>(moved, INT32_MIN, INT32_MAX);
+    };
+    return std::pair{shift(geo::encodeLatitude(std::clamp(lat, -90.0, 90.0))),
+                     shift(geo::encodeLongitude(std::clamp(lon, -180.0, 180.0)))};
+  };
+
+  int32_t built = 0;
+  std::array<int32_t, 3> relations{};
+  std::array<int32_t, 2> matched{};
+  for (int32_t trial = 0; trial < 120; trial++) {
+    SCOPED_TRACE(trial);
+    double lat = uniform(-80.0, 80.0), lon = uniform(-170.0, 170.0);
+    double radius = std::exp(uniform(std::log(1e-4), std::log(15.0)));
+    PolygonSet set;
+    int32_t parts = 1 + (int32_t)(rng() % 3);
+    for (int32_t p = 0; p < parts; p++) {
+      double partLat = lat + uniform(-radius, radius), partLon = lon + uniform(-radius, radius);
+      std::vector<Ring> holes;
+      for (uint64_t h = rng() % 3; h > 0; h--) {
+        holes.push_back(ring(partLat + uniform(-radius, radius) / 2,
+                             partLon + uniform(-radius, radius) / 2, radius / 2));
+      }
+      set.add(ring(partLat, partLon, radius), std::move(holes));
+    }
+    std::optional<GeoPolygonQuery> query;
+    try {
+      query.emplace(set.pool, "geo", set.polygons);
+    } catch (const std::invalid_argument&) {
+      continue;  // a snapped ring collapsed below three distinct vertices
+    }
+    built++;
+    const BKDPolygonRelation& relation = query->makeRelation();
+    LinearPolygonRelation linear(query->getPolygons());
+    std::vector<geo::LatLon> vertices;
+    for (const auto& polygon : query->getPolygons()) {
+      vertices.insert(vertices.end(), polygon.outer.begin(), polygon.outer.end());
+      for (auto hole : polygon.holes) vertices.insert(vertices.end(), hole.begin(), hole.end());
+    }
+    double reach = 2.5 * radius;
+    for (int32_t i = 0; i < 300; i++) {
+      const geo::LatLon& near = vertices[rng() % vertices.size()];
+      auto [cellLat, cellLon] = i % 2 == 0
+          ? encodedPoint(near.lat, near.lon, 64)
+          : encodedPoint(lat + uniform(-reach, reach), lon + uniform(-reach, reach), 0);
+      int64_t half = (int64_t)std::exp(uniform(0.0, std::log(geo::LAT_SCALE * reach)));
+      auto clampInt = [](int64_t v) { return (int32_t)std::clamp<int64_t>(v, INT32_MIN, INT32_MAX); };
+      int32_t latMin = clampInt(cellLat - half), latMax = clampInt(cellLat + half);
+      int32_t lonMin = clampInt(cellLon - 2 * half), lonMax = clampInt(cellLon + 2 * half);
+      BKDRelation expected = linear.compare(latMin, latMax, lonMin, lonMax);
+      ASSERT_EQ(expected, relation.compare(latMin, latMax, lonMin, lonMax))
+          << latMin << ".." << latMax << " x " << lonMin << ".." << lonMax;
+      relations[(size_t)expected]++;
+    }
+    for (int32_t i = 0; i < 600; i++) {
+      std::pair<int32_t, int32_t> point;
+      if (i % 3 == 0) {
+        point = encodedPoint(lat + uniform(-reach, reach), lon + uniform(-reach, reach), 0);
+      } else {
+        // Near an edge: a point along the segment from a vertex to the next.
+        size_t at = rng() % vertices.size();
+        const geo::LatLon& a = vertices[at];
+        const geo::LatLon& b = vertices[(at + 1) % vertices.size()];
+        double t = unitDouble(rng);
+        point = encodedPoint(a.lat + t * (b.lat - a.lat), a.lon + t * (b.lon - a.lon), 4);
+      }
+      bool expected = linear.matches(point.first, point.second);
+      ASSERT_EQ(expected, relation.matches(point.first, point.second))
+          << point.first << "," << point.second;
+      matched[expected]++;
+    }
+  }
+  EXPECT_GT(built, 100);
+  for (int32_t count : relations) EXPECT_GT(count, 3000);
+  for (int32_t count : matched) EXPECT_GT(count, 10000);
+}
+
 // The public request path: a geo_polygon query over each cardinality.
 TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
   CollectionHelper helper;

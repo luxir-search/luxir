@@ -229,70 +229,106 @@ struct PolygonRings {
   std::span<const std::span<const LatLon>> holes;
 };
 
-// A polygon in degrees: one outer ring and optional holes. Rings are not
-// closed (the last vertex connects back to the first), and edges are straight
-// lines in latitude/longitude, as in Lucene's LatLonPoint polygon queries. A
-// point is inside when it is inside the outer ring and inside no hole, each by
-// the even-odd rule, so a self-intersecting ring still has a defined interior.
-// Points exactly on an edge may fall either way.
-struct Polygon {
-  std::span<const LatLon> outer;
-  std::span<const std::span<const LatLon>> holes;
-  BoundingBox box;
+// One ring edge, from the previous vertex (lat1, lon1) to the next one
+// (lat2, lon2). low is the edge's lower latitude and max the highest latitude
+// of the edge and of its subtree in the EdgeTree.
+struct Edge {
+  double lat1;
+  double lon1;
+  double lat2;
+  double lon2;
+  double low;
+  double max;
+};
 
-  // The polygon of rings, bounded by its outer ring's vertices.
-  static Polygon of(const PolygonRings& rings) {
-    BoundingBox box{rings.outer[0].lat, rings.outer[0].lat,
-                    rings.outer[0].lon, rings.outer[0].lon};
-    for (const LatLon& point : rings.outer) {
-      box.minLat = std::min(box.minLat, point.lat);
-      box.maxLat = std::max(box.maxLat, point.lat);
-      box.minLon = std::min(box.minLon, point.lon);
-      box.maxLon = std::max(box.maxLon, point.lon);
-    }
-    return {rings.outer, rings.holes, box};
-  }
+// A ring's edges as Lucene's EdgeTree: an interval tree over latitude, kept
+// implicit in an array sorted by (low, max) whose middle element roots each
+// range. A walk skips every subtree whose latitudes cannot meet the query, so
+// a point or a box visits O(log V + k) edges for k edges spanning its
+// latitude, not all V. Each visited edge gets the same test a scan of the
+// ring would give it, so the answers are the scan's.
+struct EdgeTree {
+  std::span<const Edge> edges;
 
-  static bool ringContains(std::span<const LatLon> ring, double lat,
-                           double lon) {
-    bool inside = false;
+  // Fills edges, one per ring vertex, and returns the tree over them.
+  static EdgeTree build(std::span<const LatLon> ring, std::span<Edge> edges) {
     size_t n = ring.size();
     for (size_t i = 0, j = n - 1; i < n; j = i++) {
-      const LatLon& a = ring[i];
-      const LatLon& b = ring[j];
-      if ((a.lat > lat) != (b.lat > lat)
-          && lon < (b.lon - a.lon) * (lat - a.lat) / (b.lat - a.lat) + a.lon) {
-        inside = !inside;
-      }
+      const LatLon& a = ring[j];
+      const LatLon& b = ring[i];
+      edges[i] = {a.lat, a.lon, b.lat, b.lon, std::min(a.lat, b.lat),
+                  std::max(a.lat, b.lat)};
     }
-    return inside;
+    std::ranges::sort(edges, [](const Edge& x, const Edge& y) {
+      return x.low != y.low ? x.low < y.low : x.max < y.max;
+    });
+    pullMax(edges);
+    return {edges};
   }
 
+  // Even-odd: whether a ray from the point toward greater longitude crosses
+  // the ring an odd number of times.
   bool contains(double lat, double lon) const {
-    if (lat < box.minLat || lat > box.maxLat
-        || lon < box.minLon || lon > box.maxLon
-        || !ringContains(outer, lat, lon)) {
-      return false;
-    }
-    for (auto hole : holes) {
-      if (ringContains(hole, lat, lon)) return false;
-    }
-    return true;
+    return crossesOdd(edges, lat, lon);
   }
 
-  // Whether any ring edge touches the closed rectangle. When none does, the
-  // whole rectangle is on one side of every ring, so one contains() probe
-  // classifies all of it.
-  bool edgeTouches(double minLat, double maxLat, double minLon,
-                   double maxLon) const {
-    if (ringTouches(outer, minLat, maxLat, minLon, maxLon)) return true;
-    for (auto hole : holes) {
-      if (ringTouches(hole, minLat, maxLat, minLon, maxLon)) return true;
+  // Whether any edge touches the closed rectangle.
+  bool touches(double minLat, double maxLat, double minLon,
+               double maxLon) const {
+    return anyTouches(edges, minLat, maxLat, minLon, maxLon);
+  }
+
+private:
+  static size_t root(std::span<const Edge> range) {
+    return (range.size() - 1) / 2;
+  }
+
+  static double pullMax(std::span<Edge> range) {
+    if (range.empty()) return -std::numeric_limits<double>::infinity();
+    size_t mid = root(range);
+    Edge& node = range[mid];
+    node.max = std::max({node.max, pullMax(range.first(mid)),
+                         pullMax(range.subspan(mid + 1))});
+    return node.max;
+  }
+
+  // An edge flips the ray's parity when its latitudes straddle lat, so lat
+  // lies in [low, highest latitude): subtrees with max <= lat cannot flip,
+  // and no edge right of a node with low > lat can either.
+  static bool crossesOdd(std::span<const Edge> range, double lat, double lon) {
+    bool odd = false;
+    while (!range.empty()) {
+      size_t mid = root(range);
+      const Edge& edge = range[mid];
+      if (lat >= edge.max) break;
+      if ((edge.lat2 > lat) != (edge.lat1 > lat)
+          && lon < (edge.lon1 - edge.lon2) * (lat - edge.lat2)
+                       / (edge.lat1 - edge.lat2) + edge.lon2) {
+        odd = !odd;
+      }
+      odd ^= crossesOdd(range.first(mid), lat, lon);
+      if (lat < edge.low) break;
+      range = range.subspan(mid + 1);
+    }
+    return odd;
+  }
+
+  static bool anyTouches(std::span<const Edge> range, double minLat,
+                         double maxLat, double minLon, double maxLon) {
+    while (!range.empty()) {
+      size_t mid = root(range);
+      const Edge& edge = range[mid];
+      if (minLat > edge.max) return false;
+      if (edgeTouches(edge, minLat, maxLat, minLon, maxLon)
+          || anyTouches(range.first(mid), minLat, maxLat, minLon, maxLon)) {
+        return true;
+      }
+      if (maxLat < edge.low) return false;
+      range = range.subspan(mid + 1);
     }
     return false;
   }
 
-private:
   static double orient(double ax, double ay, double bx, double by,
                        double cx, double cy) {
     return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
@@ -320,26 +356,68 @@ private:
         || (d4 == 0 && onSegment(ax, ay, bx, by, dx, dy));
   }
 
-  static bool ringTouches(std::span<const LatLon> ring, double minLat,
-                          double maxLat, double minLon, double maxLon) {
-    size_t n = ring.size();
-    for (size_t i = 0, j = n - 1; i < n; j = i++) {
-      double ax = ring[j].lon, ay = ring[j].lat;
-      double bx = ring[i].lon, by = ring[i].lat;
-      if (std::max(ax, bx) < minLon || std::min(ax, bx) > maxLon
-          || std::max(ay, by) < minLat || std::min(ay, by) > maxLat) {
-        continue;
-      }
-      if ((minLon <= ax && ax <= maxLon && minLat <= ay && ay <= maxLat)
-          || (minLon <= bx && bx <= maxLon && minLat <= by && by <= maxLat)) {
-        return true;
-      }
-      if (segmentsTouch(ax, ay, bx, by, minLon, minLat, maxLon, minLat)
-          || segmentsTouch(ax, ay, bx, by, maxLon, minLat, maxLon, maxLat)
-          || segmentsTouch(ax, ay, bx, by, maxLon, maxLat, minLon, maxLat)
-          || segmentsTouch(ax, ay, bx, by, minLon, maxLat, minLon, minLat)) {
-        return true;
-      }
+  static bool edgeTouches(const Edge& edge, double minLat, double maxLat,
+                          double minLon, double maxLon) {
+    double ax = edge.lon1, ay = edge.lat1;
+    double bx = edge.lon2, by = edge.lat2;
+    if (std::max(ax, bx) < minLon || std::min(ax, bx) > maxLon
+        || std::max(ay, by) < minLat || std::min(ay, by) > maxLat) {
+      return false;
+    }
+    if ((minLon <= ax && ax <= maxLon && minLat <= ay && ay <= maxLat)
+        || (minLon <= bx && bx <= maxLon && minLat <= by && by <= maxLat)) {
+      return true;
+    }
+    return segmentsTouch(ax, ay, bx, by, minLon, minLat, maxLon, minLat)
+        || segmentsTouch(ax, ay, bx, by, maxLon, minLat, maxLon, maxLat)
+        || segmentsTouch(ax, ay, bx, by, maxLon, maxLat, minLon, maxLat)
+        || segmentsTouch(ax, ay, bx, by, minLon, maxLat, minLon, minLat);
+  }
+};
+
+// A polygon in degrees: one outer ring and optional holes. Edges are
+// straight lines in latitude/longitude, as in Lucene's LatLonPoint polygon
+// queries. A point is inside when it is inside the outer ring and inside no
+// hole, each by the even-odd rule, so a self-intersecting ring still has a
+// defined interior. Points exactly on an edge may fall either way.
+struct Polygon {
+  EdgeTree outer;
+  std::span<const EdgeTree> holes;
+  BoundingBox box;
+
+  // The polygon of the trees, bounded by its outer ring's vertices.
+  static Polygon of(EdgeTree outer, std::span<const EdgeTree> holes) {
+    const Edge& first = outer.edges[0];
+    BoundingBox box{first.lat1, first.lat1, first.lon1, first.lon1};
+    for (const Edge& edge : outer.edges) {
+      box.minLat = std::min(box.minLat, edge.lat1);
+      box.maxLat = std::max(box.maxLat, edge.lat1);
+      box.minLon = std::min(box.minLon, edge.lon1);
+      box.maxLon = std::max(box.maxLon, edge.lon1);
+    }
+    return {outer, holes, box};
+  }
+
+  bool contains(double lat, double lon) const {
+    if (lat < box.minLat || lat > box.maxLat
+        || lon < box.minLon || lon > box.maxLon
+        || !outer.contains(lat, lon)) {
+      return false;
+    }
+    for (const EdgeTree& hole : holes) {
+      if (hole.contains(lat, lon)) return false;
+    }
+    return true;
+  }
+
+  // Whether any ring edge touches the closed rectangle. When none does, the
+  // whole rectangle is on one side of every ring, so one contains() probe
+  // classifies all of it.
+  bool edgeTouches(double minLat, double maxLat, double minLon,
+                   double maxLon) const {
+    if (outer.touches(minLat, maxLat, minLon, maxLon)) return true;
+    for (const EdgeTree& hole : holes) {
+      if (hole.touches(minLat, maxLat, minLon, maxLon)) return true;
     }
     return false;
   }

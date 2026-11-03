@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -62,9 +63,10 @@ public:
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
   float matchCost() override {
-    if (!multi) return 2.0f;
+    float point = relation.matchCost();
+    if (!multi) return point;
     int64_t docs = reader.docsWithValue();
-    return docs > 0 ? 2.0f * (float)reader.numValues() / (float)docs : 2.0f;
+    return docs > 0 ? point * (float)reader.numValues() / (float)docs : point;
   }
 
   int32_t next() override {
@@ -236,7 +238,8 @@ public:
       return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
     }
 
-    static Query::ScorerShape shapeFor(ScorerArm arm, bool pricedCheck) {
+    static Query::ScorerShape shapeFor(ScorerArm arm,
+                                       std::optional<double> checkPrice) {
       bool bkdArm = arm == ScorerArm::BKD;
       return {
         .matchState = Query::MatchState::NONEMPTY,
@@ -254,11 +257,9 @@ public:
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
         // Candidate consumption requires a bounded verifier before opting in.
         .membershipConsumption = Query::MembershipConsumption::WINDOWS,
-        // The sparse verifier's check of one point against a box, the case
-        // VERIFY_POINTS was fitted on; scans, multivalued fields and other
-        // relations do not quote.
-        .verificationPoints = arm == ScorerArm::SPARSE_VERIFY && pricedCheck
-            ? std::optional<double>(PointsMaterialize::VERIFY_POINTS) : std::nullopt,
+        // The sparse verifier's check of one point; scans do not quote.
+        .verificationPoints = arm == ScorerArm::SPARSE_VERIFY
+            ? checkPrice : std::nullopt,
       };
     }
 
@@ -315,13 +316,18 @@ public:
 
     int64_t cost() override { return estimatedCost; }
 
-    bool pricedCheck() const {
-      return !reader.multiValued() && std::is_same_v<Relation, BKDBoxRelation>;
+    // One verified point: a column check, VERIFY_POINTS as fitted on boxes,
+    // plus what the relation's own test adds. Relations that have not
+    // measured theirs, and multivalued fields, do not quote.
+    std::optional<double> checkPrice() const {
+      std::optional<double> check = relation.checkPoints();
+      if (reader.multiValued() || !check.has_value()) return std::nullopt;
+      return PointsMaterialize::VERIFY_POINTS + *check;
     }
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      return shapeFor(selectScorerArm(buildContext), pricedCheck());
+      return shapeFor(selectScorerArm(buildContext), checkPrice());
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -338,7 +344,7 @@ public:
       int64_t iterated = arm == ScorerArm::BKD ? cost()
           : std::max(cost(), (int64_t)reader.docsWithValue());
       return planPool.make<Plan>(
-          *this, planContext, shapeFor(arm, pricedCheck()), iterated, arm);
+          *this, planContext, shapeFor(arm, checkPrice()), iterated, arm);
     }
 
     BulkPlan planBulk(
