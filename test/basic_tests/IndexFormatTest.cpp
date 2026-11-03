@@ -14,6 +14,10 @@
 
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/server/HttpServer.h"
+#include "luxir/util/Uuid.h"
+#include "test/HttpReq.h"
+#include "test/StorageTestUtils.h"
 #include "luxir/store/IndexFormat.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/Manifest.h"
@@ -30,7 +34,7 @@ namespace {
 
 // The digest of the reference index written by IndexFormat::VERSION. When a
 // change alters the bytes Luxir writes, this test fails: bump
-// IndexFormat::VERSION (and HEADER) and record both new values here. Changing
+// IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
 constexpr uint64_t kReferenceVersion = 9;
 constexpr uint64_t kReferenceDigest = 0xed72bcf91de3225a;
@@ -51,6 +55,10 @@ void buildReferenceIndex(CollectionHelper& ch) {
               "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f}),
   }, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(ch.deleteById("b", UpdateMessage::COMMIT).success);
+  // The reference vector column stores raw floats, with no normalization or ANN.
+  auto* vector = dynamic_cast<const VectorFieldType*>(ch.collection().getSchema()->getFieldTypePtr("vec_v"));
+  ASSERT_NE(nullptr, vector);
+  ASSERT_EQ(VectorFieldType::METRIC_NONE, vector->metric_);
 }
 
 // The manifest re-encoded without the fields that differ from run to run, so
@@ -58,9 +66,11 @@ void buildReferenceIndex(CollectionHelper& ch) {
 uint64_t referenceDigest(Directory& dir) {
   auto durable = readDurableIndexInfo(dir);
   auto info = durable.info;
+  EXPECT_TRUE(info.aux_indexes.empty());
   std::vector<api::SegmentInfo> segments(info.segments.begin(), info.segments.end());
   std::vector<std::vector<api::FileDescriptor>> files;
   for (auto& segment : segments) {
+    EXPECT_TRUE(segment.overlays.empty());
     segment.commit_time = 0;
     segment.schema = {};
     auto& kept = files.emplace_back();
@@ -120,9 +130,9 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
   auto digest = buildReferenceDigest();
   ASSERT_EQ(digest, buildReferenceDigest()) << "the reference index is not deterministic";
   EXPECT_EQ(IndexFormat::VERSION, kReferenceVersion)
-      << "IndexFormat::VERSION changed: record the new reference digest";
+      << "IndexFormat::VERSION changed: update kReferenceVersion and kReferenceDigest";
   EXPECT_EQ(digest, kReferenceDigest) << std::format(
-      "The bytes Luxir writes changed (digest {:#x}). Bump IndexFormat::VERSION and HEADER, "
+      "The bytes Luxir writes changed (digest {:#x}). Bump IndexFormat::VERSION, "
       "then update kReferenceVersion and kReferenceDigest.", digest);
 }
 
@@ -137,13 +147,52 @@ TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
   ASSERT_TRUE(api::decode(info, api::copyToPaddedInput(*manifest.bytes, arena), arena));
   info.version = IndexFormat::VERSION - 1;
 
-  RAMDir old;
+  for (bool missingSchema : {false, true}) {
+    auto changed = info;
+    if (missingSchema) changed.schema_file = {};
+    RAMDir old;
+    reserveIncarnation(old);
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(changed, bytes));
+    Manifest::write(old, info.index_gen, bytes, info.writer_epoch);
+    IncarnationState::install(old, Manifest::tip(info.index_gen, info.writer_epoch));
+    EXPECT_THROW(Manifest::load(old), IndexFormatError);
+    EXPECT_THROW(Manifest::files(std::make_shared<const std::vector<std::byte>>(bytes)), IndexFormatError);
+  }
+}
+
+TEST_F(IndexFormatTest, incompatibleCollectionFailsAloneAfterRestart) {
+  auto path = std::filesystem::temp_directory_path() / ("luxir-format-" + newUuid());
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  {
+    LuxirNode node(config);
+    for (auto name : {"bad", "good"}) {
+      CollectionHelper ch(node, name);
+      ASSERT_TRUE(ch.index(flatdoc("id", name), UpdateMessage::COMMIT).success);
+    }
+  }
+  FSDirectory dir(incarnationPath(path, "bad"));
+  auto durable = readDurableIndexInfo(dir);
+  auto info = durable.info;
+  info.version = IndexFormat::VERSION + 1;
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(info, bytes));
-  IncarnationState::create(old);
-  Manifest::write(old, info.index_gen, bytes, info.writer_epoch);
-  IncarnationState::install(old, Manifest::tip(info.index_gen, info.writer_epoch));
-  EXPECT_THROW(Manifest::load(old), IndexFormatError);
+  ASSERT_TRUE(dir.publishFile(Manifest::name(info.index_gen, info.writer_epoch), Manifest::withFooter(bytes), Directory::PublishMode::REPLACE));
+  LuxirNode node(config);
+  auto entries = node.collectionEntries();
+  auto failed = std::ranges::find_if(entries, [](const auto& entry) { return entry.id.name == "bad"; });
+  ASSERT_NE(entries.end(), failed);
+  EXPECT_EQ("failed to load: " + std::string(IndexFormatError(info.version).what()), failed->error);
+  EXPECT_THROW(node.getCollection("bad"), CollectionUnavailableError);
+  for (const auto& file : filesOf(info)) EXPECT_TRUE(dir.openFile(file.name));
+  HttpServer server(node, 1, 0);
+  server.start();
+  auto result = httpRequest(server.getPort(), http::verb::post, "/collections/good/_search", R"({"query":"id:good","fields":["id"]})");
+  EXPECT_EQ(200, result.result_int()) << result.body();
+  EXPECT_NE(std::string::npos, result.body().find(R"("good")"));
 }
 
 TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {

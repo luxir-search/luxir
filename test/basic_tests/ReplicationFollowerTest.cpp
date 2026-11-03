@@ -2196,3 +2196,73 @@ TEST_F(ReplicationFollowerTest, swappedUnreadableIncarnationStaysReservedForRepa
   fail = false; ASSERT_TRUE(caughtUp("a"));
 }
 }
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, incompatibleManifestKeepsLocalCopy) {
+  followerConfig.replication.retry_ms = 1000;
+  startSource();
+  CollectionHelper main(*source, "main"), healthy(*source, "healthy");
+  ASSERT_TRUE(main.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
+  startFollower(manualClock()); ASSERT_TRUE(caughtUp()); ASSERT_TRUE(caughtUp("healthy"));
+  auto local = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  stopFollower();
+  ASSERT_TRUE(main.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  auto& snapshots = main.collection().getShard()->getSnapshots();
+  auto valid = snapshots.snapshot();
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(valid->bytes, arena);
+  info.version = IndexFormat::VERSION + 1;
+  auto bytes = std::make_shared<std::vector<std::byte>>();
+  ASSERT_TRUE(api::encode(info, *bytes));
+  auto incompatible = std::make_shared<CommitSnapshot>(*valid);
+  incompatible->bytes = bytes; incompatible->digest = CommitSnapshot::digestOf(*bytes);
+  snapshots.publish(incompatible, snapshots.readers.getReader());
+  startFollower(manualClock());
+  ASSERT_TRUE(until([&] { return status().find(IndexFormatError(info.version).what()) != std::string::npos; }));
+  ASSERT_TRUE(healthy.index(flatdoc("id", "progress"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp("healthy")); // other work runs while this collection is backed off
+  auto& installed = follower->getCollection("main")->getShard()->getSnapshots();
+  EXPECT_EQ(local->id, installed.snapshot()->id);
+  EXPECT_EQ(1, installed.readers.getReader()->liveDocs());
+  for (const auto& file : local->files) EXPECT_TRUE(installed.dir.openFile(file.name));
+  snapshots.publish(valid, snapshots.readers.getReader());
+  while (snapshots.testEvictOldest()) {} // discard pins of the incompatible bytes
+  advance(1s);
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
+  startSource();
+  CollectionHelper main(*source, "main");
+  ASSERT_TRUE(main.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  startFollower(); ASSERT_TRUE(caughtUp()); stopFollower();
+  std::string selected, target, root;
+  {
+    FSDirFactory factory(followerConfig.store.data_dir);
+    TenantCatalog catalog(factory, "t0");
+    selected = catalog.current("main").value();
+    target = copySnapshot(catalog, "main", selected, Manifest::load(*catalog.directory(selected)));
+    auto directory = catalog.directory(target);
+    auto manifest = Manifest::load(*directory);
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = Manifest::decode(manifest.bytes, arena);
+    info.version = IndexFormat::VERSION + 1;
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(info, bytes));
+    root = Manifest::name(info.index_gen, info.writer_epoch);
+    ASSERT_TRUE(directory->publishFile(root, Manifest::withFooter(bytes), Directory::PublishMode::REPLACE));
+    auto metadata = factory.directory(StorageRoot::NODE_PRIVATE, "");
+    auto state = ReplicationState::read(*metadata->openFile("replication.json"));
+    state.incarnation("t0", selected).promoted = target;
+    state.write(*metadata);
+  }
+  auto result = promote();
+  EXPECT_NE(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos, result.second.find(IndexFormatError(IndexFormat::VERSION + 1).what()));
+  EXPECT_EQ(selected, selectedIncarnation(followerConfig.store.data_dir));
+  auto base = path / "follower";
+  EXPECT_TRUE(std::filesystem::exists(base / "t" / "t0" / "i" / target / root));
+  EXPECT_TRUE(std::filesystem::exists(base / "node" / "replication.json"));
+}
+}

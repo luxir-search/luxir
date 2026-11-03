@@ -64,6 +64,8 @@ bool validTarget(TenantCatalog& storage, std::string_view name, const std::strin
       if (listed == target.listing.end() || listed->size != file.size) return false;
     }
     return true;
+  } catch (const IndexFormatError&) {
+    throw;
   } catch (const std::exception& e) {
     LOG_WARN("Cannot validate promotion target for '{}': {}", name, e.what());
     return false;

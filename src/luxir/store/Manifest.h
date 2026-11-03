@@ -85,11 +85,13 @@ struct Manifest {
 
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {
     api::IndexInfo info;
-    if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)
-        || !info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
+    if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
     if (info.version != IndexFormat::VERSION) throw IndexFormatError(info.version);
+    if (!info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
+      throw std::runtime_error("Invalid snapshot manifest");
+    }
     return info;
   }
 

@@ -735,7 +735,12 @@ struct ReplicationFollower::Impl {
     auto response = request(client, http::verb::get, snapshotPath(name) + "?" + followerQuery());
     auto& body = response.body();
     auto bytes = std::make_shared<const std::vector<std::byte>>((const std::byte*)body.data(), (const std::byte*)body.data() + body.size());
-    auto snapshot = CommitSnapshot::fromBytes(bytes);
+    std::shared_ptr<const CommitSnapshot> snapshot;
+    try { snapshot = CommitSnapshot::fromBytes(bytes); }
+    catch (const IndexFormatError& e) {
+      LOG_ERROR("Cannot replicate collection '{}' from {}: {}", name.label(), binding.source, e.what());
+      throw;
+    }
     validateIncarnation(snapshot->id.incarnation);
     if (response["X-Luxir-Commit"] != snapshot->id.token()) throw std::runtime_error("snapshot commit mismatch");
     if (!snapshot->populated) Signal::emit("replicationEmptySnapshotReceived");
