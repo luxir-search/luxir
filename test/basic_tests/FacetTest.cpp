@@ -1578,7 +1578,11 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   // their zone runs are counted apart.
   SkipStatsScope stats;
   SearchOverridesGuard overrides(IntFacetRangeReq::disableZoneRangeFacetForTests,
-                                 forcedRangeFacetBucketDomainByteBudget);
+                                 forcedRangeFacetBucketDomainByteBudget,
+                                 forcedFacetSubOpInline);
+  // Sub-ops take bucket domains, whose zone construction is under test,
+  // rather than joining the count pass.
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   const std::vector<Spec> explicitSpecs = pick(0), subSpecs = pick(SUB),
                           dataSpecs = pick(DATA);
   for (std::string_view filter : {"", "third", "rare"}) {

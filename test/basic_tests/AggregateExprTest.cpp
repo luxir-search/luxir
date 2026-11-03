@@ -914,6 +914,8 @@ TEST_F(AggregateExprTest, cardinalityBucketBlocksUseObservedStateBytes) {
   }
   size_t blocks = 0;
   auto guard = facetAggregateOverrides();
+  // Column metrics would otherwise join the count pass.
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   forcedRangeFacetBucketDomainByteBudget = 1;
   facetBucketBlockCounter = &blocks;
   for (size_t budget : {4u * 1024, 256u * 1024}) {
@@ -2380,6 +2382,8 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
 
   size_t blocks = 0;
   auto guard = facetAggregateOverrides();
+  // Column metrics would otherwise join the count pass.
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   forcedRangeFacetBucketDomainByteBudget = 1;
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
   facetBucketBlockCounter = &blocks;
@@ -2419,6 +2423,70 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
   blocks = 0;
   run(heavyExpression, 100);
   EXPECT_GT(blocks, 1u);
+}
+
+TEST_F(AggregateExprTest, intAndRangeFacetsFuseColumnMetricsIntoCountPass) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 400; i++) {
+      int id = segment * 400 + i;
+      std::string key = std::to_string(id);
+      // x_i is missing on every fifth document; tags_is is multi-valued.
+      // when_dt steps 3 days per document from 2024-01-01 UTC.
+      int64_t when = 1704067200000LL + (int64_t)id * 3 * 86'400'000LL;
+      if (id % 5 == 0) docs.push_back(flatdoc("id", key, "bucket_i", id % 7, "tags_is",
+          std::vector<int64_t>{id % 3, id % 3 + 1}, "when_dt", when));
+      else docs.push_back(flatdoc("id", key, "bucket_i", id % 7, "x_i", id % 101 - 50,
+          "tags_is", std::vector<int64_t>{id % 3, id % 3 + 1, id % 3}, "when_dt", when));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  auto guard = facetAggregateOverrides();
+  std::string stats = R"json({"n":"sum(count(x_i))","lo":"min(x_i)","hi":"max(x_i)",
+    "mean":"avg(x_i)","total":"sum(x_i)"})json";
+  // {request, joins the count pass, as keyed batches}
+  std::array<std::tuple<std::string, bool, bool>, 10> cases{{
+    {R"json({"ops":{"f":{"field_facet":{"field":"bucket_i","limit":3,"ops":)json" + stats + "}}}}", true, true},
+    {R"json({"ops":{"f":{"field_facet":{"field":"bucket_i","limit":3,"sort":[{"expr":"total","dir":"desc"}],"ops":)json"
+        + stats + "}}}}", true, true},
+    {R"json({"ops":{"f":{"range_facet":{"field":"bucket_i","start":0,"end":9,"gap":2,"mincount":0,"ops":)json"
+        + stats + "}}}}", true, true},
+    {R"json({"query":"x_i:[0 TO *]","ops":{"f":{"range_facet":{"field":"bucket_i","start":1,"end":6,"gap":1,"ops":)json"
+        + stats + "}}}}", true, true},
+    {R"json({"ops":{"f":{"range_facet":{"field":"tags_is","start":0,"end":4,"gap":1,"ops":)json"
+        + stats + "}}}}", true, true},
+    // bounds:data grows its directory, so its entries are sparse and per doc.
+    {R"json({"ops":{"f":{"range_facet":{"field":"bucket_i","bounds":"data","gap":2,"ops":)json"
+        + stats + "}}}}", true, false},
+    {R"json({"query":"x_i:[0 TO *]","ops":{"f":{"range_facet":{"field":"tags_is","bounds":"data","gap":1,"ops":)json"
+        + stats + "}}}}", true, false},
+    {R"json({"ops":{"f":{"range_facet":{"field":"when_dt","start":"2024-01-01","end":"2034-01-01","calendar_gap":{"n":1,"unit":"month"},"ops":)json"
+        + stats + "}}}}", true, true},
+    {R"json({"ops":{"f":{"range_facet":{"field":"when_dt","bounds":"data","calendar_gap":{"n":1,"unit":"year"},"ops":)json"
+        + stats + "}}}}", true, false},
+    // An expression input keeps the bucket-domain feed.
+    {R"json({"ops":{"f":{"range_facet":{"field":"bucket_i","start":0,"end":9,"gap":3,"ops":{"m":"sum(x_i*2)"}}}}})json",
+        false, false},
+  }};
+  for (auto& [json, inlined, keyed] : cases) {
+    SCOPED_TRACE(json);
+    auto run = [&](FacetSubOpInlineMode mode, InlineFacetEntryStats& stats) {
+      SearchOverridesGuard modeGuard(forcedFacetSubOpInline, inlineFacetEntryStatsForTests);
+      forcedFacetSubOpInline = mode;
+      inlineFacetEntryStatsForTests = &stats;
+      AggregateExecutionStats executionStats;
+      return runSharedSketchRequest(helper, json, executionStats).values;
+    };
+    InlineFacetEntryStats baselineStats, fusedStats;
+    auto baseline = run(FacetSubOpInlineMode::SORT_KEY_ONLY, baselineStats);
+    auto fused = run(FacetSubOpInlineMode::AUTO, fusedStats);
+    EXPECT_FALSE(fused.empty());
+    EXPECT_EQ(baseline, fused);
+    EXPECT_EQ(inlined, fusedStats.denseTables.load() + fusedStats.sparseTables.load() > 0);
+    EXPECT_EQ(keyed, fusedStats.keyedBatches.load() > 0);
+  }
 }
 
 TEST_F(AggregateExprTest, denseTableHugePageBoundaryAndReuse) {

@@ -473,6 +473,9 @@ public:
 
   class InlineCalc final : public InlineCalculator {
     std::vector<BoundAggregateInput> bindings;
+    // Per binding, the column iterator of a count(column) input (else null),
+    // for keyed batches.
+    std::vector<IntColReader::BulkIterator*> countColumns;
     std::vector<uint64_t> finalizedValues;
     std::vector<uint64_t> finalizedValid;
     AggregateEvalScratch scratch;
@@ -648,8 +651,31 @@ public:
       static constexpr size_t CHUNK = 256;
       int64_t chunkKeys[CHUNK];
       int64_t chunkValues[CHUNK];
-      for (BoundAggregateInput& binding : bindings) {
-        assert(binding.bareColumn);
+      for (size_t b = 0; b < bindings.size(); b++) {
+        BoundAggregateInput& binding = bindings[b];
+        if (!binding.bareColumn) {
+          // count(column): 1 for a doc with a value, else 0, for every doc.
+          assert(denseFacetState == nullptr);
+          IntColReader::BulkIterator* column = countColumns[b];
+          for (size_t start = 0; start < docs.size(); start += CHUNK) {
+            size_t end = std::min(docs.size(), start + CHUNK);
+            for (size_t i = start; i < end; i++) {
+              int32_t doc = docs[i];
+              bool present = false;
+              if (column != nullptr) {
+                if (column->docId() < doc) column->advance(doc);
+                present = column->docId() == doc;
+              }
+              chunkValues[i - start] = present ? 1 : 0;
+            }
+            binding.producer->resolved.state.accumulateKeyedRawBatch(
+                states + binding.producerStateOffset, stride,
+                std::span<const int64_t>(keys.data() + start, end - start),
+                std::span<const int64_t>(chunkValues, end - start),
+                FieldType::INT, binding.arguments);
+          }
+          continue;
+        }
         for (size_t start = 0; start < docs.size(); start += CHUNK) {
           size_t end = std::min(docs.size(), start + CHUNK);
           const int64_t* runKeys = keys.data() + start;
@@ -734,13 +760,23 @@ public:
 
     void startSeg(int32_t segnum) override {
       bindings.clear();
+      countColumns.clear();
       segmentFailure = AggregateFailure::NONE;
       try {
         MemPool& pool = MemPool::threadLocal();
         auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
         bindings = bindAggregateInputs(thisOp().aggregate, pool, segment, thisOp().fields);
+        if (keyedBatches) {
+          for (BoundAggregateInput& binding : bindings) {
+            ColumnInput input = columnInput(*binding.producer);
+            auto& node = binding.values->nodes[input.node];
+            countColumns.push_back(input.count && node.bulkIterator
+                ? &*node.bulkIterator : nullptr);
+          }
+        }
       } catch (const ValueEvaluationError&) {
         bindings.clear();
+        countColumns.clear();
         segmentFailure = AggregateFailure::VALUE_EVALUATION;
       }
     }
@@ -748,7 +784,14 @@ public:
     void LUXIR_NOINLINE rewind() override {
       // Bare-column inputs bypass the expression reader's restart detection.
       // Rebuild only those iterators when the driver starts another doc walk.
-      for (BoundAggregateInput& binding : bindings) {
+      for (size_t b = 0; b < bindings.size(); b++) {
+        BoundAggregateInput& binding = bindings[b];
+        if (b < countColumns.size() && countColumns[b] != nullptr) {
+          auto& node = binding.values->nodes[columnInput(*binding.producer).node];
+          node.bulkIterator.reset();
+          node.bulkIterator.emplace(*node.column);
+          countColumns[b] = &*node.bulkIterator;
+        }
         if (binding.columnIterator == nullptr) continue;
         auto& node = binding.values->nodes[binding.producer->input->rootNode];
         node.bulkIterator.reset();
@@ -760,6 +803,7 @@ public:
     void endSeg(int32_t segnum) override {
       unused(segnum);
       bindings.clear();
+      countColumns.clear();
       segmentFailure = AggregateFailure::NONE;
     }
 
@@ -1123,15 +1167,14 @@ public:
     });
   }
 
-  // Every producer a bare scalar column with a keyed raw batch accumulator: the
-  // inline calculator then reads its values straight from the column per batch.
+  // Every producer reads a bare scalar column, as its input or through
+  // count(column), with a keyed raw batch accumulator: the inline calculator
+  // then reads its values straight from the column per batch.
   bool inlinesAsColumnBatch() const override {
     return !aggregate.hasIndirectStates
         && std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
-      const ValueNode& input = producer.input->root();
       return producer.resolved.state.inlineCapable
-          && input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
-          && input.type != ValueType::COLUMN_ONLY
+          && columnInput(producer).valid
           && producer.resolved.state.accumulateKeyedRawBatch != nullptr;
     });
   }

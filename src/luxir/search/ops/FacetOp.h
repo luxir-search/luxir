@@ -982,6 +982,28 @@ public:
     return {useVector, globalMin, useVector ? (uint64_t)globalMax - (uint64_t)globalMin + 1 : 0};
   }
 
+  // Fused column metrics, as for string facets (StrFacetOp::init): over a
+  // small value range, column metrics join the count pass as keyed batches
+  // into the dense value-indexed entry table, instead of a domain per
+  // returned bucket that each metric walks again. Refittable.
+  static constexpr int64_t FUSED_METRICS_MAX_VALUES = 256;
+  static constexpr int64_t FUSED_METRICS_MAX_PAGES = 4;
+
+  void init() override {
+    FieldFacetReq::init();
+    if (countDistinct != nullptr || !inlineSubOps.empty() || subOps.empty()) return;
+    int64_t width = useVector ? globalMax - globalMin + 1 : 0;
+    bool fusedMetrics = useVector && minCount != 0
+        && width <= FUSED_METRICS_MAX_VALUES
+        && (limit < 0 || width <= FUSED_METRICS_MAX_PAGES * limit)
+        && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
+        && std::ranges::all_of(subOps, [](const auto& subOp) {
+             return subOp.second->canInlineInBucket()
+                 && subOp.second->inlinesAsColumnBatch();
+           });
+    if (fusedMetrics) inlineRemainingSubOps();
+  }
+
   bool canEmitAsBucketChild() const override {
     return true;
   }
@@ -1059,7 +1081,9 @@ public:
           int64_t keyBase = thisOp().useVector ? thisOp().globalMin : 0;
           thisOp().withIntColumn(domain, segnum, data.missing_num,
               [&](IntColReader& column, int32_t maxDoc) {
-                if (!column.multiValued() || column.multiSet()) {
+                if (!column.multiValued() && data.counts.acceptsKeyedBatches()) {
+                  addKeyedValues(data, domain, column, maxDoc, keyBase);
+                } else if (!column.multiValued() || column.multiSet()) {
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
                         data.counts.add(value - keyBase, docid);
@@ -1119,6 +1143,28 @@ public:
         }
       });
     };
+
+    // The count pass as keyed batches: each batch of (value key, doc) goes to
+    // the inline calculators whole, which read their own columns for it.
+    void addKeyedValues(MergeableFieldFacetInline& data, DocSet* domain,
+                        IntColReader& column, int32_t maxDoc, int64_t keyBase) {
+      static constexpr size_t BATCH = 256;
+      std::array<int64_t, BATCH> keys;
+      std::array<int32_t, BATCH> docs;
+      size_t count = 0;
+      auto flush = [&] {
+        data.counts.addKeyedBatch(std::span<const int64_t>(keys.data(), count),
+                                  std::span<const int32_t>(docs.data(), count));
+        count = 0;
+      };
+      forEachIntColValue(domain, column, maxDoc, data.missing_num,
+          [&](int32_t docid, int64_t value) LUXIR_INLINE {
+            keys[count] = value - keyBase;
+            docs[count++] = docid;
+            if (count == BATCH) flush();
+          });
+      if (count != 0) flush();
+    }
 
     void facetResult(MergeableIntFacet& merged) {
       auto lookup = [&](int64_t selected) -> int64_t {
@@ -1526,12 +1572,19 @@ class FixedBucketFacetReq : public FacetReq {
   size_t numBuckets;
   std::span<const size_t> selectedBuckets;
 
+protected:
+  // Sub-ops that run in the count pass, in an entry table per bucket, instead
+  // of over a domain per emitted bucket. Set by init().
+  std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
+
 public:
+  using InlineData = FieldFacetReq::MergeableFieldFacetInline;
   struct CountView { std::span<const int64_t> counts; int64_t missing_num; };
   class MergeableFixedBuckets : public MergeableData {
   public:
     std::vector<int64_t> counts;
     int64_t missing_num = 0;
+    std::unique_ptr<InlineData> inlineData;
 
     static MergeableFixedBuckets* merge(
         MergeableFixedBuckets* a, MergeableFixedBuckets* b) {
@@ -1544,6 +1597,12 @@ public:
         }
       }
       a->missing_num += b->missing_num;
+      if (a->inlineData && b->inlineData) {
+        InlineData* kept = InlineData::merge(a->inlineData.get(), b->inlineData.get());
+        if (kept != a->inlineData.get()) std::swap(a->inlineData, b->inlineData);
+      } else if (b->inlineData) {
+        std::swap(a->inlineData, b->inlineData);
+      }
       return a;
     }
   };
@@ -1644,6 +1703,8 @@ public:
     SegmentMergeDriver<Data> driver;
     DistinctFacetMode mode = DistinctFacetMode::AUTO;
     std::atomic<int32_t> gatheredDomainsSeen{0};
+    // The merged inline entries while the result is built.
+    InlineData* inlineResult = nullptr;
 
   protected:
     // Per-segment incoming domains, kept only while something later reads
@@ -1699,7 +1760,87 @@ public:
       fixedOp().checkEmittedBucketCount(emitted.size());
       auto* result = slotArm<luxir::api::FacetResult>(nullptr);
       storage.emit(fixedOp(), *result, merged, emitted, mr);
+      fillInlineResults(emitted);
       executeResultChildren(merged, emitted, pinned);
+    }
+
+    // The emitted buckets' inline sub-op values, from the merged entry table
+    // (a bucket no document reached has no entry and reads as missing).
+    void fillInlineResults(std::span<const size_t> emitted) {
+      if (fixedOp().inlineSubOps.empty() || emitted.empty()) return;
+      std::unique_ptr<InlineData> empty;
+      InlineData* data = inlineResult;
+      if (data == nullptr) {
+        empty.reset(createInlineData());
+        data = empty.get();
+      }
+      boost::unordered_flat_map<int64_t, char*> entries;
+      entries.reserve(data->counts.size());
+      data->counts.forEachEntry([&](int64_t key, char* entry) { entries.emplace(key, entry); });
+      std::vector<char*> states;
+      std::vector<int64_t> counts;
+      states.reserve(emitted.size());
+      counts.reserve(emitted.size());
+      for (size_t bucket : emitted) {
+        // Growing layouts key entries by the bucket's lower fence, which stays
+        // put while the directory grows; fixed ones by bucket index.
+        int64_t key;
+        if constexpr (Storage::growing) key = storage.layout[bucket];
+        else key = (int64_t)bucket;
+        auto found = entries.find(key);
+        char* entry = found == entries.end() ? nullptr : found->second;
+        states.push_back(entry ? FacetEntryTable::metricState(entry) : nullptr);
+        counts.push_back(entry ? loadUnaligned<int64_t>(entry) : 0);
+      }
+      for (auto* calc : data->inlineCalcs) calc->fillResult(states, counts);
+    }
+
+    InlineData* createInlineData() {
+      auto data = std::make_unique<InlineData>();
+      auto& ops = fixedOp().inlineSubOps;
+      data->inlineCalcs.reserve(ops.size());
+      for (auto& [key, subop] : ops) {
+        data->inlineCalcs.push_back(subop->createInlineCalculator(this, -1, -1));
+      }
+      std::string detail = data->inlineCalcs.size() == 1
+          ? std::format("facet '{}' metric '{}'", fixedOp().facetName,
+                        data->inlineCalcs.front()->getOp().name)
+          : std::format("facet '{}' inline metrics", fixedOp().facetName);
+      data->counts.configure(data->inlineCalcs, op.req.memoryTracker,
+                             (int64_t)fixedOp().bucketCount(), std::move(detail),
+                             inlineFacetEntryStatsForTests);
+      return data.release();
+    }
+
+    // Runs walk(inlineData) with the inline calculators bound to the segment.
+    template <typename Walk>
+    void withInlineSegment(std::unique_ptr<InlineData>& slot, int32_t segnum,
+                           DocSet* domain, Walk&& walk) {
+      if (!slot) slot.reset(createInlineData());
+      InlineData& data = *slot;
+      int32_t maxDoc = fixedOp().reader.segments()[(size_t)segnum].maxDoc();
+      data.counts.initialize(domain ? domain->card() : maxDoc,
+          forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_DENSE,
+          forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_SPARSE);
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      auto& calcs = data.inlineCalcs;
+      size_t started = 0;
+      auto endSegments = scope_guard([&]() noexcept {
+        for (size_t i = 0; i < started; i++) calcs[i]->endSeg(segnum);
+      });
+      for (; started < calcs.size(); started++) calcs[started]->startSeg(segnum);
+      walk(data);
+    }
+
+    // Adds keys[i] (a bucket index) for docs[i] to the inline entries, as one
+    // keyed batch when every calculator takes them.
+    static void addInlineBatch(InlineData& data, std::span<const int64_t> keys,
+                               std::span<const int32_t> docs) {
+      if (data.counts.acceptsKeyedBatches()) {
+        data.counts.addKeyedBatch(keys, docs);
+      } else {
+        for (size_t i = 0; i < keys.size(); i++) data.counts.add(keys[i], docs[i]);
+      }
     }
 
     // Post-selection sub-op execution sizes each bucket block from the child
@@ -1751,6 +1892,9 @@ public:
       : Calculator(op, parent, slot, numSlots, structural),
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<Data> merged) {
+                 if constexpr (requires { merged->inlineData; }) {
+                   inlineResult = merged->inlineData.get();
+                 }
                  if constexpr (Storage::growing) {
                    auto release = scope_guard([&]() noexcept { input.clear(); });
                    storage.finish(fixedOp(), *merged, [this](CountView counts) { facetResult(counts); });
@@ -1786,8 +1930,8 @@ public:
       routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
           [&](luxir::api::Val& val) { target = &val; });
       auto& result = oneofMut<luxir::api::FacetResult>(*target);
-      return build::opsSlot(
-          result.ops, fixedOp().subOps.size(), sub.name, resp->mr);
+      return build::opsSlot(result.ops,
+          fixedOp().subOps.size() + fixedOp().inlineSubOps.size(), sub.name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -2081,9 +2225,31 @@ public:
     return FacetBucketProducer::JOINT;
   }
 
+  static constexpr size_t MAX_BUCKETS_WITH_SUB_OPS = 1024;
+
   void checkEmittedBucketCount(size_t count) const override {
-    if (!subOps.empty() && count > 1024) throw RequestError(
-        "facet '" + std::string(name) + "': range facets with sub-ops are limited to 1024 buckets");
+    if ((!subOps.empty() || !inlineSubOps.empty()) && count > MAX_BUCKETS_WITH_SUB_OPS) {
+      throw RequestError("facet '" + std::string(name)
+          + "': range facets with sub-ops are limited to 1024 buckets");
+    }
+  }
+
+  // Fused column metrics: column metrics join the count pass, instead of a
+  // domain per emitted bucket that each metric walks again. Over fixed fences
+  // they take keyed batches into a dense bucket-indexed entry table; over
+  // bounds:data, whose directory grows, a sparse table keyed by lower fence.
+  void init() override {
+    FixedBucketFacetReq::init();
+    bool fusedMetrics = countDistinct == nullptr && !subOps.empty()
+        && bucketCount() <= MAX_BUCKETS_WITH_SUB_OPS
+        && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
+        && std::ranges::all_of(subOps, [](const auto& subOp) {
+             return subOp.second->canInlineInBucket()
+                 && subOp.second->inlinesAsColumnBatch();
+           });
+    if (!fusedMetrics) return;
+    for (auto& subOp : subOps) inlineSubOps.push_back(subOp);
+    subOps.clear();
   }
 
   std::vector<size_t> emittedBuckets(
@@ -2153,6 +2319,10 @@ public:
                   [&](int32_t doc) { missingBucket(group(doc)); });
             });
       } else {
+      if (!rangeOp().inlineSubOps.empty()) {
+        collectInline(data, segnum, domain);
+        return;
+      }
       int64_t start = rangeOp().fences.front();
       int64_t end = rangeOp().fences.back();
       auto& segment = rangeOp().reader.segments()[segnum];
@@ -2220,6 +2390,39 @@ public:
             counts[(size_t)bucket]++;
           });
       }
+    }
+
+    // Counts and inline metrics in one walk of the segment's values.
+    void collectInline(typename Base::Data& data, int32_t segnum, DocSet* domain) {
+      this->withInlineSegment(data.inlineData, segnum, domain, [&](auto& inlineData) {
+        collectInline(data, inlineData, segnum, domain);
+      });
+    }
+
+    void collectInline(typename Base::Data& data, InlineData& inlineData,
+                       int32_t segnum, DocSet* domain) {
+      auto& range = rangeOp();
+      static constexpr size_t BATCH = 256;
+      std::array<int64_t, BATCH> keys;
+      std::array<int32_t, BATCH> docs;
+      size_t count = 0;
+      auto flush = [&] {
+        Base::addInlineBatch(inlineData, std::span<const int64_t>(keys.data(), count),
+                             std::span<const int32_t>(docs.data(), count));
+        count = 0;
+      };
+      std::span<int64_t> counts(data.counts);
+      range.facetSegIntBuckets(domain, segnum, data.missing_num,
+          [layout = range.fixedLayout()](int64_t value) mutable LUXIR_INLINE -> std::optional<int64_t> {
+            if (!layout.inRange(value)) return std::nullopt;
+            return (int64_t)layout.bucketOf(value);
+          }, [&](int32_t doc, int64_t bucket) LUXIR_INLINE {
+            counts[(size_t)bucket]++;
+            keys[count] = bucket;
+            docs[count++] = doc;
+            if (count == BATCH) flush();
+          });
+      if (count != 0) flush();
     }
 
     void feedBucketDomains(size_t segnum,

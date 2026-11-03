@@ -24,11 +24,12 @@ constexpr std::string_view STATS = R"json({"n":"sum(count(fare_d))","lo":"min(fa
 
 struct MetricAggregateCase {
   std::string json;
-  // The same request with sibling fusion turned off.
+  // The same request with sibling fusion turned off, and facet metrics fed
+  // over bucket domains.
   bool unfused = false;
 };
 
-std::array<MetricAggregateCase, 4> cases() {
+std::array<MetricAggregateCase, 10> cases() {
   std::string stats(STATS);
   return {{
     {R"json({"ops":)json" + stats + "}"},
@@ -37,6 +38,16 @@ std::array<MetricAggregateCase, 4> cases() {
         + stats + "}}}}"},
     {R"json({"ops":{"q":{"top_docs":{"limit":0,"query":"passengers_i:[2 TO 4]","ops":)json"
         + stats + "}}}}", true},
+    {R"json({"ops":{"f":{"range_facet":{"field":"distance_d","start":0,"end":60,"gap":0.5,"ops":)json"
+        + stats + "}}}}"},
+    {R"json({"ops":{"f":{"range_facet":{"field":"distance_d","start":0,"end":60,"gap":0.5,"ops":)json"
+        + stats + "}}}}", true},
+    {R"json({"ops":{"f":{"range_facet":{"field":"distance_d","bounds":"data","gap":0.5,"ops":)json"
+        + stats + "}}}}"},
+    {R"json({"ops":{"f":{"range_facet":{"field":"distance_d","bounds":"data","gap":0.5,"ops":)json"
+        + stats + "}}}}", true},
+    {R"json({"ops":{"f":{"field_facet":{"field":"vendor_i","limit":5,"ops":)json" + stats + "}}}}"},
+    {R"json({"ops":{"f":{"field_facet":{"field":"vendor_i","limit":5,"ops":)json" + stats + "}}}}", true},
   }};
 }
 
@@ -99,8 +110,10 @@ struct MetricAggregateFixture {
 void BM_MetricAggregate(benchmark::State& state, size_t caseIndex) {
   MetricAggregateFixture fixture;
   const auto entry = cases().at(caseIndex);
-  SearchOverridesGuard guard(disableAggregateSharingForTests);
+  SearchOverridesGuard guard(disableAggregateSharingForTests, forcedFacetSubOpInline);
   disableAggregateSharingForTests = entry.unfused;
+  forcedFacetSubOpInline = entry.unfused ? FacetSubOpInlineMode::SORT_KEY_ONLY
+                                         : FacetSubOpInlineMode::AUTO;
   auto run = [&]() {
     auto req = localReq(fixture.helper.getSearchEngine());
     parseQueryRequest(entry.json, req->rawRequest(), req->mr);
@@ -127,5 +140,11 @@ LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, root_stats, 0);
 LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, root_stats_unfused, 1);
 LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, filtered_stats, 2);
 LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, filtered_stats_unfused, 3);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, histogram_stats, 4);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, histogram_stats_unfused, 5);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, data_histogram_stats, 6);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, data_histogram_stats_unfused, 7);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, int_terms_stats, 8);
+LUXIR_BENCHMARK_CAPTURE(BM_MetricAggregate, int_terms_stats_unfused, 9);
 
 } // namespace
