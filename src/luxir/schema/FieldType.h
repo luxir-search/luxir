@@ -293,6 +293,14 @@ public:
 // DATE stores int64 epoch units directly in the standard int column. Signed
 // counts sort chronologically without a transform. Numeric ingest uses the
 // field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
+//
+// A local date (schema type LOCAL_DATE) is a calendar date with no time of
+// day: a birthday or an invoice date.  It stores the same int64 epoch millis
+// of UTC midnight in the same column, so segments, sorting, merging and
+// output are DATE's, and the segment records FieldType::DATE.  What differs
+// is the civil frame: ingest accepts only values at UTC midnight, and query
+// literals, date math and calendar range facets resolve in UTC whatever the
+// request or facet time_zone, so a date never shifts into a neighbouring day.
 class DateFieldType : public FieldType {
 public:
   struct QueryRange {
@@ -301,10 +309,27 @@ public:
     bool unroundedNow = false;
   };
   DateUnit unit;
+  const bool local;
 
-  DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
-    : FieldType(name, FieldType::DATE, flags), unit(unit) {
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS,
+                bool local=false)
+    : FieldType(name, FieldType::DATE, flags), unit(unit), local(local) {
     typeFlagsForUnit(unit);
+    assert(!local || unit == DateUnit::MILLIS);
+  }
+
+  // Whether `fieldType` is a DATE field with calendar-date semantics.
+  static bool isLocal(FieldType& fieldType) {
+    return fieldType.type() == FieldType::DATE && ((DateFieldType&)fieldType).local;
+  }
+
+  // The civil frame this field resolves literals in: UTC for a local date,
+  // the request's zone otherwise.
+  CoerceContext frame(const CoerceContext& context) const {
+    if (!local) return context;
+    CoerceContext utc = context;
+    utc.timeZone = TimeZone::utc();
+    return utc;
   }
 
   static uint32_t typeFlagsForUnit(DateUnit unit);

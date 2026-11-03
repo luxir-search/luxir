@@ -207,7 +207,7 @@ A multi-geo field uses an array of points in any
 point. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
 one-vector list. Enable a [multi-valued mode](schema.md#multi-valued-modes);
-the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, `_ps`, and `_vs` suffixes already do.
+the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, `_lds`, `_ps`, and `_vs` suffixes already do.
 
 ## What is returned
 

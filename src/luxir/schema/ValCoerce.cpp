@@ -124,25 +124,38 @@ DateColumnCoercion tryDateColumn(const api::Val& val, DateUnit unit, const Coerc
 std::optional<int64_t> DateFieldType::tryCoerceColInt64(
     const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
   unused(fieldName);
-  return tryDateColumn(val, unit, context).value;
+  auto value = tryDateColumn(val, unit, frame(context)).value;
+  if (value && local && *value % datetime_detail::kMsPerDay != 0) return std::nullopt;
+  return value;
 }
 
 int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
                                       const CoerceContext& context) const {
-  auto parsed = tryDateColumn(val, unit, context);
-  if (parsed.value) return *parsed.value;
+  auto parsed = tryDateColumn(val, unit, frame(context));
+  if (parsed.value) {
+    // A local date is a whole UTC day: a time of day is rejected rather than
+    // truncated, so "2024-06-01T23:30-05:00" cannot silently become June 2.
+    if (local && *parsed.value % datetime_detail::kMsPerDay != 0) {
+      throw RequestError(fmt::format(
+          "LOCAL_DATE field '{}': {} is not a calendar date "
+          "(expected a date such as 2024-06-01, or epoch millis at UTC midnight)",
+          fieldName, coerce::describe(val)), "invalid_value");
+    }
+    return *parsed.value;
+  }
   throwDateCoerce(val, fieldName, unit, parsed.outsideRange);
 }
 
 std::optional<int64_t> DateFieldType::coerceDateInstant(
     const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
-  auto parsed = tryDateColumn(val, unit, context);
+  auto parsed = tryDateColumn(val, unit, frame(context));
   if (parsed.value || parsed.outsideRange) return parsed.value;
   throwDateCoerce(val, fieldName, unit);
 }
 
 std::optional<DateFieldType::QueryRange> DateFieldType::tryCoerceDateRange(
-    const api::Val& val, const CoerceContext& context) const {
+    const api::Val& val, const CoerceContext& requestContext) const {
+  CoerceContext context = frame(requestContext);
   auto inputUnit = context.dateInputUnit.value_or(unit);
   std::optional<int64_t> integer;
   if (auto i = std::get_if<int64_t>(&val.kind)) integer = *i;

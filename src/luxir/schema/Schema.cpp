@@ -570,7 +570,8 @@ struct FieldCompiler {
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
-                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
+                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
+                        r.type == FieldClass::LOCAL_DATE;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -671,6 +672,9 @@ struct FieldCompiler {
       case FieldClass::DATE:
         ft = std::make_shared<DateFieldType>(name, flags,
             r.dateUnit.value_or(ApiDateUnit::MS) == ApiDateUnit::NS ? DateUnit::NANOS : DateUnit::MILLIS);
+        break;
+      case FieldClass::LOCAL_DATE:
+        ft = std::make_shared<DateFieldType>(name, flags, DateUnit::MILLIS, true);
         break;
       case FieldClass::GEO_POINT:
         ft = std::make_shared<GeoPointFieldType>(name, flags, r.geoIgnoreMalformed.value_or(false),
@@ -1253,6 +1257,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_ld", FieldClass::LOCAL_DATE);
+  add(templates, "_lds", FieldClass::LOCAL_DATE).multi = api::FieldDef::MultiMode::DEFAULT;
   // Geo points: unlike the numeric suffixes these build the points index,
   // since geo queries are their only use.
   add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
