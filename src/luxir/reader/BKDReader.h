@@ -352,7 +352,7 @@ struct BKDPolygonRelation {
                                              relation.latMax, relation.lonMin,
                                              relation.lonMax);
     }
-    relation.cost = pointCostOf(parts, relation.grid.crossShare());
+    relation.cost = relation.pointCostOf(relation.grid.crossShare());
     return relation;
   }
 
@@ -410,20 +410,38 @@ private:
     return (1.0 + stabbed) * std::log2((double)tree.edges.size() + 1.0);
   }
 
+  static double boxArea(int32_t latLow, int32_t latHigh, int32_t lonLow, int32_t lonHigh) {
+    if (latHigh < latLow || lonHigh < lonLow) return 0.0;
+    return ((double)latHigh - latLow + 1.0) * ((double)lonHigh - lonLow + 1.0);
+  }
+
   // The model counts in half box tests: two box tests for the box and grid
-  // lookups, one for each part's box check, and 3 per walked node. A point
-  // beside the boundary lands in a crossing grid cell and pays every walk; a
-  // point anywhere in the box pays them in the grid's crossing share. Fitted
-  // on noisy circles of 100 to 100k vertices to within 25% of GeoBM's
-  // measured ratio to a box test (release, 2026-11-03).
-  static BKDPointCost pointCostOf(std::span<const Part> parts, double crossShare) {
+  // lookups, one per part's box check, and 3 per walked node. A point walks
+  // the parts whose box holds it, so each part's walks are weighted by its
+  // box's share of the union box; a point beside a boundary is in at least
+  // one part's box, so the weights scale up to sum to at least one. That
+  // point lands in a crossing grid cell and pays the walks in full; a point
+  // anywhere in the box pays them in the grid's crossing share. Fitted on
+  // noisy circles of 100 to 100k vertices to within 25% of GeoBM's measured
+  // ratio to a box test (release, 2026-11-03).
+  BKDPointCost pointCostOf(double crossShare) const {
+    double area = boxArea(latMin, latMax, lonMin, lonMax);
+    double checks = 0.0;
+    double shares = 0.0;
     double walks = 0.0;
     for (const Part& part : parts) {
-      walks += 2.0 + 3.0 * walkNodes(part.polygon.outer);
-      for (const geo::EdgeTree& hole : part.polygon.holes) walks += 3.0 * walkNodes(hole);
+      double share = area > 0.0
+          ? boxArea(part.latMin, part.latMax, part.lonMin, part.lonMax) / area : 0.0;
+      double nodes = walkNodes(part.polygon.outer);
+      for (const geo::EdgeTree& hole : part.polygon.holes) nodes += walkNodes(hole);
+      checks += 2.0;
+      shares += share;
+      walks += share * 3.0 * nodes;
     }
+    if (shares > 0.0 && shares < 1.0) walks /= shares;
+    double crossing = checks + walks;
     auto extra = [](double halves) { return (halves / 2.0 - 1.0) * BOX_TEST_POINTS; };
-    return {extra(4.0 + walks), extra(4.0 + crossShare * walks), true};
+    return {extra(4.0 + crossing), extra(4.0 + crossShare * crossing), true};
   }
 };
 

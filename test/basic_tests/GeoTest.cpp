@@ -1179,6 +1179,31 @@ TEST_F(GeoPolygonQueryTest, relationPointCostPricesEveryConsumer) {
   EXPECT_FLOAT_EQ((float)(2.0 * (1.0 + cost.average / BOX_TEST_POINTS)), matchCost);
 }
 
+// A multipolygon walks only the parts whose box holds the point: four
+// disjoint districts price about like one, four copies of one like four.
+TEST_F(GeoPolygonQueryTest, partWalksWeighByBoxShare) {
+  auto circle = [](double lat, double lon) {
+    Ring ring;
+    for (int32_t i = 0; i < 200; i++) {
+      double angle = 2.0 * std::numbers::pi * i / 200;
+      ring.push_back({lat + std::sin(angle), lon + std::cos(angle)});
+    }
+    return ring;
+  };
+  auto exact = [](PolygonSet& set) {
+    GeoPolygonQuery query(set.pool, "geo", set.polygons);
+    return query.makeRelation().pointCost().exact;
+  };
+  PolygonSet one, districts, copies;
+  one.add(circle(0.0, 0.0));
+  for (auto [lat, lon] : {std::pair{0.0, 0.0}, {0.0, 3.0}, {3.0, 0.0}, {3.0, 3.0}}) {
+    districts.add(circle(lat, lon));
+    copies.add(circle(0.0, 0.0));
+  }
+  EXPECT_LT(exact(districts), 1.2 * exact(one));
+  EXPECT_GT(exact(copies), 3.0 * exact(one));
+}
+
 // The public request path: a geo_polygon query over each cardinality.
 TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
   CollectionHelper helper;
