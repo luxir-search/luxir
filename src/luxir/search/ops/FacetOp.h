@@ -3,7 +3,6 @@
 
 #pragma once
 #include <atomic>
-#include <functional>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -14,6 +13,7 @@
 #include "FacetEmit.h"
 #include "FacetExecution.h"
 #include "DistinctFacetCounts.h"
+#include "FacetTermFilter.h"
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
@@ -325,11 +325,19 @@ public:
   }
 };
 
+// inlineResult's default key filter: every key may be an ordinary bucket.
+struct AcceptAnyFacetKey {
+  constexpr bool operator()(int64_t) const { return true; }
+};
+
 class FieldFacetReq : public FacetReq {
 public:
   const ReqFieldFacet& fieldFacet;
   std::span<const int64_t> selectedInts;
   std::span<const std::string_view> selectedStrings;
+  // Which global ords may be ordinary buckets: a string facet's term_filter,
+  // owned by StrFacetOp. Null keeps every key.
+  const FacetOrdFilter* termFilter = nullptr;
 
 protected:
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -614,15 +622,14 @@ public:
       return data.release();
     }
 
+    // `accept` picks which keys may join the ordinary page; selected values
+    // are captured regardless.
     template <typename Label, typename Data, typename ResolveLabel, typename ExecuteChildren,
-              typename KeyLess = std::less<int64_t>>
+              typename KeyLess = std::less<int64_t>, typename Accept = AcceptAnyFacetKey>
     void inlineResult(std::unique_ptr<Data> mergedData,
                       std::span<const std::optional<int64_t>> pinKeys,
                       ResolveLabel&& resolveLabel, ExecuteChildren&& executeChildren,
-                      KeyLess keyLess = {},
-                      // Null keeps every key. Rejected keys never join the
-                      // ordinary page; pinned buckets are captured regardless.
-                      std::function<bool(int64_t)> acceptKey = nullptr) {
+                      KeyLess keyLess = {}, Accept accept = {}) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = fieldOp().minCount;
@@ -686,9 +693,7 @@ public:
       if (finalizer.needsCandidates() || capturePins) {
         counts.forEachEntry([&](int64_t key, char* entry) {
           int64_t count = loadUnaligned<int64_t>(entry);
-          if (!acceptKey || acceptKey(key)) {
-            finalizer.add({key, count, {entry, finalizedSlot}});
-          }
+          if (accept(key)) finalizer.add({key, count, {entry, finalizedSlot}});
           if (capturePins) {
             auto pin = pinByKey.find(key);
             if (pin != pinByKey.end()) {
@@ -810,6 +815,30 @@ public:
       }
     }
 
+    // term_filter selection: the distinct counter has no page floor, so the
+    // term tier runs once over the counted ords; zero-count padding walks
+    // the accepted ords only.
+    template <typename Finalizer>
+    LUXIR_NOINLINE void selectFiltered(const DistinctFacetCounts& data, const FacetOrdFilter& filter,
+                                       OrdMapStr& labels, Finalizer& finalizer) {
+      auto& facet = this->fieldOp();
+      auto accept = filter.select([&](auto&& visit) {
+        for (auto [value, count] : data.counts) if (count > 0) visit(value);
+      }, labels);
+      for (auto [value, count] : data.counts) {
+        if (count > 0 && accept(value)) finalizer.add({value, count, {}});
+      }
+      if (facet.minCount != 0) return;
+      FacetOrdFilter::Terms terms(filter, filter.hasTermTier() ? &labels : nullptr);
+      int64_t padded = 0;
+      terms.forEachAccepted([&](int64_t ord) {
+        if (data.count(ord) != 0) return true;
+        finalizer.add({ord, 0, {}});
+        // Zero counts tie, and the smaller ord wins a tie, so later ones lose.
+        return facet.limit < 0 || ++padded < facet.limit;
+      });
+    }
+
     void result(std::unique_ptr<DistinctFacetCounts> data) {
       auto& facet = this->fieldOp();
       data->finish();
@@ -823,6 +852,10 @@ public:
         }
       } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
       auto finalized = this->finishCountBuckets([&](auto& finalizer) {
+        if constexpr (Ordinal) if (facet.termFilter != nullptr) {
+          selectFiltered(*data, *facet.termFilter, *labels, finalizer);
+          return;
+        }
         for (auto [value, count] : data->counts) if (count > 0) finalizer.add({value, count, {}});
         if constexpr (Ordinal) if (facet.minCount == 0) {
           for (uint64_t value = 0; value < valueDimension.size; value++) {

@@ -14,7 +14,6 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
-#include "luxir/query/FacetTermFilter.h"
 #include "FacetExecution.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
@@ -150,10 +149,9 @@ class StrFacetOp : public FieldFacetReq {
   };
   std::vector<PinnedBucket> pinnedBuckets;
   bool inlineAllCandidate = false;
-  // Which terms may be ordinary buckets; null keeps every term. Counting is
-  // unaffected, so selection is the only place it applies (OrdCountSink,
-  // facetResult2). Selected buckets bypass it.
-  std::shared_ptr<const FacetTermFilter> termFilter;
+  // term_filter resolved over this facet's global ords; FieldFacetReq's
+  // termFilter points here. Unset when no filter (or one that keeps all).
+  std::optional<FacetOrdFilter> resolvedTermFilter;
 
 public:
   class MergeableStrData : public luxir::MergeableData {
@@ -366,17 +364,23 @@ public:
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
     std::span<const std::string_view> selected,
-    std::shared_ptr<const FacetTermFilter> termFilter = nullptr) :
+    std::optional<FacetTermFilterSpec> termFilterSpec = std::nullopt) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
-  ordMap(std::move(ordMap)), termFilter(std::move(termFilter)) {
-    if (!selected.empty()) {
+  ordMap(std::move(ordMap)) {
+    if (!selected.empty() || termFilterSpec) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
       pinnedBuckets.reserve(selected.size());
       for (std::string_view key : selected) {
         auto stats = lookup.termStats(key);
         pinnedBuckets.push_back({key, stats.globalOrd, stats.docFreq});
+      }
+      if (termFilterSpec) {
+        resolvedTermFilter = FacetOrdFilter::resolve(std::move(*termFilterSpec), lookup,
+            this->ordMap ? this->ordMap->numOrds() : 0);
+        // With limit 0 there are no ordinary buckets for it to choose.
+        if (resolvedTermFilter && limit != 0) termFilter = &*resolvedTermFilter;
       }
     }
     enableExecutionProfile();
@@ -450,17 +454,30 @@ public:
     bool full = false;
     int64_t floorCount = 0;
     int64_t floorOrd = 0;
-    // Term lookup for the filter, only when one is set. The guard releases
-    // the lookup's pool allocations with the sink.
-    std::optional<MemPool::ScopeGuard> poolGuard;
-    std::optional<OrdMapStr> labels;
+    // term_filter (null keeps every ord). An ord must pass it before it is
+    // counted or admitted. Its term tier runs here, behind the floor, unless
+    // the caller resolved it up front (`selection`). Replay rows share one
+    // Terms; otherwise the sink opens its own term lookups when it is built,
+    // so no later pool scope can rewind beneath them.
+    const FacetOrdFilter* filter;
+    const FacetOrdFilter::Selection* selection;
+    FacetOrdFilter::Terms* sharedTerms;
+    std::optional<MemPool::ScopeGuard> termsPool;
+    std::optional<OrdMapStr> ownLabels;
+    std::optional<FacetOrdFilter::Terms> ownTerms;
+
+    FacetOrdFilter::Terms& terms() { return sharedTerms ? *sharedTerms : *ownTerms; }
 
     bool accepts(int64_t ord) {
-      return op.termFilter == nullptr
-          || op.termFilter->accepts(labels->ordToStr(ord));
+      if (selection != nullptr) return (*selection)(ord);
+      return filter->containsOrd(ord)
+          && (!filter->hasTermTier() || terms().acceptsTerm(ord));
     }
 
-    LUXIR_NOINLINE void admit(int64_t ord, int64_t count) {
+    LUXIR_NOINLINE void addSlow(int64_t ord, int64_t count) {
+      if (filter != nullptr && !accepts(ord)) return;
+      if (counted < paddingTarget) countedOrds.push_back(ord);
+      counted++;
       finalizer.add({ord, count, {}});
       if (const auto* worst = finalizer.worst()) {
         full = true;
@@ -469,13 +486,36 @@ public:
       }
     }
 
+    LUXIR_NOINLINE void padFiltered(const boost::unordered_flat_set<int64_t>& present) {
+      size_t emitted = counted;
+      auto pad = [&](int64_t ord) {
+        if (present.contains(ord)) return true;
+        finalizer.add({ord, 0, {}});
+        return ++emitted < paddingTarget;
+      };
+      if (sharedTerms == nullptr) {
+        ownTerms->forEachAccepted(pad);
+        return;
+      }
+      for (size_t i = 0; emitted < paddingTarget; i++) {
+        auto ord = sharedTerms->acceptedAt(i);
+        if (!ord || !pad(*ord)) break;
+      }
+    }
+
   public:
-    OrdCountSink(const StrFacetOp& op, bool allowZeroPadding)
+    OrdCountSink(const StrFacetOp& op, bool allowZeroPadding,
+                 const FacetOrdFilter::Selection* selection = nullptr,
+                 FacetOrdFilter::Terms* terms = nullptr)
       : op(op),
-        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder) {
-      if (op.termFilter != nullptr) {
-        poolGuard.emplace(MemPool::threadLocal());
-        labels.emplace(poolGuard->pool(), op.ordMap.get(), op.reader, op.segInfos);
+        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder),
+        filter(op.termFilter), selection(selection), sharedTerms(terms) {
+      if (filter != nullptr && sharedTerms == nullptr) {
+        if (filter->hasTermTier()) {
+          termsPool.emplace(MemPool::threadLocal());
+          ownLabels.emplace(termsPool->pool(), op.ordMap.get(), op.reader, op.segInfos);
+        }
+        ownTerms.emplace(*filter, ownLabels ? &*ownLabels : nullptr);
       }
       if (allowZeroPadding && op.minCount == 0) {
         int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
@@ -485,19 +525,20 @@ public:
 
     LUXIR_INLINE void add(int64_t ord, int64_t count) {
       // countFieldBucketOrder: a newcomer must beat the page's worst bucket
-      // on count, or tie it with a smaller ord.
+      // on count, or tie it with a smaller ord. Losing implies a full page,
+      // so counted already covers paddingTarget and the ord needs neither
+      // remembering nor a term_filter test.
       if (full && (count < floorCount
                    || (count == floorCount && ord > floorOrd))) {
         counted++;
         return;
       }
-      if (op.termFilter != nullptr && !accepts(ord)) return;
-      if (counted < paddingTarget) countedOrds.push_back(ord);
-      counted++;
-      admit(ord, count);
+      addSlow(ord, count);
     }
 
-    // Counted ords added so far.
+    // Ords added so far that passed term_filter, plus the ones the floor
+    // rejected once the page was full (they need no filter test). The early
+    // stops in facetResult read size() >= limit as a full page.
     size_t size() const { return counted; }
 
     // pinCounts carries the count each selected value was found to have, read
@@ -509,13 +550,17 @@ public:
       if (counted < paddingTarget) {
         boost::unordered_flat_set<int64_t> present(
             countedOrds.begin(), countedOrds.end());
-        int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
-        size_t emitted = counted;
-        for (int64_t ord = 0;
-             ord < numGlobalOrds && emitted < paddingTarget; ord++) {
-          if (present.contains(ord) || !accepts(ord)) continue;
-          finalizer.add({ord, 0, {}});
-          emitted++;
+        if (filter != nullptr) {
+          padFiltered(present);
+        } else {
+          int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
+          size_t emitted = counted;
+          for (int64_t ord = 0;
+               ord < numGlobalOrds && emitted < paddingTarget; ord++) {
+            if (present.contains(ord)) continue;
+            finalizer.add({ord, 0, {}});
+            emitted++;
+          }
         }
       }
       return op.finishPage(finalizer.finish(), pinCounts);
@@ -531,8 +576,10 @@ public:
   // delete this wrapper.
   std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
       const std::vector<std::pair<int64_t, int64_t>>& ordCounts,
-      bool allowZeroPadding) const {
-    auto sink = ordCountSink(allowZeroPadding);
+      bool allowZeroPadding,
+      const FacetOrdFilter::Selection* selection = nullptr,
+      FacetOrdFilter::Terms* terms = nullptr) const {
+    OrdCountSink sink(*this, allowZeroPadding, selection, terms);
     for (auto [ord, count] : ordCounts) sink.add(ord, count);
     return sink.finish();
   }
@@ -1375,7 +1422,11 @@ public:
         // buckets after sorting/truncating the competitive nonzero buckets.
         auto min = std::max<int64_t>(thisOp().minCount, 1);
 
-        if (allTopTerms) {
+        if (thisOp().termFilter != nullptr) {
+          // TOP_TERMS is never planned under a filter (countSegment).
+          assert(!allTopTerms);
+          collectFiltered(*mergedData, *thisOp().termFilter, min, limit, ordCounts);
+        } else if (allTopTerms) {
           assert(thisOp().ordMap != nullptr);
           for (const auto& entry : thisOp().ordMap->topTerms().entries) {
             if (entry.df < min) break;
@@ -1459,6 +1510,66 @@ public:
       emitPage(ordCounts.finish(pinCounts), missing_count);
     }
 
+    // Streams the counted ords term_filter can keep into the sink, which
+    // applies the filter itself. Dense counters are walked only over the
+    // filter's ord intervals; sparse ones are probed per accepted ord when
+    // the filter is narrower than what they hold.
+    LUXIR_NOINLINE void collectFiltered(MergeableStrData& data, const FacetOrdFilter& filter,
+                                        int64_t min, int64_t limit, OrdCountSink& out) {
+      auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&data.counts);
+      auto* skinnyCounts = std::get_if<SkinnyCounter8>(&data.counts);
+      auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&data.counts);
+      auto* spanCounts = std::get_if<SpanCounter>(&data.counts);
+      auto forEachRangeOrd = [&](size_t size, auto&& visit) {
+        for (const auto& interval : filter.ranges()) {
+          size_t end = std::min((size_t)interval.hi, size);
+          for (size_t ord = (size_t)interval.lo; ord < end; ord++) visit((int64_t)ord);
+        }
+      };
+      if (vecCounts) {
+        forEachRangeOrd(vecCounts->size(), [&](int64_t ord) {
+          int64_t count = (*vecCounts)[(size_t)ord];
+          if (count >= min) out.add(ord, count);
+        });
+      } else if (skinnyCounts) {
+        // As the unfiltered walk: overflowed ords first, which outcount every
+        // ord that did not overflow.
+        for (auto [ord, count] : skinnyCounts->overflow) {
+          count += skinnyCounts->counts[ord];
+          skinnyCounts->counts[ord] = 0;
+          if (count >= min) out.add(ord, count);
+        }
+        if (limit == -1 || (int64_t)out.size() < limit) {
+          forEachRangeOrd(skinnyCounts->counts.size(), [&](int64_t ord) {
+            int64_t count = skinnyCounts->counts[(size_t)ord];
+            if (count >= min) out.add(ord, count);
+          });
+        }
+      } else if (mapCounts) {
+        if (filter.width() < (int64_t)mapCounts->size()) {
+          forEachRangeOrd(std::numeric_limits<size_t>::max(), [&](int64_t ord) {
+            auto it = mapCounts->find(ord);
+            if (it != mapCounts->end() && it->second >= min) out.add(ord, it->second);
+          });
+        } else {
+          for (auto& [ord, count] : *mapCounts) {
+            if (count >= min) out.add(ord, count);
+          }
+        }
+      } else if (spanCounts) {
+        if (filter.width() < (int64_t)spanCounts->distinct()) {
+          forEachRangeOrd(spanCounts->maxOrd, [&](int64_t ord) {
+            int64_t count = spanCounts->total(ord);
+            if (count >= min) out.add(ord, count);
+          });
+        } else {
+          collectSparseCounts(*spanCounts, min, limit, out);
+        }
+      } else {
+        assert(false);
+      }
+    }
+
     void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
                   int64_t missingCount) {
 
@@ -1472,6 +1583,10 @@ public:
 
 
     void facetResult2(std::unique_ptr<MergeableFieldFacetInline> mergedData) {
+      if (thisOp().termFilter != nullptr) {
+        facetResult2Filtered(std::move(mergedData), *thisOp().termFilter);
+        return;
+      }
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
                        thisOp().reader, thisOp().segInfos);
@@ -1483,12 +1598,30 @@ public:
             return std::string(bucket.pinned()
                 ? thisOp().pinnedBuckets[bucket.pinIndex].key
                 : labels.ordToStr(*bucket.key));
+          }, [this](auto& buckets) { executeResultChildren(buckets); });
+    }
+
+    // facetResult2 under term_filter. There is no page floor here, so the
+    // term tier runs once, ascending, over the ords the filter's intervals
+    // keep. Out of line, so the unfiltered page keeps its inlining.
+    LUXIR_NOINLINE void facetResult2Filtered(std::unique_ptr<MergeableFieldFacetInline> mergedData,
+                                             const FacetOrdFilter& filter) {
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
+                       thisOp().reader, thisOp().segInfos);
+      std::vector<std::optional<int64_t>> pins;
+      pins.reserve(thisOp().pinnedBuckets.size());
+      for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
+      auto accept = filter.select([&](auto&& visit) {
+        mergedData->counts.forEachEntry([&](int64_t key, char*) { visit(key); });
+      }, labels);
+      inlineResult<std::string>(std::move(mergedData), pins,
+          [&](const auto& bucket) {
+            return std::string(bucket.pinned()
+                ? thisOp().pinnedBuckets[bucket.pinIndex].key
+                : labels.ordToStr(*bucket.key));
           }, [this](auto& buckets) { executeResultChildren(buckets); },
-          std::less<int64_t>{}, thisOp().termFilter == nullptr
-              ? std::function<bool(int64_t)>()
-              : [&](int64_t ord) {
-                  return thisOp().termFilter->accepts(labels.ordToStr(ord));
-                });
+          std::less<int64_t>{}, [&](int64_t key) { return accept(key); });
     }
 
 
@@ -1709,6 +1842,18 @@ public:
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
                          *child.req.reader, child.segInfos);
+      // term_filter: one term-tier pass over every row's ords, and one
+      // ascending accepted-ord stream for every row's zero-count padding.
+      std::optional<FacetOrdFilter::Selection> selection;
+      std::optional<FacetOrdFilter::Terms> terms;
+      if (const auto* filter = child.termFilter) {
+        selection.emplace(filter->select([&](auto&& visit) {
+          for (const auto& row : rows) {
+            for (auto [ord, count] : row) visit(ord);
+          }
+        }, ordMapStr));
+        terms.emplace(*filter, filter->hasTermTier() ? &ordMapStr : nullptr);
+      }
       std::vector<std::pair<std::string, int64_t>> countVec;
       for (const auto& bucket : buckets) {
         int32_t owner = bucket.owner.value;
@@ -1716,7 +1861,8 @@ public:
         assert(owner >= 0 && owner < (int32_t)rows.size());
         assert(output >= 0 && output < (int32_t)arr.v.size());
         auto& ordCounts = rows[(size_t)owner];
-        auto finalized = child.finalizeOrdCounts(ordCounts, true);
+        auto finalized = child.finalizeOrdCounts(ordCounts, true,
+            selection ? &*selection : nullptr, terms ? &*terms : nullptr);
         countVec.clear();
         countVec.reserve(finalized.size());
         for (const auto& result : finalized) {

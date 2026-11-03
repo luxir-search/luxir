@@ -8,11 +8,14 @@
 #include <utility>
 #include <vector>
 
-#include "luxir/query/FacetTermFilter.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/DistinctFacetCounts.h"
+#include "luxir/search/ops/FacetTermFilter.h"
 #include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -24,10 +27,16 @@ using Buckets = std::vector<std::pair<std::string, int64_t>>;
 
 std::string join(const Buckets& buckets) {
   std::string out;
-  for (const auto& [key, count] : buckets) {
-    out += key + "=" + std::to_string(count) + " ";
-  }
+  for (const auto& [key, count] : buckets) out += key + "=" + std::to_string(count) + " ";
   return out;
+}
+
+Buckets bucketsOf(const api::FacetResult& result) {
+  Buckets buckets;
+  if (!result.bucket_ids.has_value()) return buckets;
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  for (size_t i = 0; i < ids.size(); i++) buckets.emplace_back(std::string(ids[i]), result.counts[i]);
+  return buckets;
 }
 
 }  // namespace
@@ -38,8 +47,7 @@ class FacetTermFilterTest : public LuxirTest {
 protected:
   CollectionHelper helper;
 
-  // Two segments, so global ords are remapped and the whole-index top-terms
-  // shortcut is a candidate for the unfiltered facet.
+  // Two segments. The first holds every term, so global ords are identity.
   void SetUp() override {
     LuxirTest::SetUp();
     struct Row { const char* cat; int count; const char* other; };
@@ -63,8 +71,6 @@ protected:
       }
       ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     }
-    ASSERT_EQ(2u, helper.getIndexWriter()->snapshots.readers.getReader()
-                      ->segments().size());
   }
 
   struct Result {
@@ -75,8 +81,9 @@ protected:
   };
 
   // `facet` is the field_facet body; `domain` an optional domain query.
-  Result run(const std::string& facet, const std::string& domain = "") {
-    auto req = localReq(helper.getSearchEngine());
+  Result run(const std::string& facet, const std::string& domain = "",
+             CollectionHelper* on = nullptr) {
+    auto req = localReq((on ? *on : helper).getSearchEngine());
     std::string json = R"json({"ops":{"f":{"field_facet":)json" + facet
         + (domain.empty() ? "" : R"json(,"domain":{"query":")json" + domain + "\"}")
         + "}}}";
@@ -90,78 +97,120 @@ protected:
       return result;
     }
     const auto& facetResult = *req->responses[0]->proto.ops.at("f")->facetResult();
-    if (facetResult.bucket_ids.has_value()) {
-      const auto& ids = std::get<api::ColStr>(facetResult.bucket_ids->kind).v;
-      for (size_t i = 0; i < ids.size(); i++) {
-        result.buckets.emplace_back(std::string(ids[i]), facetResult.counts[i]);
-      }
-    }
+    result.buckets = bucketsOf(facetResult);
     result.missing = facetResult.missing;
     return result;
   }
 
-  Buckets ok(const std::string& facet, const std::string& domain = "") {
-    auto result = run(facet, domain);
+  Buckets ok(const std::string& facet, const std::string& domain = "",
+             CollectionHelper* on = nullptr) {
+    auto result = run(facet, domain, on);
     EXPECT_TRUE(result.ok) << result.error;
     return result.buckets;
   }
+
+  // Facet "f" under top_docs "q" with the given top_docs body.
+  Buckets underTopDocs(const std::string& topDocs) {
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(R"json({"ops":{"q":{"top_docs":)json" + topDocs + "}}}",
+                      req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    if (!req->ok()) return {};
+    return bucketsOf(*req->docList("q")->ops.at("f")->facetResult());
+  }
 };
 
-TEST_F(FacetTermFilterTest, prefix) {
-  EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}}),
-            ok(R"json({"field":"cat_s","limit":10,"term_filter":{"prefix":"ap"}})json"));
+TEST_F(FacetTermFilterTest, prefixAcrossCounterReps) {
+  SearchOverridesGuard guard(forcedFacetCounterMode);
+  for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::FORCE_VECTOR,
+                    FacetCounterMode::FORCE_SKINNY, FacetCounterMode::FORCE_HASH,
+                    FacetCounterMode::SPAN_GLOBAL}) {
+    forcedFacetCounterMode = mode;
+    SCOPED_TRACE((int)mode);
+    EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}}),
+              ok(R"json({"field":"cat_s","limit":10,"term_filter":{"prefix":"ap"}})json"));
+    EXPECT_EQ((Buckets{{"banana", 3}, {"cherry", 1}}),
+              ok(R"json({"field":"cat_s","limit":10,
+                     "term_filter":{"include":["cherry","banana","missing"]}})json"));
+    EXPECT_EQ((Buckets{{"blueberry", 2}}),
+              ok(R"json({"field":"cat_s","limit":10,"term_filter":{"regex":"b.*y"}})json"));
+    // Wide filters: hash and span counters iterate their entries.
+    EXPECT_EQ((Buckets{{"apricot", 4}, {"banana", 3}}),
+              ok(R"json({"field":"cat_s","limit":2,"term_filter":{"exclude":["apple"]}})json"));
+    // A full page with the term tier tested behind its floor.
+    EXPECT_EQ((Buckets{{"apricot", 4}, {"blueberry", 2}}),
+              ok(R"json({"field":"cat_s","limit":2,"term_filter":{"regex":".*r.*"}})json"));
+  }
+}
+
+TEST_F(FacetTermFilterTest, skinnyOverflowRejected) {
+  // 300 counts overflow the skinny byte counter. Rejecting the overflowed
+  // term must not end selection before the in-range terms are read.
+  CollectionHelper big;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 300; i++) docs.push_back(flatdoc("id", "b" + std::to_string(i), "c_s", "big"));
+  docs.push_back(flatdoc("id", "s1", "c_s", "small"));
+  docs.push_back(flatdoc("id", "s2", "c_s", "small"));
+  docs.push_back(flatdoc("id", "t1", "c_s", "tiny"));
+  ASSERT_TRUE(big.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetCounterMode);
+  forcedFacetCounterMode = FacetCounterMode::FORCE_SKINNY;
+  EXPECT_EQ((Buckets{{"small", 2}}),
+            ok(R"json({"field":"c_s","limit":1,"term_filter":{"exclude":["big"]}})json", "", &big));
+  EXPECT_EQ((Buckets{{"big", 300}, {"small", 2}}),
+            ok(R"json({"field":"c_s","limit":2,"term_filter":{"regex":"[bs].*"}})json", "", &big));
 }
 
 TEST_F(FacetTermFilterTest, filterAppliesBeforeLimit) {
   // apple outranks banana overall, so a post-limit filter would return nothing.
   EXPECT_EQ((Buckets{{"banana", 3}}),
             ok(R"json({"field":"cat_s","limit":1,"term_filter":{"prefix":"b"}})json"));
-  EXPECT_EQ((Buckets{{"apple", 5}}),
-            ok(R"json({"field":"cat_s","limit":1,"term_filter":{"exclude":["nope"]}})json"));
-}
-
-TEST_F(FacetTermFilterTest, regexIsWholeTerm) {
-  EXPECT_EQ((Buckets{{"apricot", 4}, {"blueberry", 2}, {"cherry", 1}}),
-            ok(R"json({"field":"cat_s","limit":-1,"term_filter":{"regex":".*r.*"}})json"));
-  EXPECT_TRUE(ok(R"json({"field":"cat_s","limit":-1,"term_filter":{"regex":"ap"}})json").empty());
-}
-
-TEST_F(FacetTermFilterTest, includeAndExcludeLists) {
-  EXPECT_EQ((Buckets{{"banana", 3}, {"cherry", 1}}),
-            ok(R"json({"field":"cat_s","limit":10,
-                   "term_filter":{"include":["cherry","banana","missing"]}})json"));
   EXPECT_EQ((Buckets{{"apricot", 4}, {"banana", 3}}),
             ok(R"json({"field":"cat_s","limit":2,"term_filter":{"exclude":["apple"]}})json"));
-  EXPECT_EQ((Buckets{{"banana", 3}, {"blueberry", 2}, {"cherry", 1}}),
-            ok(R"json({"field":"cat_s","limit":10,"term_filter":{"exclude_regex":"a.*"}})json"));
 }
 
-TEST_F(FacetTermFilterTest, conditionsCombineWithAnd) {
+TEST_F(FacetTermFilterTest, regexShapes) {
+  auto all = [&](const std::string& filter) {
+    return ok(R"json({"field":"cat_s","limit":-1,"term_filter":)json" + filter + "}");
+  };
+  EXPECT_EQ((Buckets{{"apricot", 4}, {"blueberry", 2}, {"cherry", 1}}), all(R"({"regex":".*r.*"})"));
+  EXPECT_TRUE(all(R"({"regex":"ap"})").empty());                      // whole term
+  EXPECT_EQ((Buckets{{"apple", 5}}), all(R"({"regex":"apple"})"));      // single term
+  EXPECT_EQ(5u, all(R"({"regex":".*"})").size());                       // every term
+  EXPECT_EQ((Buckets{{"banana", 3}, {"blueberry", 2}, {"cherry", 1}}),
+            all(R"({"exclude_regex":"a.*"})"));                        // prefix hole
+  EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}, {"banana", 3}}),
+            all(R"({"exclude_regex":".*rr.*"})"));                     // general exclude
+  EXPECT_TRUE(all(R"({"exclude_regex":".*"})").empty());
+  EXPECT_TRUE(all(R"({"include":["nope"]})").empty());                 // nothing resolves
   EXPECT_EQ((Buckets{{"blueberry", 2}}),
-            ok(R"json({"field":"cat_s","limit":10,"term_filter":{
-                "prefix":"b","regex":".*e.*","exclude":["banana"]}})json"));
+            all(R"({"prefix":"b","regex":".*e.*","exclude":["banana"]})"));
+  EXPECT_EQ(5u, all("{}").size());
 }
 
 TEST_F(FacetTermFilterTest, partitionsCoverEveryTermOnce) {
-  const std::vector<std::string> terms{"apple", "apricot", "banana", "blueberry", "cherry"};
-  const uint32_t parts = 3;
-  Buckets all;
-  for (uint32_t part = 0; part < parts; part++) {
-    auto got = ok(R"json({"field":"cat_s","limit":-1,"term_filter":{"partition":)json"
-                  + std::to_string(part) + R"json(,"num_partitions":3}})json");
-    for (const auto& [key, count] : got) {
-      EXPECT_EQ(part, FacetTermFilter::partitionHash(key) % parts) << key;
-      all.emplace_back(key, count);
+  // Plain and with an inline sub-op (no page floor, so the term tier is
+  // resolved up front).
+  for (std::string ops : {"", R"json(,"ops":{"total":{"expr_op":"sum(n_i)"}})json"}) {
+    const uint32_t parts = 3;
+    Buckets all;
+    for (uint32_t part = 0; part < parts; part++) {
+      auto got = ok(R"json({"field":"cat_s","limit":-1,"term_filter":{"partition":)json"
+                    + std::to_string(part) + R"json(,"num_partitions":3})json" + ops + "}");
+      for (const auto& [key, count] : got) {
+        EXPECT_EQ(part, FacetOrdFilter::partitionHash(key) % parts) << key;
+        all.emplace_back(key, count);
+      }
     }
+    std::sort(all.begin(), all.end());
+    EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}, {"banana", 3},
+                       {"blueberry", 2}, {"cherry", 1}}), all) << join(all) << ops;
   }
-  std::sort(all.begin(), all.end());
-  EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}, {"banana", 3},
-                     {"blueberry", 2}, {"cherry", 1}}), all) << join(all);
 }
 
 TEST_F(FacetTermFilterTest, countsStayExactInTheDomain) {
-  auto unfiltered = ok(R"json({"field":"cat_s","limit":-1})json", "other_s:x");
-  EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}, {"blueberry", 2}}), unfiltered);
   EXPECT_EQ((Buckets{{"apricot", 4}, {"blueberry", 2}}),
             ok(R"json({"field":"cat_s","limit":-1,"term_filter":{"exclude":["apple"]}})json",
                "other_s:x"));
@@ -176,79 +225,95 @@ TEST_F(FacetTermFilterTest, missingIgnoresFilter) {
 }
 
 TEST_F(FacetTermFilterTest, mincountZeroPadsOnlyAllowedTerms) {
-  // Domain matches apple only; banana and blueberry pad with zeros, nothing
-  // outside the prefix does.
+  // The domain matches apple only.
   EXPECT_EQ((Buckets{{"banana", 0}, {"blueberry", 0}}),
             ok(R"json({"field":"cat_s","limit":10,"mincount":0,
                    "term_filter":{"prefix":"b"}})json", "cat_s:apple"));
   EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 0}}),
             ok(R"json({"field":"cat_s","limit":10,"mincount":0,
                    "term_filter":{"prefix":"ap"}})json", "cat_s:apple"));
+  EXPECT_EQ((Buckets{{"blueberry", 0}, {"cherry", 0}}),
+            ok(R"json({"field":"cat_s","limit":10,"mincount":0,
+                   "term_filter":{"regex":".*rr.*"}})json", "cat_s:apple"));
 }
 
 TEST_F(FacetTermFilterTest, inlineSubOpsHonorFilter) {
-  // limit -1 aggregates sub-ops inline, a different selection path.
-  auto req = localReq(helper.getSearchEngine());
-  parseQueryRequest(R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,
-      "term_filter":{"prefix":"b"},
-      "ops":{"total":{"expr_op":"sum(n_i)"}}}}}})json", req->rawRequest(), req->mr);
-  req->collection("main");
-  req->execute();
-  ASSERT_OK(req);
-  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
-  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
-  ASSERT_EQ(2u, ids.size());
-  EXPECT_EQ("banana", ids[0]);
-  EXPECT_EQ("blueberry", ids[1]);
-  EXPECT_EQ(3, result.counts[0]);
-  EXPECT_EQ(2, result.counts[1]);
+  // limit -1 aggregates sub-ops inline, through a dense or a sparse table.
+  SearchOverridesGuard guard(forcedInlineFacetEntryMode);
+  for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
+    forcedInlineFacetEntryMode = mode;
+    for (std::string filter : {R"({"prefix":"b"})", R"({"regex":"b.*"})", R"({"exclude_regex":"[^b].*"})"}) {
+      EXPECT_EQ((Buckets{{"banana", 3}, {"blueberry", 2}}),
+                ok(R"json({"field":"cat_s","limit":-1,"term_filter":)json" + filter
+                   + R"json(,"ops":{"total":{"expr_op":"sum(n_i)"}}})json")) << filter;
+    }
+  }
+}
+
+TEST_F(FacetTermFilterTest, sortBySubOp) {
+  // n_i grows with the doc number, so blueberry's docs outweigh banana's.
+  EXPECT_EQ((Buckets{{"blueberry", 2}, {"banana", 3}}),
+            ok(R"json({"field":"cat_s","limit":2,"term_filter":{"prefix":"b"},
+                   "sort":[{"expr":"top","dir":"desc"}],
+                   "ops":{"top":{"expr_op":"max(n_i)"}}})json"));
 }
 
 TEST_F(FacetTermFilterTest, nestedFacet) {
-  auto req = localReq(helper.getSearchEngine());
-  parseQueryRequest(R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,
-      "ops":{"o":{"field_facet":{"field":"other_s","limit":-1,
-                  "term_filter":{"exclude":["y"]}}}}}}}})json",
-      req->rawRequest(), req->mr);
-  req->collection("main");
-  req->execute();
-  ASSERT_OK(req);
-  const auto& parent = *req->responses[0]->proto.ops.at("f")->facetResult();
-  const auto& cats = std::get<api::ColStr>(parent.bucket_ids->kind).v;
-  const auto* arr = std::get_if<api::ArrVal>(&(**parent.ops.find("o")).kind);
-  ASSERT_NE(nullptr, arr);
-  ASSERT_EQ(cats.size(), arr->v.size());
-  for (size_t i = 0; i < cats.size(); i++) {
-    const auto* child = arr->v[i].facetResult();
-    ASSERT_NE(nullptr, child);
-    bool yOnly = cats[i] == "banana" || cats[i] == "cherry";
-    if (yOnly) {
-      EXPECT_TRUE(!child->bucket_ids.has_value()
-                  || std::get<api::ColStr>(child->bucket_ids->kind).v.empty()) << cats[i];
-    } else {
-      ASSERT_TRUE(child->bucket_ids.has_value()) << cats[i];
-      const auto& ids = std::get<api::ColStr>(child->bucket_ids->kind).v;
-      ASSERT_EQ(1u, ids.size()) << cats[i];
-      EXPECT_EQ("x", ids[0]);
+  SearchOverridesGuard guard(forcedFacetFeedStrategy);
+  for (auto strategy : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+    forcedFacetFeedStrategy = strategy;
+    for (std::string filter : {R"({"exclude":["y"]})", R"({"regex":"[^y]"})"}) {
+      auto req = localReq(helper.getSearchEngine());
+      parseQueryRequest(R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,
+          "ops":{"o":{"field_facet":{"field":"other_s","limit":-1,"mincount":0,
+                      "term_filter":)json" + filter + "}}}}}}}",
+          req->rawRequest(), req->mr);
+      req->collection("main");
+      req->execute();
+      ASSERT_OK(req);
+      const auto& parent = *req->responses[0]->proto.ops.at("f")->facetResult();
+      const auto& cats = std::get<api::ColStr>(parent.bucket_ids->kind).v;
+      const auto* arr = std::get_if<api::ArrVal>(&(**parent.ops.find("o")).kind);
+      ASSERT_NE(nullptr, arr);
+      ASSERT_EQ(cats.size(), arr->v.size());
+      for (size_t i = 0; i < cats.size(); i++) {
+        const auto* child = arr->v[i].facetResult();
+        ASSERT_NE(nullptr, child);
+        bool yOnly = cats[i] == "banana" || cats[i] == "cherry";
+        // mincount 0 pads x where the parent has none; y never appears.
+        EXPECT_EQ((Buckets{{"x", yOnly ? 0 : (cats[i] == "apple" ? 5 : cats[i] == "apricot" ? 4 : 2)}}),
+                  bucketsOf(*child)) << cats[i] << " " << filter << " " << (int)strategy;
+      }
     }
   }
 }
 
 TEST_F(FacetTermFilterTest, selectedBucketsBypassFilter) {
-  auto req = localReq(helper.getSearchEngine());
-  parseQueryRequest(R"json({"ops":{"q":{"top_docs":{"limit":0,"get_number":true,"ops":{
-      "f":{"field_facet":{"field":"cat_s","limit":10,"selected":["cherry"],
-           "term_filter":{"prefix":"ap"}}}}}}}})json", req->rawRequest(), req->mr);
-  req->collection("main");
-  req->execute();
-  ASSERT_OK(req);
-  const auto& result = *req->docList("q")->ops.at("f")->facetResult();
-  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
-  ASSERT_EQ(3u, ids.size());
-  EXPECT_EQ("apple", ids[0]);
-  EXPECT_EQ("apricot", ids[1]);
-  EXPECT_EQ("cherry", ids[2]);
-  EXPECT_EQ(1, result.counts[2]);
+  EXPECT_EQ((Buckets{{"apple", 5}, {"apricot", 4}, {"cherry", 1}}),
+            underTopDocs(R"json({"limit":0,"ops":{
+                "f":{"field_facet":{"field":"cat_s","limit":10,"selected":["cherry"],
+                     "term_filter":{"prefix":"ap"}}}}})json"));
+  EXPECT_EQ((Buckets{{"cherry", 1}}),
+            underTopDocs(R"json({"limit":0,"ops":{
+                "f":{"field_facet":{"field":"cat_s","limit":0,"selected":["cherry"],
+                     "term_filter":{"regex":".*p.*"}}}}})json"));
+}
+
+TEST_F(FacetTermFilterTest, distinctCounts) {
+  SearchOverridesGuard guard(forcedDistinctFacetMode);
+  for (auto mode : {DistinctFacetMode::PAGED, DistinctFacetMode::HASH}) {
+    forcedDistinctFacetMode = mode;
+    EXPECT_EQ((Buckets{{"banana", 1}, {"blueberry", 1}}),
+              ok(R"json({"field":"cat_s","count_distinct":"other_s",
+                     "term_filter":{"prefix":"b"}})json"));
+    EXPECT_EQ((Buckets{{"blueberry", 1}, {"cherry", 0}}),
+              ok(R"json({"field":"cat_s","count_distinct":"other_s","mincount":0,
+                     "term_filter":{"regex":".*rr.*"}})json", "other_s:x"));
+    // Facets under a collapsed list count groups, through the same path.
+    EXPECT_EQ((Buckets{{"apple", 1}, {"apricot", 1}}),
+              underTopDocs(R"json({"limit":0,"collapse":"other_s","ops":{
+                  "f":{"field_facet":{"field":"cat_s","term_filter":{"prefix":"ap"}}}}})json"));
+  }
 }
 
 TEST_F(FacetTermFilterTest, multiValuedField) {
@@ -258,23 +323,86 @@ TEST_F(FacetTermFilterTest, multiValuedField) {
       flatdoc("id", "2", "tags_ss", std::vector<std::string>{"red", "square"}),
       flatdoc("id", "3", "tags_ss", std::vector<std::string>{"round"}),
   }, UpdateMessage::COMMIT);
-  auto req = localReq(multi.getSearchEngine());
-  parseQueryRequest(R"json({"ops":{"f":{"field_facet":{"field":"tags_ss","limit":-1,
-      "term_filter":{"regex":"r.*"}}}}})json", req->rawRequest(), req->mr);
-  req->collection("main");
-  req->execute();
-  ASSERT_OK(req);
-  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
-  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
-  ASSERT_EQ(2u, ids.size());
-  EXPECT_EQ("red", ids[0]);
-  EXPECT_EQ(2, result.counts[0]);
-  EXPECT_EQ("round", ids[1]);
-  EXPECT_EQ(2, result.counts[1]);
+  EXPECT_EQ((Buckets{{"red", 2}, {"round", 2}}),
+            ok(R"json({"field":"tags_ss","limit":-1,"term_filter":{"regex":"r.*"}})json", "", &multi));
 }
 
-TEST_F(FacetTermFilterTest, emptyFilterKeepsEverything) {
-  EXPECT_EQ(5u, ok(R"json({"field":"cat_s","limit":-1,"term_filter":{}})json").size());
+// No segment holds every term, so global ords are delta-mapped and a ceiling
+// is the smallest segment ceiling.
+TEST_F(FacetTermFilterTest, noSegmentHoldsEveryTerm) {
+  CollectionHelper split;
+  ASSERT_TRUE(split.indexAll(std::array{
+      flatdoc("id", "1", "c_s", "apple"), flatdoc("id", "2", "c_s", "banana"),
+      flatdoc("id", "3", "c_s", "banana")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(split.indexAll(std::array{
+      flatdoc("id", "4", "c_s", "apricot"), flatdoc("id", "5", "c_s", "blueberry"),
+      flatdoc("id", "6", "c_s", "cherry")}, UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Buckets{{"banana", 2}, {"blueberry", 1}}),
+            ok(R"json({"field":"c_s","limit":-1,"term_filter":{"prefix":"b"}})json", "", &split));
+  EXPECT_EQ((Buckets{{"apricot", 1}, {"cherry", 1}}),
+            ok(R"json({"field":"c_s","limit":-1,"term_filter":{"include":["cherry","apricot"]}})json",
+               "", &split));
+  // The first segment's ceiling for "apr" is banana; the global one is apricot.
+  EXPECT_EQ((Buckets{{"apricot", 1}}),
+            ok(R"json({"field":"c_s","limit":-1,"term_filter":{"prefix":"apr"}})json", "", &split));
+  EXPECT_EQ((Buckets{{"apricot", 0}, {"banana", 0}, {"blueberry", 0}}),
+            ok(R"json({"field":"c_s","limit":3,"mincount":0,
+                   "term_filter":{"exclude":["apple"]}})json", "c_s:nope", &split));
+}
+
+TEST_F(FacetTermFilterTest, literalsNormalizeAsQueries) {
+  CollectionHelper folded;
+  SchemaBuilder schema;
+  auto& field = schema.field("lc");
+  field.type = api::FieldDef_::FieldClass::STRING;
+  field.column = true;
+  schema.normalizer(field, {"lowercase"});
+  schema.set(folded.collection());
+  ASSERT_TRUE(folded.indexAll(std::array{
+      flatdoc("id", "1", "lc", "Apple"), flatdoc("id", "2", "lc", "APRICOT"),
+      flatdoc("id", "3", "lc", "Banana")}, UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Buckets{{"apple", 1}, {"apricot", 1}}),
+            ok(R"json({"field":"lc","term_filter":{"prefix":"AP"}})json", "", &folded));
+  EXPECT_EQ((Buckets{{"banana", 1}}),
+            ok(R"json({"field":"lc","term_filter":{"include":["BANANA"],"regex":"B.*"}})json",
+               "", &folded));
+  // ID fields match verbatim.
+  EXPECT_EQ((Buckets{{"d1", 1}}),
+            ok(R"json({"field":"id","term_filter":{"include":["d1","D1"]}})json"));
+}
+
+// Values over the indexed term length are fitted to a prefix plus hash.
+TEST_F(FacetTermFilterTest, fittedLongTerms) {
+  CollectionHelper fitted;
+  std::string longValue = std::string(300, 'x') + "tail";
+  ASSERT_TRUE(fitted.indexAll(std::array{
+      flatdoc("id", "1", "v_s", longValue), flatdoc("id", "2", "v_s", "xshort")},
+      UpdateMessage::COMMIT).success);
+  auto run = [&](const std::string& filter) {
+    auto req = localReq(fitted.getSearchEngine());
+    parseQueryRequest(R"json({"ops":{"f":{"field_facet":{"field":"v_s","limit":-1,"term_filter":)json"
+                      + filter + "}}}}", req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    auto warned = std::ranges::count(req->respWarnings(), std::string_view("fitted_terms"),
+                                     &api::Warning::code);
+    return std::pair<size_t, long>(
+        bucketsOf(*req->responses[0]->proto.ops.at("f")->facetResult()).size(), warned);
+  };
+  std::string literal(240, 'x');
+  // The regex keeps every term with the kept prefix, as the query does.
+  EXPECT_EQ((std::pair<size_t, long>(1, 0)), run(R"({"regex":")" + literal + R"(.*"})"));
+  // exclude_regex never widens: it tests the fitted bytes, so the fitted term
+  // is not excluded, and it warns.
+  EXPECT_EQ((std::pair<size_t, long>(2, 1)), run(R"({"exclude_regex":")" + literal + R"(.*"})"));
+  // A general pattern can reach fitted bytes and says so.
+  EXPECT_EQ((std::pair<size_t, long>(0, 1)), run(R"({"regex":".*tail"})"));
+}
+
+TEST_F(FacetTermFilterTest, fieldWithoutTerms) {
+  EXPECT_TRUE(ok(R"json({"field":"absent_s","mincount":0,"term_filter":{"regex":".*a.*"}})json")
+                  .empty());
 }
 
 TEST_F(FacetTermFilterTest, invalidFilters) {
@@ -286,7 +414,8 @@ TEST_F(FacetTermFilterTest, invalidFilters) {
   };
   expectError(R"json({"field":"n_i","term_filter":{"prefix":"1"}})json",
               "term_filter is supported only on STRING and ID fields");
-  expectError(R"json({"field":"cat_s","term_filter":{"regex":"(unclosed"}})json", "term_filter regex");
+  expectError(R"json({"field":"cat_s","term_filter":{"regex":"(unclosed"}})json",
+              "term_filter regex: Regex query for field 'cat_s' pattern '(unclosed'");
   expectError(R"json({"field":"cat_s","term_filter":{"partition":3,"num_partitions":3}})json",
               "partition 3 must be less than num_partitions 3");
   expectError(R"json({"field":"cat_s","term_filter":{"partition":1}})json",

@@ -345,10 +345,19 @@ nothing because an `a` term ranked first).
 | `partition`, `num_partitions` | Keep terms whose stable hash modulo `num_partitions` equals `partition`. Requests for partitions `0` to `num_partitions - 1` together return every term exactly once, so a client can page through a very large term set. The hash is 64-bit FNV-1a over the indexed term bytes. |
 
 Every condition that is set must hold. Literals are matched the way the field
-indexes terms: `prefix`, `regex`, `include`, and `exclude` are normalized like
-the same values in a prefix, regex, or `any_of` query, and ID fields use them
-verbatim. Regexes cannot see the discarded bytes of a long term that the field
-truncates or hashes.
+indexes terms: `prefix`, `include`, and `exclude` are normalized like the same
+values in a prefix or `any_of` query, `regex` and `exclude_regex` are compiled
+like a [regex query](query-reference.md) (field folding per character), and ID
+fields use them verbatim. A `regex` whose literal start is longer than a field
+keeps of a long value matches every term with the kept prefix, as the regex
+query does. Otherwise both regexes test a long value's indexed bytes (an
+`exclude_regex` never widens, since that would drop terms it does not match),
+and the response carries a `fitted_terms` warning when that can happen.
+
+A `prefix`, the literal start of a `regex`, and the `include` and `exclude`
+lists resolve to ranges of terms once per request, and bucket selection walks
+only those ranges. The rest of a regex, `exclude_regex`, and partitions read
+each candidate term, so they cost more on a high-cardinality field.
 
 The filter changes only the ordinary buckets:
 
@@ -357,7 +366,7 @@ The filter changes only the ordinary buckets:
 - `selected` buckets are always returned, whether or not they pass the filter.
 - Sub-operations and nested facets run on the buckets that pass.
 
-`term_filter` is rejected on integer, date, and text fields.
+`term_filter` is rejected on numeric, date, and text fields.
 
 ## Expression metrics
 
