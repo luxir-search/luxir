@@ -84,7 +84,7 @@ struct KnnPlanner {
   struct Request {
     int64_t k = 0, boundedTarget = 0;
     int32_t nprobe = 0, referenceBreadth = 1;
-    double minScanFraction = 0, dimFactor = 1, alpha = 0.5, flatDensity = 0.6;
+    double minScanFraction = 0, dimFactor = 1, alpha = 0.25, flatDensity = 0.6;
     Selector selector = Selector::AUTO;
   };
   struct Price {

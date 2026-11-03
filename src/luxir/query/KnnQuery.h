@@ -209,7 +209,10 @@ public:
     KnnPlanner::Costs plannerCosts;
     // Dense single-valued crossover; -1 forces sequential, infinity walks.
     double flatDomainDensityThreshold = 0.6;
-    double filteredCoverageAlpha = 0.5;
+    // Default effort scans about N^-1/4 of an index (sqrt(N) lists, sqrt of
+    // them probed); applying that rule to the eligible population sN scales
+    // the fraction by s^-1/4, which keeps filtered recall near unfiltered.
+    double filteredCoverageAlpha = 0.25;
     // Both zero select next-list-only growth.
     double breadthHeadroom = 1.25, breadthGrowth = 2.0;
   };

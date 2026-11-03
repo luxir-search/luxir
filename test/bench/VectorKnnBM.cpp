@@ -1299,13 +1299,16 @@ TUNING_BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segmen
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
+// The default filtered coverage exponent, in hundredths.
+constexpr int FILTERED_ALPHA100 = 25;
+
 LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
     ->Apply([](benchmark::Benchmark* b) {
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selectivity : {100, 1000})
-        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, 50, 0, 0, 0});
+        for (int correlation : {0, 1, 2, 3}) b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 0, 0, 0});
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selector : {1, 2})
-        b->Args({codec, 1000, 0, 50, 1, selector, 1});
-      for (int codec : {PQ, RABITQ2, RABITQ1}) b->Args({codec, 1000, 2, 50, 1, 0, 0});
+        b->Args({codec, 1000, 0, FILTERED_ALPHA100, 1, selector, 1});
+      for (int codec : {PQ, RABITQ2, RABITQ1}) b->Args({codec, 1000, 2, FILTERED_ALPHA100, 1, 0, 0});
     });
 
 TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
@@ -1314,11 +1317,11 @@ TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permy
         for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
           for (int correlation : {0, 1, 2, 3}) {
             for (int alpha : {0, 25, 50, 100}) b->Args({codec, selectivity, correlation, alpha, 1, 0, 1});
-            b->Args({codec, selectivity, correlation, 50, 0, 0, 0});
-            b->Args({codec, selectivity, correlation, 50, 0, 0, 1});
-            b->Args({codec, selectivity, correlation, 50, 1, 0, 0});
-            b->Args({codec, selectivity, correlation, 50, 2, 0, 0});
-            for (int selector : {1, 2}) b->Args({codec, selectivity, correlation, 50, 1, selector, 1});
+            b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 0, 0, 0});
+            b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 0, 0, 1});
+            b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 1, 0, 0});
+            b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 2, 0, 0});
+            for (int selector : {1, 2}) b->Args({codec, selectivity, correlation, FILTERED_ALPHA100, 1, selector, 1});
           }
     });
 

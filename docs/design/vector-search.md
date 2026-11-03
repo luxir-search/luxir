@@ -481,8 +481,13 @@ simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions
 cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
 allocation denominator uses exact live counts.
 
-With default probes, the initial fraction expands by `1 / sqrt(s)`, where
-`s` is the eligible-vector fraction over the searched IVF slots. The fraction is floored by `min_scan_fraction` and capped
+With default probes, the initial fraction expands by `s^(-1/4)`, where
+`s` is the eligible-vector fraction over the searched IVF slots. Default effort
+scans about `N^(-1/4)` of an index (`sqrt(N)` lists, `sqrt` of them probed), and
+the same rule applied to the `sN` eligible vectors gives the exponent. On SIFT
+1M and miracl 1M it keeps independent-filter recall at or above unfiltered
+recall at default effort; `s^(-1/2)` bought recall above that at about twice
+the latency for 10-30% filters. The fraction is floored by `min_scan_fraction` and capped
 at one. Explicit `nprobe` receives no selectivity expansion. All allocated lists
 are scanned before checking fill, even if exact slots already supply k units.
 Bounded document fill is capped by eligible docs in bounded IVF slots; document

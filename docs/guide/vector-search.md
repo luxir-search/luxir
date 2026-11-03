@@ -844,8 +844,10 @@ compete, and candidate selection decides which vectors are read exactly.
 
 The reference size includes all live vectors; the scan fraction is charged
 only against segments searched through IVF. With default probes, a filter
-expands that fraction by `1 / sqrt(s)`, capped at one, where `s` is the eligible
-fraction of vectors in those IVF segments. Explicit
+expands that fraction by `s^(-1/4)`, capped at one, where `s` is the eligible
+fraction of vectors in those IVF segments. The default fraction itself scales
+as `N^(-1/4)` with index size, so this treats the eligible vectors like an
+index of their own and keeps filtered recall near unfiltered recall. Explicit
 `nprobe` keeps its pin and receives no filter expansion. Default-probe queries
 also keep widening until newly scanned lists have yielded the number of
 filter-passing vectors expected at that initial fraction, or all lists are
