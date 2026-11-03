@@ -871,10 +871,11 @@ TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   ASSERT_EQ(0, pull().first);
   bool parentSynced = false, recorded = false;
+  auto root = std::filesystem::weakly_canonical(path);
   Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
     auto& dir = *(std::filesystem::path*)directory;
-    if (dir == path / "follower" / "t" / "t0" / "i" && !file) parentSynced = true;
-    if (dir == path / "follower" / "node" && file && *(std::string*)file == "replication.json") {
+    if (dir == root / "follower" / "t" / "t0" / "i" && !file) parentSynced = true;
+    if (dir == root / "follower" / "node" && file && *(std::string*)file == "replication.json") {
       EXPECT_TRUE(parentSynced);
       recorded = true;
     }

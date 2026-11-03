@@ -378,6 +378,15 @@ TEST_F(CollectionAdminApiTest, manifestsReferenceSchemaAndOwnIncarnation) {
       writer->dir.listFiles(files);
       EXPECT_EQ(1, std::ranges::count_if(files, [](const auto& f) { return SchemaBinding::isFile(f.name); }));
     }
+    if (!disk) {
+      // A reopened RAM catalog starts over, so its next incarnation is the
+      // clock's millisecond: let the clock pass the first one.
+      uint64_t first = std::stoull(incarnation, nullptr, 16);
+      while ((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count() <= first) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
     {
       LuxirNode reopened(config);
       CollectionHelper helper(reopened);
