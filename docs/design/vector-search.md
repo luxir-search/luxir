@@ -355,7 +355,16 @@ explicit build succeeds.
 
 `KnnQuery` creates one vector engine per segment. A segment uses its
 `vec.<field>` FAISS overlay when present, or scans the vector column exactly
-when no overlay exists. FAISS ids are segment-local vector value ranks, so the
+when no overlay exists. The engines search inside the per-segment prepare
+domain, which is live-filtered and already holds every enclosing restriction:
+a boolean folds its `filter` clauses and, when a `required` or `optional`
+clause selects inside that domain (kNN, directly or nested), its `prohibited`
+(must_not) clauses into the domain it hands its children (outer AND filters
+AND NOT prohibited). The folded domain then replaces the
+boolean's prohibited scorers as its required domain supplier, so each
+exclusion is materialized once, through the same filter cache uses as a
+filter clause. Scoring siblings are not folded: they intersect with the
+kNN's top-k after it ran. FAISS ids are segment-local vector value ranks, so the
 query path maps each returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 

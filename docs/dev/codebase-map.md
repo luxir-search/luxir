@@ -15,9 +15,13 @@ locations, browse `src/luxir/<area>/`.
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
-     (startup discovery, creation, activation of a new incarnation, removal),
-     announced in order through `CollectionEvents`
-   - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+     (startup discovery, creation, activation, rename, swap, removal), announced
+     in order through `CollectionEvents`; a multi-name mapping is one event and
+     atomic per-name lookup changes
+   - `ReplicationFollower`: Discovery and transfer protocol, with work keyed by
+     tenant/incarnation. Stages missing data, then applies each tenant mapping
+     through `Collections` for ready bindings, leaving dependent names unavailable
+     when their old data now belongs to another name
    - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
      fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
@@ -122,13 +126,30 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputStream` / `OutputStream`: segment I/O primitives
+   - `InputStream` / `OutputStream`: segment I/O primitives; the `checked*` reads decode
+     segment info and the field catalog without trusting the file
+   - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
+     file's header. Bump it with any change to written bytes (`IndexFormatTest` flags one);
+     manifests of another version fail to load with `IndexFormatError`
    - `FileVerifier`: size + xxh3 checks of files against manifest `FileDescriptor`s over
      `Directory::openChecksum` (pread, optional O_DIRECT; never mmap): verify-on-open, scrub
    - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
-     (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
-     handle: CURRENT selects one of its incarnation directories
+     (`CheckedDirFactory`, `ReadOnlyDirFactory`); opens path views under authoritative
+     and node-private roots. `server/TenantCatalog` owns names, timestamp incarnation
+     allocation, and reservation/activation/retirement through catalog CAS.
+     RAM storage accounts are keyed by tenant/incarnation; names select accounts
+   - `store/IncarnationState`: per-incarnation writer epochs and tip CAS. Catalog
+     reservation creates STATE; deleting STATE fences prior writers. `Manifest`
+     loads the STATE-selected candidate; filenames carry the creating writer
+     epoch, including later live-doc and overlay generations
+   - `StorageRegistry` (`StorageRegistry.h`): named backends and layers resolved by `Collections`
+     from `store.backend` / `store.layers`, with scoped options validated through `ParamReader`;
+     `DelegatingDirectory` / `DelegatingDirFactory` forward everything for plugin layers.
+     CheckedDirectory and the read-only wrappers implement the bare interfaces; CheckedDirFactory
+     delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
+     `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
+     `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
@@ -140,7 +161,12 @@ locations, browse `src/luxir/<area>/`.
      authored source stays sparse, resolved HTTP view exposes effective settings
      and introduction/segment generations for conservative coverage
    - `FieldSignature`: Effective properties for schema introduction history and
-     the resolved view; `SchemaInfo` persists authored definitions and introductions
+     the resolved view; immutable `SchemaInfo` files persist authored definitions
+     and structured introduction versions
+   - `SchemaBinding`: Tenant scope, shared name and major/minor/local/epoch version;
+     manifests reference a schema file, segments record historical bindings
+   - `SchemaCache`: Node-wide weak cache by location/version; snapshots and readers
+     share parsed schemas and their tenant memory charge
    - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
      token filters, char filters, plus named analyzers) is the only path from an authored
      `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
@@ -162,11 +188,12 @@ locations, browse `src/luxir/<area>/`.
 ## Data Organization
 
 - **Collection**: Logical document group with schema; its storage is a sequence of
-  incarnations (identities), one selected by CURRENT
+  incarnations (identities), one active in the tenant catalog
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
-  - Flush records the pinned schema generation; merge records the minimum input
-    generation, preserving the no-backfill contract
+  - Flush records the pinned schema binding; merge records the oldest input
+    version, preserving the no-backfill contract. Historical segment bindings
+    do not require opening old schema definitions
 
 ## Request Flow
 

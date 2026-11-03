@@ -1037,6 +1037,12 @@ message SearchResponse {
   Error error = 3;
   repeated Warning warnings = 4; // final response only, on success or failure
   ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its final response is ready to serialize. Includes parsing,
+  // any min_commit wait, execution, and earlier streamed batches, including any
+  // pause while the client reads them. Excludes serializing, queueing, and
+  // sending the final response. Final response only.
+  uint64 took_us = 8;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
@@ -1287,6 +1293,12 @@ message UpdateResponse {
   // Any collection error sets the response status to ERROR and a top-level error;
   // every admitted collection outcome is retained. HTTP status remains 200.
   map<string, CollectionCommit> commits = 10;
+
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its response is ready to serialize, including parsing and any
+  // commit and replica wait. Excludes serializing, queueing, and sending the
+  // response. HTTP NDJSON stream acknowledgments do not carry this field.
+  uint64 took_us = 11;
 }
 
 
@@ -1474,6 +1486,19 @@ message DeleteCollectionRequest {
 message DeleteCollectionResponse {
   string name = 1;
 }
+
+message RenameCollectionRequest {
+  string from = 1;
+  string to = 2;
+  string tenant = 3;
+}
+message RenameCollectionResponse { string from = 1; string to = 2; }
+message SwapCollectionsRequest {
+  string a = 1;
+  string b = 2;
+  string tenant = 3;
+}
+message SwapCollectionsResponse { string a = 1; string b = 2; }
 
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
@@ -1856,6 +1881,8 @@ message MemoryStats {
   uint64 node_budget_bytes = 5;
   // Per-request tracked search memory ceiling; zero disables rejection.
   uint64 search_request_limit_bytes = 6;
+  // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
+  uint64 schema_cache_bytes = 7;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1863,6 +1890,11 @@ message ReplicationCatalog {
   string boot = 1;
   string cursor = 2;
   repeated ReplicationCatalogEntry collections = 3;
+  repeated ReplicationTenant tenants = 4;
+}
+message ReplicationTenant {
+  string tenant = 1;
+  uint64 revision = 2;
 }
 message ReplicationCatalogEntry {
   string commit = 1;
@@ -2014,9 +2046,9 @@ message IndexStats {
 
 // Ids and generations that appear in filenames are reported in their
 // filesystem spelling so stats output correlates directly with directory
-// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// listings and logs: "seg" includes the creator epoch (e.g. "s0a.2"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// in filenames (e.g. live_gen "01" written in epoch 3 -> file "s0a.2__L01.3").
 // Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,

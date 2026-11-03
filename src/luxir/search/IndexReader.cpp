@@ -10,6 +10,7 @@
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/SchemaCache.h"
 #include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
@@ -49,26 +50,26 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
+std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
   std::string deleteFileName = Postings::getLiveDocsFileName(
-    Postings::getSortableString(segId), liveGen);
+    Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
 
   auto deleteFile = dir.openFile(deleteFileName, expectSynced);
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing
-      IREADER_DEBUG("Delete file {} not found for segment {} (liveGen={})",
-                deleteFileName, segId, liveGen);
+      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})",
+                deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen);
       return nullptr;
     } else {
       throw std::filesystem::filesystem_error(
-              std::format("Delete file {} not found for segment {} (liveGen={})",
-                         deleteFileName, segId, liveGen),
+              std::format("Delete file {} not found for segment s{} (liveGen={})",
+                         deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
   }
-  IREADER_DEBUG("Successfully opened delete file {} for segment {}", deleteFileName, segId);
+  IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
 
   InputStream deleteStream = deleteFile->getInputStream();
 
@@ -117,8 +118,8 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   // FixedBitSet with live docs - memory map directly!
   uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
 
-  IREADER_DEBUG("Loaded {} deleted documents from {} for segment {}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, segId, numLiveDocs);
+  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
+            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
 
   return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), numLiveDocs);
 }
@@ -206,12 +207,13 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         prevAuxByName.clear();
         prevSegAuxByKey.clear();
       }
-      if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
+      if (preferredSchema && preferredSchema->binding == SchemaBinding(*indexInfo.schema)) {
         schema = preferredSchema;
-      } else if (previous && previousReader->schema()->gen_ == indexInfo.schema_gen) {
+      } else if (previous && previousReader->schema()->binding == SchemaBinding(*indexInfo.schema)) {
         schema = previousReader->schema();
       } else {
-        schema = Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen);
+        SchemaCache schemas; // standalone readers have no node owner
+        schema = schemas.load(dir, indexInfo);
       }
       indexGen = indexInfo.index_gen;
       core->segmentFiles.clear();
@@ -220,7 +222,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         auto& files = core->segmentFiles.emplace_back();
         files.segId = segment.seg_id;
         std::string liveName = segment.live_gen == 0 ? std::string()
-            : Postings::getLiveDocsFileName(Postings::getSortableString(segment.seg_id), segment.live_gen);
+            : Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), segment.live_gen, segment.live_epoch);
         for (const auto& file : segment.files) {
           (file.name == liveName ? files.liveDocs : files.files)
               .push_back({std::string(file.name), file.size, file.xxh3});
@@ -269,7 +271,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         if (!postingsReader && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
           postingsReader = prevSeg->sharedPostingsReader;
         }
-        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
+        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true);
         if (!postingsReader) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
           retry = true;
@@ -281,7 +283,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             && prevFiles->liveDocs == files.liveDocs) {
           liveDocs = prevSeg->sharedLiveDocs;
         } else if (liveGen > 0) {
-          liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
+          liveDocs = LiveDocs::create(dir, segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs, missingFileOK, true);
           if (!liveDocs) {
             // Failed to create LiveDocs (delete file not found) - trigger retry
             retry = true;
@@ -299,8 +301,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           if (prevIt != prevSegAuxByKey.end()
               && prevIt->second->getGen() == info.gen
               && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
-            IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
-                          info.name, segId, info.gen);
+            IREADER_DEBUG("Reusing segment overlay '{}' for seg=s{} (gen={}) from previous IndexReader",
+                          info.name, Postings::segmentKey(segId, segment.creator_epoch), info.gen);
             segmentAuxReaders.push_back(prevIt->second);
             continue;
           }
@@ -308,8 +310,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           auto aux = openKnownAux(dir, info, missingFileOK);
           if (!aux && (info.kind == VectorAuxReader::KIND
                        || info.kind == TestOverlayAuxReader::KIND)) {
-            IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
-                          info.name, segId);
+            IREADER_DEBUG("Segment overlay file missing for '{}' seg=s{} - triggering retry",
+                          info.name, Postings::segmentKey(segId, segment.creator_epoch));
             retry = true;
             break;
           }

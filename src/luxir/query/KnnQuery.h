@@ -693,7 +693,7 @@ public:
     Weight(Query::Context& context, KnnQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, query, flags), query(query),
         boost(constantWhenScored(flags, multiplier)) {
-      traits |= NEEDS_PREPARE;  // index-level ANN pass
+      traits |= NEEDS_PREPARE | CONSUMES_DOMAIN;  // index-level ANN pass
     }
 
     class KnnPreparedWeight final : public Query::Weight::PreparedWeight {

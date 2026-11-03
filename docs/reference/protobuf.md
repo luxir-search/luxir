@@ -29,6 +29,8 @@ defaults and constraints are described in the comments and guides.
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
 | <a id="method-luxir.admin.deletecollection"></a>[`DeleteCollection`](#method-luxir.admin.deletecollection) | [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest) | [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse) |  |
+| <a id="method-luxir.admin.renamecollection"></a>[`RenameCollection`](#method-luxir.admin.renamecollection) | [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest) | [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse) |  |
+| <a id="method-luxir.admin.swapcollections"></a>[`SwapCollections`](#method-luxir.admin.swapcollections) | [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest) | [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse) |  |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
 | <a id="method-luxir.admin.cachecontrol"></a>[`CacheControl`](#method-luxir.admin.cachecontrol) | [`CacheControlRequest`](#message-luxir.cachecontrolrequest) | [`CacheControlResponse`](#message-luxir.cachecontrolresponse) |  |
 
@@ -168,6 +170,8 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest)
+- [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse)
 - [`ReplicaRequirement`](#message-luxir.replicarequirement)
 - [`ReplicaResult`](#message-luxir.replicaresult)
 - [`ReplicationCatalog`](#message-luxir.replicationcatalog)
@@ -175,6 +179,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus)
 - [`ReplicationInstalled`](#message-luxir.replicationinstalled)
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
+- [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
@@ -195,6 +200,8 @@ defaults and constraints are described in the comments and guides.
 - [`StatsTotals`](#message-luxir.statstotals)
 - [`StorageRamStats`](#message-luxir.storageramstats)
 - [`StoredResourceDef`](#message-luxir.storedresourcedef)
+- [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest)
+- [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse)
 - [`SystemStats`](#message-luxir.systemstats)
 - [`TcpStats`](#message-luxir.tcpstats)
 - [`TopDocs`](#message-luxir.topdocs)
@@ -1581,6 +1588,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 | <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
+| <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
 
 <a id="message-luxir.multimatchquery"></a>
 
@@ -1948,6 +1956,29 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 | <a id="field-luxir.regexquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.regexquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, and every member of character classes and ranges also match their simple Unicode case alternates. Negated classes exclude all case forms of their members. |
 
+<a id="message-luxir.renamecollectionrequest"></a>
+
+### luxir.RenameCollectionRequest
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.renamecollectionrequest.from"></a>[`from`](#field-luxir.renamecollectionrequest.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionrequest.to"></a>[`to`](#field-luxir.renamecollectionrequest.to) | 2 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionrequest.tenant"></a>[`tenant`](#field-luxir.renamecollectionrequest.tenant) | 3 | `string` | singular |  |
+
+<a id="message-luxir.renamecollectionresponse"></a>
+
+### luxir.RenameCollectionResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.renamecollectionresponse.from"></a>[`from`](#field-luxir.renamecollectionresponse.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.renamecollectionresponse.to"></a>[`to`](#field-luxir.renamecollectionresponse.to) | 2 | `string` | singular |  |
+
 <a id="message-luxir.replicarequirement"></a>
 
 ### luxir.ReplicaRequirement
@@ -1990,6 +2021,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationcatalog.boot"></a>[`boot`](#field-luxir.replicationcatalog.boot) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalog.cursor"></a>[`cursor`](#field-luxir.replicationcatalog.cursor) | 2 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalog.collections"></a>[`collections`](#field-luxir.replicationcatalog.collections) | 3 | [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry) | repeated |  |
+| <a id="field-luxir.replicationcatalog.tenants"></a>[`tenants`](#field-luxir.replicationcatalog.tenants) | 4 | [`ReplicationTenant`](#message-luxir.replicationtenant) | repeated |  |
 
 <a id="message-luxir.replicationcatalogentry"></a>
 
@@ -2050,6 +2082,17 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationstatus.last_contact"></a>[`last_contact`](#field-luxir.replicationstatus.last_contact) | 4 | `uint64` | singular | Unix milliseconds |
 | <a id="field-luxir.replicationstatus.collections"></a>[`collections`](#field-luxir.replicationstatus.collections) | 5 | [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus) | repeated |  |
 | <a id="field-luxir.replicationstatus.followers"></a>[`followers`](#field-luxir.replicationstatus.followers) | 6 | [`FollowerStatus`](#message-luxir.followerstatus) | repeated |  |
+
+<a id="message-luxir.replicationtenant"></a>
+
+### luxir.ReplicationTenant
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationtenant.tenant"></a>[`tenant`](#field-luxir.replicationtenant.tenant) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationtenant.revision"></a>[`revision`](#field-luxir.replicationtenant.revision) | 2 | `uint64` | singular |  |
 
 <a id="message-luxir.rescorequery"></a>
 
@@ -2196,13 +2239,14 @@ Top-level response to a Search request
 | <a id="field-luxir.searchresponse.error"></a>[`error`](#field-luxir.searchresponse.error) | 3 | [`Error`](#message-luxir.error) | singular | Present on a failed request's final response; ops is then empty. A final error may follow earlier result batches. |
 | <a id="field-luxir.searchresponse.warnings"></a>[`warnings`](#field-luxir.searchresponse.warnings) | 4 | [`Warning`](#message-luxir.warning) | repeated | final response only, on success or failure |
 | <a id="field-luxir.searchresponse.profile"></a>[`profile`](#field-luxir.searchresponse.profile) | 5 | [`ExecutionProfile`](#message-luxir.executionprofile) | singular | final response only, when SearchRequest.profile is true |
+| <a id="field-luxir.searchresponse.took_us"></a>[`took_us`](#field-luxir.searchresponse.took_us) | 8 | `uint64` | singular | Server-side wall time in microseconds from receipt of the complete request message until its final response is ready to serialize. Includes parsing, any min\_commit wait, execution, and earlier streamed batches, including any pause while the client reads them. Excludes serializing, queueing, and sending the final response. Final response only. |
 | <a id="field-luxir.searchresponse.more"></a>[`more`](#field-luxir.searchresponse.more) | 15 | `bool` | singular | if true, expect at least one more streaming response to the logical request. |
 
 <a id="message-luxir.segmentstats"></a>
 
 ### luxir.SegmentStats
 
-Ids and generations that appear in filenames are reported in their filesystem spelling so stats output correlates directly with directory listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"), while generations are the length-prefixed base36 sortable strings embedded in filenames (e.g. live\_gen "01" -&gt; file "s0a\_\_L01"). Sortable strings order the same as the numbers they encode, so lexicographic comparison remains valid. Empty (omitted in JSON) means none. Generations that never appear on disk (index\_gen, core\_gen, update\_version) stay numeric.
+Ids and generations that appear in filenames are reported in their filesystem spelling so stats output correlates directly with directory listings and logs: "seg" includes the creator epoch (e.g. "s0a.2"), while generations are the length-prefixed base36 sortable strings embedded in filenames (e.g. live\_gen "01" written in epoch 3 -&gt; file "s0a.2\_\_L01.3"). Sortable strings order the same as the numbers they encode, so lexicographic comparison remains valid. Empty (omitted in JSON) means none. Generations that never appear on disk (index\_gen, core\_gen, update\_version) stay numeric.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2392,6 +2436,29 @@ Chunk settings for one stored-field group (a FieldDef stored\_resource). Every s
 | <a id="field-luxir.storedresourcedef.zstd_dictionary"></a>[`zstd_dictionary`](#field-luxir.storedresourcedef.zstd_dictionary) | 5 | `bool` | optional | Enable one ZSTD dictionary per resource, shared by its segments. The first merge with at least 100 times the capacity (at most 8 MiB) of live stored data trains it; earlier segments have none. Helps most with small chunks; decoding can be slower with large chunks. No automatic retraining: changing this setting, the capacity or codec clears it for a later merge to retrain. After restart, use the dictionary from the largest live segment carrying one. Only valid with codec zstd. |
 | <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with zstd\_dictionary. |
 
+<a id="message-luxir.swapcollectionsrequest"></a>
+
+### luxir.SwapCollectionsRequest
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.swapcollectionsrequest.a"></a>[`a`](#field-luxir.swapcollectionsrequest.a) | 1 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsrequest.b"></a>[`b`](#field-luxir.swapcollectionsrequest.b) | 2 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsrequest.tenant"></a>[`tenant`](#field-luxir.swapcollectionsrequest.tenant) | 3 | `string` | singular |  |
+
+<a id="message-luxir.swapcollectionsresponse"></a>
+
+### luxir.SwapCollectionsResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.swapcollectionsresponse.a"></a>[`a`](#field-luxir.swapcollectionsresponse.a) | 1 | `string` | singular |  |
+| <a id="field-luxir.swapcollectionsresponse.b"></a>[`b`](#field-luxir.swapcollectionsresponse.b) | 2 | `string` | singular |  |
+
 <a id="message-luxir.systemstats"></a>
 
 ### luxir.SystemStats
@@ -2507,6 +2574,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | `string` | singular | Resulting snapshot identity; absent without a completed commit. Snapshot token: incarnation:index\_gen. |
 | <a id="field-luxir.updateresponse.replicas"></a>[`replicas`](#field-luxir.updateresponse.replicas) | 9 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 | <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON URL EOF commit outcomes, including for a single collection. Any collection error sets the response status to ERROR and a top-level error; every admitted collection outcome is retained. HTTP status remains 200. |
+| <a id="field-luxir.updateresponse.took_us"></a>[`took_us`](#field-luxir.updateresponse.took_us) | 11 | `uint64` | singular | Server-side wall time in microseconds from receipt of the complete request message until its response is ready to serialize, including parsing and any commit and replica wait. Excludes serializing, queueing, and sending the response. HTTP NDJSON stream acknowledgments do not carry this field. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 
@@ -2577,10 +2645,10 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: pq; rabitq is opt-in |
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: rabitq; pq requires explicit selection |
 | <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
-| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | requires explicit codec rabitq |
-| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
+| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | codec rabitq (the default) only |
+| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | requires explicit codec pq |
 
 <a id="message-luxir.vectoranndef.pq"></a>
 
@@ -2590,7 +2658,7 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers. Positive m requires positive effective (inherited) dims and must divide it. Absent or 0: automatic, including inferred dims. Choose the largest divisor leaving at least 4 dimensions per sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2. If none does, choose the largest divisor under the same cap. |
+| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers. Positive m requires positive effective (inherited) dims and must divide it. Absent or 0: automatic, including inferred dims. Choose the largest divisor leaving at least 4 dimensions per sub-quantizer, capped at max(32, dims / 8) for every metric. If none does, choose the largest divisor under the same cap. |
 | <a id="field-luxir.vectoranndef.pq.bits"></a>[`bits`](#field-luxir.vectoranndef.pq.bits) | 2 | `int32` | optional | bits per sub-quantizer code, 1..8. Absent: 8. |
 
 <a id="message-luxir.vectoranndef.rabitq"></a>
@@ -2601,7 +2669,7 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
+| <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 0..9. Absent or 0: 2 below 384 stored dims, 1 at or above. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
 | <a id="field-luxir.vectoranndef.rabitq.query_bits"></a>[`query_bits`](#field-luxir.vectoranndef.rabitq.query_bits) | 2 | `int32` | optional | Query quantization bits, 0..8; 0 scans with the float query. Absent: 4. Read at search time, so a change applies to existing overlays. |
 
 <a id="message-luxir.warning"></a>

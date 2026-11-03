@@ -89,9 +89,9 @@ public:
   // Static factory method to create PostingsReader with optional handling of missing files.
   // Returns nullptr if missingFileOK=true and any required files are missing.
   // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
-  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false, bool expectSynced = false);
+  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK = false, bool expectSynced = false);
 
-  explicit PostingsReader(Directory& dir, uint64_t segId);
+  explicit PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~PostingsReader();
   PostingsReader(const PostingsReader&) = delete;
   PostingsReader& operator=(const PostingsReader&) = delete;
@@ -101,7 +101,7 @@ private:
   PostingsReader() = default;
 
   // Initialize from files, returns false if missing files and missingFileOK=true
-  bool initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced = false);
+  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced);
 
 public:
 

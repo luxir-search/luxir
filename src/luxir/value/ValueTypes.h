@@ -33,11 +33,13 @@ enum class ValueNature : uint8_t {
   NUMBER,
   DATE_MS,
   DATE_NS,
+  GEO_POINT,
 };
 
 inline std::string_view valueNatureName(ValueNature nature) {
   switch (nature) {
     case ValueNature::NUMBER: return "number";
+    case ValueNature::GEO_POINT: return "GEO_POINT";
     case ValueNature::DATE_MS: return "DATE unit 'ms'";
     case ValueNature::DATE_NS: return "DATE unit 'ns'";
   }
@@ -193,6 +195,8 @@ struct ValueBounds {
   ValueType type = ValueType::INT64;
   BoundsCertainty certainty = BoundsCertainty::UNBOUNDED;
   BoundsInvalidity invalidity = BoundsInvalidity::NONE;
+  // Origin of a proof of invalidity, assigned during program propagation.
+  uint32_t invalidNode = UINT32_MAX;
   bool mayBeMissing = false;
   bool alwaysMissing = false;
   bool minAttained = false;

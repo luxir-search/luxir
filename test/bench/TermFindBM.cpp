@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
@@ -343,7 +344,7 @@ private:
   }
 
   void buildStatsReader() {
-    CommitSnapshotRegistry writerSnapshots(queryDir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(queryDir));
     IndexWriter writer(writerSnapshots);
     Inverter& inverter = writer.obtainInverter();
     auto& handler = inverter.getIndexHandler(kStatsFieldName);

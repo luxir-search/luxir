@@ -12,25 +12,27 @@
 namespace luxir {
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                             google::protobuf::Arena& arena)
+                             google::protobuf::Arena& arena,
+                             std::chrono::steady_clock::time_point startTime)
     : engine(engine), searchConfig(engine.searchConfig()),
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
+      startTime(startTime),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
 }
 
 // A dispatched search that never sent its final response was abandoned.
 SearchRequest::~SearchRequest() {
-  if (counting && !finalSent) count(MetricOutcome::CANCELLED);
+  if (counting && !finalSent) count(MetricOutcome::CANCELLED, std::chrono::steady_clock::now());
 }
 
 // Counts the search for the node and, once resolved, for its collection.
-void SearchRequest::count(MetricOutcome outcome) {
-  auto nanos = nanosSince(submitted);
+void SearchRequest::count(MetricOutcome outcome, std::chrono::steady_clock::time_point end) {
+  auto nanos = nanosSince(submitted, end);
   engine.metrics().complete(metricActivity(MetricStage::SEARCH), outcome, nanos);
   if (collectionMetrics) collectionMetrics->search(outcome, nanos);
 }
@@ -75,8 +77,12 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    // The only clock read at the end of a request: no other thread touches
+    // lastResponse once finalSent is decided.
+    auto end = std::chrono::steady_clock::now();
+    lastResponse->proto.took_us = microsSince(startTime, end);
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
-    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK);
+    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }

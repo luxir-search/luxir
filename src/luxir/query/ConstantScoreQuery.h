@@ -298,7 +298,8 @@ public:
       // The child constrains matches; this wrapper replaces its score.
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.
-      traits |= IS_CONSTANT_SCORING | (childWeight->getFlags() & NEEDS_PREPARE);
+      traits |= IS_CONSTANT_SCORING
+          | (childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN));
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
