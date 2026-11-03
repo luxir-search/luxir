@@ -1084,6 +1084,17 @@ TEST_F(GeoPolygonQueryTest, indexedRelationMatchesLinearScan) {
     built++;
     const BKDPolygonRelation& relation = query->makeRelation();
     LinearPolygonRelation linear(query->getPolygons());
+    // The subdivided grid holds each cell's own compare().
+    const BKDRelationGrid& grid = relation.grid;
+    ASSERT_EQ((size_t)grid.latCells * grid.lonCells, grid.cells.size());
+    for (uint32_t row = 0; row < grid.latCells; row++) {
+      for (uint32_t column = 0; column < grid.lonCells; column++) {
+        auto [latMin, latMax, lonMin, lonMax] = grid.blockBox(row, column, 1, 1);
+        ASSERT_EQ(relation.compare(latMin, latMax, lonMin, lonMax),
+                  grid.cells[(size_t)row * grid.lonCells + column])
+            << row << "," << column;
+      }
+    }
     std::vector<geo::LatLon> vertices;
     for (const auto& polygon : query->getPolygons()) {
       vertices.insert(vertices.end(), polygon.outer.begin(), polygon.outer.end());

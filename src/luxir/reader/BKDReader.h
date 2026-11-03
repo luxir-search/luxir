@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -214,6 +215,7 @@ struct BKDRelationGrid {
   uint32_t lonBase = 0;
   int32_t latShift = 0;
   int32_t lonShift = 0;
+  uint32_t latCells = 0;
   uint32_t lonCells = 0;
 
   // The cell holding a point of the box the grid was built over.
@@ -230,6 +232,16 @@ struct BKDRelationGrid {
     return (double)crosses / (double)cells.size();
   }
 
+  // The encoded box {latMin, latMax, lonMin, lonMax} of the block of cells
+  // from (row, column) spanning rows x columns.
+  std::array<int32_t, 4> blockBox(uint32_t row, uint32_t column, uint32_t rows,
+                                  uint32_t columns) const {
+    uint64_t lat = (uint64_t)(latBase + row) << latShift;
+    uint64_t lon = (uint64_t)(lonBase + column) << lonShift;
+    return {unbiased(lat), unbiased(lat + ((uint64_t)rows << latShift) - 1),
+            unbiased(lon), unbiased(lon + ((uint64_t)columns << lonShift) - 1)};
+  }
+
   // Grid over the inclusive encoded box, which must not be empty or wrap.
   template <class Relation>
   static BKDRelationGrid build(MemPool& pool, const Relation& relation,
@@ -240,23 +252,43 @@ struct BKDRelationGrid {
     grid.lonShift = shiftFor(biased(lonMin), biased(lonMax));
     grid.latBase = biased(latMin) >> grid.latShift;
     grid.lonBase = biased(lonMin) >> grid.lonShift;
-    uint32_t latCells = (biased(latMax) >> grid.latShift) - grid.latBase + 1;
+    grid.latCells = (biased(latMax) >> grid.latShift) - grid.latBase + 1;
     grid.lonCells = (biased(lonMax) >> grid.lonShift) - grid.lonBase + 1;
-    auto cells = pool.make_span<BKDRelation>((size_t)latCells * grid.lonCells);
-    for (uint32_t row = 0; row < latCells; row++) {
-      uint64_t cellLat = (uint64_t)(grid.latBase + row) << grid.latShift;
-      for (uint32_t column = 0; column < grid.lonCells; column++) {
-        uint64_t cellLon = (uint64_t)(grid.lonBase + column) << grid.lonShift;
-        cells[(size_t)row * grid.lonCells + column] = relation.compare(
-            unbiased(cellLat), unbiased(cellLat + (UINT64_C(1) << grid.latShift) - 1),
-            unbiased(cellLon), unbiased(cellLon + (UINT64_C(1) << grid.lonShift) - 1));
-      }
-    }
+    auto cells = pool.make_span<BKDRelation>((size_t)grid.latCells * grid.lonCells);
+    grid.fill(relation, cells, 0, 0, ARITY);
     grid.cells = cells;
     return grid;
   }
 
 private:
+  // Compares the aligned size x size block at (row, column), clipped to the
+  // grid, and fills it when that answer holds for each of its cells, else
+  // splits it in four. A cell of a block that a bounding box rejects, or
+  // that no edge touches, gets the same answer from its own compare(), so
+  // the cells equal per-cell compares at a fraction of the calls.
+  template <class Relation>
+  void fill(const Relation& relation, std::span<BKDRelation> out, uint32_t row,
+            uint32_t column, uint32_t size) const {
+    if (row >= latCells || column >= lonCells) return;
+    uint32_t rows = std::min(size, latCells - row);
+    uint32_t columns = std::min(size, lonCells - column);
+    auto [cellLatMin, cellLatMax, cellLonMin, cellLonMax] =
+        blockBox(row, column, rows, columns);
+    BKDRelation answer =
+        relation.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+    if (answer != BKDRelation::CROSSES || size == 1) {
+      for (uint32_t r = row; r < row + rows; r++) {
+        std::fill_n(out.begin() + (ptrdiff_t)((size_t)r * lonCells + column), columns, answer);
+      }
+      return;
+    }
+    uint32_t half = size / 2;
+    fill(relation, out, row, column, half);
+    fill(relation, out, row, column + half, half);
+    fill(relation, out, row + half, column, half);
+    fill(relation, out, row + half, column + half, half);
+  }
+
   // Encoded coordinates with the sign bit flipped, so unsigned order is
   // coordinate order.
   static uint32_t biased(int32_t value) { return (uint32_t)value ^ UINT32_C(0x80000000); }
