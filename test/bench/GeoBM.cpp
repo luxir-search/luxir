@@ -856,14 +856,15 @@ void BM_GeoPolygonBuild(benchmark::State& state) {
   int32_t vertices = (int32_t)state.range(0);
   if (!unitPolygonCase(vertices)) return skipReduced(state);
   NoisyCircle circle(vertices);
-  float matchCost = 0;
+  BKDPointCost cost;
   for (auto _ : state) {
     MemPool pool;
     BKDPolygonRelation relation = BKDPolygonRelation::build(pool, circle.polygons);
-    matchCost = relation.matchCost();
+    cost = relation.pointCost();
     benchmark::DoNotOptimize(relation);
   }
-  state.counters["match_cost"] = matchCost;
+  state.counters["exact_points"] = cost.exact;
+  state.counters["average_points"] = cost.average;
 }
 
 // One cell relation, as the BKD walk and its estimate call it, against the
@@ -921,7 +922,8 @@ void BM_GeoPolygonMatches(benchmark::State& state, PolygonImpl impl) {
   }
   state.SetItemsProcessed(state.iterations() * (int64_t)points.size());
   state.counters["inside"] = inside;
-  state.counters["match_cost"] = indexed.matchCost();
+  // The modeled test, in box tests, beside the measured ratio of rates.
+  state.counters["model_box_tests"] = 1.0 + indexed.pointCost().average / BOX_TEST_POINTS;
   state.counters["cross_share"] = indexed.grid.crossShare();
 }
 

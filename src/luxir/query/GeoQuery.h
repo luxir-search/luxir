@@ -62,8 +62,13 @@ public:
   }
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
+  // A box test is two value compares; other relations scale it by their
+  // average test (BKDPointCost).
+  static constexpr double BOX_MATCH_COST = 2.0;
+
   float matchCost() override {
-    float point = relation.matchCost();
+    float point = (float)(BOX_MATCH_COST
+        * (1.0 + relation.pointCost().average / BOX_TEST_POINTS));
     if (!multi) return point;
     int64_t docs = reader.docsWithValue();
     return docs > 0 ? point * (float)reader.numValues() / (float)docs : point;
@@ -148,10 +153,12 @@ public:
     // Points of the crossing leaves, which the traversal tests one by one.
     uint64_t crossingPoints;
 
-    // Testing one point of a crossing leaf, in point emissions. Measured by
-    // forcing the BKD for lone boxes under a 35-candidate lead (5M docs, one
-    // segment, 2026-10-28): 0.69 ns per emitted point, 1.3 ns per crossing
-    // point (nine boxes, emitted 0.8k-2.5M, crossing 1.5k-88k).
+    // Testing one point of a crossing leaf against a box, in point
+    // emissions. Measured by forcing the BKD for lone boxes under a
+    // 35-candidate lead (5M docs, one segment, 2026-10-28): 0.69 ns per
+    // emitted point, 1.3 ns per crossing point (nine boxes, emitted
+    // 0.8k-2.5M, crossing 1.5k-88k). Other relations add their exact test's
+    // extra (BKDPointCost).
     static constexpr double CROSSING_POINTS = 2;
 
     BKDReader::Scratch scratch(MemPool& pool) const {
@@ -212,7 +219,14 @@ public:
     // emits each matching point.
     double bkdPrice() const {
       return PointsMaterialize::price((uint64_t)estimatedCost, segment.maxDoc())
-          + CROSSING_POINTS * (double)crossingPoints;
+          + (CROSSING_POINTS + relation.pointCost().exact) * (double)crossingPoints;
+    }
+
+    // Verifying one candidate: a column check, VERIFY_POINTS as fitted on
+    // boxes, plus the relation's average test extra, since candidates fall
+    // anywhere in its box.
+    double verifyPoints() const {
+      return PointsMaterialize::VERIFY_POINTS + relation.pointCost().average;
     }
 
     // Verify or produce the BKD. A consumer that fills windows over an
@@ -231,7 +245,8 @@ public:
       if (bkd != nullptr && (exposure || demand.expectedCandidates >= 0)) {
         double candidates = exposure ? (double)demand.candidates
             : std::min(demand.expectedCandidates, (double)reader.docsWithValue());
-        return PointsMaterialize::verifyPrice(candidates, demand) <= bkdPrice()
+        return PointsMaterialize::verifyPrice(candidates, demand, verifyPoints())
+                <= bkdPrice()
             ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
       }
       if (demand.candidates < estimatedCost) return ScorerArm::SPARSE_VERIFY;
@@ -316,13 +331,11 @@ public:
 
     int64_t cost() override { return estimatedCost; }
 
-    // One verified point: a column check, VERIFY_POINTS as fitted on boxes,
-    // plus what the relation's own test adds. Relations that have not
-    // measured theirs, and multivalued fields, do not quote.
+    // The sparse verifier quotes its check when the relation's price is
+    // measured; multivalued fields do not quote.
     std::optional<double> checkPrice() const {
-      std::optional<double> check = relation.checkPoints();
-      if (reader.multiValued() || !check.has_value()) return std::nullopt;
-      return PointsMaterialize::VERIFY_POINTS + *check;
+      if (reader.multiValued() || !relation.pointCost().quoted) return std::nullopt;
+      return verifyPoints();
     }
 
     Query::ScorerShape describeScorer(

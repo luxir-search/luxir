@@ -24,6 +24,7 @@
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/GeoPolygonQuery.h"
+#include "luxir/query/PointsMaterialize.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/BKDReader.h"
@@ -1124,6 +1125,58 @@ TEST_F(GeoPolygonQueryTest, indexedRelationMatchesLinearScan) {
   EXPECT_GT(built, 100);
   for (int32_t count : relations) EXPECT_GT(count, 3000);
   for (int32_t count : matched) EXPECT_GT(count, 10000);
+}
+
+// Every geo price comes from the relation's point cost. A box quotes the
+// fitted column verification and a match cost of 2, distance keeps those
+// prices without quoting, multivalued fields do not quote, and a polygon
+// adds its modeled extra to both.
+TEST_F(GeoPolygonQueryTest, relationPointCostPricesEveryConsumer) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& singleHandler = inverter.getIndexHandler("geo_single");
+  auto& multiHandler = inverter.getIndexHandler("geo_multi");
+  SplitMix64 rng(0x1c0571e5);
+  for (int32_t doc = 0; doc < 300; doc++) {
+    inverter.startDoc();
+    singleHandler.index(inverter, 40.0 + unitDouble(rng), -75.0 + unitDouble(rng));
+    std::array<GeoPoint, 2> values{{{40.0 + unitDouble(rng), -75.0 + unitDouble(rng)},
+                                    {40.0 + unitDouble(rng), -75.0 + unitDouble(rng)}}};
+    multiHandler.index(inverter, std::span<const GeoPoint>(values));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  // The sparse verifier's quote and its scorer's match cost.
+  auto prices = [&]<class Q>(Q& query) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = (typename Q::Weight*)query.createWeight(context, 0);
+    auto* plan = resolveScorerPlanForTests(pool, *weight->scorerSupplier(pool, segment), 0);
+    EXPECT_EQ(Query::ReportedTwoPhase::YES, plan->shape().reportedTwoPhase);
+    return std::pair{plan->shape().verificationPoints, plan->build(pool)->matchCost()};
+  };
+  GeoBoxQuery box("geo_single", 40.2, 40.8, -74.8, -74.2);
+  EXPECT_EQ(std::pair(std::optional(PointsMaterialize::VERIFY_POINTS), 2.0f), prices(box));
+  GeoBoxQuery boxes("geo_multi", 40.2, 40.8, -74.8, -74.2);
+  EXPECT_EQ(std::pair(std::optional<double>(), 4.0f), prices(boxes));
+  GeoDistanceQuery circle("geo_single", 40.5, -74.5, 20000.0);
+  EXPECT_EQ(std::pair(std::optional<double>(), 2.0f), prices(circle));
+
+  PolygonSet set;
+  set.add({{40.2, -74.8}, {40.8, -74.8}, {40.5, -74.5}, {40.8, -74.2}, {40.2, -74.2}});
+  GeoPolygonQuery polygon(set.pool, "geo_single", set.polygons);
+  BKDPointCost cost = polygon.makeRelation().pointCost();
+  EXPECT_GT(cost.exact, cost.average);
+  EXPECT_GT(cost.average, 0.0);
+  auto [quote, matchCost] = prices(polygon);
+  EXPECT_EQ(PointsMaterialize::VERIFY_POINTS + cost.average, quote);
+  EXPECT_FLOAT_EQ((float)(2.0 * (1.0 + cost.average / BOX_TEST_POINTS)), matchCost);
 }
 
 // The public request path: a geo_polygon query over each cardinality.

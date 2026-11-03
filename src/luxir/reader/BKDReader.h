@@ -10,7 +10,6 @@
 #include <cstring>
 #include <limits>
 #include <numbers>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -44,6 +43,21 @@ inline BKDLongitudeRelation compareBKDLongitudeInterval(
   bool disjointLower = intervalMax < cellMin;
   return {insideUpper || insideLower, disjointUpper && disjointLower};
 }
+
+// One box matches() in the planner's point emissions (Query::Demand):
+// GeoBM's box test takes 0.43-0.54 ns per point (release, 2026-11-03), and a
+// forced BKD box emits a point in 0.69 ns (GeoQuery.h, CROSSING_POINTS).
+inline constexpr double BOX_TEST_POINTS = 0.7;
+
+// What one point test costs beyond a box test, in point emissions: exact for
+// a point beside the boundary, as in a crossing BKD leaf, and average over
+// the relation's box. quoted says the price is measured, so a verifier may
+// quote it to the planner.
+struct BKDPointCost {
+  double exact = 0.0;
+  double average = 0.0;
+  bool quoted = true;
+};
 
 // Inclusive encoded-space box. Reversed longitude bounds describe one
 // wrapped interval and are evaluated as two arms inside one traversal.
@@ -80,10 +94,8 @@ struct BKDBoxRelation {
         && geo::longitudeInRange(lon, lonMin, lonMax);
   }
 
-  // A point check is a few integer compares. It adds nothing measurable to
-  // a column verification, whose price was fitted on boxes.
-  float matchCost() const { return 2.0f; }
-  std::optional<double> checkPoints() const { return 0.0; }
+  // The box test is the unit the other relations' tests are priced in.
+  BKDPointCost pointCost() const { return {}; }
 };
 
 struct BKDDistanceRelation {
@@ -185,10 +197,8 @@ public:
         <= sortKey;
   }
 
-  // Priced like a box check; its verification price is not measured, so the
-  // sparse verifier quotes none.
-  float matchCost() const { return 2.0f; }
-  std::optional<double> checkPoints() const { return std::nullopt; }
+  // Priced like a box test and not quoted: its verification is not measured.
+  BKDPointCost pointCost() const { return {0.0, 0.0, false}; }
 };
 
 // A relation's answers precomputed on a grid of at most 64 x 64 cells over an
@@ -321,7 +331,7 @@ struct BKDPolygonRelation {
   int32_t lonMin = std::numeric_limits<int32_t>::max();
   int32_t lonMax = std::numeric_limits<int32_t>::min();
   BKDRelationGrid grid;
-  float pointCost = 2.0f;
+  BKDPointCost cost;
 
   // The trees and grid live in pool, which must outlive the relation and its
   // copies; the rings may go once this returns.
@@ -342,7 +352,7 @@ struct BKDPolygonRelation {
                                              relation.latMax, relation.lonMin,
                                              relation.lonMax);
     }
-    relation.pointCost = matchCostOf(parts, relation.grid.crossShare());
+    relation.cost = pointCostOf(parts, relation.grid.crossShare());
     return relation;
   }
 
@@ -373,9 +383,7 @@ struct BKDPolygonRelation {
     });
   }
 
-  float matchCost() const { return pointCost; }
-  // Not measured yet, so the sparse verifier quotes no price.
-  std::optional<double> checkPoints() const { return std::nullopt; }
+  BKDPointCost pointCost() const { return cost; }
 
 private:
   explicit BKDPolygonRelation(std::span<const Part> parts) : parts(parts) {
@@ -402,18 +410,20 @@ private:
     return (1.0 + stabbed) * std::log2((double)tree.edges.size() + 1.0);
   }
 
-  // matches() in a box check's units (2): about two box checks for the box
-  // and grid lookups, plus, in the share of grid cells an edge crosses, each
-  // part's box check and ring walks at 3 per node. Fitted on noisy circles of
-  // 100 to 100k vertices, within 25% of the measured ratio to a box check
-  // (one segment, release build, 2026-11-03).
-  static float matchCostOf(std::span<const Part> parts, double crossShare) {
-    double exact = 0.0;
+  // The model counts in half box tests: two box tests for the box and grid
+  // lookups, one for each part's box check, and 3 per walked node. A point
+  // beside the boundary lands in a crossing grid cell and pays every walk; a
+  // point anywhere in the box pays them in the grid's crossing share. Fitted
+  // on noisy circles of 100 to 100k vertices to within 25% of GeoBM's
+  // measured ratio to a box test (release, 2026-11-03).
+  static BKDPointCost pointCostOf(std::span<const Part> parts, double crossShare) {
+    double walks = 0.0;
     for (const Part& part : parts) {
-      exact += 2.0 + 3.0 * walkNodes(part.polygon.outer);
-      for (const geo::EdgeTree& hole : part.polygon.holes) exact += 3.0 * walkNodes(hole);
+      walks += 2.0 + 3.0 * walkNodes(part.polygon.outer);
+      for (const geo::EdgeTree& hole : part.polygon.holes) walks += 3.0 * walkNodes(hole);
     }
-    return (float)(4.0 + crossShare * exact);
+    auto extra = [](double halves) { return (halves / 2.0 - 1.0) * BOX_TEST_POINTS; };
+    return {extra(4.0 + walks), extra(4.0 + crossShare * walks), true};
   }
 };
 
