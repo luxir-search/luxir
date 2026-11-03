@@ -46,6 +46,9 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
+  // The scale of a DECIMAL value: this node is div(children[0], children[1])
+  // with an exact int64 numerator and the constant 10^scale. -1 otherwise.
+  int8_t decimalScale = -1;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;

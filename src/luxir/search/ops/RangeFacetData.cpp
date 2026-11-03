@@ -110,7 +110,7 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
   using Base = FixedBucketFacetReq::Calc<Distinct, GrowingStorage<Distinct>>;
   using Data = typename Base::Data;
   IntFacetRangeReq& rangeOp() { return (IntFacetRangeReq&)this->getOp(); }
-  FieldType::Type rangeOpType() const { return ((IntFacetRangeReq&)this->op).valueType; }
+  FieldType::Type rangeOpType() const { return ((IntFacetRangeReq&)this->op).valueKind(); }
 
   bool finite(int64_t value) const {
     if constexpr (!Floating) return true;
@@ -138,7 +138,7 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
     auto residual = pool.pool().make_span<uint32_t>(points.maxPointsPerLeaf());
     auto raw = pool.pool().make_span<int64_t>(points.maxPointsPerLeaf());
     if constexpr (Floating) if (!finite(lo) || !finite(hi)) {
-      double max = range.valueType == FieldType::FLOAT
+      double max = range.valueKind() == FieldType::FLOAT
           ? (double)std::numeric_limits<float>::max() : std::numeric_limits<double>::max();
       int64_t finiteLo = range.grid->encode(-max), finiteHi = range.grid->encode(max);
       auto span = points.fenceRange(finiteLo, finiteHi);
@@ -275,7 +275,7 @@ size_t IntFacetRangeReq::facetBucketResidentBytes() const {
 SearchOp::Calculator* IntFacetRangeReq::createDataCalculator(
     Calculator* parent, int64_t slot, int64_t numSlots,
     const StructuralConstraint* structural) {
-  bool floating = valueType == FieldType::Type::FLOAT || valueType == FieldType::Type::DOUBLE;
+  bool floating = valueKind() == FieldType::Type::FLOAT || valueKind() == FieldType::Type::DOUBLE;
   if (countDistinct) {
     if (floating) return new DataCalc<true, true>(*this, parent, slot, numSlots, structural);
     return new DataCalc<true>(*this, parent, slot, numSlots, structural);

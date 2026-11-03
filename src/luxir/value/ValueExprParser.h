@@ -326,7 +326,19 @@ private:
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
-    return append(node);
+    uint32_t column = append(node);
+    if (field->logical != FieldType::Logical::DECIMAL) return column;
+    // A DECIMAL column holds value * 10^scale: expressions see the value.
+    ValueNode unit;
+    unit.kind = ValueNodeKind::CONSTANT;
+    unit.type = ValueType::DOUBLE;
+    unit.doubleValue = static_cast<DecimalFieldType*>(field)->unit;
+    unit.sourcePos = pos;
+    unit.text = program->copyString(target.physicalName);
+    std::array<uint32_t, 2> args{column, append(unit)};
+    uint32_t value = makeFunction("div", pos, args);
+    program->nodes[value].decimalScale = (int8_t)static_cast<DecimalFieldType*>(field)->scale;
+    return value;
   }
 
   template <class Grammar>
@@ -372,6 +384,9 @@ private:
   uint32_t appendFunction(const ValueFunction* function, size_t pos,
                           std::array<uint32_t, 2> args, uint8_t count) {
     assert(function != nullptr);
+    if (uint32_t lifted = liftDecimal(function, pos, args, count); lifted != NO_NODE) {
+      return lifted;
+    }
     std::array<ResolvedValue, 2> resolvedArgs{};
     for (uint8_t i = 0; i < count; i++) {
       const ValueNode& arg = program->nodes[args[i]];
@@ -407,6 +422,30 @@ private:
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
     return append(node);
+  }
+
+  static constexpr uint32_t NO_NODE = UINT32_MAX;
+
+  // min and max of DECIMAL values of one scale select a value, so they run on
+  // the exact scaled integers and divide once: min(a, b) / 10^s. The result
+  // stays a DECIMAL, which lets aggregates sum it without rounding.
+  uint32_t liftDecimal(const ValueFunction* function, size_t pos,
+                       std::array<uint32_t, 2> args, uint8_t count) {
+    if (function->opcode != ValueOpcode::MIN && function->opcode != ValueOpcode::MAX) {
+      return NO_NODE;
+    }
+    int8_t scale = program->nodes[args[0]].decimalScale;
+    std::array<uint32_t, 2> scaled{};
+    for (uint8_t i = 0; i < count; i++) {
+      const ValueNode& arg = program->nodes[args[i]];
+      if (scale < 0 || arg.decimalScale != scale) return NO_NODE;
+      scaled[i] = arg.children[0];
+    }
+    uint32_t unit = program->nodes[args[0]].children[1];
+    uint32_t selected = appendFunction(function, pos, scaled, count);
+    uint32_t value = appendFunction(ValueFunctionRegistry::find("div"), pos, {selected, unit}, 2);
+    program->nodes[value].decimalScale = scale;
+    return value;
   }
 };
 

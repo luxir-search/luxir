@@ -8,8 +8,8 @@
 #include <string_view>
 
 #include "AllQuery.h"
+#include "BitSetScorer.h"
 #include "Query.h"
-#include "luxir/reader/DocsReader.h"
 
 namespace luxir {
 
@@ -49,50 +49,15 @@ public:
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
-  class Scorer final : public Query::ConstantScorer {
-    DocsReader docs;
-    screaming::BitSet::Iterator iterator;
-
+  // The docs-with-field set, read straight from SegFieldInfo.
+  class Scorer final : public BitSetScorer {
   public:
     Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
            float constantScore)
-        : Query::ConstantScorer(constantScore),
-          docs(postingsReader, fieldInfo), iterator(docs.bitset()) {
+        : BitSetScorer(postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc).ptr(),
+                       constantScore) {
       assert(fieldInfo.docsWithField > 0);
       assert(fieldInfo.docsWithField < postingsReader.maxDoc());
-      assert(docs.hasBitset());
-    }
-
-    [[gnu::cold]] void reset() override {
-      iterator.reset();
-    }
-
-    int32_t next() override {
-      return iterator.next();
-    }
-
-    int32_t advance(int32_t target) override {
-      assert(docId() < target);
-      return iterator.advance(target);
-    }
-
-    int32_t docId() override { return iterator.val(); }
-
-    void fillScoredWindowBits(std::span<uint64_t> words,
-                              int32_t min, int32_t max) override {
-      fillWindowBits(words, min, max);
-    }
-
-    void fillWindowBits(std::span<uint64_t> words, int32_t min,
-                        int32_t max) override {
-      if (min >= max) return;
-      int32_t doc = iterator.val();
-      if (doc < min) doc = iterator.advance(min);
-      while (doc < max) {
-        int32_t bit = doc - min;
-        words[(size_t)bit >> 6] |= 1ULL << (bit & 63);
-        doc = iterator.next();
-      }
     }
   };
 

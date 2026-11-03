@@ -20,6 +20,7 @@
 #include "luxir/util/Cursor.h"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/util/Clock.h"
+#include "luxir/util/IpAddress.h"
 
 namespace luxir {
 
@@ -156,6 +157,8 @@ public:
   // fields are targetable too but only for exact match - see numericQueryable.
   // Everything else degrades to text.
   static bool termQueryable(FieldType& fieldType) {
+    // IP terms are binary addresses: exact-match arm only (numericQueryable).
+    if (fieldType.logical == FieldType::Logical::IP) return false;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
       case FieldType::Type::STRING:
@@ -429,7 +432,9 @@ private:
   // (field:value or a quoted value); wildcard/fuzzy have no numeric meaning and
   // degrade to text.  Requires column storage - the match scan reads the column,
   // so a numeric field without it is not targetable and degrades to text.
+  // IP fields take the same exact-match-only arm (an address or CIDR block).
   static bool numericQueryable(FieldType& fieldType) {
+    if (fieldType.logical == FieldType::Logical::IP) return fieldType.indexed();
     switch (fieldType.type()) {
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
@@ -445,8 +450,14 @@ private:
     return fieldType.indexed() || fieldType.hasColumn();
   }
 
-  static std::string_view numericTypeName(FieldType::Type t) {
-    switch (t) {
+  static std::string_view numericTypeName(FieldType& fieldType) {
+    switch (fieldType.logical) {
+      case FieldType::Logical::BOOLEAN: return "boolean";
+      case FieldType::Logical::DECIMAL: return "decimal";
+      case FieldType::Logical::IP: return "IP address or CIDR block";
+      default: break;
+    }
+    switch (fieldType.type()) {
       case FieldType::Type::INT: return "integer";
       case FieldType::Type::DATE: return "date";
       default: return "number";  // FLOAT / DOUBLE
@@ -458,6 +469,9 @@ private:
   // simple_query still never hard-fails at build.  Uses the same coercion
   // contract as ingest / query build, which signals failure by throwing.
   bool numericCoercible(FieldType& fieldType, std::string_view value) {
+    if (fieldType.logical == FieldType::Logical::IP) {
+      return ip::parse(value).has_value() || ip::parseCidr(value).has_value();
+    }
     api::Val v;
     v.kind = value;
     try {
@@ -954,7 +968,7 @@ private:
                 // phrase over the default fields (declared).
                 warn("numeric_field_value",
                      fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
-                                 phrase->text, numericTypeName(fieldType->type()), field));
+                                 phrase->text, numericTypeName(*fieldType), field));
                 addUnit(st, makeDefault({}, nullptr, tokenText));
                 addUnit(st, makePhrase({}, nullptr, phrase->text, phrase->slop,
                                        phrase->suffixPresent));
@@ -1047,7 +1061,7 @@ private:
             } else if (!numericCoercible(*ft, tail)) {
               warn("numeric_field_value",
                    fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
-                               tail, numericTypeName(ft->type()), head));
+                               tail, numericTypeName(*ft), head));
             } else {
               field = head;
               fieldType = ft;
