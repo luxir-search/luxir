@@ -997,6 +997,7 @@ ResolvedAggregate resolveCardinality(
       addSketchRawBatch<HyperLogLog, cardinalityThreshold>, mergeCardinality, finishCardinality};
   ops.destroy = destroySketch<HyperLogLog>;
   ops.inlineCapable = false;
+  ops.duplicateInsensitive = true;
   return {BucketValueType::INT128, ValueNature::NUMBER, ops};
 }
 

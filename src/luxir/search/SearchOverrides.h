@@ -113,6 +113,9 @@ inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
 // A/B toggle: inline facet metrics take the per-document calculator calls
 // instead of keyed ord batches.
 inline bool disableKeyedInlineBatchesForTests = false;
+// A/B toggle: cardinality over an ordinal column hashes every value instead of
+// each distinct segment ordinal once.
+inline bool disableDistinctOrdCardinalityForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE

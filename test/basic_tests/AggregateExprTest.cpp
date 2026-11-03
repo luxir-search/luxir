@@ -757,6 +757,60 @@ TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
   EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
+TEST_F(AggregateExprTest, cardinalityAddsEachDistinctOrdOnce) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  std::mt19937_64 random(11);
+  std::set<std::string> all, tagged;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 5000; i++) {
+      std::string user = "u" + std::to_string(random() % (segment == 2 ? 300 : 9000));
+      std::string tag = "t" + std::to_string(random() % 50);
+      all.insert(user);
+      if (i % 4 == 0) tagged.insert(user);
+      docs.push_back(flatdoc("id", std::to_string(segment * 5000 + i), "user_s", user,
+          "tags_ss", vecs(tag, tag + "x", user), "quarter_i", i % 4, "cat_s", i % 3 ? "a" : "b"));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  auto guard = facetAggregateOverrides();
+  SearchOverridesGuard ordGuard(disableDistinctOrdCardinalityForTests);
+  std::array<std::string, 4> cases{
+    R"json({"ops":{"users":"cardinality(user_s)","exact":"cardinality(user_s,40000)",
+      "tags":"cardinality(tags_ss)","ids":"cardinality(id,40000)"}})json",
+    R"json({"ops":{"q":{"top_docs":{"limit":0,"query":"quarter_i:0","ops":{
+      "users":"cardinality(user_s)","exact":"cardinality(user_s,40000)"}}}}})json",
+    R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":{
+      "users":"cardinality(user_s)","tags":"cardinality(tags_ss,40000)"}}}}})json",
+    R"json({"ops":{"f":{"field_facet":{"field":"quarter_i","limit":2,"ops":{
+      "users":"cardinality(user_s)"}}}}})json"};
+  for (const std::string& json : cases) {
+    SCOPED_TRACE(json);
+    AggregateExecutionStats baselineStats, distinctStats;
+    disableDistinctOrdCardinalityForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableDistinctOrdCardinalityForTests = false;
+    auto distinct = runSharedSketchRequest(helper, json, distinctStats, -1);
+    EXPECT_FALSE(distinct.values.empty());
+    EXPECT_EQ(baseline.values, distinct.values);
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(cases[1], req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((int64_t)tagged.size(), req->docList("q")->ops.at("exact")->asInt());
+  auto root = localReq(helper.getSearchEngine());
+  parseQueryRequest(cases[0], root->rawRequest(), root->mr);
+  root->collection("main");
+  root->execute(false);
+  ASSERT_TRUE(root->ok()) << root->errorMsg();
+  EXPECT_EQ((int64_t)all.size(), root->scalar<int64_t>("exact"));
+  EXPECT_EQ(15000, root->scalar<int64_t>("ids"));
+}
+
 TEST_F(AggregateExprTest, sketchRowsSkipNonFiniteValuesAndCanonicalizeZero) {
   CollectionHelper helper;
   double nan = std::numeric_limits<double>::quiet_NaN();
