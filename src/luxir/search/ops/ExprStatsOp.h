@@ -216,6 +216,54 @@ public:
       if (count != 0) flush();
     }
 
+    // A duplicate-insensitive state (cardinality) over an ordinal column needs
+    // each distinct value once: the walk marks the segment's ords in a bitset,
+    // and only the marked ones are mapped to global ords and added. Taken
+    // when the bitset is cheap next to the domain; false leaves the binding
+    // to the per-value path.
+    bool accumulateDistinctOrds(AggregateAccumulator& accumulator,
+                                BoundAggregateInput& binding, DocSet* domain,
+                                int32_t maxDoc) {
+      static constexpr int64_t MAX_BITSET_ORDS = int64_t{1} << 30;
+      if (disableDistinctOrdCardinalityForTests || binding.ordColumn == nullptr
+          || !binding.producer->resolved.state.duplicateInsensitive) {
+        return false;
+      }
+      int64_t numOrds = binding.ordMapping.numOrds;
+      if (numOrds <= 0) {
+        // A segment holding every ord maps to them by identity.
+        const OrdMap* ords = thisOp().fields[binding.producerIndex].ords;
+        numOrds = ords != nullptr ? ords->numOrds() : 0;
+      }
+      int64_t domainDocs = domain != nullptr ? domain->card() : maxDoc;
+      if (numOrds <= 0 || numOrds > MAX_BITSET_ORDS || numOrds / 64 > domainDocs) {
+        return false;
+      }
+      std::vector<uint64_t> seen(((size_t)numOrds + 63) / 64);
+      int64_t missing = 0;
+      forEachOrdValue(domain, *binding.ordColumn, OrdMap::SegToGlobal::identity(),
+          maxDoc, missing, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
+            unused(docid);
+            seen[(uint64_t)ord >> 6] |= uint64_t{1} << ((uint64_t)ord & 63);
+          });
+      std::array<ScalarValueResult, BATCH_SIZE> values;
+      size_t count = 0;
+      auto flush = [&] {
+        accumulator.addBatch(binding.producerIndex,
+            std::span<const ScalarValueResult>(values.data(), count));
+        count = 0;
+      };
+      for (size_t word = 0; word < seen.size(); word++) {
+        for (uint64_t bits = seen[word]; bits != 0; bits &= bits - 1) {
+          int64_t ord = (int64_t)(word * 64 + (size_t)std::countr_zero(bits));
+          values[count++] = ScalarValueResult::integer(binding.ordMapping.globalOrd(ord));
+          if (count == values.size()) flush();
+        }
+      }
+      if (count != 0) flush();
+      return true;
+    }
+
     void accumulateExpression(AggregateAccumulator& accumulator,
                               BoundAggregateInput& binding, DocSet* domain,
                               int32_t maxDoc) {
@@ -309,6 +357,8 @@ public:
             if (binding.columnScan) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
+            } else if (accumulateDistinctOrds(
+                           accumulator, binding, domainHandle.get(), maxDoc)) {
             } else {
               accumulateExpression(
                   accumulator, binding, domainHandle.get(), maxDoc);
