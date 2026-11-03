@@ -18,6 +18,7 @@
 #include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/BKDWriter.h"
+#include "luxir/util/MemPool.h"
 #include "luxir/util/geo.h"
 
 namespace luxir {
@@ -179,26 +180,84 @@ public:
   }
 };
 
-// Polygon over decoded point coordinates. A cell outside the polygon's
-// bounding box is OUTSIDE. Otherwise a cell that no ring edge touches lies
+// A union of polygons over decoded point coordinates (see geo::Polygon). A
+// cell is INSIDE when one polygon holds all of it, OUTSIDE when every polygon
+// misses it, and CROSSES otherwise. Against one polygon, a cell outside its
+// bounding box is OUTSIDE; otherwise a cell that no ring edge touches lies
 // wholly inside or wholly outside the polygon, and one corner decides which.
 // The cell is widened by a tiny margin for the edge test so rounding cannot
-// call a cell INSIDE while a point in it tests outside.
+// call a cell INSIDE while a point in it tests outside. The polygons are built
+// once per query (build), so copies of the relation share them.
 struct BKDPolygonRelation {
   static constexpr double EDGE_MARGIN = 1e-9;
 
-  geo::Polygon polygon;
-  int32_t latMin;
-  int32_t latMax;
-  int32_t lonMin;
-  int32_t lonMax;
+  // One polygon and its bounding box in encoded space.
+  struct Part {
+    geo::Polygon polygon;
+    int32_t latMin;
+    int32_t latMax;
+    int32_t lonMin;
+    int32_t lonMax;
 
-  explicit BKDPolygonRelation(const geo::Polygon& polygon)
-      : polygon(polygon),
-        latMin(geo::encodeLatitudeCeil(polygon.box.minLat)),
-        latMax(geo::encodeLatitude(polygon.box.maxLat)),
-        lonMin(geo::encodeLongitudeCeil(polygon.box.minLon)),
-        lonMax(geo::encodeLongitude(polygon.box.maxLon)) {}
+    static Part of(const geo::Polygon& polygon) {
+      return {polygon,
+              geo::encodeLatitudeCeil(polygon.box.minLat),
+              geo::encodeLatitude(polygon.box.maxLat),
+              geo::encodeLongitudeCeil(polygon.box.minLon),
+              geo::encodeLongitude(polygon.box.maxLon)};
+    }
+
+    BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                        int32_t cellLonMin, int32_t cellLonMax) const {
+      if (cellLatMax < latMin || latMax < cellLatMin
+          || cellLonMax < lonMin || lonMax < cellLonMin) {
+        return BKDRelation::OUTSIDE;
+      }
+      double minLat = geo::decodeLatitude(cellLatMin);
+      double maxLat = geo::decodeLatitude(cellLatMax);
+      double minLon = geo::decodeLongitude(cellLonMin);
+      double maxLon = geo::decodeLongitude(cellLonMax);
+      if (polygon.edgeTouches(minLat - EDGE_MARGIN, maxLat + EDGE_MARGIN,
+                              minLon - EDGE_MARGIN, maxLon + EDGE_MARGIN)) {
+        return BKDRelation::CROSSES;
+      }
+      return polygon.contains(minLat, minLon)
+          ? BKDRelation::INSIDE : BKDRelation::OUTSIDE;
+    }
+
+    bool matches(int32_t lat, int32_t lon) const {
+      return latMin <= lat && lat <= latMax && lonMin <= lon && lon <= lonMax
+          && polygon.contains(geo::decodeLatitude(lat),
+                              geo::decodeLongitude(lon));
+    }
+  };
+
+  std::span<const Part> parts;
+  // The encoded bounding box of every part.
+  int32_t latMin = std::numeric_limits<int32_t>::max();
+  int32_t latMax = std::numeric_limits<int32_t>::min();
+  int32_t lonMin = std::numeric_limits<int32_t>::max();
+  int32_t lonMax = std::numeric_limits<int32_t>::min();
+
+  // The polygons' state lives in pool, which must outlive the relation and
+  // its copies; the rings are borrowed.
+  static BKDPolygonRelation build(MemPool& pool,
+                                  std::span<const geo::PolygonRings> polygons) {
+    auto parts = pool.make_span<Part>(polygons.size());
+    for (size_t i = 0; i < polygons.size(); i++) {
+      parts[i] = Part::of(geo::Polygon::of(polygons[i]));
+    }
+    return BKDPolygonRelation(parts);
+  }
+
+  explicit BKDPolygonRelation(std::span<const Part> parts) : parts(parts) {
+    for (const Part& part : parts) {
+      latMin = std::min(latMin, part.latMin);
+      latMax = std::max(latMax, part.latMax);
+      lonMin = std::min(lonMin, part.lonMin);
+      lonMax = std::max(lonMax, part.lonMax);
+    }
+  }
 
   BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
                       int32_t cellLonMin, int32_t cellLonMax) const {
@@ -206,22 +265,23 @@ struct BKDPolygonRelation {
         || cellLonMax < lonMin || lonMax < cellLonMin) {
       return BKDRelation::OUTSIDE;
     }
-    double minLat = geo::decodeLatitude(cellLatMin);
-    double maxLat = geo::decodeLatitude(cellLatMax);
-    double minLon = geo::decodeLongitude(cellLonMin);
-    double maxLon = geo::decodeLongitude(cellLonMax);
-    if (polygon.edgeTouches(minLat - EDGE_MARGIN, maxLat + EDGE_MARGIN,
-                            minLon - EDGE_MARGIN, maxLon + EDGE_MARGIN)) {
-      return BKDRelation::CROSSES;
+    bool crosses = false;
+    for (const Part& part : parts) {
+      BKDRelation relation =
+          part.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+      if (relation == BKDRelation::INSIDE) return relation;
+      crosses |= relation == BKDRelation::CROSSES;
     }
-    return polygon.contains(minLat, minLon)
-        ? BKDRelation::INSIDE : BKDRelation::OUTSIDE;
+    return crosses ? BKDRelation::CROSSES : BKDRelation::OUTSIDE;
   }
 
   bool matches(int32_t lat, int32_t lon) const {
-    return latMin <= lat && lat <= latMax && lonMin <= lon && lon <= lonMax
-        && polygon.contains(geo::decodeLatitude(lat),
-                            geo::decodeLongitude(lon));
+    if (lat < latMin || latMax < lat || lon < lonMin || lonMax < lon) {
+      return false;
+    }
+    return std::ranges::any_of(parts, [lat, lon](const Part& part) {
+      return part.matches(lat, lon);
+    });
   }
 };
 

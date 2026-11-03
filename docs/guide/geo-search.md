@@ -180,9 +180,10 @@ when any point is inside the circle, and the document is returned once.
 
 ## Polygon queries
 
-`geo_polygon` matches points inside a polygon. Vertices use named `lat` and
-`lon` keys; the outer ring needs at least three distinct vertices and may
-repeat its first vertex at the end:
+`geo_polygon` matches points inside any of its `polygons`. Each polygon has
+an outer ring, `points`, and optional `holes`. Vertices use named `lat` and
+`lon` keys; a ring needs at least three distinct vertices and may repeat its
+first vertex at the end:
 
 ```http
 POST /collections/places/_search
@@ -191,14 +192,26 @@ POST /collections/places/_search
   "query": {
     "geo_polygon": {
       "field":"location",
-      "points":[
-        {"lat":40.0,"lon":-75.0},
-        {"lat":42.0,"lon":-75.0},
-        {"lat":42.0,"lon":-72.0},
-        {"lat":40.0,"lon":-72.0}
-      ],
-      "holes":[
-        {"points":[{"lat":40.5,"lon":-74.5},{"lat":41.0,"lon":-74.5},{"lat":41.0,"lon":-74.0}]}
+      "polygons":[
+        {
+          "points":[
+            {"lat":40.0,"lon":-75.0},
+            {"lat":42.0,"lon":-75.0},
+            {"lat":42.0,"lon":-72.0},
+            {"lat":40.0,"lon":-72.0}
+          ],
+          "holes":[
+            {"points":[{"lat":40.5,"lon":-74.5},{"lat":41.0,"lon":-74.5},{"lat":41.0,"lon":-74.0}]}
+          ]
+        },
+        {
+          "points":[
+            {"lat":51.0,"lon":-1.0},
+            {"lat":52.0,"lon":-1.0},
+            {"lat":52.0,"lon":1.0},
+            {"lat":51.0,"lon":1.0}
+          ]
+        }
       ]
     }
   },
@@ -206,14 +219,14 @@ POST /collections/places/_search
 }
 ```
 
-A point matches when it is inside the outer ring and inside no hole, each by
-the even-odd rule. Edges are straight lines in latitude/longitude, as in
-Lucene's point polygon queries, and a polygon cannot cross the date line;
-split such a polygon into two `geo_polygon` clauses under a boolean `should`.
-A point exactly on an edge may match either way. With `index: "range"` the
-points index prunes whole cells by the polygon's bounding box and edges, and
-checks each point only in cells an edge crosses. Each cell test walks every
-edge, so very large polygons cost proportionally more.
+A point matches when it is inside any polygon. It is inside a polygon when it
+is inside the outer ring and inside none of that polygon's holes, each ring by
+the even-odd rule; a hole cuts only its own polygon. Edges are straight lines
+in latitude/longitude, as in Lucene's point polygon queries, and a polygon
+cannot cross the date line: split such a polygon into two polygons of the
+same query. A point exactly on an edge may match either way. With
+`index: "range"` the points index prunes whole cells by each polygon's
+bounding box and edges, and checks each point only in cells an edge crosses.
 
 ## Combine place with relevance
 

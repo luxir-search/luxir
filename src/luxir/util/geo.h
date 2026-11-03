@@ -222,6 +222,13 @@ struct LatLon {
   double lon;
 };
 
+// One polygon's rings: the outer ring and optional holes, each a vertex list
+// whose last vertex connects back to the first.
+struct PolygonRings {
+  std::span<const LatLon> outer;
+  std::span<const std::span<const LatLon>> holes;
+};
+
 // A polygon in degrees: one outer ring and optional holes. Rings are not
 // closed (the last vertex connects back to the first), and edges are straight
 // lines in latitude/longitude, as in Lucene's LatLonPoint polygon queries. A
@@ -232,6 +239,19 @@ struct Polygon {
   std::span<const LatLon> outer;
   std::span<const std::span<const LatLon>> holes;
   BoundingBox box;
+
+  // The polygon of rings, bounded by its outer ring's vertices.
+  static Polygon of(const PolygonRings& rings) {
+    BoundingBox box{rings.outer[0].lat, rings.outer[0].lat,
+                    rings.outer[0].lon, rings.outer[0].lon};
+    for (const LatLon& point : rings.outer) {
+      box.minLat = std::min(box.minLat, point.lat);
+      box.maxLat = std::max(box.maxLat, point.lat);
+      box.minLon = std::min(box.minLon, point.lon);
+      box.maxLon = std::max(box.maxLon, point.lon);
+    }
+    return {rings.outer, rings.holes, box};
+  }
 
   static bool ringContains(std::span<const LatLon> ring, double lat,
                            double lon) {

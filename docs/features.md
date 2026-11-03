@@ -366,8 +366,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
   `ignore_z_value`.
 - Bounding-box queries (dateline-aware), great-circle distance queries, and
-  polygon queries with holes, usable as the main query, as a non-scoring
-  filter, or as a boolean clause.
+  polygon queries over a union of polygons with holes, usable as the main
+  query, as a non-scoring filter, or as a boolean clause.
 - Requested geo fields come back in their ingest shape, `[lon, lat]`, or
   `[[lon, lat], ...]` for a multi-valued field, so results index back
   unchanged.

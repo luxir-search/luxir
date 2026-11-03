@@ -57,9 +57,9 @@ inline constexpr std::array<std::string_view, 24> ARM_NAMES = {
     "regex",          // RegexQuery
     "any_of",         // AnyOfQuery - exact scalar/list input
     "multi_match",    // MultiMatchQuery
+    "geo_polygon",    // GeoPolygonQuery - not callable in this pass
     "dis_max",        // DisMaxQuery
     "plugin",         // PluginQuery - called by the plugin's own name (QueryRegistry)
-    "geo_polygon",    // GeoPolygonQuery - not callable in this pass
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");

@@ -242,10 +242,15 @@ luxir::Query* ProtobufQueryParser::parseGeoPolygon(
     for (size_t i = 0; i < points.size(); i++) out[i] = {points[i].lat, points[i].lon};
     return std::span<const geo::LatLon>(out);
   };
-  auto holes = pool.make_span<std::span<const geo::LatLon>>(geoPolygonQuery.holes.size());
-  for (size_t i = 0; i < holes.size(); i++) holes[i] = ring(geoPolygonQuery.holes[i].points);
+  auto polygons = pool.make_span<geo::PolygonRings>(geoPolygonQuery.polygons.size());
+  for (size_t p = 0; p < polygons.size(); p++) {
+    const auto& polygon = geoPolygonQuery.polygons[p];
+    auto holes = pool.make_span<std::span<const geo::LatLon>>(polygon.holes.size());
+    for (size_t h = 0; h < holes.size(); h++) holes[h] = ring(polygon.holes[h].points);
+    polygons[p] = {ring(polygon.points), holes};
+  }
   return pool.make<luxir::GeoPolygonQuery>(
-      api::build::arenaStr(pool, target.physicalName), ring(geoPolygonQuery.points), holes);
+      pool, api::build::arenaStr(pool, target.physicalName), polygons);
 }
 
 luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery) {

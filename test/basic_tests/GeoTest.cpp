@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -213,6 +214,28 @@ void setValues(api::Val& val, std::pmr::memory_resource& mr, size_t size,
   auto& arr = val.kind.emplace<api::ArrVal>();
   api::Val* out = api::build::allocArray(arr.v, size, mr);
   for (size_t i = 0; i < size; i++) fill(out[i], i, mr);
+}
+
+using Ring = std::vector<geo::LatLon>;
+
+// Polygons as vertex lists, kept alive with the pool for the GeoPolygonQuery
+// that borrows them.
+struct PolygonSet {
+  MemPool pool;
+  std::deque<Ring> rings;
+  std::deque<std::vector<std::span<const geo::LatLon>>> holes;
+  std::vector<geo::PolygonRings> polygons;
+
+  PolygonSet& add(Ring outer, std::vector<Ring> holeRings = {}) {
+    auto& spans = holes.emplace_back();
+    for (auto& ring : holeRings) spans.push_back(rings.emplace_back(std::move(ring)));
+    polygons.push_back({rings.emplace_back(std::move(outer)), spans});
+    return *this;
+  }
+};
+
+Ring square(double minLat, double maxLat, double minLon, double maxLon) {
+  return {{minLat, minLon}, {maxLat, minLon}, {maxLat, maxLon}, {minLat, maxLon}};
 }
 
 } // namespace
@@ -854,14 +877,13 @@ TEST_F(GeoBoxQueryTest, scanAgreesWithPointChecks) {
     GeoDistanceQuery query("geo_single", 40.7, -74.0, radius);
     EXPECT_GT(check(query), 0u);
   }
-  std::array<geo::LatLon, 4> outer{{{35.0, 139.0}, {36.0, 139.0},
-                                    {36.0, 140.0}, {35.0, 140.0}}};
-  std::array<geo::LatLon, 3> hole{{{35.65, 139.65}, {35.75, 139.65},
-                                   {35.7, 139.75}}};
-  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
-  GeoPolygonQuery polygon("geo_single", outer, holes);
+  PolygonSet set;
+  set.add(square(35.0, 36.0, 139.0, 140.0),
+          {{{35.65, 139.65}, {35.75, 139.65}, {35.7, 139.75}}});
+  set.add(square(51.45, 51.5, -0.15, -0.1));
+  GeoPolygonQuery polygon(set.pool, "geo_single", set.polygons);
   EXPECT_GT(check(polygon), 0u);
-  EXPECT_LT(check(polygon), 512u);
+  EXPECT_LT(check(polygon), 1024u);
 }
 
 class GeoPolygonQueryTest : public LuxirTest {};
@@ -869,39 +891,71 @@ class GeoPolygonQueryTest : public LuxirTest {};
 TEST_F(GeoPolygonQueryTest, containmentHolesAndValidation) {
   // A concave "C" around New York with a triangular hole in its top bar;
   // the ring repeats its first vertex, which the query drops.
-  std::array<geo::LatLon, 9> outer{{{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0},
-                                    {41.0, -73.0}, {41.0, -74.5}, {40.5, -74.5},
-                                    {40.5, -73.0}, {40.0, -73.0}, {40.0, -75.0}}};
-  std::array<geo::LatLon, 3> hole{{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}};
-  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
-  GeoPolygonQuery query("geo", outer, holes);
-  const geo::Polygon& polygon = query.getPolygon();
-  EXPECT_EQ(8u, polygon.outer.size());
-  EXPECT_TRUE(polygon.contains(40.25, -74.0));   // bottom bar
-  EXPECT_TRUE(polygon.contains(41.25, -73.5));   // top bar
-  EXPECT_TRUE(polygon.contains(40.75, -74.75));  // left bar
-  EXPECT_FALSE(polygon.contains(40.75, -73.5));  // the notch
-  EXPECT_FALSE(polygon.contains(41.35, -74.85)); // the hole
-  EXPECT_FALSE(polygon.contains(42.0, -74.0));
-
-  BKDPolygonRelation relation = query.makeRelation();
-  auto cell = [](double minLat, double maxLat, double minLon, double maxLon) {
-    return std::array<int32_t, 4>{geo::encodeLatitude(minLat), geo::encodeLatitude(maxLat),
-                                  geo::encodeLongitude(minLon), geo::encodeLongitude(maxLon)};
+  PolygonSet set;
+  set.add({{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0}, {41.0, -73.0}, {41.0, -74.5},
+           {40.5, -74.5}, {40.5, -73.0}, {40.0, -73.0}, {40.0, -75.0}},
+          {{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}});
+  GeoPolygonQuery query(set.pool, "geo", set.polygons);
+  EXPECT_EQ(8u, query.getPolygons()[0].outer.size());
+  const BKDPolygonRelation& relation = query.makeRelation();
+  auto matches = [](const BKDPolygonRelation& r, double lat, double lon) {
+    return r.matches(geo::encodeLatitude(lat), geo::encodeLongitude(lon));
   };
-  auto compare = [&](std::array<int32_t, 4> c) {
-    return relation.compare(c[0], c[1], c[2], c[3]);
-  };
-  EXPECT_EQ(BKDRelation::INSIDE, compare(cell(40.1, 40.4, -74.9, -73.1)));
-  EXPECT_EQ(BKDRelation::OUTSIDE, compare(cell(40.6, 40.9, -74.4, -73.1)));
-  EXPECT_EQ(BKDRelation::OUTSIDE, compare(cell(10.0, 20.0, 10.0, 20.0)));
-  EXPECT_EQ(BKDRelation::CROSSES, compare(cell(40.4, 40.6, -74.0, -73.5)));
-  EXPECT_EQ(BKDRelation::CROSSES, compare(cell(41.2, 41.3, -74.85, -74.7)));
+  EXPECT_TRUE(matches(relation, 40.25, -74.0));   // bottom bar
+  EXPECT_TRUE(matches(relation, 41.25, -73.5));   // top bar
+  EXPECT_TRUE(matches(relation, 40.75, -74.75));  // left bar
+  EXPECT_FALSE(matches(relation, 40.75, -73.5));  // the notch
+  EXPECT_FALSE(matches(relation, 41.35, -74.85)); // the hole
+  EXPECT_FALSE(matches(relation, 42.0, -74.0));
 
-  EXPECT_THROW(GeoPolygonQuery("geo", std::span(outer).first(2), {}),
-               std::invalid_argument);
-  std::array<geo::LatLon, 3> badLat{{{0.0, 0.0}, {91.0, 0.0}, {0.0, 1.0}}};
-  EXPECT_THROW(GeoPolygonQuery("geo", badLat, {}), std::invalid_argument);
+  auto compare = [](const BKDPolygonRelation& r, double minLat, double maxLat,
+                    double minLon, double maxLon) {
+    return r.compare(geo::encodeLatitude(minLat), geo::encodeLatitude(maxLat),
+                     geo::encodeLongitude(minLon), geo::encodeLongitude(maxLon));
+  };
+  EXPECT_EQ(BKDRelation::INSIDE, compare(relation, 40.1, 40.4, -74.9, -73.1));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(relation, 40.6, 40.9, -74.4, -73.1));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(relation, 10.0, 20.0, 10.0, 20.0));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(relation, 40.4, 40.6, -74.0, -73.5));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(relation, 41.2, 41.3, -74.85, -74.7));
+
+  // A union: the second square covers part of the first one's hole, which
+  // applies to its own polygon only.
+  PolygonSet two;
+  two.add(square(0.0, 10.0, 0.0, 10.0), {square(4.0, 6.0, 4.0, 6.0)});
+  two.add(square(5.0, 7.0, 5.0, 7.0));
+  GeoPolygonQuery both(two.pool, "geo", two.polygons);
+  const BKDPolygonRelation& unionRelation = both.makeRelation();
+  EXPECT_TRUE(matches(unionRelation, 8.0, 8.0));
+  EXPECT_TRUE(matches(unionRelation, 5.5, 5.5));
+  EXPECT_FALSE(matches(unionRelation, 4.5, 4.5));
+  EXPECT_FALSE(matches(unionRelation, 20.0, 20.0));
+  EXPECT_EQ(BKDRelation::INSIDE, compare(unionRelation, 5.2, 5.8, 5.2, 5.8));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(unionRelation, 4.2, 4.8, 4.2, 4.8));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(unionRelation, 4.5, 5.5, 4.5, 5.5));
+
+  PolygonSet same;
+  same.add(square(0.0, 10.0, 0.0, 10.0), {square(4.0, 6.0, 4.0, 6.0)});
+  same.add(square(5.0, 7.0, 5.0, 7.0));
+  GeoPolygonQuery equal(same.pool, "geo", same.polygons);
+  EXPECT_TRUE(both.equals(equal));
+  EXPECT_EQ(both.hash(), equal.hash());
+  EXPECT_FALSE(both.equals(query));
+
+  auto rejects = [](Ring outer, std::vector<Ring> holes = {}) {
+    PolygonSet bad;
+    bad.add(std::move(outer), std::move(holes));
+    EXPECT_THROW(GeoPolygonQuery(bad.pool, "geo", bad.polygons), std::invalid_argument);
+  };
+  rejects({{0.0, 0.0}, {1.0, 0.0}});
+  rejects({{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}});
+  rejects({{0.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  rejects({{0.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}});
+  rejects({{0.0, 0.0}, {91.0, 0.0}, {0.0, 1.0}});
+  rejects({{0.0, 0.0}, {std::numeric_limits<double>::quiet_NaN(), 0.0}, {0.0, 1.0}});
+  rejects(square(0.0, 1.0, 0.0, 1.0), {{{0.5, 0.5}, {0.5, 0.5}, {0.6, 0.6}}});
+  MemPool pool;
+  EXPECT_THROW(GeoPolygonQuery(pool, "geo", {}), std::invalid_argument);
 }
 
 TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
@@ -935,18 +989,22 @@ TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
   writer->commit();
   auto reader = writer->snapshots.readers.getReader();
 
-  std::array<geo::LatLon, 8> concave{{{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0},
-                                      {41.0, -73.0}, {41.0, -74.5}, {40.5, -74.5},
-                                      {40.5, -73.0}, {40.0, -73.0}}};
-  std::array<geo::LatLon, 3> hole{{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}};
-  std::array<std::span<const geo::LatLon>, 1> holes{{hole}};
-  std::array<geo::LatLon, 5> large{{{-60.0, -170.0}, {70.0, -150.0}, {80.0, 20.0},
-                                    {10.0, 175.0}, {-70.0, 60.0}}};
+  PolygonSet withHole;
+  withHole.add({{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0}, {41.0, -73.0},
+                {41.0, -74.5}, {40.5, -74.5}, {40.5, -73.0}, {40.0, -73.0}},
+               {{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}});
+  PolygonSet world;
+  world.add({{-60.0, -170.0}, {70.0, -150.0}, {80.0, 20.0}, {10.0, 175.0}, {-70.0, 60.0}});
+  PolygonSet several;
+  several.add(square(40.2, 40.9, -74.6, -73.3), {square(40.4, 40.7, -74.2, -73.8)});
+  several.add(square(40.5, 41.2, -74.0, -73.0));
+  several.add(square(-10.0, 30.0, 100.0, 140.0));
   for (std::string_view field : {"geo_single", "geo_multi"}) {
     const EncodedPoints& points = field == "geo_single" ? single : multi;
-    GeoPolygonQuery withHole(field, concave, holes);
-    GeoPolygonQuery world(field, large, {});
-    for (GeoPolygonQuery* query : {&withHole, &world}) {
+    GeoPolygonQuery concave(withHole.pool, field, withHole.polygons);
+    GeoPolygonQuery large(world.pool, field, world.polygons);
+    GeoPolygonQuery parts(several.pool, field, several.polygons);
+    for (GeoPolygonQuery* query : {&concave, &large, &parts}) {
       auto expected = relationOracle(points, query->makeRelation());
       EXPECT_FALSE(expected.empty()) << field;
       EXPECT_EQ(expected, runQuery(*reader, *query, false, false)) << field;
@@ -977,8 +1035,8 @@ TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
   auto search = [&](std::string_view field) {
     auto req = localReq(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
-    cur.rawQuery() = qb::geoPolygon(cur.mr(), field,
-        {{40.0, -75.0}, {41.0, -75.0}, {41.0, -73.0}, {40.0, -73.0}});
+    qb::GeoPolygonRings box{{{40.0, -75.0}, {41.0, -75.0}, {41.0, -73.0}, {40.0, -73.0}}};
+    cur.rawQuery() = qb::geoPolygon(cur.mr(), field, {box});
     cur.fields({"id"}).limit(10);
     req->execute();
     EXPECT_OK(req);
@@ -990,6 +1048,54 @@ TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
   auto multi = search("geo_multi");
   ASSERT_EQ(1u, multi.size());
   EXPECT_EQ("tour", std::get<std::string>(*find(multi[0], "id")));
+}
+
+// The HTTP JSON form: named vertices, a union of polygons whose holes cut
+// only their own polygon, and malformed polygons rejected as bad requests.
+TEST_F(GeoPolygonQueryTest, jsonQueryMatchesUnion) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  HttpServer server(*luxirNode, 1, 0);
+  server.start();
+  auto post = [&](std::string_view path, const std::string& body) {
+    return httpRequest(server.getPort(), http::verb::post, path, body);
+  };
+  auto update = post("/collections/main/_update", R"({"docs":[
+      {"id":"ny","geo_single":[-74.006,40.7128]},
+      {"id":"london","geo_single":[-0.1278,51.5074]},
+      {"id":"sydney","geo_single":[151.2093,-33.8688]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto search = [&](const std::string& polygons) {
+    return post("/collections/main/_search",
+                R"({"query":{"geo_polygon":{"field":"geo_single","polygons":)" + polygons
+                    + R"(}},"fields":["id"],"sort":"id asc"})");
+  };
+  auto ids = [&](const std::string& polygons) {
+    auto res = search(polygons);
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    glz::generic_i64 root;
+    EXPECT_FALSE(glz::read_json(root, res.body())) << res.body();
+    std::vector<std::string> out;
+    for (const auto& doc : root["docs"].get_array()) out.push_back(doc["id"].get_string());
+    return out;
+  };
+  const std::string ny =
+      R"({"points":[{"lat":40,"lon":-75},{"lat":41,"lon":-75},{"lat":41,"lon":-73},{"lat":40,"lon":-73}]})";
+  const std::string london =
+      R"("points":[{"lat":51,"lon":-1},{"lat":52,"lon":-1},{"lat":52,"lon":1},{"lat":51,"lon":1}])";
+  const std::string aroundLondon =
+      R"("holes":[{"points":[{"lat":51.4,"lon":-0.2},{"lat":51.6,"lon":-0.2},{"lat":51.6,"lon":0},{"lat":51.4,"lon":0}]}])";
+  EXPECT_EQ((std::vector<std::string>{"london", "ny"}), ids("[" + ny + ",{" + london + "}]"));
+  EXPECT_EQ((std::vector<std::string>{"ny"}),
+            ids("[" + ny + ",{" + london + "," + aroundLondon + "}]"));
+
+  auto repeated = search(R"([{"points":[{"lat":1,"lon":1},{"lat":1,"lon":1},{"lat":1,"lon":1}]}])");
+  EXPECT_EQ(400, repeated.result_int()) << repeated.body();
+  EXPECT_NE(std::string::npos, repeated.body().find("3 distinct vertices")) << repeated.body();
+  auto none = search("[]");
+  EXPECT_EQ(400, none.result_int()) << none.body();
+  EXPECT_NE(std::string::npos, none.body().find("at least one polygon")) << none.body();
+  server.shutdown();
 }
 
 class GeoProjectionTest : public LuxirTest {};

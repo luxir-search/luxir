@@ -342,9 +342,9 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
+    GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
-    GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside a polygon
   }
 }
 
@@ -624,23 +624,33 @@ message GeoDistanceQuery {
 // A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the
 // VALUE array contract [x, y] = [lon, lat] does not apply.
 message GeoLatLon {
-  double lat = 1; // degrees in [-90, 90]
-  double lon = 2; // degrees in [-180, 180]
+  double lat = 1; // degrees in [-90, 90], finite
+  double lon = 2; // degrees in [-180, 180], finite
 }
 
+// A ring lists its vertices in order; the last connects back to the first,
+// and repeating the first vertex at the end is optional. It needs at least 3
+// distinct vertices.
 message GeoRing {
-  repeated GeoLatLon points = 1; // at least 3 distinct vertices
+  repeated GeoLatLon points = 1;
 }
 
-// Matches when at least one GEO_POINT value is inside the polygon: inside the
-// outer ring and inside no hole, each by the even-odd rule. Edges are straight
-// lines in latitude/longitude and do not cross the dateline (split such a
-// polygon into two queries under a boolean should). A ring may repeat its
-// first vertex at the end. Points exactly on an edge may match either way.
+// One polygon: an outer ring and optional holes. A point is inside it when it
+// is inside the outer ring and inside none of its holes, each ring by the
+// even-odd rule, so a self-intersecting ring still has an interior. Holes
+// apply to this polygon only.
+message GeoPolygon {
+  repeated GeoLatLon points = 1; // the outer ring, as in GeoRing
+  repeated GeoRing holes = 2;
+}
+
+// Matches when at least one GEO_POINT value is inside any of the polygons,
+// their union. Edges are straight lines in latitude/longitude and do not
+// cross the dateline: split such a polygon into two polygons of the same
+// query. A point exactly on an edge may match either way.
 message GeoPolygonQuery {
   string field = 1;
-  repeated GeoLatLon points = 2; // outer ring, at least 3 distinct vertices
-  repeated GeoRing holes = 3;    // optional holes inside the outer ring
+  repeated GeoPolygon polygons = 2; // at least one
 }
 
 message Filter {

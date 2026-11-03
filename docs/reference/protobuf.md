@@ -130,6 +130,7 @@ defaults and constraints are described in the comments and guides.
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
 - [`GeoLatLon`](#message-luxir.geolatlon)
+- [`GeoPolygon`](#message-luxir.geopolygon)
 - [`GeoPolygonQuery`](#message-luxir.geopolygonquery)
 - [`GeoRing`](#message-luxir.georing)
 - [`GroupComponent`](#message-luxir.groupcomponent)
@@ -1254,32 +1255,46 @@ A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the VALUE array
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.geolatlon.lat"></a>[`lat`](#field-luxir.geolatlon.lat) | 1 | `double` | singular | degrees in \[-90, 90\] |
-| <a id="field-luxir.geolatlon.lon"></a>[`lon`](#field-luxir.geolatlon.lon) | 2 | `double` | singular | degrees in \[-180, 180\] |
+| <a id="field-luxir.geolatlon.lat"></a>[`lat`](#field-luxir.geolatlon.lat) | 1 | `double` | singular | degrees in \[-90, 90\], finite |
+| <a id="field-luxir.geolatlon.lon"></a>[`lon`](#field-luxir.geolatlon.lon) | 2 | `double` | singular | degrees in \[-180, 180\], finite |
+
+<a id="message-luxir.geopolygon"></a>
+
+### luxir.GeoPolygon
+
+One polygon: an outer ring and optional holes. A point is inside it when it is inside the outer ring and inside none of its holes, each ring by the even-odd rule, so a self-intersecting ring still has an interior. Holes apply to this polygon only.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.geopolygon.points"></a>[`points`](#field-luxir.geopolygon.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated | the outer ring, as in GeoRing |
+| <a id="field-luxir.geopolygon.holes"></a>[`holes`](#field-luxir.geopolygon.holes) | 2 | [`GeoRing`](#message-luxir.georing) | repeated |  |
 
 <a id="message-luxir.geopolygonquery"></a>
 
 ### luxir.GeoPolygonQuery
 
-Matches when at least one GEO\_POINT value is inside the polygon: inside the outer ring and inside no hole, each by the even-odd rule. Edges are straight lines in latitude/longitude and do not cross the dateline (split such a polygon into two queries under a boolean should). A ring may repeat its first vertex at the end. Points exactly on an edge may match either way.
+Matches when at least one GEO\_POINT value is inside any of the polygons, their union. Edges are straight lines in latitude/longitude and do not cross the dateline: split such a polygon into two polygons of the same query. A point exactly on an edge may match either way.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.geopolygonquery.field"></a>[`field`](#field-luxir.geopolygonquery.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.geopolygonquery.points"></a>[`points`](#field-luxir.geopolygonquery.points) | 2 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated | outer ring, at least 3 distinct vertices |
-| <a id="field-luxir.geopolygonquery.holes"></a>[`holes`](#field-luxir.geopolygonquery.holes) | 3 | [`GeoRing`](#message-luxir.georing) | repeated | optional holes inside the outer ring |
+| <a id="field-luxir.geopolygonquery.polygons"></a>[`polygons`](#field-luxir.geopolygonquery.polygons) | 2 | [`GeoPolygon`](#message-luxir.geopolygon) | repeated | at least one |
 
 <a id="message-luxir.georing"></a>
 
 ### luxir.GeoRing
 
+A ring lists its vertices in order; the last connects back to the first, and repeating the first vertex at the end is optional. It needs at least 3 distinct vertices.
+
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.georing.points"></a>[`points`](#field-luxir.georing.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated | at least 3 distinct vertices |
+| <a id="field-luxir.georing.points"></a>[`points`](#field-luxir.georing.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated |  |
 
 <a id="message-luxir.groupcomponent"></a>
 
@@ -1834,9 +1849,9 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
+| <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside any of several polygons |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
-| <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside a polygon |
 
 <a id="message-luxir.querybucket"></a>
 
