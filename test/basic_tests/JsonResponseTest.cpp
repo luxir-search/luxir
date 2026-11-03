@@ -335,7 +335,9 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   req->execute(false);
   ASSERT_OK(req);
 
-  EXPECT_EQ(R"({"ops":{"average":20.0,"empty":null,"empty_sum":null,"total":40}})",
+  // average and total read one column, so they run as one op and are emitted
+  // together.
+  EXPECT_EQ(R"({"ops":{"average":20.0,"total":40,"empty":null,"empty_sum":null}})",
             renderOperations(req->responses[0]->proto));
 }
 
