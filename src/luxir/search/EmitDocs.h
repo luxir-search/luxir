@@ -442,20 +442,22 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   });
 }
 
-// Decode a GEO_POINT column as multi_d: each document gets its points as
-// [lon, lat] pairs in the ingest coordinate order, so a single-valued field
-// yields [lon, lat] and a multi-valued one [lon1, lat1, lon2, lat2, ...].
-// A missing document leaves an empty array.
-inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos,
+// Decode a GEO_POINT column as col_val in the ingest shape, so returned
+// points index back unchanged: a single-valued field gives each document
+// [lon, lat] and a multi-valued one [[lon, lat], ...], by the field's
+// cardinality rather than the document's point count. A missing document
+// leaves the kind unset.
+inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
                        FieldLoaders* loaders, std::pmr::memory_resource& mr)
 {
   auto columnSize = segDocs.size();
   if (columnSize == 0) return;
-  auto& geoCol = fieldCol.kind.emplace<luxir::api::ArrArrDouble>();
-  std::span<luxir::api::ArrDouble> target(build::allocArray(geoCol.v, columnSize, mr), columnSize);
-  addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+  auto& geoCol = fieldCol.kind.emplace<luxir::api::ColVal>();
+  std::span<luxir::api::Val> target(build::allocArray(geoCol.v, columnSize, mr), columnSize);
+  bool multi = fieldType.multiValued();
+  addFieldLoader(loaders, runs, [&req, infos, segDocs, target, multi, &mr](std::span<RowIndex> idxSpan) {
     auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
@@ -463,14 +465,20 @@ inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos,
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto* info = infos.at(segNum);
     if (!info) return;
+    luxir::api::Val* points = nullptr;
     auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
       assert(segDocs[idxSpan[idx]].docId() == doc);
       unused(doc);
-      luxir::api::ArrDouble& point = target[idxSpan[idx]];
-      if (valIdx == 0) build::allocArray(point.v, 2 * numVals, mr);
-      auto* out = const_cast<double*>(point.v.data()) + 2 * valIdx;
-      out[0] = geo::decodeLongitude(geo::unpackLongitude(val));
-      out[1] = geo::decodeLatitude(geo::unpackLatitude(val));
+      luxir::api::Val* point = &target[idxSpan[idx]];
+      if (multi) {
+        if (valIdx == 0) {
+          points = build::allocArray(point->kind.emplace<luxir::api::ArrVal>().v, (size_t)numVals, mr);
+        }
+        point = points + valIdx;
+      }
+      double* lonLat = build::allocArray(point->kind.emplace<luxir::api::ArrDouble>().v, 2, mr);
+      lonLat[0] = geo::decodeLongitude(geo::unpackLongitude(val));
+      lonLat[1] = geo::decodeLatitude(geo::unpackLatitude(val));
     };
     IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
   });
@@ -1236,7 +1244,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           break;
         }
         case FieldType::Type::GEO_POINT: {
-          loadGeoCol(req, rf.infos, segDocs, runs, outputColumn(), pendingLoaders, mr);
+          loadGeoCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
           break;
         }
         case FieldType::Type::ID:

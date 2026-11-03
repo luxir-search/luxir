@@ -615,7 +615,7 @@ This process's cgroup v2. Limits are local to the cgroup; ancestors may impose s
 
 ### luxir.ColVal
 
-Column of a field type that has no typed arm (an object, an interval, a boolean): v\[i\] holds what document i's row entry would. An unset kind means missing.
+Column of a field type that has no typed arm (an object, an interval, a boolean, a geo point): v\[i\] holds what document i's row entry would. An unset kind means missing. A geo point is an arr\_d \[lon, lat\], and a multi-valued geo field an arr of such pairs, the shapes ingest reads.
 
 [Source](../../protos/luxir_types.proto)
 

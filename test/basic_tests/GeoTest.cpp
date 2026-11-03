@@ -25,9 +25,11 @@
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
+#include "luxir/server/HttpServer.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/HttpReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -952,9 +954,8 @@ TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
     }
   }
 }
-// The public request path: a geo_polygon query, with the geo fields
-// projected back as [lon, lat].
-TEST_F(GeoPolygonQueryTest, protoQueryAndPointProjection) {
+// The public request path: a geo_polygon query over each cardinality.
+TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
   CollectionHelper helper;
   setGeoSchema(helper);
   CollectionHelper::UpdateBuilder update;
@@ -978,7 +979,7 @@ TEST_F(GeoPolygonQueryTest, protoQueryAndPointProjection) {
     auto& cur = req->collection("main").topDocs("q");
     cur.rawQuery() = qb::geoPolygon(cur.mr(), field,
         {{40.0, -75.0}, {41.0, -75.0}, {41.0, -73.0}, {40.0, -73.0}});
-    cur.fields({"id", "geo_single", "geo_multi"}).limit(10);
+    cur.fields({"id"}).limit(10);
     req->execute();
     EXPECT_OK(req);
     return req->getDocs();
@@ -986,19 +987,152 @@ TEST_F(GeoPolygonQueryTest, protoQueryAndPointProjection) {
   auto single = search("geo_single");
   ASSERT_EQ(1u, single.size());
   EXPECT_EQ("ny", std::get<std::string>(*find(single[0], "id")));
-  auto lonLat = std::get<std::vector<double>>(*find(single[0], "geo_single"));
-  ASSERT_EQ(2u, lonLat.size());
-  EXPECT_NEAR(-74.0060, lonLat[0], 1e-7);
-  EXPECT_NEAR(40.7128, lonLat[1], 1e-7);
-
   auto multi = search("geo_multi");
   ASSERT_EQ(1u, multi.size());
   EXPECT_EQ("tour", std::get<std::string>(*find(multi[0], "id")));
-  auto pairs = std::get<std::vector<double>>(*find(multi[0], "geo_multi"));
-  ASSERT_EQ(4u, pairs.size());
-  EXPECT_NEAR(-74.0, pairs[0], 1e-7);
-  EXPECT_NEAR(40.7, pairs[1], 1e-7);
-  EXPECT_NEAR(151.2093, pairs[2], 1e-7);
-  EXPECT_NEAR(-33.8688, pairs[3], 1e-7);
-  EXPECT_EQ(nullptr, find(multi[0], "geo_single"));
+}
+
+class GeoProjectionTest : public LuxirTest {};
+
+// A projected geo field has the ingest shape its cardinality reads: [lon, lat]
+// for a single-valued field, [[lon, lat], ...] for a multi-valued one even
+// with one point, and no value when missing. Indexing what a search returns,
+// as gRPC Vals in either document format or as HTTP JSON, gives back the same
+// quantized points.
+TEST_F(GeoProjectionTest, projectedPointsIndexBackUnchanged) {
+  struct Input {
+    std::string id;
+    std::string field;
+    std::vector<GeoPoint> points;
+  };
+  const std::vector<Input> inputs = {
+      {"single", "geo_single", {{40.712776123456, -74.005974321987}}},
+      {"corner", "geo_single", {{-90.0, 180.0}}},
+      {"one", "geo_multi", {{-33.8688197, 151.2092955}}},
+      {"many", "geo_multi",
+       {{51.5072178, -0.1275862}, {35.6764225, 139.6500231}, {51.5072178, -0.1275862}}},
+  };
+  auto otherField = [](const Input& input) {
+    return input.field == "geo_single" ? "geo_multi" : "geo_single";
+  };
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  CollectionHelper::UpdateBuilder originals;
+  for (const auto& input : inputs) {
+    addWireDoc(originals, input.id, input.field, [&input](api::Val& val, auto& mr) {
+      auto lonLat = [](api::Val& out, auto& outMr, const GeoPoint& p) {
+        setDoubles(out, outMr, {p.longitude, p.latitude});
+      };
+      if (input.field == "geo_single") return lonLat(val, mr, input.points[0]);
+      setValues(val, mr, input.points.size(), [&](api::Val& point, size_t i, auto& innerMr) {
+        lonLat(point, innerMr, input.points[i]);
+      });
+    });
+  }
+  originals.commit();
+  ASSERT_EQ(IndexResult::Status::OK, helper.submit(originals).status);
+  auto original = [&](std::string_view id) {
+    return std::ranges::find(inputs, id, &Input::id) != inputs.end();
+  };
+
+  // gRPC: the returned Val of each original, from row maps and from columns.
+  for (auto [format, suffix] : {std::pair{api::DocFormat::ROWS, "-rows"},
+                                std::pair{api::DocFormat::COLUMNS, "-cols"}}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main").topDocs("q").allQuery()
+        .fields({"id", "geo_single", "geo_multi"}).documentFormat(format).limit(100);
+    req->execute();
+    ASSERT_OK(req);
+    const api::DocList& list = *req->docList();
+    auto docs = req->getDocs();
+    auto rowVal = [&](size_t row, std::string_view field) -> const api::Val* {
+      for (const auto& [name, column] : list.columns) {
+        if (name != field) continue;
+        const auto& slot = std::get<api::ColVal>(column.kind).v[row];
+        return slot.isNull() ? nullptr : &slot;
+      }
+      if (row >= list.docs.size()) return nullptr;
+      for (const auto& [name, val] : list.docs[row].fields) {
+        if (name == field) return &*val;
+      }
+      return nullptr;
+    };
+    CollectionHelper::UpdateBuilder copies;
+    for (size_t row = 0; row < docs.size(); row++) {
+      auto id = std::get<std::string>(*find(docs[row], "id"));
+      if (!original(id)) continue;
+      const Input& input = *std::ranges::find(inputs, id, &Input::id);
+      const api::Val* val = rowVal(row, input.field);
+      ASSERT_NE(nullptr, val) << id;
+      EXPECT_EQ(nullptr, rowVal(row, otherField(input))) << id;
+      EXPECT_EQ(input.field == "geo_multi", std::holds_alternative<api::ArrVal>(val->kind)) << id;
+      addWireDoc(copies, id + suffix, input.field, [val](api::Val& out, auto&) { out = *val; });
+    }
+    copies.commit();
+    ASSERT_EQ(IndexResult::Status::OK, helper.submit(copies).status);
+  }
+
+  // HTTP JSON: wildcard selection includes geo fields; post each value back.
+  HttpServer server(*luxirNode, 1, 0);
+  server.start();
+  auto found = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                           R"({"query":"*:*","fields":["*"],"limit":100})");
+  ASSERT_EQ(200, found.result_int()) << found.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, found.body())) << found.body();
+  std::string body = R"({"docs":[)";
+  for (const auto& doc : root["docs"].get_array()) {
+    const auto& id = doc["id"].get_string();
+    if (!original(id)) continue;
+    const Input& input = *std::ranges::find(inputs, id, &Input::id);
+    ASSERT_TRUE(doc.contains(input.field)) << id;
+    EXPECT_TRUE(!doc.contains(otherField(input)) || doc[otherField(input)].is_null()) << id;
+    const auto& value = doc[input.field];
+    EXPECT_EQ(input.field == "geo_multi", value[0].is_array()) << id;
+    if (body.back() != '[') body += ',';
+    body += R"({"id":")" + id + R"(-json",")" + input.field + R"(":)"
+        + glz::write_json(value).value() + "}";
+  }
+  body += R"(],"commit":{}})";
+  auto posted = httpRequest(server.getPort(), http::verb::post, "/collections/main/_update", body);
+  ASSERT_EQ(200, posted.result_int()) << posted.body();
+  server.shutdown();
+
+  auto quantized = [](const FieldVal& val) {
+    std::vector<std::vector<double>> points;
+    if (const auto* one = std::get_if<std::vector<double>>(&val)) points.push_back(*one);
+    else points = std::get<std::vector<std::vector<double>>>(val);
+    std::vector<std::pair<int32_t, int32_t>> out;
+    for (const auto& point : points) {
+      EXPECT_EQ(2u, point.size());
+      out.push_back({geo::encodeLatitude(point[1]), geo::encodeLongitude(point[0])});
+    }
+    return out;
+  };
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery()
+      .fields({"id", "geo_single", "geo_multi"}).limit(100);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  EXPECT_EQ(4 * inputs.size(), docs.size());
+  for (const auto& input : inputs) {
+    std::vector<std::pair<int32_t, int32_t>> expected;
+    for (const auto& p : input.points) {
+      expected.push_back({geo::encodeLatitude(p.latitude), geo::encodeLongitude(p.longitude)});
+    }
+    for (std::string suffix : {"", "-rows", "-cols", "-json"}) {
+      std::string id = input.id + suffix;
+      auto doc = std::ranges::find_if(docs, [&](const Doc& d) {
+        return std::get<std::string>(*find(d, "id")) == id;
+      });
+      ASSERT_NE(docs.end(), doc) << id;
+      const FieldVal* val = find(*doc, input.field);
+      ASSERT_NE(nullptr, val) << id;
+      EXPECT_EQ(input.field == "geo_multi",
+                std::holds_alternative<std::vector<std::vector<double>>>(*val)) << id;
+      EXPECT_EQ(expected, quantized(*val)) << id;
+      EXPECT_EQ(nullptr, find(*doc, otherField(input))) << id;
+    }
+  }
 }

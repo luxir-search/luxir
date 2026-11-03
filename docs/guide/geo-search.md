@@ -258,17 +258,20 @@ domain can be driven by the points index.
 
 ## Return points
 
-Requesting a geo field in `fields` returns its points in the ingest order,
-`[lon, lat]`:
+A geo field in `fields` returns its points in the canonical ingest shape, so
+a returned value indexes back as the same points. A single-valued field
+returns `[lon, lat]`. A multi-valued field returns a list of points,
+`[[lon, lat], ...]`, even for a document with one point:
 
 ```json
-{"id":"nyc","location":[-74.006,40.7128]}
+{"id":"nyc","location":[-74.00600004941225,40.712799984030426]}
 ```
 
-The values are the quantized grid points, so they can differ from the input
-in roughly the eighth decimal place. A multi-valued field returns its points
-as one flat array of pairs, `[lon1, lat1, lon2, lat2, ...]`. On the gRPC
-API, a geo field is a `multi_d` column with one such array per document.
+The values are the quantized grid points, so they differ from the input in
+roughly the eighth decimal place. A wildcard or empty `fields` selection
+includes geo fields. On the gRPC API a geo field is a `col_val` column whose
+values have the ingest `Val` shapes: an `arr_d` pair, or an `arr` of pairs for
+a multi-valued field.
 
 ## Current limits
 
