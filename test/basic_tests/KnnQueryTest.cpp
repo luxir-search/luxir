@@ -4490,6 +4490,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
   KnnQuery::tuning.plannerCosts.units.fill(0);
   KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM] = 500;
   KnnQuery::tuning.plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
+  KnnQuery::tuning.filteredCoverageAlpha = 0.5; // The crafted sizes assume this exponent.
   CollectionHelper h("main");
   h.getIndexWriter()->mergePolicy->setMergeFactor(100);
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
