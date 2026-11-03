@@ -1,10 +1,10 @@
 # Geo search
 
-A location is a typed `geo_point`, and a geo query can go anywhere another
-query can: as the main query, as a non-scoring filter on text or vector
-retrieval, or as one boolean clause among several. "Coffee within five
-kilometers" is a text query with a distance filter beside it, evaluated as
-one query with no post-filter stage.
+A location is a typed `geo_point`, and a geo query (a box, a radius, or a set
+of polygons) can go anywhere another query can: as the main query, as a
+non-scoring filter on text or vector retrieval, or as one boolean clause
+among several. "Coffee within five kilometers" is a text query with a
+distance filter beside it, evaluated as one query with no post-filter stage.
 
 ## Define a point field
 
@@ -46,8 +46,8 @@ POST /collections/places/_update
 
 {
   "docs": [
-    {"id":"nyc","name_s":"New York","location":[-74.0060,40.7128]},
-    {"id":"london","name_s":"London","location":[-0.1278,51.5074]}
+    {"id":"nyc","name_s":"New York","description_t":"coffee and bagels","location":[-74.0060,40.7128]},
+    {"id":"london","name_s":"London","description_t":"tea and coffee","location":[-0.1278,51.5074]}
   ],
   "commit": {}
 }
@@ -73,10 +73,11 @@ the `"lat,lon"` string puts latitude first. A string with no comma that is
 not WKT is read as a geohash. For example, a coordinate sent as the bare
 string `"40"` becomes a coarse geohash cell, not a number.
 
-A multi-valued field takes an array of points, in any mix of forms:
+A multi-valued field, such as one named by the `_ps` template, takes an
+array of points in any mix of forms:
 
 ```json
-{"id":"tour","location":[[-74.0060,40.7128],"51.5074,-0.1278","u4pruydqqvj"]}
+{"id":"tour","name_s":"City tour","stops_ps":[[-74.0060,40.7128],"51.5074,-0.1278","u4pruydqqvj"]}
 ```
 
 An array whose elements are all numbers is always one point, so
@@ -181,9 +182,8 @@ when any point is inside the circle, and the document is returned once.
 ## Polygon queries
 
 `geo_polygon` matches points inside any of its `polygons`. Each polygon has
-an outer ring, `points`, and optional `holes`. Vertices use named `lat` and
-`lon` keys; a ring needs at least three distinct vertices and may repeat its
-first vertex at the end:
+an outer ring and optional holes, and vertices use named `lat` and `lon`
+keys. This query matches London; New York lies in the first polygon's hole:
 
 ```http
 POST /collections/places/_search
@@ -201,7 +201,12 @@ POST /collections/places/_search
             {"lat":40.0,"lon":-72.0}
           ],
           "holes":[
-            {"points":[{"lat":40.5,"lon":-74.5},{"lat":41.0,"lon":-74.5},{"lat":41.0,"lon":-74.0}]}
+            {"points":[
+              {"lat":40.5,"lon":-74.5},
+              {"lat":41.0,"lon":-74.5},
+              {"lat":41.0,"lon":-73.5},
+              {"lat":40.5,"lon":-73.5}
+            ]}
           ]
         },
         {
@@ -219,14 +224,31 @@ POST /collections/places/_search
 }
 ```
 
-A point matches when it is inside any polygon. It is inside a polygon when it
-is inside the outer ring and inside none of that polygon's holes, each ring by
-the even-odd rule; a hole cuts only its own polygon. Edges are straight lines
-in latitude/longitude, as in Lucene's point polygon queries, and a polygon
-cannot cross the date line: split such a polygon into two polygons of the
-same query. A point exactly on an edge may match either way. With
-`index: "range"` the points index prunes whole cells by each polygon's
-bounding box and edges, and checks each point only in cells an edge crosses.
+```json
+{"docs":[{"id":"london","name_s":"London"}]}
+```
+
+| Key | Meaning |
+|---|---|
+| `field` | The `geo_point` field. |
+| `polygons` | One or more polygons. A point matches when it is inside any of them. |
+| `points` | A polygon's outer ring, at least three distinct vertices. |
+| `holes` | Optional rings, each `{"points":[...]}`, cut out of their own polygon. |
+
+A ring lists its vertices in order, and the last connects back to the first;
+repeating the first vertex at the end is allowed. A point is inside a polygon
+when it is inside the outer ring and inside none of that polygon's holes, each
+ring by the even-odd rule, so a self-intersecting ring still has a defined
+inside. A hole cuts only its own polygon: a point in one polygon's hole still
+matches through another polygon that covers it.
+
+Edges are straight lines in latitude and longitude, as in Lucene's point
+polygon queries. A polygon cannot cross the date line; split it into two
+polygons of the same query. A point exactly on an edge may match either way.
+With `index: "range"` the points index skips whole regions outside every
+polygon and accepts whole regions inside one. A point check does not test
+every edge, so polygons with many vertices, such as administrative
+boundaries, stay practical.
 
 ## Combine place with relevance
 
@@ -276,18 +298,39 @@ a returned value indexes back as the same points. A single-valued field
 returns `[lon, lat]`. A multi-valued field returns a list of points,
 `[[lon, lat], ...]`, even for a document with one point:
 
+```http
+POST /collections/places/_search
+
+{"query":"id:(nyc tour)","fields":["id","location","stops_ps"]}
+```
+
 ```json
-{"id":"nyc","location":[-74.00600004941225,40.712799984030426]}
+{
+  "docs": [
+    {"id":"nyc","location":[-74.00600004941225,40.712799984030426]},
+    {
+      "id":"tour",
+      "stops_ps":[
+        [-74.00600004941225,40.712799984030426],
+        [-0.12780005112290382,51.50739999487996],
+        [10.407439693808556,57.64911063015461]
+      ]
+    }
+  ]
+}
 ```
 
 The values are the quantized grid points, so they differ from the input in
-roughly the eighth decimal place. A wildcard or empty `fields` selection
-includes geo fields. On the gRPC API a geo field is a `col_val` column whose
-values have the ingest `Val` shapes: an `arr_d` pair, or an `arr` of pairs for
-a multi-valued field.
+roughly the eighth decimal place, and a geohash comes back as the centre of
+its cell. A wildcard or empty `fields` selection includes geo fields. On the
+gRPC API a geo field is a `col_val` column holding the same `Val` shapes the
+ingest API reads: an `arr_d` pair, or an `arr` of pairs for a multi-valued
+field.
 
-## Current limits
+## Limits
 
 - Geo-distance sorting is not implemented.
 - The query does not emit the computed distance as a result field.
 - Polygons cannot cross the date line.
+- Polygon vertices are `{"lat","lon"}` objects; GeoJSON `Polygon` and
+  `MultiPolygon` coordinates are not accepted as query input yet.

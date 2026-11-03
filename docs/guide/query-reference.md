@@ -734,7 +734,7 @@ in their own guides:
   `min_scan_fraction`).
 - [`geo_box`, `geo_distance`, and `geo_polygon`](geo-search.md) cover
   coordinate order, inclusive boundaries, dateline crossing, distance units,
-  and polygon rings and holes.
+  and unions of polygons with holes.
 
 ## Limits
 
