@@ -796,10 +796,11 @@ to its following value. The function spellings remain available:
   [Decay functions](#decay-functions)).
 - Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Missing or
   empty arrays reduce to missing except for `count`, which returns zero (and
-  one or zero for a present or missing scalar). Integer `sum` overflow makes
-  that document's value missing; `sum` rejects DATE arrays. A composed
-  array-valued root must use an explicit reducer. The two-argument `min` and
-  `max` compare scalars, which is useful for clamping.
+  one or zero for a present or missing scalar). Integers add exactly. A `sum`
+  that overflows makes that document's value missing, and a floating `avg`
+  that overflows double is an evaluation error; `sum` rejects DATE arrays. A
+  composed array-valued root must use an explicit reducer. The two-argument
+  `min` and `max` compare scalars, which is useful for clamping.
 
 Field names use the value binding. Numeric, date, string, and ID fields keep
 the direct column-sort path. Use `col("name")` when a field name is reserved

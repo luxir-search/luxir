@@ -676,14 +676,13 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
     return ValueResult::missing(node.type);
   }
   __int128 intSum = 0;
-  long double doubleSum = 0.0;
+  double doubleSum = 0.0;
   int64_t present = 0;
   for (int64_t i = 0; i < input.array.size; i++) {
     ValueResult value = program.evalArrayElement(input.array, i);
     if (!value.valid) continue;
     if (node.type == ValueType::DOUBLE) {
-      doubleSum += value.type == ValueType::DOUBLE
-          ? (long double)value.doubleValue : (long double)value.intValue;
+      doubleSum += value.type == ValueType::DOUBLE ? value.doubleValue : (double)value.intValue;
     } else {
       intSum += (__int128)value.intValue;
     }
@@ -691,8 +690,8 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
   }
   if (present == 0) return ValueResult::missing(node.type);
   if (node.type == ValueType::DOUBLE) {
-    double out = (double)doubleSum;
-    return std::isfinite(out) ? ValueResult::floating(out) : ValueResult::missing(node.type);
+    return std::isfinite(doubleSum) ? ValueResult::floating(doubleSum)
+                                    : ValueResult::missing(node.type);
   }
   if (intSum < INT64_MIN || intSum > INT64_MAX) return ValueResult::missing(node.type);
   return ValueResult::integer((int64_t)intSum);
@@ -761,14 +760,14 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
         return ValueResult::missing(node.type);
       }
       ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
-      long double sum = 0.0;
+      double sum = 0.0;
       __int128 intSum = 0;
       int64_t present = 0;
       for (int64_t i = 0; i < first.array.size; i++) {
         ValueResult next = program.evalArrayElement(first.array, i);
         if (!next.valid) continue;
         if (node.opcode == ValueOpcode::AVG) {
-          if (next.type == ValueType::DOUBLE) sum += (long double)next.doubleValue;
+          if (next.type == ValueType::DOUBLE) sum += next.doubleValue;
           else intSum += (__int128)next.intValue;
         } else if (!aggregate.valid) {
           aggregate = next;
@@ -787,7 +786,7 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       }
       if (present == 0) return ValueResult::missing(node.type);
       if (node.opcode == ValueOpcode::AVG) {
-        double out = (double)((sum + (long double)intSum) / present);
+        double out = (sum + (double)intSum) / (double)present;
         if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
         return ValueResult::floating(out);
       }

@@ -638,9 +638,9 @@ TEST_F(ValueExprKernelTest, wideArraySumAndAverage) {
   helper.index(flatdoc("ints", vec_i(M, -M, -2),
       "doubles", vec(-1e308, 1e308, -1e308)), UpdateMessage::COMMIT);
   helper.index(flatdoc("ints", vec_i(M, 2, -M, -4),
-      "doubles", vec(1e308, 1e308, -1e308)), UpdateMessage::NO_COMMIT);
+      "doubles", vec(1e308, -1e308, 1e308)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("ints", vec_i(M, 1),
-      "doubles", vec(1e308, 1e308)), UpdateMessage::NO_COMMIT);
+      "doubles", vec(1e308, -5e307)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("ints", vec_i(M, INT64_MIN, 1)), UpdateMessage::COMMIT);
   struct Case { const char* expr; std::array<std::optional<double>, 4> expected; };
   for (int merge = 0; merge < 2; merge++) {
@@ -650,9 +650,9 @@ TEST_F(ValueExprKernelTest, wideArraySumAndAverage) {
     MemPool pool;
     for (auto c : std::array{
         Case{"sum(ints)", {-2, -2, std::nullopt, 0}},
-        Case{"sum(doubles)", {-1e308, 1e308, std::nullopt, std::nullopt}},
-        Case{"avg(ints)", {-2.0 / 3, -0.5, (double)((long double)M + 1) / 2, 0}},
-        Case{"avg(doubles)", {-1e308 / 3, 1e308 / 3, 1e308, std::nullopt}}}) {
+        Case{"sum(doubles)", {-1e308, 1e308, 5e307, std::nullopt}},
+        Case{"avg(ints)", {-2.0 / 3, -0.5, (double)((__int128)M + 1) / 2, 0}},
+        Case{"avg(doubles)", {-1e308 / 3, 1e308 / 3, 2.5e307, std::nullopt}}}) {
       auto* program = parseValue(memory, *currentSchema, c.expr);
       for (auto& segment : reader->segments()) {
         auto* bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
@@ -686,7 +686,7 @@ TEST_F(ValueExprKernelTest, wideArraySumAndAverage) {
   }
 }
 
-TEST_F(ValueExprKernelTest, sortedSetSumsSurvivePartialOverflow) {
+TEST_F(ValueExprKernelTest, sortedSetSumsKeepIntegersExactAndRejectFloatingOverflow) {
   CollectionHelper helper;
   helper.index(flatdoc("v_is", vec_i(INT64_MAX, -INT64_MAX, -2),
       "v_ds", vec(1e308, -9e307, -1e308)), UpdateMessage::COMMIT);
@@ -694,16 +694,20 @@ TEST_F(ValueExprKernelTest, sortedSetSumsSurvivePartialOverflow) {
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
-  for (auto [expr, expected] : {
-      std::pair{"sum(v_is)", -2.0}, {"avg(v_is)", -2.0 / 3},
-      {"sum(v_ds)", -9e307}, {"avg(v_ds)", -9e307 / 3}}) {
+  auto bind = [&](const char* expr) {
     auto* program = parseValue(memory, *schema, expr);
-    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
-    auto result = bound->evalPoint(0, 0);
+    return program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+  };
+  for (auto [expr, expected] : {std::pair{"sum(v_is)", -2.0}, {"avg(v_is)", -2.0 / 3}}) {
+    auto result = bind(expr)->evalPoint(0, 0);
     ASSERT_TRUE(result.valid) << expr;
     EXPECT_DOUBLE_EQ(expected, result.type == ValueType::INT64
         ? (double)result.intValue : result.doubleValue) << expr;
   }
+  // Floating sums add in double, as aggregates do: the set's ascending order
+  // overflows at -1e308 + -9e307.
+  EXPECT_FALSE(bind("sum(v_ds)")->evalPoint(0, 0).valid);
+  EXPECT_THROW(bind("avg(v_ds)")->evalPoint(0, 0), ValueEvaluationError);
 }
 
 TEST_F(ValueExprKernelTest, nativeDateUnitUsesExistingScalarArrayBatchAndBoundsLanes) {
