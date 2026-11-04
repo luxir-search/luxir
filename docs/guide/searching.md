@@ -617,6 +617,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
 | Geo distance | `{"geo_distance":{"field":"location","lat":40.71,"lon":-74.01,"radius_meters":5000}}` | Inclusive great-circle radius. |
+| Geo polygon | `{"geo_polygon":{"field":"location","polygons":[{"points":[{"lat":40,"lon":-75},{"lat":42,"lon":-75},{"lat":42,"lon":-72}]}]}}` | Union of polygons, each with optional `holes`; no dateline crossing. |
 
 `match` accepts `operator: "and"` or a numeric `min_match` when analysis
 produces several terms. Boolean `optional` clauses rank but do not constrain a
@@ -910,7 +911,7 @@ keys, dense ones as columns (see [column placement](grpc.md#column-placement)).
 `columns` and `adaptive` are rejected with `format=docs`.
 
 With no `fields`, every retrievable logical field comes back: stored text,
-string, numeric, date, and `id` values, discovered from the index itself (so
+string, numeric, date, geo point, and `id` values, discovered from the index itself (so
 dynamic suffix fields appear under their concrete names), `id` first and the
 rest in name order. Vector fields and engine fields such as `_version_` are
 returned only when named. A `fields` entry containing `*` is a wildcard
@@ -935,9 +936,13 @@ TEXT variants are skipped; retrieve their logical primary for source text.
 Name `__self` explicitly to retrieve it. Variant columns follow their resolved
 [multi-valued mode](schema.md#multi-valued-modes).
 
+Geo points come back in their ingest shape, `[lon, lat]` or `[[lon, lat], ...]`
+by the field's cardinality; see [Geo search](geo-search.md#return-points).
+
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
-column when requested.
+column when requested. A field type with no typed column arm, such as a geo
+point, is a `col_val` column.
 
 ## Full request form
 
