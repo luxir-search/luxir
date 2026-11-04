@@ -198,21 +198,28 @@ Each indexed document gets a synthetic uniform integer rank and one integer
 similarity rank per query. All ranks are unique permutations of `0..N-1`.
 Uniform ranks use NumPy's seed 196 permutation, independent of the vectors.
 Similarity ranks use descending float64 inner product (or cosine similarity
-for a cosine dataset), breaking ties by input document ID. Thus:
+for a cosine dataset), breaking ties by input document ID. Following
+[ACORN](https://arxiv.org/abs/2403.04871) (Patel, Kraft, Guestrin, Zaharia,
+sections 3.2.1 and 7.1.2), query correlation describes how close a query vector
+is to the documents matching its predicate. The workloads are:
 
-- **uniform:** the first `m` random ranks, the same uncorrelated subset for
-  every query;
-- **aligned:** that query's `m` nearest documents by similarity rank;
-- **anti-aligned:** that query's `m` farthest documents by similarity rank.
+- **no-cor (no correlation):** the first `m` random ranks, the same
+  uncorrelated subset for every query;
+- **pos-cor (positive correlation):** that query's `m` nearest documents by
+  similarity rank;
+- **neg-cor (negative correlation):** that query's `m` farthest documents by
+  similarity rank.
 
 Here `m = max(10, round(N * selectivity))`, for selectivities 0.01%, 0.1%,
 0.3%, 1%, 3%, 10%. Results include actual cardinality and selectivity; on the
-99k preset the smallest set is 10 documents rather than 9.9. Alignment is
-query-specific, not a cluster proxy. This is a deliberately strong correlation
-stress test, not a model of production tenant filters. All synthetic fields
-are explicit `int` columns with `index: range`. Queries use Luxir's ordinary
+99k preset the smallest set is 10 documents rather than 9.9. Query correlation is
+query-specific, not a cluster proxy. Our pos-cor/neg-cor workloads are the
+extreme form: a query's exactly nearest/farthest documents by similarity rank,
+whereas ACORN builds its workloads from keyword matches. This is a deliberately
+strong correlation stress test, not a model of production tenant filters. All
+synthetic fields are explicit `int` columns with `index: range`. Queries use Luxir's ordinary
 pre-filter syntax, for example `"filter":["filter_q0_i:[0 TO 99]"]`, beside
-`"query":{"knn":...}`. Anti-aligned filters select the upper rank interval.
+`"query":{"knn":...}`. Neg-cor filters select the upper rank interval.
 Every query is checked against server `exact:true` top-10 using the identical
 filter, computed once per query/kind/selectivity on the first arm and shared
 by all arms. Every arm also measures exact controls and requires recall 1.0.
@@ -273,7 +280,7 @@ neighbors with exact similarity at least the tenth true neighbor's similarity,
 minus `1e-6 * max(abs(tenth_similarity), 1e-12)`, divided by ten. Missing
 neighbors score zero. Similarities use original base vectors and queries in
 NumPy float64 (dot product for IP, normalized dot product for cosine), never
-server or quantized scores. Read this alongside ID recall for anti-aligned
+server or quantized scores. Read this alongside ID recall for neg-cor
 filters: a narrow boundary band can make ID recall sensitive to tiny errors.
 A low tie-aware value still indicates loss at this stated tolerance.
 

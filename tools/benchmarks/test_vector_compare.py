@@ -87,8 +87,8 @@ class InputChecks(unittest.TestCase):
                 lo, hi = map(int, bounds)
                 self.assertEqual(hi - lo + 1, keep)
                 self.assertEqual(keep, round(1000000 * fraction))
-                self.assertIn('filter_uniform_i' if kind == 'uniform' else 'filter_q2_i', expr)
-        self.assertEqual(bench.filter_expression('uniform', 0, 99000, 0.0001)[1], 10)
+                self.assertIn('filter_uniform_i' if kind == 'no-cor' else 'filter_q2_i', expr)
+        self.assertEqual(bench.filter_expression('no-cor', 0, 99000, 0.0001)[1], 10)
 
     def test_filtered_quality(self):
         np = bench.np

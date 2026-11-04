@@ -188,7 +188,7 @@ def dataset(cache, name=DEFAULT_DATASET, filtered_queries=0):
 
 
 SELECTIVITIES = [0.0001, 0.001, 0.003, 0.01, 0.03, 0.1]
-FILTER_KINDS = ['uniform', 'aligned', 'anti-aligned']
+FILTER_KINDS = ['no-cor', 'pos-cor', 'neg-cor']
 FILTER_NPROBES = [0, 1, 4, 16, 64, 256, 1024]
 
 
@@ -234,8 +234,8 @@ def filtered_stream(cache, base, queries, metric, meta, query_count):
 
 def filter_expression(kind, q, count, selectivity):
     keep = max(10, round(count * selectivity))
-    field = 'filter_uniform_i' if kind == 'uniform' else f'filter_q{q}_i'
-    lo, hi = (count - keep, count - 1) if kind == 'anti-aligned' else (0, keep - 1)
+    field = 'filter_uniform_i' if kind == 'no-cor' else f'filter_q{q}_i'
+    lo, hi = (count - keep, count - 1) if kind == 'neg-cor' else (0, keep - 1)
     return f'{field}:[{lo} TO {hi}]', keep
 
 
