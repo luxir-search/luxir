@@ -1756,7 +1756,10 @@ TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
 TEST_F(KnnQueryTest, exactWitnessesDoNotReplaceFilteredCoverage) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
-  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.filteredCoverageAlpha);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.filteredCoverageAlpha,
+                            VectorIndexBuilder::ivfTrainingPointsPerCentroid);
+  // Each cluster must get its own list: train on every row.
+  VectorIndexBuilder::ivfTrainingPointsPerCentroid = 1600;
   for (bool interval : {false, true}) {
     CollectionHelper h("main");
     h.clear();

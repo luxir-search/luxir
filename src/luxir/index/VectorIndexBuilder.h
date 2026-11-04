@@ -60,7 +60,13 @@ public:
   static int64_t ivfBuildThresholdScanCost;
   static std::atomic<int64_t> ivfBuildCountForTests;
   static std::atomic<int64_t> ivfMergeBuildCountForTests;
-  static size_t ivfTrainingSampleBytes;
+  // Training sample size: this many vectors per trained centroid (IVF lists,
+  // or the PQ codebook entries when those are more), capped by the segment and
+  // by the memory ceiling for the sample's in-memory copy. The codec training
+  // floor still applies.
+  static int64_t ivfTrainingPointsPerCentroid;
+  static size_t ivfTrainingSampleMaxBytes;
+  static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
   // Add chunk input-byte target. Chunks also hold at least four row tasks
   // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;

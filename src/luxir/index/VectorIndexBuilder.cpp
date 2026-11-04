@@ -302,7 +302,9 @@ int64_t VectorIndexBuilder::ivfRaBitQMinTrainingVectors = 8192;
 int64_t VectorIndexBuilder::ivfBuildThresholdScanCost = 1'000'000;
 std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
-size_t VectorIndexBuilder::ivfTrainingSampleBytes = 64 * 1024 * 1024;
+int64_t VectorIndexBuilder::ivfTrainingPointsPerCentroid = 100;
+size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)4 * 1024 * 1024 * 1024;
+std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
 
@@ -456,10 +458,13 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   }
   if (!rabitq) pqM = choosePqM(ann.pqM, dims);
 
+  // Scale the sample with what it trains: the IVF lists and, for PQ, the
+  // codebook entries of each sub-quantizer, which are trained on the same rows.
   size_t bytesPerVec = (size_t)dims * sizeof(float);
-  int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);
-  int64_t sampleCap = std::min<int64_t>(
-      ntotal, std::max<int64_t>(requiredTraining, std::max<int64_t>(1, byteCap)));
+  int64_t centroids = std::max<int64_t>(nlist, rabitq ? 0 : (int64_t)1 << pqBits);
+  int64_t byteCap = (int64_t)(ivfTrainingSampleMaxBytes / bytesPerVec);
+  int64_t sampleCap = std::min<int64_t>(ntotal, std::max<int64_t>(requiredTraining,
+      std::min<int64_t>(ivfTrainingPointsPerCentroid * centroids, byteCap)));
   std::vector<float> training;
   training.reserve((size_t)sampleCap * (size_t)dims);
 
@@ -473,6 +478,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     return nextSampleOrd < sampleCap;
   });
   int64_t ntrain = (int64_t)(training.size() / (size_t)dims);
+  ivfLastTrainingVectorsForTests.store(ntrain, std::memory_order_relaxed);
   if (ntrain < requiredTraining) {
     LOG_TRACE("VectorIndexBuilder: field {} collected only {} training vectors; "
               "using flat-over-column fallback",
