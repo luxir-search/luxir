@@ -180,8 +180,7 @@ struct AggregateLeaf {
 enum class AggregateNodeKind : uint8_t {
   CONSTANT,
   AGGREGATE,
-  UNARY,
-  BINARY,
+  FUNCTION,
 };
 
 struct AggregateNode {
@@ -189,7 +188,8 @@ struct AggregateNode {
   BucketValueType type = BucketValueType::INT128;
   ValueNature nature = ValueNature::NUMBER;
   const ValueFunction* function = nullptr;
-  std::array<uint32_t, 2> children{};
+  std::array<uint32_t, VALUE_MAX_ARITY> children{};
+  uint8_t childCount = 0;
   uint32_t aggregate = 0;
   size_t sourcePos = 0;
   __int128 intValue = 0;

@@ -30,6 +30,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -211,6 +212,7 @@ std::vector<ScoredId> boundedKnn(CollectionHelper& h, const std::vector<float>& 
 } // namespace
 
 TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   using C = api::VectorAnnDef::Codec;
   for (const auto& ann : {rabitqAnn(), rabitqAnn(0, 4), pqAnn(0, 0, 4)}) {
@@ -244,6 +246,7 @@ TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
 }
 
 TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   for (int32_t dims : {1, 7, 32}) for (int32_t bits : {1, 4, 9}) {
     for (auto metric : {api::VectorMetric::IP, api::VectorMetric::L2, api::VectorMetric::COSINE}) {
@@ -345,6 +348,7 @@ TEST_F(VectorAnnCodecTest, rejectsOldAmplitudeMetadata) {
 }
 
 TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(0, 2));
@@ -377,6 +381,7 @@ TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
 // A codec change applies to overlays built afterwards; existing segments keep
 // theirs, and one query serves each segment by its own overlay metadata.
 TEST_F(VectorAnnCodecTest, codecChangeLeavesMixedSegmentsQueryable) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::IP, pqAnn(0, 0, 4));
@@ -395,6 +400,7 @@ TEST_F(VectorAnnCodecTest, codecChangeLeavesMixedSegmentsQueryable) {
 }
 
 TEST_F(VectorAnnCodecTest, boundedFloorSpansChunksAndCodecs) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   SearchOverridesGuard overrides(KnnQuery::statsForTests, KnnQuery::scanTaskGrainVectors);
   CollectionHelper h("main");
@@ -433,6 +439,7 @@ TEST_F(VectorAnnCodecTest, boundedFloorSpansChunksAndCodecs) {
 }
 
 TEST_F(VectorAnnCodecTest, negativeEstimatesRemainOrderedAcrossSegments) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(1, 1, 0));
@@ -457,6 +464,7 @@ TEST_F(VectorAnnCodecTest, negativeEstimatesRemainOrderedAcrossSegments) {
 }
 
 TEST_F(VectorAnnCodecTest, groupedNegativeDistanceFloor) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   for (int32_t bits : {1, 2}) {
     SCOPED_TRACE(bits);
@@ -530,6 +538,7 @@ TEST_F(VectorAnnCodecTest, structuredRotationPreservesGeometry) {
 // Compare list payloads rather than files: partitioned builds
 // can differ in the last bits, so only PQ codes must match exactly.
 TEST_F(VectorAnnCodecTest, partitionedBuildMatchesSingleTask) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   SearchOverridesGuard rows(VectorIndexBuilder::ivfBuildMinRowsPerTask);
   using List = std::pair<std::vector<faiss::idx_t>, std::vector<uint8_t>>;
@@ -579,6 +588,7 @@ TEST_F(VectorAnnCodecTest, partitionedBuildMatchesSingleTask) {
 }
 
 TEST_F(VectorAnnCodecTest, partitionedBlasBuildKeepsFormatAndRecall) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   SearchOverridesGuard saved(VectorIndexBuilder::ivfBuildMinRowsPerTask,
                               faiss::distance_compute_blas_threshold);
@@ -613,6 +623,7 @@ TEST_F(VectorAnnCodecTest, partitionedBlasBuildKeepsFormatAndRecall) {
 }
 
 TEST_F(VectorAnnCodecTest, negativeEstimateCannotEvictExactColumnWitness) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(1, 1, 0));
@@ -637,6 +648,7 @@ TEST_F(VectorAnnCodecTest, negativeEstimateCannotEvictExactColumnWitness) {
 }
 
 TEST_F(VectorAnnCodecTest, intervalSeedsReuseScoresAndIgnoreBoundedCap) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   SearchOverridesGuard saved(KnnQuery::maxKnnCandidates, KnnQuery::statsForTests, KnnQuery::scanTaskGrainVectors);
   KnnQuery::maxKnnCandidates = 1;
@@ -670,6 +682,7 @@ TEST_F(VectorAnnCodecTest, intervalSeedsReuseScoresAndIgnoreBoundedCap) {
 }
 
 TEST_F(VectorAnnCodecTest, intervalMemoryCeilingReleasesOnFailureAndSuccess) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::IP, rabitqAnn(4));
@@ -689,6 +702,7 @@ TEST_F(VectorAnnCodecTest, intervalMemoryCeilingReleasesOnFailureAndSuccess) {
 }
 
 TEST_F(VectorAnnCodecTest, mixedCollectorsKeepTheirOwnObligations) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::IP, pqAnn(4, 8, 2));
@@ -717,6 +731,7 @@ TEST_F(VectorAnnCodecTest, mixedCollectorsKeepTheirOwnObligations) {
 }
 
 TEST_F(VectorAnnCodecTest, intervalSeedCanLoseToAnotherGroupMember) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   CollectionHelper h("main");
   installAnn(h.collection(), api::VectorMetric::IP, rabitqAnn(1, 1, 0));
@@ -766,6 +781,7 @@ TEST_F(VectorAnnCodecTest, intervalSeedCanLoseToAnotherGroupMember) {
 }
 
 TEST_F(VectorAnnCodecTest, intervalEndpointsSupportPaddedDimensionsAndQueryBits) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
   for (int dims : {1, 7}) for (int bits : {1, 9}) for (int queryBits : {0, 8}) {
     CollectionHelper h("main");

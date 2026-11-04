@@ -157,28 +157,18 @@ BucketScalar AggregateStateView::evaluate(AggregateEvalScratch& scratch) const {
       case AggregateNodeKind::AGGREGATE:
         scratch.nodes[i] = scratch.aggregates[node.aggregate];
         break;
-      case AggregateNodeKind::UNARY: {
+      case AggregateNodeKind::FUNCTION: {
         assert(node.function != nullptr);
-        std::array<BucketScalar, 1> args{
-            scratch.nodes[node.children[0]]};
-        scratch.nodes[i] = node.function->evalBucketScalar(
-            args,
-            node.type == BucketValueType::DOUBLE
-                ? ValueType::DOUBLE : ValueType::INT64,
+        std::array<BucketScalar, VALUE_MAX_ARITY> args;
+        for (uint8_t child = 0; child < node.childCount; child++) {
+          args[child] = scratch.nodes[node.children[child]];
+        }
+        scratch.nodes[i] = node.function->bucket(
+            {args.data(), node.childCount},
+            node.type == BucketValueType::DOUBLE ? ValueType::DOUBLE : ValueType::INT64,
             node.nature);
         break;
       }
-      case AggregateNodeKind::BINARY:
-        assert(node.function != nullptr);
-        std::array<BucketScalar, 2> args{
-            scratch.nodes[node.children[0]],
-            scratch.nodes[node.children[1]]};
-        scratch.nodes[i] = node.function->evalBucketScalar(
-            args,
-            node.type == BucketValueType::DOUBLE
-                ? ValueType::DOUBLE : ValueType::INT64,
-            node.nature);
-        break;
     }
   }
   return scratch.nodes[program->rootNode];

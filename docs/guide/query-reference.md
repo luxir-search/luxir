@@ -474,7 +474,11 @@ expression:
 | `min_score` | Optional. Documents whose rescored value is below it do not match. |
 
 The expression uses the same value-expression language as sorting (arithmetic,
-`def`, unary math, and reducers; see [Searching](searching.md#sorting)) and
+`def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
+`random`, reducers, and the Elasticsearch-style `gauss_decay`, `exp_decay`,
+and `linear_decay` decay functions; see
+[Searching](searching.md#sort-expressions-in-detail) and
+[Decay functions](searching.md#decay-functions)) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
@@ -761,14 +765,15 @@ in their own guides:
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
-- [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
-  inclusive boundaries, dateline crossing, and distance units.
+- [`geo_box`, `geo_distance`, and `geo_polygon`](geo-search.md) cover
+  coordinate order, inclusive boundaries, dateline crossing, distance units,
+  and unions of polygons with holes.
 
 ## Limits
 
-- `knn`, `geo_box`, and `geo_distance` are structured-only: expression
-  functions cannot currently represent vector or coordinate-list arguments,
-  so use the objects shown in the vector and geo guides.
+- `knn`, `geo_box`, `geo_distance`, and `geo_polygon` are structured-only:
+  expression functions cannot currently represent vector or coordinate-list
+  arguments, so use the objects shown in the vector and geo guides.
 - New structured arms are not automatically callable from the query language
   until their expression behavior is declared.
 - `except_ops` routing is not accepted on Fusion filters or Fusion source

@@ -17,9 +17,10 @@ message IndexInfo {
   uint64 index_gen = 3;               // Generation of this index (incremented on each commit)
   uint64 core_gen = 4;                // Segment composition generation (incremented only when segments change, not deletes)
   uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
-  uint64 schema_gen = 6;             // Schema generation (incremented on each schema change)
-  SchemaInfo schema = 7;             // Query schema and field history for this snapshot
-  string incarnation = 8;            // Collection UUID, changes on recreate
+  FileDescriptor schema_file = 6;    // Immutable schema definition and introduction history
+  SchemaReference schema = 7;        // Schema binding at commit
+  string incarnation = 8;            // Timestamp lineage id, also the incarnation directory name
+  uint64 writer_epoch = 10;          // Writer lifetime that published this candidate
   uint64 last_seg_id = 9;             // Allocation high-water mark, including retired segments
   repeated SegmentInfo segments = 15; // List of segments in this index
 
@@ -28,15 +29,30 @@ message IndexInfo {
   repeated AuxIndexInfo aux_indexes = 16;
 }
 
-// Authored schema and field introduction history embedded in the manifest.
+// Shared minor and collection-local versions occupy separate components. The
+// epoch prevents independent writer lifetimes from reusing a local file name.
+message SchemaVersion {
+  uint64 major = 1;
+  uint64 minor = 2;
+  uint64 local = 3;
+  uint64 epoch = 4;
+}
+
+message SchemaReference {
+  string scope = 1; // tenant owning the schema (may differ from the collection's tenant)
+  string name = 2; // shared schema name, empty for a collection's own schema
+  SchemaVersion version = 3; // minor at commit, plus a local version when customized
+}
+
+// Authored schema and field introduction history in an immutable schema file.
 message SchemaInfo {
   bytes source_def = 1; // encoded luxir.SchemaDef
-  map<string, uint64> introduced_gen = 2; // physical field name to introduction generation
+  map<string, SchemaVersion> introduced = 2; // physical field name to introduction version
 }
 
 // An auxiliary index entry built at a particular commit. Used for both
 // index-level aux indexes and segment-local overlays.
-// Files use the naming convention "s_<name>_<sortable_gen>_<sortable_fnum>".
+// Overlay files include both the segment creator and overlay writer epochs.
 message AuxIndexInfo {
   string kind = 1;             // e.g. "vector_faiss"
   string field = 2;            // empty if not field-scoped
@@ -60,11 +76,13 @@ message SegmentInfo {
   uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
   int32 max_doc = 6;                    // Number of documents in this segment (ignoring deletes)
   int32 live_docs = 7;                  // Number of non-deleted documents in this segment
-  uint64 schema_gen = 8;                // Minimum input schema generation; merges never imply backfill
+  SchemaReference schema = 8;           // Oldest input schema binding; merges never imply backfill
 
   // Segment-local auxiliary overlays. Vector ANN indexes are recorded here
   // with kind "vector_faiss"; validity is segment liveness, not core_gen.
   repeated AuxIndexInfo overlays = 9;
   repeated FileDescriptor files = 10; // Segment data and current liveDocs
+  uint64 creator_epoch = 12; // Writer lifetime that created the core files
+  uint64 live_epoch = 13; // Writer lifetime that wrote live_gen
   uint64 next_overlay_gen = 11; // Persistent high-water mark, including dropped overlays
 }

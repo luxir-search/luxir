@@ -9,6 +9,7 @@
 // rejected because it splits a request's shared updateVersion across segments and
 // breaks version-gated overwrite deletes. See ProtoUpdateMessage.cpp.
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -423,7 +424,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
 
@@ -498,7 +499,7 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;
     auto& inverter = iw.obtainInverter();
@@ -539,7 +540,7 @@ TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
 
   IndexRamBudget budget;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
   iw.pressureFlushFloorBytes = 1;
@@ -594,7 +595,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   }
 
   IndexRamBudget budget;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
@@ -726,7 +727,7 @@ TEST(FlushWorkspaceTest, flushGrowsDrainingReservation) {
   IndexRamBudget budget;
   RAMDir dir;
   {
-    Inverter inverter(dir, 1, Schema::createDefaultSchema(), &budget);
+    Inverter inverter(dir, 1, 1, Schema::createDefaultSchema(), &budget);
     auto& tags = inverter.getIndexHandler("tags_ss");
     for (int d = 0; d < 1000; d++) {
       inverter.startDoc();

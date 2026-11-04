@@ -151,6 +151,8 @@ public:
 
   ReplyStatus reply(SearchResponse& response) override {
     responses.push_back(&response);  // retain; the response's arena stays alive until done()
+    // took_us differs on every execution; tests compare whole responses.
+    response.proto.took_us = 0;
     return ReplyStatus::OK;
   }
   void replyCallback(SearchResponse& response) override { unused(response); }
@@ -368,6 +370,15 @@ private:
       std::vector<std::vector<float>> vals;
       for (const auto& vec : av->v) {
         if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
+      }
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* av = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+      // A list of double arrays (multi-valued GEO_POINT); other lists are not read.
+      std::vector<std::vector<double>> vals;
+      for (const auto& elem : av->v) {
+        const auto* a = std::get_if<luxir::api::ArrDouble>(&elem.kind);
+        if (a == nullptr) return;
+        vals.emplace_back(a->v.begin(), a->v.end());
       }
       doc.push_back({std::string(name), std::move(vals)});
     }

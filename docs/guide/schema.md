@@ -926,7 +926,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 
 | Property | Meaning |
 |---|---|
-| `generation` | Current schema generation; the initial default schema is generation `0`. |
+| `generation` | Current schema generation; the initial persisted schema is generation `1`. |
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |

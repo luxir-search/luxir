@@ -9,10 +9,61 @@
 
 namespace luxir {
 
+enum class VectorSearchRound { BREADTH, DEPTH, COMPLETION };
+
+// One task's work, reduced at barriers into query-owned per-segment totals.
+// New-list passes are disjoint across breadth rounds; depth revisits never
+// contribute to the eligible-examined obligation. scoreBytes counts scored
+// code/column bytes, not physical IO or selector/allocator metadata reads.
+struct VectorSearchWork {
+  int64_t listSetups = 0, physicalEntries = 0, selectorPasses = 0;
+  int64_t newListSelectorPasses = 0, newListLiveVectors = 0, depthEntries = 0;
+  int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
+  int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
+  int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
+  // Logical scan mappings/probes exclude optional read-ahead metadata work.
+  int64_t rankVisits = 0, sparseMaps = 0, multiMaps = 0, coarseDims = 0, rounds = 0, ivfRounds = 0;
+  int64_t selectorNone = 0, selectorBitmap = 0, resolveIdentity = 0, resolveSelect = 0, resolveMono = 0;
+  // arraySteps is resolve calls times bit_width(domain card), a size-weighted
+  // probe count, not instrumented comparisons inside the DocSet search.
+  int64_t bitProbes = 0, arraySteps = 0, allocatorEntries = 0;
+  // Fold mapping includes nonmembers visited by the complement walk.
+  // Words count bitmap initialization/copy traffic, not pooled-bit clears.
+  int64_t foldDocs = 0, foldWords = 0;
+
+  VectorSearchWork& operator+=(const VectorSearchWork& other) {
+    listSetups += other.listSetups;
+    physicalEntries += other.physicalEntries;
+    selectorPasses += other.selectorPasses;
+    newListSelectorPasses += other.newListSelectorPasses;
+    newListLiveVectors += other.newListLiveVectors;
+    depthEntries += other.depthEntries;
+    pqScores += other.pqScores;
+    oneBitScores += other.oneBitScores;
+    extraBitScores += other.extraBitScores;
+    gateRejections += other.gateRejections;
+    exactVectors += other.exactVectors;
+    domainDocs += other.domainDocs;
+    domainProbes += other.domainProbes;
+    seedReads += other.seedReads;
+    remainingReads += other.remainingReads;
+    scoreBytes += other.scoreBytes;
+    rankVisits += other.rankVisits; sparseMaps += other.sparseMaps; multiMaps += other.multiMaps;
+    coarseDims += other.coarseDims; rounds += other.rounds; ivfRounds += other.ivfRounds;
+    selectorNone += other.selectorNone; selectorBitmap += other.selectorBitmap;
+    resolveIdentity += other.resolveIdentity; resolveSelect += other.resolveSelect; resolveMono += other.resolveMono;
+    bitProbes += other.bitProbes; arraySteps += other.arraySteps;
+    allocatorEntries += other.allocatorEntries;
+    foldDocs += other.foldDocs; foldWords += other.foldWords;
+    return *this;
+  }
+};
+
 /// One round of WIDEN. Bounded collectors receive a fresh candidate budget
 /// and exclude already returned ranks. Interval collectors persist witnesses
 /// and retained records for the query: DEPTH never rescans them; BREADTH scans
-/// only newly selected lists. Exact slots supply distinct-unit top-k witnesses.
+/// only newly selected lists. COMPLETION runs pending exact slots without IVF.
+/// Exact slots supply distinct-unit top-k witnesses.
 struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;
@@ -20,33 +71,20 @@ struct VectorSearchRequest {
   // IVF applies one shared bounded cut across its bounded segments and chunks
   // for this round. A fresh-only depth request starts a new cut/floor.
   int64_t candidates = 0;
-  // Domain filtering is supplied by engine construction. IVF scanners
-  // apply it through task-local selectors instead of per-request state.
-  int32_t breadth = 0;
-  // Floor on the fraction of live vectors the engine examines, in [0,1];
-  // raises the effective breadth when breadth maps below it.  1.0 forces a
-  // full scan.  Exact engines satisfy it trivially.
-  float minScanFraction = 0.0f;
-  // Bounded-channel exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
-  // indexed by segOrd; empty (or an empty per-segment span) until the host's
-  // first deepen round, when the host folds its pooled-hit set into them.
-  // Contract:
-  //   - A CLEARED bit means the rank is already in the host pool and MUST
-  //     NOT be returned.  This is a return filter only: whether cleared
-  //     ranks are visited or scored during traversal is engine business.
-  //     An engine that cannot push the filter down may drop cleared ranks
-  //     from its returned hits ONLY if the result heap is then refilled
-  //     with non-cleared ranks (scan past the pooled prefix) or the drops
-  //     are folded into its exhaustion answer - post-filtering a
-  //     fixed-depth scan under-returns fresh hits while still reporting an
-  //     unexhausted pool, which starves the host's depth axis (and never
-  //     trips the stale-hit counter, because the pooled hits never arrive).
-  //   - A SET bit promises NOTHING: not liveness, not domain membership.
-  //     The host seeds these bitmaps from per-query copies of the liveness
-  //     bitmap only where one exists; an engine's own domain/liveness
-  //     filtering still applies in full.
-  //   - The spans are valid only for the duration of this search() call.
-  //     The host mutates the backing bytes between rounds; never cache them.
+  // Cumulative fraction of the searched IVF population, chosen by the host.
+  // Domain filtering is supplied by engine construction.
+  double scanFraction = 0.0;
+  VectorSearchRound round = VectorSearchRound::BREADTH;
+  // Rank bitmaps (LSB-first, indexed by segOrd), valid for this call only.
+  // IVF spans contain the complete live domain minus pooled ranks, so one
+  // bitmap probe replaces both domain resolution and pooled exclusion.
+  // An empty span leaves domain/liveness filtering to the scanner. Filtered
+  // IVF slots always have a complete bitmap from the first deepen onward.
+  // Flat slots use these only for pooled exclusion, and still check their
+  // domain. A cleared rank excludes its whole document: flat emits max-sim.
+  // Cleared ranks must not be returned. Dropping them from a fixed-depth
+  // heap without refilling (or reporting exhaustion) starves the depth axis.
+  // The host mutates backing bytes between rounds; never cache the spans.
   std::span<const std::span<const uint8_t>> eligible;
   // Bounded group policy only; interval collectors have no member cap.
   int64_t perKey = 1;
@@ -90,9 +128,11 @@ struct VectorSearchResult {
   std::vector<int32_t> exactSegOrds;
   VectorSelection boundedSelection = VectorSelection::COMPLETE;
   bool breadthExhausted = true;
-  // Engine's hint for the next useful breadth value (the smallest one that
-  // adds work).  0 = no hint; the host then steps breadth by 1.
-  int32_t nextBreadth = 0;
+  // Actual cumulative coverage (whole lists can overshoot the target),
+  // and coverage after the next globally-best list. A zero-live list can
+  // leave nextFraction equal to coveredFraction; BREADTH must still advance.
+  double coveredFraction = 0.0, nextFraction = 0.0;
+  VectorSearchWork work;
 };
 
 /// Engines return fresh bounded and exact candidates here. Query-owned interval

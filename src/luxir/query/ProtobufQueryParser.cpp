@@ -25,6 +25,7 @@
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/QueryRegistry.h"
@@ -228,6 +229,28 @@ luxir::Query* ProtobufQueryParser::parseGeoDistance(
   return pool.make<luxir::GeoDistanceQuery>(
       api::build::arenaStr(pool, target.physicalName), geoDistanceQuery.lat, geoDistanceQuery.lon,
       geoDistanceQuery.radius_meters);
+}
+
+luxir::Query* ProtobufQueryParser::parseGeoPolygon(
+    const luxir::api::GeoPolygonQuery& geoPolygonQuery) {
+  const auto& target = context.fields.resolve(geoPolygonQuery.field, OpClass::PRIMARY, context.opName);
+  if (target.fieldType->type() != FieldType::GEO_POINT) {
+    throw std::runtime_error(std::format("GeoPolygon query on non-geo field: {}", geoPolygonQuery.field));
+  }
+  auto ring = [this](std::span<const luxir::api::GeoLatLon> points) {
+    auto out = pool.make_span<geo::LatLon>(points.size());
+    for (size_t i = 0; i < points.size(); i++) out[i] = {points[i].lat, points[i].lon};
+    return std::span<const geo::LatLon>(out);
+  };
+  auto polygons = pool.make_span<geo::PolygonRings>(geoPolygonQuery.polygons.size());
+  for (size_t p = 0; p < polygons.size(); p++) {
+    const auto& polygon = geoPolygonQuery.polygons[p];
+    auto holes = pool.make_span<std::span<const geo::LatLon>>(polygon.holes.size());
+    for (size_t h = 0; h < holes.size(); h++) holes[h] = ring(polygon.holes[h].points);
+    polygons[p] = {ring(polygon.points), holes};
+  }
+  return pool.make<luxir::GeoPolygonQuery>(
+      pool, api::build::arenaStr(pool, target.physicalName), polygons);
 }
 
 luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery) {
@@ -472,9 +495,10 @@ std::optional<float> ProtobufQueryParser::constantOutput(const ValueProgram& pro
 }
 
 bool ProtobufQueryParser::exactlyRepresented(const ValueResult& result, float value) {
-  return result.type == ValueType::DOUBLE
-      ? (double)value == result.doubleValue
-      : (long double)value == (long double)result.intValue;
+  if (result.type == ValueType::DOUBLE) return (double)value == result.doubleValue;
+  // Compare as integers: a double cannot hold every int64.
+  return value >= -0x1p63f && value < 0x1p63f && std::trunc(value) == value
+      && (int64_t)value == result.intValue;
 }
 
 luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& rescoreQuery) {
@@ -629,6 +653,9 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::GeoBoxQuery& g) -> luxir::Query* { return parseGeoBox(g); },
     [&](const luxir::api::GeoDistanceQuery& g) -> luxir::Query* {
       return parseGeoDistance(g);
+    },
+    [&](const luxir::api::GeoPolygonQuery& g) -> luxir::Query* {
+      return parseGeoPolygon(g);
     },
     [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseFuzzy(f); },
     [&](const luxir::api::SimpleQuery& s) -> luxir::Query* { return parseSimpleQuery(s, pquery); },

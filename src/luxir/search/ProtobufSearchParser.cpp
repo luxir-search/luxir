@@ -27,6 +27,7 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/FittedTerms.h"
 #include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -247,7 +248,7 @@ public:
           queryLimits(), &req.warnings,
           FilterKeyContext{.schemaGen = req.schema->gen_,
                            .timeZone = req.proto.time_zone},
-          req.filterUses, &req.memoryTracker);
+          req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -359,7 +360,7 @@ public:
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
         bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
             req.arena, req.requestPool, *req.reader, queryLimits(), &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -660,6 +661,73 @@ public:
     facetGroupPlans.push_back(facet.groupPlan);
   }
 
+  // FieldFacet.term_filter with literals normalized as the field normalizes
+  // query text: prefix as a prefix query, regex and exclude_regex as a regex
+  // query, include and exclude as any_of values.
+  FacetTermFilterSpec parseTermFilter(std::string_view facetName,
+                                      const ResolvedFieldHandle& target,
+                                      const luxir::api::TermFilter& termFilter) {
+    std::string context = std::format("facet '{}': term_filter", facetName);
+    if (termFilter.num_partitions == 0 && termFilter.partition != 0) {
+      throw RequestError(context + ": partition requires num_partitions");
+    }
+    if (termFilter.num_partitions != 0 && termFilter.partition >= termFilter.num_partitions) {
+      throw RequestError(std::format("{}: partition {} must be less than num_partitions {}",
+                                     context, termFilter.partition, termFilter.num_partitions));
+    }
+    QueryBuilder builder(req.requestPool, *req.schema, coerceContext(*req.timeZone),
+                         facetName, &req.warnings, &fields);
+    FacetTermFilterSpec spec;
+    // Errors name the term_filter field they came from.
+    auto within = [&](std::string_view name, auto&& build) {
+      try {
+        return build();
+      } catch (const std::runtime_error& e) {
+        throw RequestError(std::format("{} {}: {}", context, name, e.what()));
+      }
+    };
+    // A positive regex whose literal outgrows fitted terms matches by the kept
+    // prefix instead, as the regex query does, so only the others can warn.
+    auto compile = [&](std::string_view pattern, bool positive) {
+      TermPattern compiled = builder.compileRegexPattern(target, pattern);
+      if (compiled.fittedPolicy && !(positive && compiled.fittedPrefix)) {
+        warnIfFittedTermsReachable(*req.reader, &req.warnings, req.requestPool,
+            target.physicalName, *compiled.fittedPolicy, [&] {
+              return compiled.dfa.maxAcceptedLength() >= (int32_t)PackedTerm::MIN_FITTED_LEN;
+            });
+      }
+      return compiled;
+    };
+    auto normalize = [&](std::span<const std::string_view> values) {
+      std::vector<std::string> terms;
+      terms.reserve(values.size());
+      for (std::string_view value : values) {
+        terms.emplace_back(builder.normalizeLiteral(target, value, true));
+      }
+      return terms;
+    };
+    if (!termFilter.prefix.empty()) {
+      spec.prefix = within("prefix", [&] {
+        return std::string(builder.normalizePrefix(target, termFilter.prefix));
+      });
+    }
+    if (!termFilter.regex.empty()) {
+      spec.regex = within("regex", [&] { return compile(termFilter.regex, true); });
+    }
+    if (!termFilter.exclude_regex.empty()) {
+      spec.excludeRegex = within("exclude_regex", [&] {
+        return compile(termFilter.exclude_regex, false);
+      });
+    }
+    if (!termFilter.include.empty()) {
+      spec.include = within("include", [&] { return normalize(termFilter.include); });
+    }
+    spec.exclude = within("exclude", [&] { return normalize(termFilter.exclude); });
+    spec.partition = termFilter.partition;
+    spec.numPartitions = termFilter.num_partitions;
+    return spec;
+  }
+
   FacetReq* createFieldFacetReq(
       std::string_view facetName, const luxir::api::FieldFacet& facetReq,
       OpsPlacement placement,
@@ -711,6 +779,12 @@ public:
       }
     }
 
+    if (facetReq.term_filter.has_value() && ftype->type() != FieldType::Type::ID
+        && ftype->type() != FieldType::Type::STRING) {
+      throw RequestError("facet '" + std::string(facetName)
+          + "': term_filter is supported only on STRING and ID fields");
+    }
+
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
       // Numeric columns hold raw integers, date ticks, or sortable floating
@@ -741,10 +815,14 @@ public:
               + std::string(facetField) + "' is column-only (not indexed); string facets "
               "require an indexed field");
         }
+        std::optional<FacetTermFilterSpec> termFilter;
+        if (facetReq.term_filter.has_value()) {
+          termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);
+        }
         auto ordMap = req.reader->getOrdMap(facetField);
         facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing,
-            std::move(ordMap), selectedStrings);
+            std::move(ordMap), selectedStrings, std::move(termFilter));
         break;
       }
       case FieldType::Type::TEXT:
@@ -1309,7 +1387,7 @@ public:
         queryLimits(), &req.warnings,
         FilterKeyContext{.schemaGen = req.schema->gen_,
                          .timeZone = req.proto.time_zone},
-        req.filterUses, &req.memoryTracker);
+        req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1702,7 +1780,7 @@ public:
       &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
-      req.filterUses, &req.memoryTracker);
+      req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2207,8 +2285,8 @@ public:
     Query::PlanningContext& planning() override {
       if (planningContext == nullptr) {
         planningContext = luxir::arenaCreate<Query::PlanningContext>(
-            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
+            req.arena, req.requestPool, *req.reader, parser.queryLimits(), &req.warnings,
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
       }
       return *planningContext;
     }

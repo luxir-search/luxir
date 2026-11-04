@@ -23,6 +23,7 @@
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
 #include "MultiTermBudget.h"
+#include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
@@ -64,6 +65,7 @@ enum class QueryKind : uint8_t {
   EXISTS,
   GEO_BOX,
   GEO_DISTANCE,
+  GEO_POLYGON,
   ALL,
   NONE,
   RESCORE,
@@ -657,6 +659,10 @@ public:
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
+    // Point emissions (see Demand) of one two-phase check, when the arm knows
+    // it. A parent choosing where verification runs prices the checks a
+    // schedule adds with it.
+    std::optional<double> verificationPoints;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -932,6 +938,12 @@ public:
       // the docid runs that hold no match. A conjunction leapfrogging a
       // produced supplier skips its siblings' documents in those runs.
       double hull = 1;
+      // Whether hull estimates where the matches lie, which yield knowledge
+      // does not imply (an exact doc set knows its count, not its spread):
+      // for a dense single-valued numeric column, the share of documents in
+      // leaves that can match. Pricing that relies on the matches' support
+      // requires it.
+      bool knownHull = false;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -1215,17 +1227,18 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
         std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr,
-        RequestMemTracker* memoryTracker = nullptr)
+        RequestMemTracker* memoryTracker = nullptr, ExecutionProfileSink* profiles = nullptr)
       : memoryTracker(memoryTracker ? *memoryTracker : standaloneMemoryTracker),
         pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext), limits(limits),
-        warnings(warnings) {
+        warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       if (this->limits.multiTermBudget == nullptr) {
@@ -1687,6 +1700,10 @@ public:
     /// bit-space from createWeight() input flags: input flags say what the
     /// parent requested, traits say what is true of the built weight.
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
+    // Selects matches inside the prepare domain, directly or through any
+    // descendant prepared in it (kNN top-k). Unlike ordinary predicates,
+    // exclusions applied after it can change that selection.
+    static constexpr int32_t CONSUMES_DOMAIN = 1 << 5;
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
@@ -1701,6 +1718,8 @@ public:
 
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
+
+    bool consumesDomain() const noexcept { return (traits & CONSUMES_DOMAIN) != 0; }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
@@ -1928,6 +1947,10 @@ public:
       }
       return filled;
     }
+    /// OR this scorer's matches in [windowStart, windowEnd) into windowBits,
+    /// bit i for doc windowStart + i; no bit at or past windowEnd - windowStart
+    /// is set. Windows arrive forward only but need not be contiguous: a
+    /// consumer may skip windows, and the next fill resumes at its own start.
     virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                                 int32_t windowEnd) {
       skipCount(SkipStats::countBulkFillCalls);
@@ -2314,6 +2337,16 @@ private:
     std::fill(currentBits.begin(), currentBits.end(), 0);
     fill(scorers[0], currentBits);
     for (size_t i = 1; i < scorers.size(); i++) {
+      // A membership intersection stops at its first empty result; the
+      // skipped filters resume at a later window, and only the window's
+      // words hold bits (fillWindowBits). OR them without branching, so
+      // where the first set word lands steers no branch.
+      if constexpr (!scored) {
+        uint64_t live = 0;
+        size_t words = (size_t) (end - start + 63) >> 6;
+        for (size_t word = 0; word < words; word++) live |= currentBits[word];
+        if (live == 0) return 0;
+      }
       std::fill(scratchBits.begin(), scratchBits.end(), 0);
       fill(scorers[i], scratchBits);
       for (size_t word = 0; word < currentBits.size(); word++) {
