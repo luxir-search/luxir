@@ -80,7 +80,7 @@ class DfaIntersectEnum final : public AutomatonSeekCore<automaton::ByteDfaView> 
     s.chainBroken = true;
   }
 
-  // Terms classified by either path, for the visit limit.
+  // Terms classified by either path, for the scan allowance.
   static int64_t visits(const SmartScan& s) { return s.examined; }
   static int64_t visits(const Scan& s) { return s.examined + s.linearTerms; }
 
@@ -302,9 +302,13 @@ class DfaIntersectEnum final : public AutomatonSeekCore<automaton::ByteDfaView> 
     }
 
     const A a = automaton;
-    const int64_t limit = visitLimit;
+    int64_t limit = sliceEnd;
     for (;;) {
-      if (visits(s) >= limit) return stopAtLimit(s);
+      if (visits(s) >= limit) [[unlikely]] {
+        store(s);
+        if (!extendSlice()) return stopAtLimit(s);
+        limit = sliceEnd;
+      }
       if constexpr (USE_LINEAR) {
         if (s.linearActive) {
           if (!termBeforeLinearUpper(s)) {

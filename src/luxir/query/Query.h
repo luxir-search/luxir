@@ -1207,7 +1207,7 @@ public:
     struct Limits {
       int32_t fuzzyMaxExpansions = 10000;
       // Request-wide multi-term work allowance, shared by every planning
-      // context of one request. Null gives the context its own default one.
+      // context of one request. Null gives the context its own unlimited one.
       MultiTermBudget* multiTermBudget = nullptr;
 
       constexpr Limits(int32_t fuzzyMaxExpansions = 10000,

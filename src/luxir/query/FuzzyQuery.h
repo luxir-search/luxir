@@ -160,7 +160,7 @@ private:
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
       TermsEnum te(scratch, postingsReader, *segFieldInfo);
       FuzzySeekEnum fte(scratch, te, prefix, suffix, maxEdits);
-      fte.setVisitLimit(budget.remainingTermsExamined());
+      fte.setAllowance(budget.scanAllowance());
       while (fte.next()) {
         std::string_view t = fte.termView();
         auto iter = termToIndex.find(t);
@@ -175,9 +175,8 @@ private:
         candidate.termStats.docFreq += te.docFreq();
         candidate.termStats.totalTermFreq += te.totalTermFreq();
       }
-      // Each scan charges as it ends, so the next segment sees what is left.
-      if (fte.stoppedAtVisitLimit()
-          || !budget.chargeTermsExamined(fte.termsVisited())) {
+      // The scan reported its final visits when it finished.
+      if (fte.stoppedAtVisitLimit()) {
         budget.throwTermsExamined(std::format(
             "fuzzy query '{}' on field '{}'", term, field));
       }

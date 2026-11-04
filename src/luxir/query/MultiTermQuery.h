@@ -418,14 +418,8 @@ public:
               scratchPool, segment.postingsReader(), *segFieldInfo);
           FilteredTermsEnum* fenum =
               query.createFilteredEnum(scratchPool, *termsEnum);
-          // A refill re-walks a scan this request was already charged for;
-          // the engine released it, so the request does not pay twice. The
-          // expansion cap still applies: the same walk accepts the same terms.
-          // A top-terms selection drains the same visit-limited enum.
-          bool charge = !facts->released;
-          int64_t postingsLimit = charge ? budget.remainingPostings()
-                                         : std::numeric_limits<int64_t>::max();
-          if (charge) fenum->setVisitLimit(budget.remainingTermsExamined());
+          int64_t unchargedPostings = 0;
+          fenum->setAllowance(budget.scanAllowance());
           skipCount(SkipStats::multitermExpansions);
           std::optional<RequestMemResource> selectionMemory;
           if (query.maxExpansions > 0) {
@@ -454,8 +448,10 @@ public:
             if (termCount > (size_t)expansionCap) [[unlikely]] {
               budget.throwTooManyExpansions(query.describe());
             }
-            if (sumDocFreq > postingsLimit) [[unlikely]] {
-              budget.throwPostings(query.describe());
+            unchargedPostings += state.docFreq;
+            if (unchargedPostings >= MultiTermBudget::POSTINGS_SLICE) [[unlikely]] {
+              if (!budget.chargePostings(unchargedPostings)) budget.throwPostings(query.describe());
+              unchargedPostings = 0;
             }
             if (bitWords != nullptr) {
               FixedBitSet bits(bitWords, segment.maxDoc());
@@ -479,14 +475,11 @@ public:
             // No state views have escaped; return all heap blocks at spill.
             facts->statePool.rewind(facts->stateStart, 0);
           }
-          if (charge) {
-            if (fenum->stoppedAtVisitLimit()
-                || !budget.chargeTermsExamined(fenum->termsVisited())) {
-              budget.throwTermsExamined(query.describe());
-            }
-            if (!budget.chargePostings(sumDocFreq)) {
-              budget.throwPostings(query.describe());
-            }
+          if (fenum->stoppedAtVisitLimit()) {
+            budget.throwTermsExamined(query.describe());
+          }
+          if (!budget.chargePostings(unchargedPostings)) {
+            budget.throwPostings(query.describe());
           }
         }
       }

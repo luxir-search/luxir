@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 
+#include "ScanAllowance.h"
 #include "TermsEnum.h"
 #include "luxir/util/screaming.h"
 
@@ -26,14 +27,30 @@ protected:
   TermsEnum& te;
   bool started = false;
   bool exhausted = false;
-  // Set when the scan ended at visitLimit instead of at the end of its
+  // Set when the scan exhausted its allowance instead of at the end of its
   // candidates, so the accepted terms so far are not the whole set.
   bool stoppedAtLimit = false;
   // Dictionary terms classified so far, accepted or not.
   int64_t visitedTerms = 0;
-  int64_t visitLimit = std::numeric_limits<int64_t>::max();
+  int64_t reported = 0;
+  int64_t sliceEnd = std::numeric_limits<int64_t>::max();
+  ScanAllowance* allowance = nullptr;
+
+  bool extendSlice() {
+    int64_t next = allowance->charge(visitedTerms - reported);
+    reported = visitedTerms;
+    sliceEnd = visitedTerms + next;
+    if (next == 0) allowance = nullptr;
+    return next != 0;
+  }
 
   bool finish() {
+    if (allowance != nullptr) {
+      auto* source = allowance;
+      allowance = nullptr;
+      if (source->charge(visitedTerms - reported) == 0) stoppedAtLimit = true;
+      reported = visitedTerms;
+    }
     exhausted = true;
     return false;
   }
@@ -46,9 +63,11 @@ protected:
 public:
   explicit FilteredTermsEnum(TermsEnum& te) : te(te) {}
 
-  // Bounds the terms the scan may classify; past it next() returns false and
-  // stoppedAtVisitLimit() reports why. Set before the first next().
-  void setVisitLimit(int64_t limit) { visitLimit = limit; }
+  // Install before the first next(); a null source leaves the scan unlimited.
+  void setAllowance(ScanAllowance* source) {
+    allowance = source;
+    sliceEnd = source ? 0 : std::numeric_limits<int64_t>::max();
+  }
   bool stoppedAtVisitLimit() const { return stoppedAtLimit; }
   int64_t termsVisited() const { return visitedTerms; }
 
@@ -98,7 +117,9 @@ public:
       if (!advance()) return finish();
     }
     for (;;) {
-      if (visitedTerms >= visitLimit) return finishAtLimit();
+      if (visitedTerms >= sliceEnd) [[unlikely]] {
+        if (!extendSlice()) return finishAtLimit();
+      }
       visitedTerms++;
       switch (accept()) {
         case Status::ACCEPT: return true;
@@ -180,7 +201,9 @@ public:
     }
 
     while (candidate != end) {
-      if (visitedTerms >= visitLimit) return finishAtLimit();
+      if (visitedTerms >= sliceEnd) [[unlikely]] {
+        if (!extendSlice()) return finishAtLimit();
+      }
       visitedTerms++;
       std::string_view indexed = termView();
       if (indexed == *candidate) return true;

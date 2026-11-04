@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "luxir/util/ApiError.h"
+#include "luxir/reader/ScanAllowance.h"
 
 namespace luxir {
 
@@ -19,34 +20,30 @@ namespace luxir {
 // string range, fuzzy). A multi-term query's cost grows with the field's
 // dictionary, not with the request, so one short pattern on a
 // high-cardinality field can hold a core for as long as the scan runs. These
-// limits bound that work per request and a request cannot raise them. Zero in
-// any field means unlimited (an operator decision; a request can never ask
-// for it).
+// limits are operator opt-ins, all off by default. A request cannot raise or
+// disable an operator limit; zero means unlimited.
 struct MultiTermLimits {
   // Terms one segment of one query may expand to before the request is
   // rejected. For a prefix with max_expansions, this counts the selected
-  // terms; a selection no larger than this cap stays within it.
-  int32_t maxExpansions = 65'536;
+  // terms. Counts per segment, so a merge can change whether a query passes.
+  int32_t maxExpansions = 0;
   // Dictionary terms all multi-term and fuzzy scans of one request may visit,
-  // matching or not. This is what bounds a zero-hit `*x*` scan. HARDWARE
-  // SENSITIVE: a leading-wildcard scan visits ~11 ns/term on a laptop
-  // (BM_AutomatonEnum), so the default is ~100 ms of one core.
-  int64_t maxTermsExamined = 1 << 23;
-  // Postings all multi-term expansions of one request may union (summed
-  // docFreq of the accepted terms).
-  int64_t maxPostings = 1 << 30;
+  // matching or not. Opt in to bound even a zero-hit `*x*` scan.
+  int64_t maxTermsExamined = 0;
+  // Estimate: summed docFreq of selected terms, not decoded postings.
+  // Fuzzy scored rewrites do not count toward this limit.
+  int64_t maxPostings = 0;
   // A pattern with an unbounded language and fewer literal leading bytes than
   // this is costed as a scan of its whole literal-prefix range, and rejected
   // before scanning when that range is larger than the remaining budget.
-  int32_t minPrefixLength = 1;
+  int32_t minPrefixLength = 0;
 };
 
 // Request-wide dictionary work allowance shared by every multi-term query in
 // one request, across planning contexts, weights, and segments. Charges are
-// atomic so concurrent segment tasks may share it; a scan reads the remaining
-// allowance when it starts, so concurrent scans can overshoot by at most one
-// scan each.
-class MultiTermBudget {
+// atomic and report work after use. The outcome depends only on the total,
+// not scheduling; work can pass a limit by at most one slice per concurrent scan.
+class MultiTermBudget : public ScanAllowance {
   static constexpr int64_t UNLIMITED = std::numeric_limits<int64_t>::max();
 
   MultiTermLimits limits;
@@ -57,6 +54,7 @@ class MultiTermBudget {
     if (limit <= 0) return UNLIMITED;
     return std::max<int64_t>(0, limit - used.load(std::memory_order_relaxed));
   }
+
 
 public:
   explicit MultiTermBudget(MultiTermLimits limits = {}) : limits(limits) {}
@@ -73,10 +71,6 @@ public:
     return remaining(limits.maxTermsExamined, examined);
   }
 
-  int64_t remainingPostings() const noexcept {
-    return remaining(limits.maxPostings, postings);
-  }
-
   int64_t termsExamined() const noexcept {
     return examined.load(std::memory_order_relaxed);
   }
@@ -85,14 +79,22 @@ public:
     return postings.load(std::memory_order_relaxed);
   }
 
-  // Record a scan's visited terms or accepted postings. False when the
-  // request total passed its limit; the caller throws with its description.
-  [[nodiscard]] bool chargeTermsExamined(int64_t terms) noexcept {
-    int64_t total = examined.fetch_add(terms, std::memory_order_relaxed) + terms;
-    return limits.maxTermsExamined <= 0 || total <= limits.maxTermsExamined;
+  // Work can pass the limit by at most one slice per concurrent scan.
+  // A future deadline/cancel poll gets a ~50 us interval.
+  static constexpr int64_t SCAN_SLICE = 4096;
+
+  ScanAllowance* scanAllowance() { return limits.maxTermsExamined > 0 ? this : nullptr; }
+
+  int64_t charge(int64_t visited) override {
+    int64_t total = examined.fetch_add(visited, std::memory_order_relaxed) + visited;
+    if (total > limits.maxTermsExamined) return 0;
+    // Avoid overflow when the configured limit is INT64_MAX.
+    return std::min(SCAN_SLICE - 1, limits.maxTermsExamined - total) + 1;
   }
 
-  [[nodiscard]] bool chargePostings(int64_t count) noexcept {
+  static constexpr int64_t POSTINGS_SLICE = 1 << 20;
+
+  [[nodiscard]] bool chargePostings(int64_t count) {
     int64_t total = postings.fetch_add(count, std::memory_order_relaxed) + count;
     return limits.maxPostings <= 0 || total <= limits.maxPostings;
   }
@@ -109,8 +111,8 @@ public:
 
   [[noreturn]] void throwPostings(std::string_view what) const {
     throw ResourceExhaustedError(
-        std::format("{} expands to too many postings: the request may union "
-                    "at most {} postings across all multi-term expansions",
+        std::format("{} exceeds the postings estimate limit of {}: summed docFreq "
+                    "of selected terms across all multi-term expansions",
                     what, limits.maxPostings),
         "too_many_expansion_postings");
   }

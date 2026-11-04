@@ -721,22 +721,22 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
-- Multi-term expansion (prefix, wildcard, regex, term range, fuzzy) is bounded
-  per request so one pattern on a high-cardinality field cannot hold a core.
-  A request can never raise or disable these limits; `0` here means
-  unlimited. See [Expansion limits](query-reference.md#expansion-limits).
-  - `search.multiterm-max-expansions` (default `65536`): terms one index
-    segment of one query may expand before the request is rejected. For a
-    prefix with `max_expansions`, this counts only the selected terms.
-  - `search.multiterm-max-terms-examined` (default `8388608`): dictionary
-    terms all scans of one request may visit, matching or not. This bounds a
-    zero-hit `*abc*` scan; the default is roughly 100 ms of one core.
-  - `search.multiterm-max-postings` (default `1073741824`): postings all
-    expansions of one request may union.
-  - `search.multiterm-min-prefix-length` (default `1`): an open-ended wildcard
-    or regex with fewer literal leading bytes is costed as a scan of every
-    term under its prefix, and is rejected before scanning when that exceeds
-    the remaining request budget.
+- Multi-term expansion limits are operator opt-ins, all off by default (`0`).
+  With limits off, broad patterns on high-cardinality fields simply run. Operators
+  exposing public endpoints can bound this work using the following options.
+  A request cannot raise or disable an operator limit. Exceeding one fails with
+  `RESOURCE_EXHAUSTED` naming the query and limit, never a truncated match set.
+  See [Expansion limits](query-reference.md#expansion-limits).
+  - `search.multiterm-max-expansions`: terms one query may expand per segment,
+    counting selected terms for a capped prefix. A merge can change whether a
+    query passes.
+  - `search.multiterm-max-terms-examined`: dictionary terms visited across all
+    multi-term and fuzzy scans, including refills, whether matching or not.
+  - `search.multiterm-max-postings`: request-wide estimate, the summed docFreq of
+    selected terms, not postings decoded. Fuzzy's scored rewrite is excluded.
+  - `search.multiterm-min-prefix-length`: an open-ended wildcard or regex with
+    fewer literal leading bytes is costed as a scan of every term under its
+    prefix, and rejected when that exceeds the remaining request budget.
 - `multi_match` field lists containing patterns may resolve to at most `64`
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
