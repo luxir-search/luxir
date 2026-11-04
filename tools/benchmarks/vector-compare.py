@@ -213,6 +213,7 @@ def filtered_stream(cache, base, queries, metric, meta, query_count):
     if not query_count:
         raise RuntimeError('cohere-768-cos requires --filtered')
     queries = queries[:query_count].copy()
+    np.save(cache / 'filtered-base.npy', base)
     ranks = filter_ranks(base, queries, metric)
     fields = ['filter_uniform_i'] + [f'filter_q{q}_i' for q in range(len(queries))]
     stream = cache / f'filtered-{len(queries)}.ndjson'
@@ -238,6 +239,29 @@ def filter_expression(kind, q, count, selectivity):
     return f'{field}:[{lo} TO {hi}]', keep
 
 
+def filtered_quality(base, query, ids, truth, metric):
+    # Evaluate original vectors in float64, never server/quantized scores.
+    def scores(doc_ids):
+        vectors = base[[int(i) for i in doc_ids]].astype(np.float64)
+        q = np.asarray(query, dtype=np.float64)
+        values = vectors @ q
+        if metric == 'cosine':
+            values /= np.linalg.norm(vectors, axis=1) * np.linalg.norm(q)
+        return values
+
+    expected = scores(truth)
+    returned = scores(ids)
+    threshold = expected[9]
+    tolerance = 1e-6 * max(abs(threshold), 1e-12)
+    # Cosine/IP distance is 1 - similarity. Undefined zero denominators are null.
+    ratios = [(1 - float(a)) / (1 - float(b)) if abs(1 - b) > 1e-12 else None
+              for a, b in zip(returned, expected[:10])]
+    return {'tie_aware_recall_at_10': float(np.count_nonzero(returned >= threshold - tolerance)) / 10,
+            'truth_gap_1_10': float(expected[0] - threshold),
+            'truth_gap_10_11': float(threshold - expected[10]) if len(expected) > 10 else None,
+            'distance_ratio_by_rank': ratios}
+
+
 def filtered_measure(args, queries, meta, search, call):
     rows = []
     for kind in FILTER_KINDS:
@@ -254,8 +278,10 @@ def filtered_measure(args, queries, meta, search, call):
                         raise RuntimeError(f'Filter cardinality differs: {expr}: {count}')
                     exact = copy.deepcopy(payload)
                     exact['query']['knn']['exact'] = True
-                    ids = {d['id'] for d in call(exact)['docs']}
-                    if len(ids) != 10:
+                    exact['limit'] = min(11, keep)
+                    exact['query']['knn']['k'] = min(11, keep)
+                    ids = [d['id'] for d in call(exact)['docs']]
+                    if len(ids) != min(11, keep):
                         raise RuntimeError('Exact filtered top ten underfilled')
                     args.filtered_truth[key] = ids
                 truth.append(args.filtered_truth[key])
@@ -264,7 +290,8 @@ def filtered_measure(args, queries, meta, search, call):
                 passes = []
                 for pass_no in range(4):
                     times, recalls, ids_by_query = [], [], []
-                    for payload, expected in zip(payloads, truth):
+                    qualities = []
+                    for q, (payload, expected) in enumerate(zip(payloads, truth)):
                         payload['query']['knn']['exact'] = effort == 'exact'
                         payload['query']['knn']['ivf']['nprobe'] = 0 if effort == 'exact' else effort
                         start = time.perf_counter_ns()
@@ -273,17 +300,20 @@ def filtered_measure(args, queries, meta, search, call):
                         ids = [d['id'] for d in docs]
                         if len(set(ids)) != len(ids) or len(ids) > 10:
                             raise RuntimeError('Invalid filtered top ten')
-                        recall = len(set(ids) & expected) / 10
+                        recall = len(set(ids) & set(expected[:10])) / 10
                         if effort == 'exact' and recall != 1:
                             raise RuntimeError('Exact filtered truth differs across arms')
                         recalls.append(recall)
                         ids_by_query.append(ids)
+                        qualities.append(filtered_quality(args.filtered_base, queries[q], ids, expected, args.filtered_metric))
                     if pass_no:
                         passes.append({'p50_ms': float(np.percentile(times, 50)),
                                        'p99_ms': float(np.percentile(times, 99)),
                                        'recall_at_10': statistics.mean(recalls),
                                        'query_result_ids_sha256': hashlib.sha256(json.dumps(ids_by_query, separators=(',', ':')).encode()).hexdigest(),
-                                       'latencies_ms': times})
+                                       'latencies_ms': times,
+                                       'quality_by_query': qualities,
+                                       'tie_aware_recall_at_10': statistics.mean(x['tie_aware_recall_at_10'] for x in qualities)})
                 row = {'variant': args.variant, 'field_settings': args.settings, 'kind': kind,
                        'selectivity': selectivity, 'eligible_count': keep,
                        'actual_selectivity': keep / meta['index_count'],
@@ -291,6 +321,16 @@ def filtered_measure(args, queries, meta, search, call):
                        **{k: statistics.median(p[k] for p in passes) for k in ['p50_ms', 'p99_ms', 'recall_at_10']}}
                 if effort == 'exact' and row['recall_at_10'] != 1:
                     raise RuntimeError('Exact filtered truth differs across arms')
+                row['tie_aware_recall_at_10'] = statistics.median(p['tie_aware_recall_at_10'] for p in passes)
+                quality = passes[0]['quality_by_query']
+                for field in ['truth_gap_1_10', 'truth_gap_10_11']:
+                    values = [x[field] for x in quality if x[field] is not None]
+                    row[field] = statistics.mean(values) if values else None
+                row['mean_distance_ratio_by_rank'] = []
+                for rank in range(10):
+                    values = [x['distance_ratio_by_rank'][rank] for p in passes for x in p['quality_by_query']
+                              if len(x['distance_ratio_by_rank']) > rank and x['distance_ratio_by_rank'][rank] is not None]
+                    row['mean_distance_ratio_by_rank'].append(statistics.mean(values) if values else None)
                 rows.append(row)
                 (args.output / 'filtered-rows.json').write_text(json.dumps(rows, indent=2))
                 print(f'{args.variant} {kind} keep={selectivity:g} effort={effort} recall={row["recall_at_10"]:.4f}', flush=True)
@@ -322,7 +362,7 @@ def run_filtered(args, queries, stream, metric, meta):
                 selections.append({'variant': variant_result['label_variant'], 'kind': kind,
                                    'selectivity': selectivity, 'least_nprobe_recall_095': chosen or 'not reached'})
     result = {'filtered': True, 'variants': variants, 'selections': selections,
-              'truth': [{'kind': k, 'selectivity': s, 'query': q, 'ids': sorted(v)} for (k, s, q), v in truth.items()]}
+              'truth': [{'kind': k, 'selectivity': s, 'query': q, 'ids': sorted(v[:10])} for (k, s, q), v in truth.items()]}
     (args.output / 'results.json').write_text(json.dumps(result, indent=2))
     lines = ['## Filtered vector comparison', '',
              f'Base `{args.base_revision}`; candidate `{args.candidate_revision}`; dataset `{args.dataset}`; {len(queries)} held-out queries.', '',
@@ -551,6 +591,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     queries, stream, metric, meta = dataset(args.cache, args.dataset, args.filtered_queries if args.filtered else 0)
     if args.filtered:
+        args.filtered_base = np.load(args.cache / args.dataset / 'filtered-base.npy', mmap_mode='r')
+        args.filtered_metric = metric
         run_filtered(args, queries, stream, metric, meta)
         return
     specs = [('base', args.base_binary, args.base_revision, {}), ('candidate_feature', args.candidate_binary, args.candidate_revision, settings), ('candidate_default', args.candidate_binary, args.candidate_revision, {})]

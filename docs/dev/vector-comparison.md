@@ -264,3 +264,26 @@ The 1M dataset and four indexes need substantial disk space and time. Collection
 information and shutdown checks are retained, but collection data directories
 are removed after each arm, including failure, once its server has stopped.
 Keep the results artifact; do not upload collection data or downloaded corpora.
+
+### Filtered score quality
+
+Filtered rows also report `tie_aware_recall_at_10`: the number of returned
+neighbors with exact similarity at least the tenth true neighbor's similarity,
+minus `1e-6 * max(abs(tenth_similarity), 1e-12)`, divided by ten. Missing
+neighbors score zero. Similarities use original base vectors and queries in
+NumPy float64 (dot product for IP, normalized dot product for cosine), never
+server or quantized scores. Read this alongside ID recall for anti-aligned
+filters: a narrow boundary band can make ID recall sensitive to tiny errors.
+A low tie-aware value still indicates loss at this stated tolerance.
+
+`quality_by_query` records truth score gaps from rank 1 to 10 and rank 10 to
+11, and returned/true distance ratios at each returned rank. Truth fetches up
+to eleven exact filtered neighbors; rank 10-11 is null when only ten qualify.
+Distance means `1 - similarity` for both supported metrics. Zero true distance
+(within 1e-12) is undefined and recorded as null; IP distances can be negative
+for non-unit vectors. Missing ranks are omitted, so read ratios with recall.
+Rows report mean truth gaps and `mean_distance_ratio_by_rank` over measured
+passes and queries, excluding undefined/missing entries. Per-pass tie-aware
+recall averages queries; the row takes the median of three measured passes,
+just like ID recall. Existing ID recall, effort selection and unfiltered
+output retain their definitions.

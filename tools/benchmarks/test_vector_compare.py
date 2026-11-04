@@ -90,6 +90,23 @@ class InputChecks(unittest.TestCase):
                 self.assertIn('filter_uniform_i' if kind == 'uniform' else 'filter_q2_i', expr)
         self.assertEqual(bench.filter_expression('uniform', 0, 99000, 0.0001)[1], 10)
 
+    def test_filtered_quality(self):
+        np = bench.np
+        base = np.array([[0.5 - i * 1e-8, 1.] for i in range(12)])
+        truth = [str(i) for i in range(11)]
+        # An ID miss inside tolerance is accepted, underfill keeps denominator ten.
+        result = bench.filtered_quality(base, [1., 0.], ['11'], truth, 'ip')
+        self.assertEqual(result['tie_aware_recall_at_10'], 0.1)
+        self.assertAlmostEqual(result['truth_gap_1_10'], 9e-8)
+        self.assertAlmostEqual(result['truth_gap_10_11'], 1e-8)
+        self.assertAlmostEqual(result['distance_ratio_by_rank'][0], (1 - base[11, 0]) / 0.5)
+        base[11, 0] = 0.4
+        self.assertEqual(bench.filtered_quality(base, [1., 0.], ['11'], truth, 'ip')['tie_aware_recall_at_10'], 0)
+        result = bench.filtered_quality(np.tile([1., 0.], (11, 1)), [2., 0.], truth[:10], truth[:10], 'cosine')
+        self.assertEqual(result['tie_aware_recall_at_10'], 1)
+        self.assertIsNone(result['truth_gap_10_11'])
+        self.assertEqual(result['distance_ratio_by_rank'], [None] * 10)
+
     def test_checksum_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'shard.parquet'
