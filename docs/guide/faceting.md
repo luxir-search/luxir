@@ -381,6 +381,8 @@ The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
 `percentile_rank`. Their value arguments use the same expression language as
 [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
+`sum(count(field))` counts values, like Elasticsearch `value_count`, for
+numeric, date, STRING, ID and GEO_POINT fields alike.
 A composite metric is a single expression:
 
 ```json
