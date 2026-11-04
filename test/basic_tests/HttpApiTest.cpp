@@ -315,6 +315,14 @@ TEST_F(HttpApiTest, buildInfo) {
   auto res = httpRequest(port(), http::verb::post, "/");
   EXPECT_EQ(405, res.result_int());
   EXPECT_EQ("GET", res[http::field::allow]);
+
+  // _stats (shared with gRPC) and Prometheus report the same commit.
+  auto stats = httpRequest(port(), http::verb::get, "/_stats");
+  glz::generic_i64 statsJson;
+  ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
+  EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  auto metrics = httpRequest(port(), http::verb::get, "/metrics");
+  EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {

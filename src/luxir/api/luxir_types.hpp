@@ -550,6 +550,7 @@ struct TransportStats {
 struct ServiceStats {
   std::string_view version;
   std::string_view cpu_target;
+  std::string_view source_commit;
   std::span<const double> request_duration_bounds;
   std::span<const double> background_duration_bounds;
   TransportStats http;

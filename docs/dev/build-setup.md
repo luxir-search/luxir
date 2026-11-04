@@ -292,17 +292,20 @@ The binaries for every preset are under `build/<preset>/bin/`.
 ## Embedded build information
 
 The binary embeds the CMake project version, full Git HEAD commit hash, and CPU
-target. `luxir --version`, the startup banner, and `GET /` expose the same values.
-Incremental builds track Git HEAD and its ref, including linked worktrees and
-packed refs, so committing or switching branches refreshes the embedded hash.
-Uncommitted edits are not represented by the hash.
+target. `luxir --version`, the startup banner, `GET /`, `_stats`, and the
+`luxir_build_info` metric expose the same values. Incremental builds track Git
+HEAD and its ref, including linked worktrees, packed refs, and reftable, so
+committing or switching branches refreshes the embedded hash. Uncommitted edits
+are not represented by the hash.
 
 For a source archive without `.git`, pass `-DLUXIR_SOURCE_COMMIT=<full-hash>` when
-configuring. Without it, CMake warns and the binary reports `unknown`. This
-override is cached; leave it empty for automatic Git detection in a checkout.
+configuring. Without it, or when Git cannot read the checkout's repository, CMake
+warns and the binary reports `unknown`; release packaging rejects such a binary.
+This override is cached; leave it empty for automatic Git detection in a checkout.
 
-Run `python3 tools/test-build-info` to check metadata refresh behavior with real
-Git repositories and a small CMake/Ninja build, without building the engine.
+Run `tools/test-build-info` to check metadata refresh behavior with real Git
+repositories and a small CMake/Ninja build, without building the engine. It uses
+CMake's default C++ compiler; set `CXX` to choose another.
 
 ## Measure on your workload
 
