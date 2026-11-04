@@ -435,7 +435,7 @@ public:
       if (cachedFieldInfo == nullptr) return;
 
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
-      Similarity similarity;
+      Similarity similarity(cachedFieldInfo->bm25);
       double idf = 0.0;
       for (int i = 0; i < cachedTermInfos.size(); i++) {
         cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);

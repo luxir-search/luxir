@@ -941,6 +941,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
           } else if (key == "ignore_z_value") {
             util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
+          } else if (key == "k1") {
+            util::from_json<V>(value.k1, ctx, vit, vend);
+          } else if (key == "b") {
+            util::from_json<V>(value.b, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

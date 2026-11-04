@@ -395,6 +395,10 @@ public:
   // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
 
+  // BM25 parameters of a physical field in this reader's schema; the defaults
+  // when the schema does not list it.
+  Bm25Params bm25(std::string_view name) const;
+
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 
   // This reader's segment `segId`, or null.

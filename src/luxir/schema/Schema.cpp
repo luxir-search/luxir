@@ -3,6 +3,7 @@
 
 #include "Schema.h"
 #include <algorithm>
+#include <cmath>
 #include <memory_resource>
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
@@ -66,6 +67,8 @@ struct ResolvedField {
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
+  std::optional<float> bm25K1;
+  std::optional<float> bm25B;
 };
 
 struct ResolvedOwnership {
@@ -295,6 +298,8 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                                               : parentResolved.geoIgnoreMalformed;
   r.geoIgnoreZValue = def.ignore_z_value ? def.ignore_z_value
                                          : parentResolved.geoIgnoreZValue;
+  r.bm25K1 = def.k1 ? def.k1 : parentResolved.bm25K1;
+  r.bm25B = def.b ? def.b : parentResolved.bm25B;
   return r;
 }
 
@@ -451,6 +456,20 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
                       name + ")");
   }
+  bool scored = r.type == FieldClass::TEXT || r.type == FieldClass::STRING || r.type == FieldClass::ID;
+  if (def.k1 && !scored) {
+    throw SchemaError("k1 is only valid for text, string or id fields (field: " + name + ")");
+  }
+  if (def.b && r.type != FieldClass::TEXT) {
+    throw SchemaError("b is only valid for text fields; other fields have no length norms (field: " +
+                      name + ")");
+  }
+  if (def.k1 && !(std::isfinite(*def.k1) && *def.k1 >= 0.0f)) {
+    throw SchemaError("k1 must be finite and >= 0 (field: " + name + ")");
+  }
+  if (def.b && !(*def.b >= 0.0f && *def.b <= 1.0f)) {
+    throw SchemaError("b must be in [0, 1] (field: " + name + ")");
+  }
 }
 
 // Reserved-field invariants.  "id" and "_version_" are operationally hard-coded
@@ -482,7 +501,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field '_version_' cannot be multi-valued");
       if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
           || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
-          || r.longTerms || logical.defaults) {
+          || r.longTerms || r.bm25K1 || r.bm25B || logical.defaults) {
         throw SchemaError("reserved field '_version_' is retrieval-only and cannot be configured");
       }
     } else if (r.hasType && r.type == FieldClass::ID) {
@@ -726,6 +745,8 @@ struct FieldCompiler {
       case LongTerms::TRUNCATE: ft->longTerms = TermPolicy::TRUNCATE; break;
       case LongTerms::REJECT: ft->longTerms = TermPolicy::REJECT; break;
     }
+    if (r.bm25K1) ft->bm25.k1 = *r.bm25K1;
+    if (r.bm25B) ft->bm25.b = *r.bm25B;
     if (r.isTemplate) ft->flags_ |= FieldType::ABSTRACT;
     // Apply any resolved storedResource_ override; empty means "keep default".
     if (!derived && !logical.storedResource.empty()) ft->storedResource_ = logical.storedResource;

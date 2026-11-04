@@ -383,7 +383,12 @@ public:
         }
       }
       if (anyTerm && docCount > 0) {
-        Similarity similarity;
+        // Fields of a group share one parameter set; the builder groups by it.
+        Bm25Params params;
+        for (auto* info : fieldInfos) {
+          if (info != nullptr) { params = info->bm25; break; }
+        }
+        Similarity similarity(params);
         float idf = similarity.idf(termStats.docFreq, docCount);
         float avgdl = (float)(sumTotalTermFreq / (double)docCount);
         // Keep membership even with empty statistics or float overflow from
