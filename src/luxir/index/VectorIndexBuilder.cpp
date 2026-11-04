@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -47,16 +49,19 @@ float amplitudeUp(double value) {
   return result < value ? std::nextafter(result, INFINITY) : result;
 }
 
-float computeAmplitude(const float* x, const float* centroid,
-                       const uint8_t* code, int32_t dims, int32_t bits,
-                       faiss::MetricType metric) {
-  using namespace faiss::rabitq_utils;
-  if (bits == 1) {
-    auto factors = compute_vector_factors(x, (size_t)dims, centroid, metric, true);
-    // FAISS folds its confidence constant and the L2 factor of two into f_error.
-    return amplitudeUp((double)factors.f_error / 1.9f);
-  }
+// RaBitQ's sign-code error scale before its confidence constant:
+// ||r|| * tan(angle(r, sign code)) / sqrt(d - 1), doubled for L2. absSum is the
+// L1 norm of r. FAISS's f_error is this times 1.9, but zero once absSum is below
+// 2 * FLT_EPSILON, which is not negligible for small-magnitude data.
+double nearCentroidSigma1(double norm2, double absSum, int32_t dims, faiss::MetricType metric) {
+  if (absSum <= 0) return 0;
+  double tan2 = std::max(0.0, norm2 * dims / (absSum * absSum) - 1);
+  return (metric == faiss::METRIC_L2 ? 2 : 1) * std::sqrt(norm2 * tan2 / std::max(1, dims - 1));
+}
 
+float multiBitAmplitude(const float* x, const float* centroid, const uint8_t* code,
+                        int32_t dims, int32_t bits, faiss::MetricType metric) {
+  using namespace faiss::rabitq_utils;
   int32_t extraBits = bits - 1;
   const uint8_t* extra = code + (dims + 7) / 8 + sizeof(SignBitFactorsWithError);
   ExtraBitsFactors full;
@@ -307,6 +312,32 @@ size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)4 * 1024 * 1024 *
 std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
+
+float VectorIndexBuilder::finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
+                                           int32_t dims, int32_t bits, faiss::MetricType metric) {
+  using namespace faiss::rabitq_utils;
+  float norm2, xNorm2, absSum;
+  compute_vector_intermediate_values(x, (size_t)dims, centroid, norm2, xNorm2, absSum);
+  // FAISS folds its confidence constant and the L2 factor of two into f_error.
+  double sigma1 = (double)compute_factors_from_intermediates(
+      norm2, xNorm2, absSum, (size_t)dims, metric, true).f_error / 1.9f;
+  // Below FLT_EPSILON FAISS replaces 1 / ||r|| with 1 but keeps multiplying by
+  // the real ||r||, so dp_multiplier comes out near 1 / cos(angle) instead of
+  // ||r|| / cos(angle) and the code scores as if its residual had unit length.
+  // At and above the threshold the FAISS value equals this formula, so the
+  // estimator is continuous. The extra-bit factors have no such branch.
+  if (norm2 < std::numeric_limits<float>::epsilon()) {
+    uint8_t* factors = code + (dims + 7) / 8;
+    float multiplier = absSum > 0 ? (float)((double)norm2 * std::sqrt((double)dims) / absSum) : 0;
+    std::memcpy(factors + offsetof(SignBitFactors, dp_multiplier), &multiplier, sizeof(multiplier));
+    sigma1 = nearCentroidSigma1(norm2, absSum, dims, metric);
+    if (bits > 1) {
+      float fError = amplitudeUp(sigma1 * 1.9);
+      std::memcpy(factors + sizeof(SignBitFactors), &fError, sizeof(fError));
+    }
+  }
+  return bits == 1 ? amplitudeUp(sigma1) : multiBitAmplitude(x, centroid, code, dims, bits, metric);
+}
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -593,7 +624,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
                               codes.data() + (size_t)begin * codeBytes, /*include_listnos=*/true);
         if (rabitq) {
           for (int64_t row = 0; row < count; row++) {
-            amplitudes[(size_t)(index->ntotal + begin + row)] = computeAmplitude(
+            amplitudes[(size_t)(index->ntotal + begin + row)] = finishRaBitQCode(
                 x + row * dims, flat->get_xb() + listNos[row] * dims,
                 codes.data() + (size_t)(begin + row) * codeBytes + index->coarse_code_size(),
                 dims, rabitqBits, metric);

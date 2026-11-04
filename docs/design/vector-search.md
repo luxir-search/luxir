@@ -347,6 +347,24 @@ reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
 for squared L2. Sigma1 removes FAISS's fixed 1.9 confidence multiplier from
 its error factor. These amplitudes support empirical confidence intervals;
 they are not deterministic error bounds. The reader exposes a mmap view.
+
+The same step corrects near-centroid sign factors. Below a squared residual of
+`FLT_EPSILON`, FAISS 1.14.3 substitutes 1 for `1 / ||r||` while still
+multiplying by the real `||r||`, so `dp_multiplier` is about `1 / cos(angle)`
+instead of `||r|| / cos(angle)`. The code then scores as if its residual had
+unit length, with an error term near zero. That happens to a vector that almost
+equals its centroid (duplicates, singleton lists, rounding of a normalized
+centroid), and to every code in a list when the data itself has a small
+magnitude under L2. An interval built from such a code is a false witness: it
+can lift the floor above true neighbors and prune them, at any probe count.
+`VectorIndexBuilder::finishRaBitQCode` overwrites these codes with the
+unguarded formula, `||r||^2 * sqrt(D) / sum(|r_i|)`, plus f_error for multi-bit
+codes. That equals the FAISS value at and above the threshold, so the estimator
+has no discontinuity there and the codes keep the same empirical error rate as
+any other. Their error scale is recomputed the same way, because the FAISS
+f_error is zero when `sum(|r_i|)` is below `2 * FLT_EPSILON`. The extra-bit
+factors have no such defect: they zero out only below a norm of 1e-10, so at
+multiple bits the bad factor could only affect the 1-bit gate.
 The reader validates finite, non-negative amplitudes once at open and exposes
 per-list spans for sequential, unchecked scan loads. Metadata and footer
 version 3 validate the component count and file size;
