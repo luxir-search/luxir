@@ -11,6 +11,7 @@ revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.js
 the same manifest, and the same overlay ports. Native dependencies are installed
 in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 
+The native workflow runs on Linux x86-64 and ARM64 hosts and on Apple silicon.
 For a Linux ARM64 executable built on an x86-64 host,
 use the [ARM64 cross-build workflow](arm64-build.md).
 
@@ -82,7 +83,8 @@ Build both native dependency variants:
 
 The script fetches pinned FastPFOR sources, checks the vcpkg revision, and installs
 the manifest sequentially with `x64-linux-luxir-native` and
-`x64-linux-luxir-native-asan`. Dependency build jobs default to what the cores
+`x64-linux-luxir-native-asan` (`arm64-linux-luxir-native*` on ARM64 Linux).
+Dependency build jobs default to what the cores
 and memory allow (`tools/build-jobs`); `VCPKG_MAX_CONCURRENCY` overrides
 that. Both variants include
 Debug and Release libraries. ASan uses unsanitized host tools from the
