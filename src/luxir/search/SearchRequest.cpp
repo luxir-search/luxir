@@ -22,7 +22,6 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
           .maxExpansions = searchConfig.multiterm_max_expansions,
           .maxTermsExamined = searchConfig.multiterm_max_terms_examined,
           .maxPostings = searchConfig.multiterm_max_postings,
-          .minPrefixLength = searchConfig.multiterm_min_prefix_length,
       }),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),

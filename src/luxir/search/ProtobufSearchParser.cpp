@@ -229,6 +229,16 @@ public:
         req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
   }
 
+  // All request parse paths share the operator rules and field resolver.
+  ParseContext createParseContext(std::string_view name) {
+    ParseContext parseContext{req.requestPool, *req.schema, req.arena,
+        coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
+    parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
+    parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
+    return parseContext;
+  }
+
   CoerceContext coerceContext(const TimeZone& zone) const {
     return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags)};
   }
@@ -240,11 +250,7 @@ public:
     rootOp.parent = nullptr;
     rootOp.flags = options.flags;
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone),
-      "root", &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext("root");
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
       rootOp.planning = createPlanningContext();
@@ -335,11 +341,7 @@ public:
         ? (listFilters ? listFilters : &static_cast<TopDocsReq&>(currOp).filters) : nullptr;
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
-      ParseContext context{req.requestPool, *req.schema, req.arena,
-          coerceContext(*req.timeZone),
-          currOp.name, &req.warnings, &fields, &req.engine.getNode()};
-      context.collapse = enclosingCollapse;
-      context.reader = req.reader.get();
+      auto context = createParseContext(currOp.name);
       auto domains = parseChildDomains(ops, context);
       if (!domains.empty()) {
         std::vector<Query*> filters;
@@ -489,12 +491,7 @@ public:
           plan = prepared->second;
           preparedFacets.erase(prepared);
         } else {
-          ParseContext parseContext{
-            req.requestPool, *req.schema, req.arena,
-            coerceContext(*req.timeZone),
-            name, &req.warnings, &fields, &req.engine.getNode()};
-          parseContext.collapse = enclosingCollapse;
-          parseContext.reader = req.reader.get();
+          auto parseContext = createParseContext(name);
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -1328,7 +1325,8 @@ public:
       try {
         plan.bucketQueries[i] = parser.parse(*bucket.query);
       } catch (const std::runtime_error& error) {
-        throw std::runtime_error("facet '" + std::string(facetName)
+        auto info = classifyException(error, ErrorKind::INVALID_REQUEST);
+        throw ApiError(info.kind, info.code, "facet '" + std::string(facetName)
             + "': query_facet bucket '" + std::string(bucket.name)
             + "': " + error.what());
       }
@@ -1649,11 +1647,7 @@ public:
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
     }
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -2260,11 +2254,7 @@ public:
       : PluginOpContext(parser.req, name, proto,
                         ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
         parser(parser), depth(depth),
-        context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
-                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings,
-                &parser.fields, &parser.req.engine.getNode()) {
-      context.collapse = parser.enclosingCollapse;
-      context.reader = parser.req.reader.get();
+        context(parser.createParseContext(name)) {
     }
 
     ParseContext& parseContext() override { return context; }
@@ -2434,11 +2424,7 @@ public:
       sourceWeights.push_back(weights[i]);
     }
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");

@@ -176,21 +176,24 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
 
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix,
                                    prefixQuery.max_expansions, prefixQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern,
                                      wildcardQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createRegexQuery(regexQuery.field, regexQuery.pattern,
                                   regexQuery.case_insensitive);
 }

@@ -125,6 +125,7 @@ class QueryBuilder {
   CoerceContext coerceContext;
   std::string_view opName;
   std::vector<api::Warning>* warnings;
+  int32_t minLiteralPrefix;
 
   // Per-codepoint approximation of field folding for automaton literals.
   // Combining-sequence patterns may not compose exactly like whole terms.
@@ -380,10 +381,10 @@ public:
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
                std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
-               IndexReader* reader = nullptr)
+               IndexReader* reader = nullptr, int32_t minLiteralPrefix = 0)
     : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
-      warnings(warnings) {}
+      warnings(warnings), minLiteralPrefix(minLiteralPrefix) {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
@@ -590,11 +591,13 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
+        prefix = normalizeLiteral(target, prefix, false);
+        checkLiteralPrefix("Prefix", field, prefix, prefix.size());
         if (caseInsensitive) {
           return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field,
-                                         normalizeLiteral(target, prefix, false), 1.0f, maxExpansions);
+                                         prefix, 1.0f, maxExpansions);
         }
-        return pool.make<PrefixQuery>(field, normalizePrefix(target, prefix), maxExpansions);
+        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix), maxExpansions);
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
@@ -611,16 +614,8 @@ public:
   Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern,
                              bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
-    checkAutomatonField("Wildcard", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
-          caseInsensitive, compilePattern("Wildcard", target, pattern, &folder, caseInsensitive,
-                                          automaton::compileWildcard));
-    }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
-        caseInsensitive, compilePattern("Wildcard", target, pattern, nullptr, caseInsensitive,
-                                        automaton::compileWildcard));
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern, caseInsensitive,
+        compileQueryPattern("Wildcard", target, pattern, caseInsensitive, automaton::compileWildcard));
   }
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern,
@@ -633,21 +628,14 @@ public:
                           bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, field, pattern, caseInsensitive,
-                              compileRegexPattern(target, pattern, caseInsensitive));
+                              compileQueryPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex));
   }
 
   // A regex compiled as createRegexQuery compiles it, for callers that test
   // terms themselves.
   TermPattern compileRegexPattern(const ResolvedFieldHandle& target, std::string_view pattern,
                                   bool caseInsensitive = false) {
-    checkAutomatonField("Regex", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return compilePattern("Regex", target, pattern, &folder, caseInsensitive,
-                            automaton::compileRegex);
-    }
-    return compilePattern("Regex", target, pattern, nullptr, caseInsensitive,
-                          automaton::compileRegex);
+    return compileFieldPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex);
   }
 
   // A prefix normalized and fitted as createPrefixQuery matches it.
@@ -657,6 +645,40 @@ public:
   }
 
 private:
+  void checkLiteralPrefix(std::string_view kind, std::string_view field,
+                         std::string_view pattern, size_t length) const {
+    if (minLiteralPrefix <= 0 || length >= (size_t) minLiteralPrefix) return;
+    throw ResourceExhaustedError(std::format(
+        "{} query '{}' on field '{}' needs a literal prefix of at least {} bytes; use a longer literal prefix",
+        kind, pattern, field, minLiteralPrefix), "pattern_prefix_too_short");
+  }
+
+  TermPattern compileFieldPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    checkAutomatonField(label, target);
+    auto* chain = fields.chain(target);
+    FieldCodepointFolder folder(chain);
+    const automaton::CodepointFolder* folding = chain ? &folder : nullptr;
+    return compilePattern(label, target, pattern, folding, caseInsensitive, compile);
+  }
+
+  TermPattern compileQueryPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    auto compiled = compileFieldPattern(label, target, pattern, caseInsensitive, compile);
+    if (minLiteralPrefix > 0
+        && compiled.dfa.maxAcceptedLength() == automaton::ByteDfaView::UNBOUNDED) {
+      auto length = caseInsensitive
+          ? compileFieldPattern(label, target, pattern, false, compile).dfa.commonPrefixAndState().first.size()
+          : compiled.dfa.commonPrefixAndState().first.size();
+      checkLiteralPrefix(label, target.physicalName, pattern, length);
+    }
+    return compiled;
+  }
+
   FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;

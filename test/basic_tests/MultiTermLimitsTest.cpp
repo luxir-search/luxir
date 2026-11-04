@@ -59,11 +59,10 @@ TEST_F(MultiTermLimitsTest, serverDefaultsMatchBudgetDefaults) {
   EXPECT_EQ(0, limits.maxExpansions);
   EXPECT_EQ(0, limits.maxTermsExamined);
   EXPECT_EQ(0, limits.maxPostings);
-  EXPECT_EQ(0, limits.minPrefixLength);
+  EXPECT_EQ(0, search.multiterm_min_prefix_length);
   EXPECT_EQ(limits.maxExpansions, search.multiterm_max_expansions);
   EXPECT_EQ(limits.maxTermsExamined, search.multiterm_max_terms_examined);
   EXPECT_EQ(limits.maxPostings, search.multiterm_max_postings);
-  EXPECT_EQ(limits.minPrefixLength, search.multiterm_min_prefix_length);
 }
 
 TEST_F(MultiTermLimitsTest, completeExpansionRejectedAtServerCap) {
@@ -178,34 +177,75 @@ TEST_F(MultiTermLimitsTest, termsExaminedBudgetIsRequestWide) {
   EXPECT_EQ("too_many_terms_examined", both->errorCode());
 }
 
-TEST_F(MultiTermLimitsTest, shortPrefixScanRejectedBeforeScanning) {
-  LuxirNode node(config(1000, 40));
+TEST_F(MultiTermLimitsTest, minLiteralPrefixChecksOnlyThePattern) {
+  struct Pattern { const char* json; bool allowed; };
+  for (int minimum : {0, 2}) {
+    LuxirNode node(config(0, 0, minimum));
+    CollectionHelper helper(node);
+    for (bool populated : {false, true}) {
+      if (populated) {
+        ASSERT_TRUE(helper.index(flatdoc("id", "one", "tag_s", "abc"), UpdateMessage::COMMIT).success);
+      }
+      for (auto [query, allowed] : {
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"*abc*"}})json", false},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":".*abc"}})json", false},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"a*"}})json", false},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"*"}})json", false},
+          Pattern{R"json({"prefix":{"field":"tag_s","prefix":"a"}})json", false},
+          Pattern{R"json({"prefix":{"field":"tag_s","prefix":"a","max_expansions":1}})json", false},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"(dune|kings)"}})json", true},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"a(b|c)"}})json", true},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"abc"}})json", true},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"abc"}})json", true},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"ab*"}})json", true},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"ab.*"}})json", true},
+          Pattern{R"json({"prefix":{"field":"tag_s","prefix":"ab"}})json", true},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"Ab*","case_insensitive":true}})json", true},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"Ab.*","case_insensitive":true}})json", true},
+          Pattern{R"json({"prefix":{"field":"tag_s","prefix":"Ab","case_insensitive":true}})json", true},
+          Pattern{R"json({"wildcard":{"field":"tag_s","pattern":"a*","case_insensitive":true}})json", false},
+          Pattern{R"json({"regex":{"field":"tag_s","pattern":"a.*","case_insensitive":true}})json", false},
+          Pattern{R"json({"prefix":{"field":"tag_s","prefix":"a","case_insensitive":true}})json", false}}) {
+        SCOPED_TRACE(query);
+        auto req = localReq(helper.getSearchEngine());
+        auto json = std::format(R"({{"query":{},"limit":0,"count_limit":-1}})", query);
+        parseQueryRequest(api::build::arenaStr(req->mr, json), req->rawRequest(), req->mr);
+        req->collection("main").execute(false);
+        EXPECT_EQ(minimum == 0 || allowed, req->ok()) << req->errorMsg();
+        if (minimum != 0 && !allowed) {
+          EXPECT_EQ("pattern_prefix_too_short", req->errorCode());
+          EXPECT_NE(std::string::npos, req->errorMsg().find("at least 2 bytes"));
+          EXPECT_EQ(0, req->multiTermBudget.termsExamined());
+        }
+      }
+    }
+    for (int pass = 0; pass < 3; pass++) {
+      for (auto pattern : {"a*", "ab*"}) {
+        auto req = localReq(helper.getSearchEngine());
+        req->topDocs("q").allQuery().filter(qb::wildcard(req->mr, "tag_s", pattern)).countLimit();
+        req->execute(false);
+        EXPECT_EQ(minimum == 0 || std::string_view(pattern) == "ab*", req->ok()) << req->errorMsg();
+        if (!req->ok()) { EXPECT_EQ("pattern_prefix_too_short", req->errorCode()); }
+      }
+    }
+    auto facet = localReq(helper.getSearchEngine());
+    auto json = R"({"query":{"all":true},"ops":{"b":{"query_facet":{"buckets":{"short":{"prefix":{"field":"tag_s","prefix":"a"}}}}}}})";
+    parseQueryRequest(api::build::arenaStr(facet->mr, json), facet->rawRequest(), facet->mr);
+    facet->collection("main").execute(false);
+    EXPECT_EQ(minimum == 0, facet->ok()) << facet->errorMsg();
+    if (!facet->ok()) { EXPECT_EQ("pattern_prefix_too_short", facet->errorCode()); }
+  }
+}
+
+TEST_F(MultiTermLimitsTest, facetTermFilterIsExemptFromMinLiteralPrefix) {
+  LuxirNode node(config(0, 0, 5));
   CollectionHelper helper(node);
-  indexTerms(helper);
-
-  // No literal prefix and an unbounded language: the whole 100-term
-  // dictionary is the cost, more than the 40-term budget.
-  auto leading = localReq(helper.getSearchEngine());
-  leading->collection("main").topDocs("q").regexQuery("tag_s", ".*5");
-  leading->execute(false);
-  EXPECT_FALSE(leading->ok());
-  EXPECT_EQ("pattern_prefix_too_short", leading->errorCode());
-  EXPECT_NE(leading->errorMsg().find("must scan 100 dictionary terms"),
-            std::string::npos) << leading->errorMsg();
-
-  // A finite language seeks term by term, so it needs no literal prefix.
-  auto finite = localReq(helper.getSearchEngine());
-  finite->collection("main").topDocs("q").regexQuery("tag_s", "(t001|t042)").limit(10);
-  finite->execute();
-  ASSERT_TRUE(finite->ok()) << finite->errorMsg();
-  EXPECT_EQ(2u, finite->getDocs().size());
-
-  // With a literal prefix the scan runs, bounded by the budget as it goes.
-  auto prefixed = localReq(helper.getSearchEngine());
-  prefixed->collection("main").topDocs("q").wildcardQuery("tag_s", "t09*5").limit(10);
-  prefixed->execute();
-  ASSERT_TRUE(prefixed->ok()) << prefixed->errorMsg();
-  EXPECT_EQ(1u, prefixed->getDocs().size());
+  ASSERT_TRUE(helper.index(flatdoc("id", "one", "tag_s", "abc"), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  auto json = R"({"query":{"all":true},"ops":{"f":{"field_facet":{"field":"tag_s","term_filter":{"regex":"a.*"}}}}})";
+  parseQueryRequest(api::build::arenaStr(req->mr, json), req->rawRequest(), req->mr);
+  req->collection("main").execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
 }
 
 TEST_F(MultiTermLimitsTest, fuzzyExpansionSharesTheBudget) {

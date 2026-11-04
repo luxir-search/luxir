@@ -183,6 +183,7 @@ struct SearchConfig {
   int32_t multiterm_max_expansions = 0;
   int64_t multiterm_max_terms_examined = 0;
   int64_t multiterm_max_postings = 0;
+  // Pattern-only minimum literal prefix for unbounded prefix/wildcard/regex.
   int32_t multiterm_min_prefix_length = 0;
 };
 

@@ -40,8 +40,6 @@ private:
   automaton::ByteDfaKind classification;
   std::string_view exactOrPrefix;
   DfaScanPlan scanPlan;
-  // The language is infinite, so a scan is bounded only by its literal prefix.
-  bool unboundedLanguage;
   // The field's long-term policy for a general pattern on a field that can
   // hold fitted (hashed or truncated) long values, whose discarded bytes the
   // pattern cannot see; nullopt means no warning applies.
@@ -56,8 +54,6 @@ public:
         caseInsensitive(caseInsensitive), pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan),
-        unboundedLanguage(classification == automaton::ByteDfaKind::NORMAL
-            && dfa.maxAcceptedLength() == automaton::ByteDfaView::UNBOUNDED),
         fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
@@ -73,11 +69,6 @@ public:
     value = mixHash(value, field);
     value = mixHash(value, pattern);
     return maxExpansions > 0 ? mixHash(value, maxExpansions) : value;
-  }
-
-  std::optional<std::string_view> unboundedScanPrefix() const override {
-    if (!unboundedLanguage) return std::nullopt;
-    return scanPlan.prefix;
   }
 
   std::string describe() const override {

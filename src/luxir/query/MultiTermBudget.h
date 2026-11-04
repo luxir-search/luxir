@@ -33,10 +33,6 @@ struct MultiTermLimits {
   // Estimate: summed docFreq of selected terms, not decoded postings.
   // Fuzzy scored rewrites do not count toward this limit.
   int64_t maxPostings = 0;
-  // A pattern with an unbounded language and fewer literal leading bytes than
-  // this is costed as a scan of its whole literal-prefix range, and rejected
-  // before scanning when that range is larger than the remaining budget.
-  int32_t minPrefixLength = 0;
 };
 
 // Request-wide dictionary work allowance shared by every multi-term query in
@@ -44,17 +40,9 @@ struct MultiTermLimits {
 // atomic and report work after use. The outcome depends only on the total,
 // not scheduling; work can pass a limit by at most one slice per concurrent scan.
 class MultiTermBudget : public ScanAllowance {
-  static constexpr int64_t UNLIMITED = std::numeric_limits<int64_t>::max();
-
   MultiTermLimits limits;
   std::atomic<int64_t> examined{0};
   std::atomic<int64_t> postings{0};
-
-  static int64_t remaining(int64_t limit, const std::atomic<int64_t>& used) {
-    if (limit <= 0) return UNLIMITED;
-    return std::max<int64_t>(0, limit - used.load(std::memory_order_relaxed));
-  }
-
 
 public:
   explicit MultiTermBudget(MultiTermLimits limits = {}) : limits(limits) {}
@@ -65,10 +53,6 @@ public:
   int32_t maxExpansions() const noexcept {
     return limits.maxExpansions > 0 ? limits.maxExpansions
                                     : std::numeric_limits<int32_t>::max();
-  }
-
-  int64_t remainingTermsExamined() const noexcept {
-    return remaining(limits.maxTermsExamined, examined);
   }
 
   int64_t termsExamined() const noexcept {
@@ -124,18 +108,6 @@ public:
                     "to keep only its most frequent terms",
                     what, maxExpansions(), maxExpansions()),
         "too_many_expansions");
-  }
-
-  [[noreturn]] void throwShortPrefix(
-      std::string_view what, size_t prefixLength, int64_t rangeTerms) const {
-    throw ResourceExhaustedError(
-        std::format("{} is open-ended with a {}-byte literal prefix (under "
-                    "the {}-byte minimum), so it must scan {} dictionary "
-                    "terms, more than the {} the request has left; start the "
-                    "pattern with a longer literal prefix",
-                    what, prefixLength, limits.minPrefixLength, rangeTerms,
-                    remainingTermsExamined()),
-        "pattern_prefix_too_short");
   }
 };
 

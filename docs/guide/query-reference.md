@@ -420,15 +420,16 @@ nothing.
 | `too_many_expansions` | A query expands more terms in one segment than the configured cap. A merge can change whether the query passes. |
 | `too_many_terms_examined` | Dictionary scans, matching or not, exceed the request-wide configured visit limit, including fuzzy scans and refills. |
 | `too_many_expansion_postings` | The summed docFreq of selected terms exceeds the configured request-wide estimate limit. This counts estimated postings, not postings decoded; fuzzy's scored rewrite does not count toward it. |
-| `pattern_prefix_too_short` | An open-ended wildcard or regex (for example `*abc*` or `.*abc`) has fewer literal leading bytes than the server minimum, and the terms under that prefix already exceed the request's remaining scan budget. It is rejected before it scans anything. |
+| `pattern_prefix_too_short` | An unbounded prefix, wildcard, or regex query has fewer literal leading bytes than the configured minimum. This rule looks only at the normalized pattern, never the index or cache. A type-ahead endpoint using N rejects keystrokes shorter than N. |
 
-A prefix query that sets
-`max_expansions` keeps at most that many terms per segment. The selected count
-is subject to any configured `too_many_expansions` cap, and its scan counts
-toward any configured terms-examined budget. `any_of` term lists are not capped by term count,
-because the request already lists every term. Finite patterns such as `(dune|kings)` need no
-literal prefix: they seek directly to each term. See
-[Operations](operations.md) for the server settings.
+A prefix query with `max_expansions` keeps at most that many terms per segment.
+The selected count is subject to any configured `too_many_expansions` cap, and
+its scan counts toward any configured terms-examined budget. `any_of` term
+lists are not capped by term count because the request already lists every
+term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
+prefix rule. Case-insensitive matching does not shorten the measured literal.
+Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
+See [Operations](operations.md) for the server settings.
 
 ## Constant score and boost
 

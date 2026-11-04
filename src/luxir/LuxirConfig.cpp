@@ -291,8 +291,8 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-min-prefix-length",
                  search.multiterm_min_prefix_length,
-                 "Literal leading bytes below which an open-ended wildcard/regex "
-                 "is costed as a scan of its whole prefix range; operator opt-in (0 = off, default)")
+                 "Pattern-only minimum literal prefix in bytes for unbounded prefix/wildcard/regex; "
+                 "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
       ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
 }

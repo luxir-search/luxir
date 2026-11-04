@@ -734,9 +734,10 @@ Search has its own limits:
     multi-term and fuzzy scans, including refills, whether matching or not.
   - `search.multiterm-max-postings`: request-wide estimate, the summed docFreq of
     selected terms, not postings decoded. Fuzzy's scored rewrite is excluded.
-  - `search.multiterm-min-prefix-length`: an open-ended wildcard or regex with
-    fewer literal leading bytes is costed as a scan of every term under its
-    prefix, and rejected when that exceeds the remaining request budget.
+  - `search.multiterm-min-prefix-length`: pattern-only minimum literal prefix in
+    bytes for unbounded prefix, wildcard, and regex queries. Finite languages
+    are exempt. It never consults the index or cache. A type-ahead endpoint
+    using N rejects keystrokes shorter than N. Default `0` disables the rule.
 - `multi_match` field lists containing patterns may resolve to at most `64`
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
