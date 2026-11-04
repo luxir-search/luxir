@@ -25,12 +25,14 @@ struct KnnPlanner {
   enum Unit { EXACT_DIM, TERMINAL_DIM, TERMINAL_READ, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
-              PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD, NUM_UNITS };
+              PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD,
+              SCORER_DIM, SCORER_LIST_DIM, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
-    "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words"};
+    "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words",
+    "scorer_dims", "scorer_list_dims"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
     // Forced-arm fit after selector devirtualization, munin at 3.3 GHz:
@@ -42,13 +44,22 @@ struct KnnPlanner {
     // fold words and entry-none. PQ_LIST_SETUP counts precomputed L2 lists x subquantizers.
     // PQ_TABLE_DIM is seeded at EXACT_DIM cost, not fitted.
     // Open: IVF_REQUEST's shared 180.6 us remains unexplained by profiles.
+    // ONE_BIT_DIM and RABITQ_LIST_DIM price FAISS's distance computer, which
+    // extended codes keep. SCORER_* price RaBitQScorer on 1-bit codes. They are
+    // not a munin refit but those two values scaled by the scorer's ratio to the
+    // computer on one machine at 768 dims and 4 query bits: 0.75x per code and
+    // 0.055x per list, from forced full scans of Cohere 1M at nlist 1000 and 4000.
+    // Forced filtered IVF at 0.1-30% selectivity then predicts 1.43x actual, where
+    // the computer predicted 1.56x. Its selector test does not branch, so the
+    // scorer pays no ENTRY_MISPREDICT.
     static constexpr double NS_PER_DIM = 0.135;
     Work units{1, 0.281 / NS_PER_DIM, 227 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
                1, 1.01 / NS_PER_DIM, 2.23 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
                9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.45 / NS_PER_DIM, 0,
                0.0297 / NS_PER_DIM, 0.218 / NS_PER_DIM, 39.7 / NS_PER_DIM, 1, 18.3 / NS_PER_DIM,
                0.1125 / NS_PER_DIM, 25000 / NS_PER_DIM, 180600 / NS_PER_DIM,
-               4.49 / NS_PER_DIM, 0.5 / NS_PER_DIM};
+               4.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
+               0.0224 / NS_PER_DIM, 1.0 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
@@ -129,6 +140,8 @@ struct KnnPlanner {
     return std::clamp(std::max(fraction, request.minScanFraction), 0.0, 1.0);
   }
   static double arraySteps(int64_t card) { return (double)std::bit_width((uint64_t)std::max((int64_t)1, card)); }
+  // The planner assumes the default query bits, which select RaBitQScorer.
+  static bool usesScorer(const Segment& s) { return s.codec == Codec::RABITQ && s.rabitqBits <= 1; }
   static bool canIvf(const Segment& s) {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
   }
@@ -193,7 +206,7 @@ struct KnnPlanner {
     // Both resolve and folded selectors pay these terms. They cancel in
     // the round-one selector crossover; allocator liveness probes do not.
     if (s.codec == Codec::PQ && (!s.unfiltered || s.deletes)) p.linear[ENTRY_PQ] = (double)s.vectors;
-    p.linear[ENTRY_MISPREDICT] = mispredicts((double)s.vectors, (double)s.eligibleVectors);
+    p.linear[ENTRY_MISPREDICT] = usesScorer(s) ? 0 : mispredicts((double)s.vectors, (double)s.eligibleVectors);
     if (s.deletes) {
       // Allocation probes physical ids for liveness too. Allow one extra
       // head list for nextFraction's lookahead at the round boundary.
@@ -204,13 +217,15 @@ struct KnnPlanner {
       p.linear[PQ_SUBCODE] = (double)s.eligibleVectors * s.pqM;
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
     } else {
-      p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
-      if (s.rabitqBits > 1) p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
+      if (s.rabitqBits > 1) {
+        p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
+        p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
+      } else p.linear[SCORER_DIM] = (double)s.eligibleVectors * s.dims;
     }
     if (s.codec == Codec::PQ) {
       p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
       p.linear[PQ_TABLE_DIM] = s.pqPerListTable ? (double)s.nlist * (1 << s.pqBits) * s.dims : 0;
-    } else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
+    } else p.linear[s.rabitqBits > 1 ? RABITQ_LIST_DIM : SCORER_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
     p.a = costs.price(p.linear);
     p.b = costs.price(p.fixed);
@@ -432,16 +447,16 @@ struct KnnPlanner {
     f[ENTRY_NONE] = (double)w.selectorNone; f[ENTRY_BITMAP] = (double)(w.selectorBitmap + w.allocatorEntries);
     if (s.codec == Codec::PQ)
       f[ENTRY_PQ] = (double)(w.selectorBitmap + w.resolveIdentity + w.resolveSelect + w.resolveMono);
-    f[ENTRY_MISPREDICT] = mispredicts((double)w.physicalEntries, (double)w.selectorPasses);
+    f[ENTRY_MISPREDICT] = usesScorer(s) ? 0 : mispredicts((double)w.physicalEntries, (double)w.selectorPasses);
     f[RESOLVE_IDENTITY] = (double)w.resolveIdentity; f[RESOLVE_SELECT] = (double)w.resolveSelect;
     f[RESOLVE_MONO] = (double)w.resolveMono;
     f[BIT_PROBE] = (double)w.bitProbes; f[ARRAY_STEP] = (double)w.arraySteps;
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
-    f[ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
+    f[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
     f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;
     f[PQ_TABLE_DIM] = s.codec == Codec::PQ && s.pqPerListTable ? (double)w.listSetups * (1 << s.pqBits) * s.dims : 0;
-    f[RABITQ_LIST_DIM] = s.codec == Codec::RABITQ ? (double)w.listSetups * s.dims : 0;
+    if (s.codec == Codec::RABITQ) f[usesScorer(s) ? SCORER_LIST_DIM : RABITQ_LIST_DIM] = (double)w.listSetups * s.dims;
     f[FOLD_DOC] = (double)w.foldDocs; f[FOLD_WORD] = (double)w.foldWords;
     f[COARSE_DIM] = (double)w.coarseDims; f[ROUND] = (double)w.ivfRounds;
     return f;

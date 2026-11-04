@@ -436,6 +436,12 @@ target_compile_definitions(luxir_lib PUBLIC
 
 add_executable(luxir src/luxir/main.cpp)
 target_link_libraries(luxir PRIVATE luxir_lib)
+# Its estimates must round as FAISS's do; see the file's header. Precompiled
+# headers are built without this option.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/luxir/query/RaBitQScorer.cpp PROPERTIES
+    COMPILE_OPTIONS "-ffp-contract=off" SKIP_PRECOMPILE_HEADERS ON)
+endif()
 set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
   COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${_luxir_cpu_name}\"")
 # Declare the executable's baseline, without marking optional dependency kernels

@@ -166,7 +166,13 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   EXPECT_EQ(plan.prices[0].linear[KnnPlanner::RABITQ_LIST_DIM], 0);
   segments[0].codec = KnnPlanner::Codec::RABITQ;
   auto price = KnnPlanner::price(segments[0], req, costs);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_LIST_DIM], 256 * 128);
+  EXPECT_EQ(price.linear[KnnPlanner::RABITQ_LIST_DIM], 0);
+  segments[0].rabitqBits = 2;
+  price = KnnPlanner::price(segments[0], req, costs);
   EXPECT_EQ(price.linear[KnnPlanner::RABITQ_LIST_DIM], 256 * 128);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_LIST_DIM], 0);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_DIM], 0);
   EXPECT_EQ(price.exact[KnnPlanner::ROUND], 0);
   VectorSearchWork work;
   work.exactVectors = 10; work.seedReads = 3; work.remainingReads = 2; work.rounds = 1;
@@ -289,7 +295,7 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
       auto actual = KnnPlanner::actualWork(s, work);
       for (const auto& features : {price.linear, actual}) {
         EXPECT_EQ(codec == KnnPlanner::Codec::PQ && selector ? 100 : 0, features[KnnPlanner::ENTRY_PQ]);
-        EXPECT_DOUBLE_EQ(selector ? 9 : 0, features[KnnPlanner::ENTRY_MISPREDICT]);
+        EXPECT_DOUBLE_EQ(selector && !KnnPlanner::usesScorer(s) ? 9 : 0, features[KnnPlanner::ENTRY_MISPREDICT]);
         EXPECT_EQ(codec == KnnPlanner::Codec::PQ && l2 ? 12 : 0, features[KnnPlanner::PQ_LIST_SETUP]);
         EXPECT_EQ(0, features[KnnPlanner::IVF_REQUEST]); // Shared charge stays out of completion.
       }
