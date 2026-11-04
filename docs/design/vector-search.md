@@ -41,7 +41,9 @@ Explicit vector selectors also activate those concrete overlay names in the
 writer. That activation is process-local unless it produced a durable overlay
 entry. A commit that fails mid-build has no side effects: staged overlay files
 are deleted, no overlay entries are published, and no names are activated -
-the caller sees the error and decides whether to retry. Startup seeds active
+the caller sees the error and decides whether to retry. A selecting commit also
+records its selectors as in-flight when it captures its segments, for merges
+finishing during its build (see [Merging](#merging)). Startup seeds active
 names only from overlays already present in the commit manifest, so Luxir never treats
 intent-only state as a boot-time "must build" queue.
 
@@ -349,7 +351,26 @@ publishes the merged segment publishes its overlay entries atomically with the
 segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
-explicit build succeeds.
+explicit build succeeds or the segment merges again.
+
+A commit activates names only after its build succeeds, and that build can take
+long on a large corpus. A merge finishing in that window is not among the
+segments the commit captured, so it needs its own overlay. Before its swap, a
+merge whose output holds a field selected by the in-flight commit and not yet active waits
+for that commit to end. This delays nothing a query can see: commits are serial,
+so the output could not publish before the in-flight commit ended anyway. The
+wait parks the merge node, not the commit, and no commit waits for a merge in
+this phase. If the commit succeeded, the merge builds the overlay; if it failed,
+the output publishes without one, so a failed commit still leaves no overlay
+behind. The swap rechecks under the writer lock that activation and in-flight
+state are unchanged since the merge prepared, and prepares again otherwise. A
+merge swapping before the commit's capture is in the captured segments and gets
+its overlay from the commit. Commits repeating already active names cause no
+wait.
+
+Source segments that the commit captured still get overlays from it even when
+a merge is replacing them, because that commit publishes them. Those builds are
+discarded once the merged output publishes.
 
 ## Query Execution
 

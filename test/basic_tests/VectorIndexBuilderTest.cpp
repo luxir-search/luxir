@@ -1247,6 +1247,138 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
   EXPECT_EQ(afterApprox, afterExact);
 }
 
+namespace {
+
+class AsyncAuxCommit final : public UpdateMessage {
+  std::latch& finished;
+
+public:
+  explicit AsyncAuxCommit(std::latch& finished) : finished(finished) {
+    commit = COMMIT;
+    buildAuxIndexes.push_back("vec.embedding_v");
+  }
+  void handle(IndexWriter& iw) override { unused(iw); }
+  void done(IndexWriter& iw) override { unused(iw); finished.count_down(); }
+};
+
+// Runs a merge to its last step before publication while an aux commit is
+// building, then lets the commit finish, optionally failing.  Returns once all
+// of it settled and any merge output was published.
+void mergeFinishesDuringAuxBuild(CollectionHelper& h, IndexWriter& iw, bool failCommit) {
+  std::latch mergeStarted(1), releaseMerge(1), building(1), mergeDone(1), releaseCommit(1), finished(1);
+  std::atomic_bool fail{false};
+  luxir::Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    mergeStarted.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+  auto reached = [&](void*, void*, void*) -> void* {
+    mergeDone.count_down();
+    return nullptr;
+  };
+  luxir::Signal::listen("mergeAwaitsVectorCommit", reached);
+  luxir::Signal::listen("mergeSwap", reached);
+  luxir::Signal::listen("vectorBuildField", [&](void*, void* site, void*) -> void* {
+    if ((VectorIndexBuilder::BuildSite)(intptr_t)site == VectorIndexBuilder::BuildSite::COMMIT) {
+      building.count_down();
+      releaseCommit.wait();
+      if (fail.load()) throw std::runtime_error("injected commit build failure");
+    }
+    return nullptr;
+  });
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  mergeStarted.wait();
+  AsyncAuxCommit aux(finished);
+  ASSERT_TRUE(iw.submitUpdate(&aux));
+  building.wait();
+  releaseMerge.count_down();
+  mergeDone.wait();
+  fail.store(failCommit);
+  releaseCommit.count_down();
+  finished.wait();
+  iw.updateGraph->wait_for_all();
+  for (auto name : {"mergeStart", "mergeAwaitsVectorCommit", "mergeSwap", "vectorBuildField"}) {
+    luxir::Signal::unlisten(name);
+  }
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+}
+
+} // namespace
+
+TEST_F(VectorIndexBuilderTest, mergeFinishingDuringAuxCommitPublishesWithOverlay) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/false);
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+}
+
+TEST_F(VectorIndexBuilderTest, failedAuxCommitLeavesConcurrentMergeOutputFlat) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  ExpectLog quiet("injected commit build failure");
+  mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/true);
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 0u);
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+}
+
+// The merge passed its overlay preparation before the aux commit began, and
+// swaps only after the commit activated the name.
+TEST_F(VectorIndexBuilderTest, mergeSwappingAfterActivationRechecksActiveNames) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  std::latch atDiff(1), releaseMerge(1), finished(1);
+  std::atomic_flag once;
+  luxir::Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
+    if (once.test_and_set()) return nullptr;
+    atDiff.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  atDiff.wait();
+  AsyncAuxCommit aux(finished);
+  ASSERT_TRUE(iw->submitUpdate(&aux));
+  finished.wait();
+  releaseMerge.count_down();
+  iw->updateGraph->wait_for_all();
+  luxir::Signal::unlisten("mergeLiveDocsDiff");
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+}
+
 // Cosine metric normalizes on column write by default.  The FAISS builder can
 // add the already-normalized column bytes directly as inner-product vectors.
 TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {

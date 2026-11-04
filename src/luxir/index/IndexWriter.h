@@ -14,6 +14,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include <oneapi/tbb/task_arena.h>
+#include <condition_variable>
 #include "luxir/index/AuxInfo.h"
 #include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
@@ -449,6 +450,14 @@ public:
   // seeds only from overlays that actually exist in the manifest.  Protected by
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
+  // Vector selectors of the commit now in finishCommitBody, set under the same
+  // indexMutex hold that captures its segments.  A merge output swapped in after
+  // that capture misses the commit's build, so it must see this intent.
+  std::vector<std::string> inFlightVectorSelectors;
+  // Advances whenever either of the two sets above changes, so a merge can tell
+  // at its swap that what it prepared for is still current.
+  uint64_t vectorOverlayIntentGen = 0;
+  std::condition_variable vectorCommitFinished;
 
   // Registered atomically with flushed segments and snapshotted with them.
   // A batch survives until a covering commit or a delete pass retires it.
@@ -852,7 +861,12 @@ private:
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
-  std::vector<std::string> snapshotActiveVectorOverlayNames();
+  // Builds what the private merge output owes the active names, first waiting
+  // out an in-flight commit that selects a field the output holds.  Returns the
+  // intent generation the output is now current for.
+  uint64_t prepareMergedVectorOverlays(SegInfo& output,
+                                       boost::unordered_flat_set<std::string>& attempted,
+                                       const char*& phase);
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
