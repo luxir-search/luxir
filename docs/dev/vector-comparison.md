@@ -257,6 +257,7 @@ For a local 1M comparison, build both binaries first, then run:
 ```bash
 python3 tools/benchmarks/vector-compare.py --filtered --dataset cohere-768-cos \
   --base-binary /path/to/base/luxir --candidate-binary /path/to/candidate/luxir \
+  --base-revision BASE_SHA --candidate-revision CANDIDATE_SHA \
   --cache /path/to/datasets --output /path/to/results
 ```
 
