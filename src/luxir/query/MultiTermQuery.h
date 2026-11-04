@@ -7,10 +7,12 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory_resource>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 #include "DocSetBulkScorer.h"
 #include "MultiTermBudget.h"
@@ -18,6 +20,7 @@
 #include "Query.h"
 #include "QueryStats.h"
 #include "luxir/reader/FilteredTermsEnum.h"
+#include "luxir/search/RequestMemTracker.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
@@ -29,9 +32,8 @@ protected:
   std::string_view field;
   // Positive: per segment, union only the maxExpansions accepted terms with
   // the highest document frequency (ties keep the lower term). Zero: every
-  // accepted term. Bounded by Weight::MAX_LAZY_TERMS, so a capped expansion
-  // never outgrows the retained-state budget and never spills to the eager
-  // bitset on its own.
+  // accepted term. Selection has no upper bound; the operator term cap still
+  // applies, and retained-state overflow spills to an eager bitset.
   int32_t maxExpansions;
 
 public:
@@ -184,6 +186,7 @@ public:
     google::protobuf::Arena& memoArena;
     std::span<ExpansionMemo> expansionMemos;
     MultiTermBudget& budget;
+    RequestMemTracker& memoryTracker;
     int32_t expansionCap;
 
   public:
@@ -243,7 +246,8 @@ public:
         expansionMemos(
             context.pool.make_span<ExpansionMemo>(context.numSegments())),
         budget(context.multiTermBudget()),
-        expansionCap(query.capsExpansions() && query.getMaxExpansions() == 0
+        memoryTracker(context.planningContext().memoryTracker),
+        expansionCap(query.capsExpansions()
             ? budget.maxExpansions() : std::numeric_limits<int32_t>::max()) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
@@ -351,27 +355,25 @@ public:
 
     // Keep the `limit` accepted terms with the highest docFreq, returned in
     // term order. Only postings states are retained; no postings are read.
-    static std::span<TopTerm> selectTopTerms(
-        MemPool& pool, FilteredTermsEnum& fenum, size_t limit) {
-      auto heap = pool.make_span<TopTerm>(limit);
-      size_t size = 0;
+    static void selectTopTerms(
+        FilteredTermsEnum& fenum, size_t limit, std::pmr::vector<TopTerm>& heap) {
       size_t ord = 0;
       while (fenum.next()) {
         TopTerm candidate{fenum.terms().postingsState(), ord++};
-        if (size < limit) {
-          heap[size++] = candidate;
-          std::push_heap(heap.begin(), heap.begin() + (ptrdiff_t) size,
-                         strongerTerm);
+        if (heap.size() < limit) {
+          if (heap.size() == heap.capacity()) {
+            heap.reserve(std::min(limit, std::max((size_t) 1, heap.capacity() * 2)));
+          }
+          heap.push_back(candidate);
+          std::push_heap(heap.begin(), heap.end(), strongerTerm);
         } else if (strongerTerm(candidate, heap[0])) {
           std::pop_heap(heap.begin(), heap.end(), strongerTerm);
-          heap[limit - 1] = candidate;
+          heap.back() = candidate;
           std::push_heap(heap.begin(), heap.end(), strongerTerm);
         }
       }
-      auto kept = heap.first(size);
-      std::sort(kept.begin(), kept.end(),
+      std::sort(heap.begin(), heap.end(),
                 [](const TopTerm& a, const TopTerm& b) { return a.ord < b.ord; });
-      return kept;
     }
 
     static ExpansionFacts* findExpansionFacts(
@@ -425,10 +427,14 @@ public:
                                          : std::numeric_limits<int64_t>::max();
           if (charge) fenum->setVisitLimit(budget.remainingTermsExamined());
           skipCount(SkipStats::multitermExpansions);
-          std::span<TopTerm> topTerms;
+          std::optional<RequestMemResource> selectionMemory;
           if (query.maxExpansions > 0) {
-            topTerms = selectTopTerms(
-                scratchPool, *fenum, (size_t) query.maxExpansions);
+            selectionMemory.emplace(memoryTracker, query.getField(), "multi-term selection");
+          }
+          std::pmr::vector<TopTerm> topTerms(
+              selectionMemory ? &*selectionMemory : std::pmr::get_default_resource());
+          if (query.maxExpansions > 0) {
+            selectTopTerms(*fenum, (size_t) query.maxExpansions, topTerms);
           }
           size_t nextTop = 0;
           auto nextState = [&](TermsEnum::PostingsState& out) {

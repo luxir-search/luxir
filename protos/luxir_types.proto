@@ -694,7 +694,9 @@ message PrefixQuery {
   // A positive value keeps only the terms with the highest document frequency
   // in each segment (ties go to the lower term), so a short prefix over a
   // large dictionary costs at most this many postings lists per segment.
-  // Values above 4096 and negative values are rejected.
+  // Any positive value is valid; negative values are rejected. Selection also
+  // supports case_insensitive. Operator expansion and request memory limits
+  // still apply.
   int32 max_expansions = 4;
 }
 

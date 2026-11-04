@@ -698,14 +698,12 @@ TEST_F(PrefixQueryTest, maxExpansionsKeepsHighestDocFreqTerms) {
   EXPECT_TRUE(PrefixQuery("foo_w", "p", 2).equals(PrefixQuery("foo_w", "p", 2)));
 }
 
-// A capped expansion of a huge prefix stays on the windowed lazy union instead
-// of the heap union the uncapped query takes.
-TEST_F(PrefixQueryTest, maxExpansionsKeepsHugePrefixWindowed) {
+// A capped expansion of a huge prefix keeps the highest-df terms.
+TEST_F(PrefixQueryTest, maxExpansionsKeepsHugePrefixSelection) {
   TestIndex ti;
   TestField field(ti, "foo_w");
   field.startIndexing();
-  constexpr int32_t termCount =
-      (int32_t) MultiTermQuery::Weight::MAX_LAZY_TERMS + 100;
+  constexpr int32_t termCount = 5000;
   for (int32_t doc = 0; doc < termCount; doc++) {
     std::string body = "pre" + std::to_string(doc);
     // A few terms repeat so they outrank the single-doc terms.
@@ -721,7 +719,7 @@ TEST_F(PrefixQueryTest, maxExpansionsKeepsHugePrefixWindowed) {
   auto* scorer = prefix.createWeight(
       context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
       ->createScorer(pool, context.topReader.segments()[0]);
-  ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
+  ASSERT_NE(scorer, nullptr);
   std::vector<int32_t> docs;
   for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
     docs.push_back(doc);
@@ -735,9 +733,9 @@ TEST_F(PrefixQueryTest, maxExpansionsValidation) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
   QueryBuilder builder(pool, *schema, CoerceContext{});
-  int32_t cap = (int32_t) MultiTermQuery::Weight::MAX_LAZY_TERMS;
+  int32_t cap = std::numeric_limits<int32_t>::max();
   EXPECT_NE(builder.createPrefixQuery("foo_w", "ab", cap), nullptr);
-  EXPECT_THROW(builder.createPrefixQuery("foo_w", "ab", cap + 1), std::runtime_error);
+  EXPECT_NE(builder.createPrefixQuery("foo_w", "ab", cap, true), nullptr);
   EXPECT_THROW(builder.createPrefixQuery("foo_w", "ab", -1), std::runtime_error);
 }
 
@@ -756,8 +754,77 @@ TEST_F(PrefixQueryE2ETest, maxExpansions) {
   EXPECT_EQ(count("prefix(a, field=body_w, max_expansions=1)"), 3);
   EXPECT_EQ(count("prefix(a, field=body_w, max_expansions=2)"), 4);
 
-  auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").exprQuery("prefix(a, field=body_w, max_expansions=5000)");
-  req->execute();
-  EXPECT_FALSE(req->ok());
+  EXPECT_EQ(count("prefix(a, field=body_w, max_expansions=1000000000)"), 4);
+}
+
+TEST_F(PrefixQueryTest, maxExpansionsAbove4096) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < 5001; doc++) field.add(doc, std::format("pre{:05}", doc));
+  ti.flush();
+  field.startReading();
+  auto [docs, retained] = cappedPrefixDocs(ti, "pre", 5000, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  ASSERT_EQ(5000u, docs.size());
+  EXPECT_EQ(5000u, retained);
+  for (int32_t doc = 0; doc < 5000; doc++) EXPECT_EQ(doc, docs[doc]);
+}
+
+TEST_F(PrefixQueryTest, selectionMemoryGrowsWithMatchesAndIsReleased) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < 10; doc++) field.add(doc, "pre" + std::to_string(doc));
+  ti.flush();
+  field.startReading();
+  for (size_t ceiling : {128u, 4096u}) {
+    MemPool pool;
+    google::protobuf::Arena arena;
+    RequestMemTracker tracker(ceiling);
+    auto* planning = luxir::arenaCreate<Query::PlanningContext>(
+        arena, pool, *ti.reader, Query::PlanningContext::Limits{}, nullptr,
+        FilterKeyContext{}, nullptr, &tracker);
+    auto* context = Query::Context::create(&arena, *planning);
+    PrefixQuery query("foo_w", "pre", 1'000'000'000);
+    auto* weight = query.createWeight(*context, 0);
+    auto& segment = ti.reader->segments()[0];
+    if (ceiling == 128) {
+      EXPECT_THROW(weight->createScorer(pool, segment), ResourceExhaustedError);
+    } else {
+      auto* scorer = weight->createScorer(pool, segment);
+      ASSERT_NE(nullptr, scorer);
+      for (int32_t doc = 0; doc < 10; doc++) EXPECT_EQ(doc, scorer->next());
+      EXPECT_EQ(PostingsReader::END, scorer->next());
+      EXPECT_GT(tracker.peak(), 0u);
+      EXPECT_LE(tracker.peak(), ceiling);
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+}
+
+TEST_F(PrefixQueryTest, cappedSelectionSpillsToBitset) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < 10; doc++) field.add(doc, "pre" + std::to_string(doc));
+  ti.flush();
+  field.startReading();
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  PrefixQuery query("foo_w", "pre", 5);
+  auto* weight = (MultiTermQuery::Weight*) query.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  auto& segment = ti.reader->segments()[0];
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  auto buildContext = supplier->makePlanContext(Query::Demand::fromLeadCost(1));
+  buildContext.multiTermMaxLazyStateBytes = sizeof(TermsEnum::PostingsState);
+  auto* scorer = supplier->resolve(pool, buildContext)->build(pool);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_TRUE(weight->expansionMemoUsesBitsetForTests(segment));
+  EXPECT_EQ(0u, weight->expansionMemoRetainedStatesForTests(segment));
+  for (int32_t doc = 0; doc < 5; doc++) {
+    EXPECT_EQ(doc, scorer->next());
+    EXPECT_FLOAT_EQ(1.0f, scorer->score());
+  }
+  EXPECT_EQ(PostingsReader::END, scorer->next());
 }

@@ -24,9 +24,8 @@ namespace luxir {
 // for it).
 struct MultiTermLimits {
   // Terms one segment of one query may expand to before the request is
-  // rejected. A prefix query with a positive max_expansions keeps only its
-  // top terms (at most MultiTermQuery::Weight::MAX_LAZY_TERMS), so it never
-  // reaches this cap; every other expansion is complete and is held to it.
+  // rejected. For a prefix with max_expansions, this counts the selected
+  // terms; a selection no larger than this cap stays within it.
   int32_t maxExpansions = 65'536;
   // Dictionary terms all multi-term and fuzzy scans of one request may visit,
   // matching or not. This is what bounds a zero-hit `*x*` scan. HARDWARE
@@ -64,7 +63,7 @@ public:
 
   const MultiTermLimits& getLimits() const noexcept { return limits; }
 
-  // The per-segment cap on a complete expansion.
+  // The per-segment cap on expanded terms, after any top-term selection.
   int32_t maxExpansions() const noexcept {
     return limits.maxExpansions > 0 ? limits.maxExpansions
                                     : std::numeric_limits<int32_t>::max();
@@ -119,9 +118,9 @@ public:
   [[noreturn]] void throwTooManyExpansions(std::string_view what) const {
     throw ResourceExhaustedError(
         std::format("{} matches more than {} terms in one segment; narrow the "
-                    "pattern, or give a prefix query max_expansions to keep "
-                    "only its most frequent terms",
-                    what, maxExpansions()),
+                    "pattern, or give a prefix query max_expansions of at most {} "
+                    "to keep only its most frequent terms",
+                    what, maxExpansions(), maxExpansions()),
         "too_many_expansions");
   }
 

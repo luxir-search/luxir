@@ -292,19 +292,21 @@ matches documents with at least one indexed term for the field.
 | `field` | Indexed term field. Required. |
 | `prefix` | Literal prefix, including any `*`, `?`, or backslashes. Required. |
 | `case_insensitive` | After normalization, also match other simple Unicode case forms. Default `false`. |
-| `max_expansions` | Unset or `0`: every term with the prefix. `N` (at most 4096): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+| `max_expansions` | Unset or `0`: every term with the prefix. Any positive `N` (no upper bound): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
 
 A short prefix over a large dictionary can expand to hundreds of thousands of
 terms, and an unscored or exactly counted request then reads every one of their
-postings lists. `max_expansions` bounds that work, the way Elasticsearch's
-`match_bool_prefix` does (its default there is 50). The terms are chosen per
-segment, so a term just outside the cut can match in one segment and not in
-another. Without `max_expansions` the complete expansion is held to the server
-limits in [Expansion limits](#expansion-limits).
+postings lists. `max_expansions` bounds the selected postings lists, while
+selection still scans every matching term. The terms are chosen per segment,
+so a term just outside the cut can match in one segment and not in another.
+Both capped and complete expansions are held to the server limits in
+[Expansion limits](#expansion-limits). Selection memory counts toward the
+request memory ceiling.
 
 With `case_insensitive`, the entire prefix is normalized once, then matched
 through a case-alternating automaton. TEXT, STRING, and ID are supported, and
-queries are constant-scoring. The expression form is
+queries are constant-scoring. `max_expansions` selects by document frequency
+across the accepted case variants. The expression form is
 `prefix(err, field=body_w, case_insensitive=true)`.
 
 ## Wildcard
@@ -408,16 +410,16 @@ returning a truncated match set:
 
 | Error code | Cause |
 |---|---|
-| `too_many_expansions` | One index segment of a wildcard, regex, term-range, or prefix query without `max_expansions` matched more terms than the server allows (`65536` by default). |
+| `too_many_expansions` | One index segment of a wildcard, regex, term-range, or prefix query expanded more terms than the server allows (`65536` by default). |
 | `too_many_terms_examined` | The request's dictionary scans, matching or not, visited more terms than the server allows. All multi-term and fuzzy queries of a request share this budget. |
 | `too_many_expansion_postings` | The request's multi-term expansions together matched more postings than the server allows. |
 | `pattern_prefix_too_short` | An open-ended wildcard or regex (for example `*abc*` or `.*abc`) has fewer literal leading bytes than the server minimum, and the terms under that prefix already exceed the request's remaining scan budget. It is rejected before it scans anything. |
 
 A request cannot raise or disable these limits. A prefix query that sets
-`max_expansions` keeps at most that many terms per segment, so it never hits
-`too_many_expansions`, but its scan still counts toward the terms-examined
-budget. `any_of` term lists are not capped by term count, because the request
-already lists every term. Finite patterns such as `(dune|kings)` need no
+`max_expansions` keeps at most that many terms per segment. The selected count
+is held to `too_many_expansions`, and its scan still counts toward the
+terms-examined budget. `any_of` term lists are not capped by term count,
+because the request already lists every term. Finite patterns such as `(dune|kings)` need no
 literal prefix: they seek directly to each term. See
 [Operations](operations.md) for the server settings.
 

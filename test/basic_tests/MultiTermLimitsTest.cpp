@@ -85,8 +85,7 @@ TEST_F(MultiTermLimitsTest, completeExpansionRejectedAtServerCap) {
 }
 
 TEST_F(MultiTermLimitsTest, truncatingPrefixStaysUnderTheCap) {
-  // A prefix that keeps its top terms expands to at most max_expansions, so
-  // the server cap on complete expansions does not apply; the scan budget does.
+  // Selecting fewer terms than the server cap fits; the scan budget still applies.
   LuxirNode node(config(10, 1'000'000));
   CollectionHelper helper(node);
   indexTerms(helper);
@@ -105,6 +104,24 @@ TEST_F(MultiTermLimitsTest, truncatingPrefixStaysUnderTheCap) {
   scanned->execute(false);
   EXPECT_FALSE(scanned->ok());
   EXPECT_EQ("too_many_terms_examined", scanned->errorCode());
+}
+
+TEST_F(MultiTermLimitsTest, cappedPrefixCannotBypassServerCap) {
+  LuxirNode node(config(10, 1'000'000));
+  CollectionHelper helper(node);
+  indexTerms(helper);
+  for (int32_t selected : {10, 11, 1'000'000'000}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").prefixQuery("tag_s", "t", selected).limit(200);
+    req->execute(false);
+    if (selected == 10) {
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ(10u, req->getDocs().size());
+    } else {
+      EXPECT_FALSE(req->ok());
+      EXPECT_EQ("too_many_expansions", req->errorCode());
+    }
+  }
 }
 
 TEST_F(MultiTermLimitsTest, zeroHitScanStopsAtTermsExaminedBudget) {
