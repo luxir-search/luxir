@@ -10,6 +10,10 @@ harness=$(cd "$(dirname "$0")" && pwd)
 : "${WORK_DIR:?fresh work directory required}"
 python=${BENCH_PYTHON:-python3}
 settings=${CANDIDATE_FIELD_SETTINGS:-'{}'}
+mode=()
+if [[ ${FILTERED:-false} == true ]]; then
+  mode=(--filtered)
+fi
 mkdir "$WORK_DIR"
 cd "$WORK_DIR"
 mkdir evidence
@@ -56,7 +60,7 @@ for variant in base candidate; do
     'cmake --preset container-release -DLUXIR_COMPILE_JOBS="$1" && cmake --build --preset container-release --target luxir' bash "$jobs"
 done
 cd "$WORK_DIR"
-"$python" "$harness/vector-compare.py" \
+"$python" "$harness/vector-compare.py" "${mode[@]}" \
   --base-binary base/build/container-release/bin/luxir \
   --candidate-binary candidate/build/container-release/bin/luxir \
   --base-revision "$(cat evidence/base-revision.txt)" \

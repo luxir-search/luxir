@@ -36,13 +36,14 @@ class InputChecks(unittest.TestCase):
 
     def test_presets_and_cache_provenance(self):
         self.assertEqual(bench.DEFAULT_DATASET, 'dbpedia-openai3-1536-100k')
-        self.assertEqual(len(bench.PRESETS), 2)
+        self.assertEqual(len(bench.PRESETS), 3)
         cohere = bench.PRESETS['cohere-wikipedia-en-v3-1024-100k']
         self.assertEqual((cohere['subset'], cohere['dims'], cohere['vector_column']),
                          ('en', 1024, 'emb'))
         self.assertEqual(len(cohere['files']), 1)
         for name, preset in bench.PRESETS.items():
-            self.assertEqual((preset['index_count'], preset['query_count']), (99000, 1000))
+            self.assertEqual((preset['index_count'], preset['query_count']),
+                             (1000000, 1000) if name == 'cohere-768-cos' else (99000, 1000))
             self.assertEqual(len(preset['revision']), 40)
             self.assertTrue(all(len(f['sha256']) == 64 for f in preset['files']))
             with tempfile.TemporaryDirectory() as tmp:
@@ -64,6 +65,30 @@ class InputChecks(unittest.TestCase):
                 bench.validate_vectors(a, 2)
         self.assertEqual(bench.validate_vectors(np.eye(2), 2)[0], 'ip')
         self.assertEqual(bench.validate_vectors(np.eye(2) * 2, 2)[0], 'cosine')
+
+    def test_filter_domains_and_correlation(self):
+        np = bench.np
+        base = np.array([[1., 0.], [0.8, 0.2], [0., 1.], [-1., 0.]])
+        queries = np.array([[1., 0.], [0., 1.]])
+        ranks = bench.filter_ranks(base, queries, 'cosine')
+        self.assertTrue(np.array_equal(ranks, bench.filter_ranks(base, queries, 'cosine')))
+        for col in ranks.T:
+            self.assertEqual(sorted(col), list(range(len(base))))
+        self.assertEqual(int(np.argmin(ranks[:, 1])), 0)
+        self.assertEqual(int(np.argmax(ranks[:, 1])), 3)
+        self.assertEqual(int(np.argmin(ranks[:, 2])), 2)
+        # Similarity ties keep input document order.
+        tied = bench.filter_ranks(np.array([[1., 0.], [1., 0.]]), queries[:1], 'ip')
+        self.assertEqual(tied[:, 1].tolist(), [0, 1])
+        for kind in bench.FILTER_KINDS:
+            for fraction in bench.SELECTIVITIES:
+                expr, keep = bench.filter_expression(kind, 2, 1000000, fraction)
+                bounds = expr.split(':[')[1][:-1].split(' TO ')
+                lo, hi = map(int, bounds)
+                self.assertEqual(hi - lo + 1, keep)
+                self.assertEqual(keep, round(1000000 * fraction))
+                self.assertIn('filter_uniform_i' if kind == 'uniform' else 'filter_q2_i', expr)
+        self.assertEqual(bench.filter_expression('uniform', 0, 99000, 0.0001)[1], 10)
 
     def test_checksum_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:

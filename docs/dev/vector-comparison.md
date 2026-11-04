@@ -183,3 +183,84 @@ hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent
 all search workloads. Native ARM, cold-cache performance, and ASan results are
 outside this workflow.
+
+## Filtered kNN comparison
+
+Pass `--filtered` to `vector-compare.py`, or set the workflow's `filtered`
+input. The unfiltered path and its output are unchanged when this is off.
+Filtered mode compares four sequential arms: base RaBitQ, candidate RaBitQ,
+base PQ (`ann.codec=pq`), candidate PQ. Omit
+`candidate_field_settings`, since this mode fixes the codecs for both refs.
+The workflow uses the same hosted runner and dependency images as unfiltered
+comparisons. Use either 100k preset in CI; the 1M preset is for local runs.
+
+Each indexed document gets a synthetic uniform integer rank and one integer
+similarity rank per query. All ranks are unique permutations of `0..N-1`.
+Uniform ranks use NumPy's seed 196 permutation, independent of the vectors.
+Similarity ranks use descending float64 inner product (or cosine similarity
+for a cosine dataset), breaking ties by input document ID. Thus:
+
+- **uniform:** the first `m` random ranks, the same uncorrelated subset for
+  every query;
+- **aligned:** that query's `m` nearest documents by similarity rank;
+- **anti-aligned:** that query's `m` farthest documents by similarity rank.
+
+Here `m = max(10, round(N * selectivity))`, for selectivities 0.01%, 0.1%,
+0.3%, 1%, 3%, 10%. Results include actual cardinality and selectivity; on the
+99k preset the smallest set is 10 documents rather than 9.9. Alignment is
+query-specific, not a cluster proxy. This is a deliberately strong correlation
+stress test, not a model of production tenant filters. All synthetic fields
+are explicit `int` columns with `index: range`. Queries use Luxir's ordinary
+pre-filter syntax, for example `"filter":["filter_q0_i:[0 TO 99]"]`, beside
+`"query":{"knn":...}`. Anti-aligned filters select the upper rank interval.
+Every query is checked against server `exact:true` top-10 using the identical
+filter, computed once per query/kind/selectivity on the first arm and shared
+by all arms. Every arm also measures exact controls and requires recall 1.0.
+Filter cardinalities are checked against server counts. Underfilled ANN
+responses contribute missing neighbors to the recall denominator of ten; duplicate
+IDs and overfilled responses are errors.
+
+The default sample is the first 32 held-out queries; `--filtered-queries` can
+change it. A small sample bounds the number of synthetic indexed columns and
+exact requests. Percentiles from 32 queries are coarse, especially p99; raw
+per-pass latencies and ordered-result hashes are retained. Filter setup and
+similarity ranking are outside latency measurement. Serial ingest remains 1.
+Each cell has one warm-up and three timed passes, reporting medians of pass
+recall@10, p50 and p99. Arms run sequentially, so load drift remains a limitation.
+The effort sweep is default/adaptive, 1, 4, 16, 64, 256, 1024 nprobe. The summary
+records the least *swept positive nprobe* reaching mean recall >= 0.95, or
+`not reached`; adaptive effort is reported separately and is not ordered as 0.
+This is no guarantee of a global minimum between sweep points. An explicit
+nprobe requests effort; the candidate can still choose exact search internally.
+
+`cohere-768-cos` uses 1,000,000 training vectors and a separate 1,000-query
+file from [YoKONCy/Cohere-1M-wikipedia-768d](https://huggingface.co/datasets/YoKONCy/Cohere-1M-wikipedia-768d/tree/de34a7af7f436d7aceb4fecdda01490e552efdde),
+revision `de34a7af7f436d7aceb4fecdda01490e552efdde`. The preset pins both file
+SHA-256s, dimensions (768), sizes, row counts, cosine metric, and the mirror's
+Apache-2.0 license declaration. The first 32 test queries are used by default;
+no train vectors are held out. This preset requires filtered mode. Existing
+100k presets retain their original split and metric detection.
+
+For a correctness smoke, use a 100k preset and `--filtered-queries 8`, pointing
+both binary options at the same server. Exact controls must have recall 1.0;
+compare each codec's base/candidate ordered-ID hashes across all measured
+passes. Smoke latency under concurrent work is not meaningful.
+
+```bash
+gh workflow run vector-compare.yml -f filtered=true \
+  -f dataset=dbpedia-openai3-1536-100k \
+  -f base_ref=main -f candidate_ref=refs/pull/NUMBER/head
+```
+
+For a local 1M comparison, build both binaries first, then run:
+
+```bash
+python3 tools/benchmarks/vector-compare.py --filtered --dataset cohere-768-cos \
+  --base-binary /path/to/base/luxir --candidate-binary /path/to/candidate/luxir \
+  --cache /path/to/datasets --output /path/to/results
+```
+
+The 1M dataset and four indexes need substantial disk space and time. Collection
+information and shutdown checks are retained, but collection data directories
+are removed after each arm, including failure, once its server has stopped.
+Keep the results artifact; do not upload collection data or downloaded corpora.
