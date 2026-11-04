@@ -1410,6 +1410,55 @@ TEST_F(AggregateExprTest, siblingSketchesRouteListGroupAndFusionResults) {
   }
 }
 
+TEST_F(AggregateExprTest, siblingColumnMetricsShareOneColumnWalk) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 500; i++) {
+      int id = segment * 500 + i;
+      // Every seventh document lacks x_d, and the last segment has no y_i.
+      if (id % 7 == 0) docs.push_back(flatdoc("id", std::to_string(id), "cat_s", "a"));
+      else if (segment == 2) docs.push_back(flatdoc("id", std::to_string(id), "x_d", id * 0.37 - 90,
+          "cat_s", i % 2 ? "b" : "a"));
+      else docs.push_back(flatdoc("id", std::to_string(id), "x_d", id * 0.37 - 90,
+          "y_i", id % 13, "cat_s", i % 2 ? "b" : "a"));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  auto guard = facetAggregateOverrides();
+  std::string stats = R"json({"n":"sum(count(x_d))","lo":"min(x_d)","hi":"max(x_d)",
+    "mean":"avg(x_d)","total":"sum(x_d)","ny":"sum(count(y_i))","my":"max(y_i)",
+    "ratio":"sum(x_d)/sum(count(y_i))","other":"sum(y_i*2)"})json";
+  std::array<std::pair<std::string, size_t>, 4> cases{{
+    {R"json({"ops":)json" + stats + "}", 6},
+    {R"json({"ops":{"q":{"top_docs":{"limit":0,"query":"cat_s:b","ops":)json" + stats + "}}}}", 6},
+    {R"json({"ops":{"q":{"top_docs":{"limit":0,"query":"cat_s:absent","ops":)json" + stats + "}}}}", 6},
+    // Under a facet the metrics may run inline, so they stay separate.
+    {R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":)json" + stats + "}}}}", 0},
+  }};
+  for (auto& [json, followers] : cases) {
+    SCOPED_TRACE(json);
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_FALSE(shared.values.empty());
+    EXPECT_EQ(followers, sharedStats.followers.load());
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"ops":)json" + stats + "}", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1500 - 215, req->scalar<int64_t>("n"));
+  EXPECT_EQ(1000 - 143, req->scalar<int64_t>("ny"));
+  EXPECT_EQ(12, req->scalar<int64_t>("my"));
+}
+
 TEST_F(AggregateExprTest, siblingSketchGroupsRequireEqualIndirectProducerSets) {
   CollectionHelper helper;
   indexSharedSketchData(helper);

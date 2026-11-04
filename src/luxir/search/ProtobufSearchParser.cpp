@@ -275,6 +275,31 @@ public:
     }
   }
 
+  template <typename Candidate>
+  static void fuseColumnMetrics(std::span<const Candidate> candidates) {
+    struct Group {
+      const Candidate* leader;
+      std::vector<ExprStatsOp*> followers;
+    };
+    std::vector<Group> groups;
+    for (const Candidate& candidate : candidates) {
+      bool joined = false;
+      for (Group& group : groups) {
+        if (candidate.plan == group.leader->plan && candidate.variant == group.leader->variant
+            && group.leader->op->fusesColumnsWith(*candidate.op)) {
+          group.leader->op->absorbProducers(*candidate.op);
+          group.followers.push_back(candidate.op);
+          joined = true;
+          break;
+        }
+      }
+      if (!joined) groups.push_back({&candidate, {}});
+    }
+    for (Group& group : groups) {
+      for (ExprStatsOp* follower : group.followers) follower->followFused(*group.leader->op);
+    }
+  }
+
   void groupExprStats(SearchOp& parent, OpsPlacement placement,
       const boost::unordered_flat_map<std::string_view, SearchOp*>& block) {
     if (disableAggregateSharingForTests || block.size() < 2) return;
@@ -290,17 +315,26 @@ public:
       parentPlan = &static_cast<TopDocsReq&>(parent).domainVariants;
     }
     std::vector<Candidate> candidates;
+    std::vector<Candidate> columnCandidates;
+    // Plain-state metrics fuse only where nothing inlines them into a parent's
+    // bucket table: an inline leader would not write its followers' results.
+    bool fuseColumns = placement == OpsPlacement::REQUEST_ROOT
+        || placement == OpsPlacement::TOP_DOCS;
     for (auto& [name, child] : block) {
       auto* metric = dynamic_cast<ExprStatsOp*>(child);
-      if (metric == nullptr || !metric->hasOnlyIndirectProducers()) continue;
+      if (metric == nullptr) continue;
+      bool indirect = metric->hasOnlyIndirectProducers();
+      if (!indirect && !fuseColumns) continue;
       auto* plan = parentPlan ? parentPlan
           : child->bucketDomain ? &child->bucketDomain->variants : nullptr;
       size_t variant = plan ? plan->variantForChild(name) : 0;
-      candidates.push_back({metric, variant == 0 ? nullptr : plan, variant});
+      (indirect ? candidates : columnCandidates).push_back(
+          {metric, variant == 0 ? nullptr : plan, variant});
     }
-    std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
-      return candidate.op->name;
-    });
+    auto byName = [](const Candidate& candidate) { return candidate.op->name; };
+    std::ranges::sort(candidates, {}, byName);
+    std::ranges::sort(columnCandidates, {}, byName);
+    fuseColumnMetrics<Candidate>(columnCandidates);
     std::vector<Candidate> leaders;
     for (const Candidate& candidate : candidates) {
       bool shared = false;
