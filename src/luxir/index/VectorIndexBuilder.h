@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <faiss/MetricType.h>
 #include "luxir/index/AuxInfo.h"
 #include "luxir/store/Directory.h"
 #include "luxir/schema/Schema.h"
@@ -75,6 +76,12 @@ public:
   // ceil(FAISS distance_compute_blas_threshold / dims) to retain BLAS.
   // PQ codebooks train independently per sub-quantizer regardless of this floor.
   static int64_t ivfBuildMinRowsPerTask;
+
+  // Completes a RaBitQ code FAISS encoded for x against its list centroid:
+  // corrects the sign-bit factors of near-centroid vectors, and returns the
+  // amplitude stored beside the code. x and centroid are in the rotated space.
+  static float finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
+                                int32_t dims, int32_t bits, faiss::MetricType metric);
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
   // dims shares one transform (deduplicated in RAM by internVectorRotation).
