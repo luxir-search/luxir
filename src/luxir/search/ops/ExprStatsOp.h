@@ -144,6 +144,73 @@ public:
     return true;
   }
 
+  // A bare scalar column a producer reads, either as its whole input or as
+  // count(column). Producers reading one column, in one op or in fused
+  // siblings, are fed from a single walk of that column.
+  struct ColumnInput {
+    uint32_t node = 0;
+    bool count = false;
+    bool valid = false;
+  };
+
+  static ColumnInput columnInput(const AggregateProducer& producer) {
+    const ValueProgram& input = *producer.input;
+    const ValueNode& root = input.root();
+    auto bare = [](const ValueNode& node) {
+      return node.kind == ValueNodeKind::COLUMN && !valueArray(node.type)
+          && node.type != ValueType::COLUMN_ONLY;
+    };
+    if (producer.resolved.state.orderSensitive) return {};
+    if (bare(root)) return {input.rootNode, false, true};
+    if (root.kind == ValueNodeKind::FUNCTION && root.childCount == 1
+        && root.function != nullptr && root.function->name == "count"
+        && bare(input.nodes[root.children[0]])) {
+      return {root.children[0], true, true};
+    }
+    return {};
+  }
+
+  static std::string_view columnName(const AggregateProducer& producer) {
+    ColumnInput input = columnInput(producer);
+    return input.valid ? producer.input->nodes[input.node].text : std::string_view{};
+  }
+
+  // Sibling metrics with plain (non-sketch) states that read a common column
+  // can run as one op: the leader takes the union of their producers and
+  // walks each shared column once per segment for all of them.
+  bool fusesColumnsWith(const ExprStatsOp& other) const {
+    if (aggregate.hasIndirectStates || other.aggregate.hasIndirectStates) return false;
+    for (const AggregateProducer& mine : aggregate.producers) {
+      std::string_view column = columnName(mine);
+      if (column.empty()) continue;
+      for (const AggregateProducer& theirs : other.aggregate.producers) {
+        if (columnName(theirs) == column) return true;
+      }
+    }
+    return false;
+  }
+
+  void absorbProducers(const ExprStatsOp& follower) {
+    assert(!passive && !follower.passive && &follower != this);
+    aggregate.absorbProducers(follower.aggregate);
+    fields = resolveAggregateFields(aggregate, req.requestPool, *req.reader);
+  }
+
+  // After the leader has absorbed every follower's producers.
+  void followFused(ExprStatsOp& leader) {
+    assert(!passive && members.empty() && !leader.passive && &leader != this);
+    bool adopted = aggregate.adoptProducers(leader.aggregate, true);
+    assert(adopted);
+    unused(adopted);
+    fields = leader.fields;
+    if (leader.members.empty()) leader.members.push_back(&leader);
+    leader.members.push_back(this);
+    passive = true;
+    if (aggregateExecutionStatsForTests != nullptr) {
+      aggregateExecutionStatsForTests->followers.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void init() override {
     SearchOp::init();
     denseFacetState = resolveDenseFacetState();
@@ -214,6 +281,83 @@ public:
             if (count == values.size()) flush();
           });
       if (count != 0) flush();
+    }
+
+    // Feeds every group of two or more producers that read one bare column,
+    // and every count(column) producer, from a single walk of the column:
+    // the raw values for a plain column input, and a 1 per present value plus
+    // a 0 per missing document for count(column), which is what evaluating
+    // count() per document yields. Returns which bindings were fed (empty
+    // when none were).
+    std::vector<bool> accumulateSharedColumns(
+        AggregateAccumulator& accumulator, std::span<BoundAggregateInput> bindings,
+        DocSet* domain, int32_t maxDoc) {
+      std::vector<bool> fed;
+      auto inputOf = [](const BoundAggregateInput& binding) {
+        return binding.scalar() ? columnInput(*binding.producer) : ColumnInput{};
+      };
+      for (size_t first = 0; first < bindings.size(); first++) {
+        ColumnInput lead = inputOf(bindings[first]);
+        if (!lead.valid || (!fed.empty() && fed[first])) continue;
+        std::string_view column = bindings[first].producer->input->nodes[lead.node].text;
+        std::vector<size_t> group{first};
+        for (size_t i = first + 1; i < bindings.size(); i++) {
+          ColumnInput input = inputOf(bindings[i]);
+          if (input.valid && (fed.empty() || !fed[i])
+              && bindings[i].producer->input->nodes[input.node].text == column) {
+            group.push_back(i);
+          }
+        }
+        if (group.size() < 2 && !lead.count) continue;
+        BoundValueNode& bound = bindings[first].values->nodes[lead.node];
+        // An absent column leaves count() to the per-document path, which
+        // still sees every missing document.
+        if (!bound.column) continue;
+        FieldType::Type columnType =
+            bindings[first].producer->input->nodes[lead.node].columnType;
+        if (fed.empty()) fed.assign(bindings.size(), false);
+        for (size_t i : group) fed[i] = true;
+
+        static constexpr std::array<int64_t, BATCH_SIZE> ONES = [] {
+          std::array<int64_t, BATCH_SIZE> ones{};
+          ones.fill(1);
+          return ones;
+        }();
+        static constexpr std::array<int64_t, BATCH_SIZE> ZEROS{};
+        std::array<int64_t, BATCH_SIZE> values;
+        size_t count = 0;
+        auto flush = [&] {
+          for (size_t i : group) {
+            BoundAggregateInput& binding = bindings[i];
+            if (inputOf(binding).count) {
+              accumulator.addRawBatch(binding.producerIndex,
+                  std::span<const int64_t>(ONES.data(), count), FieldType::INT);
+            } else {
+              accumulator.addRawBatch(binding.producerIndex,
+                  std::span<const int64_t>(values.data(), count), columnType);
+            }
+          }
+          count = 0;
+        };
+        int64_t missing = 0;
+        forEachIntColValue(
+            domain, *bound.column, maxDoc, missing,
+            [&](int32_t docid, int64_t value) LUXIR_INLINE {
+              unused(docid);
+              values[count++] = value;
+              if (count == values.size()) flush();
+            });
+        if (count != 0) flush();
+        for (size_t i : group) {
+          if (!inputOf(bindings[i]).count) continue;
+          for (int64_t left = missing; left > 0; left -= (int64_t)BATCH_SIZE) {
+            size_t n = (size_t)std::min<int64_t>(left, (int64_t)BATCH_SIZE);
+            accumulator.addRawBatch(bindings[i].producerIndex,
+                std::span<const int64_t>(ZEROS.data(), n), FieldType::INT);
+          }
+        }
+      }
+      return fed;
     }
 
     void accumulateExpression(AggregateAccumulator& accumulator,
@@ -305,7 +449,11 @@ public:
               thisOp().aggregate, pool, segment, thisOp().fields);
 
           int32_t maxDoc = segment.postingsReader().maxDoc();
-          for (BoundAggregateInput& binding : bindings) {
+          std::vector<bool> fed = accumulateSharedColumns(
+              accumulator, bindings, domainHandle.get(), maxDoc);
+          for (size_t i = 0; i < bindings.size(); i++) {
+            if (!fed.empty() && fed[i]) continue;
+            BoundAggregateInput& binding = bindings[i];
             if (binding.columnScan) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
@@ -325,6 +473,9 @@ public:
 
   class InlineCalc final : public InlineCalculator {
     std::vector<BoundAggregateInput> bindings;
+    // Per binding, the column iterator of a count(column) input (else null),
+    // for keyed batches.
+    std::vector<IntColReader::BulkIterator*> countColumns;
     std::vector<uint64_t> finalizedValues;
     std::vector<uint64_t> finalizedValid;
     AggregateEvalScratch scratch;
@@ -500,8 +651,31 @@ public:
       static constexpr size_t CHUNK = 256;
       int64_t chunkKeys[CHUNK];
       int64_t chunkValues[CHUNK];
-      for (BoundAggregateInput& binding : bindings) {
-        assert(binding.bareColumn);
+      for (size_t b = 0; b < bindings.size(); b++) {
+        BoundAggregateInput& binding = bindings[b];
+        if (!binding.bareColumn) {
+          // count(column): 1 for a doc with a value, else 0, for every doc.
+          assert(denseFacetState == nullptr);
+          IntColReader::BulkIterator* column = countColumns[b];
+          for (size_t start = 0; start < docs.size(); start += CHUNK) {
+            size_t end = std::min(docs.size(), start + CHUNK);
+            for (size_t i = start; i < end; i++) {
+              int32_t doc = docs[i];
+              bool present = false;
+              if (column != nullptr) {
+                if (column->docId() < doc) column->advance(doc);
+                present = column->docId() == doc;
+              }
+              chunkValues[i - start] = present ? 1 : 0;
+            }
+            binding.producer->resolved.state.accumulateKeyedRawBatch(
+                states + binding.producerStateOffset, stride,
+                std::span<const int64_t>(keys.data() + start, end - start),
+                std::span<const int64_t>(chunkValues, end - start),
+                FieldType::INT, binding.arguments);
+          }
+          continue;
+        }
         for (size_t start = 0; start < docs.size(); start += CHUNK) {
           size_t end = std::min(docs.size(), start + CHUNK);
           const int64_t* runKeys = keys.data() + start;
@@ -586,13 +760,23 @@ public:
 
     void startSeg(int32_t segnum) override {
       bindings.clear();
+      countColumns.clear();
       segmentFailure = AggregateFailure::NONE;
       try {
         MemPool& pool = MemPool::threadLocal();
         auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
         bindings = bindAggregateInputs(thisOp().aggregate, pool, segment, thisOp().fields);
+        if (keyedBatches) {
+          for (BoundAggregateInput& binding : bindings) {
+            ColumnInput input = columnInput(*binding.producer);
+            auto& node = binding.values->nodes[input.node];
+            countColumns.push_back(input.count && node.bulkIterator
+                ? &*node.bulkIterator : nullptr);
+          }
+        }
       } catch (const ValueEvaluationError&) {
         bindings.clear();
+        countColumns.clear();
         segmentFailure = AggregateFailure::VALUE_EVALUATION;
       }
     }
@@ -600,7 +784,14 @@ public:
     void LUXIR_NOINLINE rewind() override {
       // Bare-column inputs bypass the expression reader's restart detection.
       // Rebuild only those iterators when the driver starts another doc walk.
-      for (BoundAggregateInput& binding : bindings) {
+      for (size_t b = 0; b < bindings.size(); b++) {
+        BoundAggregateInput& binding = bindings[b];
+        if (b < countColumns.size() && countColumns[b] != nullptr) {
+          auto& node = binding.values->nodes[columnInput(*binding.producer).node];
+          node.bulkIterator.reset();
+          node.bulkIterator.emplace(*node.column);
+          countColumns[b] = &*node.bulkIterator;
+        }
         if (binding.columnIterator == nullptr) continue;
         auto& node = binding.values->nodes[binding.producer->input->rootNode];
         node.bulkIterator.reset();
@@ -612,6 +803,7 @@ public:
     void endSeg(int32_t segnum) override {
       unused(segnum);
       bindings.clear();
+      countColumns.clear();
       segmentFailure = AggregateFailure::NONE;
     }
 
@@ -975,15 +1167,14 @@ public:
     });
   }
 
-  // Every producer a bare scalar column with a keyed raw batch accumulator: the
-  // inline calculator then reads its values straight from the column per batch.
+  // Every producer reads a bare scalar column, as its input or through
+  // count(column), with a keyed raw batch accumulator: the inline calculator
+  // then reads its values straight from the column per batch.
   bool inlinesAsColumnBatch() const override {
     return !aggregate.hasIndirectStates
         && std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
-      const ValueNode& input = producer.input->root();
       return producer.resolved.state.inlineCapable
-          && input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
-          && input.type != ValueType::COLUMN_ONLY
+          && columnInput(producer).valid
           && producer.resolved.state.accumulateKeyedRawBatch != nullptr;
     });
   }

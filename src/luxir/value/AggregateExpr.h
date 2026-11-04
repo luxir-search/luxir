@@ -216,8 +216,12 @@ public:
 
   uint32_t addProducer(AggregateProducer producer, bool sharing = true);
   // Before binding or creating state; refresh resolved fields after adoption.
-  // Source inputs/arguments must outlive this program; unequal sets are unchanged.
-  bool adoptProducers(const AggregateProgram& source);
+  // Source inputs/arguments must outlive this program; unequal sets are
+  // unchanged. With subset, the source may hold producers this one lacks.
+  bool adoptProducers(const AggregateProgram& source, bool subset = false);
+  // Appends the producers of other that this program lacks, keeping existing
+  // producer indexes and state offsets. Same lifetime rules as adoption.
+  void absorbProducers(const AggregateProgram& other);
 
   uint32_t addNode(AggregateNode node) {
     nodes.push_back(node);

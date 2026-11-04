@@ -31,9 +31,10 @@ uint32_t AggregateProgram::addProducer(AggregateProducer producer, bool sharing)
   return (uint32_t)producers.size() - 1;
 }
 
-bool AggregateProgram::adoptProducers(const AggregateProgram& source) {
+bool AggregateProgram::adoptProducers(const AggregateProgram& source, bool subset) {
   if (this == &source) return true;
-  if (producers.size() != source.producers.size()) return false;
+  if (subset ? producers.size() > source.producers.size()
+             : producers.size() != source.producers.size()) return false;
   std::vector<uint32_t> remap;
   std::vector<bool> used(source.producers.size());
   remap.reserve(producers.size());
@@ -51,6 +52,13 @@ bool AggregateProgram::adoptProducers(const AggregateProgram& source) {
   stateBytes = source.stateBytes;
   hasIndirectStates = source.hasIndirectStates;
   return true;
+}
+
+void AggregateProgram::absorbProducers(const AggregateProgram& other) {
+  if (this == &other) return;
+  for (const AggregateProducer& producer : other.producers) {
+    addProducer(producer, true);
+  }
 }
 
 std::string_view aggregateFailureReason(AggregateFailure failure) {

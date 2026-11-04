@@ -10,12 +10,20 @@ namespace luxir {
 struct IntFacetRangeReq::DataCounts : MergeableData {
   RangeFacetCountWindow window;
   int64_t missing_num = 0;
+  // Inline sub-op entries keyed by cell lower fence (init()).
+  std::unique_ptr<InlineData> inlineData;
   explicit DataCounts(IntFacetRangeReq& op)
       : window(*op.grid, op.req.memoryTracker, std::format("facet '{}'", op.name)) {}
   static DataCounts* merge(DataCounts* a, DataCounts* b) {
     if (a->window.size() < b->window.size()) std::swap(a, b);
     a->window.mergeFrom(b->window);
     a->missing_num += b->missing_num;
+    if (a->inlineData && b->inlineData) {
+      InlineData* kept = InlineData::merge(a->inlineData.get(), b->inlineData.get());
+      if (kept != a->inlineData.get()) std::swap(a->inlineData, b->inlineData);
+    } else if (b->inlineData) {
+      std::swap(a->inlineData, b->inlineData);
+    }
     return a;
   }
 };
@@ -193,6 +201,21 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
                 [&](int32_t doc) { missingBucket(group(doc)); });
           });
     } else {
+      if (!range.inlineSubOps.empty()) {
+        this->withInlineSegment(data.inlineData, segnum, domain, [&](InlineData& inlineData) {
+          size_t index = 0;
+          range.facetSegIntBuckets(domain, segnum, data.missing_num,
+              [&](int64_t value) -> std::optional<int64_t> {
+                if constexpr (Floating) if (!finite(value)) return std::nullopt;
+                index = data.window.observe(value);
+                return data.window.cellKey(index);
+              }, [&](int32_t doc, int64_t key) LUXIR_INLINE {
+                data.window.entry(index)++;
+                inlineData.counts.add(key, doc);
+              });
+        });
+        return;
+      }
       if (pointsSegment(data, segnum, domain)) return;
       // A zone inside one grid cell counts without a decode. Its bounds can
       // come from docs outside the domain, so classifying never throws: a
