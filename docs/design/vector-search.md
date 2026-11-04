@@ -266,6 +266,24 @@ a prefix sample. This avoids training only on the oldest values when data
 inside a segment is time ordered. The builder normalizes vectors for FAISS
 when the field uses cosine and the stored column is raw.
 
+The sample holds `ivfTrainingPointsPerCentroid` (100) vectors per trained
+centroid: the IVF lists for RaBitQ, and the larger of the lists and the 2^bits
+codebook entries for PQ, whose codebooks train on the same rows. It is capped
+by the segment and by `ivfTrainingSampleMaxBytes` (4 GiB); the codec's training
+floor still wins over that ceiling. FAISS asks for at least 39 points per
+centroid and subsamples above 256, so 100 sits between the two. A byte budget
+that ignores nlist starves large segments: 64 MiB at 768 dims is 21,845
+vectors, 10 per list at 5M vectors, which produces uneven lists and lower
+recall at every probe count. K-means work is proportional to sample size times
+nlist, so at `nlist = sqrt(N)` training stays linear in N. The default nlist
+cap of 4096 bounds the sample at 409,600 vectors: 1.2 GiB at 768 dims and
+2.4 GiB at 1536. That sample is an in-memory copy held until training
+finishes; FAISS trains IVF+PQ codebooks on at most 256 residuals per codebook
+entry, copied from it. Building already holds the inverted lists in memory,
+which are of the same order at those sizes. Each merge or commit build holds
+its own sample. A field with a large explicit `nlist` or thousands of
+dimensions reaches the ceiling first and gets fewer points per centroid.
+
 Raw-cosine training samples are normalized in place in their owned buffer.
 RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
 Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),

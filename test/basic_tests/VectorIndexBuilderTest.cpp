@@ -31,6 +31,7 @@
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
+#include <faiss/utils/distances.h>
 
 #include <cstring>
 #include <atomic>
@@ -39,6 +40,7 @@
 #include <latch>
 #include <memory>
 #include <memory_resource>
+#include <random>
 #include <span>
 #include <thread>
 #include <vector>
@@ -1596,6 +1598,37 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     EXPECT_EQ(approx, (std::vector<std::string>{"doc79"}));
     EXPECT_EQ(approx, runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1, true));
   }
+}
+
+namespace {
+std::vector<float> randomUnit(std::mt19937& rng, int32_t dims) {
+  std::normal_distribution<float> normal;
+  std::vector<float> v((size_t)dims);
+  for (auto& x : v) x = normal(rng);
+  faiss::fvec_renorm_L2((size_t)dims, 1, v.data());
+  return v;
+}
+}
+
+TEST_F(VectorIndexBuilderTest, trainingSampleScalesWithCentroids) {
+  IvfTestGuard guard;
+  SearchOverridesGuard<size_t> maxBytes{VectorIndexBuilder::ivfTrainingSampleMaxBytes};
+  auto trained = [](api::VectorAnnDef ann) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), ann, 4);
+    std::mt19937 rng(3);
+    for (int32_t i = 0; i < 1000; i++) h.index(flatdoc("id", std::to_string(i), "embedding_v", randomUnit(rng, 4)));
+    h.commit({"*"});
+    return VectorIndexBuilder::ivfLastTrainingVectorsForTests.load();
+  };
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 400);       // lists * 100
+  EXPECT_EQ(trained(rabitqAnn(32, 1)), 1000);     // capped by the segment
+  EXPECT_EQ(trained(pqAnn(2, 2, 3)), 800);        // 2^bits codebook entries bind
+  EXPECT_EQ(trained(pqAnn(8, 2, 2)), 800);        // lists bind
+  VectorIndexBuilder::ivfTrainingSampleMaxBytes = 100 * 4 * sizeof(float);
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 100);       // memory ceiling
+  EXPECT_EQ(trained(rabitqAnn(200, 1)), 200);     // floor (one per list) beats the ceiling
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
