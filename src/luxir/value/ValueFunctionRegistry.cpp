@@ -29,7 +29,8 @@ void requireNumeric(std::span<const ResolvedValue> args) {
     }
     if (arg.type == ValueType::COLUMN_ONLY) {
       throw std::runtime_error(
-          "a non-numeric column is only valid as the complete sort expression");
+          "a non-numeric column is only valid as a complete sort expression, "
+          "as the argument of count(), or as the input of cardinality()");
     }
   }
 }
@@ -165,8 +166,8 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
 }
 
-// count() also takes a string or id column, the one place a non-numeric
-// column is valid inside an expression: it counts the column's values.
+// count() takes any value (an ANY operand): it counts a STRING or ID
+// column's values from the column's shape, and a GEO_POINT's points.
 ResolvedValue countResolve(std::span<const ResolvedValue> args) {
   unused(args);
   return {ValueType::INT64, ValueNature::NUMBER};
@@ -702,7 +703,9 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
 ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
   if (program.program.nodes[node.children[0]].type == ValueType::COLUMN_ONLY) {
-    return ValueResult::integer(program.countOrdValues(node.children[0], docid));
+    BoundStringColumn* column = program.nodes[node.children[0]].stringColumn;
+    if (column == nullptr || !column->cursor.seek(docid)) return ValueResult::integer(0);
+    return ValueResult::integer(column->cursor.count());
   }
   ValueResult input = program.evalNode(node.children[0], docid, score);
   if (!input.valid) return ValueResult::integer(0);
@@ -1682,6 +1685,8 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
 }
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+constexpr ValueFunction::Operand ANY_VALUE{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
 constexpr ValueFunction::Operand GEO_POINT{
     .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
 constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
@@ -1733,7 +1738,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
      sumBounds, evalSumElement, 1, 1, {RAW}, nullptr},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
-     evalFunctionBatch, countBounds, evalCountElement, 1, 1, {RAW}, nullptr},
+     evalFunctionBatch, countBounds, evalCountElement, 1, 1, {ANY_VALUE}, nullptr},
     {ValueOpcode::EXP, "exp", unaryDouble, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::EXP, 1>},
@@ -1857,7 +1862,7 @@ ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args
       if (args[i].nature != ValueNature::GEO_POINT) {
         throw std::runtime_error(fmt::format("argument {} is not a GEO_POINT value", i + 1));
       }
-    } else {
+    } else if (operands[i].kind == Kind::NUMERIC) {
       requireNumeric(args.subspan(i, 1));
     }
   }
@@ -2022,8 +2027,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {
-        bound.ordColumn.emplace(postings, *fieldInfo);
-        bound.ordIterator.emplace(*bound.ordColumn);
+        bound.stringColumn = pool.make<BoundStringColumn>(postings, *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
             fieldInfo->docsWithField < postings.maxDoc());
       } else {
@@ -2139,24 +2143,6 @@ ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float
   if (node.type == ValueType::INT64) return ValueResult::integer(node.intValue);
   if (node.type == ValueType::DOUBLE) return ValueResult::floating(node.doubleValue);
   return ValueResult::arrayValue(node.type, index, docid, score, node.arraySize);
-}
-
-int64_t BoundValueProgram::countOrdValues(uint32_t index, int32_t docid) {
-  BoundValueNode& bound = nodes[index];
-  if (!bound.ordColumn) return 0;
-  if (bound.ordIterator->docId() > docid) {
-    bound.ordIterator.reset();
-    bound.ordIterator.emplace(*bound.ordColumn);
-  }
-  OrdColReader::Iterator& iterator = *bound.ordIterator;
-  if (iterator.docId() < docid) iterator.advance(docid);
-  if (iterator.docId() != docid) return 0;
-  // A stored 0 is no value, as for the aggregate ord bindings.
-  if (!bound.ordColumn->multiValued()) return iterator.value() != 0 ? 1 : 0;
-  auto [start, end] = bound.ordColumn->getStartEndValueRank(iterator.rank());
-  int64_t count = 0;
-  for (int64_t i = start; i < end; i++) count += iterator.values().valueAt(i) != 0;
-  return count;
 }
 
 ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float score) {

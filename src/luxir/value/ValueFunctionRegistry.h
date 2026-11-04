@@ -56,7 +56,8 @@ inline constexpr size_t VALUE_MAX_ARITY = 5;
 
 struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
-  enum class Kind : uint8_t { NUMERIC, GEO_POINT };
+  // ANY also takes GEO_POINT values and non-numeric (STRING or ID) columns.
+  enum class Kind : uint8_t { NUMERIC, GEO_POINT, ANY };
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
     bool lazy = false;

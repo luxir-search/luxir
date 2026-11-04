@@ -14,6 +14,7 @@
 
 #include <google/protobuf/arena.h>
 
+#include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/schema/FieldType.h"
@@ -105,13 +106,38 @@ public:
                           ValueFieldInfos fields) const;
 };
 
+// A STRING or ID column node. count() reads only its shape; a consumer that
+// needs the stored ords (cardinality) attaches them.
+struct BoundStringColumn {
+  const SegFieldInfo& fieldInfo;
+  ColumnShape shape;
+  ColumnShape::Cursor cursor;
+  OrdColReader* ords = nullptr;
+  OrdColReader::BulkOrds* ordValues = nullptr;
+
+  BoundStringColumn(PostingsReader& postings, const SegFieldInfo& fieldInfo)
+      : fieldInfo(fieldInfo), shape(postings, fieldInfo), cursor(shape) {}
+
+  // Only indexed STRING and ID columns store ords.
+  void attachOrds(MemPool& pool, PostingsReader& postings) {
+    ords = pool.make<OrdColReader>(postings, fieldInfo);
+    ordValues = pool.make<OrdColReader::BulkOrds>(*ords);
+  }
+
+  // The stored ord (segment ord + 1) at value rank `rank` of `docid`, after
+  // cursor.seek(docid) found it.
+  int32_t storedOrd(int32_t docid, int64_t rank) {
+    assert(ords != nullptr && rank >= cursor.begin() && rank < cursor.end());
+    int64_t index = !ords->multiValued() && ords->docIdIndexed() ? docid : rank;
+    return ordValues->valueAt(index);
+  }
+};
+
 struct BoundValueNode {
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
-  // A non-numeric (string or id) column, which only count() reads.
-  std::optional<OrdColReader> ordColumn;
-  std::optional<OrdColReader::Iterator> ordIterator;
+  BoundStringColumn* stringColumn = nullptr;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;
@@ -145,8 +171,6 @@ public:
   void evalScalarBatch(std::span<const int32_t> docids,
                        std::span<ScalarValueResult> results);
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
-  // The number of values a non-numeric column node holds for the document.
-  int64_t countOrdValues(uint32_t node, int32_t docid);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
   const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
   std::string_view firstUnboundedNode() const;

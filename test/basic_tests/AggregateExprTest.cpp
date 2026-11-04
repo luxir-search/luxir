@@ -651,6 +651,78 @@ TEST_F(AggregateExprTest, countTakesStringAndIdColumns) {
   ArenaOwner memory;
   expectParseError(memory, *schema, "sum(abs(s_s))",
                    "a non-numeric column is only valid");
+  expectParseError(memory, *schema, "sum(abs(at_p))", "GEO_POINT is not numeric");
+  expectParseError(memory, *schema, "cardinality(code_sc)",
+                   "requires an indexed STRING or ID column");
+}
+
+TEST_F(AggregateExprTest, countReadsStoredValuesOfEveryColumnKind) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  SchemaBuilder schema;
+  for (auto [name, indexed, array] : {std::tuple{"set", true, false}, {"array", true, true},
+                                      {"raw_set", false, false}, {"raw_array", false, true}}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::STRING;
+    if (!indexed) {
+      field.index = api::FieldDef::IndexMode::NONE;
+      field.column = true;
+    }
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+  }
+  schema.set(helper.collection());
+  auto tags = vecs("p", "q", "p");
+  auto none = std::vector<std::string>{};
+  // In the first segment s_s is single-valued and too sparse for docid
+  // indexing, so its ords are addressed by rank.
+  helper.indexAll({
+      flatdoc("id", "a", "set", tags, "array", tags, "raw_set", tags, "raw_array", tags,
+              "at_p", std::vector<double>{1, 2},
+              "at_ps", std::vector<std::vector<double>>{{1, 2}, {3, 4}}),
+      flatdoc("id", "b", "set", none, "array", none, "raw_array", none,
+              "at_p", std::vector<double>{5, 6}),
+      flatdoc("id", "c", "s_s", "z")}, UpdateMessage::COMMIT);
+  helper.indexAll({flatdoc("id", "d", "s_s", "z"), flatdoc("id", "e", "s_s", "y")},
+                  UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  for (const char* name : {"set", "array", "raw_set", "raw_array", "at_p", "at_ps", "s_s"}) {
+    root.expr(name, std::string("sum(count(") + name + "))");
+  }
+  root.expr("distinct", "cardinality(s_s)");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->scalar<int64_t>("set"));
+  EXPECT_EQ(3, req->scalar<int64_t>("array"));
+  EXPECT_EQ(2, req->scalar<int64_t>("raw_set"));
+  EXPECT_EQ(3, req->scalar<int64_t>("raw_array"));
+  EXPECT_EQ(2, req->scalar<int64_t>("at_p"));
+  EXPECT_EQ(2, req->scalar<int64_t>("at_ps"));
+  EXPECT_EQ(3, req->scalar<int64_t>("s_s"));
+  EXPECT_EQ(2, req->scalar<int64_t>("distinct"));
+}
+
+TEST_F(AggregateExprTest, countAndCardinalitySeeNoValuesInAColumnEmptiedByMerge) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "a", "s_s", "x", "tags_ss", vecs("p", "q")),
+                   flatdoc("id", "b")}, UpdateMessage::COMMIT);
+  helper.indexAll({flatdoc("id", "c")}, UpdateMessage::COMMIT);
+  ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("strings", "sum(count(s_s))");
+  root.expr("tags", "sum(count(tags_ss))");
+  root.expr("distinct", "cardinality(s_s)");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0, req->scalar<int64_t>("strings"));
+  EXPECT_EQ(0, req->scalar<int64_t>("tags"));
+  EXPECT_EQ(0, req->scalar<int64_t>("distinct"));
 }
 
 TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
