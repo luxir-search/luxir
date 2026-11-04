@@ -9,17 +9,38 @@ import subprocess
 import tempfile
 
 source = Path(__file__).resolve().parents[1]
-with tempfile.TemporaryDirectory(prefix='luxir-build-info-test-') as temporary:
-    base = Path(temporary)
-    repo = base / 'repo'
-    repo.mkdir()
 
-    def run(*args, cwd=repo):
-        p = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if p.returncode:
-            raise RuntimeError(f'{args}:\n{p.stdout}')
-        return p.stdout.strip()
 
+def run(*args, cwd, ok=True):
+    p = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if ok and p.returncode:
+        raise RuntimeError(f'{args}:\n{p.stdout}')
+    return p.stdout.strip()
+
+
+def git(tree, *args):
+    return run('git', '-c', 'user.email=test@example.invalid', '-c', 'user.name=Build metadata test', *args, cwd=tree)
+
+
+def configure(tree, build, *extra):
+    return run('cmake', '-G', 'Ninja', '-S', str(tree), '-B', str(build), *extra, cwd=tree)
+
+
+def check(tree, build, expected):
+    run('cmake', '--build', str(build), cwd=tree)
+    assert run(str(build / 'info'), cwd=tree) == f'1.2.3 {expected} test'
+
+
+def packaged_fresh(build):
+    # tools/package-release: refresh the graph, then dry-run it from stdin.
+    run('ninja', '-C', str(build), 'build.ninja', cwd=build)
+    pending = subprocess.run(['ninja', '-C', str(build), '-f', '/dev/stdin', '-n'], text=True, check=True,
+                             input=(build / 'build.ninja').read_text(), stdout=subprocess.PIPE).stdout
+    return pending.strip().endswith('ninja: no work to do.')
+
+
+def fixture(repo, *init):
+    repo.mkdir(parents=True)
     for name in ('BuildInfo.cmake', 'BuildInfo.cpp.in'):
         shutil.copy(source / 'cmake' / name, repo / name)
     (repo / 'luxir').mkdir()
@@ -33,52 +54,81 @@ with tempfile.TemporaryDirectory(prefix='luxir-build-info-test-') as temporary:
     target_include_directories(info PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     ''')
     (repo / 'main.cpp').write_text('#include "luxir/BuildInfo.h"\n#include <iostream>\nint main() { const auto& b = luxir::buildInfo(); std::cout << b.version << " " << b.sourceCommit << " " << b.cpuTarget; }\n')
-    run('git', 'init', '-b', 'main')
-    run('git', 'config', 'user.email', 'test@example.invalid')
-    run('git', 'config', 'user.name', 'Build metadata test')
-    run('git', 'add', '.')
-    run('git', 'commit', '-m', 'initial fixture')
-    first = run('git', 'rev-parse', 'HEAD')
+    git(repo, 'init', '-b', 'main', *init)
+    git(repo, 'add', '.')
+    git(repo, 'commit', '-m', 'initial fixture')
 
-    def configure(tree, build, *extra):
-        run('cmake', '-G', 'Ninja', '-S', str(tree), '-B', str(build), *extra)
 
-    def check(tree, build, expected):
-        run('cmake', '--build', str(build), cwd=tree)
-        assert run(str(build / 'info')) == f'1.2.3 {expected} test'
-
+def follows_head(base, *init):
+    repo = base / 'repo'
+    fixture(repo, *init)
+    first = git(repo, 'rev-parse', 'HEAD')
     build = base / 'build'
     configure(repo, build)
     check(repo, build, first)
     mtime = (build / 'info').stat().st_mtime_ns
     check(repo, build, first)
     assert (build / 'info').stat().st_mtime_ns == mtime, 'unchanged build relinked'
-    run('git', 'commit', '--allow-empty', '-m', 'next fixture')
-    second = run('git', 'rev-parse', 'HEAD')
+    assert packaged_fresh(build)
+    git(repo, 'commit', '--allow-empty', '-m', 'next fixture')
+    second = git(repo, 'rev-parse', 'HEAD')
+    assert not packaged_fresh(build), 'packaging accepted a build of the previous commit'
     check(repo, build, second)
-    run('git', 'checkout', '--detach', first)
+    assert packaged_fresh(build)
+    git(repo, 'checkout', '--detach', first)
     check(repo, build, first)
-    run('git', 'checkout', 'main')
+    git(repo, 'checkout', 'main')
     check(repo, build, second)
-    run('git', 'pack-refs', '--all', '--prune')
+    git(repo, 'pack-refs', '--all', '--prune')
     check(repo, build, second)
-    run('git', 'commit', '--allow-empty', '-m', 'after packed refs')
-    third = run('git', 'rev-parse', 'HEAD')
+    git(repo, 'commit', '--allow-empty', '-m', 'after packed refs')
+    third = git(repo, 'rev-parse', 'HEAD')
     check(repo, build, third)
+
     worktree = base / 'worktree'
-    run('git', 'worktree', 'add', '-b', 'linked', str(worktree))
+    git(repo, 'worktree', 'add', '-b', 'linked', str(worktree))
     workbuild = base / 'workbuild'
     configure(worktree, workbuild)
     check(worktree, workbuild, third)
-    run('git', 'commit', '--allow-empty', '-m', 'linked commit', cwd=worktree)
-    check(worktree, workbuild, run('git', 'rev-parse', 'HEAD', cwd=worktree))
-    archive = base / 'archive'
-    shutil.copytree(repo, archive, ignore=shutil.ignore_patterns('.git'))
+    git(worktree, 'commit', '--allow-empty', '-m', 'linked commit')
+    check(worktree, workbuild, git(worktree, 'rev-parse', 'HEAD'))
+    # Moving the linked worktree's branch from the main checkout leaves that
+    # worktree's own HEAD and reflog untouched.
+    git(repo, 'update-ref', 'refs/heads/linked', first)
+    check(worktree, workbuild, first)
+    return repo, third
+
+
+with tempfile.TemporaryDirectory(prefix='luxir-build-info-test-') as temporary:
+    base = Path(temporary)
+    repo, head = follows_head(base / 'files')
+    probe = base / 'probe'
+    if subprocess.run(['git', 'init', '-q', '--ref-format=reftable', str(probe)]).returncode == 0:
+        follows_head(base / 'reftable', '--ref-format=reftable')
+        reftable = 'reftable'
+    else:
+        reftable = 'reftable SKIPPED (unsupported by this git)'
+
+    # A source archive inside an unrelated repository must not report that
+    # repository's commit.
+    archive = repo / 'archive'
+    shutil.copytree(repo, archive, ignore=shutil.ignore_patterns('.git', 'archive'))
     archivebuild = base / 'archivebuild'
-    configure(archive, archivebuild)
+    assert 'Source commit unknown' in configure(archive, archivebuild)
     check(archive, archivebuild, 'unknown')
-    configure(archive, archivebuild, f'-DLUXIR_SOURCE_COMMIT={third}')
-    check(archive, archivebuild, third)
-    p = subprocess.run(['cmake', '-S', str(archive), '-B', str(archivebuild), '-DLUXIR_SOURCE_COMMIT=bad'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    assert p.returncode and 'must be a full Git commit hash' in p.stdout
-    print('PASS: unchanged builds, commits, detached HEAD, branch switches, packed refs, linked worktrees, archive fallback, override, and invalid hash rejection')
+    configure(archive, archivebuild, f'-DLUXIR_SOURCE_COMMIT={head}')
+    check(archive, archivebuild, head)
+    out = run('cmake', '-S', str(archive), '-B', str(archivebuild), '-DLUXIR_SOURCE_COMMIT=bad', cwd=archive, ok=False)
+    assert 'must be a full Git commit hash' in out
+
+    # A checkout whose Git directory is unreachable (a linked worktree in a
+    # container) still configures.
+    unreachable = base / 'unreachable'
+    shutil.copytree(archive, unreachable)
+    (unreachable / '.git').write_text(f'gitdir: {base / "missing"}\n')
+    unreachablebuild = base / 'unreachablebuild'
+    assert 'Source commit unknown' in configure(unreachable, unreachablebuild)
+    check(unreachable, unreachablebuild, 'unknown')
+    print(f'PASS: files, {reftable}; unchanged builds, commits, packaging freshness, detached HEAD, branch '
+          'switches, packed refs, linked worktrees, external branch updates, archive fallback, nested archive, '
+          'override, invalid hash rejection, and unreachable Git directory')

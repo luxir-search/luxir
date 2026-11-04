@@ -53,8 +53,9 @@ public:
 };
 
 void service(Renderer& r, const api::ServiceStats& s) {
-  r.gauge("luxir_build_info", "Luxir build version and CPU target.", 1,
-          PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target));
+  r.gauge("luxir_build_info", "Luxir build version, CPU target and source commit.", 1,
+          PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target) + "," +
+          PrometheusText::label("source_commit", s.source_commit));
   r.gauge("luxir_node_read_only", "Node is configured read only.", s.read_only);
   for (auto [transportName, transport] : {std::pair{"http", &s.http}, {"grpc", &s.grpc}}) {
     auto t = PrometheusText::label("transport", transportName);

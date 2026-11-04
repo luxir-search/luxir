@@ -2240,6 +2240,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 |---|---|---|---|---|
 | <a id="field-luxir.servicestats.version"></a>[`version`](#field-luxir.servicestats.version) | 1 | `string` | singular |  |
 | <a id="field-luxir.servicestats.cpu_target"></a>[`cpu_target`](#field-luxir.servicestats.cpu_target) | 20 | `string` | singular | The CPU target the binary was built for. |
+| <a id="field-luxir.servicestats.source_commit"></a>[`source_commit`](#field-luxir.servicestats.source_commit) | 23 | `string` | singular | The full Git commit the binary was built from, or "unknown". |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
 | <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
 | <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, delete pass, merge, vector build and reader refresh histograms. |

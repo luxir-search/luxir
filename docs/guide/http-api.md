@@ -69,7 +69,7 @@ statistics or accessing Git at runtime:
 
 `source_commit` identifies the checkout's HEAD at build time; it does not describe
 uncommitted edits. It is `"unknown"` for source archives built without an explicit
-commit hash. `luxir --version` and the startup banner report the same version,
+commit hash, or when the build could not read the checkout's Git repository. `luxir --version` and the startup banner report the same version,
 commit, and CPU target. The root endpoint defaults to pretty JSON; use
 `/?pretty=false` for compact output.
 
