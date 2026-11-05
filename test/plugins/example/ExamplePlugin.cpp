@@ -101,6 +101,10 @@ public:
                                        -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingLayer>(std::move(inner));
     });
+    r.storage.addLayer("remote", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&)
+                                     -> std::unique_ptr<DirectoryFactory> {
+      return std::make_unique<RemoteLayer>(std::move(inner));
+    });
 
     r.query.add("doc_ids", ::example::docIdsDef());
     r.query.add("field_value", ::example::fieldValueDef());

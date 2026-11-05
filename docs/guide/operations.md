@@ -610,6 +610,12 @@ above `1` are reserved for a bounded parallelism budget and not implemented
 yet. A request with `min_commit` continues on a shared worker once its commit
 wait ends, whatever the setting.
 
+A search of a collection on a remote storage backend (one whose directory
+reports `Directory::REMOTE`) leaves the shard in every lane, because its reads
+can wait on the network: `0` and `1` run serially on a worker, and `-1` fans out
+from one. The search still holds that worker while it waits, so concurrent cold
+searches can occupy the whole pool.
+
 gRPC searches always run on the shared workers, never on the completion-queue
 thread: a client such as a gateway multiplexes many calls over one HTTP/2
 connection, and gRPC offers a connection's new calls to its preferred

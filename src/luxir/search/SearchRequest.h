@@ -106,6 +106,10 @@ public:
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
+  // The request left its receiving transport thread for the task arena
+  // (SearchEngine::enqueueSubmit), in any max_parallel lane.  Its resumed
+  // production stays off that thread too.
+  bool offloaded = false;
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);

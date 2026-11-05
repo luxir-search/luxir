@@ -3,11 +3,20 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/search/SearchRequest.h"
+#include "luxir/server/HttpServer.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
+#include "test/HttpReq.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
@@ -17,6 +26,96 @@ using luxir::example::CountingLayer;
 using luxir::example::CountingRamBackend;
 
 class StorageExampleTest : public LuxirTest {};
+
+namespace {
+
+// Holds the first thread that emits `signal` once `when` holds, until the shard has been probed,
+// as a read of a slow object holds a search. Destroy it only after the request
+// that emits the signal has finished.
+class StalledSignal {
+  std::promise<void> reached, released;
+  std::shared_future<void> releasedFuture = released.get_future().share();
+  std::atomic<bool> first{true};
+
+public:
+  explicit StalledSignal(std::string_view signal, std::function<bool()> when = [] { return true; }) {
+    Signal::listen(signal, [this, when = std::move(when)](void*, void*, void*) -> void* {
+      if (when() && first.exchange(false)) {
+        reached.set_value();
+        releasedFuture.wait();
+      }
+      return nullptr;
+    });
+  }
+
+  // While a thread is stalled, the server's only shard must still answer.
+  void expectShardAnswers(int port) {
+    ASSERT_EQ(std::future_status::ready, reached.get_future().wait_for(std::chrono::seconds(60)));
+    auto health = std::async(std::launch::async, [port] { return httpRequest(port, http::verb::get, "/health"); });
+    bool answered = health.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    released.set_value();
+    EXPECT_TRUE(answered);
+    EXPECT_EQ(200, health.get().result_int());
+  }
+};
+
+LuxirConfig remoteConfig() {
+  LuxirConfig config;
+  config.store.layers = {"remote"};
+  return config;
+}
+
+}  // namespace
+
+TEST_F(StorageExampleTest, remoteCollectionSearchLeavesTheShard) {
+  LuxirNode node(remoteConfig());
+  HttpServer server(node, 1, 0);
+  server.start();
+  auto update = httpRequest(server.getPort(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"a"},{"id":"b"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  for (std::string lane : {"0", "1", "-1"}) {
+    SCOPED_TRACE(lane);
+    StalledSignal stalled("searchRootChildStart");
+    auto search = std::async(std::launch::async, [&] {
+      return httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                         R"({"query":{"all":true},"max_parallel":)" + lane + "}");
+    });
+    stalled.expectShardAnswers(server.getPort());
+    auto response = search.get();
+    EXPECT_EQ(200, response.result_int()) << response.body();
+    EXPECT_NE(std::string::npos, response.body().find(R"("id":"b")")) << response.body();
+  }
+  server.shutdown();
+}
+
+// Production resumed after backpressure stays off the shard too. Only a
+// parallel emitter emits this signal; once a batch has paused, the next one to
+// emit it is a resumed one.
+TEST_F(StorageExampleTest, remoteCollectionResumesProductionOffTheShard) {
+  LuxirNode node(remoteConfig());
+  CollectionHelper helper(node, "main");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", "d" + std::to_string(i), "pad_s", std::string(400, 'x')));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  HttpServer server(node, 1, 0, /*streamBufferBytes=*/4096);
+  server.start();
+
+  int64_t pausesBefore = streamPauseCount.load();
+  StalledSignal stalled("emitDocsColumnsWait", [&] { return streamPauseCount.load() > pausesBefore; });
+  auto search = std::async(std::launch::async, [&] {
+    return httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                       R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":-1,"fields":["id","pad_s"]})");
+  });
+  stalled.expectShardAnswers(server.getPort());
+  auto response = search.get();
+  EXPECT_EQ(200, response.result_int());
+  size_t count = 0;
+  for (size_t pos = 0; (pos = response.body().find(R"("id":"d)", pos)) != std::string::npos; pos++) count++;
+  EXPECT_EQ(2000u, count);
+  server.shutdown();
+}
 
 TEST_F(StorageExampleTest, nodeRunsOnPluginBackendAndLayer) {
   LuxirConfig config;

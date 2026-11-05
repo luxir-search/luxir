@@ -124,6 +124,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
 }
 
 void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
+  req.offloaded = true;
   try {
     // Isolated: a -1 request waiting on its task group helps only with its own
     // tasks, never stealing another request's.
@@ -135,6 +136,15 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
     // sees exactly one final reply.
     req.setError(classifyException(e, ErrorKind::INTERNAL));
     req.bodyDone();
+  }
+}
+
+bool SearchEngine::readsRemotely(const SearchRequest& req) {
+  try {
+    auto collection = node.getCollection(LuxirNode::target(req.tenant, req.proto.collection));
+    return collection->getShard()->getDirectory()->capabilities() & Directory::REMOTE;
+  } catch (const std::exception&) {
+    return false;  // getResources reports the failed lookup, as for any collection
   }
 }
 
@@ -172,12 +182,15 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
       return;
     }
   }
-  // 0 and -1 start on the receiving thread when its transport allows it.
-  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1);
+  // 0 and -1 start on the receiving thread when its transport allows it and
+  // the collection's reads cannot wait on the network.
+  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1)
+      && !readsRemotely(req);
   if (!runOnReceiver) {
-    // Off the receiving thread: always for an offloading transport, and for
-    // 1 (serial on the arena, the escape hatch for a query expected to be
-    // expensive).  Other values are rejected in prepare(), on the arena like 1.
+    // Off the receiving thread: always for an offloading transport or a remote
+    // collection, and for 1 (serial on the arena, the escape hatch for a query
+    // expected to be expensive).  Other values are rejected in prepare(), on
+    // the arena like 1.
     enqueueSubmit(req, maxParallel);
   } else if (maxParallel == 0) {
     // Default lane: the whole query runs serially right here on the receiving
