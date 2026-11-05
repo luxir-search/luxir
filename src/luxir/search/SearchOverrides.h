@@ -115,6 +115,8 @@ inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
 inline bool disableKeyedInlineBatchesForTests = false;
 // A/B toggle: ordinal aggregate inputs use the per-document value evaluator.
 inline bool disableOrdinalAggregateBatchesForTests = false;
+// A/B toggle: ordinal batches go straight to HLL instead of exact ordinal storage.
+inline bool disableCardinalityOrdSetsForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE

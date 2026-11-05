@@ -507,7 +507,8 @@ The typing rules:
 
 `cardinality` is exact up to `threshold` distinct values, then switches to a
 HyperLogLog estimate with a standard error of about 1.6% at the default
-threshold (0.4% at 40000). A larger threshold extends the exact phase and uses
+threshold (0.4% at 40000). For indexed STRING/ID inputs, the result may be exact
+beyond the threshold. A larger threshold extends the sketch's exact phase and uses
 more memory; 0 estimates from the first value.
 
 `percentile` is exact for fewer than 5 x `compression` values (500 by

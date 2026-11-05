@@ -33,6 +33,9 @@ namespace luxir {
 class ExprStatsOp : public SearchOp {
   static constexpr std::string_view FACET_STATE_BREAKER =
       "facet aggregate state";
+  // Cap on an optional exact ordinal set per state: an L2-sized working set
+  // (2M ords); larger dictionaries use the sketch.
+  static constexpr size_t MAX_ORD_SET_BYTES = 256 * 1024;
 
   AggregateProgram& aggregate;
   std::span<const AggregateFieldInfos> fields;
@@ -199,12 +202,15 @@ public:
       bool ordinals = root.type == ValueType::COLUMN_ONLY;
       if (ordinals ? bound.stringColumn == nullptr || bound.stringColumn->ords == nullptr
                    : !bound.column) return;
+      int64_t numOrds = ordinals ? thisOp().fields[binding.producerIndex].ords->numOrds() : 0;
+      size_t maxSetBytes = disableCardinalityOrdSetsForTests ? 0 : MAX_ORD_SET_BYTES;
       std::array<int64_t, BATCH_SIZE> values;
       size_t count = 0;
       auto flush = [&] {
-        accumulator.addRawBatch(
-            binding.producerIndex,
-            std::span<const int64_t>(values.data(), count), root.columnType);
+        auto batch = std::span<const int64_t>(values.data(), count);
+        if (ordinals) accumulator.addOrdBatch(
+            binding.producerIndex, batch, numOrds, maxSetBytes);
+        else accumulator.addRawBatch(binding.producerIndex, batch, root.columnType);
         count = 0;
       };
       int64_t missing = 0;

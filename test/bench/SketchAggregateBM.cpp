@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
+#include <cstdlib>
+#include <numeric>
 #include <random>
 #include <string>
 #include <string_view>
 
 #include "bench/luxir_bench.h"
 #include "luxir/server/JsonRequest.h"
+#include "luxir/search/OrdMap.h"
+#include "luxir/search/SearchOverrides.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
@@ -18,24 +22,31 @@ namespace {
 
 struct SketchAggregateCase {
   std::string_view json;
-  bool filtered = false;
+  int32_t filterUpper = -1;
   int32_t buckets = 0;
 };
 
 // Keep the complete requests together so alternate API surfaces can use the
 // same corpus, execution loop, and registrations.
-constexpr std::array<SketchAggregateCase, 11> cases{{
+constexpr std::array<SketchAggregateCase, 18> cases{{
   {R"json({"ops":{"metric":"cardinality(user_s)"}})json"},
   {R"json({"ops":{"metric":"cardinality(size_i)"}})json"},
   {R"json({"ops":{"metric":"percentile(latency_d,99)"}})json"},
   {R"json({"ops":{"metric":"percentile_rank(latency_d,100)"}})json"},
   {R"json({"ops":{"p50":"percentile(latency_d,50)","p95":"percentile(latency_d,95)","p99":"percentile(latency_d,99)"}})json"},
-  {R"json({"query":"size_i:[0 TO 4999]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(user_s)"}})json", true},
-  {R"json({"query":"size_i:[0 TO 4999]","limit":0,"count_limit":-1,"ops":{"metric":"percentile(latency_d,99)"}})json", true},
-  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":10,"ops":{"metric":"cardinality(user_s)"}}}}})json", false, 10},
-  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":10,"ops":{"metric":"percentile(latency_d,99)"}}}}})json", false, 10},
-  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":-1,"ops":{"metric":"cardinality(user_s)"}}}}})json", false, 100},
-  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":-1,"ops":{"metric":"percentile(latency_d,99)"}}}}})json", false, 100},
+  {R"json({"query":"size_i:[0 TO 4999]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(user_s)"}})json", 4999},
+  {R"json({"query":"size_i:[0 TO 4999]","limit":0,"count_limit":-1,"ops":{"metric":"percentile(latency_d,99)"}})json", 4999},
+  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":10,"ops":{"metric":"cardinality(user_s)"}}}}})json", -1, 10},
+  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":10,"ops":{"metric":"percentile(latency_d,99)"}}}}})json", -1, 10},
+  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":-1,"ops":{"metric":"cardinality(user_s)"}}}}})json", -1, 100},
+  {R"json({"ops":{"hosts":{"field_facet":{"field":"host_s","limit":-1,"ops":{"metric":"percentile(latency_d,99)"}}}}})json", -1, 100},
+  {R"json({"ops":{"metric":"cardinality(id)"}})json"},
+  {R"json({"ops":{"metric":"cardinality(user_s,40000)"}})json"},
+  {R"json({"ops":{"metric":"cardinality(host_s)"}})json"},
+  {R"json({"query":"size_i:[0 TO 0]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(user_s)"}})json", 0},
+  {R"json({"query":"size_i:[0 TO 9]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(user_s)"}})json", 9},
+  {R"json({"query":"size_i:[0 TO 49]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(user_s)"}})json", 49},
+  {R"json({"query":"size_i:[0 TO 49]","limit":0,"count_limit":-1,"ops":{"metric":"cardinality(id)"}})json", 49},
 }};
 
 struct SketchAggregateValues {
@@ -60,7 +71,7 @@ struct SketchAggregateFixture {
   static constexpr int32_t numSegments = 8;
   CollectionHelper helper{collectionName};
   int64_t numDocs = unit_tests ? LuxirTest::scaleTestWork(800) : 1000000;
-  int64_t filteredDocs = 0;
+  std::vector<int64_t> sizeCounts = std::vector<int64_t>(50000);
   std::shared_ptr<IndexReader> reader;
 
   SketchAggregateFixture() {
@@ -73,7 +84,7 @@ struct SketchAggregateFixture {
     LOG_DEBUG("Sketch aggregate corpus: reused={} docs={}", reused, numDocs);
     SketchAggregateGenerator generator;
     if (reused) {
-      for (int64_t doc = 0; doc < numDocs; doc++) filteredDocs += generator.next().size < 5000;
+      for (int64_t doc = 0; doc < numDocs; doc++) sizeCounts[(size_t)generator.next().size]++;
       reader = helper.getIndexWriter()->snapshots.readers.getReader();
       return;
     }
@@ -99,7 +110,7 @@ struct SketchAggregateFixture {
         auto values = generator.next();
         api::Val latencyValue;
         latencyValue.kind = values.latency;
-        filteredDocs += values.size < 5000;
+        sizeCounts[(size_t)values.size]++;
         inv.startDoc();
         id.index(inv, std::to_string(doc));
         host.index(inv, hosts[doc % hosts.size()]);
@@ -118,6 +129,14 @@ struct SketchAggregateFixture {
 };
 
 void BM_SketchAggregate(benchmark::State& state, size_t caseIndex) {
+  // Compare the same cases without changing the production execution path:
+  // 0 = per value, 1 = batched HLL, 2 = buffered ordinal cardinality (default).
+  const char* setting = std::getenv("LUXIR_CARDINALITY_BENCH_MODE");
+  int mode = setting ? std::atoi(setting) : 2;
+  SearchOverridesGuard guard(disableOrdinalAggregateBatchesForTests,
+      disableCardinalityOrdSetsForTests);
+  disableOrdinalAggregateBatchesForTests = mode == 0;
+  disableCardinalityOrdSetsForTests = mode < 2;
   SketchAggregateFixture fixture;
   const auto& entry = cases.at(caseIndex);
   auto run = [&]() {
@@ -132,13 +151,20 @@ void BM_SketchAggregate(benchmark::State& state, size_t caseIndex) {
   ASSERT_EQ(fixture.numDocs, fixture.reader->liveDocs());
   // Prime field/ordinal/filter caches outside timing. Each case measures a
   // steady-state request, including JSON parsing and response construction.
+  int64_t domain = fixture.numDocs;
+  size_t peakBytes = 0;
   {
     auto req = run();
     ASSERT_TRUE(req->ok()) << req->errorMsg();
     ASSERT_EQ(fixture.reader.get(), req->reader.get());
-    if (entry.filtered) {
-      ASSERT_EQ(fixture.filteredDocs, req->docList("q")->found);
+    if (entry.filterUpper >= 0) {
+      ASSERT_TRUE(req->docList("q")->found.has_value());
+      domain = *req->docList("q")->found;
+      int64_t expected = std::accumulate(fixture.sizeCounts.begin(),
+          fixture.sizeCounts.begin() + entry.filterUpper + 1, int64_t{0});
+      ASSERT_EQ(expected, domain);
     }
+    peakBytes = req->memoryTracker.peak();
     if (entry.buckets) {
       const auto& facet = *req->responses[0]->proto.ops.at("hosts")->facetResult();
       ASSERT_EQ(entry.buckets, facet.counts.size());
@@ -151,7 +177,14 @@ void BM_SketchAggregate(benchmark::State& state, size_t caseIndex) {
     ASSERT_EQ(fixture.reader.get(), req->reader.get());
     benchmark::DoNotOptimize(req->responses[0]->proto);
   }
-  int64_t domain = entry.filtered ? fixture.filteredDocs : fixture.numDocs;
+  state.counters["peak_bytes"] = (double)peakBytes;
+  for (auto field : {"user_s", "id", "host_s"}) {
+    if (entry.json.find(std::string("cardinality(") + field) != std::string_view::npos) {
+      int64_t ords = fixture.reader->getOrdMap(field)->numOrds();
+      int64_t values = entry.buckets ? fixture.numDocs / 100 : domain;
+      state.counters["values_per_ord"] = (double)values / (double)std::max<int64_t>(1, ords);
+    }
+  }
   state.counters["docs"] = (double)fixture.numDocs;
   state.counters["domain"] = (double)domain;
   state.counters["segments"] = (double)fixture.reader->segments().size();
@@ -171,5 +204,12 @@ LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, facet_10_cardinality_user, 7);
 LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, facet_10_percentile_99, 8);
 LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, facet_all_cardinality_user, 9);
 LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, facet_all_percentile_99, 10);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, root_cardinality_id, 11);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, root_cardinality_user_exact40k, 12);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, root_cardinality_host, 13);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, filtered_size_0_cardinality_user, 14);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, filtered_size_9_cardinality_user, 15);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, filtered_size_49_cardinality_user, 16);
+LUXIR_BENCHMARK_CAPTURE(BM_SketchAggregate, filtered_size_49_cardinality_id, 17);
 
 } // namespace
