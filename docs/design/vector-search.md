@@ -124,6 +124,37 @@ and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
 its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
 terminal rescoring retain the canonical query.
 
+Codes with one bit per dimension and a quantized query skip FAISS's distance
+computer for `RaBitQScorer`. Each scan task allocates its query buffers once;
+for each list it re-quantizes the residual and packs the query's bit planes
+without allocating, then scores 256-row blocks without a virtual call. Scoring
+uses AVX2 nibble lookups or NEON `vcnt` over whole chunks, with hardware popcount
+on 64-bit words for the rest and on other targets, all chosen at compile time
+from `LUXIR_CPU_TARGET`. Its estimates equal FAISS's to the bit: the quantized
+query and popcounts are the same integers, the query norms come from the same
+FAISS functions, and the floats combine in the same order. The one subtlety is
+FMA. FAISS compiles this code without FMA on x86-64 and GCC contracts it on
+AArch64, so the file builds with `-ffp-contract=off` and fuses explicitly on
+AArch64 only. Tests compare factors, planes and estimates against FAISS on real
+overlays, for 7 dimension counts, every query-bit setting, and both metrics.
+FAISS's computer remains for extended codes and for query bits 0. Filtered blocks
+first select rows without branching, then prefetch ahead through the selection,
+which took 5 to 30% off forced filtered IVF at 1-30% selectivity.
+
+| Forced IVF, 1 segment, serial, RaBitQ-1, i7-14700KF | FAISS computer | scorer |
+|---|---|---|
+| Cohere 1M 768-d cosine, default effort | 1817 us | 1148 us |
+| Cohere 1M, full scan, nlist 1000 | 26.7 ms | 12.8 ms |
+| Cohere 1M, full scan, nlist 4000 | 58.1 ms | 14.5 ms |
+| arxiv 1M 1536-d cosine, default effort | 4765 us | 2617 us |
+| Deep 1M 96-d L2, default effort | 738 us | 339 us |
+
+These runs returned identical ids and score bits. A list now costs about 0.6 us
+at 768 dims rather than 10.5 us, and a code about 12.2 ns rather than 16.2 ns, so
+list count no longer dominates the scan. A larger nlist still costs more at equal
+coverage (1500 vs 1148 us at default effort for nlist 4000 vs 1000), now mostly
+in the coarse search, which ranks every centroid.
+
 RaBitQ's estimated squared L2 distance can be negative. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
@@ -388,12 +419,14 @@ and rank-bitmap folds use the same doc-to-rank walk.
 slots pay per scored dimension, per visited domain doc and per rank mapping.
 IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
 tests the selector through a virtual call) and a branch-misprediction term
-proportional to `p(1-p)` for selector pass rate `p`; per codec score (PQ
+proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
+selector test does not branch; per codec score (PQ
 subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
 dimension. RaBitQ re-quantizes the query residual for every list, so its list
-setup scales with dimensions. PQ list setup is zero for inner product and
-cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
+setup scales with dimensions; 1-bit and extended codes have separate unit costs
+for scoring and list setup, since only the former use `RaBitQScorer`. PQ list
+setup is zero for inner product and cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
 precomputed table; without it, FAISS computes a full distance table per list,
 priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
 the exact-dimension cost. Interval terminal reads have a shared floor of
@@ -589,8 +622,9 @@ All IVF chunks and segments share a bounded cut per fresh epoch and persistent
 interval witness state for the query. Task-local handlers batch admissions and
 canonical keys; group bounded handlers keep their local capped admission.
 Serialized updates publish monotone scalar floors. PQ uses its optimized
-kernel with floor refreshes between 256-code blocks. RaBitQ uses its distance
-computer in the common traversal. Peak and terminal retained counts, seed and
+kernel with floor refreshes between 256-code blocks. 1-bit RaBitQ scores a block
+and then admits its rows in order; extended RaBitQ uses its distance computer per
+code in the common traversal. Peak and terminal retained counts, seed and
 remaining reads, gate rejections and extra-bit evaluations accompany the
 selector-passing scan count in the benchmark stats seam.
 
