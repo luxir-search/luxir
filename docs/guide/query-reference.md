@@ -102,8 +102,7 @@ document before BM25 saturation, with shared statistics (maximum document
 frequency and summed total term frequency). A rare spelling gets no extra
 IDF. These term weights do not affect field lengths. `operator`, `min_match`, and
 boosts still apply over the analyzed query tokens. Filters match the same
-variants without computing scores. Scored matches reject more than 64 distinct
-indexed case variants per token; filters retain the complete match set.
+variants without computing scores.
 
 If analysis already erases the token's case, ordinary term lookup and scoring
 are retained. Case expansion is slower than using a folding TEXT variant such
@@ -401,8 +400,8 @@ Term ranges are subject to any operator-configured [Expansion limits](#expansion
 
 ## Expansion limits
 
-Prefix, wildcard, regex, term-range, and fuzzy queries expand against the
-field's term dictionary, so their cost grows with its cardinality. Every
+Prefix, wildcard, regex, term-range, fuzzy, and `case_insensitive` match queries
+expand against the field's term dictionary, so their cost grows with its cardinality. Every
 expansion limit is an operator opt-in, off by default. With limits off, a broad
 pattern on a high-cardinality field simply runs. Operators exposing a public
 endpoint can set these options to bound dictionary work and postings estimates.

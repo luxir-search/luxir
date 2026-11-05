@@ -61,9 +61,12 @@ Query::Weight* AutomatonQuery::createWeight(
   }
 
   // Discover the union across segments before computing shared synonym stats.
-  // Bound retained terms as well as scorer clauses. Unlike fuzzy, case matching
-  // promises every alternate, so overflow is an error rather than truncation.
-  std::set<std::string> variants;
+  // Unlike fuzzy, case matching promises every alternate, so an operator limit
+  // rejects rather than truncates, as this query's filter form does.
+  MultiTermBudget& budget = context.multiTermBudget();
+  RequestMemResource variantMemory(
+      context.planningContext().memoryTracker, field, "multi-term selection");
+  std::pmr::set<std::pmr::string> variants(&variantMemory);
   if (auto* fieldInfo = context.getCachedFieldInfo(field)) {
     for (auto& segment : context.topReader.segments()) {
       const auto* segInfo = fieldInfo->segInfos.at(segment);
@@ -71,14 +74,18 @@ Query::Weight* AutomatonQuery::createWeight(
       MemPool scratch;
       TermsEnum te(scratch, segment.postingsReader(), *segInfo);
       auto* filtered = createFilteredEnum(scratch, te);
+      filtered->setAllowance(budget.scanAllowance());
+      int32_t segmentVariants = 0;
+      int64_t segmentPostings = 0;
       while (filtered->next()) {
-        variants.emplace(filtered->termView());
-        if (variants.size() > MAX_CASE_VARIANTS) {
-          throw std::runtime_error(std::format(
-              "Match case_insensitive on field '{}' exceeds {} indexed case variants; use a folding field variant",
-              field, MAX_CASE_VARIANTS));
+        if (++segmentVariants > budget.maxExpansions()) {
+          budget.throwTooManyExpansions(describe());
         }
+        segmentPostings += filtered->terms().postingsState().docFreq;
+        variants.emplace(filtered->termView());
       }
+      if (filtered->stoppedAtVisitLimit()) budget.throwTermsExamined(describe());
+      if (!budget.chargePostings(segmentPostings)) budget.throwPostings(describe());
     }
   }
 
@@ -101,7 +108,7 @@ Query::Weight* AutomatonQuery::createWeight(
       char* copy = context.pool.alloc(variant.size());
       memcpy(copy, variant.data(), variant.size());
       terms[i++] = {0, std::string_view(copy, variant.size()),
-                    variant == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
+                    std::string_view(variant) == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
     }
     auto fields = context.pool.make_span<std::string_view>(1);
     auto weights = context.pool.make_span<float>(1);

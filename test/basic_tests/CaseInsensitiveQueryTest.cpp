@@ -356,26 +356,27 @@ TEST_F(CaseInsensitiveQueryTest, escapedLiteralKeepsExactCasePreference) {
   }
 }
 
-TEST_F(CaseInsensitiveQueryTest, scoredExpansionBudgetRejectsWithoutTruncatingFilters) {
-  for (int i = 0; i <= (int)AutomatonQuery::MAX_CASE_VARIANTS; i++) {
-    std::string term(7, 'a');
+TEST_F(CaseInsensitiveQueryTest, scoredMatchHasNoVariantCap) {
+  constexpr int64_t kVariants = 1000;
+  for (int64_t i = 0; i < kVariants; i++) {
+    std::string term(10, 'a');
     for (size_t bit = 0; bit < term.size(); bit++) {
-      if ((i & (1 << bit)) != 0) term[bit] = 'A';
+      if ((i & ((int64_t)1 << bit)) != 0) term[bit] = 'A';
     }
     ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), "variants_w", term),
         UpdateMessage::NO_COMMIT).success);
-    if (i + 1 == (int)AutomatonQuery::MAX_CASE_VARIANTS) {
-      helper.commit();
-      EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS,
-                scores("match(aaaaaaa, field=variants_w, case_insensitive=true)").size());
-    }
   }
   helper.commit();
-  auto req = run(R"({"query":{"match":{"variants_w":"aaaaaaa","case_insensitive":true}},"get_scores":true})");
-  EXPECT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("64 indexed case variants"));
-  auto filtered = run(R"json({"query":{"all":true},"filter":["match(aaaaaaa, field=variants_w, case_insensitive=true)"],"fields":["id"],"limit":-1})json");
-  EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS + 1, ids(*filtered).size());
+  auto scoredCount = run(R"json({"query":{"match":{"variants_w":"aaaaaaaaaa","case_insensitive":true}},"get_scores":true,"count_limit":-1})json");
+  ASSERT_TRUE(scoredCount->ok()) << scoredCount->errorMsg();
+  EXPECT_EQ(kVariants, scoredCount->getMatchCount());
+  auto filteredCount = run(R"json({"query":{"all":true},"filter":["match(aaaaaaaaaa, field=variants_w, case_insensitive=true)"],"count_limit":-1})json");
+  ASSERT_TRUE(filteredCount->ok()) << filteredCount->errorMsg();
+  EXPECT_EQ(kVariants, filteredCount->getMatchCount());
+
+  // Doc 0 holds the query's exact case, and alternates tie below it.
+  auto top = scores("match(aaaaaaaaaa, field=variants_w, case_insensitive=true)");
+  EXPECT_GT(top.at("0"), top.at("1"));
 }
 
 TEST_F(CaseInsensitiveQueryTest, idAndNumericMatch) {

@@ -261,6 +261,35 @@ TEST_F(MultiTermLimitsTest, fuzzyExpansionSharesTheBudget) {
   EXPECT_NE(req->errorMsg().find("fuzzy query 't050'"), std::string::npos) << req->errorMsg();
 }
 
+TEST_F(MultiTermLimitsTest, scoredCaseInsensitiveMatchHonorsLimits) {
+  auto errorCode = [](const LuxirConfig& limited) {
+    LuxirNode node(limited);
+    CollectionHelper helper(node);
+    std::vector<Doc> docs;
+    for (auto term : {"aaa", "Aaa", "aAa", "aaA"}) {
+      docs.push_back(flatdoc("id", term, "word_w", term));
+    }
+    EXPECT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .exprQuery("match(aaa, field=word_w, case_insensitive=true)").limit(10).getScores();
+    req->execute(false);
+    return req->ok() ? std::string() : std::string(req->errorCode());
+  };
+  auto postings = [](int64_t limit) {
+    LuxirConfig limited = config(0, 0, 0);
+    limited.search.multiterm_max_postings = limit;
+    return limited;
+  };
+
+  EXPECT_EQ("", errorCode(config(0, 0, 0)));
+  EXPECT_EQ("", errorCode(config(4, 0, 0)));
+  EXPECT_EQ("too_many_expansions", errorCode(config(3, 0, 0)));
+  EXPECT_EQ("too_many_terms_examined", errorCode(config(0, 1, 0)));
+  EXPECT_EQ("", errorCode(postings(4)));
+  EXPECT_EQ("too_many_expansion_postings", errorCode(postings(3)));
+}
+
 TEST_F(MultiTermLimitsTest, postingsBudgetBoundsTheUnion) {
   LuxirConfig limited = config(1000, 1'000'000);
   limited.search.multiterm_max_postings = 20;
