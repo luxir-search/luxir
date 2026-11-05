@@ -225,10 +225,13 @@ public:
                                 BoundAggregateInput& binding, DocSet* domain,
                                 int32_t maxDoc) {
       static constexpr int64_t MAX_BITSET_ORDS = int64_t{1} << 30;
-      if (disableDistinctOrdCardinalityForTests || binding.ordColumn == nullptr
+      BoundStringColumn* column = binding.values == nullptr ? nullptr
+          : binding.values->nodes[binding.producer->input->rootNode].stringColumn;
+      if (disableDistinctOrdCardinalityForTests || column == nullptr || column->ords == nullptr
           || !binding.producer->resolved.state.duplicateInsensitive) {
         return false;
       }
+      OrdColReader& ordColumn = *column->ords;
       int64_t numOrds = binding.ordMapping.numOrds;
       if (numOrds <= 0) {
         // A segment holding every ord maps to them by identity.
@@ -241,7 +244,7 @@ public:
       }
       std::vector<uint64_t> seen(((size_t)numOrds + 63) / 64);
       int64_t missing = 0;
-      forEachOrdValue(domain, *binding.ordColumn, OrdMap::SegToGlobal::identity(),
+      forEachOrdValue(domain, ordColumn, OrdMap::SegToGlobal::identity(),
           maxDoc, missing, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
             unused(docid);
             seen[(uint64_t)ord >> 6] |= uint64_t{1} << ((uint64_t)ord & 63);
