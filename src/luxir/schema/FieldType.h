@@ -91,6 +91,22 @@ public:
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
 
+  static_assert([] {
+    constexpr flag_type bits[] = {
+      INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
+      INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
+      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
+      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+    };
+    flag_type used = 0;
+    for (auto bit : bits) {
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      used |= bit;
+    }
+    return true;
+  }(), "Field flags must use distinct single bits");
+
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
