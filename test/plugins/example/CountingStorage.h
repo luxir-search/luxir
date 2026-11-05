@@ -64,6 +64,22 @@ public:
   std::string describe() const override { return "counting(" + delegate->describe() + ")"; }
 };
 
+// Reports its bytes as remote, as a directory over an object store does.
+class RemoteDirectory : public DelegatingDirectory {
+public:
+  using DelegatingDirectory::DelegatingDirectory;
+  Capabilities capabilities() const override { return DelegatingDirectory::capabilities() | REMOTE; }
+};
+
+class RemoteLayer : public DelegatingDirFactory {
+public:
+  using DelegatingDirFactory::DelegatingDirFactory;
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    return std::make_shared<RemoteDirectory>(delegate->directory(root, path, std::move(options)));
+  }
+  std::string describe() const override { return "remote(" + delegate->describe() + ")"; }
+};
+
 class CountingRamBackend : public DelegatingDirFactory {
 public:
   std::shared_ptr<StorageCounters> counters = std::make_shared<StorageCounters>();
