@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import socket
 import statistics
 import subprocess
@@ -47,6 +48,25 @@ PRESETS = {
      'license': {'card': 'undeclared', 'api': 'undeclared'}},
 }
 
+# Cohere 1M, separate train/test files (same pin as the defaults grid).
+PRESETS['cohere-768-cos'] = {'dataset': 'YoKONCy/Cohere-1M-wikipedia-768d',
+ 'revision': 'de34a7af7f436d7aceb4fecdda01490e552efdde',
+ 'dims': 768,
+ 'format': 'f32',
+ 'metric': 'cosine',
+ 'index_count': 1000000,
+ 'query_count': 1000,
+ 'license': 'apache-2.0',
+ 'files': [{'path': 'cohere_test.f32',
+            'sha256': '03139cf22783b7bac9278264cfc515682a268ca14162e0c850618eebfb811ab3',
+            'size': 3072000},
+           {'path': 'cohere_train.f32',
+            'sha256': 'd4bd7224f525ff1722ef4a77d0437a01c5f2c624857ead009f0a9c0e8e167961',
+            'size': 3072000000}],
+ 'base_file': 'cohere_train.f32',
+ 'query_file': 'cohere_test.f32',
+ 'provenance': 'Mirror card: originally sampled from Cohere/wikipedia-22-12-en-embeddings (deprecated); '
+               'normalized. Card model attribution is preserved without correction in source evidence.'}
 
 # Luxir has no listen-address flag. Restrict this owned process to loopback
 # without changing host firewall/services or the public source under test.
@@ -103,7 +123,7 @@ def validate_vectors(a, dims):
                     'max_unit_error': float(np.abs(norms - 1).max()), 'unit_tolerance': 0.001}
 
 
-def dataset(cache, name=DEFAULT_DATASET):
+def dataset(cache, name=DEFAULT_DATASET, filtered_queries=0):
     # Each preset has its own cache namespace; immutable metadata is checked.
     preset = PRESETS[name]
     cache = cache / name
@@ -116,6 +136,21 @@ def dataset(cache, name=DEFAULT_DATASET):
     manifest.write_text(json.dumps(meta, indent=2) + '\n')
     count = meta['index_count'] + meta['query_count']
     dims = meta['dims']
+    if meta.get('format') == 'f32':
+        paths = {}
+        for item in meta['files']:
+            path = cache / item['path']
+            download(f'https://huggingface.co/datasets/{meta["dataset"]}/resolve/{meta["revision"]}/{item["path"]}', path, item['sha256'])
+            if path.stat().st_size != item['size']:
+                raise RuntimeError('Wrong f32 file size')
+            paths[item['path']] = path
+        base = np.memmap(paths[meta['base_file']], dtype='<f4', mode='r').reshape(-1, dims)
+        queries = np.memmap(paths[meta['query_file']], dtype='<f4', mode='r').reshape(-1, dims)
+        if len(base) != meta['index_count'] or len(queries) != meta['query_count']:
+            raise RuntimeError('Wrong f32 row counts')
+        _, meta['norms'] = validate_vectors(base, dims)
+        validate_vectors(queries, dims)
+        return filtered_stream(cache, base, queries, 'cosine', meta, filtered_queries)
     a = np.empty((count, dims), dtype=np.float32)
     offset = 0
     for item in meta['files']:
@@ -138,6 +173,8 @@ def dataset(cache, name=DEFAULT_DATASET):
     if offset != count:
         raise RuntimeError(f'Unexpected dataset rows: {offset}')
     metric, meta['norms'] = validate_vectors(a, dims)
+    if filtered_queries:
+        return filtered_stream(cache, a[:meta['index_count']], a[meta['index_count']:], metric, meta, filtered_queries)
     stream = cache / 'train.ndjson'
     if not stream.exists():
         tmp = cache / 'train.partial'
@@ -148,6 +185,203 @@ def dataset(cache, name=DEFAULT_DATASET):
         tmp.replace(stream)
     meta['ndjson_sha256'] = hashlib.file_digest(stream.open('rb'), 'sha256').hexdigest()
     return a[meta['index_count']:].copy(), stream, metric, meta
+
+
+SELECTIVITIES = [0.0001, 0.001, 0.003, 0.01, 0.03, 0.1]
+FILTER_KINDS = ['no-cor', 'pos-cor', 'neg-cor']
+FILTER_NPROBES = [0, 1, 4, 16, 64, 256, 1024]
+
+
+def filter_ranks(base, queries, metric):
+    # Stable ties break by original document ID. Uniform is independent of vectors.
+    ranks = np.empty((len(base), len(queries) + 1), dtype=np.int32)
+    ranks[:, 0] = np.random.default_rng(196).permutation(len(base))
+    for q, v in enumerate(queries):
+        scores = np.empty(len(base), dtype=np.float64)
+        for start in range(0, len(base), 4096):
+            block = base[start:start + 4096].astype(np.float64)
+            values = block @ v.astype(np.float64)
+            if metric == 'cosine':
+                values /= np.linalg.norm(block, axis=1) * np.linalg.norm(v.astype(np.float64))
+            scores[start:start + len(block)] = values
+        order = np.argsort(-scores, kind='stable')
+        ranks[order, q + 1] = np.arange(len(base))
+    return ranks
+
+
+def filtered_stream(cache, base, queries, metric, meta, query_count):
+    if not query_count:
+        raise RuntimeError('cohere-768-cos requires --filtered')
+    queries = queries[:query_count].copy()
+    np.save(cache / 'filtered-base.npy', base)
+    ranks = filter_ranks(base, queries, metric)
+    fields = ['filter_uniform_i'] + [f'filter_q{q}_i' for q in range(len(queries))]
+    stream = cache / f'filtered-{len(queries)}.ndjson'
+    # Recreate from verified vectors, never reuse stale synthetic attributes.
+    with stream.with_suffix('.partial').open('w') as f:
+        for i, v in enumerate(base):
+            doc = {'id': str(i), 'embedding_v': v.tolist(),
+                   **{field: int(rank) for field, rank in zip(fields, ranks[i])}}
+            f.write(json.dumps(doc, separators=(',', ':'), allow_nan=False) + '\n')
+        f.write('{"_end_":{"commit":{}}}\n')
+    stream.with_suffix('.partial').replace(stream)
+    meta['filtered'] = {'seed': 196, 'queries': len(queries), 'fields': fields,
+                        'selectivities': SELECTIVITIES, 'nprobes': FILTER_NPROBES,
+                        'rank_sha256': hashlib.sha256(ranks.tobytes()).hexdigest()}
+    meta['ndjson_sha256'] = hashlib.file_digest(stream.open('rb'), 'sha256').hexdigest()
+    return queries, stream, metric, meta
+
+
+def filter_expression(kind, q, count, selectivity):
+    keep = max(10, round(count * selectivity))
+    field = 'filter_uniform_i' if kind == 'no-cor' else f'filter_q{q}_i'
+    lo, hi = (count - keep, count - 1) if kind == 'neg-cor' else (0, keep - 1)
+    return f'{field}:[{lo} TO {hi}]', keep
+
+
+def filtered_quality(base, query, ids, truth, metric):
+    # Evaluate original vectors in float64, never server/quantized scores.
+    def scores(doc_ids):
+        vectors = base[[int(i) for i in doc_ids]].astype(np.float64)
+        q = np.asarray(query, dtype=np.float64)
+        values = vectors @ q
+        if metric == 'cosine':
+            values /= np.linalg.norm(vectors, axis=1) * np.linalg.norm(q)
+        return values
+
+    expected = scores(truth)
+    returned = scores(ids)
+    threshold = expected[9]
+    tolerance = 1e-6 * max(abs(threshold), 1e-12)
+    # Cosine/IP distance is 1 - similarity. Undefined zero denominators are null.
+    ratios = [(1 - float(a)) / (1 - float(b)) if abs(1 - b) > 1e-12 else None
+              for a, b in zip(returned, expected[:10])]
+    return {'tie_aware_recall_at_10': float(np.count_nonzero(returned >= threshold - tolerance)) / 10,
+            'truth_gap_1_10': float(expected[0] - threshold),
+            'truth_gap_10_11': float(threshold - expected[10]) if len(expected) > 10 else None,
+            'distance_ratio_by_rank': ratios}
+
+
+def filtered_measure(args, queries, meta, search, call):
+    rows = []
+    for kind in FILTER_KINDS:
+        for selectivity in SELECTIVITIES:
+            payloads, truth = [], []
+            for q, v in enumerate(queries.tolist()):
+                expr, keep = filter_expression(kind, q, meta['index_count'], selectivity)
+                payload = search(v)
+                payload['filter'] = [expr]
+                key = (kind, selectivity, q)
+                if key not in args.filtered_truth:
+                    count = call({'query': '*:*', 'filter': [expr], 'limit': 0, 'count_limit': -1})
+                    if count.get('found') != keep:
+                        raise RuntimeError(f'Filter cardinality differs: {expr}: {count}')
+                    exact = copy.deepcopy(payload)
+                    exact['query']['knn']['exact'] = True
+                    exact['limit'] = min(11, keep)
+                    exact['query']['knn']['k'] = min(11, keep)
+                    ids = [d['id'] for d in call(exact)['docs']]
+                    if len(ids) != min(11, keep):
+                        raise RuntimeError('Exact filtered top ten underfilled')
+                    args.filtered_truth[key] = ids
+                truth.append(args.filtered_truth[key])
+                payloads.append(payload)
+            for effort in ['exact', *FILTER_NPROBES]:
+                passes = []
+                for pass_no in range(4):
+                    times, recalls, ids_by_query = [], [], []
+                    qualities = []
+                    for q, (payload, expected) in enumerate(zip(payloads, truth)):
+                        payload['query']['knn']['exact'] = effort == 'exact'
+                        payload['query']['knn']['ivf']['nprobe'] = 0 if effort == 'exact' else effort
+                        start = time.perf_counter_ns()
+                        docs = call(payload)['docs']
+                        times.append((time.perf_counter_ns() - start) / 1e6)
+                        ids = [d['id'] for d in docs]
+                        if len(set(ids)) != len(ids) or len(ids) > 10:
+                            raise RuntimeError('Invalid filtered top ten')
+                        recall = len(set(ids) & set(expected[:10])) / 10
+                        if effort == 'exact' and recall != 1:
+                            raise RuntimeError('Exact filtered truth differs across arms')
+                        recalls.append(recall)
+                        ids_by_query.append(ids)
+                        qualities.append(filtered_quality(args.filtered_base, queries[q], ids, expected, args.filtered_metric))
+                    if pass_no:
+                        passes.append({'p50_ms': float(np.percentile(times, 50)),
+                                       'p99_ms': float(np.percentile(times, 99)),
+                                       'recall_at_10': statistics.mean(recalls),
+                                       'query_result_ids_sha256': hashlib.sha256(json.dumps(ids_by_query, separators=(',', ':')).encode()).hexdigest(),
+                                       'latencies_ms': times,
+                                       'quality_by_query': qualities,
+                                       'tie_aware_recall_at_10': statistics.mean(x['tie_aware_recall_at_10'] for x in qualities)})
+                row = {'variant': args.variant, 'field_settings': args.settings, 'kind': kind,
+                       'selectivity': selectivity, 'eligible_count': keep,
+                       'actual_selectivity': keep / meta['index_count'],
+                       'nprobe': 'adaptive' if effort == 0 else effort, 'passes': passes,
+                       **{k: statistics.median(p[k] for p in passes) for k in ['p50_ms', 'p99_ms', 'recall_at_10']}}
+                if effort == 'exact' and row['recall_at_10'] != 1:
+                    raise RuntimeError('Exact filtered truth differs across arms')
+                row['tie_aware_recall_at_10'] = statistics.median(p['tie_aware_recall_at_10'] for p in passes)
+                quality = passes[0]['quality_by_query']
+                for field in ['truth_gap_1_10', 'truth_gap_10_11']:
+                    values = [x[field] for x in quality if x[field] is not None]
+                    row[field] = statistics.mean(values) if values else None
+                row['mean_distance_ratio_by_rank'] = []
+                for rank in range(10):
+                    values = [x['distance_ratio_by_rank'][rank] for p in passes for x in p['quality_by_query']
+                              if len(x['distance_ratio_by_rank']) > rank and x['distance_ratio_by_rank'][rank] is not None]
+                    row['mean_distance_ratio_by_rank'].append(statistics.mean(values) if values else None)
+                rows.append(row)
+                (args.output / 'filtered-rows.json').write_text(json.dumps(rows, indent=2))
+                print(f'{args.variant} {kind} keep={selectivity:g} effort={effort} recall={row["recall_at_10"]:.4f}', flush=True)
+    return rows
+
+
+def run_filtered(args, queries, stream, metric, meta):
+    truth, variants = {}, []
+    specs = [('base_rabitq', args.base_binary, args.base_revision, {}),
+             ('candidate_rabitq', args.candidate_binary, args.candidate_revision, {}),
+             ('base_pq', args.base_binary, args.base_revision, {'ann': {'codec': 'pq'}}),
+             ('candidate_pq', args.candidate_binary, args.candidate_revision, {'ann': {'codec': 'pq'}})]
+    for name, binary, revision, settings in specs:
+        config = SimpleNamespace(**{**vars(args), 'variant': name, 'binary': binary,
+                                    'source_revision': revision, 'settings': settings,
+                                    'filtered_truth': truth, 'output': args.output / name})
+        gen = variant(config, queries, stream, metric, meta)
+        try:
+            variants.append(next(gen))
+        finally:
+            gen.close()
+    selections = []
+    for variant_result in variants:
+        for kind in FILTER_KINDS:
+            for selectivity in SELECTIVITIES:
+                rows = [r for r in variant_result['rows'] if r['kind'] == kind and r['selectivity'] == selectivity]
+                eligible = [r for r in rows if isinstance(r['nprobe'], int) and r['recall_at_10'] >= 0.95]
+                chosen = min(eligible, key=lambda r: r['nprobe'], default=None)
+                selections.append({'variant': variant_result['label_variant'], 'kind': kind,
+                                   'selectivity': selectivity, 'least_nprobe_recall_095': chosen or 'not reached'})
+    result = {'filtered': True, 'variants': variants, 'selections': selections,
+              'truth': [{'kind': k, 'selectivity': s, 'query': q, 'ids': sorted(v[:10])} for (k, s, q), v in truth.items()]}
+    (args.output / 'results.json').write_text(json.dumps(result, indent=2))
+    lines = ['## Filtered vector comparison', '',
+             f'Base `{args.base_revision}`; candidate `{args.candidate_revision}`; dataset `{args.dataset}`; {len(queries)} held-out queries.', '',
+             'Sequential arms; one warm-up and median of three measured passes. Read recall with latency.', '',
+             '| Variant | Kind | Keep % | Effort | Recall@10 | p50 ms | p99 ms |',
+             '|---|---|---:|---|---:|---:|---:|']
+    for v in variants:
+        for r in v['rows']:
+            lines.append(f'| {v["label_variant"]} | {r["kind"]} | {100*r["selectivity"]:g} | {r["nprobe"]} | {r["recall_at_10"]:.4f} | {r["p50_ms"]:.3f} | {r["p99_ms"]:.3f} |')
+    lines += ['', '| Variant | Kind | Keep % | Least swept nprobe at recall >= 0.95 |', '|---|---|---:|---|']
+    for s in selections:
+        chosen = s['least_nprobe_recall_095']
+        effort = chosen['nprobe'] if isinstance(chosen, dict) else chosen
+        lines.append(f'| {s["variant"]} | {s["kind"]} | {100*s["selectivity"]:g} | {effort} |')
+    markdown = '\n'.join(lines) + '\n'
+    (args.output / 'summary.md').write_text(markdown)
+    if os.getenv('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write(markdown)
 
 
 def checked(body):
@@ -218,6 +452,9 @@ def variant(args, queries, stream, metric, meta):
         print(f'{name}: schema/ingest', flush=True)
         schema = {'fields': {'embedding_v': {'type': 'vector', 'dims': meta['dims'], 'metric': metric, **copy.deepcopy(args.settings)}}}
         (args.output / f'{name}-schema.json').write_text(json.dumps(schema, indent=2))
+        if args.filtered:
+            schema['fields'].update({f: {'type': 'int', 'index': 'range'} for f in meta['filtered']['fields']})
+        (args.output / f'{name}-schema.json').write_text(json.dumps(schema, indent=2))
         call(f'/collections/{name}/_schema', schema)
         start = time.perf_counter()
         with stream.open('rb') as f:
@@ -252,6 +489,15 @@ def variant(args, queries, stream, metric, meta):
         size = sum(x.stat().st_size for x in files)
         allocated = sum(x.stat().st_blocks * 512 for x in files)
         (args.output / f'{name}-files.json').write_text(json.dumps({str(x.relative_to(directory)): x.stat().st_size for x in files}, indent=2))
+        if args.filtered:
+            result['label_variant'] = name
+            result['query_count'] = len(queries)
+            result['rows'] = filtered_measure(args, queries, meta, search,
+                lambda payload: call(f'/collections/{name}/_search', payload))
+            result['build'] = {'ingest_s': ingest, 'ann_build_s': build_s, 'index_bytes': size}
+            (args.output / 'results.json').write_text(json.dumps(result, indent=2))
+            yield result
+            return
         print(f'{name}: exact ground truth', flush=True)
         vectors = queries.tolist()
         truth = []
@@ -300,6 +546,9 @@ def variant(args, queries, stream, metric, meta):
             proc.wait()
         log.close()
         session.close()
+        if args.filtered and data.exists():
+            shutil.rmtree(data)
+            (args.output / 'cleanup.json').write_text(json.dumps({'collection_data_removed': not data.exists()}))
         listeners_closed = {}
         for listener in [port, grpc]:
             with socket.socket() as probe:
@@ -319,6 +568,8 @@ def main():
     p.add_argument('--base-revision', required=True)
     p.add_argument('--candidate-revision', required=True)
     p.add_argument('--candidate-field-settings', default='{}', help='JSON merged into candidate vector field; base/default receive none')
+    p.add_argument('--filtered', action='store_true', help='Compare filtered RaBitQ and PQ, including exact controls')
+    p.add_argument('--filtered-queries', type=int, default=32, help='First held-out queries used in filtered mode (default 32)')
     p.add_argument('--dataset', choices=PRESETS, default=DEFAULT_DATASET)
     p.add_argument('--cache', type=Path, default=Path('.vector-dataset'))
     p.add_argument('--output', type=Path, default=Path('vector-results'))
@@ -331,8 +582,19 @@ def main():
     settings = json.loads(args.candidate_field_settings)
     if not isinstance(settings, dict) or any(k in settings for k in ['type', 'dims', 'metric']):
         p.error('Candidate settings must be an object without type/dims/metric overrides')
+    if args.filtered_queries < 1 or args.filtered_queries > PRESETS[args.dataset]['query_count']:
+        p.error('filtered-queries must be between 1 and the preset query count')
+    if args.dataset == 'cohere-768-cos' and not args.filtered:
+        p.error('cohere-768-cos requires --filtered')
+    if args.filtered and settings:
+        p.error('filtered mode fixes both codecs; omit candidate-field-settings')
     args.output.mkdir(parents=True, exist_ok=False)
-    queries, stream, metric, meta = dataset(args.cache, args.dataset)
+    queries, stream, metric, meta = dataset(args.cache, args.dataset, args.filtered_queries if args.filtered else 0)
+    if args.filtered:
+        args.filtered_base = np.load(args.cache / args.dataset / 'filtered-base.npy', mmap_mode='r')
+        args.filtered_metric = metric
+        run_filtered(args, queries, stream, metric, meta)
+        return
     specs = [('base', args.base_binary, args.base_revision, {}), ('candidate_feature', args.candidate_binary, args.candidate_revision, settings), ('candidate_default', args.candidate_binary, args.candidate_revision, {})]
     schedule = []
     with ExitStack() as stack:

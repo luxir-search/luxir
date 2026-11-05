@@ -183,3 +183,115 @@ hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent
 all search workloads. Native ARM, cold-cache performance, and ASan results are
 outside this workflow.
+
+## Filtered kNN comparison
+
+Pass `--filtered` to `vector-compare.py`, or set the workflow's `filtered`
+input. The unfiltered path and its output are unchanged when this is off.
+Filtered mode compares four sequential arms: base RaBitQ, candidate RaBitQ,
+base PQ (`ann.codec=pq`), candidate PQ. Omit
+`candidate_field_settings`, since this mode fixes the codecs for both refs.
+The workflow uses the same hosted runner and dependency images as unfiltered
+comparisons. Use either 100k preset in CI; the 1M preset is for local runs.
+
+Each indexed document gets a synthetic uniform integer rank and one integer
+similarity rank per query. All ranks are unique permutations of `0..N-1`.
+Uniform ranks use NumPy's seed 196 permutation, independent of the vectors.
+Similarity ranks use descending float64 inner product (or cosine similarity
+for a cosine dataset), breaking ties by input document ID. Following
+[ACORN](https://arxiv.org/abs/2403.04871) (Patel, Kraft, Guestrin, Zaharia,
+sections 3.2.1 and 7.1.2), query correlation describes how close a query vector
+is to the documents matching its predicate. The workloads are:
+
+- **no-cor (no correlation):** the first `m` random ranks, the same
+  uncorrelated subset for every query;
+- **pos-cor (positive correlation):** that query's `m` nearest documents by
+  similarity rank;
+- **neg-cor (negative correlation):** that query's `m` farthest documents by
+  similarity rank.
+
+Here `m = max(10, round(N * selectivity))`, for selectivities 0.01%, 0.1%,
+0.3%, 1%, 3%, 10%. Results include actual cardinality and selectivity; on the
+99k preset the smallest set is 10 documents rather than 9.9. Query correlation is
+query-specific, not a cluster proxy. Our pos-cor/neg-cor workloads are the
+extreme form: a query's exactly nearest/farthest documents by similarity rank,
+whereas ACORN builds its workloads from keyword matches. This is a deliberately
+strong correlation stress test, not a model of production tenant filters. All
+synthetic fields are explicit `int` columns with `index: range`. Queries use Luxir's ordinary
+pre-filter syntax, for example `"filter":["filter_q0_i:[0 TO 99]"]`, beside
+`"query":{"knn":...}`. Neg-cor filters select the upper rank interval.
+Every query is checked against server `exact:true` top-10 using the identical
+filter, computed once per query/kind/selectivity on the first arm and shared
+by all arms. Every arm also measures exact controls and requires recall 1.0.
+Filter cardinalities are checked against server counts. Underfilled ANN
+responses contribute missing neighbors to the recall denominator of ten; duplicate
+IDs and overfilled responses are errors.
+
+The default sample is the first 32 held-out queries; `--filtered-queries` can
+change it. A small sample bounds the number of synthetic indexed columns and
+exact requests. Percentiles from 32 queries are coarse, especially p99; raw
+per-pass latencies and ordered-result hashes are retained. Filter setup and
+similarity ranking are outside latency measurement. Serial ingest remains 1.
+Each cell has one warm-up and three timed passes, reporting medians of pass
+recall@10, p50 and p99. Arms run sequentially, so load drift remains a limitation.
+The effort sweep is default/adaptive, 1, 4, 16, 64, 256, 1024 nprobe. The summary
+records the least *swept positive nprobe* reaching mean recall >= 0.95, or
+`not reached`; adaptive effort is reported separately and is not ordered as 0.
+This is no guarantee of a global minimum between sweep points. An explicit
+nprobe requests effort; the candidate can still choose exact search internally.
+
+`cohere-768-cos` uses 1,000,000 training vectors and a separate 1,000-query
+file from [YoKONCy/Cohere-1M-wikipedia-768d](https://huggingface.co/datasets/YoKONCy/Cohere-1M-wikipedia-768d/tree/de34a7af7f436d7aceb4fecdda01490e552efdde),
+revision `de34a7af7f436d7aceb4fecdda01490e552efdde`. The preset pins both file
+SHA-256s, dimensions (768), sizes, row counts, cosine metric, and the mirror's
+Apache-2.0 license declaration. The first 32 test queries are used by default;
+no train vectors are held out. This preset requires filtered mode. Existing
+100k presets retain their original split and metric detection.
+
+For a correctness smoke, use a 100k preset and `--filtered-queries 8`, pointing
+both binary options at the same server. Exact controls must have recall 1.0;
+compare each codec's base/candidate ordered-ID hashes across all measured
+passes. Smoke latency under concurrent work is not meaningful.
+
+```bash
+gh workflow run vector-compare.yml -f filtered=true \
+  -f dataset=dbpedia-openai3-1536-100k \
+  -f base_ref=main -f candidate_ref=refs/pull/NUMBER/head
+```
+
+For a local 1M comparison, build both binaries first, then run:
+
+```bash
+python3 tools/benchmarks/vector-compare.py --filtered --dataset cohere-768-cos \
+  --base-binary /path/to/base/luxir --candidate-binary /path/to/candidate/luxir \
+  --base-revision BASE_SHA --candidate-revision CANDIDATE_SHA \
+  --cache /path/to/datasets --output /path/to/results
+```
+
+The 1M dataset and four indexes need substantial disk space and time. Collection
+information and shutdown checks are retained, but collection data directories
+are removed after each arm, including failure, once its server has stopped.
+Keep the results artifact; do not upload collection data or downloaded corpora.
+
+### Filtered score quality
+
+Filtered rows also report `tie_aware_recall_at_10`: the number of returned
+neighbors with exact similarity at least the tenth true neighbor's similarity,
+minus `1e-6 * max(abs(tenth_similarity), 1e-12)`, divided by ten. Missing
+neighbors score zero. Similarities use original base vectors and queries in
+NumPy float64 (dot product for IP, normalized dot product for cosine), never
+server or quantized scores. Read this alongside ID recall for neg-cor
+filters: a narrow boundary band can make ID recall sensitive to tiny errors.
+A low tie-aware value still indicates loss at this stated tolerance.
+
+`quality_by_query` records truth score gaps from rank 1 to 10 and rank 10 to
+11, and returned/true distance ratios at each returned rank. Truth fetches up
+to eleven exact filtered neighbors; rank 10-11 is null when only ten qualify.
+Distance means `1 - similarity` for both supported metrics. Zero true distance
+(within 1e-12) is undefined and recorded as null; IP distances can be negative
+for non-unit vectors. Missing ranks are omitted, so read ratios with recall.
+Rows report mean truth gaps and `mean_distance_ratio_by_rank` over measured
+passes and queries, excluding undefined/missing entries. Per-pass tie-aware
+recall averages queries; the row takes the median of three measured passes,
+just like ID recall. Existing ID recall, effort selection and unfiltered
+output retain their definitions.

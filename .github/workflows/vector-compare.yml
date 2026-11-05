@@ -11,6 +11,10 @@ on:
           - dbpedia-openai3-1536-100k
           - cohere-wikipedia-en-v3-1024-100k
         required: true
+      filtered:
+        description: Compare filtered kNN with both codecs
+        type: boolean
+        default: false
       base_ref:
         description: Base ref or full SHA in this repository
         type: string
@@ -54,6 +58,7 @@ jobs:
           "$RUNNER_TEMP/bench-venv/bin/python" -m unittest discover -s tools/benchmarks -p 'test_*.py'
       - name: Build refs and compare
         env:
+          FILTERED: ${{ inputs.filtered }}
           DATASET: ${{ inputs.dataset }}
           BASE_REPO: ${{ github.repository }}
           BASE_REF: ${{ inputs.base_ref }}
