@@ -1214,7 +1214,7 @@ Matches indexed terms within byte-wise Levenshtein distance of \`term\`. TEXT fi
 | <a id="field-luxir.fuzzyquery.term"></a>[`term`](#field-luxir.fuzzyquery.term) | 2 | `string` | singular |  |
 | <a id="field-luxir.fuzzyquery.max_edits"></a>[`max_edits`](#field-luxir.fuzzyquery.max_edits) | 3 | `int32` | optional | Maximum edit distance, 0..2. Unset = AUTO by term length: 0 for &lt;=2 bytes, 1 for &lt;=5, else 2. |
 | <a id="field-luxir.fuzzyquery.prefix_length"></a>[`prefix_length`](#field-luxir.fuzzyquery.prefix_length) | 4 | `int32` | optional | Leading bytes that must match exactly. Unset = 1; 0 = no required prefix. |
-| <a id="field-luxir.fuzzyquery.max_expansions"></a>[`max_expansions`](#field-luxir.fuzzyquery.max_expansions) | 5 | `int32` | singular | Max term expansions, closest terms first. Unset/0 = default 50. A positive value requests that cap; the operator/clause budget may lower it with a warning. Negative values are rejected. |
+| <a id="field-luxir.fuzzyquery.max_expansions"></a>[`max_expansions`](#field-luxir.fuzzyquery.max_expansions) | 5 | `int32` | singular | Max term expansions, closest terms first. Unset/0 = default 50. A positive value is honored as given, with no upper bound. Negative values are rejected. |
 
 <a id="message-luxir.geoboxquery"></a>
 

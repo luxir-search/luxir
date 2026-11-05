@@ -1228,9 +1228,8 @@ supported maximum:
 }
 ```
 
-Treat warning `code` as the machine key and `message` as human detail. The
-fuzzy query expansion limits are execution policy and do not produce response
-warnings.
+Treat warning `code` as the machine key and `message` as human detail. Fuzzy
+terms dropped past `max_expansions` do not produce response warnings.
 
 See [HTTP API conventions](http-api.md#errors) for error responses and how to
 handle a search that fails after streaming has begun.

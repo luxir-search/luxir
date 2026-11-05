@@ -146,7 +146,7 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
 
   MemPool scratch;
   auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
-  truncateCandidates(context, candidates);
+  truncateCandidates(candidates);
   if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
 
   Similarity::TermStats blendedStats = {};

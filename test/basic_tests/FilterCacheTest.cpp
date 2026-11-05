@@ -6246,15 +6246,16 @@ TEST(FilterKeyTest, fuzzyIsCoreStableAndIncludesEffectiveLimit) {
   FuzzyQuery fuzzy("title", "luxir", 2, 1, 0);
   FuzzyQuery boostedFuzzy("title", "luxir", 2, 1, 0, 3.0f);
   BoostQuery wrappedFuzzy(&fuzzy, 3.0f);
-  FilterKeyContext first{.schemaGen = 5, .coreGen = 10,
-                         .fuzzyMaxExpansions = 40, .timeZone = "UTC"};
+  FuzzyQuery explicitDefault("title", "luxir", 2, 1, FuzzyQuery::DEFAULT_MAX_EXPANSIONS);
+  FuzzyQuery wide("title", "luxir", 2, 1, 1000);
+  FuzzyQuery wider("title", "luxir", 2, 1, 1001);
+  FilterKeyContext first{.schemaGen = 5, .coreGen = 10, .timeZone = "UTC"};
   FilterKeyContext otherCore = first;
   otherCore.coreGen = 11;
-  FilterKeyContext otherLimit = first;
-  otherLimit.fuzzyMaxExpansions = 30;
 
   EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherCore));
-  EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherLimit));
+  EXPECT_EQ(keyFor(fuzzy, first), keyFor(explicitDefault, first));
+  EXPECT_NE(keyFor(wide, first), keyFor(wider, first));
   EXPECT_EQ(keyFor(fuzzy, first), keyFor(boostedFuzzy, first));
   EXPECT_EQ(keyFor(fuzzy, first), keyFor(wrappedFuzzy, first));
 }

@@ -495,7 +495,7 @@ TEST_F(MultiTermLimitsTest, refillsConsumeTermsAndPostings) {
     limits.maxPostings = terms ? 0 : 15;
     MultiTermBudget budget(limits);
     MemPool pool;
-    Query::Context context(pool, *index.reader, {10000, &budget});
+    Query::Context context(pool, *index.reader, {&budget});
     PrefixQuery query("value_s", "t");
     auto* weight = query.createWeight(context, 0);
     auto& segment = index.reader->segments()[0];

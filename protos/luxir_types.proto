@@ -745,8 +745,8 @@ message FuzzyQuery {
   optional int32 prefix_length = 4;
 
   // Max term expansions, closest terms first. Unset/0 = default 50. A
-  // positive value requests that cap; the operator/clause budget may lower it
-  // with a warning. Negative values are rejected.
+  // positive value is honored as given, with no upper bound. Negative values
+  // are rejected.
   int32 max_expansions = 5;
 }
 

@@ -95,8 +95,8 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  // Same scored-clause ceiling as fuzzy. Filters retain the complete union;
-  // scored MATCH rejects overflow rather than silently losing case variants.
+  // Scored-clause ceiling. Filters retain the complete union; scored MATCH
+  // rejects overflow rather than silently losing case variants.
   static constexpr size_t MAX_CASE_VARIANTS = 64;
   static constexpr float CASE_ALTERNATE_WEIGHT = 0.9f;
 

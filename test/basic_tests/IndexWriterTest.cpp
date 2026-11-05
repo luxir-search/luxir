@@ -634,8 +634,7 @@ TEST_F(IndexWriterTest, queryContextOwnsAndDeduplicatesFilterUses) {
   auto reader = iw.snapshots.readers.getReader();
   MemPool pool;
   Query::Context context(pool, *reader, {}, nullptr,
-                         {.schemaGen = 9, .coreGen = 0,
-                          .fuzzyMaxExpansions = 10000, .timeZone = {}});
+                         {.schemaGen = 9, .coreGen = 0, .timeZone = {}});
   TermQuery query("text_w", "test");
 
   auto* first = context.getFilterUse(query);

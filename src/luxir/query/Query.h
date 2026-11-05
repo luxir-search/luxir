@@ -1205,15 +1205,12 @@ public:
 
   public:
     struct Limits {
-      int32_t fuzzyMaxExpansions = 10000;
       // Request-wide multi-term work allowance, shared by every planning
       // context of one request. Null gives the context its own unlimited one.
       MultiTermBudget* multiTermBudget = nullptr;
 
-      constexpr Limits(int32_t fuzzyMaxExpansions = 10000,
-                       MultiTermBudget* multiTermBudget = nullptr)
-        : fuzzyMaxExpansions(fuzzyMaxExpansions),
-          multiTermBudget(multiTermBudget) {}
+      constexpr Limits(MultiTermBudget* multiTermBudget = nullptr)
+        : multiTermBudget(multiTermBudget) {}
     };
 
   private:
@@ -1240,7 +1237,6 @@ public:
         filterKeyContext(filterKeyContext), limits(limits),
         warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
-      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       if (this->limits.multiTermBudget == nullptr) {
         ownedMultiTermBudget = std::make_unique<MultiTermBudget>();
         this->limits.multiTermBudget = ownedMultiTermBudget.get();

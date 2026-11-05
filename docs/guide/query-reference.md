@@ -374,10 +374,9 @@ toward the pattern complexity budget.
 | `term` | Term to compare. TEXT normalizes/folds without tokenizing; STRING uses its normalizer if present; ID uses it verbatim. Required. |
 | `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
-| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
+| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; any positive value (no upper bound) pins the cap. |
 
-The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. Truncation is not reported in the response. Scoring uses
+Terms past the cap are dropped without a response warning. Scoring uses
 blended BM25 statistics; filter context is constant-scoring, but both use the
 same expansion set and match set. Simple-query syntax still warns when it
 clamps an unsupported edit distance before constructing the fuzzy query.
@@ -795,7 +794,6 @@ in their own guides:
 - `multi_match.phrase` requires `per_field` mode and indexed positions on
   TEXT fields; it cannot be combined with an explicit `operator` or a
   positive `min_match`.
-- Fuzzy expansion truncation (the `64` clause budget and any lower operator
-  limit) is not reported in the response.
+- Fuzzy expansion truncation at `max_expansions` is not reported in the response.
 - Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
   [Expansion limits](#expansion-limits).

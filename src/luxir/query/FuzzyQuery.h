@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
-#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -35,7 +34,7 @@ class FuzzyQuery final : public Query {
   std::string_view term;
   int maxEdits;
   int prefixLength;   // clamped to <= term length
-  int maxExpansions;  // 0/unset means DEFAULT_MAX_EXPANSIONS; also clause-budget capped
+  int maxExpansions;  // 0/unset means DEFAULT_MAX_EXPANSIONS
   // The field's long-term policy when edits can reach a fitted (hashed or
   // truncated) long value, whose discarded bytes distance cannot see;
   // nullopt means no warning applies.
@@ -63,17 +62,9 @@ class FuzzyQuery final : public Query {
 
   // Explicit maxExpansions pins the cap; unset adopts the Lucene-compatible
   // default rather than complete matching, so an expansion set that outgrows
-  // the corpus never silently changes query cost or (via the clause budget)
-  // which docs can match.
-  int userExpansionLimit() const {
+  // the corpus never silently changes query cost.
+  int expansionLimit() const {
     return maxExpansions > 0 ? maxExpansions : DEFAULT_MAX_EXPANSIONS;
-  }
-
-  int clauseLimit(Context& context) const {
-    int operatorLimit = context.limits.fuzzyMaxExpansions > 0
-        ? context.limits.fuzzyMaxExpansions
-        : std::numeric_limits<int>::max();
-    return std::min({userExpansionLimit(), operatorLimit, FUZZY_CLAUSE_BUDGET});
   }
 
 public:
@@ -81,11 +72,6 @@ public:
 
   // Default expansion cap when max_expansions is unset (Lucene parity).
   static constexpr int DEFAULT_MAX_EXPANSIONS = 50;
-
-  // HARDWARE SENSITIVE: interim clause cap (applies scored or not, so the
-  // match set stays uniform). Laptop-tuned per the tuning registry convention;
-  // re-validate on target desktop/cloud/ARM.
-  static constexpr int FUZZY_CLAUSE_BUDGET = 64;
 
   FuzzyQuery(std::string_view field, std::string_view term, int maxEdits,
              int prefixLength = 0, int maxExpansions = 0, float boost = 1.0f,
@@ -128,18 +114,13 @@ public:
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
-                                 const FilterKeyContext& ctx) const override {
+                                 const FilterKeyContext&) const override {
     out.appendKind(kind);
     out.appendString(field);
     out.appendTerm(term);
     out.appendInt32(maxEdits);
     out.appendInt32(prefixLength);
-    int operatorLimit = ctx.fuzzyMaxExpansions > 0
-        ? ctx.fuzzyMaxExpansions
-        : std::numeric_limits<int>::max();
-    int effectiveLimit = std::min({userExpansionLimit(), operatorLimit,
-                                   FUZZY_CLAUSE_BUDGET});
-    out.appendInt32(effectiveLimit);
+    out.appendInt32(expansionLimit());
     return FilterKeyScope::CORE_STABLE;
   }
 
@@ -184,10 +165,9 @@ private:
     return candidates;
   }
 
-  void truncateCandidates(Context& context,
-                          std::vector<ExpansionCandidate>& candidates) const {
+  void truncateCandidates(std::vector<ExpansionCandidate>& candidates) const {
     int matched = (int)candidates.size();
-    int limit = clauseLimit(context);
+    int limit = expansionLimit();
 
     if (matched > limit) {
       std::partial_sort(candidates.begin(), candidates.begin() + limit, candidates.end(),
