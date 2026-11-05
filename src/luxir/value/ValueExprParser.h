@@ -306,7 +306,7 @@ private:
     }
     bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
                    field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-    bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING;
+    bool stringSortable = FieldType::storage(field->type()) == FieldType::Storage::TERMS;
     bool geo = field->type() == FieldType::GEO_POINT;
     if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));
     if (!field->hasColumn()) {

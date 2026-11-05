@@ -285,7 +285,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     FieldReader fields(*this, ordinal);
     fields.readFieldInfo(*fresh);
     checkFieldLocations(files, *fresh);
-    if (fresh->type == FieldType::BIN && (fresh->flags & FieldType::STORED) != 0) {
+    if (FieldType::storage(fresh->type) == FieldType::Storage::BIN && (fresh->flags & FieldType::STORED) != 0) {
       fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
     }
     if (FieldType::sortsByIntColumn(fresh->type) && fresh->columnLoc.offset() > 0) {

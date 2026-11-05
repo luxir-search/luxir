@@ -2634,7 +2634,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         while (fields.readNextField()) {
           SegFieldInfo info;
           fields.readFieldInfo(info);
-          if (info.type != FieldType::STRING ||
+          if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
               (info.flags & FieldType::INDEX_DOCS) == 0 ||
               (info.flags & FieldType::MULTI_VALUED) == 0) {
             continue;

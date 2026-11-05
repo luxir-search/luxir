@@ -4835,3 +4835,30 @@ TEST_F(IndexWriterTest, takeoverDuringStateCasFencesCandidate) {
   EXPECT_EQ(1, IndexReader(dir).liveDocs());
   test::expectValidInventory(dir, *winner);
 }
+
+TEST_F(IndexWriterTest, idTypeSurvivesMergeAndReopen) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  auto check = [](IndexReader& reader, size_t segments) {
+    EXPECT_EQ(2, reader.liveDocs());
+    EXPECT_EQ(segments, reader.segments().size());
+    for (const auto& seg : reader.segments()) {
+      auto* field = seg.postingsReader().fieldInfo("id");
+      ASSERT_NE(nullptr, field);
+      EXPECT_EQ(FieldType::ID, field->type);
+    }
+  };
+  check(*iw->snapshots.readers.getReader(), 2);
+  iw->mergeSegments();
+  iw->commit();
+  check(*iw->snapshots.readers.getReader(), 1);
+  iw->close();
+  CommitSnapshotRegistry snapshots(iw->dir);
+  IndexWriter reopened(snapshots);
+  check(*reopened.snapshots.readers.getReader(), 1);
+}

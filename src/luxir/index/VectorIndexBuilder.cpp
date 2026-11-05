@@ -268,7 +268,7 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
     auto* info = pr.fieldInfo(fieldName);
     if (!info) continue;
     const auto& fi = *info;
-    if (fi.type != FieldType::VECTOR) continue;
+    if (FieldType::storage(fi.type) != FieldType::Storage::VECTOR) continue;
 
     VectorReader vr(pr, fi);
     int32_t segDims = vr.dims();
@@ -325,7 +325,7 @@ VectorIndexBuilder::collectEligibleFields() {
     while (fr.readNextField()) {
       SegFieldInfo fi;
       fr.readFieldInfo(fi);
-      if (fi.type == FieldType::VECTOR) {
+      if (FieldType::storage(fi.type) == FieldType::Storage::VECTOR) {
         seen.emplace((std::string_view)fr.name());
       }
     }

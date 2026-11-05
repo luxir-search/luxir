@@ -14,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -53,6 +54,26 @@ public:
     DATE,     // timestamp; column-stored as int64 epoch units (default ms)
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
+
+  enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
+
+  static constexpr Storage storage(Type type) {
+    switch (type) {
+      case NONE: return Storage::NONE;
+      case STRING: case ID: return Storage::TERMS;
+      case TEXT: return Storage::TEXT;
+      case BIN: return Storage::BIN;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: return Storage::INT64;
+      case VECTOR: return Storage::VECTOR;
+    }
+    throw std::invalid_argument("Unknown field storage type");
+  }
+
+  static constexpr bool usesOneDimensionalPoints(Type type) {
+    return storage(type) == Storage::INT64 && type != GEO_POINT;
+  }
+
+  static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
 
   static std::string_view typeName(Type type);
   // Decode parameters using the persisted type, independently of any schema.
@@ -182,9 +203,6 @@ public:
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   bool isStored() { return (bool) (flags_ & STORED); }
-
-  // ID uses the indexed STRING representation in segment metadata.
-  Type persistedType() const { return type_ == ID ? STRING : type_; }
 
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce

@@ -480,11 +480,11 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   if (sharedSchema) {
     if (auto* expected = sharedSchema->getFieldTypePtr(name)) {
       const auto& persisted = result.totals();
-      if (expected->persistedType() != persisted.type
+      if (expected->type() != persisted.type
           || expected->segmentTypeFlags() != FieldType::typeParameters(persisted.type, persisted.typeFlags)) {
         throw RequestError(std::format(
             "Field '{}': schema {} does not match persisted {}",
-            name, FieldType::describeType(expected->persistedType(), expected->segmentTypeFlags()),
+            name, FieldType::describeType(expected->type(), expected->segmentTypeFlags()),
             FieldType::describeType(persisted.type, persisted.typeFlags)),
             "field_type_mismatch");
       }
@@ -583,7 +583,7 @@ void IndexReader::PhysicalCore::buildFieldCatalogs() {
         SegFieldInfo fi;
         fieldReader.readFieldInfo(fi);
         std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
-        if (fi.type == FieldType::BIN && (fi.flags & FieldType::STORED)) {
+        if (FieldType::storage(fi.type) == FieldType::Storage::BIN && (fi.flags & FieldType::STORED)) {
           // A stored-fields resource: its metadata lists the fields it holds.
           // An empty resource is never written, but guard the reader's
           // precondition anyway.
@@ -595,7 +595,7 @@ void IndexReader::PhysicalCore::buildFieldCatalogs() {
               resources.push_back(physicalName);
             }
           }
-        } else if (fi.type != FieldType::BIN) {
+        } else if (FieldType::storage(fi.type) != FieldType::Storage::BIN) {
           sources[physicalName].column |= (fi.flags & FieldType::COLUMN_STORED) != 0;
         }
       }
@@ -637,21 +637,16 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
       bool stored = !derived && type->isStored() && std::ranges::find(source.storedResources,
           std::string_view(type->storedResource_)) != source.storedResources.end();
       bool retrievable = false;
-      switch (type->type()) {
-        case FieldType::TEXT:
+      switch (FieldType::storage(type->type())) {
+        case FieldType::Storage::TEXT:
           retrievable = stored;
           break;
-        case FieldType::STRING:
-        case FieldType::ID:
+        case FieldType::Storage::TERMS:
           // Stored STRING/ID also fall back to their own older segment columns
           // even if the current schema no longer enables a column.
           retrievable = stored || (source.column && (type->isStored() || type->hasColumn()));
           break;
-        case FieldType::INT:
-        case FieldType::FLOAT:
-        case FieldType::DOUBLE:
-        case FieldType::DATE:
-        case FieldType::GEO_POINT:
+        case FieldType::Storage::INT64:
           retrievable = source.column && type->hasColumn();
           break;
         default:

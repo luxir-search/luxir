@@ -50,7 +50,7 @@ std::vector<SortClause> memberClauses(const TopDocsReq& op) {
     if (clause.getKind() != SortClause::COLUMN) continue;
     const auto& field = clause.getSortField();
     auto& type = const_cast<FieldType&>(field.getFieldType());
-    if ((type.type() == FieldType::STRING || type.type() == FieldType::ID) && type.indexed()) {
+    if ((FieldType::storage(type.type()) == FieldType::Storage::TERMS) && type.indexed()) {
       // Exhaustive folds retain all groups. Global ords bound each slot's
       // storage without retaining a copy of every best member's term.
       clause = SortClause(SortField(field.getFieldName(), type, field.getOrder(),

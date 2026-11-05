@@ -114,9 +114,8 @@ public:
                 isReversed(), missingValue, fields
             );
         }
-        switch (type) {
-            case FieldType::Type::ID:
-            case FieldType::Type::STRING: {
+        switch (FieldType::storage(type)) {
+            case FieldType::Storage::TERMS: {
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
                     if (stringSortMode == StringSortMode::SEGMENT &&

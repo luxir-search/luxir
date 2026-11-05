@@ -593,7 +593,7 @@ public:
         case FieldType::DATE: wireType = Type::DATE; break;
         default: throw RequestError("unsupported collapse key type: " + std::string(name));
       }
-      bool ordinal = type.type() == FieldType::STRING || type.type() == FieldType::ID;
+      bool ordinal = FieldType::storage(type.type()) == FieldType::Storage::TERMS;
       if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
         throw RequestError("string collapse key must be indexed: " + std::string(name));
       }

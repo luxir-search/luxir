@@ -646,7 +646,7 @@ inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments info
         continue;
       }
       auto t = r.fieldType->type();
-      if (t == FieldType::Type::STRING || t == FieldType::Type::ID) {
+      if (FieldType::storage(t) == FieldType::Storage::TERMS) {
         colReqs.push_back(&r);
       }
     }

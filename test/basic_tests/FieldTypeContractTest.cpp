@@ -60,7 +60,7 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
         EXPECT_EQ(expected, info.typeFlags) << name;
         EXPECT_EQ(expected, FieldType::typeParameters(info.type, info.typeFlags));
       }
-      EXPECT_EQ(FieldType::STRING, postings.fieldInfo("id")->type);
+      EXPECT_EQ(FieldType::ID, postings.fieldInfo("id")->type);
       EXPECT_EQ(FieldType::DATE, postings.fieldInfo("when_dt")->type);
       EXPECT_EQ(0u, postings.fieldInfo("when_dt")->typeFlags);
     }
