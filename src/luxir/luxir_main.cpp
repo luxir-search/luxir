@@ -22,6 +22,7 @@
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
 #include <CLI/CLI.hpp>
+#include <faiss/utils/simd_levels.h>
 
 namespace fs = std::filesystem;
 
@@ -240,6 +241,7 @@ std::string luxir_banner() {
   ss << std::endl;
   ss << "\tallocator=" << allocatorName();
   ss << " hw_threads=" << std::thread::hardware_concurrency();
+  ss << " faiss_simd=" << faiss::SIMDConfig::get_level_name();
   ss << " cwd=" << fs::current_path();
   ss << " tmp=" << fs::temp_directory_path();
 
