@@ -17,6 +17,10 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(__SSE2__)
+#include <immintrin.h>
+#endif
+
 #include "luxir/query/Query.h"
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/reader/IntColReader.h"
@@ -361,7 +365,8 @@ public:
   // block granularity: per leaf zone (any encoding), and for a linear-fit
   // block by the rank intervals the codec bounds. runAt walks the refinement
   // as runs of in-block ranks sharing one relation, so consumers emit INSIDE
-  // runs, skip OUTSIDE runs and check only CROSSES runs value by value.
+  // runs, skip OUTSIDE runs and check values (CrossingValues) only in CROSSES
+  // runs.
   struct BlockPlan {
     static constexpr uint32_t LEAF_SIZE = NumColumnFormat::LEAF_ZONE_SIZE;
     static_assert(NumColumnFormat::LEAVES_PER_BLOCK <= 8);
@@ -702,34 +707,160 @@ public:
     return plan;
   }
 
+  // The values of CROSSES runs, decoded one 128-value codec frame at a time
+  // and kept until a request leaves the frame. A 64-value group never spans
+  // frames, so consumers ask by group: mask() answers every requested value
+  // at once, any() stops at the first match.
   class CrossingValues {
+    // The decoders fill at most one frame, and frames start at multiples of
+    // its size, so no 64-value group spans two.
+    static constexpr uint32_t FRAME = NumColumnFormat::BULK_SIZE;
+    static_assert(FRAME % 64 == 0);
+
     IntColReader& reader;
     int64_t residualStart = -1;
     int64_t rawStart = -1;
     uint32_t residualCount = 0;
     uint32_t rawCount = 0;
-    uint32_t residuals[128];
-    int64_t raw[128];
+    uint32_t residuals[FRAME];
+    int64_t raw[FRAME];
+
+    // Once per frame, out of line: the group loops carry no codec dispatch.
+    LUXIR_NOINLINE void decodeResiduals(int64_t rank) {
+      residualStart = reader.decodeResidualSubBlock(rank, residuals,
+                                                    residualCount);
+    }
+
+    LUXIR_NOINLINE void decodeRaw(int64_t rank) {
+      rawStart = reader.decodeValueSubBlock(rank, raw, rawCount);
+    }
+
+    LUXIR_INLINE const uint32_t* residualsAt(int64_t rank) {
+      if ((uint64_t)(rank - residualStart) >= residualCount) decodeResiduals(rank);
+      return residuals + (rank - residualStart);
+    }
+
+    LUXIR_INLINE const int64_t* rawAt(int64_t rank) {
+      if ((uint64_t)(rank - rawStart) >= rawCount) decodeRaw(rank);
+      return raw + (rank - rawStart);
+    }
+
+    // Bit i: values[i] - lower <= width in unsigned 32-bit arithmetic, for
+    // 64 decoded residuals.
+    static LUXIR_INLINE uint64_t residualMask64(const uint32_t* values,
+                                                uint32_t lower, uint32_t width) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+      const __m512i base = _mm512_set1_epi32((int)lower);
+      const __m512i span = _mm512_set1_epi32((int)width);
+      auto group = [&](int g) LUXIR_INLINE {
+        __m512i v = _mm512_loadu_si512((const void*)(values + 16 * g));
+        return _mm512_cmple_epu32_mask(_mm512_sub_epi32(v, base), span);
+      };
+      __mmask32 low = _mm512_kunpackw(group(1), group(0));
+      __mmask32 high = _mm512_kunpackw(group(3), group(2));
+      return (uint64_t)_mm512_kunpackd(high, low);
+#elif defined(__AVX2__)
+      // Biasing both sides by 2^31 turns the unsigned test into a signed one:
+      // v - (lower ^ 2^31) equals (v - lower) ^ 2^31.
+      const __m256i base = _mm256_set1_epi32((int)(lower ^ 0x80000000u));
+      const __m256i span = _mm256_set1_epi32((int)(width ^ 0x80000000u));
+      uint64_t outside = 0;
+      for (int g = 0; g < 8; g++) {
+        __m256i v = _mm256_sub_epi32(
+            _mm256_loadu_si256((const __m256i*)(values + 8 * g)), base);
+        outside |= (uint64_t)(uint32_t)_mm256_movemask_ps(
+            _mm256_castsi256_ps(_mm256_cmpgt_epi32(v, span))) << (8 * g);
+      }
+      return ~outside;
+#elif defined(__SSE2__)
+      // The AVX2 bias, four lanes at a time.
+      const __m128i base = _mm_set1_epi32((int)(lower ^ 0x80000000u));
+      const __m128i span = _mm_set1_epi32((int)(width ^ 0x80000000u));
+      uint64_t outside = 0;
+      for (int g = 0; g < 16; g++) {
+        __m128i v = _mm_sub_epi32(
+            _mm_loadu_si128((const __m128i*)(values + 4 * g)), base);
+        outside |= (uint64_t)(uint32_t)_mm_movemask_ps(
+            _mm_castsi128_ps(_mm_cmpgt_epi32(v, span))) << (4 * g);
+      }
+      return ~outside;
+#else
+      uint64_t bits = 0;
+      for (uint32_t i = 0; i < 64; i++) {
+        bits |= (uint64_t)((uint32_t)(values[i] - lower) <= width) << i;
+      }
+      return bits;
+#endif
+    }
 
   public:
     explicit CrossingValues(IntColReader& reader) : reader(reader) {}
 
-    bool matches(int64_t valueRank, const BlockPlan& plan,
-                 const NumericPredicateQuery& query) {
+    // The length of the chunk at rank: to end, but within rank's 64-value
+    // group.
+    static uint32_t groupChunk(int64_t rank, int64_t end) {
+      return (uint32_t)std::min<int64_t>(end - rank, 64 - (rank & 63));
+    }
+
+    // Bit i reports whether the value at rank + i matches, for the
+    // 1 <= n <= 64 values of one CROSSES run in one 64-value group. A whole
+    // group compares its 64 lanes at once; a shorter chunk compares only its
+    // own values, so no lane the decoder did not write is read. Short chunks
+    // occur only at run and window edges and raw values take matchesValue one
+    // at a time, so both loops stay scalar: vectorized, they outweighed the
+    // 64-lane kernel in the fill loops' code.
+    LUXIR_INLINE uint64_t mask(int64_t rank, uint32_t n, const BlockPlan& plan,
+                               const NumericPredicateQuery& query) {
+      assert(n >= 1 && (uint32_t)(rank & 63) + n <= 64);
+      uint64_t bits = 0;
       if (plan.residualComparable) {
-        if (valueRank < residualStart
-            || valueRank >= residualStart + (int64_t)residualCount) {
-          residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
-                                                        residualCount);
+        const uint32_t* values = residualsAt(rank);
+        assert(rank + n <= residualStart + (int64_t)residualCount);
+        if (n == 64) [[likely]] {
+          return residualMask64(values, plan.residualLower, plan.residualWidth);
         }
-        uint32_t v = residuals[valueRank - residualStart];
-        return (uint32_t)(v - plan.residualLower) <= plan.residualWidth;
+#pragma GCC novector
+        for (uint32_t i = 0; i < n; i++) {
+          bits |= (uint64_t)((uint32_t)(values[i] - plan.residualLower)
+                             <= plan.residualWidth) << i;
+        }
+        return bits;
       }
-      if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
-        rawStart = reader.decodeValueSubBlock(valueRank, raw, rawCount);
+      const int64_t* values = rawAt(rank);
+      assert(rank + n <= rawStart + (int64_t)rawCount);
+#pragma GCC novector
+      for (uint32_t i = 0; i < n; i++) {
+        bits |= (uint64_t)query.matchesValue(values[i]) << i;
       }
-      int64_t v = raw[valueRank - rawStart];
-      return query.matchesValue(v);
+      return bits;
+    }
+
+    // Whether any value at ranks [rank, end) of one CROSSES run matches,
+    // stopping at the first that does. Scalar like mask()'s short chunks:
+    // documents hold few values and often match early, and vectorized, the
+    // scans' peeling and cleanup doubled the multivalued fills.
+    bool any(int64_t rank, int64_t end, const BlockPlan& plan,
+             const NumericPredicateQuery& query) {
+      for (int64_t frameEnd; rank < end; rank = frameEnd) {
+        if (plan.residualComparable) {
+          const uint32_t* values = residualsAt(rank);
+          frameEnd = std::min<int64_t>(end, residualStart + (int64_t)residualCount);
+#pragma GCC novector
+          for (int64_t r = rank; r < frameEnd; r++, values++) {
+            if ((uint32_t)(*values - plan.residualLower) <= plan.residualWidth) {
+              return true;
+            }
+          }
+        } else {
+          const int64_t* values = rawAt(rank);
+          frameEnd = std::min<int64_t>(end, rawStart + (int64_t)rawCount);
+#pragma GCC novector
+          for (int64_t r = rank; r < frameEnd; r++, values++) {
+            if (query.matchesValue(*values)) return true;
+          }
+        }
+      }
+      return false;
     }
   };
 
@@ -747,10 +878,9 @@ public:
       BlockPlan::Run run = plan.runAt((uint32_t)(rank - blockStart));
       int64_t runEnd = std::min<int64_t>(end, blockStart + run.end);
       if (run.relation == BlockRelation::INSIDE) return true;
-      if (run.relation == BlockRelation::CROSSES) {
-        for (; rank < runEnd; rank++) {
-          if (crossing.matches(rank, plan, query)) return true;
-        }
+      if (run.relation == BlockRelation::CROSSES
+          && crossing.any(rank, runEnd, plan, query)) {
+        return true;
       }
       rank = runEnd;
     }
@@ -789,6 +919,17 @@ public:
                        int32_t doc) {
       int32_t index = doc - windowStart;
       words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+    }
+
+    // ORs bits [0, n) into words from window offset index on. Only a chunk
+    // that crosses into the next word stores there, which also keeps both
+    // shifts below 64.
+    static void orBits(std::span<uint64_t> words, int32_t index,
+                       uint64_t bits, uint32_t n) {
+      uint32_t shift = (uint32_t)index & 63;
+      size_t word = (size_t)(index >> 6);
+      words[word] |= bits << shift;
+      if (shift + n > 64) words[word + 1] |= bits >> (64 - shift);
     }
 
     static void setRun(std::span<uint64_t> words, int32_t windowStart,
@@ -834,11 +975,15 @@ public:
       if (doc > walk->val()) walk->advance(doc);
     }
 
+    // Out of line: GCC otherwise inlines next()'s bucket scans into the
+    // sparse crossing loop, quadrupling fillSingle<true>.
+    LUXIR_NOINLINE int32_t stepWalk() { return walk->next(); }
+
     // The document of rank, the rank after the one a fill just visited.
     template <bool SPARSE>
     LUXIR_INLINE int32_t nextDoc(int32_t rank) {
       if constexpr (SPARSE) {
-        return walk->next();
+        return stepWalk();
       } else {
         return rank;
       }
@@ -860,13 +1005,33 @@ public:
       }
     }
 
+    // Dense CROSSES ranks [rank, end), where doc == rank: one mask per
+    // 64-value group, ORed in at the group's window offset.
+    LUXIR_INLINE void fillCrossing(std::span<uint64_t> words, int32_t min,
+                                   int32_t rank, int32_t end, const BlockPlan& plan) {
+      while (rank < end) {
+        uint32_t n = CrossingValues::groupChunk(rank, end);
+#ifndef NDEBUG
+        if (verificationObserver != nullptr) {
+          for (int32_t doc = rank; doc < rank + (int32_t)n; doc++) {
+            verificationObserver(query, doc);
+          }
+        }
+#endif
+        orBits(words, rank - min, crossing.mask(rank, n, plan, query), n);
+        rank += (int32_t)n;
+      }
+    }
+
     // One source per loop, instantiated per docsWithValue density: dense
-    // fills step doc with rank and set INSIDE runs whole, sparse fills step
-    // walk. Separate functions keep each loop's per-value work inlined and its
-    // registers independent of the other loop. Pin the start alignment: zone
-    // fills dominate column-only range filters, and a 16-byte shift from
-    // unrelated edits cost frange2 r01_old10 TOP_10 11-18% more cycles at
-    // identical instruction counts (hugin, 2026-10-29).
+    // fills bound each run by the window once, then set INSIDE runs whole and
+    // OR CROSSES runs in a mask per 64-value group; sparse fills step walk,
+    // and in CROSSES runs read each value's bit from its group's mask.
+    // Separate functions keep each loop's work inlined and its registers
+    // independent of the other loop. Pin the start alignment: zone fills
+    // dominate column-only range filters, and a 16-byte shift from unrelated
+    // edits cost frange2 r01_old10 TOP_10 11-18% more cycles at identical
+    // instruction counts (hugin, 2026-10-29).
     template <bool SPARSE>
     [[gnu::aligned(64)]] LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
                                    int32_t max, int32_t doc, int32_t rank) {
@@ -883,25 +1048,36 @@ public:
           doc = jumpDoc<SPARSE>(rank, max);
           continue;
         }
-        if (!SPARSE && run.relation == BlockRelation::INSIDE) {
-          int32_t insideEnd = (int32_t)std::min<int64_t>(runEnd, max);
-          setRun(words, min, doc, insideEnd);
-          rank = insideEnd;
-          doc = insideEnd;
+        if constexpr (!SPARSE) {
+          int32_t end = (int32_t)std::min<int64_t>(runEnd, max);
+          if (run.relation == BlockRelation::INSIDE) setRun(words, min, rank, end);
+          else fillCrossing(words, min, rank, end, plan);
+          rank = end;
+          doc = end;
           continue;
         }
-        while (rank < runEnd && doc < max) {
-#ifndef NDEBUG
-          if (run.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
-            verificationObserver(query, doc);
-          }
-#endif
-          if (run.relation == BlockRelation::INSIDE
-              || crossing.matches(rank, plan, query)) {
+        if (run.relation == BlockRelation::INSIDE) {
+          while (rank < runEnd && doc < max) {
             setBit(words, min, doc);
+            rank++;
+            doc = nextDoc<SPARSE>(rank);
           }
-          rank++;
-          doc = nextDoc<SPARSE>(rank);
+          continue;
+        }
+        // max bounds documents, not ranks: a group's mask may cover values
+        // past it, but walk consumes ranks only while doc < max.
+        while (rank < runEnd && doc < max) {
+          int32_t groupEnd = rank + (int32_t)CrossingValues::groupChunk(rank, runEnd);
+          uint64_t bits = crossing.mask(rank, (uint32_t)(groupEnd - rank), plan, query);
+          do {
+#ifndef NDEBUG
+            if (verificationObserver != nullptr) verificationObserver(query, doc);
+#endif
+            if ((bits & 1) != 0) setBit(words, min, doc);
+            bits >>= 1;
+            rank++;
+            doc = nextDoc<SPARSE>(rank);
+          } while (rank < groupEnd && doc < max);
         }
       }
     }
@@ -1801,9 +1977,12 @@ public:
                   if (relation == BlockRelation::INSIDE) {
                     count += end - begin;
                   } else if (relation == BlockRelation::CROSSES) {
-                    for (int64_t rank = start + begin; rank < start + end;
-                         rank++) {
-                      count += crossing.matches(rank, plan, weight.query);
+                    // One stored value per document, sparse or dense.
+                    for (int64_t rank = start + begin; rank < start + end;) {
+                      uint32_t n = CrossingValues::groupChunk(rank, start + end);
+                      count += std::popcount(
+                          crossing.mask(rank, n, plan, weight.query));
+                      rank += n;
                     }
                   }
                 });
