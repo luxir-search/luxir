@@ -757,7 +757,7 @@ TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
   EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
-TEST_F(AggregateExprTest, cardinalityAddsEachDistinctOrdOnce) {
+TEST_F(AggregateExprTest, ordinalAggregateBatchesMatchPerValueInputs) {
   CollectionHelper helper;
   helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
   std::mt19937_64 random(11);
@@ -775,7 +775,7 @@ TEST_F(AggregateExprTest, cardinalityAddsEachDistinctOrdOnce) {
     helper.indexAll(docs, UpdateMessage::COMMIT);
   }
   auto guard = facetAggregateOverrides();
-  SearchOverridesGuard ordGuard(disableDistinctOrdCardinalityForTests);
+  SearchOverridesGuard ordGuard(disableOrdinalAggregateBatchesForTests);
   std::array<std::string, 4> cases{
     R"json({"ops":{"users":"cardinality(user_s)","exact":"cardinality(user_s,40000)",
       "tags":"cardinality(tags_ss)","ids":"cardinality(id,40000)"}})json",
@@ -787,13 +787,13 @@ TEST_F(AggregateExprTest, cardinalityAddsEachDistinctOrdOnce) {
       "users":"cardinality(user_s)"}}}}})json"};
   for (const std::string& json : cases) {
     SCOPED_TRACE(json);
-    AggregateExecutionStats baselineStats, distinctStats;
-    disableDistinctOrdCardinalityForTests = true;
+    AggregateExecutionStats baselineStats, batchStats;
+    disableOrdinalAggregateBatchesForTests = true;
     auto baseline = runSharedSketchRequest(helper, json, baselineStats);
-    disableDistinctOrdCardinalityForTests = false;
-    auto distinct = runSharedSketchRequest(helper, json, distinctStats, -1);
-    EXPECT_FALSE(distinct.values.empty());
-    EXPECT_EQ(baseline.values, distinct.values);
+    disableOrdinalAggregateBatchesForTests = false;
+    auto batched = runSharedSketchRequest(helper, json, batchStats, -1);
+    EXPECT_FALSE(batched.values.empty());
+    EXPECT_EQ(baseline.values, batched.values);
   }
 
   auto req = localReq(helper.getSearchEngine());

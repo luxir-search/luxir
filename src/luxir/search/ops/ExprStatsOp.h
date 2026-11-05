@@ -196,7 +196,9 @@ public:
       const ValueNode& root = binding.producer->input->root();
       BoundValueNode& bound = binding.values->nodes[
           binding.producer->input->rootNode];
-      if (!bound.column) return;
+      bool ordinals = root.type == ValueType::COLUMN_ONLY;
+      if (ordinals ? bound.stringColumn == nullptr || bound.stringColumn->ords == nullptr
+                   : !bound.column) return;
       std::array<int64_t, BATCH_SIZE> values;
       size_t count = 0;
       auto flush = [&] {
@@ -206,65 +208,18 @@ public:
         count = 0;
       };
       int64_t missing = 0;
-      forEachIntColValue(
-          domain, *bound.column, maxDoc, missing,
-          [&](int32_t docid, int64_t value) LUXIR_INLINE {
-            unused(docid);
-            values[count++] = value;
-            if (count == values.size()) flush();
-          });
-      if (count != 0) flush();
-    }
-
-    // A duplicate-insensitive state (cardinality) over an ordinal column needs
-    // each distinct value once: the walk marks the segment's ords in a bitset,
-    // and only the marked ones are mapped to global ords and added. Taken
-    // when the bitset is cheap next to the domain; false leaves the binding
-    // to the per-value path.
-    bool accumulateDistinctOrds(AggregateAccumulator& accumulator,
-                                BoundAggregateInput& binding, DocSet* domain,
-                                int32_t maxDoc) {
-      static constexpr int64_t MAX_BITSET_ORDS = int64_t{1} << 30;
-      BoundStringColumn* column = binding.values == nullptr ? nullptr
-          : binding.values->nodes[binding.producer->input->rootNode].stringColumn;
-      if (disableDistinctOrdCardinalityForTests || column == nullptr || column->ords == nullptr
-          || !binding.producer->resolved.state.duplicateInsensitive) {
-        return false;
-      }
-      OrdColReader& ordColumn = *column->ords;
-      int64_t numOrds = binding.ordMapping.numOrds;
-      if (numOrds <= 0) {
-        // A segment holding every ord maps to them by identity.
-        const OrdMap* ords = thisOp().fields[binding.producerIndex].ords;
-        numOrds = ords != nullptr ? ords->numOrds() : 0;
-      }
-      int64_t domainDocs = domain != nullptr ? domain->card() : maxDoc;
-      if (numOrds <= 0 || numOrds > MAX_BITSET_ORDS || numOrds / 64 > domainDocs) {
-        return false;
-      }
-      std::vector<uint64_t> seen(((size_t)numOrds + 63) / 64);
-      int64_t missing = 0;
-      forEachOrdValue(domain, ordColumn, OrdMap::SegToGlobal::identity(),
-          maxDoc, missing, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
-            unused(docid);
-            seen[(uint64_t)ord >> 6] |= uint64_t{1} << ((uint64_t)ord & 63);
-          });
-      std::array<ScalarValueResult, BATCH_SIZE> values;
-      size_t count = 0;
-      auto flush = [&] {
-        accumulator.addBatch(binding.producerIndex,
-            std::span<const ScalarValueResult>(values.data(), count));
-        count = 0;
+      auto consume = [&](int32_t docid, int64_t value) LUXIR_INLINE {
+        unused(docid);
+        values[count++] = value;
+        if (count == values.size()) flush();
       };
-      for (size_t word = 0; word < seen.size(); word++) {
-        for (uint64_t bits = seen[word]; bits != 0; bits &= bits - 1) {
-          int64_t ord = (int64_t)(word * 64 + (size_t)std::countr_zero(bits));
-          values[count++] = ScalarValueResult::integer(binding.ordMapping.globalOrd(ord));
-          if (count == values.size()) flush();
-        }
+      if (ordinals) {
+        forEachOrdValue(domain, *bound.stringColumn->ords, binding.ordMapping,
+                        maxDoc, missing, consume);
+      } else {
+        forEachIntColValue(domain, *bound.column, maxDoc, missing, consume);
       }
       if (count != 0) flush();
-      return true;
     }
 
     void accumulateExpression(AggregateAccumulator& accumulator,
@@ -357,11 +312,11 @@ public:
 
           int32_t maxDoc = segment.postingsReader().maxDoc();
           for (BoundAggregateInput& binding : bindings) {
-            if (binding.columnScan) {
+            if (binding.columnScan
+                && !(disableOrdinalAggregateBatchesForTests
+                     && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
-            } else if (accumulateDistinctOrds(
-                           accumulator, binding, domainHandle.get(), maxDoc)) {
             } else {
               accumulateExpression(
                   accumulator, binding, domainHandle.get(), maxDoc);

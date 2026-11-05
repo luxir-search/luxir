@@ -317,8 +317,8 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     const ValueNode& root = producer.input->root();
     BoundValueProgram* values = producer.input->bind(pool, segment, fields[index].values);
     BoundValueNode& rootBinding = values->nodes[producer.input->rootNode];
-    // A string column root yields its global ords (cardinality); only int
-    // columns scan raw values.
+    // A string column root yields its global ords (cardinality). Raw point
+    // reads remain numeric-only.
     bool strings = root.type == ValueType::COLUMN_ONLY;
     OrdMap::SegToGlobal ordMapping;
     if (strings && rootBinding.stringColumn != nullptr && fields[index].ords != nullptr) {
@@ -326,8 +326,10 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
       rootBinding.stringColumn->attachOrds(pool, segment.postingsReader());
       ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
     }
-    bool columnScan = root.kind == ValueNodeKind::COLUMN && !strings;
-    bool bareColumn = columnScan && !valueArray(root.type);
+    bool columnScan = root.kind == ValueNodeKind::COLUMN
+        && (!strings || (rootBinding.stringColumn != nullptr
+                        && rootBinding.stringColumn->ords != nullptr));
+    bool bareColumn = columnScan && !strings && !valueArray(root.type);
     bindings.push_back({
         .values = values,
         .producer = &producer,
