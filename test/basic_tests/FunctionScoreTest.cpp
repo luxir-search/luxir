@@ -372,10 +372,12 @@ TEST_F(FunctionScoreTest, geoOperandsUseTheRegistryAndStayNonNumeric) {
   EXPECT_EQ(eval("geo_distance(loc_p, 0, 0)"), eval("geo_distance(col(\"loc_p\"), 0, 0)"));
   EXPECT_EQ(eval("geo_distance(loc_p, 0, 0)"), eval("min(geo_distance(locs_p, 0, 0))"));
   for (auto expression : {"loc_p", "loc_p + 1", "abs(loc_p)", "pow(loc_p, 2)", "loc_p == loc_p",
-                          "def(loc_p, 0)", "count(locs_p)", "if(1, loc_p, loc_p)",
+                          "def(loc_p, 0)", "if(1, loc_p, loc_p)",
                           "random(7, loc_p)", "min(locs_p)"}) {
     expectParseError(expression, "GEO_POINT is not numeric");
   }
+  // count() takes any value and counts points.
+  EXPECT_EQ(ValueType::INT64, parse("count(locs_p)")->root().type);
   expectParseError("geo_distance(no_column_p, 0, 0)", "no column values");
   expectParseError("geo_distance(loc_p, x_i, 0)", "argument 2 must be a constant numeric scalar");
   expectParseError("geo_distance(loc_p, 0, 181)", "longitude");

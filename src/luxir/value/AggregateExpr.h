@@ -305,8 +305,6 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value);
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
   const AggregateProducer* producer = nullptr;
-  OrdColReader* ordColumn = nullptr;
-  OrdColReader::Iterator* ordIterator = nullptr;
   OrdMap::SegToGlobal ordMapping;
   IntColReader::BulkIterator* columnIterator = nullptr;
   AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
@@ -325,17 +323,12 @@ struct BoundAggregateInput {
   template <typename Consume>
   void forEachValue(int32_t docid, Consume&& consume) {
     if (producer->input->root().type == ValueType::COLUMN_ONLY) {
-      if (ordIterator == nullptr) return;
-      if (ordIterator->docId() < docid) ordIterator->advance(docid);
-      if (ordIterator->docId() != docid) return;
-      auto add = [&](int32_t stored) {
-        if (stored != 0) consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
-      };
-      if (ordColumn->multiValued()) {
-        auto [start, end] = ordColumn->getStartEndValueRank(ordIterator->rank());
-        for (int64_t i = start; i < end; i++) add(ordIterator->values().valueAt(i));
-      } else {
-        add(ordIterator->value());
+      BoundStringColumn* column = values->nodes[producer->input->rootNode].stringColumn;
+      if (column == nullptr || column->ords == nullptr || !column->cursor.seek(docid)) return;
+      for (int64_t rank = column->cursor.begin(); rank < column->cursor.end(); rank++) {
+        int32_t stored = column->storedOrd(docid, rank);
+        assert(stored != 0);
+        consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
       }
       return;
     }

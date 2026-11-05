@@ -29,7 +29,8 @@ void requireNumeric(std::span<const ResolvedValue> args) {
     }
     if (arg.type == ValueType::COLUMN_ONLY) {
       throw std::runtime_error(
-          "a non-numeric column is only valid as the complete sort expression");
+          "a non-numeric column is only valid as a complete sort expression, "
+          "as the argument of count(), or as the input of cardinality()");
     }
   }
 }
@@ -165,8 +166,10 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
 }
 
+// count() takes any value (an ANY operand): it counts a STRING or ID
+// column's values from the column's shape, and a GEO_POINT's points.
 ResolvedValue countResolve(std::span<const ResolvedValue> args) {
-  requireNumeric(args);
+  unused(args);
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
@@ -699,6 +702,11 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
 
 ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
+  if (program.program.nodes[node.children[0]].type == ValueType::COLUMN_ONLY) {
+    BoundStringColumn* column = program.nodes[node.children[0]].stringColumn;
+    if (column == nullptr || !column->cursor.seek(docid)) return ValueResult::integer(0);
+    return ValueResult::integer(column->cursor.count());
+  }
   ValueResult input = program.evalNode(node.children[0], docid, score);
   if (!input.valid) return ValueResult::integer(0);
   if (!valueArray(input.type)) return ValueResult::integer(1);
@@ -1418,7 +1426,7 @@ ValueBounds countBounds(const ValueNode& node,
                         std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
   if (args[0].alwaysMissing) return ValueBounds::integer(0, 0);
-  if (!valueArray(args[0].type)) {
+  if (!valueArray(args[0].type) && args[0].type != ValueType::COLUMN_ONLY) {
     if (!args[0].mayBeMissing) return ValueBounds::integer(1, 1);
     ValueBounds out = ValueBounds::integer(0, 1);
     out.minAttained = false;
@@ -1677,6 +1685,8 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
 }
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+constexpr ValueFunction::Operand ANY_VALUE{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
 constexpr ValueFunction::Operand GEO_POINT{
     .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
 constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
@@ -1728,7 +1738,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
      sumBounds, evalSumElement, 1, 1, {RAW}, nullptr},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
-     evalFunctionBatch, countBounds, evalCountElement, 1, 1, {RAW}, nullptr},
+     evalFunctionBatch, countBounds, evalCountElement, 1, 1, {ANY_VALUE}, nullptr},
     {ValueOpcode::EXP, "exp", unaryDouble, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::EXP, 1>},
@@ -1852,7 +1862,7 @@ ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args
       if (args[i].nature != ValueNature::GEO_POINT) {
         throw std::runtime_error(fmt::format("argument {} is not a GEO_POINT value", i + 1));
       }
-    } else {
+    } else if (operands[i].kind == Kind::NUMERIC) {
       requireNumeric(args.subspan(i, 1));
     }
   }
@@ -2016,6 +2026,10 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       auto* fieldInfo = fields[index].at(segment);
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
+      } else if (node.type == ValueType::COLUMN_ONLY) {
+        bound.stringColumn = pool.make<BoundStringColumn>(postings, *fieldInfo);
+        bound.bounds = ValueBounds::unbounded(node.type,
+            fieldInfo->docsWithField < postings.maxDoc());
       } else {
         bound.column.emplace(postings, *fieldInfo);
         bound.iterator.emplace(*bound.column);
