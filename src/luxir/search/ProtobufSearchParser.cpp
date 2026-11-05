@@ -214,8 +214,29 @@ public:
   // The provided pool will be used to store the parsed query tree.
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
+
   explicit SearchParserImpl(SearchRequest& req)
     : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
+  }
+
+  // Every planning context of the request draws on one multi-term budget.
+  Query::PlanningContext* createPlanningContext() {
+    Query::PlanningContext::Limits limits;
+    limits.multiTermBudget = &req.multiTermBudget;
+    return luxir::arenaCreate<Query::PlanningContext>(
+        req.arena, req.requestPool, *req.reader, limits, &req.warnings,
+        FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone},
+        req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+  }
+
+  // All request parse paths share the operator rules and field resolver.
+  ParseContext createParseContext(std::string_view name) {
+    ParseContext parseContext{req.requestPool, *req.schema, req.arena,
+        coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
+    parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
+    parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
+    return parseContext;
   }
 
   CoerceContext coerceContext(const TimeZone& zone) const {
@@ -229,19 +250,10 @@ public:
     rootOp.parent = nullptr;
     rootOp.flags = options.flags;
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone),
-      "root", &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext("root");
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
-      rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
-          req.arena, req.requestPool, *req.reader,
-          Query::PlanningContext::Limits{}, &req.warnings,
-          FilterKeyContext{.schemaGen = req.schema->gen_,
-                           .timeZone = req.proto.time_zone},
-          req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+      rootOp.planning = createPlanningContext();
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -329,11 +341,7 @@ public:
         ? (listFilters ? listFilters : &static_cast<TopDocsReq&>(currOp).filters) : nullptr;
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
-      ParseContext context{req.requestPool, *req.schema, req.arena,
-          coerceContext(*req.timeZone),
-          currOp.name, &req.warnings, &fields, &req.engine.getNode()};
-      context.collapse = enclosingCollapse;
-      context.reader = req.reader.get();
+      auto context = createParseContext(currOp.name);
       auto domains = parseChildDomains(ops, context);
       if (!domains.empty()) {
         std::vector<Query*> filters;
@@ -351,9 +359,7 @@ public:
           domain.applyParentFilters = false;
         }
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
-        bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
-            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+        bucketPlan->planning = createPlanningContext();
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -485,12 +491,7 @@ public:
           plan = prepared->second;
           preparedFacets.erase(prepared);
         } else {
-          ParseContext parseContext{
-            req.requestPool, *req.schema, req.arena,
-            coerceContext(*req.timeZone),
-            name, &req.warnings, &fields, &req.engine.getNode()};
-          parseContext.collapse = enclosingCollapse;
-          parseContext.reader = req.reader.get();
+          auto parseContext = createParseContext(name);
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -1324,7 +1325,8 @@ public:
       try {
         plan.bucketQueries[i] = parser.parse(*bucket.query);
       } catch (const std::runtime_error& error) {
-        throw std::runtime_error("facet '" + std::string(facetName)
+        auto info = classifyException(error, ErrorKind::INVALID_REQUEST);
+        throw ApiError(info.kind, info.code, "facet '" + std::string(facetName)
             + "': query_facet bucket '" + std::string(bucket.name)
             + "': " + error.what());
       }
@@ -1375,12 +1377,7 @@ public:
   }
 
   void validateQueryFacetQueries(FacetParsePlan& plan) {
-    plan.planning = luxir::arenaCreate<Query::PlanningContext>(
-        req.arena, req.requestPool, *req.reader,
-        Query::PlanningContext::Limits{}, &req.warnings,
-        FilterKeyContext{.schemaGen = req.schema->gen_,
-                         .timeZone = req.proto.time_zone},
-        req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+    plan.planning = createPlanningContext();
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1650,11 +1647,7 @@ public:
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
     }
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -1768,12 +1761,7 @@ public:
     if (topDocsReq.collapse && !topDocsReq.collapse->head_sort.empty()) {
       headSort = parseSorts(topDocsReq.collapse->head_sort);
     }
-    auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
-      req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
-      &req.warnings,
-      FilterKeyContext{.schemaGen = req.schema->gen_,
-                       .timeZone = req.proto.time_zone},
-      req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+    auto* planningContext = createPlanningContext();
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2266,20 +2254,14 @@ public:
       : PluginOpContext(parser.req, name, proto,
                         ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
         parser(parser), depth(depth),
-        context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
-                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings,
-                &parser.fields, &parser.req.engine.getNode()) {
-      context.collapse = parser.enclosingCollapse;
-      context.reader = parser.req.reader.get();
+        context(parser.createParseContext(name)) {
     }
 
     ParseContext& parseContext() override { return context; }
 
     Query::PlanningContext& planning() override {
       if (planningContext == nullptr) {
-        planningContext = luxir::arenaCreate<Query::PlanningContext>(
-            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+        planningContext = parser.createPlanningContext();
       }
       return *planningContext;
     }
@@ -2442,11 +2424,7 @@ public:
       sourceWeights.push_back(weights[i]);
     }
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");

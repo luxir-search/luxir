@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -151,6 +152,7 @@ private:
     std::string_view prefix = term.substr(0, prefixLength);
     std::string_view suffix = term.substr(prefixLength);
 
+    MultiTermBudget& budget = context.multiTermBudget();
     size_t nSegs = context.numSegments();
     for (size_t s = 0; s < nSegs; s++) {
       auto* segFieldInfo = fieldInfo.segInfos.at(s);
@@ -158,6 +160,7 @@ private:
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
       TermsEnum te(scratch, postingsReader, *segFieldInfo);
       FuzzySeekEnum fte(scratch, te, prefix, suffix, maxEdits);
+      fte.setAllowance(budget.scanAllowance());
       while (fte.next()) {
         std::string_view t = fte.termView();
         auto iter = termToIndex.find(t);
@@ -171,6 +174,11 @@ private:
         ExpansionCandidate& candidate = candidates[(size_t)iter->second];
         candidate.termStats.docFreq += te.docFreq();
         candidate.termStats.totalTermFreq += te.totalTermFreq();
+      }
+      // The scan reported its final visits when it finished.
+      if (fte.stoppedAtVisitLimit()) {
+        budget.throwTermsExamined(std::format(
+            "fuzzy query '{}' on field '{}'", term, field));
       }
     }
     return candidates;

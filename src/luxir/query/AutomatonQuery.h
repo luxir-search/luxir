@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "FittedTerms.h"
@@ -47,23 +49,37 @@ public:
   AutomatonQuery(std::string_view field, Kind kind, bool caseInsensitive, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
                  std::string_view exactOrPrefix, DfaScanPlan scanPlan,
-                 std::optional<TermPolicy> fittedPolicy = std::nullopt)
-      : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
+                 std::optional<TermPolicy> fittedPolicy = std::nullopt, int32_t maxExpansions = 0)
+      : MultiTermQuery(QueryKind::AUTOMATON, field, maxExpansions), automatonKind(kind),
         caseInsensitive(caseInsensitive), pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
-        scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
+        scanPlan(scanPlan),
+        fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
     return automatonKind == rhs.automatonKind && caseInsensitive == rhs.caseInsensitive
-        && field == rhs.field && pattern == rhs.pattern;
+        && field == rhs.field && pattern == rhs.pattern
+        && maxExpansions == rhs.maxExpansions;
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), automatonKind);
     value = mixHash(value, caseInsensitive);
     value = mixHash(value, field);
-    return mixHash(value, pattern);
+    value = mixHash(value, pattern);
+    return maxExpansions > 0 ? mixHash(value, maxExpansions) : value;
+  }
+
+  std::string describe() const override {
+    std::string_view label;
+    switch (automatonKind) {
+      case Kind::WILDCARD: label = "wildcard"; break;
+      case Kind::REGEX: label = "regex"; break;
+      case Kind::MATCH: label = "match"; break;
+      case Kind::PREFIX: label = "prefix"; break;
+    }
+    return std::format("{} query '{}' on field '{}'", label, pattern, field);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -74,6 +90,7 @@ public:
     out.appendString(field);
     // A general pattern is not fitted to the term length a one-byte prefix holds.
     out.appendString(pattern);
+    out.appendInt32(maxExpansions);
     unused(ctx);
     return FilterKeyScope::SEGMENT_STABLE;
   }

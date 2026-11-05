@@ -271,6 +271,30 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-expansions",
+                 search.multiterm_max_expansions,
+                 "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
+                 "a merge can change acceptance (0 = off, default)")
+      ->default_val(search.multiterm_max_expansions)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-terms-examined",
+                 search.multiterm_max_terms_examined,
+                 "Dictionary terms all multi-term and fuzzy scans of one request "
+                 "may visit; operator opt-in (0 = off, default)")
+      ->default_val(search.multiterm_max_terms_examined)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-postings",
+                 search.multiterm_max_postings,
+                 "Operator opt-in postings estimate: summed selected docFreq, excluding "
+                 "fuzzy scored rewrites (0 = off, default)")
+      ->default_val(search.multiterm_max_postings)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-min-prefix-length",
+                 search.multiterm_min_prefix_length,
+                 "Pattern-only minimum literal prefix in bytes for unbounded prefix/wildcard/regex; "
+                 "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
+      ->default_val(search.multiterm_min_prefix_length)
+      ->check(CLI::NonNegativeNumber);
 }
 
 void LuxirConfig::resolveRamBudgets() {

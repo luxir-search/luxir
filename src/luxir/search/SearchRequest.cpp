@@ -18,6 +18,11 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
+      multiTermBudget(MultiTermLimits{
+          .maxExpansions = searchConfig.multiterm_max_expansions,
+          .maxTermsExamined = searchConfig.multiterm_max_terms_examined,
+          .maxPostings = searchConfig.multiterm_max_postings,
+      }),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
       startTime(startTime),

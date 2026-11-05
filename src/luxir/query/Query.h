@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "MultiTermBudget.h"
 #include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
@@ -1205,11 +1206,20 @@ public:
   public:
     struct Limits {
       int32_t fuzzyMaxExpansions = 10000;
+      // Request-wide multi-term work allowance, shared by every planning
+      // context of one request. Null gives the context its own unlimited one.
+      MultiTermBudget* multiTermBudget = nullptr;
 
-      constexpr Limits(int32_t fuzzyMaxExpansions = 10000)
-        : fuzzyMaxExpansions(fuzzyMaxExpansions) {}
+      constexpr Limits(int32_t fuzzyMaxExpansions = 10000,
+                       MultiTermBudget* multiTermBudget = nullptr)
+        : fuzzyMaxExpansions(fuzzyMaxExpansions),
+          multiTermBudget(multiTermBudget) {}
     };
 
+  private:
+    std::unique_ptr<MultiTermBudget> ownedMultiTermBudget;
+
+  public:
     RequestMemTracker& memoryTracker;
     MemPool& pool;
     IndexReader& topReader;
@@ -1231,6 +1241,10 @@ public:
         warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
+      if (this->limits.multiTermBudget == nullptr) {
+        ownedMultiTermBudget = std::make_unique<MultiTermBudget>();
+        this->limits.multiTermBudget = ownedMultiTermBudget.get();
+      }
       auto* filterCache = topReader.filterCache();
       if (this->filterUses == nullptr) {
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
@@ -1465,6 +1479,10 @@ public:
     }
 
     PlanningContext& planningContext() const noexcept { return planning; }
+
+    MultiTermBudget& multiTermBudget() const noexcept {
+      return *limits.multiTermBudget;
+    }
 
     google::protobuf::Arena& arena() const noexcept {
       return *allocationArena;

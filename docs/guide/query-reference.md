@@ -292,10 +292,21 @@ matches documents with at least one indexed term for the field.
 | `field` | Indexed term field. Required. |
 | `prefix` | Literal prefix, including any `*`, `?`, or backslashes. Required. |
 | `case_insensitive` | After normalization, also match other simple Unicode case forms. Default `false`. |
+| `max_expansions` | Unset or `0`: every term with the prefix. Any positive `N` (no upper bound): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+
+A short prefix over a large dictionary can expand to hundreds of thousands of
+terms, and an unscored or exactly counted request then reads every one of their
+postings lists. `max_expansions` bounds the selected postings lists, while
+selection still scans every matching term. The terms are chosen per segment,
+so a term just outside the cut can match in one segment and not in another.
+Both capped and complete expansions are subject to any operator-configured limits in
+[Expansion limits](#expansion-limits). Selection memory counts toward the
+request memory ceiling.
 
 With `case_insensitive`, the entire prefix is normalized once, then matched
 through a case-alternating automaton. TEXT, STRING, and ID are supported, and
-queries are constant-scoring. The expression form is
+queries are constant-scoring. `max_expansions` selects by document frequency
+across the accepted case variants. The expression form is
 `prefix(err, field=body_w, case_insensitive=true)`.
 
 ## Wildcard
@@ -387,6 +398,38 @@ numbers in the field's unit (`ms` or `ns`), ISO-8601, partial dates, and date ma
 terms in byte order with constant scores. Text bounds receive the field's
 normalization/folding but are not tokenized; STRING bounds use its normalizer.
 The bare field uses the value binding, including a range with no bounds.
+Term ranges are subject to any operator-configured [Expansion limits](#expansion-limits).
+
+## Expansion limits
+
+Prefix, wildcard, regex, term-range, and fuzzy queries expand against the
+field's term dictionary, so their cost grows with its cardinality. Every
+expansion limit is an operator opt-in, off by default. With limits off, a broad
+pattern on a high-cardinality field simply runs. Operators exposing a public
+endpoint can set these options to bound dictionary work and postings estimates.
+
+When a configured limit is exceeded, the request fails with
+`RESOURCE_EXHAUSTED`, naming the query and limit, never a truncated match set.
+A request cannot raise or disable an operator limit. The outcome depends only
+on the request's total, not timing, though work can run slightly past a limit
+before the request stops. A filter served from cache scans nothing and counts
+nothing.
+
+| Error code | Cause |
+|---|---|
+| `too_many_expansions` | A query expands more terms in one segment than the configured cap. A merge can change whether the query passes. |
+| `too_many_terms_examined` | Dictionary scans, matching or not, exceed the request-wide configured visit limit, including fuzzy scans and refills. |
+| `too_many_expansion_postings` | The summed docFreq of selected terms exceeds the configured request-wide estimate limit. This counts estimated postings, not postings decoded; fuzzy's scored rewrite does not count toward it. |
+| `pattern_prefix_too_short` | An unbounded prefix, wildcard, or regex query has fewer literal leading bytes than the configured minimum. This rule looks only at the normalized pattern, never the index or cache. A type-ahead endpoint using N rejects keystrokes shorter than N. |
+
+A prefix query with `max_expansions` keeps at most that many terms per segment.
+The selected count is subject to any configured `too_many_expansions` cap, and
+its scan counts toward any configured terms-examined budget. `any_of` term
+lists are not capped by term count because the request already lists every
+term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
+prefix rule. Case-insensitive matching does not shorten the measured literal.
+Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
+See [Operations](operations.md) for the server settings.
 
 ## Constant score and boost
 
@@ -754,3 +797,5 @@ in their own guides:
   positive `min_match`.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.
+- Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
+  [Expansion limits](#expansion-limits).

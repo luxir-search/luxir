@@ -125,6 +125,7 @@ class QueryBuilder {
   CoerceContext coerceContext;
   std::string_view opName;
   std::vector<api::Warning>* warnings;
+  int32_t minLiteralPrefix;
 
   // Per-codepoint approximation of field folding for automaton literals.
   // Combining-sequence patterns may not compose exactly like whole terms.
@@ -380,10 +381,10 @@ public:
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
                std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
-               IndexReader* reader = nullptr)
+               IndexReader* reader = nullptr, int32_t minLiteralPrefix = 0)
     : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
-      warnings(warnings) {}
+      warnings(warnings), minLiteralPrefix(minLiteralPrefix) {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
@@ -565,14 +566,21 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
+  // maxExpansions 0 expands every matching term; a positive value keeps the
+  // highest-docFreq terms per segment, including with caseInsensitive.
+  // There is no upper bound; operator expansion and memory limits still apply.
   Query* createPrefixQuery(std::string_view field, std::string_view prefix,
-                            bool caseInsensitive = false) {
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
     return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
-                              caseInsensitive);
+                             maxExpansions, caseInsensitive);
   }
 
   Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
-                            bool caseInsensitive = false) {
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
+    if (maxExpansions < 0) {
+      throw std::runtime_error(std::format(
+          "Prefix query max_expansions must not be negative (got {})", maxExpansions));
+    }
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
@@ -583,11 +591,13 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
+        prefix = normalizeLiteral(target, prefix, false);
+        checkLiteralPrefix("Prefix", field, prefix, prefix.size());
         if (caseInsensitive) {
           return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field,
-                                         normalizeLiteral(target, prefix, false));
+                                         prefix, 1.0f, maxExpansions);
         }
-        return pool.make<PrefixQuery>(field, normalizePrefix(target, prefix));
+        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix), maxExpansions);
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
@@ -604,16 +614,8 @@ public:
   Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern,
                              bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
-    checkAutomatonField("Wildcard", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
-          caseInsensitive, compilePattern("Wildcard", target, pattern, &folder, caseInsensitive,
-                                          automaton::compileWildcard));
-    }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern,
-        caseInsensitive, compilePattern("Wildcard", target, pattern, nullptr, caseInsensitive,
-                                        automaton::compileWildcard));
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern, caseInsensitive,
+        compileQueryPattern("Wildcard", target, pattern, caseInsensitive, automaton::compileWildcard));
   }
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern,
@@ -626,21 +628,14 @@ public:
                           bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, field, pattern, caseInsensitive,
-                              compileRegexPattern(target, pattern, caseInsensitive));
+                              compileQueryPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex));
   }
 
   // A regex compiled as createRegexQuery compiles it, for callers that test
   // terms themselves.
   TermPattern compileRegexPattern(const ResolvedFieldHandle& target, std::string_view pattern,
                                   bool caseInsensitive = false) {
-    checkAutomatonField("Regex", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return compilePattern("Regex", target, pattern, &folder, caseInsensitive,
-                            automaton::compileRegex);
-    }
-    return compilePattern("Regex", target, pattern, nullptr, caseInsensitive,
-                          automaton::compileRegex);
+    return compileFieldPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex);
   }
 
   // A prefix normalized and fitted as createPrefixQuery matches it.
@@ -650,6 +645,40 @@ public:
   }
 
 private:
+  void checkLiteralPrefix(std::string_view kind, std::string_view field,
+                         std::string_view pattern, size_t length) const {
+    if (minLiteralPrefix <= 0 || length >= (size_t) minLiteralPrefix) return;
+    throw ResourceExhaustedError(std::format(
+        "{} query '{}' on field '{}' needs a literal prefix of at least {} bytes; use a longer literal prefix",
+        kind, pattern, field, minLiteralPrefix), "pattern_prefix_too_short");
+  }
+
+  TermPattern compileFieldPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    checkAutomatonField(label, target);
+    auto* chain = fields.chain(target);
+    FieldCodepointFolder folder(chain);
+    const automaton::CodepointFolder* folding = chain ? &folder : nullptr;
+    return compilePattern(label, target, pattern, folding, caseInsensitive, compile);
+  }
+
+  TermPattern compileQueryPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    auto compiled = compileFieldPattern(label, target, pattern, caseInsensitive, compile);
+    if (minLiteralPrefix > 0
+        && compiled.dfa.maxAcceptedLength() == automaton::ByteDfaView::UNBOUNDED) {
+      auto length = caseInsensitive
+          ? compileFieldPattern(label, target, pattern, false, compile).dfa.commonPrefixAndState().first.size()
+          : compiled.dfa.commonPrefixAndState().first.size();
+      checkLiteralPrefix(label, target.physicalName, pattern, length);
+    }
+    return compiled;
+  }
+
   FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;
@@ -707,8 +736,9 @@ private:
   }
 
   Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view field,
-                            std::string_view pattern, bool caseInsensitive, TermPattern compiled) {
-    if (compiled.fittedPrefix) return pool.make<PrefixQuery>(field, poolCopy(*compiled.fittedPrefix));
+                            std::string_view pattern, bool caseInsensitive, TermPattern compiled,
+                            int32_t maxExpansions = 0) {
+    if (compiled.fittedPrefix) return pool.make<PrefixQuery>(field, poolCopy(*compiled.fittedPrefix), maxExpansions);
     if (compiled.kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
     bool normal = compiled.kind == automaton::ByteDfaKind::NORMAL;
     std::string_view patternCopy = poolCopy(pattern);
@@ -719,13 +749,14 @@ private:
     automaton::ByteDfaView frozen = compiled.dfa.freeze(pool);
     return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen,
                                      compiled.kind, exactOrPrefixCopy, scanPlan,
-                                     compiled.fittedPolicy);
+                                     compiled.fittedPolicy, maxExpansions);
   }
 
   // An already-normalized literal, escaped and compiled without a field folder
   // so non-idempotent normalizers run only once. Prefix adds the wildcard last.
   Query* makeCaseInsensitiveTerm(AutomatonQuery::Kind kind, const ResolvedFieldHandle& target,
-                                 std::string_view field, std::string_view term, float boost = 1.0f) {
+                                 std::string_view field, std::string_view term, float boost = 1.0f,
+                                 int32_t maxExpansions = 0) {
     std::string escaped;
     escaped.reserve(term.size());
     for (char c : term) {
@@ -736,7 +767,7 @@ private:
     if (prefix) escaped.push_back('*');
     Query* query = makeAutomatonQuery(kind, field, escaped, true,
         compilePattern(prefix ? "Prefix" : "Match", target, escaped, nullptr, true,
-                       automaton::compileWildcard));
+                       automaton::compileWildcard), maxExpansions);
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
