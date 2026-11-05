@@ -336,6 +336,9 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
   static inline int64_t numericPredicateClassifiedBlocks = 0;
@@ -638,6 +641,8 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
     numericPredicateClassifiedBlocks = 0;

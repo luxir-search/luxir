@@ -734,11 +734,26 @@ private:
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
+    bool allIndexed = true;
     for (const auto& field : fields) {
       if (type == FieldType::Type::NONE) {
         type = field.segFieldInfo.type;
       }
       allFlags |= field.segFieldInfo.flags;
+      if (field.segFieldInfo.numValues != 0
+          && !(field.segFieldInfo.flags & FieldType::INDEX_DOCS)) allIndexed = false;
+    }
+    // Numeric postings are an optional complete acceleration of the column.
+    // A mode change can leave inputs without postings; their values must not
+    // disappear behind a partial dictionary. Keep the merged column instead.
+    // TODO: take the merged index structures from the current schema instead
+    // of the inputs' flags. Today postings drop on mixed inputs (none -> match
+    // never takes effect for merged data) while points are synthesized from
+    // the column (range -> none never takes effect). Building postings from
+    // the column as synthesizePointRun does for points would let index mode
+    // changes converge in both directions.
+    if (FieldType::storage(type) == FieldType::Storage::INT64 && !allIndexed) {
+      allFlags &= ~FieldType::INDEX_DOCS_FREQS_POSITIONS;
     }
   }
 
@@ -1683,12 +1698,11 @@ private:
     }
 
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
-    int32_t allFlags = 0;
-    FieldType::Type type = firstInfo.type;
+    int32_t allFlags;
+    FieldType::Type type;
+    batchTypeAndFlags(mergeFieldInfos, type, allFlags);
+    allFlags &= ~FieldType::SEGMENT_MARKERS;
     auto storage = FieldType::storage(type);
-    for (auto* field : compactFields) {
-      allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
-    }
     bool isText = storage == FieldType::Storage::TEXT;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {

@@ -583,11 +583,10 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
+      if (numericClass && !column) {
+        throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (r.type == FieldClass::VECTOR) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }

@@ -25,6 +25,7 @@
 #include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/SchemaBuilder.h"
 
 namespace luxir::test {
 
@@ -37,15 +38,23 @@ namespace {
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
 constexpr uint64_t kReferenceVersion = 10;
-constexpr uint64_t kReferenceDigest = 0x1e40a1ba8b727fb7;
+constexpr uint64_t kReferenceDigest = 0x8b49a8c1de1c24e0;
 
 // A small index over every default field template's kind, with two segments
 // and a delete. Each segment is one request flushed by a single inverter.
 // Merges are left out: fields merge as parallel tasks, so a merged segment's
 // file layout varies.
 void buildReferenceIndex(CollectionHelper& ch) {
+  SchemaBuilder schema;
+  auto& match = schema.field("numeric_match");
+  match.type = api::FieldDef::FieldClass::INT;
+  match.index = api::FieldDef::IndexMode::MATCH;
+  auto& array = schema.field("numeric_array");
+  array.type = api::FieldDef::FieldClass::INT;
+  array.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(ch.collection());
   ASSERT_TRUE(ch.indexAll({
-      flatdoc("id", "a", "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
+      flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "f_f", 1.5f, "d_d", 2.25,
               "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0},
               "code_sc", "k1", "codes_ssc", vecs("k2", "k3"), "fs_fs", std::vector<double>{0.5, -1.25},
