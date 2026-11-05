@@ -621,6 +621,16 @@ TEST_F(ScreamingTest, randomSets) {
   }
 }
 
+TEST_F(ScreamingTest, advancePastLastBucketLeavesEnd) {
+  SStreamBuilder set;
+  set.add(7);
+  set.finishBuild();
+  screaming::BitSet::Iterator iter(*set.bitset);
+  EXPECT_EQ(7, iter.next());
+  EXPECT_EQ(screaming::BitSet::END, iter.advance(1 << 16));
+  EXPECT_EQ(screaming::BitSet::END, iter.val());
+}
+
 TEST_F(ScreamingTest, select) {
   // Focused select() coverage: a sparse bucket, a dense (bitset) bucket, and a
   // gap, across multiple bucket bases.  verifyIteratorSkips() round-trips both the
