@@ -21,7 +21,8 @@ enum class CheckedDirMode {
 ///
 /// Files that already existed in the directory before this wrapper was created
 /// (e.g. from a previous session) are assumed to have been properly synced.
-class CheckedDirectory : public DelegatingDirectory {
+class CheckedDirectory : public Directory {
+  std::shared_ptr<Directory> delegate;
   CheckedDirMode mode_;
   bool verbose_;
 
@@ -40,7 +41,14 @@ class CheckedDirectory : public DelegatingDirectory {
 
 public:
   CheckedDirectory(std::shared_ptr<Directory> inner, CheckedDirMode mode, bool verbose = false)
-      : DelegatingDirectory(std::move(inner)), mode_(mode), verbose_(verbose) {}
+      : delegate(std::move(inner)), mode_(mode), verbose_(verbose) {}
+
+  void listFiles(std::vector<FileInfo>& target) override { delegate->listFiles(target); }
+  Directory& underlying() override { return delegate->underlying(); }
+  Capabilities capabilities() const override { return delegate->capabilities(); }
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return delegate->openChecksum(name, direct);
+  }
 
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
     if (expectSynced) {
@@ -62,6 +70,9 @@ public:
       if (unsyncedFiles_.contains(file.name)) reportUnsynced("publication", file.name);
     }
   }
+
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate->knownFiles(files); }
+  std::string scratchPath() const override { return delegate->scratchPath(); }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
     // A non-null test listener result injects a file creation failure.
@@ -111,13 +122,28 @@ public:
     if (verbose_) LOG_DEBUG("CheckedDirectory: finishFile({}) size={}", file.name(), file.size());
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    delegate->renameFile(from, to);
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    std::optional<PublicationVersion> applied;
+    try { applied = delegate->publishFile(name, bytes, condition); }
+    catch (...) {
+      std::lock_guard lock(mu_);
+      unsyncedFiles_.insert(std::string(name)); // installation may have preceded the failure
+      throw;
+    }
+    if (applied) {
+      std::lock_guard lock(mu_);
+      unsyncedFiles_.erase(std::string(name));
+    }
+    if (verbose_) LOG_DEBUG("CheckedDirectory: publishFile({}, applied={})", name, applied.has_value());
+    return applied;
+  }
+
+  std::optional<Publication> readPublished(std::string_view name) override { return delegate->readPublished(name); }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    delegate->deleteDurably(names);
     std::lock_guard lock(mu_);
-    bool unsynced = unsyncedFiles_.erase(std::string(from));
-    unsyncedFiles_.erase(std::string(to));
-    if (unsynced) unsyncedFiles_.insert(std::string(to));
-    if (verbose_) LOG_DEBUG("CheckedDirectory: renameFile({} -> {})", from, to);
+    for (const auto& name : names) unsyncedFiles_.erase(name);
   }
 
   void sync(std::span<const std::string> filenames) override {
@@ -152,39 +178,29 @@ class CheckedDirFactory : public DelegatingDirFactory {
   CheckedDirMode mode_;
   bool verbose_;
   std::mutex mu_;
-  // Reopening a directory must not forget which of its files are unsynced, so
-  // wrappers live until their namespace is removed. An empty incarnation key
-  // is the collection's container.
-  std::map<std::pair<CollectionId, std::string>, std::shared_ptr<CheckedDirectory>> opened_;
-
-  std::shared_ptr<Directory> wrap(const CollectionId& id, std::string_view incarnation, std::shared_ptr<Directory> dir) {
-    std::lock_guard lock(mu_);
-    auto& checked = opened_[{id, std::string(incarnation)}];
-    if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
-    return checked;
-  }
-
+  // Reopening must not forget unsynced files until the namespace is removed.
+  std::map<std::pair<StorageRoot, std::string>, std::shared_ptr<CheckedDirectory>> opened_;
 public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> inner, CheckedDirMode mode, bool verbose = false)
       : DelegatingDirFactory(std::move(inner)), mode_(mode), verbose_(verbose) {}
-
   std::string describe() const override { return "checked(" + delegate->describe() + ")"; }
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
-    return wrap(id, {}, delegate->container(id, create));
-  }
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
-    return wrap(id, incarnation, delegate->incarnation(id, incarnation, create));
-  }
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
-    delegate->removeIncarnation(id, incarnation);
+  DirectoryFactory* inner() override { return delegate.get(); }
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    auto key = std::pair(root, checkedPath(root, path));
+    auto dir = delegate->directory(root, path, std::move(options));
     std::lock_guard lock(mu_);
-    opened_.erase({id, std::string(incarnation)});
+    auto& checked = opened_[key];
+    if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
+    return checked;
   }
-  void remove(const CollectionId& id) override {
-    delegate->remove(id);
+  void removeTree(StorageRoot root, std::string_view path) override {
+    delegate->removeTree(root, path);
     std::lock_guard lock(mu_);
-    std::erase_if(opened_, [&](const auto& entry) { return entry.first.first == id; });
+    std::erase_if(opened_, [&](const auto& entry) {
+      return entry.first.first == root && (entry.first.second == path || entry.first.second.starts_with(std::string(path) + '/'));
+    });
   }
+
 };
 
 } // namespace luxir

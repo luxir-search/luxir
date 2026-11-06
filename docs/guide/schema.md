@@ -347,7 +347,9 @@ the single-valued `id` field.
 Bare multi-valued numeric, date, and STRING fields sort by their minimum
 ascending and maximum descending in both modes. Per-document numeric reducers
 such as `min(f)`, `max(f)`, `count(f)`, `sum(f)`, and `avg(f)` consume the stored
-values. Default facets count each document once per bucket in either
+values; `count(f)` also counts STRING, ID and GEO_POINT values, so a set
+counts a repeated value once and an array counts each repeat. Default facets
+count each document once per bucket in either
 mode, even when several values fall in that bucket. Indexed STRING postings
 also contain each document once per term in both modes.
 
@@ -994,7 +996,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 
 | Property | Meaning |
 |---|---|
-| `generation` | Current schema generation; the initial default schema is generation `0`. |
+| `generation` | Current schema generation; the initial persisted schema is generation `1`. |
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |

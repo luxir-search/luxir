@@ -164,6 +164,9 @@ struct SkipStats {
   static inline int64_t conjDenseScoredFilterRejects = 0;
   static inline int64_t conjExactScoredBoundsBypasses = 0;
   static inline int64_t conjExactDirectApproxEngagements = 0;
+  // Verifiers a pull conjunction confirms inside its leading exact group
+  // (BooleanWeight sourceGroupVerifier), one per verifier per build.
+  static inline int64_t conjSourceGroupedVerifiers = 0;
   static inline int64_t conjDirectDenseEngagements = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
@@ -506,6 +509,7 @@ struct SkipStats {
     conjDenseScoredFilterRejects = 0;
     conjExactScoredBoundsBypasses = 0;
     conjExactDirectApproxEngagements = 0;
+    conjSourceGroupedVerifiers = 0;
     conjDirectDenseEngagements = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;

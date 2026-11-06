@@ -4,7 +4,7 @@
 #pragma once
 
 #include <algorithm>
-#include "DelegatingDirectory.h"
+#include "DirectoryFactory.h"
 
 namespace luxir {
 
@@ -13,15 +13,16 @@ namespace luxir {
 /// This is the enforcement point for --read-only: the node opens a data
 /// directory it does not own (no write.lock), so nothing may write to it.
 /// Making that a wrapper rather than a flag inside each backend means the
-/// guarantee holds for any Directory implementation, and a mutator added to
-/// the interface later cannot silently escape it: DelegatingDirectory forwards
-/// by default, so a new mutating virtual must get an override here (reviewed
-/// together with every Directory addition; DelegatingDirectoryTest lists them).
+/// guarantee holds for any Directory implementation. Core wrappers that refuse
+/// or track mutations implement the bare interface; layers derive from the
+/// delegating bases. A new pure virtual requires an explicit implementation here;
+/// a default implementation calls this wrapper's own virtuals.
 ///
 /// Requests are refused at the transport before reaching here; these throws are
 /// the backstop for paths that hold a Directory directly (schema persistence,
 /// merges, commit) rather than the expected way for a user to see an error.
-class ReadOnlyDirectory : public DelegatingDirectory {
+class ReadOnlyDirectory : public Directory {
+  std::shared_ptr<Directory> delegate;
   std::string name_;
 
   [[noreturn]] void reject(std::string_view operation) const {
@@ -31,7 +32,20 @@ class ReadOnlyDirectory : public DelegatingDirectory {
 
 public:
   ReadOnlyDirectory(std::shared_ptr<Directory> inner, std::string name)
-      : DelegatingDirectory(std::move(inner)), name_(std::move(name)) {}
+      : delegate(std::move(inner)), name_(std::move(name)) {}
+
+  void listFiles(std::vector<FileInfo>& target) override { delegate->listFiles(target); }
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+    return delegate->openFile(name, expectSynced);
+  }
+  void expectSynced(std::span<const FileDescriptor> files) override { delegate->expectSynced(files); }
+  // A read-side hint (sizes of committed files), not a mutation.
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate->knownFiles(files); }
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return delegate->openChecksum(name, direct);
+  }
+  Directory& underlying() override { return delegate->underlying(); }
+  Capabilities capabilities() const override { return delegate->capabilities(); }
 
   // No writes reach the backend's disk, scratch included.
   std::string scratchPath() const override { return {}; }
@@ -56,9 +70,13 @@ public:
     reject(std::string("finishFile(") + std::string(file.name()) + ")");
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    reject(std::string("renameFile(") + std::string(from) + " -> " + std::string(to) + ")");
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte>, PublishCondition) override {
+    reject(std::string("publishFile(") + std::string(name) + ")");
   }
+
+  std::optional<Publication> readPublished(std::string_view name) override { return delegate->readPublished(name); }
+
+  void deleteDurably(std::span<const std::string>) override { reject("deleteDurably"); }
 
   void sync(std::span<const std::string> filenames) override {
     unused(filenames);
@@ -77,38 +95,22 @@ public:
 ///
 /// Pair it with a backend factory opened read-only (see FSDirFactory), which
 /// suppresses the open-time side effects a wrapper cannot reach: taking
-/// write.lock, creating the data directory, resetting trash/.
-class ReadOnlyDirFactory : public DelegatingDirFactory {
-  [[noreturn]] static void refuse(std::string_view what, const CollectionId& id) {
-    throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + id.label() + "'");
-  }
+/// write.lock, creating the data directory, and cleaning publication temps.
+class ReadOnlyDirFactory : public DirectoryFactory {
+  std::unique_ptr<DirectoryFactory> delegate;
 
 public:
-  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> inner)
-      : DelegatingDirFactory(std::move(inner)) {}
-
+  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> inner) : delegate(std::move(inner)) {}
   std::string describe() const override { return "read_only(" + delegate->describe() + ")"; }
-  std::shared_ptr<Directory> nodeDirectory() override {
-    return std::make_shared<ReadOnlyDirectory>(delegate->nodeDirectory(), "node");
+  std::string diskPath() const override { return delegate->diskPath(); }
+  DirectoryFactory* inner() override { return delegate.get(); }
+  std::shared_ptr<StorageMemory> memory() override { return delegate->memory(); }
+  std::vector<Child> children(StorageRoot root, std::string_view path) override { return delegate->children(root, path); }
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    return std::make_shared<ReadOnlyDirectory>(delegate->directory(root, path, std::move(options)), std::string(path));
   }
+  void removeTree(StorageRoot, std::string_view) override { throw ReadOnlyError("read-only data directory: cannot remove a subtree"); }
 
-  // Every namespace mutation is refused before it reaches the backend, and
-  // opening never creates.
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
-    if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate->container(id, false), id.label());
-  }
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
-    if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate->incarnation(id, incarnation, false),
-                                               id.label() + "/" + std::string(incarnation));
-  }
-  void createCollection(const CollectionId& id) override { refuse("create collection", id); }
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
-    unused(incarnation);
-    refuse("remove an incarnation of", id);
-  }
-  void remove(const CollectionId& id) override { refuse("remove collection", id); }
 };
 
 } // namespace luxir

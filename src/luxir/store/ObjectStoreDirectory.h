@@ -35,9 +35,9 @@ class Hotcache;
 /// and finishFile closes it and uploads it with one put. The staged copy stays
 /// readable until the file is deleted or the directory is destroyed, so a
 /// segment that was just flushed is not fetched back. An acknowledged put is
-/// durable, so sync() has nothing left to do. renameFile is a server-side copy
-/// plus a remove: the target object is replaced atomically, which is all that
-/// CURRENT switching needs. linkFile is a server-side copy.
+/// durable, so sync() has nothing left to do. publishFile is a conditional put
+/// (If-None-Match / If-Match on the object's version) and readPublished a get
+/// that returns the version with the bytes. linkFile is a server-side copy.
 class ObjectStoreDirectory : public Directory {
 public:
   struct Options {
@@ -48,6 +48,7 @@ public:
     // Smaller streams are folded into the segment's first file, so a smaller
     // value means more, finer objects for a lazy reader to choose between.
     uint64_t spillBytes = 0;
+    std::shared_ptr<StorageMemory> account;  // charged for RAM staging; null uses a private one
   };
 
 private:
@@ -90,7 +91,7 @@ private:
   std::filesystem::path stagedPath;   // only when staging on a filesystem
   std::map<std::string, std::shared_ptr<HotSlot>, std::less<>> hot;  // by segment string
   // Sizes of committed files (knownFiles), so that opening one needs no size
-  // request. A name leaves when this directory deletes, writes, renames or
+  // request. A name leaves when this directory deletes, writes, publishes or
   // links over it.
   std::map<std::string, uint64_t, std::less<>> known;
 
@@ -125,22 +126,28 @@ public:
   std::unique_ptr<File> createFile(std::string_view name) override;
   std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions options) override;
   bool deleteFile(std::string_view name) override;
+  void deleteDurably(std::span<const std::string> names) override;
   void finishFile(File& file) override;
-  void renameFile(std::string_view from, std::string_view to) override;
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes,
+                                                PublishCondition condition) override;
+  std::optional<Publication> readPublished(std::string_view name) override;
   void sync(std::span<const std::string> filenames) override { unused(filenames); }
   void clear() override;
   void linkFile(Directory& source, std::string_view name) override;
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override;
 };
 
-/// The storage backend over an ObjectStore: collections laid out as
-/// t/<tenant>/<collection>/<incarnation>/<file> keys (the layout of the fs
-/// backend), CURRENT beside the incarnations, node-level files under node/.
+/// The storage backend over an ObjectStore. A view (root, path) is the key
+/// prefix "<path>/" for the authoritative root and "node/<path>/" for the
+/// node-private one, so the keys follow the fs backend's layout. A view's
+/// "directory" exists while some object has its prefix; opening one creates
+/// nothing. Live views are shared, so that a delete through one waits for the
+/// readers of another.
 ///
 /// This is the entry point for a plugin that provides a remote store: register
 /// a backend whose maker returns
 /// `std::make_unique<ObjectStoreDirFactory>(std::make_shared<MyStore>(...), ctx)`.
-/// It reads these options from `ctx.options` (the --store.option flags):
+/// It reads these options from `ctx.params` (--store.option <backend>.KEY=VALUE):
 ///   chunk_bytes  fetch granularity of lazy reads (default 1M)
 ///   staging_dir  local directory for staged writes (default: stage in RAM)
 ///   spill_bytes  with staging_dir, stream size at which a file becomes its own
@@ -148,35 +155,26 @@ public:
 class ObjectStoreDirFactory : public DirectoryFactory {
   std::shared_ptr<ObjectStore> store_;
   ObjectStoreDirectory::Options options_;
+  std::mutex mutex;
+  std::map<std::string, std::weak_ptr<ObjectStoreDirectory>, std::less<>> views;
 
-  std::string collectionPrefix(const CollectionId& id) const { return "t/" + id.tenant + "/" + id.name + "/"; }
-  std::shared_ptr<Directory> directory(std::string prefix) const;
-  void ensureMarker(const std::string& key);
-  bool exists(const std::string& prefix, const std::string& marker);
-  void removeAll(const std::string& prefix);
+  static std::string prefixOf(StorageRoot root, std::string_view path);
 
 public:
   ObjectStoreDirFactory(std::shared_ptr<ObjectStore> store, const StorageContext& ctx);
+  explicit ObjectStoreDirFactory(std::shared_ptr<ObjectStore> store, ObjectStoreDirectory::Options options = {});
 
   ObjectStore& store() { return *store_; }
 
-  std::vector<CollectionId> collections() override;
-  uint64_t storageBytes() override;
-  uint64_t collectionBytes(const CollectionId& id) override;
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override;
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override;
-  void createCollection(const CollectionId& id) override;
-  std::vector<std::string> incarnations(const CollectionId& id) override;
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override;
-  void remove(const CollectionId& id) override;
-  std::shared_ptr<Directory> nodeDirectory() override;
-  bool holdsNoCollections() override;
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override;
+  std::vector<Child> children(StorageRoot root, std::string_view path) override;
+  void removeTree(StorageRoot root, std::string_view path) override;
   std::string describe() const override;
   std::string diskPath() const override { return options_.stagingDir; }
 };
 
 /// Registers the built-in backend ram_object: an ObjectStoreDirFactory over a
-/// RamObjectStore. Options: chunk_bytes, staging_dir (see ObjectStoreDirFactory)
+/// RamObjectStore. Options: chunk_bytes, staging_dir, spill_bytes (see ObjectStoreDirFactory)
 /// and store_name, which selects the process-wide RamObjectStore (default
 /// "default"), so that a node restarted in the same process finds its data and
 /// tests can inspect the store with RamObjectStore::named().

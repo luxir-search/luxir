@@ -69,19 +69,31 @@ TEST(DelegatingDirectoryTest, everyVirtualForwards) {
 
   std::array<std::string, 1> names{"a.bin"};
   dir.sync(names);
-  dir.renameFile("a.bin", "renamed.bin");
-  EXPECT_EQ(nullptr, ram->openFile("a.bin"));
-  EXPECT_NE(nullptr, ram->openFile("renamed.bin"));
+  auto bytes = std::as_bytes(std::span("published", 9));
+  auto version = dir.publishFile("a.bin", bytes, Directory::PublishMode::REPLACE);
+  ASSERT_TRUE(version);
+  auto published = dir.readPublished("a.bin");
+  ASSERT_TRUE(published);
+  EXPECT_EQ("published", published->bytes);
+  EXPECT_EQ(*version, published->version);
+  EXPECT_EQ(*version, ram->readPublished("a.bin")->version);
+  EXPECT_FALSE(dir.readPublished("missing"));
+  EXPECT_FALSE(dir.publishFile("a.bin", {}, Directory::PublishMode::CREATE_ONLY));
+  EXPECT_TRUE(dir.publishFile("a.bin", bytes, Directory::PublishCondition::match(*version)));
+  EXPECT_FALSE(dir.publishFile("a.bin", {}, Directory::PublishCondition::match(*version)));
 
   DelegatingDirectory other(std::make_shared<RAMDir>());
-  other.linkFile(dir, "renamed.bin");
-  EXPECT_EQ(ram->openFile("renamed.bin"), other.openFile("renamed.bin"));  // a link shares the buffer
+  other.linkFile(dir, "a.bin");
+  EXPECT_EQ(ram->openFile("a.bin"), other.openFile("a.bin"));  // a link shares the buffer
 
-  EXPECT_TRUE(dir.deleteFile("renamed.bin"));
-  EXPECT_FALSE(dir.deleteFile("renamed.bin"));
+  EXPECT_TRUE(dir.deleteFile("a.bin"));
+  EXPECT_FALSE(dir.deleteFile("a.bin"));
   dir.deletePrefix("ab");
   EXPECT_EQ(nullptr, ram->openFile("ab.bin"));
   EXPECT_NE(nullptr, ram->openFile("direct.bin"));
+  std::array<std::string, 2> removed{"sized.bin", "missing"};
+  dir.deleteDurably(removed);
+  EXPECT_FALSE(ram->openFile("sized.bin"));
   dir.clear();
   listing.clear();
   ram->listFiles(listing);
@@ -89,26 +101,34 @@ TEST(DelegatingDirectoryTest, everyVirtualForwards) {
 }
 
 TEST(DelegatingDirectoryTest, factoryForwardsEverything) {
-  DelegatingDirFactory factory(std::make_unique<RAMDirFactory>());
-  auto id = CollectionId::of("c1");
-  EXPECT_TRUE(factory.collections().empty());
-  EXPECT_TRUE(factory.holdsNoCollections());
-  factory.createCollection(id);
-  EXPECT_EQ(std::vector<CollectionId>{id}, factory.collections());
-  EXPECT_FALSE(factory.holdsNoCollections());
-  auto incarnation = factory.incarnation(id, "i1", true);
-  put(*incarnation, "f", "bytes");
-  EXPECT_EQ(incarnation, factory.incarnation(id, "i1", false));
-  EXPECT_NE(nullptr, factory.container(id, false));
-  EXPECT_EQ((std::vector<std::string>{"i1"}), factory.incarnations(id));
-  EXPECT_GT(factory.storageBytes(), 0u);
-  EXPECT_GT(factory.collectionBytes(id), 0u);
-  EXPECT_EQ(factory.nodeDirectory(), factory.nodeDirectory());
+  DelegatingDirFactory factory(std::make_unique<RAMDirFactory>(64 * 1024));
+  EXPECT_EQ(factory.inner(), factory.find<RAMDirFactory>());
+  EXPECT_EQ(nullptr, factory.inner()->inner());
+  EXPECT_EQ(&factory, factory.find<DelegatingDirFactory>());
+  EXPECT_EQ(nullptr, factory.find<FSDirFactory>());
+  auto memory = factory.memory();
+  ASSERT_TRUE(memory);
+  EXPECT_EQ(64u * 1024, memory->limitBytes());
+  auto account = memory->child("test");
+  auto root = StorageRoot::AUTHORITATIVE;
+  std::string path = "t/t0/i/00000000001";
+  EXPECT_TRUE(factory.children(root, "").empty());
+  auto dir = factory.directory(root, path, {account});
+  EXPECT_TRUE(factory.children(root, "").empty()); // opening a view creates nothing
+  put(*dir, "f", "bytes");
+  EXPECT_EQ(dir, factory.directory(root, path));
+  auto children = factory.children(root, "t/t0/i");
+  ASSERT_EQ(1u, children.size());
+  EXPECT_EQ("00000000001", children[0].name);
+  EXPECT_TRUE(children[0].directory);
+  EXPECT_GT(account->bytes(), 0u);
+  EXPECT_EQ(account->bytes(), factory.storageBytes());
+  EXPECT_EQ(factory.directory(StorageRoot::NODE_PRIVATE, ""), factory.directory(StorageRoot::NODE_PRIVATE, ""));
   EXPECT_EQ("ram", factory.describe());
-  factory.removeIncarnation(id, "i1");
-  EXPECT_TRUE(factory.incarnations(id).empty());
-  factory.remove(id);
-  EXPECT_TRUE(factory.collections().empty());
+  EXPECT_TRUE(factory.diskPath().empty());
+  factory.removeTree(root, path);
+  EXPECT_TRUE(factory.children(root, "").empty());
+  EXPECT_EQ(0u, memory->bytes());
 }
 
 TEST(DelegatingDirectoryTest, readOnlyRejectsEveryMutatorIncludingSizedCreate) {
@@ -121,11 +141,16 @@ TEST(DelegatingDirectoryTest, readOnlyRejectsEveryMutatorIncludingSizedCreate) {
   EXPECT_THROW(dir.createFile("g", {}), ReadOnlyError);
   EXPECT_THROW(dir.deleteFile("f"), ReadOnlyError);
   EXPECT_THROW(dir.deletePrefix("f"), ReadOnlyError);
-  EXPECT_THROW(dir.renameFile("f", "g"), ReadOnlyError);
+  EXPECT_TRUE(dir.readPublished("f"));
+  EXPECT_THROW(dir.publishFile("f", {}, Directory::PublishMode::REPLACE), ReadOnlyError);
+  EXPECT_THROW(dir.publishFile("g", {}, Directory::PublishMode::CREATE_ONLY), ReadOnlyError);
+  EXPECT_THROW(dir.publishFile("f", {}, Directory::PublishCondition::match(dir.readPublished("f")->version)), ReadOnlyError);
+  EXPECT_THROW(dir.copyFile(*ram, "f"), ReadOnlyError);
   EXPECT_THROW(dir.clear(), ReadOnlyError);
   EXPECT_THROW(dir.linkFile(*ram, "f"), ReadOnlyError);
   std::array<std::string, 1> names{"f"};
   EXPECT_THROW(dir.sync(names), ReadOnlyError);
+  EXPECT_THROW(dir.deleteDurably(names), ReadOnlyError);
   auto file = ram->createFile("h");
   EXPECT_THROW(dir.finishFile(*file), ReadOnlyError);
   EXPECT_NE(nullptr, ram->openFile("f"));

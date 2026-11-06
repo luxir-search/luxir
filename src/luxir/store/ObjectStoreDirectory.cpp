@@ -17,16 +17,6 @@ namespace luxir {
 
 namespace {
 
-// Marker objects make an empty "directory" exist. They are hidden from listings.
-constexpr std::string_view kCollectionMarker = ".collection";
-constexpr std::string_view kIncarnationMarker = ".dir";
-
-bool isHidden(std::string_view name) { return name.starts_with('.'); }
-
-bool alreadyExists(const std::exception& e) {
-  return std::string_view(e.what()).find("already exists") != std::string_view::npos;
-}
-
 // One sequential checksum pass over an object: ranged reads of a bounded
 // buffer, never the mapping, so verification streams without materializing.
 // The handle counts as a reader of the object until it is destroyed, so a
@@ -120,10 +110,11 @@ Directory& ObjectStoreDirectory::staging() {
   std::lock_guard lock(mutex);
   if (!staged) {
     if (options.stagingDir.empty()) {
-      staged = std::make_shared<RAMDir>();
+      staged = options.account ? std::make_shared<RAMDir>(options.account) : std::make_shared<RAMDir>();
     } else {
       stagedPath = std::filesystem::path(options.stagingDir) / newUuid();
-      staged = std::make_shared<FSDirectory>(stagedPath, true);
+      std::filesystem::create_directories(stagedPath);
+      staged = std::make_shared<FSDirectory>(stagedPath);
     }
   }
   return *staged;
@@ -170,7 +161,7 @@ void ObjectStoreDirectory::listFiles(std::vector<FileInfo>& target) {
   std::lock_guard lock(readers->mutex);
   for (const auto& object : objects) {
     std::string_view name = std::string_view(object.name).substr(prefix.size());
-    if (name.empty() || isHidden(name) || name.find('/') != std::string_view::npos) continue;
+    if (name.empty() || name.find('/') != std::string_view::npos) continue;
     if (readers->doomed.contains(name)) continue;
     target.push_back({std::string(name), object.size});
   }
@@ -253,7 +244,7 @@ std::shared_ptr<InputFile> ObjectStoreDirectory::openCounted(std::string_view na
   }
   auto data = Hotcache::parseDataFile(name);
   if (!data) {
-    // Not segment data (CURRENT, a commit manifest, live docs, an overlay): it
+    // Not segment data (STATE, a commit manifest, live docs, an overlay): it
     // is read whole and may be replaced in place, so never leave it half
     // fetched.
     file->read();
@@ -305,20 +296,35 @@ void ObjectStoreDirectory::finishFile(File& file) {
   store->put(key(file.name()), input->read());
 }
 
-void ObjectStoreDirectory::renameFile(std::string_view from, std::string_view to) {
-  forget(from);
-  forget(to);
-  store->copy(key(from), key(to));
-  store->remove(key(from));
+void ObjectStoreDirectory::deleteDurably(std::span<const std::string> names) {
+  // An acknowledged remove is durable.
+  for (const auto& name : names) deleteFile(name);
+}
+
+std::optional<Directory::PublicationVersion> ObjectStoreDirectory::publishFile(
+    std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) {
+  forget(name);  // the name is about to hold another object
+  ObjectStore::PutCondition put;
+  put.ifAbsent = condition.mode == PublishMode::CREATE_ONLY;
+  put.ifMatch = std::move(condition.version);
+  auto version = store->put(key(name), std::string_view((const char*)bytes.data(), bytes.size()), put);
+  if (!version) return std::nullopt;
+  {
+    std::lock_guard lock(readers->mutex);
+    readers->doomed.erase(name);  // the name is reused: the new object wins
+  }
   std::shared_ptr<Directory> dir;
   {
     std::lock_guard lock(mutex);
     dir = staged;
   }
-  if (dir) {
-    dir->deleteFile(to);
-    if (dir->openFile(from)) dir->renameFile(from, to);
-  }
+  if (dir) dir->deleteFile(name);  // a staged copy would shadow the published bytes
+  return version;
+}
+
+std::optional<Directory::Publication> ObjectStoreDirectory::readPublished(std::string_view name) {
+  if (auto object = store->get(key(name))) return Publication{std::move(object->bytes), std::move(object->version)};
+  return std::nullopt;
 }
 
 void ObjectStoreDirectory::clear() {
@@ -390,105 +396,81 @@ std::shared_ptr<ChecksumReader> ObjectStoreDirectory::openChecksum(std::string_v
 }
 
 
-ObjectStoreDirFactory::ObjectStoreDirFactory(std::shared_ptr<ObjectStore> store, const StorageContext& ctx)
-    : store_(std::move(store)) {
+ObjectStoreDirFactory::ObjectStoreDirFactory(std::shared_ptr<ObjectStore> store, ObjectStoreDirectory::Options options)
+    : store_(std::move(store)), options_(std::move(options)) {
   if (!store_) throw std::invalid_argument("object store backend needs an ObjectStore");
-  options_.chunkBytes = ctx.optionBytes("chunk_bytes", options_.chunkBytes);
-  if (options_.chunkBytes == 0) throw std::invalid_argument("store option 'chunk_bytes' must be positive");
-  options_.stagingDir = ctx.optionOr("staging_dir", "");
-  options_.spillBytes = ctx.optionBytes("spill_bytes", 0);
+  if (options_.chunkBytes == 0) throw std::invalid_argument("object store chunk size must be positive");
 }
 
-std::shared_ptr<Directory> ObjectStoreDirFactory::directory(std::string prefix) const {
-  return std::make_shared<ObjectStoreDirectory>(store_, std::move(prefix), options_);
+namespace {
+ObjectStoreDirectory::Options optionsOf(const StorageContext& ctx) {
+  ObjectStoreDirectory::Options options;
+  options.chunkBytes = ctx.params.getBytes("chunk_bytes", options.chunkBytes);
+  if (options.chunkBytes == 0) ctx.params.fail("chunk_bytes", "must be positive");
+  options.stagingDir = std::string(ctx.params.getString("staging_dir"));
+  options.spillBytes = ctx.params.getBytes("spill_bytes", 0);
+  return options;
+}
+}  // namespace
+
+ObjectStoreDirFactory::ObjectStoreDirFactory(std::shared_ptr<ObjectStore> store, const StorageContext& ctx)
+    : ObjectStoreDirFactory(std::move(store), optionsOf(ctx)) {}
+
+std::string ObjectStoreDirFactory::prefixOf(StorageRoot root, std::string_view path) {
+  std::string key = checkedPath(root, path);
+  std::string prefix = root == StorageRoot::NODE_PRIVATE ? "node/" : "";
+  return key.empty() ? prefix : prefix + key + "/";
 }
 
-void ObjectStoreDirFactory::ensureMarker(const std::string& key) {
-  if (store_->size(key)) return;
-  store_->put(key, {});
+std::shared_ptr<Directory> ObjectStoreDirFactory::directory(StorageRoot root, std::string_view path,
+                                                            ViewOptions viewOptions) {
+  std::string prefix = prefixOf(root, path);
+  std::lock_guard lock(mutex);
+  std::erase_if(views, [](const auto& view) { return view.second.expired(); });
+  if (auto it = views.find(prefix); it != views.end()) {
+    if (auto live = it->second.lock()) return live;
+  }
+  auto options = options_;
+  options.account = std::move(viewOptions.account);
+  auto dir = std::make_shared<ObjectStoreDirectory>(store_, prefix, std::move(options));
+  views.insert_or_assign(prefix, dir);
+  return dir;
 }
 
-bool ObjectStoreDirFactory::exists(const std::string& prefix, const std::string& marker) {
-  return store_->size(prefix + marker) || !store_->list(prefix).empty();
+std::vector<DirectoryFactory::Child> ObjectStoreDirFactory::children(StorageRoot root, std::string_view path) {
+  std::string prefix = prefixOf(root, path);
+  std::map<std::string, bool, std::less<>> found;
+  for (const auto& object : store_->list(prefix)) {
+    std::string_view rest = std::string_view(object.name).substr(prefix.size());
+    auto slash = rest.find('/');
+    if (slash == std::string_view::npos) {
+      if (!rest.empty()) found.emplace(std::string(rest), false);
+      continue;
+    }
+    // The authoritative root does not show the node-private one.
+    std::string_view name = rest.substr(0, slash);
+    if (name.empty() || (root == StorageRoot::AUTHORITATIVE && prefix.empty() && name == "node")) continue;
+    found[std::string(name)] = true;
+  }
+  std::vector<Child> result;
+  for (auto& [name, isDirectory] : found) result.push_back({name, isDirectory});
+  return result;
 }
 
-void ObjectStoreDirFactory::removeAll(const std::string& prefix) {
+void ObjectStoreDirFactory::removeTree(StorageRoot root, std::string_view path) {
+  if (checkedPath(root, path).empty()) throw std::invalid_argument("cannot remove a storage root");
+  std::string prefix = prefixOf(root, path);
+  std::vector<std::shared_ptr<ObjectStoreDirectory>> live;
+  {
+    std::lock_guard lock(mutex);
+    for (auto& [viewPrefix, view] : views) {
+      if (!viewPrefix.starts_with(prefix)) continue;
+      if (auto dir = view.lock()) live.push_back(std::move(dir));
+    }
+  }
+  // Views still held forget what they cached and staged.
+  for (const auto& dir : live) dir->clear();
   for (const auto& object : store_->list(prefix)) store_->remove(object.name);
-}
-
-std::vector<CollectionId> ObjectStoreDirFactory::collections() {
-  std::vector<CollectionId> ids;
-  for (const auto& tenant : store_->listDirectories("t/")) {
-    for (auto& name : store_->listDirectories("t/" + tenant + "/")) ids.emplace_back(tenant, std::move(name));
-  }
-  return ids;
-}
-
-uint64_t ObjectStoreDirFactory::storageBytes() {
-  uint64_t total = 0;
-  for (const auto& object : store_->list("t/")) total += object.size;
-  return total;
-}
-
-uint64_t ObjectStoreDirFactory::collectionBytes(const CollectionId& id) {
-  uint64_t total = 0;
-  for (const auto& object : store_->list(collectionPrefix(id))) total += object.size;
-  return total;
-}
-
-std::shared_ptr<Directory> ObjectStoreDirFactory::container(const CollectionId& id, bool create) {
-  std::string prefix = collectionPrefix(id);
-  if (create) ensureMarker(prefix + std::string(kCollectionMarker));
-  else if (!exists(prefix, std::string(kCollectionMarker))) {
-    throw std::runtime_error("collection directory does not exist: " + id.label());
-  }
-  return directory(std::move(prefix));
-}
-
-std::shared_ptr<Directory> ObjectStoreDirFactory::incarnation(const CollectionId& id, std::string_view incarnation,
-                                                              bool create) {
-  std::string prefix = collectionPrefix(id) + std::string(incarnation) + "/";
-  if (create) {
-    ensureMarker(collectionPrefix(id) + std::string(kCollectionMarker));
-    ensureMarker(prefix + std::string(kIncarnationMarker));
-  } else if (!exists(prefix, std::string(kIncarnationMarker))) {
-    throw std::runtime_error("incarnation directory does not exist: " + id.label() + "/" + std::string(incarnation));
-  }
-  return directory(std::move(prefix));
-}
-
-void ObjectStoreDirFactory::createCollection(const CollectionId& id) {
-  std::string prefix = collectionPrefix(id);
-  try {
-    store_->put(prefix + std::string(kCollectionMarker), {}, true);
-  } catch (const std::exception& e) {
-    if (alreadyExists(e)) throw std::runtime_error("collection directory already exists");
-    throw;
-  }
-}
-
-std::vector<std::string> ObjectStoreDirFactory::incarnations(const CollectionId& id) {
-  return store_->listDirectories(collectionPrefix(id));
-}
-
-void ObjectStoreDirFactory::removeIncarnation(const CollectionId& id, std::string_view incarnation) {
-  removeAll(collectionPrefix(id) + std::string(incarnation) + "/");
-}
-
-void ObjectStoreDirFactory::remove(const CollectionId& id) {
-  std::string prefix = collectionPrefix(id);
-  store_->remove(prefix + "CURRENT");  // first, as the fs backend does: nothing selects half-removed data
-  removeAll(prefix);
-}
-
-std::shared_ptr<Directory> ObjectStoreDirFactory::nodeDirectory() { return directory("node/"); }
-
-bool ObjectStoreDirFactory::holdsNoCollections() {
-  if (!collections().empty()) return false;
-  for (const auto& object : store_->list("node/")) {
-    if (object.name != "node/replication.json.pending") return false;
-  }
-  return true;
 }
 
 std::string ObjectStoreDirFactory::describe() const { return "object:" + store_->describe(); }
@@ -496,7 +478,7 @@ std::string ObjectStoreDirFactory::describe() const { return "object:" + store_-
 
 void registerRamObjectBackend(StorageRegistry& registry) {
   registry.addBackend("ram_object", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
-    return std::make_unique<ObjectStoreDirFactory>(RamObjectStore::named(ctx.optionOr("store_name", "default")), ctx);
+    return std::make_unique<ObjectStoreDirFactory>(RamObjectStore::named(ctx.params.getString("store_name", "default")), ctx);
   });
 }
 

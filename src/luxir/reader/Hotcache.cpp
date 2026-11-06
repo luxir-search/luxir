@@ -45,11 +45,14 @@ std::string Hotcache::fileName(std::string_view segStr) {
   return std::string(Postings::PREFIX_FNAME).append(segStr).append("__hot");
 }
 
-std::string Hotcache::fileName(uint64_t segId) { return fileName(Postings::getSortableString(segId)); }
+std::string Hotcache::fileName(uint64_t segId, uint64_t creatorEpoch) {
+  return fileName(Postings::segmentKey(segId, creatorEpoch));
+}
 
 std::optional<Hotcache::DataFile> Hotcache::parseDataFile(std::string_view name) {
-  // s<segStr>_<filenum>, where both parts are sortable strings: one underscore
-  // only (liveDocs "__L" and overlays "__" and the hotcache "__hot" have two).
+  // s<segStr>_<filenum>, where segStr is "<segId>.<epoch>" (Postings::segmentKey)
+  // and filenum is a sortable string: one underscore only (liveDocs "__L" and
+  // overlays "__" and the hotcache "__hot" have two).
   if (!name.starts_with(Postings::PREFIX_FNAME)) return std::nullopt;
   auto underscore = name.find('_');
   if (underscore == std::string_view::npos || underscore < 3) return std::nullopt;
@@ -57,7 +60,13 @@ std::optional<Hotcache::DataFile> Hotcache::parseDataFile(std::string_view name)
   std::string_view fileStr = name.substr(underscore + 1);
   if (fileStr.size() < 2 || fileStr.find('_') != std::string_view::npos) return std::nullopt;
   auto isDigit36 = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z'); };
-  if (!std::ranges::all_of(segStr, isDigit36) || !std::ranges::all_of(fileStr, isDigit36)) return std::nullopt;
+  auto dot = segStr.find('.');
+  if (dot == std::string_view::npos || dot < 2 || dot + 1 == segStr.size()) return std::nullopt;
+  std::string_view idStr = segStr.substr(0, dot), epochStr = segStr.substr(dot + 1);
+  if (!std::ranges::all_of(idStr, isDigit36) || !std::ranges::all_of(epochStr, isDigit36)
+      || !std::ranges::all_of(fileStr, isDigit36)) return std::nullopt;
+  if (Postings::getSortableString(Postings::parseSortableString(idStr)) != idStr
+      || !Postings::parseEpoch(epochStr)) return std::nullopt;
   uint64_t fileNum = Postings::parseSortableString(fileStr);
   if (fileNum > UINT32_MAX || Postings::getSortableString(fileNum) != fileStr) return std::nullopt;
   return DataFile{segStr, (uint32_t)fileNum};
@@ -164,14 +173,14 @@ void RecordingDirectory::add(const std::string& name, ByteRange range) {
 }
 
 
-Hotcache Hotcache::record(Directory& dir, uint64_t segId) {
+Hotcache Hotcache::record(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
   RecordingDirectory recording(dir);
   {
     // Whatever the open touches is the hotcache; the reader goes away here.
-    auto reader = PostingsReader::create(recording, segId);
+    auto reader = PostingsReader::create(recording, segId, creatorEpoch);
     (void)reader;
   }
-  std::string segStr = Postings::getSortableString(segId);
+  std::string segStr = Postings::segmentKey(segId, creatorEpoch);
   Hotcache cache;
   for (auto& [name, ranges] : recording.recorded()) {
     auto parsed = parseDataFile(name);
@@ -202,9 +211,9 @@ Hotcache Hotcache::record(Directory& dir, uint64_t segId) {
   return cache;
 }
 
-FileDescriptor Hotcache::write(Directory& dir, uint64_t segId) {
-  std::string bytes = record(dir, segId).encode();
-  auto file = dir.createFile(fileName(segId));
+FileDescriptor Hotcache::write(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
+  std::string bytes = record(dir, segId, creatorEpoch).encode();
+  auto file = dir.createFile(fileName(segId, creatorEpoch));
   OutputStream out(file.get());
   out.write(bytes.data(), bytes.size());
   out.close();
@@ -212,15 +221,15 @@ FileDescriptor Hotcache::write(Directory& dir, uint64_t segId) {
   return file->descriptor();
 }
 
-void writeHotcacheIfRemote(Directory& dir, uint64_t segId, std::vector<std::string>* filenames,
+void writeHotcacheIfRemote(Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::vector<std::string>* filenames,
                            std::vector<FileDescriptor>* descriptors) {
   if (!(dir.capabilities() & Directory::REMOTE)) return;
   try {
-    auto descriptor = Hotcache::write(dir, segId);
+    auto descriptor = Hotcache::write(dir, segId, creatorEpoch);
     if (filenames) filenames->push_back(descriptor.name);
     if (descriptors) descriptors->push_back(std::move(descriptor));
   } catch (const std::exception& e) {
-    LOG_WARN("segment {} has no hotcache: {}", Postings::getSortableString(segId), e.what());
+    LOG_WARN("segment {} has no hotcache: {}", Postings::segmentKey(segId, creatorEpoch), e.what());
   }
 }
 

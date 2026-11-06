@@ -93,6 +93,26 @@ void expectSameTopK(IndexReader& reader, Query& query,
 
 class RescoreQueryTest : public LuxirTest {};
 
+TEST_F(RescoreQueryTest, nativeDecayPruningMatchesExhaustiveResults) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 400; i++) {
+    docs.push_back(flatdoc("id_s", std::to_string(i), "body_w", "alpha",
+                          "v_i", (i * 37) % 401 - 200));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  google::protobuf::Arena arena;
+  TermQuery child("body_w", "alpha");
+  for (auto name : {"gauss_decay", "exp_decay", "linear_decay"}) {
+    std::string expression = fmt::format("score * {}(v_i, 0, 50, 10, 0.3)", name);
+    auto* program = parseValue(arena, *schema, expression);
+    RescoreQuery query(&child, program);
+    expectSameTopK(*reader, query, name);
+  }
+}
+
 TEST_F(RescoreQueryTest, fieldMetadataBelongsToEachWeight) {
   CollectionHelper first("first");
   CollectionHelper second("second");
