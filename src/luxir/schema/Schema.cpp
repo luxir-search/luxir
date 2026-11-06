@@ -1061,6 +1061,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     if (indexSort && !indexSort->field.empty()) {
       src.index_sort = indexSort;
       schema->indexSortField = indexSort->field;
+      schema->indexSortOrder = indexSort->order;
     }
     src.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
