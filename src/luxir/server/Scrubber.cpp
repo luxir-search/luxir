@@ -24,15 +24,67 @@ Scrubber::Scrubber(LuxirNode& node)
 Scrubber::~Scrubber() { stop(); }
 
 void Scrubber::start() {
+  if (!reporter.joinable()) reporter = std::jthread([this](std::stop_token stop) { runReports(stop); });
   if (!enabled() || thread.joinable()) return;
   thread = std::jthread([this](std::stop_token stop) { run(stop); });
 }
 
 void Scrubber::stop() {
+  if (reporter.joinable()) {
+    reporter.request_stop();
+    reportsWake.notify_all();
+    reporter.join();
+  }
   if (!thread.joinable()) return;
   thread.request_stop();
   wake.notify_all();
   thread.join();
+}
+
+void Scrubber::report(const CollectionId& id, std::weak_ptr<Collection> collection, std::vector<std::string> files,
+                      std::string reason) {
+  {
+    std::lock_guard lock(reportsMutex);
+    reports.push_back({id, std::move(collection), std::move(files), std::move(reason)});
+  }
+  reportsWake.notify_all();
+}
+
+void Scrubber::runReports(std::stop_token stop) {
+  nameThisThread("luxir_damage");
+  for (;;) {
+    Report next;
+    {
+      std::unique_lock lock(reportsMutex);
+      if (!reportsWake.wait(lock, stop, [&] { return !reports.empty(); })) return;
+      next = std::move(reports.front());
+      reports.pop_front();
+    }
+    try { handle(next); }
+    catch (const std::exception& e) { LOG_WARN("Could not report damage in collection '{}': {}", next.id.label(), e.what()); }
+  }
+}
+
+// Fails the collection as a pass would, if it still serves the damaged files.
+void Scrubber::handle(const Report& report) {
+  auto& collections = node.collections();
+  auto collection = report.collection.lock();
+  if (!collection || collection->isFailed() || collections.get(report.id) != collection) return;
+  auto shard = collection->getShard();
+  auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+  if (!snapshot) return;
+  std::vector<FileDescriptor> served;
+  std::vector<std::string> suspects;
+  for (const auto& file : snapshot->files) {
+    if (std::ranges::find(report.files, file.name) == report.files.end()) continue;
+    served.push_back(file);
+    suspects.push_back(file.name);
+  }
+  if (served.empty()) return;  // a newer snapshot no longer serves them
+  collections.fail(report.id, collection, report.reason, suspects);
+  LOG_ERROR("Collection '{}' (commit {}) is corrupt and no longer serves: {}",
+            report.id.label(), snapshot->id.token(), report.reason);
+  if (auto* follower = node.getFollower()) follower->repair(report.id, collection, report.reason, served);
 }
 
 void Scrubber::run(std::stop_token stop) {

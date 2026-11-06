@@ -481,9 +481,7 @@ public:
       if (supplier != nullptr) {
         int64_t estimatedCard = supplier->cost();
         if (segment.hasDeletes()) {
-          estimatedCard = std::min(
-              estimatedCard,
-              (int64_t)segment.liveDocs()->docset().card());
+          estimatedCard = std::min(estimatedCard, (int64_t)segment.numLive());
         }
         cards[s] = estimatedCard;
         auto context = supplier->makePlanContext(

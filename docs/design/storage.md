@@ -138,12 +138,14 @@ field's postings are spread across all of a segment's files.
 
 ### Lazy segment opening
 
-Opening a snapshot builds and holds a reader for every segment, and a mapped
-file keeps its disk space until its reader goes away. Both pruning and
-eviction therefore need segments to open lazily. A segment starts with only
-its field catalog loaded and its data files closed. Planning and pruning work
-from the catalog, and a segment opens fully only when a query needs its
-data.
+Opening a snapshot secures its files by holding a handle on each, and
+reads only the manifest and the segment summaries. A segment's data files
+are mapped and decoded (materialized) only when a search keeps the segment,
+at one batched point after planning; see
+[segment summaries](segment-summaries.md#lazy-opening). A held or mapped
+file keeps its disk space until its reader goes away. On an object store the
+handle becomes a lease on the snapshot's objects, which eviction must also
+respect; a cold segment's catalog would then come from one range read.
 
 ### A writer over cold data (optional)
 
