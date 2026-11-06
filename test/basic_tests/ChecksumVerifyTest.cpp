@@ -4,6 +4,7 @@
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
+#include "test/DurableIndexInfo.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Scrubber.h"
 #include "luxir/store/CorruptionMarker.h"
@@ -271,8 +272,9 @@ TEST_F(ChecksumVerifyTest, lazilyFoundDamageIsRecordedLikeAScrubHit) {
   {
     LuxirNode node(config);
     dir = dirOf(node, "main");
-    auto segId = node.getCollection("main")->getReaderManager().getReader()->segments()[0].segInfo.seg_id;
-    name = Postings::getIndexFileName(Postings::getSortableString(segId), 0);
+    auto durable = readDurableIndexInfo(*node.getCollection("main")->getShard()->getDirectory());
+    const auto& segment = durable.info.segments[0];
+    name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
   }
   zero(dir / name);
   std::atomic<int> marked{0};
