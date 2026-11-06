@@ -8,6 +8,7 @@
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/log.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -955,11 +956,15 @@ std::span<const api::Warning> Schema::responseWarnings(std::pmr::memory_resource
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
-  return compile(def, base, InvalidStopWords::REJECT);
+  return compile(def, base, false);
 }
 
-std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords) {
+std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, bool stored) {
   auto schema = std::make_shared<Schema>();
+  // A persisted schema loads leniently: what a request would be rejected for
+  // (stop words a newer analyzer splits, an index sort that no longer
+  // resolves) is dropped with a warning instead.
+  InvalidStopWords invalidStopWords = stored ? InvalidStopWords::WARN_AND_DROP : InvalidStopWords::REJECT;
 
   // ---- assemble the authored source entries (merge or replace) ----
   // All FieldDef views are backed by the request or by baseArena; both live
@@ -1232,14 +1237,56 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   }
 
   if (!schema->indexSortField.empty()) {
-    const auto& field = schema->indexSortField;
-    auto* ft = schema->findPhysical(field);
-    if (ft == nullptr) {
-      throw SchemaError("index_sort field is not defined by a field or template: " + field);
-    }
-    auto type = (*ft)->type();
-    if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
-      throw SchemaError("index_sort field must be an int or date field with a column: " + field);
+    // Resolves the sort field (a plugin-typed field to its sort proxy) and
+    // returns why the setting is invalid, or nothing.
+    auto resolveIndexSort = [&]() -> std::string {
+      using Order = api::SchemaDef::IndexSort::Order;
+      const std::string field = schema->indexSortField;
+      if (schema->indexSortOrder != Order::ASC && schema->indexSortOrder != Order::DESC
+          && schema->indexSortOrder != Order::HILBERT) {
+        return "index_sort order must be asc, desc or hilbert, not " + std::to_string((int)schema->indexSortOrder);
+      }
+      auto* ft = schema->findPhysical(field);
+      if (ft == nullptr) return "index_sort field is not defined by a field or template: " + field;
+      // A plugin-typed field sorts by the derived field it names as its proxy.
+      if (auto* composite = dynamic_cast<const CompositeFieldType*>(ft->get())) {
+        std::string_view proxy = composite->impl().sortProxy();
+        if (proxy.empty()) {
+          return "index_sort field '" + field + "' has plugin type '" + composite->plugin->name +
+                 "', which names no sort proxy";
+        }
+        schema->indexSortField = CompositeFieldType::derivedName(field, proxy);
+        ft = schema->findPhysical(schema->indexSortField);
+        if (ft == nullptr) {
+          return "index_sort field '" + field + "': plugin type '" + composite->plugin->name +
+                 "' names sort proxy '" + std::string(proxy) + "', which is not one of its derived fields";
+        }
+      }
+      auto type = (*ft)->type();
+      if (schema->indexSortOrder == Order::HILBERT) {
+        if (type != FieldType::GEO_POINT || !(*ft)->hasColumn()) {
+          return "index_sort order hilbert needs a geo_point field with a column: " + field;
+        }
+      } else if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
+        return "index_sort field must be an int or date field with a column"
+               " (or a geo_point with order hilbert): " + field;
+      }
+      return {};
+    };
+    if (std::string error = resolveIndexSort(); !error.empty()) {
+      if (!stored) throw SchemaError(error);
+      // A persisted schema must still load when its sort no longer resolves,
+      // e.g. after a plugin upgrade dropped the sort proxy: merges go back to
+      // arrival order, and the setting leaves the authored source too, so
+      // the next SET does not trip over it.
+      LOG_WARN("Clearing the stored index_sort: {}", error);
+      schema->indexSortField.clear();
+      schema->indexSortOrder = api::SchemaDef::IndexSort::Order::ASC;
+      std::pmr::monotonic_buffer_resource arena;
+      luxir::api::SchemaDef src;
+      parseSchemaDef(schema->sourceDef_, src, arena);
+      src.index_sort.reset();
+      schema->sourceDef_ = serializeSchemaDef(src);
     }
   }
 
