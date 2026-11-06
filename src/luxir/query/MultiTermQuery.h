@@ -7,14 +7,20 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory_resource>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 #include "DocSetBulkScorer.h"
+#include "MultiTermBudget.h"
 #include "PostingsUnion.h"
 #include "Query.h"
 #include "QueryStats.h"
 #include "luxir/reader/FilteredTermsEnum.h"
+#include "luxir/search/RequestMemTracker.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
@@ -24,6 +30,11 @@ namespace luxir {
 class MultiTermQuery : public Query {
 protected:
   std::string_view field;
+  // Positive: per segment, union only the maxExpansions accepted terms with
+  // the highest document frequency (ties keep the lower term). Zero: every
+  // accepted term. Selection has no upper bound; the operator term cap still
+  // applies, and retained-state overflow spills to an eager bitset.
+  int32_t maxExpansions;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -31,13 +42,22 @@ public:
   static inline bool disableDenseFillForTests = false;
   static inline bool disableTruthfulCostForTests = false;
 
-  MultiTermQuery(QueryKind kind, std::string_view field)
-    : Query(kind), field(field) {}
+  MultiTermQuery(QueryKind kind, std::string_view field,
+                 int32_t maxExpansions = 0)
+    : Query(kind), field(field), maxExpansions(maxExpansions) {}
 
   std::string_view getField() const { return field; }
+  int32_t getMaxExpansions() const { return maxExpansions; }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
+
+  // False when the terms come from the request itself (TermInSetQuery), so
+  // the request size already bounds them; the scan budgets still apply.
+  virtual bool capsExpansions() const { return true; }
+
+  // Names the query in limit errors, e.g. "prefix query 'ab' on field 'f'".
+  virtual std::string describe() const = 0;
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
@@ -146,11 +166,31 @@ public:
 
     // Segment tasks use distinct slots; preparation precedes dispatch and
     // facet bucket bindings sharing a weight run serially. Concurrent use of
-    // the same (weight, segment), including fill and release, is unsupported.
+    // the same (query, segment), including fill and release, is unsupported.
     // Populated facts are immutable until the executor releases the segment.
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
     };
+
+    // The facts depend on the query and segment only, so every weight a
+    // request builds for one query (ranking, count, estimate, domain) shares
+    // one memo: each segment's dictionary is walked and charged once.
+    struct SharedExpansions {
+      std::span<ExpansionMemo> memos;
+      // A subclass's own rewrite of the query, when it has one (for example a
+      // scored case_insensitive match), shared the same way.
+      Query* rewrite = nullptr;
+    };
+
+    static SharedExpansions& sharedExpansions(
+        Context& context, const MultiTermQuery& query) {
+      return context.getOrCreateLogicalPlan<SharedExpansions>(query, [&]() {
+        auto* shared = context.pool.make<SharedExpansions>();
+        shared->memos =
+            context.pool.make_span<ExpansionMemo>(context.numSegments());
+        return shared;
+      });
+    }
 
     MultiTermQuery& query;
     CachedFieldInfo* cachedFieldInfo = nullptr;
@@ -158,8 +198,18 @@ public:
     bool canUseLazy;
     google::protobuf::Arena& memoArena;
     std::span<ExpansionMemo> expansionMemos;
+    MultiTermBudget& budget;
+    RequestMemTracker& memoryTracker;
+    int32_t expansionCap;
 
   public:
+    // The query's shared rewrite slot (see SharedExpansions::rewrite). The
+    // logical plan cache is keyed by query alone, so a subclass keeps its
+    // rewrite here rather than under its own plan type.
+    static Query*& sharedRewrite(Context& context, const MultiTermQuery& query) {
+      return sharedExpansions(context, query).rewrite;
+    }
+
     // Test/bench force switch over the constant-score union scorers. AUTO is
     // the production policy. FORCE_EAGER always selects the eager scorer;
     // forced lazy modes require the lazy preconditions and retained-state
@@ -213,8 +263,11 @@ public:
                      == (NEED_SCORES | ALLOW_PRUNING)
                    && scorerModeForTests != ScorerMode::FORCE_EAGER),
         memoArena(context.arena()),
-        expansionMemos(
-            context.pool.make_span<ExpansionMemo>(context.numSegments())) {
+        expansionMemos(sharedExpansions(context, query).memos),
+        budget(context.multiTermBudget()),
+        memoryTracker(context.planningContext().memoryTracker),
+        expansionCap(query.capsExpansions()
+            ? budget.maxExpansions() : std::numeric_limits<int32_t>::max()) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
     }
@@ -256,6 +309,46 @@ public:
       DocsOnlyEnum docsEnum(state);
       docsEnum.intoBitSet(
           {bits.words, FixedBitSet::sizeInWords(bits.size())}, 0, bits.size());
+    }
+
+    // One accepted term competing for a capped expansion. `ord` is the
+    // enumeration position, so equal document frequencies keep the lower term
+    // and the selection is a pure function of the segment.
+    struct TopTerm {
+      TermsEnum::PostingsState state;
+      size_t ord;
+    };
+
+    // Heap order with the weakest candidate (lowest docFreq, then highest
+    // ord) on top.
+    static bool strongerTerm(const TopTerm& a, const TopTerm& b) {
+      if (a.state.docFreq != b.state.docFreq) {
+        return a.state.docFreq > b.state.docFreq;
+      }
+      return a.ord < b.ord;
+    }
+
+    // Keep the `limit` accepted terms with the highest docFreq, returned in
+    // term order. Only postings states are retained; no postings are read.
+    static void selectTopTerms(
+        FilteredTermsEnum& fenum, size_t limit, std::pmr::vector<TopTerm>& heap) {
+      size_t ord = 0;
+      while (fenum.next()) {
+        TopTerm candidate{fenum.terms().postingsState(), ord++};
+        if (heap.size() < limit) {
+          if (heap.size() == heap.capacity()) {
+            heap.reserve(std::min(limit, std::max((size_t) 1, heap.capacity() * 2)));
+          }
+          heap.push_back(candidate);
+          std::push_heap(heap.begin(), heap.end(), strongerTerm);
+        } else if (strongerTerm(candidate, heap[0])) {
+          std::pop_heap(heap.begin(), heap.end(), strongerTerm);
+          heap.back() = candidate;
+          std::push_heap(heap.begin(), heap.end(), strongerTerm);
+        }
+      }
+      std::sort(heap.begin(), heap.end(),
+                [](const TopTerm& a, const TopTerm& b) { return a.ord < b.ord; });
     }
 
     static ExpansionFacts* findExpansionFacts(
@@ -300,12 +393,41 @@ public:
               scratchPool, segment.postingsReader(), *segFieldInfo);
           FilteredTermsEnum* fenum =
               query.createFilteredEnum(scratchPool, *termsEnum);
+          int64_t unchargedPostings = 0;
+          fenum->setAllowance(budget.scanAllowance());
           skipCount(SkipStats::multitermExpansions);
-          while (fenum->next()) {
-            TermsEnum::PostingsState state =
-                fenum->terms().postingsState();
+          std::optional<RequestMemResource> selectionMemory;
+          if (query.maxExpansions > 0) {
+            selectionMemory.emplace(memoryTracker, query.getField(), "multi-term selection");
+          }
+          std::pmr::vector<TopTerm> topTerms(
+              selectionMemory ? &*selectionMemory : std::pmr::get_default_resource());
+          if (query.maxExpansions > 0) {
+            selectTopTerms(*fenum, (size_t) query.maxExpansions, topTerms);
+          }
+          size_t nextTop = 0;
+          auto nextState = [&](TermsEnum::PostingsState& out) {
+            if (query.maxExpansions > 0) {
+              if (nextTop == topTerms.size()) return false;
+              out = topTerms[nextTop++].state;
+              return true;
+            }
+            if (!fenum->next()) return false;
+            out = fenum->terms().postingsState();
+            return true;
+          };
+          TermsEnum::PostingsState state;
+          while (nextState(state)) {
             termCount++;
             sumDocFreq += state.docFreq;
+            if (termCount > (size_t)expansionCap) [[unlikely]] {
+              budget.throwTooManyExpansions(query.describe());
+            }
+            unchargedPostings += state.docFreq;
+            if (unchargedPostings >= MultiTermBudget::POSTINGS_SLICE) [[unlikely]] {
+              if (!budget.chargePostings(unchargedPostings)) budget.throwPostings(query.describe());
+              unchargedPostings = 0;
+            }
             if (bitWords != nullptr) {
               FixedBitSet bits(bitWords, segment.maxDoc());
               addPostingsToBitset(bits, state);
@@ -327,6 +449,12 @@ public:
             addPostingsToBitset(bits, state);
             // No state views have escaped; return all heap blocks at spill.
             facts->statePool.rewind(facts->stateStart, 0);
+          }
+          if (fenum->stoppedAtVisitLimit()) {
+            budget.throwTermsExamined(query.describe());
+          }
+          if (!budget.chargePostings(unchargedPostings)) {
+            budget.throwPostings(query.describe());
           }
         }
       }

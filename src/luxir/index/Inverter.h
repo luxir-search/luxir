@@ -105,15 +105,15 @@ public:
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
 
-  Inverter(luxir::Directory& dir, uint64_t segId,
+  Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
            IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
-      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
+      : Inverter(dir, segId, creatorEpoch, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
                  ramBudget, std::move(dictionaryProvider)) {}
 
-  Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
+  Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
            IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
-      : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)),
+      : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
         storedDictionaryProvider(std::move(dictionaryProvider)),
         ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
 
@@ -460,7 +460,7 @@ private:
 };
 
 inline std::string format_as(const Inverter& inverter) {
-  return fmt::format("(seg={} max={})",  Postings::getIndexFileNamePrefix(inverter.getSegId()), inverter.getMaxDoc());
+  return fmt::format("(seg=s{} max={})", Postings::segmentKey(inverter.getSegId(), inverter.postingsWriter.creatorEpoch), inverter.getMaxDoc());
 }
 
 } // end namespace

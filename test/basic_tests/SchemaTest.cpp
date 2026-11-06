@@ -993,10 +993,10 @@ TEST_F(SchemaTest, schemaPersistence) {
   auto& dir = *ch.collection().getShard()->getDirectory();
   auto manifest = readDurableIndexInfo(dir);
   ASSERT_TRUE(manifest->schema);
-  EXPECT_EQ(gen, manifest->schema_gen);
+  EXPECT_EQ(gen, manifest->schema->version.generation());
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef persistedDef;
-  auto persistedSchema = Schema::fromStored(*manifest->schema, manifest->schema_gen);
+  auto persistedSchema = SchemaCache{}.load(dir, *manifest);
   persistedSchema->toProto(&persistedDef, arena);
 
   // The persisted def should contain "title" field
@@ -1026,7 +1026,7 @@ TEST_F(SchemaTest, schemaGenIncrements) {
   EXPECT_GT(gen2, gen1) << "Schema gen should increment on each setSchema";
 
   auto manifest = readDurableIndexInfo(*ch.collection().getShard()->getDirectory());
-  EXPECT_EQ(gen2, manifest->schema_gen);
+  EXPECT_EQ(gen2, manifest->schema->version.generation());
 
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
@@ -1053,11 +1053,11 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   auto& dir = *ch.collection().getShard()->getDirectory();
   auto stored = test::readDurableIndexInfo(dir);
   const auto& indexInfo = *stored;
-  EXPECT_EQ(expectedGen, indexInfo.schema_gen) << "IndexInfo should contain the current schema_gen";
+  EXPECT_EQ(expectedGen, indexInfo.schema->version.generation()) << "IndexInfo should contain the current schema_gen";
 
   // Check that SegmentInfo also has schema_gen
   ASSERT_GT(indexInfo.segments.size(), 0u);
-  EXPECT_EQ(expectedGen, indexInfo.segments[0].schema_gen) << "SegmentInfo should have schema_gen";
+  EXPECT_EQ(expectedGen, indexInfo.segments[0].schema.version.generation()) << "SegmentInfo should have schema_gen";
 
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
@@ -1176,7 +1176,7 @@ TEST_F(SchemaTest, multiModesJsonBinaryAndViews) {
   sameProperties(*schemaJson(json));
   EXPECT_EQ(schema->sourceDef_, schemaJson(json)->sourceDef_);
   std::pmr::monotonic_buffer_resource arena;
-  sameProperties(*Schema::fromStored(schema->storedInfo(arena), schema->gen_));
+  sameProperties(*Schema::fromStored(schema->storedInfo(arena), schema->binding));
   EXPECT_EQ("true", schema->signatures().at("n").properties.at("multi"));
   EXPECT_EQ("true", schema->signatures().at("t").properties.at("multi"));
   EXPECT_EQ("true", schema->signatures().at("t__n").properties.at("multi"));
@@ -1224,10 +1224,10 @@ TEST_F(SchemaTest, multiModeValidationAndHistory) {
   bad.multi = (api::FieldDef::MultiMode)99;
   bad.type = FieldClass::INT;
   EXPECT_THROW(invalid.build(), SchemaError);
-  auto before = schemaJson(R"({"fields":{"f":{"type":"int","multi":true,"variants":{"d":"double"}}}})")->withHistory(10, nullptr);
-  auto same = schemaJson(R"({"fields":{"f":{"type":"int","multi":"set","variants":{"d":"double"}}}})")->withHistory(11, before.get());
+  auto before = schemaJson(R"({"fields":{"f":{"type":"int","multi":true,"variants":{"d":"double"}}}})")->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 10, 1}}), nullptr);
+  auto same = schemaJson(R"({"fields":{"f":{"type":"int","multi":"set","variants":{"d":"double"}}}})")->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 11, 1}}), before.get());
   EXPECT_EQ(10u, same->introduction("f"));
-  auto after = schemaJson(R"({"fields":{"f":{"type":"int","multi":"array","variants":{"d":"double"}}}})")->withHistory(12, same.get());
+  auto after = schemaJson(R"({"fields":{"f":{"type":"int","multi":"array","variants":{"d":"double"}}}})")->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 12, 1}}), same.get());
   EXPECT_EQ(12u, after->introduction("f"));
   EXPECT_EQ(12u, after->introduction("f__d"));
 }
@@ -1572,7 +1572,7 @@ TEST_F(SchemaTest, variantInferenceUsesResolvedTypesAndSurvivesRoundTrips) {
   EXPECT_EQ(std::string::npos, json.find("\"defaults\"")); // inferred choices stay out of authored definitions
   std::pmr::monotonic_buffer_resource storedArena;
   auto stored = s->storedInfo(storedArena);
-  for (const auto& copy : {s, schemaJson(json), Schema::fromStored(stored, s->gen_)}) {
+  for (const auto& copy : {s, schemaJson(json), Schema::fromStored(stored, s->binding)}) {
     EXPECT_EQ(s->sourceDef_, copy->sourceDef_);
     EXPECT_EQ("author__raw", copy->resolveFor("author", OpClass::VALUE).physicalName);
     EXPECT_EQ("book_words__raw", copy->resolveFor("book_words", OpClass::VALUE).physicalName);
@@ -1781,9 +1781,9 @@ TEST_F(SchemaTest, vectorAnnSettings) {
     "inherits":{"parent":"_e"},
     "replaces":{"parent":"_e","ann":{"nlist":4}}}})");
   auto ann = [&](std::string_view name) { return ((VectorFieldType*)s->physical(name))->ann(); };
-  EXPECT_EQ(VectorAnnConfig::PQ, ann("plain").codec);
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("plain").codec);
   EXPECT_EQ(0, ann("plain").nlist);
-  EXPECT_EQ(1, ann("plain").rabitqBits);
+  EXPECT_EQ(0, ann("plain").rabitqBits);
   EXPECT_EQ(4, ann("plain").rabitqQueryBits);
   EXPECT_EQ(4, ann("rbq").rabitqBits);
   EXPECT_EQ(0, ann("rbq").rabitqQueryBits);
@@ -1792,7 +1792,7 @@ TEST_F(SchemaTest, vectorAnnSettings) {
   EXPECT_EQ(4, ann("inherits").pqM);
   EXPECT_EQ(6, ann("inherits").pqBits);
   // An authored ann replaces the parent's whole definition.
-  EXPECT_EQ(VectorAnnConfig::PQ, ann("replaces").codec);
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("replaces").codec);
   EXPECT_EQ(4, ann("replaces").nlist);
   EXPECT_NE(std::string::npos, authoredJson(*s).find(R"("pq":{"m":4,"bits":6})"));
 
@@ -1800,7 +1800,7 @@ TEST_F(SchemaTest, vectorAnnSettings) {
       R"({"type":"string","ann":{}})",
       R"({"type":"vector","ann":{"codec":"pq","rabitq":{"bits":2}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","pq":{"m":4}}})",
-      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":0}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":-1}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":10}}})",
       R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"query_bits":9}}})",
       R"({"type":"vector","ann":{"codec":"pq","pq":{"bits":9}}})",
@@ -1818,7 +1818,7 @@ TEST_F(SchemaTest, vectorAnnCodecDefaultsAndPresence) {
   auto s = schemaJson(R"({"fields":{
     "absent":{"type":"vector"}, "empty":{"type":"vector","ann":{}},
     "lists":{"type":"vector","ann":{"nlist":7}},
-    "pqSettings":{"type":"vector","dims":8,"ann":{"nlist":12,"pq":{"m":2,"bits":6}}},
+    "pqSettings":{"type":"vector","dims":8,"ann":{"codec":"pq","nlist":12,"pq":{"m":2,"bits":6}}},
     "pq":{"type":"vector","ann":{"codec":"pq"}},
     "rq":{"type":"vector","ann":{"codec":"rabitq"}}
   }})");
@@ -1828,20 +1828,15 @@ TEST_F(SchemaTest, vectorAnnCodecDefaultsAndPresence) {
     for (auto name : {"absent", "empty", "lists", "pqSettings", "pq", "rq"}) {
       SCOPED_TRACE(name);
       const auto& ann = dynamic_cast<VectorFieldType&>(*schema->physical(name)).ann();
-      EXPECT_EQ(name == std::string_view("rq") ? VectorAnnConfig::RABITQ : VectorAnnConfig::PQ, ann.codec);
+      EXPECT_EQ((name == std::string_view("pq") || name == std::string_view("pqSettings")) ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ, ann.codec);
       EXPECT_EQ(name == std::string_view("lists") ? 7 : name == std::string_view("pqSettings") ? 12 : 0, ann.nlist);
       EXPECT_EQ(name == std::string_view("pqSettings") ? 2 : 0, ann.pqM);
       EXPECT_EQ(name == std::string_view("pqSettings") ? 6 : 8, ann.pqBits);
     }
   }
-  for (auto ann : {R"({"rabitq":{}})", R"({"rabitq":{"bits":2}})"}) {
-    try {
-      schemaJson(std::string(R"({"fields":{"v":{"type":"vector","ann":)") + ann + "}}}");
-      FAIL() << "Accepted RaBitQ settings without a codec";
-    } catch (const SchemaError& e) {
-      EXPECT_NE(std::string_view(e.what()).find("explicit codec \"rabitq\""), std::string_view::npos);
-    }
-  }
+  EXPECT_NO_THROW(schemaJson(R"({"fields":{"v":{"type":"vector","ann":{"rabitq":{"bits":0}}}}})"));
+  EXPECT_THROW(schemaJson(R"({"fields":{"v":{"type":"vector","ann":{"pq":{}}}}})"), SchemaError);
+
 }
 
 TEST_F(SchemaTest, vectorPqMUsesEffectiveDimensions) {
@@ -2128,7 +2123,7 @@ TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
   auto schema = helper.collection().getSchema();
   for (int i = 0; i < 8; i++) EXPECT_NE(nullptr, schema->getFieldTypePtr("field" + std::to_string(i)));
   auto manifest = readDurableIndexInfo(helper.getIndexWriter()->dir);
-  auto stored = Schema::fromStored(*manifest->schema, manifest->schema_gen);
+  auto stored = SchemaCache{}.load(helper.getIndexWriter()->dir, *manifest);
   EXPECT_EQ(schema->introducedGen, stored->introducedGen);
   EXPECT_TRUE(manifest->segments.empty());
 }
@@ -2156,7 +2151,7 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
       R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})";
   EXPECT_EQ(english, self("named", "analyzer"));
   EXPECT_EQ(R"("english")", self("named", "analyzer_preset"));
-  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             self("ex", "analyzer"));
   EXPECT_EQ(R"("example")", self("ex", "analyzer_preset"));
   // an authored equivalent shows the same expansion and no preset

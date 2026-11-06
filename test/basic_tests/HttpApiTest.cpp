@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "luxir/store/Manifest.h"
 #include <array>
 #include <atomic>
@@ -19,6 +20,7 @@
 
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
@@ -28,6 +30,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/BuildInfo.h"
 #include "luxir/util/Signal.h"
 
 namespace luxir::test {
@@ -56,12 +59,31 @@ protected:
     return "{\"commit\":\"" + token + "\"," + body.substr(1);
   }
 
+  // Only the response envelope's timing varies; nested user data is unchanged.
+  static void expectResponse(std::string_view expected, std::string_view actual) {
+    glz::generic_sorted_u64 a, b;
+    ASSERT_FALSE(glz::read_json(a, expected)) << expected;
+    ASSERT_FALSE(glz::read_json(b, actual)) << actual;
+    ASSERT_TRUE(a.is_object());
+    ASSERT_TRUE(b.is_object());
+    a.get_object().erase("took_us");
+    b.get_object().erase("took_us");
+    EXPECT_EQ(glz::write_json(a).value(), glz::write_json(b).value());
+  }
+
   static std::string explicitQuery(const std::string& body) {
-    auto split = body.find(',', body.find("\"commit\":"));
-    EXPECT_NE(std::string::npos, split);
-    if (split == std::string::npos) return {};
-    return body.substr(0, split + 1) + "\"ops\":{\"q\":{" +
-        body.substr(split + 1, body.size() - split - 2) + "}}\n";
+    glz::generic_sorted_u64 query;
+    auto error = glz::read_json(query, body);
+    EXPECT_FALSE(error) << body;
+    if (error) return {};
+    glz::generic_sorted_u64 response = glz::generic_sorted_u64::object_t{};
+    for (const char* key : {"request_id", "commit", "took_us", "error", "warnings", "profile", "more"}) {
+      if (!query.contains(key)) continue;
+      response[key] = std::move(query[key]);
+      query.get_object().erase(key);
+    }
+    response["ops"]["q"] = std::move(query);
+    return glz::write_json(response).value();
   }
 
   static bool waitForShardThreads(HttpServer& server, int expected,
@@ -148,6 +170,7 @@ protected:
     EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
+    a.took_us = b.took_us = 0;
     std::string normalizedA, normalizedB;
     ASSERT_TRUE(api::write_json(a, normalizedA));
     ASSERT_TRUE(api::write_json(b, normalizedB));
@@ -275,6 +298,31 @@ TEST_F(HttpApiTest, prettySearchMultipleBatches) {
     }
     EXPECT_EQ((std::map<std::string, std::size_t>{{"a", 3}, {"b", 3}}), docsByOp);
   }
+}
+
+TEST_F(HttpApiTest, buildInfo) {
+  for (const auto* target : {"/", "/?pretty=false"}) {
+    auto res = httpRequest(port(), http::verb::get, target);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("application/json", res[http::field::content_type]);
+    expectJsonObject(res.body(), std::string_view(target) == "/");
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body()));
+    EXPECT_EQ(buildInfo().version, root["version"].get_string());
+    EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
+    EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+  }
+  auto res = httpRequest(port(), http::verb::post, "/");
+  EXPECT_EQ(405, res.result_int());
+  EXPECT_EQ("GET", res[http::field::allow]);
+
+  // _stats (shared with gRPC) and Prometheus report the same commit.
+  auto stats = httpRequest(port(), http::verb::get, "/_stats");
+  glz::generic_i64 statsJson;
+  ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
+  EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  auto metrics = httpRequest(port(), http::verb::get, "/metrics");
+  EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {
@@ -736,7 +784,9 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   ASSERT_NE(nullptr, seg);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
+  auto info = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  const auto& segment = info->segments[0];
+  EXPECT_EQ("s" + Postings::segmentKey(segment.seg_id, segment.creator_epoch), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
 }
 
@@ -828,7 +878,7 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(withCommit(
+  expectResponse(withCommit(
       R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n"),
       response.body());
 }
@@ -844,7 +894,7 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
       R"("ops":{"hits":{"top_docs":{"limit":1,"count_limit":-1,"fields":["id"],)"
       R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(withCommit(
+  expectResponse(withCommit(
       R"({"ops":{"cats":{"buckets":[)"
       R"({"val":"x","count":2,"hits":{"found":2,"docs":[{"id":"pb2"}]}},)"
       R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n"),
@@ -882,9 +932,10 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
     ASSERT_EQ(200, response.result_int()) << response.body();
-    EXPECT_EQ(withCommit(
+    SCOPED_TRACE(mp);
+    expectResponse(withCommit(
         R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n"),
-        response.body()) << "max_parallel=" << mp;
+        response.body());
   }
 }
 
@@ -1019,7 +1070,7 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   localServer.shutdown();
 
-  EXPECT_FALSE(std::filesystem::exists(base / "t" / "t0" / "unsafe"));
+  EXPECT_TRUE(test::catalogIncarnations(base, "unsafe").empty());
   EXPECT_FALSE(std::filesystem::exists(absolute));
   std::filesystem::remove_all(base);
 }
@@ -1046,9 +1097,8 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  FSDirectory container(base / "t" / "t0" / "bad");
-  auto incarnation = *CollectionStorage::current(container);
-  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "bad" / incarnation)) {
+  auto incarnation = test::selectedIncarnation(base, "bad");
+  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "i" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
@@ -1217,6 +1267,61 @@ TEST_F(HttpApiTest, malformedUpdateJsonIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, responsesReportTook) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"t1"},{"id":"t2"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("took_us":)"), std::string::npos) << update.body();
+
+  // An operation named took_us survives both transport and comparison helpers.
+  auto named = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"took_us":{"top_docs":{"query":"id:t1","fields":["id"]}}}})");
+  ASSERT_EQ(200, named.result_int()) << named.body();
+  expectResponse(withCommit(R"({"ops":{"took_us":{"docs":[{"id":"t1"}],"found":1}}})"), named.body());
+
+  auto stream = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+      "{\"id\":\"t3\"}\n{\"_end_\":{}}\n{\"id\":\"t4\"}\n{\"_end_\":{}}\n", "application/x-ndjson");
+  ASSERT_EQ(200, stream.result_int()) << stream.body();
+  auto acks = splitLines(stream.body());
+  ASSERT_EQ(3u, acks.size()) << stream.body();
+  for (const auto& ack : acks) {
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, ack)) << ack;
+    EXPECT_FALSE(root.contains("took_us")) << ack;
+  }
+
+  // Only the final line of a batched search carries took_us.
+  auto search = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"limit":-1,"batch_size":1,"fields":["id"]})");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  auto lines = splitLines(search.body());
+  ASSERT_GT(lines.size(), 1u) << search.body();
+  for (size_t i = 0; i < lines.size(); i++) {
+    EXPECT_EQ(i + 1 == lines.size(), lines[i].find(R"("took_us":)") != std::string::npos) << lines[i];
+  }
+}
+
+TEST_F(HttpApiTest, searchErrorsReportTook) {
+  helper.index(flatdoc("id", "floor"), UpdateMessage::COMMIT);
+  auto future = helper.getIndexWriter()->snapshots.snapshot()->id;
+  future.index_gen++;
+  for (const char* format : {"", "&format=docs"}) for (bool pretty : {false, true}) {
+    auto target = "/collections/main/_search?min_commit=" + future.token() +
+        "&min_commit_timeout_ms=10" + format + (pretty ? "&pretty" : "");
+    auto response = httpRequest(port(), http::verb::post, target,
+        R"({"request_id":"timed-error","query":"*:*"})");
+    ASSERT_EQ(503, response.result_int()) << response.body();
+    EXPECT_EQ("application/json", response[http::field::content_type]);
+    expectJsonObject(response.body(), pretty && std::string_view(format).empty());
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, response.body())) << response.body();
+    EXPECT_EQ("timed-error", root["request_id"].get_string());
+    EXPECT_EQ("stale_replica", root["error"]["code"].get_string());
+    ASSERT_TRUE(root.contains("took_us")) << response.body();
+    EXPECT_GE(root["took_us"].get<int64_t>(), 10000);
+  }
 }
 
 TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
@@ -2653,8 +2758,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   HttpReq full(port());
   full.matchQuery("status_s", "active").fields({"id"}).execute();
   ASSERT_EQ(200, full.status());
-  EXPECT_EQ(explicitQuery(res.body()),
-            full.rawResponse());
+  expectResponse(explicitQuery(res.body()), full.rawResponse());
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
   // an unknown root key is rejected with a client-facing error
@@ -2729,7 +2833,7 @@ TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
   for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
     auto res = httpRequest(port(), http::verb::post, target, body);
     ASSERT_EQ(200, res.result_int()) << res.body();
-    EXPECT_EQ(withCommit("{\"found\":1,\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
+    expectResponse(withCommit("{\"found\":1,\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
   }
   for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
                            R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
@@ -2805,8 +2909,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            viaEcho.body());
+  expectResponse(explicitQuery(direct.body()), viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
   auto echo2 = httpRequest(port(), http::verb::post,
@@ -2884,7 +2987,7 @@ TEST_F(HttpApiTest, searchPostUrlOverlayWins) {
       R"({"query":"title_w:foundation","limit":0,"fields":["id"]})");
   auto urlOnly = httpRequest(port(), http::verb::get, target);
   ASSERT_EQ(200, overlaid.result_int()) << overlaid.body();
-  EXPECT_EQ(urlOnly.body(), overlaid.body());
+  expectResponse(urlOnly.body(), overlaid.body());
 }
 
 TEST_F(HttpApiTest, searchUrlOverlayPreservesSiblingOps) {
@@ -2921,8 +3024,7 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
   ASSERT_EQ(200, postback.result_int()) << postback.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            postback.body());
+  expectResponse(explicitQuery(direct.body()), postback.body());
 
   auto echo2 = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=request", echo.body());
@@ -3061,14 +3163,14 @@ TEST_F(HttpApiTest, searchUrlSemanticValidationMatchesBody) {
   auto bodyZone = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"time_zone":"Not/A/Zone","limit":0})");
   EXPECT_EQ(bodyZone.result_int(), urlZone.result_int());
-  EXPECT_EQ(bodyZone.body(), urlZone.body());
+  expectResponse(bodyZone.body(), urlZone.body());
 
   auto urlParallel = httpRequest(port(), http::verb::get,
       "/collections/main/_search?max_parallel=2&limit=0");
   auto bodyParallel = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"max_parallel":2,"limit":0})");
   EXPECT_EQ(bodyParallel.result_int(), urlParallel.result_int());
-  EXPECT_EQ(bodyParallel.body(), urlParallel.body());
+  expectResponse(bodyParallel.body(), urlParallel.body());
 }
 
 TEST_F(HttpApiTest, searchUrlTopDocsQMaterializationRule) {
@@ -4210,7 +4312,7 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   // Resolving after submission still uses the same pre-output HTTP status.
   auto search = httpRequest(port(), http::verb::get, "/collections/Bad-Name/_search");
   ASSERT_EQ(400, search.result_int()) << search.body();
-  EXPECT_NE(search.body().find(R"({"error":{"kind":"invalid_request","code":"invalid_collection_name")"),
+  EXPECT_NE(search.body().find(R"("error":{"kind":"invalid_request","code":"invalid_collection_name")"),
             std::string::npos) << search.body();
 
   // A well-formed name nothing answers to is not found.
@@ -4228,7 +4330,7 @@ TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   ASSERT_EQ(400, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
-  EXPECT_NE(lines[0].find(R"({"request_id":"s1","error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
+  EXPECT_NE(lines[0].find(R"("error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
             std::string::npos) << res.body();
   EXPECT_EQ(lines[0].find(R"("docs")"), std::string::npos) << res.body();
 
@@ -4237,8 +4339,22 @@ TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   auto docs = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"request_id":"s2","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
   EXPECT_EQ(400, docs.result_int()) << docs.body();
-  EXPECT_NE(docs.body().find(R"({"request_id":"s2","error":{"kind":"invalid_request")"),
+  EXPECT_NE(docs.body().find(R"("error":{"kind":"invalid_request")"),
             std::string::npos) << docs.body();
+
+  // A degradation declared while parsing survives a later whole-request error.
+  helper.index(flatdoc("id", "warned", "title_w", "dune"), UpdateMessage::COMMIT);
+  for (const char* format : {"", "?format=docs"}) {
+    auto warned = httpRequest(port(), http::verb::post,
+        std::string("/collections/main/_search") + format,
+        R"({"query":{"simple_query":{"q":"dune~9","fields":["title_w"]}},"offset":-1})");
+    ASSERT_EQ(400, warned.result_int()) << warned.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, warned.body())) << warned.body();
+    ASSERT_TRUE(root.contains("warnings")) << warned.body();
+    EXPECT_EQ("fuzzy_clamped", root["warnings"][0]["code"].get_string());
+    EXPECT_TRUE(root.contains("took_us")) << warned.body();
+  }
 }
 
 TEST_F(HttpApiTest, envelopeEchoesRequestId) {
@@ -4450,8 +4566,7 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
   ASSERT_EQ(200, direct.result_int()) << direct.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            replay.body());
+  expectResponse(explicitQuery(direct.body()), replay.body());
   auto again = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", explainedRequest(echo));
   ASSERT_EQ(200, again.result_int()) << again.body();
@@ -4512,11 +4627,11 @@ TEST_F(HttpApiTest, ndjsonEofKeepsAllCommitOutcomesOnFailure) {
   CollectionHelper other(*luxirNode, "eof_failure_other");
   auto cleanup = scope_guard([&] { luxirNode->deleteCollection("eof_failure_other"); });
   auto writer = helper.getIndexWriter();
-  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
-    if (source == writer.get()) throw FileIOException("commit failed");
+  Signal::listen("publishWritten", [&](void* source, void*, void*) -> void* {
+    if (source == &writer->dir.underlying()) throw FileIOException("commit failed");
     return nullptr;
   });
-  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishWritten"); });
   for (bool multiple : {false, true}) {
     std::string body = "{\"id\":\"first\"}\n";
     if (multiple) body += "{\"_update_\":{\"collection\":\"eof_failure_other\"}}\n{\"id\":\"second\"}\n";
@@ -4652,7 +4767,7 @@ TEST_F(HttpApiTest, int64StringsApplyToEnvelopeAndDocumentStreams) {
       R"({"query":"*:*","fields":["stamp","when_dt"]})");
   auto explicitDefault = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"flags":[],"query":"*:*","fields":["stamp","when_dt"]})");
-  EXPECT_EQ(ordinary.body(), explicitDefault.body());
+  expectResponse(ordinary.body(), explicitDefault.body());
   EXPECT_NE(std::string::npos, ordinary.body().find(R"("stamp":1700000000123456789)"));
   auto rejected = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"q":{"flags":["int64_str"],"top_docs":{}}}})");
