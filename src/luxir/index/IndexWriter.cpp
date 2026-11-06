@@ -2109,7 +2109,7 @@ void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noe
   try {
     // Written once per segment at a fixed generation, so it takes none from
     // the overlays that get rebuilt (vector indexes).
-    std::string fileName = SegmentSummary::overlayFileName(seg.segId);
+    std::string fileName = SegmentSummary::overlayFileName(seg.segId, seg.creatorEpoch, writerEpoch);
     AuxInfo info;
     info.kind = std::string(SegmentSummary::OVERLAY_KIND);
     info.name = std::string(SegmentSummary::OVERLAY_NAME);
