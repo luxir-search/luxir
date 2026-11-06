@@ -5,6 +5,7 @@
 #include "test/StorageTestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
+#include "test/DurableIndexInfo.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Scrubber.h"
@@ -1872,9 +1873,10 @@ TEST_F(ReplicationFollowerTest, lazilyFoundDamageIsRepairedByTheNextSync) {
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp());
   auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
-  auto segId = follower->getCollection("main")->getReaderManager().getReader()->segments()[0].segInfo.seg_id;
-  auto name = Postings::getIndexFileName(Postings::getSortableString(segId), 0);
-  auto file = path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / name;
+  auto durable = readDurableIndexInfo(*follower->getCollection("main")->getShard()->getDirectory());
+  const auto& segment = durable.info.segments[0];
+  auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+  auto file = path / "follower" / "t" / "t0" / "i" / installed->id.incarnation / name;
   stopFollower();
   {
     auto size = std::filesystem::file_size(file);
