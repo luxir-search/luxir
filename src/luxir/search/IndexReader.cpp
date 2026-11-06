@@ -227,7 +227,7 @@ std::shared_ptr<Value> SegmentPart<Value>::getOrOpen(std::string_view what, Open
 std::shared_ptr<PostingsReader> SegmentBase::get() {
   if (auto value = cell.peek()) return value;  // the warm path builds no message
   return getOrOpen("segment " + std::to_string(segId), [this](HeldFiles& held) {
-    auto reader = PostingsReader::create(held, segId, creatorEpoch, false, true);
+    auto reader = PostingsReader::create(held, segId, creatorEpoch, false, true, summary);
     if (reader->maxDoc() != maxDoc) {
       throw std::runtime_error(std::format("maxDoc {} disagrees with the manifest's {}", reader->maxDoc(), maxDoc));
     }
@@ -433,6 +433,56 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         // overlays carry over likewise when their files are unchanged.
         const Segment* prevSeg = previous ? previous->segment(segId) : nullptr;
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+        // The summary first: the base takes it, so that opening a field reads
+        // the header facts the summary records from it, not from the data files.
+        std::shared_ptr<const SegmentSummary> summary;
+        for (int j = 0; j < (int)segment.overlays.size(); j++) {
+          const auto& info = segment.overlays[j];
+          if (info.kind != SegmentSummary::OVERLAY_KIND) continue;
+          if (info.files.empty()) continue;
+          // Read now: it is small, and what lets a query skip the segment
+          // without materializing anything. A segment's summary is written
+          // once with it: reuse the previous snapshot's copy when the
+          // segment's files and the summary's own descriptor are unchanged.
+          if (prevSeg && prevSeg->sharedSummary && !files.files.empty() && prevFiles->files == files.files
+              && std::ranges::find(prevFiles->overlays, files.overlays[(size_t)j]) != prevFiles->overlays.end()) {
+            summary = prevSeg->sharedSummary;
+            continue;
+          }
+          // A file that cannot be opened counts as missing: retried like
+          // any segment file while missingFileOK, then skipped.
+          std::shared_ptr<InputFile> file;
+          try {
+            file = dir.openFile(info.files.front().name, true);
+          } catch (const std::exception& e) {
+            if (!missingFileOK) LOG_WARN("Segment summary not opened for seg={}: {}", segId, e.what());
+          }
+          if (!file) {
+            if (missingFileOK) {
+              IREADER_DEBUG("Segment summary file missing for seg={} - triggering retry", segId);
+              retry = true;
+              break;
+            }
+            continue;
+          }
+          try {
+            std::string_view image = file->read();
+            summary = SegmentSummary::fromBytes(
+                std::span<const std::byte>((const std::byte*)image.data(), image.size()));
+          } catch (const std::exception& e) {
+            // Unreadable: the segment has no summary, which proves nothing.
+            LOG_WARN("Segment summary unreadable for seg={}: {}", segId, e.what());
+            continue;
+          }
+          if (summary->segId() != segId || summary->maxDoc() != nDocs) {
+            LOG_WARN("Segment summary for seg={} describes seg={} max_doc={} (expected max_doc={}); ignored",
+                     segId, summary->segId(), summary->maxDoc(), nDocs);
+            summary = nullptr;
+          }
+          break;
+        }
+        if (retry) break;
+
         std::shared_ptr<PostingsReader> handed;
         if ((size_t)i < published.size()) {
           handed = published[i].lock();
@@ -445,7 +495,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         } else if (handed) {
           base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(handed));
         } else if (files.files.empty()) {
-          auto opened = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true);
+          auto opened = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true, summary);
           if (!opened) {
             retry = true;
             break;
@@ -466,7 +516,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             break;
           }
           dir.expectSynced(files.files);
-          base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(held), metrics, onUnreadable);
+          base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(held), summary, metrics,
+                                               onUnreadable);
         }
 
         std::shared_ptr<SegmentLive> live;
@@ -492,54 +543,11 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         // If liveGen == 0, live remains null (no deletes)
 
         std::vector<std::shared_ptr<SegmentOverlay>> segmentOverlays;
-        std::shared_ptr<const SegmentSummary> summary;
         segmentOverlays.reserve(segment.overlays.size());
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
 
-          if (info.kind == SegmentSummary::OVERLAY_KIND) {
-            if (info.files.empty()) continue;
-            // Read now: it is small, and what lets a query skip the segment
-            // without materializing anything. A segment's summary is written
-            // once with it: reuse the previous snapshot's copy when the
-            // segment's files and the summary's own descriptor are unchanged.
-            if (prevSeg && prevSeg->sharedSummary && !files.files.empty() && prevFiles->files == files.files
-                && std::ranges::find(prevFiles->overlays, files.overlays[(size_t)j]) != prevFiles->overlays.end()) {
-              summary = prevSeg->sharedSummary;
-              continue;
-            }
-            // A file that cannot be opened counts as missing: retried like
-            // any segment file while missingFileOK, then skipped.
-            std::shared_ptr<InputFile> file;
-            try {
-              file = dir.openFile(info.files.front().name, true);
-            } catch (const std::exception& e) {
-              if (!missingFileOK) LOG_WARN("Segment summary not opened for seg={}: {}", segId, e.what());
-            }
-            if (!file) {
-              if (missingFileOK) {
-                IREADER_DEBUG("Segment summary file missing for seg={} - triggering retry", segId);
-                retry = true;
-                break;
-              }
-              continue;
-            }
-            try {
-              std::string_view image = file->read();
-              summary = SegmentSummary::fromBytes(
-                  std::span<const std::byte>((const std::byte*)image.data(), image.size()));
-            } catch (const std::exception& e) {
-              // Unreadable: the segment has no summary, which proves nothing.
-              LOG_WARN("Segment summary unreadable for seg={}: {}", segId, e.what());
-              continue;
-            }
-            if (summary->segId() != segId || summary->maxDoc() != nDocs) {
-              LOG_WARN("Segment summary for seg={} describes seg={} max_doc={} (expected max_doc={}); ignored",
-                       segId, summary->segId(), summary->maxDoc(), nDocs);
-              summary = nullptr;
-            }
-            continue;
-          }
+          if (info.kind == SegmentSummary::OVERLAY_KIND) continue;  // read with the base above
           if (info.kind != VectorAuxReader::KIND && info.kind != TestOverlayAuxReader::KIND) {
             IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
             continue;
