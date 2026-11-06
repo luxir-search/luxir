@@ -265,9 +265,9 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
     double decoded = type == FieldType::Type::FLOAT ? (double)sortableInt32ToFloat((int32_t)value)
                                         : sortableInt64ToDouble(value);
     if (!std::isfinite(decoded)) throw RequestError("cannot floor a non-finite value");
-    long double index = std::floor(((long double)decoded - floatingOrigin) / floatingGap);
+    double index = std::floor((decoded - floatingOrigin) / floatingGap);
     // At larger indices unit increments cannot yield distinct double fences.
-    if (index <= (long double)INT64_MIN || index >= (long double)INT64_MAX) {
+    if (!(index > -0x1p63 && index < 0x1p63)) {
       throw RequestError("floating grid index overflow");
     }
     Cell cell = floatingCell((int64_t)index);

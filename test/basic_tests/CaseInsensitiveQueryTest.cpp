@@ -356,26 +356,27 @@ TEST_F(CaseInsensitiveQueryTest, escapedLiteralKeepsExactCasePreference) {
   }
 }
 
-TEST_F(CaseInsensitiveQueryTest, scoredExpansionBudgetRejectsWithoutTruncatingFilters) {
-  for (int i = 0; i <= (int)AutomatonQuery::MAX_CASE_VARIANTS; i++) {
-    std::string term(7, 'a');
+TEST_F(CaseInsensitiveQueryTest, scoredMatchHasNoVariantCap) {
+  constexpr int64_t kVariants = 1000;
+  for (int64_t i = 0; i < kVariants; i++) {
+    std::string term(10, 'a');
     for (size_t bit = 0; bit < term.size(); bit++) {
-      if ((i & (1 << bit)) != 0) term[bit] = 'A';
+      if ((i & ((int64_t)1 << bit)) != 0) term[bit] = 'A';
     }
     ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), "variants_w", term),
         UpdateMessage::NO_COMMIT).success);
-    if (i + 1 == (int)AutomatonQuery::MAX_CASE_VARIANTS) {
-      helper.commit();
-      EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS,
-                scores("match(aaaaaaa, field=variants_w, case_insensitive=true)").size());
-    }
   }
   helper.commit();
-  auto req = run(R"({"query":{"match":{"variants_w":"aaaaaaa","case_insensitive":true}},"get_scores":true})");
-  EXPECT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("64 indexed case variants"));
-  auto filtered = run(R"json({"query":{"all":true},"filter":["match(aaaaaaa, field=variants_w, case_insensitive=true)"],"fields":["id"],"limit":-1})json");
-  EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS + 1, ids(*filtered).size());
+  auto scoredCount = run(R"json({"query":{"match":{"variants_w":"aaaaaaaaaa","case_insensitive":true}},"get_scores":true,"count_limit":-1})json");
+  ASSERT_TRUE(scoredCount->ok()) << scoredCount->errorMsg();
+  EXPECT_EQ(kVariants, scoredCount->getMatchCount());
+  auto filteredCount = run(R"json({"query":{"all":true},"filter":["match(aaaaaaaaaa, field=variants_w, case_insensitive=true)"],"count_limit":-1})json");
+  ASSERT_TRUE(filteredCount->ok()) << filteredCount->errorMsg();
+  EXPECT_EQ(kVariants, filteredCount->getMatchCount());
+
+  // Doc 0 holds the query's exact case, and alternates tie below it.
+  auto top = scores("match(aaaaaaaaaa, field=variants_w, case_insensitive=true)");
+  EXPECT_GT(top.at("0"), top.at("1"));
 }
 
 TEST_F(CaseInsensitiveQueryTest, idAndNumericMatch) {
@@ -472,7 +473,7 @@ TEST_F(CaseInsensitiveMappingTest, literalAndPatternIdentity) {
     EXPECT_NE(literal->hash(), pattern->hash());
     EXPECT_NE(key(*literal), key(*pattern));
   };
-  distinct(builder.createPrefixQuery("body", "a", true), builder.createWildcardQuery("body", "b*", true));
+  distinct(builder.createPrefixQuery("body", "a", 0, true), builder.createWildcardQuery("body", "b*", true));
   distinct(builder.createMatchQuery("name_s", "b", QueryBuilder::Operator::OR, 0, 1.0f, true),
            builder.createWildcardQuery("name_s", "b", true));
 }
@@ -533,4 +534,37 @@ TEST_F(CaseInsensitiveMappingTest, expansionUsesAnalyzedStem) {
   }, UpdateMessage::COMMIT).success);
   EXPECT_EQ((Ids{"lower"}), hits(R"({"match":{"stem":"ponies","case_insensitive":true}})"));
   EXPECT_EQ((Ids{"upper"}), hits(R"({"match":{"stem":"PONIES","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, prefixMaxExpansionsSelectsByDocFreq) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "f", "name_s", "foo"),
+      flatdoc("id", "g", "name_s", "foo"),
+      flatdoc("id", "h", "name_s", "Foo"),
+  }, UpdateMessage::COMMIT).success);
+  // Merge so all case variants compete in the same segment: foo=3, Foo=2, FOO=1.
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  EXPECT_EQ((Ids{"b", "f", "g"}), expr("prefix(f, field=name_s, max_expansions=1)"));
+  for (int pass = 0; pass < 2; pass++) {
+    EXPECT_EQ((Ids{"b", "f", "g"}), hits(
+        R"({"prefix":{"field":"name_s","prefix":"F","case_insensitive":true,"max_expansions":1}})"));
+    EXPECT_EQ((Ids{"b", "c", "f", "g", "h"}), expr(
+        "prefix(F, field=name_s, case_insensitive=true, max_expansions=2)"));
+    EXPECT_EQ((Ids{"a", "b", "c", "f", "g", "h"}), expr(
+        "prefix(F, field=name_s, case_insensitive=true)"));
+  }
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto* capped = builder.createPrefixQuery("name_s", "F", 1, true);
+  auto* same = builder.createPrefixQuery("name_s", "F", 1, true);
+  auto* complete = builder.createPrefixQuery("name_s", "F", 0, true);
+  EXPECT_TRUE(capped->equals(*same));
+  EXPECT_EQ(capped->hash(), same->hash());
+  EXPECT_EQ(key(*capped), key(*same));
+  EXPECT_FALSE(capped->equals(*complete));
+  EXPECT_NE(capped->hash(), complete->hash());
+  EXPECT_NE(key(*capped), key(*complete));
 }

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -284,8 +285,7 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
     }
   }
   // Rewrite the committed schema of "bad" as if a plugin's filter were absent.
-  FSDirectory container(path / "t" / "t0" / "bad");
-  FSDirectory dir(path / "t" / "t0" / "bad" / *CollectionStorage::current(container));
+  FSDirectory dir(test::incarnationPath(path, "bad"));
   auto loaded = readDurableIndexInfo(dir);
   api::SchemaDef missing;
   std::string error;
@@ -294,9 +294,18 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
       << error;
   std::vector<std::byte> schemaBytes, manifest;
   ASSERT_TRUE(api::encode(missing, schemaBytes));
-  loaded.info.schema->source_def = std::span<const std::byte>(schemaBytes);
+  api::SchemaInfo stored;
+  stored.source_def = schemaBytes;
+  std::vector<std::byte> storedBytes;
+  ASSERT_TRUE(api::encode(stored, storedBytes));
+  auto contents = Manifest::withFooter(storedBytes);
+  auto& file = loaded.info.schema_file;
+  file.size = contents.size();
+  file.xxh3 = XXH3_64bits(contents.data(), contents.size());
+  dir.publishFile(file.name, contents, Directory::PublishMode::REPLACE);
   ASSERT_TRUE(api::encode(loaded.info, manifest));
-  Manifest::write(dir, loaded.info.index_gen, manifest);
+  dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+      Manifest::withFooter(manifest), Directory::PublishMode::REPLACE);
 
   LuxirNode node(config);
   CollectionHelper good(node, "good");

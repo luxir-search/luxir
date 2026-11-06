@@ -9,20 +9,32 @@
 
 namespace luxir {
 
-// Node-local follower discovery history. CURRENT only selects data.
+// Node-local follower discovery history. The tenant catalog selects data.
 struct ReplicationState {
   struct Collection {
     std::string advertised;
     std::string boot;
     bool replace_empty = true;
-    // Durable promotion target, recorded before switching CURRENT. A restart
+    // Durable promotion target, recorded before catalog activation. A restart
     // finishes that switch instead of minting another incarnation.
     std::string promoted;
   };
+  struct Tenant {
+    std::string boot;
+    uint64_t revision = 0;
+    std::map<std::string, std::string> names;
+    std::map<std::string, Collection> incarnations;
+  };
   std::string source;
-  std::map<std::string, std::map<std::string, Collection>> tenants;
+  std::map<std::string, Tenant> tenants;
 
-  Collection& collection(const CollectionId& id) { return tenants[id.tenant][id.name]; }
+  Collection& incarnation(std::string_view tenant, std::string_view id) {
+    return tenants[std::string(tenant)].incarnations[std::string(id)];
+  }
+  Collection& collection(const CollectionId& id) {
+    auto& tenant = tenants.at(id.tenant);
+    return tenant.incarnations.at(tenant.names.at(id.name));
+  }
 
   static ReplicationState read(InputFile& file);
   void write(Directory& dir) const;

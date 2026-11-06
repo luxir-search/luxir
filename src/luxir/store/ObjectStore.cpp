@@ -53,7 +53,7 @@ std::vector<ObjectStore::ObjectInfo> RamObjectStore::list(std::string_view prefi
   record("list", prefix, 0, 0);
   std::vector<ObjectInfo> result;
   for (auto it = objects.lower_bound(prefix); it != objects.end() && it->first.starts_with(prefix); ++it) {
-    result.push_back({it->first, (uint64_t)it->second.size()});
+    result.push_back({it->first, (uint64_t)it->second.bytes.size()});
   }
   return result;
 }
@@ -63,7 +63,7 @@ std::optional<uint64_t> RamObjectStore::size(std::string_view name) {
   record("size", name, 0, 0);
   auto it = objects.find(name);
   if (it == objects.end()) return std::nullopt;
-  return (uint64_t)it->second.size();
+  return (uint64_t)it->second.bytes.size();
 }
 
 void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span<char> out) {
@@ -71,7 +71,7 @@ void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span
   record("read", name, offset, out.size());
   auto it = objects.find(name);
   if (it == objects.end()) throw ObjectNotFoundError("object does not exist: " + std::string(name));
-  const std::string& bytes = it->second;
+  const std::string& bytes = it->second.bytes;
   if (offset > bytes.size() || out.size() > bytes.size() - offset) {
     throw std::runtime_error("short read of object " + std::string(name));
   }
@@ -79,17 +79,29 @@ void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span
   bytesRead_.fetch_add(out.size(), std::memory_order_relaxed);
 }
 
-void RamObjectStore::put(std::string_view name, std::string_view bytes, bool ifAbsent) {
+std::optional<ObjectStore::Object> RamObjectStore::get(std::string_view name) {
+  std::lock_guard lock(mutex);
+  auto it = objects.find(name);
+  record("get", name, 0, it == objects.end() ? 0 : it->second.bytes.size());
+  if (it == objects.end()) return std::nullopt;
+  bytesRead_.fetch_add(it->second.bytes.size(), std::memory_order_relaxed);
+  return Object{it->second.bytes, std::to_string(it->second.version)};
+}
+
+std::optional<std::string> RamObjectStore::put(std::string_view name, std::string_view bytes,
+                                               const PutCondition& condition) {
   std::lock_guard lock(mutex);
   record("put", name, 0, bytes.size());
   auto it = objects.find(name);
-  if (it != objects.end()) {
-    if (ifAbsent) throw std::runtime_error("object already exists: " + std::string(name));
-    it->second.assign(bytes);
-  } else {
-    objects.emplace(std::string(name), std::string(bytes));
+  if (condition.ifAbsent && it != objects.end()) return std::nullopt;
+  if (condition.ifMatch && (it == objects.end() || std::to_string(it->second.version) != *condition.ifMatch)) {
+    return std::nullopt;
   }
+  uint64_t version = ++nextVersion;
+  if (it != objects.end()) it->second = {std::string(bytes), version};
+  else objects.emplace(std::string(name), Stored{std::string(bytes), version});
   bytesWritten_.fetch_add(bytes.size(), std::memory_order_relaxed);
+  return std::to_string(version);
 }
 
 bool RamObjectStore::remove(std::string_view name) {
@@ -106,8 +118,8 @@ void RamObjectStore::copy(std::string_view from, std::string_view to) {
   record("copy", from, 0, 0);
   auto it = objects.find(from);
   if (it == objects.end()) throw std::runtime_error("object does not exist: " + std::string(from));
-  std::string bytes = it->second;
-  objects[std::string(to)] = std::move(bytes);
+  Stored copied{it->second.bytes, ++nextVersion};
+  objects[std::string(to)] = std::move(copied);
 }
 
 uint64_t RamObjectStore::requests(std::string_view op, std::string_view prefix) const {
@@ -123,7 +135,7 @@ std::vector<RamObjectStore::Request> RamObjectStore::requestLog() const {
 uint64_t RamObjectStore::bytesRead(std::string_view prefix) const {
   std::lock_guard lock(mutex);
   uint64_t total = 0;
-  for (const auto& r : log) if (r.op == "read" && r.name.starts_with(prefix)) total += r.length;
+  for (const auto& r : log) if ((r.op == "read" || r.op == "get") && r.name.starts_with(prefix)) total += r.length;
   return total;
 }
 
@@ -138,7 +150,7 @@ void RamObjectStore::resetStats() {
 uint64_t RamObjectStore::storedBytes(std::string_view prefix) {
   std::lock_guard lock(mutex);
   uint64_t total = 0;
-  for (auto it = objects.lower_bound(prefix); it != objects.end() && it->first.starts_with(prefix); ++it) total += it->second.size();
+  for (auto it = objects.lower_bound(prefix); it != objects.end() && it->first.starts_with(prefix); ++it) total += it->second.bytes.size();
   return total;
 }
 
