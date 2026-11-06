@@ -500,6 +500,7 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.cacheentrydump.segments_resident"></a>[`segments_resident`](#field-luxir.cacheentrydump.segments_resident) | 7 | `uint32` | singular |  |
 | <a id="field-luxir.cacheentrydump.hits"></a>[`hits`](#field-luxir.cacheentrydump.hits) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.last_used_epoch"></a>[`last_used_epoch`](#field-luxir.cacheentrydump.last_used_epoch) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.cacheentrydump.build_micros"></a>[`build_micros`](#field-luxir.cacheentrydump.build_micros) | 10 | `uint64` | singular | summed measured build cost of the resident values |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -1896,6 +1897,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.thrash_build_skips"></a>[`thrash_build_skips`](#field-luxir.querycachestats.thrash_build_skips) | 19 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_dead_builds"></a>[`reader_dead_builds`](#field-luxir.querycachestats.reader_dead_builds) | 20 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_thrash_build_skips"></a>[`reader_thrash_build_skips`](#field-luxir.querycachestats.reader_thrash_build_skips) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.recompute_micros_saved"></a>[`recompute_micros_saved`](#field-luxir.querycachestats.recompute_micros_saved) | 22 | `uint64` | singular | Summed measured build cost (microseconds) of the values served as shared hits: the recompute time the cache saved. |
 
 <a id="message-luxir.queryfacet"></a>
 

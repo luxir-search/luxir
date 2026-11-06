@@ -52,6 +52,13 @@ void clearIfSet(std::atomic<uint32_t>& value) {
   }
 }
 
+// Steady-clock builds of a few hundred nanoseconds round to zero. A one
+// microsecond floor keeps every value's density, and so its frequency weight,
+// meaningful.
+uint32_t flooredBuildCost(uint32_t micros) {
+  return std::max<uint32_t>(micros, 1);
+}
+
 } // namespace
 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
@@ -60,7 +67,8 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
                                         bool claimedBuild)
   : docs(std::move(docs)),
     charge((uint32_t) this->docs->ramBytesUsed()),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    buildCostMicros(flooredBuildCost(buildCostMicros)),
+    claimedBuild(claimedBuild),
     priority(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
@@ -75,7 +83,8 @@ FilterCache::ReaderValue::ReaderValue(
     std::vector<std::unique_ptr<DocSet>> docs,
     uint32_t buildCostMicros, bool claimedBuild)
   : readerVersion_(readerVersion), charge(0),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    buildCostMicros(flooredBuildCost(buildCostMicros)),
+    claimedBuild(claimedBuild),
     priority(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
@@ -293,7 +302,7 @@ void FilterCache::acceptSharedHit(
   // seq_cst pairs with recordCapacityEviction: either the detach sees this
   // hit and installs no debt, or this hit sees the detach flag. That replaces
   // re-loading slot->value, which costs several contended RMWs per hit.
-  value->cacheHits.fetch_add(1, std::memory_order_seq_cst);
+  uint64_t hits = value->cacheHits.fetch_add(1, std::memory_order_seq_cst) + 1;
   if (value->capacityDetached.load(std::memory_order_seq_cst)) {
     // A borrower that won before capacity detach resets feedback after the
     // detach transition has installed any zero-hit debt.
@@ -305,8 +314,9 @@ void FilterCache::acceptSharedHit(
     clearIfSet(slot->deadBuildStreak);
     clearIfSet(slot->buildBypassesRemaining);
   }
-  value->touch(evictionClock.load(std::memory_order_relaxed));
+  value->touch(evictionClock.load(std::memory_order_relaxed), hits);
   touchEpoch(use.entry->lastUsed, use.epoch);
+  counter.recomputeMicrosSaved.add(value->buildCostMicros);
   use.pinValue(segmentOrd, std::move(value));
   counter.hits.add(1);
 }
@@ -314,7 +324,7 @@ void FilterCache::acceptSharedHit(
 void FilterCache::acceptReaderSharedHit(
     Use& use, const std::shared_ptr<FilterEntry>& entry,
     const std::shared_ptr<const ReaderValue>& value) {
-  value->cacheHits.fetch_add(1, std::memory_order_relaxed);
+  uint64_t hits = value->cacheHits.fetch_add(1, std::memory_order_relaxed) + 1;
   if (entry->readerValue.load(std::memory_order_acquire) != value) {
     // Match the reader eviction transition so a candidate pinned before
     // detach clears any zero-hit debt installed by that detach.
@@ -325,8 +335,9 @@ void FilterCache::acceptReaderSharedHit(
     clearIfSet(entry->readerDeadBuildStreak);
     clearIfSet(entry->readerBuildBypassesRemaining);
   }
-  value->touch(evictionClock.load(std::memory_order_relaxed));
+  value->touch(evictionClock.load(std::memory_order_relaxed), hits);
   touchEpoch(entry->lastUsed, use.epoch);
+  counter.recomputeMicrosSaved.add(value->buildCostMicros);
   use.pinReaderValue(value);
   counter.hits.add(1);
   counter.readerStableHits.fetch_add(1, std::memory_order_relaxed);
@@ -1969,6 +1980,7 @@ void FilterCache::resetCounters() {
   counter.readerStableHits.store(0, std::memory_order_relaxed);
   counter.readerStableRefreshes.store(0, std::memory_order_relaxed);
   counter.readerStableRetires.store(0, std::memory_order_relaxed);
+  counter.recomputeMicrosSaved.reset();
 }
 
 size_t FilterCache::slotCountForTest(const FilterKey& key) {
@@ -1990,6 +2002,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       row.readerValue = true;
       row.bytes += readerValue->ramBytesUsed();
       row.hits += readerValue->cacheHits.load(std::memory_order_relaxed);
+      row.buildMicros += readerValue->buildCostMicros;
     }
     auto slots = entry->slots.load(std::memory_order_acquire);
     for (const auto& slot : *slots) {
@@ -1998,6 +2011,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       row.segmentsResident++;
       row.bytes += value->ramBytesUsed();
       row.hits += value->cacheHits.load(std::memory_order_relaxed);
+      row.buildMicros += value->buildCostMicros;
     }
     if (row.bytes == 0) return;
     resident++;
@@ -2064,6 +2078,7 @@ FilterCache::CounterValues FilterCache::counters() const {
           std::memory_order_relaxed),
       .readerStableRetires = counter.readerStableRetires.load(
           std::memory_order_relaxed),
+      .recomputeMicrosSaved = counter.recomputeMicrosSaved.load(),
       .residentBytes = residentBytes.load(std::memory_order_relaxed),
       .metadataBytes = metadataBytes.load(std::memory_order_relaxed)};
 }

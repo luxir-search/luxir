@@ -151,8 +151,10 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
   // An errored collection renders only its availability.
   const_cast<api::CollectionStats&>(response.collections[0]).error.reset();
   // Rendered in seconds, from microseconds and milliseconds.
-  static const std::map<std::string, double> perSecond = {{"collections.shards.index.commit_time", 1e6},
-                                                          {"scrub.last_pass_end", 1e3}};
+  static const std::map<std::string, double> perSecond = {
+      {"collections.shards.index.commit_time", 1e6},
+      {"collections.shards.index.query_cache.recompute_micros_saved", 1e6},
+      {"scrub.last_pass_end", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;
   ASSERT_TRUE(api::write_json(response, json));

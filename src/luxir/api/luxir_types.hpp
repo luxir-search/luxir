@@ -347,6 +347,7 @@ struct QueryCacheStats {
   uint64_t thrash_build_skips = 0;
   uint64_t reader_dead_builds = 0;
   uint64_t reader_thrash_build_skips = 0;
+  uint64_t recompute_micros_saved = 0;
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
@@ -780,6 +781,7 @@ struct CacheEntryDump {
   uint64_t bytes = 0;
   uint64_t hits = 0;
   uint64_t last_used_epoch = 0;
+  uint64_t build_micros = 0;
   std::string_view key_text;
   std::string_view scope;
   uint32_t key_bytes = 0;

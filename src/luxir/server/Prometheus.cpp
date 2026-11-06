@@ -147,6 +147,7 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
       {"reader_stable_hits", c.reader_stable_hits}, {"reader_stable_refreshes", c.reader_stable_refreshes},
       {"reader_stable_retires", c.reader_stable_retires}})
     r.counter(std::string("luxir_filter_cache_") + name + "_total", "Filter-cache events; reset by cache-control reset_counters.", (double)value, labels);
+  r.counter("luxir_filter_cache_recompute_saved_seconds_total", "Measured build time of filter-cache values served as hits; reset by cache-control reset_counters.", (double)c.recompute_micros_saved / 1e6, labels);
 }
 
 void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, const std::string& labels) {

@@ -165,10 +165,14 @@ inside the vector search rather than as a post-pass over a fixed unfiltered
 top-k, and hybrid ranking combines lexical and vector evidence in a single
 request.
 
-Filters are cached per collection as document sets. Entries are ranked by
-how expensive they are to rebuild per byte, so under pressure a cheap
-single-term filter is evicted before a compound boolean or a kNN membership
-set. Cached sets are consumed in
+Filters are cached per collection as document sets. Each cached set records
+the measured time it took to build, and eviction ranks entries by that rebuild
+cost per byte, weighted by how often the entry is hit (Greedy-Dual-Size-
+Frequency). Under pressure a cheap single-term filter is evicted before a
+wide range, a compound boolean, or a kNN membership set of similar size, and a
+frequently hit entry outranks a never-hit one. The frequency weight saturates
+after a few hits and an inflation clock rises with every eviction, so an
+expensive entry that stops being used still ages out. Cached sets are consumed in
 bulk windows, which is faster than re-decoding postings even for a filter that
 is a single term.
 

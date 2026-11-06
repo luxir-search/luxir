@@ -494,7 +494,7 @@ With `collections=true`:
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
 | `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
-| `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
+| `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, recompute time saved, payload/metadata memory, and payload budget. |
 | `luxir_snapshot_pins`, `luxir_snapshot_retained_bytes`, `luxir_snapshot_pin_drops_total` | Current pins, retired files held only by pins, and pins dropped by `reason` (idle, budget). A stats request never expires pins or removes files. |
 
 Counters reset when their owner restarts. Collection cache counters also reset
@@ -742,9 +742,13 @@ Search has its own limits:
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
-  disables it). Cached filters are evicted by rebuild cost per byte, so under
-  pressure the cache keeps expensive compound filters and drops cheap ones
-  first. Cache counters appear in `_stats?collections=true`
+  disables it). Cached filters are evicted by measured rebuild time per byte,
+  weighted by hit count (capped, and aged by an inflation clock so stale
+  entries still leave), so under pressure the cache keeps expensive, reused
+  filters and drops cheap or unused ones first. `recompute_micros_saved`
+  (Prometheus `luxir_filter_cache_recompute_saved_seconds_total`) sums the
+  build time of every value served from the cache, and the cache-control dump
+  reports each entry's `build_micros`. Cache counters appear in `_stats?collections=true`
   (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
   `NOW` bound are never cached; see [Dates](dates.md#date-math).
   The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
