@@ -23,6 +23,13 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// The precondition of an ObjectStore::put, as S3 maps it: If-None-Match: *
+/// and If-Match.
+struct ObjectPutCondition {
+  bool ifAbsent = false;              // only when no object has the name
+  std::optional<std::string> ifMatch;  // only when the object has this version
+};
+
 /// A flat key/value store of immutable byte objects: the contract an S3-like
 /// service offers, and all ObjectStoreDirectory needs from one. Names are flat
 /// keys; "directories" are only a naming convention of the caller. Every
@@ -33,12 +40,18 @@ public:
     std::string name;  // the full key, relative to the store
     uint64_t size = 0;
   };
-  /// What a HEAD reports: the size and the version tag the backend gives
-  /// the object's bytes (an S3 ETag); empty when the backend has none.
+  /// A whole object and the version it was read at.
+  struct Object {
+    std::string bytes;
+    std::string version;
+  };
+  /// What a HEAD reports: the size and the object's version (an S3 ETag, as
+  /// get() and put() report it); empty when the backend has none.
   struct Head {
     uint64_t size = 0;
     std::string etag;
   };
+  using PutCondition = ObjectPutCondition;
 
   virtual ~ObjectStore() = default;
 
@@ -53,25 +66,29 @@ public:
   /// retries; and std::runtime_error when the object does not match the read
   /// (a short read), which no retry heals.
   virtual void readRange(std::string_view name, uint64_t offset, std::span<char> out) = 0;
+  /// The whole object and its version from one observation, or nullopt when
+  /// it does not exist.
+  virtual std::optional<Object> get(std::string_view name) = 0;
   /// Replaces the object atomically: readers see the old or the new bytes,
-  /// never a mix. With `ifAbsent` the put is a conditional create and fails
-  /// when the object exists: it throws std::runtime_error whose message
-  /// contains "already exists".
-  virtual void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) = 0;
-  /// The object's size and tag, or nullopt when it does not exist. The
-  /// default has no tag.
+  /// never a mix. Returns the new version (an ETag: fresh on every put, even of
+  /// identical bytes), or nullopt when `condition` does not hold, in which case
+  /// nothing changed.
+  virtual std::optional<std::string> put(std::string_view name, std::string_view bytes,
+                                         const PutCondition& condition = {}) = 0;
+  /// The object's size and version, or nullopt when it does not exist. The
+  /// default asks size() and reports no version.
   virtual std::optional<Head> head(std::string_view name) {
     auto s = size(name);
     if (!s) return std::nullopt;
     return Head{*s, {}};
   }
-  /// Replaces the object only while its tag is still `etag` (compare and
-  /// swap). Throws std::runtime_error whose message contains "precondition
-  /// failed" when the object changed or is gone, and "not supported" on a
-  /// backend without tags (the default).
-  virtual void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) {
-    (void)name; (void)bytes; (void)etag;
-    throw std::runtime_error("conditional put not supported by " + describe());
+  /// Replaces the object only while its version is still `etag` (compare and
+  /// swap through put's ifMatch). Throws std::runtime_error whose message
+  /// contains "precondition failed" when the object changed or is gone.
+  void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) {
+    if (!put(name, bytes, {.ifAbsent = false, .ifMatch = std::string(etag)})) {
+      throw std::runtime_error("precondition failed: object " + std::string(name) + " changed");
+    }
   }
   /// True when the object existed.
   virtual bool remove(std::string_view name) = 0;
@@ -94,7 +111,7 @@ public:
 class RamObjectStore : public ObjectStore {
 public:
   struct Request {
-    std::string op;    // list, size, read, put, remove, copy
+    std::string op;    // list, size, read, get, put, remove, copy
     std::string name;  // the object, or the prefix of a list
     uint64_t offset = 0;
     uint64_t length = 0;  // bytes read or written
@@ -102,7 +119,12 @@ public:
 
 private:
   mutable std::mutex mutex;
-  std::map<std::string, std::string, std::less<>> objects;
+  struct Stored {
+    std::string bytes;
+    uint64_t version = 0;
+  };
+  std::map<std::string, Stored, std::less<>> objects;
+  uint64_t nextVersion = 0;
   std::vector<Request> log;
   std::string label;
   std::atomic<uint64_t> requests_{0};
@@ -123,13 +145,12 @@ public:
   std::optional<uint64_t> size(std::string_view name) override;
   std::optional<Head> head(std::string_view name) override;
   void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;
-  void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) override;
-  void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) override;
+  std::optional<Object> get(std::string_view name) override;
+  std::optional<std::string> put(std::string_view name, std::string_view bytes,
+                                 const PutCondition& condition = {}) override;
   bool remove(std::string_view name) override;
   void copy(std::string_view from, std::string_view to) override;
   std::string describe() const override { return "ram_object:" + label; }
-  /// The tag of these bytes, as head() reports it.
-  static std::string tagOf(std::string_view bytes);
 
   /// Every call counts as a request.
   uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }

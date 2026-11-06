@@ -36,7 +36,34 @@ void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
 }
 
 [[noreturn]] void invalidSegment(std::string_view fileName, std::string_view what) {
-  throw std::runtime_error(std::format("Segment file '{}' is corrupt: {}", fileName, what));
+  throw std::runtime_error(std::format("Segment file '{}' is corrupt or in an unsupported format: {}", fileName, what));
+}
+
+// Every region a field's metadata points to lies within one of the segment's files.
+void checkFieldLocations(const std::vector<std::shared_ptr<InputFile>>& files, const SegFieldInfo& field) {
+  auto check = [&](seg_location loc, uint64_t length = 0) {
+    if (loc.isNull()) return;
+    uint32_t fnum = loc.filenum();
+    if (fnum >= files.size() || !files[fnum] || loc.offset() > files[fnum]->size()
+        || length > files[fnum]->size() - loc.offset()) {
+      throw std::runtime_error(std::format(
+          "Field '{}' of a segment is corrupt or in an unsupported format: data location out of range",
+          std::string_view(field.fieldname)));
+    }
+  };
+  check(field.termBlockIndexLoc);
+  check(field.termsLoc);
+  check(field.docsLoc);
+  check(field.posLoc);
+  check(field.trieLoc);
+  check(field.rangeTableLoc);
+  check(field.docsWithFieldEndLoc);
+  check(field.columnLoc, field.columnMetaOff);
+  check(field.pointsLoc, field.pointsMetaOff);
+  check(field.normsLoc, field.normsLen);
+  check(field.monoLoc, field.monoMetaOff);
+  check(field.mono2Loc, field.mono2MetaOff);
+  check(field.valDocLoc, field.valDocMetaOff);
 }
 
 } // namespace
@@ -99,8 +126,8 @@ InputStream PostingsReader::materializeStream(uint32_t fnum) {
 }
 
 // Initialize from files, returns false if missing files and missingFileOK=true
-bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
-  std::string segStr = Postings::getSortableString(segId);
+bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced) {
+  std::string segStr = Postings::segmentKey(segId, creatorEpoch);
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);
   files.emplace_back(dir.openFile(segInfoFile, expectSynced));
 
@@ -114,37 +141,43 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   }
   validateSegmentFileHeader(*files.back(), segInfoFile);
 
-  // File 0 ends with: ... field metadata, offsets table, field count, segment
-  // info, segment info size. See PostingsWriter::writeSegmentInfo.
+  // File 0 ends with: ... field metadata, field offsets table, field count,
+  // segment info, segment info size. See PostingsWriter.writeSegmentInfo.
+  // Open-time reads go through ranges, so a lazy file fetches only these bytes.
   InputFile& first = *files[0];
   const int64_t firstSize = (int64_t)first.size();
   const int64_t headerSize = (int64_t)Postings::LUXIR_HEADER.size();
-  if (firstSize < headerSize + (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no segment info");
-  auto segInfoSize = first.rangeStream((uint64_t)firstSize - sizeof(int32_t), sizeof(int32_t)).readInt();
-  if (segInfoSize < 0 || segInfoSize > firstSize - headerSize - (int64_t)sizeof(int32_t)) {
+  if (firstSize < headerSize + 2 * (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no segment info");
+  int64_t segInfoSize = first.rangeStream((uint64_t)firstSize - sizeof(int32_t), sizeof(int32_t)).readInt();
+  if (segInfoSize < 0 || segInfoSize > firstSize - headerSize - 2 * (int64_t)sizeof(int32_t)) {
     invalidSegment(segInfoFile, "invalid segment info size");
   }
   segInfoOffset = firstSize - sizeof(int32_t) - segInfoSize;
-  InputStream firstIS = first.rangeStream((uint64_t)segInfoOffset, (uint64_t)segInfoSize);
-  maxdoc = firstIS.readVint();
-  uint32_t physicalFileCount = firstIS.readVint();
-  if (physicalFileCount == 0) {
-    throw std::runtime_error("Segment physical-file list is empty");
-  }
+  InputStream segInfo = first.rangeStream((uint64_t)segInfoOffset, (uint64_t)segInfoSize);
   std::vector<uint32_t> physicalFileNums;
-  physicalFileNums.reserve(physicalFileCount);
-  uint32_t previous = 0;
-  for (uint32_t i = 0; i < physicalFileCount; i++) {
-    uint32_t fileNum = firstIS.readVint();
-    if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous)) {
-      throw std::runtime_error("Segment physical-file list is not strictly sorted from file 0");
+  seg_location versionsLoc;
+  uint32_t versionCount;
+  try {
+    maxdoc = (int32_t)segInfo.checkedVint();
+    uint32_t physicalFileCount = segInfo.checkedVint();
+    if (physicalFileCount == 0 || physicalFileCount > segInfo.left()) {
+      throw std::runtime_error("invalid physical-file count");
     }
-    physicalFileNums.push_back(fileNum);
-    previous = fileNum;
+    physicalFileNums.reserve(physicalFileCount);
+    uint32_t previous = 0;
+    for (uint32_t i = 0; i < physicalFileCount; i++) {
+      uint32_t fileNum = segInfo.checkedVint();
+      if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous) || fileNum > seg_location::maxFilenum()) {
+        throw std::runtime_error("physical-file list is not strictly sorted from file 0");
+      }
+      physicalFileNums.push_back(fileNum);
+      previous = fileNum;
+    }
+    versionsLoc = seg_location::checkedRead(segInfo);
+    versionCount = segInfo.checkedVint();
+  } catch (const std::runtime_error& e) {
+    invalidSegment(segInfoFile, e.what());
   }
-
-  auto versionsLoc = seg_location::read(firstIS);
-  uint32_t versionCount = firstIS.readVint();
   files.resize((size_t) physicalFileNums.back() + 1);
   streams = std::make_unique<StreamSlot[]>(files.size());
 
@@ -197,17 +230,19 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   }
 
   // Field count, offsets table, then the catalog they point into.
-  if (segInfoOffset < headerSize + (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no field index");
-  auto count = first.rangeStream((uint64_t)segInfoOffset - sizeof(int32_t), sizeof(int32_t)).readInt();
-  if (count < 0 || (int64_t)count * (int64_t)sizeof(uint32_t) > segInfoOffset - headerSize - (int64_t)sizeof(int32_t)) {
+  int64_t count = first.rangeStream((uint64_t)segInfoOffset - sizeof(int32_t), sizeof(int32_t)).readInt();
+  if (count < 0 || count > (segInfoOffset - (int64_t)sizeof(int32_t) - headerSize) / (int64_t)sizeof(uint32_t)) {
     invalidSegment(segInfoFile, "invalid field count");
   }
-  fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - (int64_t)count * sizeof(uint32_t);
+  fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - count * (int64_t)sizeof(uint32_t);
   fieldOffsets = (const uint32_t*)first.rangeStream((uint64_t)fieldOffsetsLoc, (uint64_t)count * sizeof(uint32_t)).ptr();
+  // Each offset is back from the table to a field's metadata, which starts with
+  // its name; the largest offset is the first entry, where the catalog begins.
   catalogStart = fieldOffsetsLoc;
-  for (int32_t i = 0; i < count; i++) {
-    // Field entries precede the table; the largest offset is the first entry.
-    if ((int64_t)fieldOffsets[i] > fieldOffsetsLoc - headerSize) invalidSegment(segInfoFile, "invalid field offset");
+  for (int64_t i = 0; i < count; i++) {
+    if (fieldOffsets[i] == 0 || fieldOffsets[i] > fieldOffsetsLoc - headerSize) {
+      invalidSegment(segInfoFile, "invalid field offset");
+    }
     catalogStart = std::min(catalogStart, fieldOffsetsLoc - (int64_t)fieldOffsets[i]);
   }
   catalog = first.rangeStream((uint64_t)catalogStart, (uint64_t)(firstSize - catalogStart));
@@ -223,18 +258,18 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   return true;
 }
 
-std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
+std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced) {
   // Try to create the PostingsReader - use private constructor
   auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
-  if (!reader->initializeFromFiles(dir, segId, missingFileOK, expectSynced)) {
+  if (!reader->initializeFromFiles(dir, segId, creatorEpoch, missingFileOK, expectSynced)) {
     return nullptr;  // Missing files and missingFileOK=true
   }
   return reader;
 }
 
-PostingsReader::PostingsReader(Directory& dir, uint64_t segId) {
+PostingsReader::PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch) {
   // missingFileOK=false throws on a missing file rather than returning false
-  initializeFromFiles(dir, segId, false);
+  initializeFromFiles(dir, segId, creatorEpoch, false, false);
 }
 
 PostingsReader::~PostingsReader() {
@@ -255,10 +290,16 @@ int32_t PostingsReader::findOrdinal(std::string_view name) const {
   const auto& input = catalog;
   const int64_t tableLoc = fieldOffsetsLoc - catalogStart;
   auto* end = fieldOffsets + nFields;
+  // Offsets were checked at open; a name must also end before the offsets table.
+  auto nameAt = [&](uint32_t offset) {
+    auto term = input.readPackedTerm(tableLoc - offset);
+    if (term.memorySize() > offset) throw std::runtime_error("Segment field name extends past the field metadata");
+    return term;
+  };
   auto* found = std::lower_bound(fieldOffsets, end, name, [&](uint32_t offset, std::string_view key) {
-    return input.readPackedTerm(tableLoc - offset) < key;
+    return nameAt(offset) < key;
   });
-  return found != end && input.readPackedTerm(tableLoc - *found) == name
+  return found != end && nameAt(*found) == name
       ? (int32_t)(found - fieldOffsets) : -1;
 }
 
@@ -286,6 +327,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     auto fresh = std::make_unique<Field>();
     FieldReader fields(*this, ordinal);
     fields.readFieldInfo(*fresh);
+    checkFieldLocations(files, *fresh);
     if (fresh->type == FieldType::BIN && (fresh->flags & FieldType::STORED) != 0) {
       fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
     }

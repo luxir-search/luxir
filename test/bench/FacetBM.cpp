@@ -28,7 +28,10 @@ using namespace luxir::test;
 //
 // TODO: optionally go through grpc for searching to see how much overhead that adds.
 //
-static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view ffield, bool para, int64_t topLimit = 10) {
+// Sets FieldFacet.term_filter on a benchmarked facet.
+using TermFilterSetup = void (*)(luxir::api::TermFilter&);
+
+static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view ffield, bool para, int64_t topLimit = 10, TermFilterSetup termFilter = nullptr) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (luxir::unit_tests) {
@@ -78,6 +81,9 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     // add the field we want to facet
     auto& facet = topDocs.facet("f", ffield);
     facet.limit(5);
+    if (termFilter != nullptr) {
+      termFilter(std::get<luxir::api::FieldFacet>(facet.rawOp().kind).term_filter.emplace());
+    }
 
     req->execute(para);
     // LOG_DEBUG("ENGINE REQ: {}", req->toString());
@@ -874,6 +880,27 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, u100k_s,        nDocs, shape, "all", "short_u1
 LUXIR_BENCHMARK_CAPTURE(BM_Facet, u100k_s_para,   nDocs, shape, "all", "short_u100k_s", true);
 LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s,          nDocs, shape, "all", "short_u1m_s", false);
 LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_para,     nDocs, shape, "all", "short_u1m_s", true);
+
+// term_filter over the 1M-value field (values are 0..999999 in decimal). A
+// prefix and an include list resolve to ord ranges; the general regex and the
+// partition read each competitive term.
+static void prefixNarrow(luxir::api::TermFilter& f) { f.prefix = "1234"; }
+static void prefixWide(luxir::api::TermFilter& f) { f.prefix = "9"; }
+static void regexGeneral(luxir::api::TermFilter& f) { f.regex = ".*99"; }
+static void partitionEighth(luxir::api::TermFilter& f) { f.partition = 0; f.num_partitions = 8; }
+static void includeTen(luxir::api::TermFilter& f) {
+  static constexpr std::string_view values[] = {"7", "70", "700", "7000", "70000",
+                                                "123", "1234", "12345", "123456", "999999"};
+  f.include = values;
+}
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_prefix_narrow, nDocs, shape, "all", "short_u1m_s", false, 10, prefixNarrow);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_prefix_wide,   nDocs, shape, "all", "short_u1m_s", false, 10, prefixWide);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_regex,         nDocs, shape, "all", "short_u1m_s", false, 10, regexGeneral);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_partition,     nDocs, shape, "all", "short_u1m_s", false, 10, partitionEighth);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_include,       nDocs, shape, "all", "short_u1m_s", false, 10, includeTen);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u1m_s,          nDocs, shape, "1%", "short_u1m_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u1m_s_prefix_narrow, nDocs, shape, "1%", "short_u1m_s", false, 10, prefixNarrow);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u1m_s_regex,    nDocs, shape, "1%", "short_u1m_s", false, 10, regexGeneral);
 
 
 // test different domain sizes

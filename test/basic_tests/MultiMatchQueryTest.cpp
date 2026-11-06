@@ -9,6 +9,8 @@
 #include <map>
 #include <optional>
 #include <typeindex>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -83,6 +85,16 @@ public:
     return query;
   }
 
+  // Scores without, then with, the two-field pair table.
+  auto runPairTable(const api::Query& query) {
+    auto& threshold = CombinedFieldQuery::pairTableMinEvaluationsForTests;
+    auto restore = scope_guard([&threshold, saved = threshold] { threshold = saved; });
+    threshold = std::numeric_limits<int64_t>::max();
+    auto summed = run(query);
+    threshold = 0;
+    return std::pair(summed, run(query));
+  }
+
   float score(const api::Query& query, const std::string& id) {
     auto hits = run(query);
     return hits && hits->contains(id) ? hits->at(id) : 0.0f;
@@ -123,6 +135,43 @@ TEST_F(MultiMatchQueryTest, scoresMatchBm25fFormula) {
   EXPECT_GT(hits->at("d1"), hits->at("d2"));
 }
 
+// The scorer's norm tables and fast rounding match std::round, clamping and
+// intToByte4 over the weighted lengths for every pair of field norms.
+TEST(CombinedFieldNormTest, normTablesMatchReference) {
+  auto reference = [](double length) {
+    double rounded = std::min(std::round(length), (double)std::numeric_limits<int32_t>::max());
+    return SmallFloat::intToByte4((int32_t)rounded);
+  };
+  std::vector<uint8_t> pairNorms(256 * 256);
+  std::pair<float, float> weights[] = {{1.0f, 1.0f}, {2.0f, 1.0f}, {0.3f, 1.7f},
+                                       {1.5f, 0.25f}, {1e-3f, 3e9f}};
+  for (auto [w0, w1] : weights) {
+    CombinedFieldQuery::fillPairNorms(pairNorms, w0, w1);
+    for (int c0 = 0; c0 < 256; c0++) {
+      for (int c1 = 0; c1 < 256; c1++) {
+        double length = (double)w0 * (double)SmallFloat::decodeLengthByte((uint8_t)c0)
+            + (double)w1 * (double)SmallFloat::decodeLengthByte((uint8_t)c1);
+        ASSERT_EQ(reference(length), pairNorms[c0 << 8 | c1]) << w0 << " " << w1 << " " << c0 << " " << c1;
+        ASSERT_EQ(reference(length), CombinedFieldQuery::encodeLength(length));
+      }
+    }
+  }
+  for (double length : {0.0, 0.49999999999999994, 0.5, 2.5, 23.5, 24.5, 1e9 + 0.5,
+                        2147483646.5, 2147483647.0, 1e300}) {
+    EXPECT_EQ(reference(length), CombinedFieldQuery::encodeLength(length)) << length;
+  }
+}
+
+// Both fields have flat norms here, so a lowered threshold scores through the
+// shared pair table instead of summing the weighted lengths.
+TEST_F(MultiMatchQueryTest, pairNormTableScoresMatchSummedLengths) {
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune desert", {{"title_un", 1.3f}, {"body_un", 0.7f}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+}
+
 // title_un in 1 of 3 docs is under half density, so its norms are sparse and
 // a doc without a title adds no title length.
 class MultiMatchSparseNormsTest : public MultiMatchQueryTest {
@@ -151,6 +200,50 @@ TEST_F(MultiMatchSparseNormsTest, missingFieldAddsNoLength) {
   // s1: freq 2*1 + 1, length 2*1 + 2; s2: freq 1, length 3 (no title)
   EXPECT_NEAR(bm25f(3.0f, 4.0f), hits->at("s1"), 1e-6);
   EXPECT_NEAR(bm25f(1.0f, 3.0f), hits->at("s2"), 1e-6);
+}
+
+// The pair table reads s2's missing sparse title as code 0. s4's segment has no
+// titles, so it scores through body_un's single-field table instead.
+TEST_F(MultiMatchSparseNormsTest, normTablesReadMissingFieldsAsZero) {
+  helper.index(flatdoc("id", "s4", "body_un", "dune desert planet"), UpdateMessage::COMMIT);
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(3u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+  EXPECT_EQ(summed->at("s2"), summed->at("s4"));
+}
+
+// Three fields have no pair table and sum their weighted lengths before rounding.
+class MultiMatchThreeFieldsTest : public MultiMatchQueryTest {
+public:
+  void SetUp() override {
+    helper.index(flatdoc("id", "t1", "title_un", "dune", "body_un", "a desert planet",
+                         "note_un", "dune dune"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "t2", "title_un", "sand", "body_un", "dune",
+                         "note_un", "empire of sand"), UpdateMessage::COMMIT);
+  }
+};
+
+TEST_F(MultiMatchThreeFieldsTest, scoresMatchBm25fFormula) {
+  auto [summed, tabled] = runPairTable(qb::multiMatch(mr(), "dune",
+      {{"title_un", 2.0f}, {"body_un", {}}, {"note_un", 0.5f}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+
+  // docCount = 2; weighted sumTotalTermFreq = 2*2 + 4 + 0.5*5; df = max(1, 1, 1)
+  Similarity sim;
+  float idf = sim.idf(1, 2);
+  float avgdl = (float)(10.5 / 2.0);
+  auto bm25f = [&](float freq, float length) {
+    return Similarity::BM25Scorer(1.0f, sim.k1, sim.b, idf, avgdl)
+        .score(freq, SmallFloat::intToByte4((int32_t)length));
+  };
+  // t1: freq 2*1 + 0.5*2, length 2*1 + 3 + 0.5*2
+  // t2: freq 1, length 2*1 + 1 + 0.5*3 = 4.5, rounded half up to 5
+  EXPECT_NEAR(bm25f(3.0f, 6.0f), summed->at("t1"), 1e-6);
+  EXPECT_NEAR(bm25f(1.0f, 5.0f), summed->at("t2"), 1e-6);
 }
 
 TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {

@@ -75,9 +75,10 @@ public:
   void awaitReplicas(ReplicaWait spec, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);
   void awaitReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
                      Clock::time_point deadline, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);
-  void registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept override;
+  void registered(const CollectionId& name, const std::shared_ptr<Collection>& collection, uint64_t revision = 0) noexcept override;
+  void remapped(std::string_view tenant, uint64_t revision, std::span<const Binding> changes) noexcept override;
   void updated(const CollectionId& name, const Collection& collection) noexcept override;
-  void removed(const CollectionId& name) noexcept override;
+  void removed(const CollectionId& name, uint64_t revision = 0) noexcept override;
   // Called for acks and expiry, and after advancing an injected clock in tests.
   // `name` null: acknowledgments of any collection changed (e.g. expiry).
   void acknowledged(const CollectionId* name);
