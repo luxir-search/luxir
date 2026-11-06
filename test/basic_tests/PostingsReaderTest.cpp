@@ -6,6 +6,7 @@
 #include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/SegmentTest.h"
 #include "test/CollectionHelper.h"
@@ -270,13 +271,17 @@ TEST_F(FieldMetadataTest, columnBoundsComeFromTheSummary) {
   ASSERT_TRUE(helper.index(test::flatdoc("id", "two", "dense_i", INT64_MAX - 7,
       "multi_is", std::vector<int64_t>{4, 4}), UpdateMessage::COMMIT).success);
   auto writer = helper.getIndexWriter();
-  uint64_t segId = writer->snapshots.readers.getReader()->segments()[0].segInfo.seg_id;
-  auto summary = SegmentSummary::open(writer->dir, SegmentSummary::overlayFileName(segId));
+  auto durable = test::readDurableIndexInfo(writer->dir);
+  const auto& segment = durable.info.segments[0];
+  uint64_t segId = segment.seg_id, epoch = segment.creator_epoch;
+  auto overlay = std::ranges::find(segment.overlays, SegmentSummary::OVERLAY_KIND, &api::AuxIndexInfo::kind);
+  ASSERT_NE(segment.overlays.end(), overlay);
+  auto summary = SegmentSummary::open(writer->dir, overlay->files.front().name);
   ASSERT_NE(nullptr, summary);
 
   // The summary's bounds are the column's own.
-  auto fromColumn = PostingsReader::create(writer->dir, segId);
-  auto fromSummary = PostingsReader::create(writer->dir, segId, false, false, summary);
+  auto fromColumn = PostingsReader::create(writer->dir, segId, epoch);
+  auto fromSummary = PostingsReader::create(writer->dir, segId, epoch, false, false, summary);
   for (auto name : {"dense_i", "sparse_i", "multi_is"}) {
     auto* expected = fromColumn->fieldInfo(name);
     auto* actual = fromSummary->fieldInfo(name);
@@ -292,7 +297,7 @@ TEST_F(FieldMetadataTest, columnBoundsComeFromTheSummary) {
     if (record.fieldname == "dense_i") record.num_min = 1, record.num_max = 2;
     if (record.fieldname == "sparse_i") record.type = (uint32_t)FieldType::TEXT;
   }
-  auto crafted = PostingsReader::create(writer->dir, segId, false, false,
+  auto crafted = PostingsReader::create(writer->dir, segId, epoch, false, false,
                                         SegmentSummary::fromAggregate(records, true));
   EXPECT_EQ(1, crafted->fieldInfo("dense_i")->columnBounds->min);
   EXPECT_EQ(2, crafted->fieldInfo("dense_i")->columnBounds->max);
