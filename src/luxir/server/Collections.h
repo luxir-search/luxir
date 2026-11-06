@@ -203,6 +203,19 @@ public:
   void applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
                     const std::map<std::string, std::string>& desired,
                     std::vector<Prepared> prepared, std::span<const std::string> retained);
+  // Stops serving a collection and leaves its storage for another node: the
+  // writer commits what it holds and closes, and the entry goes. Searches
+  // already running finish; later ones get collection_not_found. Storage is
+  // not touched, so a layer that writes in the background settles its own
+  // directories once this returns, and a layer must stop listing the
+  // collection, or the next startup opens it again. Refused while a candidate
+  // is staged.
+  void detach(const CollectionId& id);
+  // Opens a collection that the tenant catalog selects and this node has not
+  // opened, as startup does for each (writers only). Throws
+  // CollectionExistsError when it is registered (even unavailable),
+  // CollectionNotFoundError when the catalog has no active incarnation for it.
+  std::shared_ptr<Collection> attach(const CollectionId& id);
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the

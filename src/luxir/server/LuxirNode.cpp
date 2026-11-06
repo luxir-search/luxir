@@ -211,6 +211,16 @@ void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
   collections_->swap(a, b);
 }
 
+void LuxirNode::detachCollection(const CollectionId& id) {
+  if (following() || readOnly()) throw ReadOnlyError("only a writer node detaches collections");
+  collections_->detach(id);
+}
+
+std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id) {
+  if (following() || readOnly()) throw ReadOnlyError("only a writer node attaches collections");
+  return collections_->attach(id);
+}
+
 void LuxirNode::deleteCollection(const CollectionId& id) {
   if (follower) follower->deleteOrphan(id);
   else collections_->remove(id);
