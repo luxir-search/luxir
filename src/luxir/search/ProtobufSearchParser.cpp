@@ -2212,7 +2212,11 @@ public:
         if (!everySegmentConstant) {
           everySegmentConstant = true;
           bool everySegmentEmpty = !req.reader->segments().empty();
+          // A segment the summaries prove empty counts as a zero metadata
+          // count, without opening it for the shortcut.
+          const SegmentMask& keyViable = pruning.viable(*query);
           for (auto& segment : req.reader->segments()) {
+            if (!keyViable.test((size_t)segment.ord)) continue;
             DocSet* rootDomain = !segment.hasDeletes()
                 ? nullptr : &segment.liveDocs()->docset();
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);

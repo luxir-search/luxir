@@ -332,6 +332,46 @@ TEST_F(CollectionSummaryTest, recomputedOnlyWhenSegmentsChange) {
   EXPECT_EQ(1u, find(manifestSummary(), "price_i")->segmentsWithField);
 }
 
+// A segment written before summaries existed has no sidecar: it may match
+// anything, so it is read normally, and the collection proves nothing until
+// a merge rewrites it with a summary.
+TEST_F(CollectionSummaryTest, segmentWithoutSummaryIsReadUntilAMergeWritesOne) {
+  indexThreeSegments();
+  ASSERT_TRUE(writer().testDropSegmentOverlay(SegmentSummary::OVERLAY_NAME, 0));
+  helper->commit();
+  EXPECT_FALSE(manifestSummary().complete);
+  auto query = [](std::string_view range) {
+    return std::string(R"({"ops":{"q":{"top_docs":{"query":{"range":{"field":"price_i",)") + std::string(range)
+        + R"(}},"limit":10,"count_limit":-1,"fields":["id"]}}}})";
+  };
+  std::string old = query(R"("lte":3)");
+  std::string none = query(R"("gte":100)");
+  std::string middle = query(R"("gte":11,"lte":13)");
+
+  reopenLazily();
+  auto reader = helper->collection().getShard()->getSnapshots().readers.getReader();
+  EXPECT_EQ(nullptr, reader->collectionSummary());
+  EXPECT_EQ(nullptr, reader->segments()[0].summary());
+  // Only the segment without a summary opens; the others are still proven
+  // empty, and the answers match a run without pruning.
+  EXPECT_EQ(1, searchOpens(none));
+  EXPECT_EQ(1, searchOpens(old));
+  EXPECT_EQ(2, searchOpens(middle));
+  EXPECT_NE(std::string::npos, render(old).find("\"found\":3")) << render(old);
+
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper->submit(merge).success);
+  EXPECT_TRUE(manifestSummary().complete);
+  reopenLazily();
+  reader = helper->collection().getShard()->getSnapshots().readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_NE(nullptr, reader->segments()[0].summary());
+  EXPECT_NE(nullptr, reader->collectionSummary());
+  EXPECT_EQ(0, searchOpens(none));
+  EXPECT_NE(std::string::npos, render(old).find("\"found\":3")) << render(old);
+}
+
 // An op the collection summary proves empty answers as an empty match
 // without opening a segment, and identically to a run with pruning disabled.
 TEST_F(CollectionSummaryTest, provenEmptySearchOpensNoSegment) {
