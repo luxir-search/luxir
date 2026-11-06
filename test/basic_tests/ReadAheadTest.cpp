@@ -14,6 +14,8 @@
 
 #include "luxir/reader/RowReadAhead.h"
 #include "luxir/store/FSDirectory.h"
+#include "luxir/store/LazyInputFile.h"
+#include "luxir/store/ObjectStore.h"
 #include "luxir/util/Uuid.h"
 
 using namespace luxir;
@@ -183,6 +185,39 @@ TEST(ReadAheadTest, faultsTurnSparseAdviceOnAndResidentBatchesOff) {
   RowReadAhead hot(gate, cold.file.get(), 0, STRIDE, (int64_t)((8 << 20) / STRIDE));
   hot.sparseAt(0, 1000, [&](int64_t k) { hot.queueRows(hotFirst + 2 * k, hotFirst + 2 * k + 1); });
   EXPECT_FALSE(hot.active());
+}
+
+// A sequence too short to reach the gate's fault check: a cold probe alone
+// starts the advice, at the next step.
+TEST(ReadAheadTest, coldProbeAdvisesAtTheNextSparseStep) {
+  ColdFile cold(8 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  RowReadAhead::Gate gate;
+  RowReadAhead ahead(gate, cold.file.get(), 0, 1, 8 << 20);
+  auto queue = [&](int64_t k) { ahead.queueRows(k * (1 << 20), (k + 1) * (1 << 20)); };
+  ahead.sparseAt(0, 8, queue);
+  EXPECT_FALSE(ahead.active());
+  EXPECT_EQ(cold.resident(0, 1 << 20), 0u);
+  ahead.probe({(4 << 20) + 100});
+  EXPECT_TRUE(ahead.active());
+  ahead.sparseAt(1, 8, queue);
+  EXPECT_TRUE(cold.waitResident(1 << 20, 1 << 20));
+}
+
+// A lazy file is never advised: its fetches bypass the fault counters, and
+// each advice would be a request of its own.  Its readers declare ranges.
+TEST(ReadAheadTest, lazyFilesBypassTheGate) {
+  auto store = std::make_shared<RamObjectStore>();
+  store->put("k", std::string(1 << 16, 'x'));
+  LazyInputFile file(store, "k", 1 << 16, 4096);
+  RowReadAhead::Gate gate;
+  RowReadAhead ahead(gate, &file, 0, 1, 1 << 16);
+  ahead.probe({1 << 15});
+  for (int64_t k = 0; k < 16; k++) {
+    ahead.sparseAt(k, 16, [&](int64_t unit) { ahead.queueRows(unit * 4096, (unit + 1) * 4096); });
+  }
+  EXPECT_FALSE(ahead.active());
+  EXPECT_EQ(file.fetchRequests(), 0u);
 }
 
 TEST(ReadAheadTest, scanAdvisesAWindowAheadOfTheCursor) {

@@ -23,6 +23,9 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/store/LazyInputFile.h"
+#include "luxir/store/ObjectStore.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -83,10 +86,11 @@ void indexSegment(CollectionHelper& h, int64_t first, int64_t count) {
 }
 
 std::vector<std::string> knnIds(CollectionHelper& h, const std::vector<float>& q, bool exact,
-                                int32_t refine, bool groups = false, int32_t parallel = 1, int32_t k = 10) {
+                                int32_t refine, bool groups = false, int32_t parallel = 1, int32_t k = 10,
+                                int32_t nprobe = ALL_LISTS) {
   auto req = localReq(h.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q").limit(k).fields({"id"});
-  cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, k, ALL_LISTS, exact, refine);
+  cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, k, nprobe, exact, refine);
   api::Collapse collapse;
   std::array<std::string_view, 1> fields{"id"};
   if (groups) {
@@ -799,5 +803,83 @@ TEST_F(VectorAnnCodecTest, intervalEndpointsSupportPaddedDimensionsAndQueryBits)
     h.commit({"*"});
     std::vector<float> query((size_t)dims, 0);
     EXPECT_EQ(knnIds(h, query, false, 0, false, 1, 1), knnIds(h, query, true, 0, false, 1, 1));
+  }
+}
+
+// On object storage an overlay is a lazy file: opening it and searching it
+// fetch the footer, the list sizes, the FAISS header (centroids, codebooks)
+// and the lists the search probes, not the whole file, and find what the
+// writer's local copy finds.
+TEST(VectorLazyOverlayTest, knnFetchesOnlyTheProbedLists) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  for (const auto& ann : {pqAnn(0, 0, 4), rabitqAnn()}) {
+    std::string name = "lazy_vec_" + newUuid();
+    LuxirConfig config;
+    config.store.backend = "ram_object";
+    config.store.options = {{"ram_object", {{"store_name", name}, {"chunk_bytes", "512"}}}};
+    auto store = RamObjectStore::named(name);
+    std::vector<std::vector<float>> queries;
+    for (int32_t q = 0; q < 4; q++) queries.push_back(clustered(1'000'000 + q, q % CLUSTERS));
+    std::vector<std::vector<std::string>> local;
+    {
+      LuxirNode node(config);
+      CollectionHelper h(node, "main");
+      installAnn(h.collection(), api::VectorMetric::IP, ann);
+      indexSegment(h, 0, 8000);
+      for (const auto& q : queries) local.push_back(knnIds(h, q, false, 0, false, 1, 10, 2));
+    }
+    store->resetStats();
+    {
+      LuxirNode node(config);
+      CollectionHelper h(node, "main");
+      std::shared_ptr<IndexReader> reader;
+      auto aux = overlays(h, reader);
+      ASSERT_EQ(aux.size(), 1u);
+      ASSERT_NE(aux[0], nullptr);
+      auto layout = aux[0]->getListLayout();
+      // This overlay is small enough for the default gap to merge every list.
+      auto* lazy = dynamic_cast<LazyInputFile*>(layout.file);
+      ASSERT_NE(lazy, nullptr);
+      lazy->setPrefetchGap(0);
+      EXPECT_EQ(knnIds(h, queries[0], false, 0, false, 1, 10, 2), local[0]);
+
+      uint64_t overlayBytes = 0, fetched = 0;
+      std::vector<RamObjectStore::Request> reads;
+      for (const auto& r : store->requestLog()) {
+        if (r.op == "read" && r.name.contains("__vec.")) reads.push_back(r);
+      }
+      ASSERT_FALSE(reads.empty());
+      overlayBytes = store->storedBytes(reads[0].name);
+      for (const auto& r : reads) fetched += r.length;
+      // Bytes [begin, end) all fetched.
+      auto fetchedAll = [&](size_t begin, size_t end) {
+        std::vector<bool> covered(end - begin);
+        for (const auto& r : reads) {
+          for (size_t b = std::max<size_t>(begin, r.offset); b < std::min<size_t>(end, r.offset + r.length); b++)
+            covered[b - begin] = true;
+        }
+        return std::ranges::all_of(covered, [](bool c) { return c; });
+      };
+      EXPECT_TRUE(fetchedAll(0, 1));                                  // the FAISS header
+      EXPECT_TRUE(fetchedAll(overlayBytes - 1, overlayBytes));        // the footer
+      // Lists whose codes were fetched: the probed ones, and a neighbour
+      // whose codes all share a chunk with them.
+      size_t listsRead = 0, nlist = layout.offsets.size() - 1;
+      for (size_t l = 0; l < nlist; l++) {
+        size_t first = layout.offsets[l], end = layout.offsets[l + 1];
+        if (end > first && fetchedAll(layout.codes + first * layout.codeSize, layout.codes + end * layout.codeSize)) {
+          listsRead++;
+        }
+      }
+      EXPECT_GT(listsRead, 0u);
+      EXPECT_LT(listsRead, nlist / 8) << "of " << nlist << " lists";
+      EXPECT_LT(fetched, overlayBytes / 4) << "fetched " << fetched << " of " << overlayBytes;
+      for (size_t q = 1; q < queries.size(); q++) {
+        EXPECT_EQ(knnIds(h, queries[q], false, 0, false, 1, 10, 2), local[q]);
+      }
+    }
+    store.reset();
+    RamObjectStore::drop(name);
   }
 }

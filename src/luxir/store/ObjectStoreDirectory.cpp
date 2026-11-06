@@ -17,6 +17,15 @@ namespace luxir {
 
 namespace {
 
+// A vector overlay, s<seg>__vec.<field>_<gen>_<fnum>
+// (Postings::getSegmentOverlayFileName). A rebuild writes a new name, so the
+// object never changes under a reader, and VectorAuxReader reads it by range.
+bool isVectorOverlay(std::string_view name) {
+  if (!name.starts_with(Postings::PREFIX_FNAME)) return false;
+  auto sep = name.find("__");
+  return sep != std::string_view::npos && name.substr(sep + 2).starts_with("vec.");
+}
+
 // One sequential checksum pass over an object: ranged reads of a bounded
 // buffer, never the mapping, so verification streams without materializing.
 // The handle counts as a reader of the object until it is destroyed, so a
@@ -244,10 +253,11 @@ std::shared_ptr<InputFile> ObjectStoreDirectory::openCounted(std::string_view na
   }
   auto data = Hotcache::parseDataFile(name);
   if (!data) {
-    // Not segment data (STATE, a commit manifest, live docs, an overlay): it
+    // Not segment data (STATE, a commit manifest, live docs, a summary): it
     // is read whole and may be replaced in place, so never leave it half
-    // fetched.
-    file->read();
+    // fetched. A vector overlay is read by range: a kNN search fetches the
+    // lists it probes.
+    if (!isVectorOverlay(name)) file->read();
   } else if (auto cache = hotcacheOf(data->segStr)) {
     auto ranges = cache->rangesOf(data->fileNum);
     if (!ranges.empty()) file->prefetchRanges(ranges);
