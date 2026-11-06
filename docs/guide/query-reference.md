@@ -85,11 +85,37 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
+| `case_insensitive` | Ignore simple Unicode case on indexed TEXT/STRING/ID; numeric/date ignore it. Default `false`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
+
+With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
+value matches indexed terms that differ only in simple Unicode case: `FOO`
+matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants
+of one token score as one word, with the exact case of the query preferred
+slightly. The analyzed/normalized query token has frequency weight 1.0;
+other case variants have weight 0.9. Weighted frequencies are summed per
+document before BM25 saturation, with shared statistics (maximum document
+frequency and summed total term frequency). A rare spelling gets no extra
+IDF. These term weights do not affect field lengths. `operator`, `min_match`, and
+boosts still apply over the analyzed query tokens. Filters match the same
+variants without computing scores.
+
+If analysis already erases the token's case, ordinary term lookup and scoring
+are retained. Case expansion is slower than using a folding TEXT variant such
+as `_t`, `_un`, or `_wl`; prefer those for frequent case-blind matching.
+Alternates come from the token **after query-time analysis**, without analyzing
+them again. Case-preserving stemmed fields can therefore be lopsided: KStem
+stems only lowercase words, so `ponies` can become `pony` while `PONIES` stays
+`PONIES`; case expansion cannot bridge the different stems.
+
+Numeric and date fields ignore the flag. Simple case folding is one-to-one,
+so sharp s (U+00DF) does not match `SS`. For frequent case-blind STRING matching,
+prefer a [STRING normalizer](schema.md#string-normalization-and-length) with
+`lowercase` or `nfkc_cf`, so ordinary `match` uses an exact term lookup.
 
 ## Exact membership (`any_of`)
 
@@ -135,7 +161,10 @@ POST /collections/authors/_search
 | `values` | Exact values; any matching value admits the document. |
 
 STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
-representations can use their columns.
+representations can use their columns. DATE members are exact instants in
+the field's unit: an ISO member uses its floored start, even for a partial
+date. Members outside the stored date domain are dropped. Match/range date
+literals retain their granularity windows.
 
 STRING literals are whole values and use the same normalizer as ingest. TEXT
 literals use exact token membership: each value must analyze to at most one
@@ -257,6 +286,28 @@ apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
 
+| Field | Meaning |
+|---|---|
+| `field` | Indexed term field. Required. |
+| `prefix` | Literal prefix, including any `*`, `?`, or backslashes. Required. |
+| `case_insensitive` | After normalization, also match other simple Unicode case forms. Default `false`. |
+| `max_expansions` | Unset or `0`: every term with the prefix. Any positive `N` (no upper bound): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+
+A short prefix over a large dictionary can expand to hundreds of thousands of
+terms, and an unscored or exactly counted request then reads every one of their
+postings lists. `max_expansions` bounds the selected postings lists, while
+selection still scans every matching term. The terms are chosen per segment,
+so a term just outside the cut can match in one segment and not in another.
+Both capped and complete expansions are subject to any operator-configured limits in
+[Expansion limits](#expansion-limits). Selection memory counts toward the
+request memory ceiling.
+
+With `case_insensitive`, the entire prefix is normalized once, then matched
+through a case-alternating automaton. TEXT, STRING, and ID are supported, and
+queries are constant-scoring. `max_expansions` selects by document frequency
+across the accepted case variants. The expression form is
+`prefix(err, field=body_w, case_insensitive=true)`.
+
 ## Wildcard
 
 ```json
@@ -267,12 +318,17 @@ matches documents with at least one indexed term for the field.
 |---|---|
 | `field` | Indexed term field. Required. |
 | `pattern` | `*` matches any bytes, `?` matches one codepoint, `\` escapes the next character. Required. |
+| `case_insensitive` | Literal characters also match their other simple Unicode case forms. Default `false`. |
 
 The pattern matches an entire indexed term. On TEXT fields, literal characters
 fold the way the field folds text, while `*`, `?`, and escapes are syntax and
 never fold; STRING fields also normalize literal characters; ID fields use
-literals verbatim. Wildcard queries are constant-scoring. The expression form
-is `wildcard(du*, field=title_t)`.
+literals verbatim. With `case_insensitive`, each literal character, escaped or
+not, also matches the lower, upper, and title forms of its folded form, so
+`err*` matches `ERROR` and `Error` on a case-preserving field. Wildcard
+queries are constant-scoring. The expression form is
+`wildcard(du*, field=title_t)`, or
+`wildcard(du*, field=title_t, case_insensitive=true)`.
 
 ## Regex
 
@@ -284,14 +340,18 @@ is `wildcard(du*, field=title_t)`.
 |---|---|
 | `field` | Indexed term field. Required. |
 | `pattern` | Anchored whole-term regular expression: `\|`, concatenation, groups, repetition, `.`, and character classes. Required. |
+| `case_insensitive` | Literals and character classes also match their other simple Unicode case forms. Default `false`. |
 
 The match is anchored to the whole indexed term, so `mess` does not match
 `messiah` but `mess.*` does; `^` and `$` are literal characters. On TEXT
 fields, literal characters fold the way the field folds text; character
 classes and ranges are codepoint-exact. STRING fields also normalize literal
-characters; ID fields use literals verbatim. Regex queries are
-constant-scoring.
-The expression form is `regex(dune|kings, field=title_t)`.
+characters; ID fields use literals verbatim. With `case_insensitive`, literals
+also match their other simple Unicode case forms, and character classes and
+ranges add the case forms of their members before negation: `[a-c]` matches
+`B`, and `[^a]` rejects both `a` and `A`. Regex queries are constant-scoring.
+The expression form is `regex(dune|kings, field=title_t)`. Case expansion counts
+toward the pattern complexity budget.
 
 ## Fuzzy
 
@@ -313,10 +373,9 @@ The expression form is `regex(dune|kings, field=title_t)`.
 | `term` | Term to compare. TEXT normalizes/folds without tokenizing; STRING uses its normalizer if present; ID uses it verbatim. Required. |
 | `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
-| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
+| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; any positive value (no upper bound) pins the cap. |
 
-The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. Truncation is not reported in the response. Scoring uses
+Terms past the cap are dropped without a response warning. Scoring uses
 blended BM25 statistics; filter context is constant-scoring, but both use the
 same expansion set and match set. Simple-query syntax still warns when it
 clamps an unsupported edit distance before constructing the fuzzy query.
@@ -332,11 +391,43 @@ Use at most one lower bound (`gte` or `gt`) and one upper bound (`lte` or
 exists query.
 
 Numeric and date fields compare column values. Date bounds accept epoch
-milliseconds, ISO-8601, partial dates, and date math; see
+numbers in the field's unit (`ms` or `ns`), ISO-8601, partial dates, and date math; see
 [Dates and time zones](dates.md). String, ID, and text fields range over indexed
 terms in byte order with constant scores. Text bounds receive the field's
 normalization/folding but are not tokenized; STRING bounds use its normalizer.
 The bare field uses the value binding, including a range with no bounds.
+Term ranges are subject to any operator-configured [Expansion limits](#expansion-limits).
+
+## Expansion limits
+
+Prefix, wildcard, regex, term-range, fuzzy, and `case_insensitive` match queries
+expand against the field's term dictionary, so their cost grows with its cardinality. Every
+expansion limit is an operator opt-in, off by default. With limits off, a broad
+pattern on a high-cardinality field simply runs. Operators exposing a public
+endpoint can set these options to bound dictionary work and postings estimates.
+
+When a configured limit is exceeded, the request fails with
+`RESOURCE_EXHAUSTED`, naming the query and limit, never a truncated match set.
+A request cannot raise or disable an operator limit. The outcome depends only
+on the request's total, not timing, though work can run slightly past a limit
+before the request stops. A filter served from cache scans nothing and counts
+nothing.
+
+| Error code | Cause |
+|---|---|
+| `too_many_expansions` | A query expands more terms in one segment than the configured cap. A merge can change whether the query passes. |
+| `too_many_terms_examined` | Dictionary scans, matching or not, exceed the request-wide configured visit limit, including fuzzy scans and refills. |
+| `too_many_expansion_postings` | The summed docFreq of selected terms exceeds the configured request-wide estimate limit. This counts estimated postings, not postings decoded; fuzzy's scored rewrite does not count toward it. |
+| `pattern_prefix_too_short` | An unbounded prefix, wildcard, or regex query has fewer literal leading bytes than the configured minimum. This rule looks only at the normalized pattern, never the index or cache. A type-ahead endpoint using N rejects keystrokes shorter than N. |
+
+A prefix query with `max_expansions` keeps at most that many terms per segment.
+The selected count is subject to any configured `too_many_expansions` cap, and
+its scan counts toward any configured terms-examined budget. `any_of` term
+lists are not capped by term count because the request already lists every
+term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
+prefix rule. Case-insensitive matching does not shorten the measured literal.
+Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
+See [Operations](operations.md) for the server settings.
 
 ## Constant score and boost
 
@@ -391,7 +482,11 @@ expression:
 | `min_score` | Optional. Documents whose rescored value is below it do not match. |
 
 The expression uses the same value-expression language as sorting (arithmetic,
-`def`, unary math, and reducers; see [Searching](searching.md#sorting)) and
+`def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
+`random`, reducers, and the Elasticsearch-style `gauss_decay`, `exp_decay`,
+and `linear_decay` decay functions; see
+[Searching](searching.md#sort-expressions-in-detail) and
+[Decay functions](searching.md#decay-functions)) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
@@ -678,14 +773,15 @@ in their own guides:
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
-- [`geo_box`, `geo_distance`, `geo_nearest`, and
+- [`geo_box`, `geo_distance`, `geo_polygon`, `geo_nearest`, and
   `distance_feature`](geo-search.md) cover coordinate order, inclusive
-  boundaries, dateline crossing, distance units, the `k` nearest documents
-  within filters, and proximity scoring.
+  boundaries, dateline crossing, distance units, unions of polygons with
+  holes, the `k` nearest documents within filters, and proximity scoring.
 
 ## Limits
 
-- `knn`, `geo_box`, `geo_distance`, `geo_nearest`, and `distance_feature` are
+- `knn`, `geo_box`, `geo_distance`, `geo_polygon`, `geo_nearest`, and
+  `distance_feature` are
   structured-only: expression functions cannot currently represent vector or
   coordinate-list arguments, so use the objects shown in the vector and geo
   guides.
@@ -700,5 +796,6 @@ in their own guides:
 - `multi_match.phrase` requires `per_field` mode and indexed positions on
   TEXT fields; it cannot be combined with an explicit `operator` or a
   positive `min_match`.
-- Fuzzy expansion truncation (the `64` clause budget and any lower operator
-  limit) is not reported in the response.
+- Fuzzy expansion truncation at `max_expansions` is not reported in the response.
+- Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
+  [Expansion limits](#expansion-limits).

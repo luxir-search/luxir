@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include "gtest/gtest.h"
 #include "test/LuxirTest.h"
@@ -2844,12 +2845,194 @@ TEST_F(TermScorerTest, phraseConjunctionDefersPositionChecks) {
 }
 
 
-// Regression for the norm-encoding fix (impact-scoring.md "Step 0"): the field-length
-// column stores the SmallFloat-encoded norm byte, not the raw token count. Before the
-// fix a doc over 40 tokens was mis-scored, and a doc over 255 tokens wrapped mod 256
-// (e.g. 256 -> byte 0 -> "length 0", the shortest-doc bonus), so a very long doc could
-// outscore a short one. With the same tf, the BM25 score must be monotone non-increasing
-// in length, with no wrap across the 40- and 255-token boundaries.
+TEST_F(TermScorerTest, nonTextTermScoresIgnoreSegmentOrdinals) {
+  TestIndex index;
+  TestField field(index, "value_s");
+  field.startIndexing();
+  field.add(0, "mango");
+  field.add(1, "zulu");
+  index.flush();
+  field.startIndexing();
+  field.add(0, "alpha");
+  field.add(1, "mango");
+  index.flush();
+  index.initReader();
+
+  Query::Context context(index.pool, *index.reader);
+  auto segments = index.reader->segments();
+  ASSERT_EQ(segments.size(), 2u);
+  constexpr float boost = 2.5f;
+  TermQuery query("value_s", "mango", boost);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  Similarity sim;
+  float expected = sim.idf(2, 4) / (1 + sim.k1) * boost;
+  int64_t previousOrd = -1;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    auto& segment = segments[(size_t)seg];
+    OrdColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("value_s"));
+    int64_t ord = column.firstOrdAt(seg);
+    if (seg > 0) {
+      EXPECT_NE(ord, previousOrd);
+    }
+    previousOrd = ord;
+    testScores(weight->createScorer(index.pool, segment), {seg}, {expected});
+  }
+}
+
+TEST_F(TermScorerTest, nonTextDisjunctionScoresIgnoreValueOrder) {
+  TestIndex index;
+  TestField field(index, "value_s");
+  field.startIndexing();
+  field.add(0, "alpha");
+  field.add(1, "zulu");
+  index.flush();
+  index.initReader();
+
+  Query::Context context(index.pool, *index.reader);
+  TermQuery alpha("value_s", "alpha");
+  TermQuery zulu("value_s", "zulu");
+  std::array<Query*, 2> terms{&alpha, &zulu};
+  BooleanQuery query({}, terms, {}, {});
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  float expected = Similarity().idf(1, 2) / (1 + Similarity().k1);
+  testScores(weight->createScorer(index.pool, index.reader->segments()[0]),
+             {0, 1}, {expected, expected});
+}
+
+TEST_F(TermScorerTest, nonTextTermScoresIgnoreOtherValues) {
+  TestIndex index;
+  TestField field(index, "value_ss");
+  field.startIndexing();
+  field.addStrings(0, {"mango"});
+  field.addStrings(1, {"alpha", "mango"});
+  field.addStrings(2, {"mango", "zulu"});
+  field.addStrings(3, {"alpha", "mango", "zulu"});
+  index.flush();
+  index.initReader();
+
+  Query::Context context(index.pool, *index.reader);
+  TermQuery query("value_ss", "mango");
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  float expected = Similarity().idf(4, 4) / (1 + Similarity().k1);
+  auto& segment = index.reader->segments()[0];
+  testScores(weight->createScorer(index.pool, segment), {0, 1, 2, 3},
+             {expected, expected, expected, expected});
+
+  // The span fill and survivor-only probe paths must agree with scalar scoring.
+  auto* block = (TermQuery::Scorer*)weight->createScorer(index.pool, segment);
+  std::array<int32_t, 4> docs;
+  std::array<float, 4> scores;
+  ASSERT_EQ(block->fillScoreBlock(docs.data(), scores.data(), 4, PostingsReader::END), 4);
+  auto* probe = (TermQuery::Scorer*)weight->createScorer(index.pool, segment);
+  for (int32_t doc = 0; doc < 4; doc++) {
+    EXPECT_EQ(docs[(size_t)doc], doc);
+    float score = 0.0f;
+    ASSERT_TRUE(probe->matchScoredProbe(doc, score));
+    EXPECT_EQ(score, scores[(size_t)doc]);
+    EXPECT_FLOAT_EQ(score, expected);
+  }
+}
+
+TEST_F(TermScorerTest, nonTextStringAndIdScores) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::MATCH;
+  field.column = false;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "alpha", "value", "mango"),
+                               flatdoc("id", "zulu", "value", "mango")},
+                              UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  for (auto [name, term, df] : {std::tuple{"value", "mango", 2},
+                               std::tuple{"id", "alpha", 1},
+                               std::tuple{"id", "zulu", 1}}) {
+    TermQuery query(name, term, 3.0f);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    int32_t count = 0;
+    for (auto& segment : reader->segments()) {
+      auto* scorer = weight->createScorer(pool, segment);
+      if (scorer == nullptr) continue;
+      while (scorer->next() != PostingsReader::END) {
+        EXPECT_FLOAT_EQ(scorer->score(), Similarity().idf(df, 2) / (1 + Similarity().k1) * 3.0f);
+        count++;
+      }
+    }
+    EXPECT_EQ(count, df);
+  }
+}
+
+TEST_F(TermScorerTest, noNormsSimilarityUsesNeutralLengthForEveryCode) {
+  Similarity sim;
+  Similarity::FieldStats fieldStats;
+  fieldStats.docsWithField = 10;
+  fieldStats.sumTotalTermFreq = 137;
+  Similarity::TermStats termStats;
+  termStats.docFreq = 3;
+  auto scorer = sim.getScorer(2.5f, fieldStats, termStats, false);
+  for (int32_t tf : {1, 2, 13}) {
+    float expected = sim.idf(fieldStats, termStats)
+        * (float)tf / ((float)tf + sim.k1) * 2.5f;
+    for (int32_t norm = 0; norm < 256; norm++) {
+      EXPECT_FLOAT_EQ(scorer.score((float)tf, norm), expected);
+    }
+  }
+}
+
+TEST_F(TermScorerTest, nonTextTermImpactBoundsAndTopKMatchExhaustive) {
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 17;
+  TestIndex index;
+  TestField field(index, "value_ss");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    if (doc < Postings::DOCS_BLOCK_SIZE) {
+      field.addStrings(doc, {"alpha", "zulu"});
+    } else {
+      field.addStrings(doc, {doc < N / 2 ? "alpha" : "zulu"});
+    }
+  }
+  index.flush();
+  index.initReader();
+
+  Query::Context context(index.pool, *index.reader);
+  auto& segment = index.reader->segments()[0];
+  TermQuery alpha("value_ss", "alpha", 2.5f);
+  TermQuery zulu("value_ss", "zulu");
+  auto* weight = alpha.createWeight(context, Query::NEED_SCORES);
+  auto* scorer = (TermQuery::Scorer*)weight->createScorer(index.pool, segment);
+  ASSERT_TRUE(scorer->hasImpacts());
+  ASSERT_EQ(scorer->next(), 0);
+  float score = scorer->score();
+  EXPECT_EQ(scorer->getMaxScore(PostingsReader::END), score);
+  EXPECT_EQ(scorer->getMaxScoreForSetup(N - 1), score);
+  for (int32_t target : {0, Postings::DOCS_BLOCK_SIZE, DocsEnumMeta::L1_DOCS - 1,
+                         DocsEnumMeta::L1_DOCS, N / 2 - 1}) {
+    int32_t upTo = scorer->advanceShallow(target);
+    EXPECT_EQ(scorer->getMaxScore(upTo), score);
+    EXPECT_EQ(scorer->refineMaxScore(upTo), score);
+  }
+  scorer->setMinCompetitiveScore(std::nextafter(score, std::numeric_limits<float>::infinity()));
+  EXPECT_EQ(scorer->next(), PostingsReader::END);
+  EXPECT_GT(scorer->skippedImpactBlocks, 0);
+
+  std::array<Query*, 2> terms{&alpha, &zulu};
+  BooleanQuery query({}, terms, {}, {});
+  for (int32_t k : {1, 10, 50}) {
+    auto exhaustive = runQueryTopK(*index.reader, query, k, false);
+    auto pruned = runQueryTopK(*index.reader, query, k, true);
+    assertQueryTopKExact(exhaustive, pruned);
+    EXPECT_EQ(exhaustive.visited, N);
+    EXPECT_LT(pruned.visited, exhaustive.visited);
+  }
+}
+
+// Regression for norm encoding: store the SmallFloat-encoded norm byte, not
+// the raw token count. A doc over 40 tokens was mis-scored, and one over 255
+// tokens wrapped mod 256 (e.g. 256 -> byte 0 -> "length 0"). With the same tf,
+// BM25 must be monotone non-increasing across the 40- and 255-token boundaries.
 TEST_F(TermScorerTest, normEncodingMonotone) {
   TestIndex testIndex;
   TestField f(testIndex, "foo_w");
@@ -4625,7 +4808,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   const int32_t N = DocsEnumMeta::L1_DOCS + 19;
   RAMDir dir;
   MemPool pool;
-  PostingsWriter postingsWriter(dir, 0, N + 16);
+  PostingsWriter postingsWriter(dir, 0, 1, N + 16);
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField("f");
@@ -4643,7 +4826,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0);
+  PostingsReader reader(dir, 0, 1);
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -7276,6 +7459,61 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
   }
 }
 
+// A membership window stops at its first empty intersection, not just an
+// empty first fill: two nonempty, disjoint fills skip the third filter, whose
+// postings resume past the skipped window (unaligned start, partial tail).
+TEST_F(TermScorerTest, WindowFilterStopsAtAnEmptyIntersectionAndResumes) {
+  CollectionHelper helper("main");
+  std::vector<Doc> docs;
+  auto inB = [](int32_t doc) {
+    return doc >= 64 && doc < 256 ? doc % 2 == 1 : doc % 3 == 0;
+  };
+  for (int32_t doc = 0; doc < 512; doc++) {
+    std::string body = "pad";
+    if (doc % 2 == 0) body += " filter_a";
+    if (inB(doc)) body += " filter_b";
+    if (doc % 5 == 0) body += " filter_c";
+    docs.push_back(flatdoc("id", "wfz_" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = context.topReader.segments()[0];
+  TermQuery filterA("body_w", "filter_a");
+  TermQuery filterB("body_w", "filter_b");
+  TermQuery filterC("body_w", "filter_c");
+  Query* filters[] = {&filterA, &filterB, &filterC};
+  auto scorers = pool.make_span<Query::Scorer*>(3);
+  for (size_t i = 0; i < 3; i++) {
+    auto* supplier = filters[i]->createWeight(context, 0)->scorerSupplier(pool, segment);
+    scorers[i] = buildScorerForTests(pool, *supplier, std::numeric_limits<int64_t>::max());
+  }
+  WindowFilter filter(pool, scorers);
+  SkipStatsGuard stats;
+  auto match = [&](int32_t doc) { return doc % 2 == 0 && inB(doc) && doc % 5 == 0; };
+  auto expectWindow = [&](int32_t start, int32_t end) {
+    int32_t expectedCard = 0;
+    for (int32_t doc = start; doc < end; doc++) expectedCard += match(doc);
+    EXPECT_EQ(filter.prepare(start, end), expectedCard) << start;
+    for (int32_t doc = start; doc < end; doc++) {
+      EXPECT_EQ(filter.accepts(doc), match(doc)) << "doc=" << doc;
+    }
+  };
+
+  expectWindow(0, 64);
+  EXPECT_EQ(SkipStats::countBulkFillCalls, 3);
+  expectWindow(64, 192);
+  EXPECT_EQ(SkipStats::countBulkFillCalls, 5);  // filter_c skipped
+  std::vector<uint64_t> bits(DocsEnumMeta::L1_DOCS / 64, ~0ULL);
+  filter.intersect(bits, 64);
+  EXPECT_TRUE(std::all_of(bits.begin(), bits.end(), [](uint64_t word) { return word == 0; }));
+  expectWindow(301, 459);
+  expectWindow(459, 512);
+  EXPECT_EQ(SkipStats::countBulkFillCalls, 11);
+}
+
 TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
   CollectionHelper helper("filter_mask_probe_score");
   const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
@@ -7362,6 +7600,96 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
                             typeid(BooleanQuery::ConjunctionBulkScorer));
   assertProbeFillEquivalent(groupedConjunctionQuery,
                             typeid(BooleanQuery::ConjunctionBulkScorer));
+}
+
+// A filtered body fills and probes its sparsest filter first and stops a
+// window's fill at the first empty intersection; a filter skipped in one
+// window resumes in the next.
+TEST_F(TermScorerTest, FilteredBodyFillsTheSparsestFilterFirstAndStopsWhenEmpty) {
+  CollectionHelper helper("filter_body_order");
+  const int32_t window = DocsEnumMeta::L1_DOCS;
+  const int32_t nDocs = 3 * window + 257;
+  auto sparse = [&](int32_t doc) {
+    int32_t w = doc / window;
+    return (w == 0 || w == 2) && doc % 7 == 0;
+  };
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "pad";
+    if (doc % 3 == 0) body += " body";
+    if (doc % 2 == 0) body += " half";
+    if (doc % 50 == 0) body += " rare";
+    if (sparse(doc)) body += " sparse_f";
+    docs.push_back(flatdoc("id", "order_" + std::to_string(doc), "body_w", body,
+                           "dense_i", (int64_t)(doc % 2)));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
+  ASSERT_EQ(reader->maxDoc(), nDocs);
+
+  auto matching = [&](auto pred) {
+    std::vector<int32_t> out;
+    for (int32_t doc = 0; doc < nDocs; doc++) {
+      if (pred(doc)) out.push_back(doc);
+    }
+    return out;
+  };
+  TermQuery body("body_w", "body");
+  TermQuery sparseFilter("body_w", "sparse_f");
+  NumericPredicateQuery denseFilter("dense_i", 0, 0);
+  struct Run {
+    std::vector<int32_t> docs;
+    int64_t filterFills;  // fillWindowBits calls, every filter
+  };
+  auto run = [&](Query& bodyQuery, std::vector<Query*> filters, bool forceFill) {
+    FilterMaskProbeGuard probeGuard(forceFill);
+    SkipStatsGuard stats;
+    std::vector<Query*> mandatory = {&bodyQuery};
+    BooleanQuery query(mandatory, {}, {}, filters);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto& segment = context.topReader.segments()[0];
+    auto* bulk = weight->scorerSupplier(pool, segment)->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    TopDocsCollector collector(nDocs);
+    if (bulk != nullptr) {
+      collectTopKWindowed(0, bulk, nullptr, collector, nullptr, segment.maxDoc(), true);
+    }
+    std::vector<int32_t> found;
+    for (const auto& hit : sortedCollectorDocs(collector)) found.push_back(hit.doc.docId());
+    std::sort(found.begin(), found.end());
+    return Run{found, SkipStats::countBulkFillCalls};
+  };
+  // Fill: with a filter that never empties a window, both filters fill
+  // every window the body reaches. Either plan order runs the sparse filter
+  // first, and the windows it leaves empty skip the dense column's fill.
+  TermQuery everyFilter("body_w", "pad");
+  int64_t everyWindow = run(body, {&denseFilter, &everyFilter}, true).filterFills;
+  EXPECT_GT(everyWindow, 0);
+  auto expected = matching([&](int32_t doc) {
+    return doc % 3 == 0 && sparse(doc) && doc % 2 == 0;
+  });
+  Run denseFirst = run(body, {&denseFilter, &sparseFilter}, true);
+  Run sparseFirst = run(body, {&sparseFilter, &denseFilter}, true);
+  EXPECT_EQ(denseFirst.docs, expected);
+  EXPECT_EQ(sparseFirst.docs, expected);
+  EXPECT_LT(denseFirst.filterFills, everyWindow);
+  EXPECT_EQ(denseFirst.filterFills, sparseFirst.filterFills);
+
+  // Probe: a rare body over filters of at least 1/8 density probes them,
+  // filling nothing, in either plan order.
+  TermQuery rare("body_w", "rare");
+  TermQuery half("body_w", "half");
+  auto probed = matching([](int32_t doc) { return doc % 150 == 0; });
+  for (auto filters : {std::vector<Query*>{&half, &body}, std::vector<Query*>{&body, &half}}) {
+    Run probe = run(rare, filters, false);
+    Run fill = run(rare, filters, true);
+    EXPECT_EQ(probe.filterFills, 0);
+    EXPECT_GT(fill.filterFills, 0);
+    EXPECT_EQ(probe.docs, probed);
+    EXPECT_EQ(fill.docs, probed);
+  }
 }
 
 TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
@@ -7523,6 +7851,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     std::vector<segdoc> docs;
     std::type_index bulkType;
     int64_t fillCalls;
+    int64_t pointArms;
   };
   auto run = [&](Query& query, bool pull, bool forceFill,
                  bool disableShapes) {
@@ -7557,7 +7886,9 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     return Run{std::move(resultDocs),
                bulk == nullptr ? std::type_index(typeid(void))
                                : std::type_index(typeid(*bulk)),
-               SkipStats::countBulkFillCalls};
+               SkipStats::countBulkFillCalls,
+               SkipStats::numericPredicatePointsArms
+                   + SkipStats::numericPredicateComplementArms};
   };
 
   for (const auto& shape : cases) {
@@ -7573,7 +7904,11 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
       Run fill = run(*shape.query, false, true, false);
       EXPECT_EQ(fill.bulkType, shape.bulkType);
       EXPECT_EQ(fill.docs, pull.docs);
-      EXPECT_GT(fill.fillCalls, attached.fillCalls);
+      EXPECT_GE(fill.pointArms, attached.pointArms);
+      // A fill that does not produce the range fills its windows.
+      if (fill.pointArms == 0) {
+        EXPECT_GT(fill.fillCalls, attached.fillCalls);
+      }
     }
   }
 }

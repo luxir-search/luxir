@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/BKDWriter.h"
+#include "luxir/util/MemPool.h"
 #include "luxir/util/geo.h"
 
 namespace luxir {
@@ -42,6 +44,21 @@ inline BKDLongitudeRelation compareBKDLongitudeInterval(
   bool disjointLower = intervalMax < cellMin;
   return {insideUpper || insideLower, disjointUpper && disjointLower};
 }
+
+// One box matches() in the planner's point emissions (Query::Demand):
+// GeoBM's box test takes 0.43-0.54 ns per point (release, 2026-11-03), and a
+// forced BKD box emits a point in 0.69 ns (GeoQuery.h, CROSSING_POINTS).
+inline constexpr double BOX_TEST_POINTS = 0.7;
+
+// What one point test costs beyond a box test, in point emissions: exact for
+// a point beside the boundary, as in a crossing BKD leaf, and average over
+// the relation's box. quoted says the price is measured, so a verifier may
+// quote it to the planner.
+struct BKDPointCost {
+  double exact = 0.0;
+  double average = 0.0;
+  bool quoted = true;
+};
 
 // Inclusive encoded-space box. Reversed longitude bounds describe one
 // wrapped interval and are evaluated as two arms inside one traversal.
@@ -77,6 +94,9 @@ struct BKDBoxRelation {
     return latMin <= lat && lat <= latMax
         && geo::longitudeInRange(lon, lonMin, lonMax);
   }
+
+  // The box test is the unit the other relations' tests are priced in.
+  BKDPointCost pointCost() const { return {}; }
 };
 
 struct BKDDistanceRelation {
@@ -177,6 +197,284 @@ public:
     return pointSortKey(geo::decodeLatitude(lat), geo::decodeLongitude(lon))
         <= sortKey;
   }
+
+  // Priced like a box test and not quoted: its verification is not measured.
+  BKDPointCost pointCost() const { return {0.0, 0.0, false}; }
+};
+
+// A relation's answers precomputed on a grid of at most 64 x 64 cells over an
+// encoded box, as in Lucene's GeoEncodingUtils, so most point tests are one
+// lookup. Each cell holds the relation's own compare() of it, so a lookup
+// answers like the relation's exact test for any point of the cell, and only
+// CROSSES cells need that test.
+struct BKDRelationGrid {
+  static constexpr uint32_t ARITY = 64;
+
+  std::span<const BKDRelation> cells;  // row-major, rows by latitude
+  uint32_t latBase = 0;                // first row's biased latitude >> latShift
+  uint32_t lonBase = 0;
+  int32_t latShift = 0;
+  int32_t lonShift = 0;
+  uint32_t latCells = 0;
+  uint32_t lonCells = 0;
+
+  // The cell holding a point of the box the grid was built over.
+  BKDRelation at(int32_t lat, int32_t lon) const {
+    uint32_t row = (biased(lat) >> latShift) - latBase;
+    uint32_t column = (biased(lon) >> lonShift) - lonBase;
+    return cells[(size_t)row * lonCells + column];
+  }
+
+  // The share of cells that are CROSSES.
+  double crossShare() const {
+    if (cells.empty()) return 0.0;
+    auto crosses = std::ranges::count(cells, BKDRelation::CROSSES);
+    return (double)crosses / (double)cells.size();
+  }
+
+  // The encoded box {latMin, latMax, lonMin, lonMax} of the block of cells
+  // from (row, column) spanning rows x columns.
+  std::array<int32_t, 4> blockBox(uint32_t row, uint32_t column, uint32_t rows,
+                                  uint32_t columns) const {
+    uint64_t lat = (uint64_t)(latBase + row) << latShift;
+    uint64_t lon = (uint64_t)(lonBase + column) << lonShift;
+    return {unbiased(lat), unbiased(lat + ((uint64_t)rows << latShift) - 1),
+            unbiased(lon), unbiased(lon + ((uint64_t)columns << lonShift) - 1)};
+  }
+
+  // Grid over the inclusive encoded box, which must not be empty or wrap.
+  template <class Relation>
+  static BKDRelationGrid build(MemPool& pool, const Relation& relation,
+                               int32_t latMin, int32_t latMax,
+                               int32_t lonMin, int32_t lonMax) {
+    BKDRelationGrid grid;
+    grid.latShift = shiftFor(biased(latMin), biased(latMax));
+    grid.lonShift = shiftFor(biased(lonMin), biased(lonMax));
+    grid.latBase = biased(latMin) >> grid.latShift;
+    grid.lonBase = biased(lonMin) >> grid.lonShift;
+    grid.latCells = (biased(latMax) >> grid.latShift) - grid.latBase + 1;
+    grid.lonCells = (biased(lonMax) >> grid.lonShift) - grid.lonBase + 1;
+    auto cells = pool.make_span<BKDRelation>((size_t)grid.latCells * grid.lonCells);
+    grid.fill(relation, cells, 0, 0, ARITY);
+    grid.cells = cells;
+    return grid;
+  }
+
+private:
+  // Compares the aligned size x size block at (row, column), clipped to the
+  // grid, and fills it when that answer holds for each of its cells, else
+  // splits it in four. A cell of a block that a bounding box rejects, or
+  // that no edge touches, gets the same answer from its own compare(), so
+  // the cells equal per-cell compares at a fraction of the calls.
+  template <class Relation>
+  void fill(const Relation& relation, std::span<BKDRelation> out, uint32_t row,
+            uint32_t column, uint32_t size) const {
+    if (row >= latCells || column >= lonCells) return;
+    uint32_t rows = std::min(size, latCells - row);
+    uint32_t columns = std::min(size, lonCells - column);
+    auto [cellLatMin, cellLatMax, cellLonMin, cellLonMax] =
+        blockBox(row, column, rows, columns);
+    BKDRelation answer =
+        relation.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+    if (answer != BKDRelation::CROSSES || size == 1) {
+      for (uint32_t r = row; r < row + rows; r++) {
+        std::fill_n(out.begin() + (ptrdiff_t)((size_t)r * lonCells + column), columns, answer);
+      }
+      return;
+    }
+    uint32_t half = size / 2;
+    fill(relation, out, row, column, half);
+    fill(relation, out, row, column + half, half);
+    fill(relation, out, row + half, column, half);
+    fill(relation, out, row + half, column + half, half);
+  }
+
+  // Encoded coordinates with the sign bit flipped, so unsigned order is
+  // coordinate order.
+  static uint32_t biased(int32_t value) { return (uint32_t)value ^ UINT32_C(0x80000000); }
+  static int32_t unbiased(uint64_t value) { return (int32_t)((uint32_t)value ^ UINT32_C(0x80000000)); }
+
+  // The smallest shift that maps [min, max] onto at most ARITY cells.
+  static int32_t shiftFor(uint32_t min, uint32_t max) {
+    int32_t shift = 0;
+    while ((max >> shift) - (min >> shift) >= ARITY) shift++;
+    return shift;
+  }
+};
+
+// A union of polygons over decoded point coordinates (see geo::Polygon). A
+// cell is INSIDE when one polygon holds all of it, OUTSIDE when every polygon
+// misses it, and CROSSES otherwise. Against one polygon, a cell outside its
+// bounding box is OUTSIDE; otherwise a cell that no ring edge touches lies
+// wholly inside or wholly outside the polygon, and one corner decides which.
+// The cell is widened by a tiny margin for the edge test so rounding cannot
+// call a cell INSIDE while a point in it tests outside. A point test looks up
+// the relation's grid first and runs the edge trees only in CROSSES cells.
+// build() makes the trees and the grid once per query, in flat pool arrays,
+// so copies of the relation share them.
+struct BKDPolygonRelation {
+  static constexpr double EDGE_MARGIN = 1e-9;
+
+  // One polygon and its bounding box in encoded space.
+  struct Part {
+    geo::Polygon polygon;
+    int32_t latMin;
+    int32_t latMax;
+    int32_t lonMin;
+    int32_t lonMax;
+
+    static Part of(const geo::Polygon& polygon) {
+      return {polygon,
+              geo::encodeLatitudeCeil(polygon.box.minLat),
+              geo::encodeLatitude(polygon.box.maxLat),
+              geo::encodeLongitudeCeil(polygon.box.minLon),
+              geo::encodeLongitude(polygon.box.maxLon)};
+    }
+
+    BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                        int32_t cellLonMin, int32_t cellLonMax) const {
+      if (cellLatMax < latMin || latMax < cellLatMin
+          || cellLonMax < lonMin || lonMax < cellLonMin) {
+        return BKDRelation::OUTSIDE;
+      }
+      double minLat = geo::decodeLatitude(cellLatMin);
+      double maxLat = geo::decodeLatitude(cellLatMax);
+      double minLon = geo::decodeLongitude(cellLonMin);
+      double maxLon = geo::decodeLongitude(cellLonMax);
+      if (polygon.edgeTouches(minLat - EDGE_MARGIN, maxLat + EDGE_MARGIN,
+                              minLon - EDGE_MARGIN, maxLon + EDGE_MARGIN)) {
+        return BKDRelation::CROSSES;
+      }
+      return polygon.contains(minLat, minLon)
+          ? BKDRelation::INSIDE : BKDRelation::OUTSIDE;
+    }
+
+    bool matches(int32_t lat, int32_t lon) const {
+      return latMin <= lat && lat <= latMax && lonMin <= lon && lon <= lonMax
+          && polygon.contains(geo::decodeLatitude(lat),
+                              geo::decodeLongitude(lon));
+    }
+  };
+
+  std::span<const Part> parts;
+  // The encoded bounding box of every part.
+  int32_t latMin = std::numeric_limits<int32_t>::max();
+  int32_t latMax = std::numeric_limits<int32_t>::min();
+  int32_t lonMin = std::numeric_limits<int32_t>::max();
+  int32_t lonMax = std::numeric_limits<int32_t>::min();
+  BKDRelationGrid grid;
+  BKDPointCost cost;
+
+  // The trees and grid live in pool, which must outlive the relation and its
+  // copies; the rings may go once this returns.
+  static BKDPolygonRelation build(MemPool& pool,
+                                  std::span<const geo::PolygonRings> polygons) {
+    auto tree = [&pool](std::span<const geo::LatLon> ring) {
+      return geo::EdgeTree::build(ring, pool.make_span<geo::Edge>(ring.size()));
+    };
+    auto parts = pool.make_span<Part>(polygons.size());
+    for (size_t i = 0; i < polygons.size(); i++) {
+      auto holes = pool.make_span<geo::EdgeTree>(polygons[i].holes.size());
+      for (size_t h = 0; h < holes.size(); h++) holes[h] = tree(polygons[i].holes[h]);
+      parts[i] = Part::of(geo::Polygon::of(tree(polygons[i].outer), holes));
+    }
+    BKDPolygonRelation relation(parts);
+    if (relation.latMin <= relation.latMax && relation.lonMin <= relation.lonMax) {
+      relation.grid = BKDRelationGrid::build(pool, relation, relation.latMin,
+                                             relation.latMax, relation.lonMin,
+                                             relation.lonMax);
+    }
+    relation.cost = relation.pointCostOf(relation.grid.crossShare());
+    return relation;
+  }
+
+  BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                      int32_t cellLonMin, int32_t cellLonMax) const {
+    if (cellLatMax < latMin || latMax < cellLatMin
+        || cellLonMax < lonMin || lonMax < cellLonMin) {
+      return BKDRelation::OUTSIDE;
+    }
+    bool crosses = false;
+    for (const Part& part : parts) {
+      BKDRelation relation =
+          part.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+      if (relation == BKDRelation::INSIDE) return relation;
+      crosses |= relation == BKDRelation::CROSSES;
+    }
+    return crosses ? BKDRelation::CROSSES : BKDRelation::OUTSIDE;
+  }
+
+  bool matches(int32_t lat, int32_t lon) const {
+    if (lat < latMin || latMax < lat || lon < lonMin || lonMax < lon) {
+      return false;
+    }
+    BKDRelation cell = grid.at(lat, lon);
+    if (cell != BKDRelation::CROSSES) return cell == BKDRelation::INSIDE;
+    return std::ranges::any_of(parts, [lat, lon](const Part& part) {
+      return part.matches(lat, lon);
+    });
+  }
+
+  BKDPointCost pointCost() const { return cost; }
+
+private:
+  explicit BKDPolygonRelation(std::span<const Part> parts) : parts(parts) {
+    for (const Part& part : parts) {
+      latMin = std::min(latMin, part.latMin);
+      latMax = std::max(latMax, part.latMax);
+      lonMin = std::min(lonMin, part.lonMin);
+      lonMax = std::max(lonMax, part.lonMax);
+    }
+  }
+
+  // One ring walk: a root-to-leaf descent, about log2 V nodes, for each edge
+  // spanning the point's latitude, which averages the ring's summed edge
+  // latitude extents over its own. Lucene's EdgeTree bound is O(k log V).
+  static double walkNodes(const geo::EdgeTree& tree) {
+    double low = tree.edges.front().low;
+    double high = low;
+    double spans = 0.0;
+    for (const geo::Edge& edge : tree.edges) {
+      high = std::max({high, edge.lat1, edge.lat2});
+      spans += std::abs(edge.lat1 - edge.lat2);
+    }
+    double stabbed = high > low ? spans / (high - low) : 0.0;
+    return (1.0 + stabbed) * std::log2((double)tree.edges.size() + 1.0);
+  }
+
+  static double boxArea(int32_t latLow, int32_t latHigh, int32_t lonLow, int32_t lonHigh) {
+    if (latHigh < latLow || lonHigh < lonLow) return 0.0;
+    return ((double)latHigh - latLow + 1.0) * ((double)lonHigh - lonLow + 1.0);
+  }
+
+  // The model counts in half box tests: two box tests for the box and grid
+  // lookups, one per part's box check, and 3 per walked node. A point walks
+  // the parts whose box holds it, so each part's walks are weighted by its
+  // box's share of the union box; a point beside a boundary is in at least
+  // one part's box, so the weights scale up to sum to at least one. That
+  // point lands in a crossing grid cell and pays the walks in full; a point
+  // anywhere in the box pays them in the grid's crossing share. Fitted on
+  // noisy circles of 100 to 100k vertices to within 25% of GeoBM's measured
+  // ratio to a box test (release, 2026-11-03).
+  BKDPointCost pointCostOf(double crossShare) const {
+    double area = boxArea(latMin, latMax, lonMin, lonMax);
+    double checks = 0.0;
+    double shares = 0.0;
+    double walks = 0.0;
+    for (const Part& part : parts) {
+      double share = area > 0.0
+          ? boxArea(part.latMin, part.latMax, part.lonMin, part.lonMax) / area : 0.0;
+      double nodes = walkNodes(part.polygon.outer);
+      for (const geo::EdgeTree& hole : part.polygon.holes) nodes += walkNodes(hole);
+      checks += 2.0;
+      shares += share;
+      walks += share * 3.0 * nodes;
+    }
+    if (shares > 0.0 && shares < 1.0) walks /= shares;
+    double crossing = checks + walks;
+    auto extra = [](double halves) { return (halves / 2.0 - 1.0) * BOX_TEST_POINTS; };
+    return {extra(4.0 + crossing), extra(4.0 + crossShare * crossing), true};
+  }
 };
 
 class BKDReader {
@@ -212,6 +510,8 @@ public:
   struct EstimateResult {
     uint64_t estimatedCount;
     uint64_t upperBound;
+    // Points of the crossing leaves, which an intersection tests one by one.
+    uint64_t crossingPoints = 0;
   };
 
   struct Scratch {
@@ -451,6 +751,19 @@ public:
   uint32_t leafCount() const { return leavesCount; }
   uint16_t maxPointsPerLeaf() const { return leafSizeMax; }
   uint64_t sizeInBytes() const { return byteSize; }
+
+  // Points in leaves [firstLeaf, firstLeaf + leaves). Every leaf but the
+  // last is full (the writer's partition; validate() checks it), so the
+  // population follows from leaf positions without reading leaf headers.
+  uint64_t leafRangePoints(uint32_t firstLeaf, uint32_t leaves) const {
+    if ((uint64_t)firstLeaf + leaves > leavesCount) {
+      throw std::out_of_range("BKDReader: leaf range");
+    }
+    uint64_t begin = (uint64_t)firstLeaf * leafSizeMax;
+    uint64_t end = std::min(pointsCount,
+                            ((uint64_t)firstLeaf + leaves) * leafSizeMax);
+    return end - begin;
+  }
 
   InnerNode innerNode(uint32_t nodeId) const {
     if (nodeId == 0 || nodeId >= leavesCount) {
@@ -811,13 +1124,7 @@ public:
   EstimateResult estimateIntersect(Relation&& relation) const {
     uint64_t estimated = 0;
     uint64_t upper = 0;
-    auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
-      for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-        uint64_t count = leafInfo(leaf).count;
-        estimated += count;
-        upper += count;
-      }
-    };
+    uint64_t crossing = 0;
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
                      uint32_t firstLeaf, int32_t cellLatMin,
                      int32_t cellLatMax, int32_t cellLonMin,
@@ -826,7 +1133,9 @@ public:
           cellLatMin, cellLatMax, cellLonMin, cellLonMax);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        addLeaves(firstLeaf, leaves);
+        uint64_t points = leafRangePoints(firstLeaf, leaves);
+        estimated += points;
+        upper += points;
         return;
       }
       if (leaves != 1) {
@@ -858,11 +1167,12 @@ public:
       } else if (tight == BKDRelation::CROSSES) {
         estimated += ((uint64_t)info.count + 1) / 2;
         upper += info.count;
+        crossing += info.count;
       }
     };
     visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
           INT32_MIN, INT32_MAX);
-    return {estimated, upper};
+    return {estimated, upper, crossing};
   }
 
   template <class Relation>
@@ -879,9 +1189,7 @@ public:
           cellLatMin, cellLatMax, cellLonMin, cellLonMax);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-          count += leafInfo(leaf).count;
-        }
+        count += leafRangePoints(firstLeaf, leaves);
         return;
       }
       if (leaves != 1) {

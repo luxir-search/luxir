@@ -56,6 +56,20 @@ TEST_F(ExecutionHierarchyTest, legacyDemandAdapterPreservesScalarAndUse) {
   EXPECT_EQ(Query::ExecutionUse::COUNT_WINDOWS, context.demand.horizon);
 }
 
+TEST_F(ExecutionHierarchyTest, exposedDemandScalesConsumerHints) {
+  Query::Demand demand = Query::Demand::fromLeadCost(800, Query::ExecutionUse::COUNT_WINDOWS);
+  demand.expectedCandidates = 400;
+  demand.sparedWork = 1000;
+  Query::Demand exposed = demand.exposedTo(250, 1000);
+  EXPECT_EQ(200, exposed.candidates);
+  EXPECT_EQ(250, exposed.span);
+  EXPECT_EQ(Query::ExecutionUse::COUNT_WINDOWS, exposed.horizon);
+  EXPECT_DOUBLE_EQ(100, exposed.expectedCandidates);
+  EXPECT_DOUBLE_EQ(250, exposed.sparedWork);
+  demand.expectedCandidates = -1;
+  EXPECT_DOUBLE_EQ(-1, demand.exposedTo(250, 1000).expectedCandidates);
+}
+
 TEST_F(ExecutionHierarchyTest, termPlanBuildsAllRecordedProducts) {
   TermQuery query("body_w", "rare");
   Query::Context context(pool, *reader);

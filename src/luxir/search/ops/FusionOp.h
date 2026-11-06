@@ -510,7 +510,7 @@ public:
       DocEmission emission = underBucketSlot()
           ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
-      emitDocsResponse(op.req, getDocList,
+      emitDocsResponse(op.req, op.flags, getDocList,
         numCollected,
         [this](int64_t i) { return fusedList[i].first; },
         [this](int64_t i) { return fusedList[i].second; },

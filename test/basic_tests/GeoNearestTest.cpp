@@ -225,7 +225,7 @@ void setSchema(CollectionHelper& helper) {
     auto& field = b.field(name);
     field.type = api::FieldDef::FieldClass::GEO_POINT;
     field.index = index ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
-    field.multi = multi;
+    if (multi) field.multi = api::FieldDef::MultiMode::DEFAULT;
   }
   b.set(helper.collection());
 }

@@ -16,7 +16,6 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/util/Cursor.h"
-#include "luxir/util/geo.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
 #include "luxir/value/ValueExpr.h"
@@ -35,12 +34,80 @@ struct ValueExprOptions {
 };
 
 class ValueExprParser {
+  class ValueConstantAnalysis {
+    std::vector<std::optional<ValueBounds>> bounds;
+    std::vector<ValueType> types;
+
+  public:
+    void clear() {
+      bounds.clear();
+      types.clear();
+    }
+
+    void append(const ValueNode& node, std::optional<ValueBounds> literal = std::nullopt) {
+      uint32_t index = (uint32_t)bounds.size();
+      std::optional<ValueBounds> result = literal;
+      if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
+        if (node.type == ValueType::INT64) {
+          result = ValueBounds::integer(node.intValue, node.intValue);
+        } else if (node.type == ValueType::DOUBLE) {
+          result = ValueBounds::floating(node.doubleValue, node.doubleValue);
+        }
+      } else if (node.kind == ValueNodeKind::FUNCTION) {
+        std::array<ValueBounds, VALUE_MAX_ARITY> children;
+        bool independent = true;
+        for (uint8_t child = 0; child < node.childCount; child++) {
+          const auto& childBounds = bounds[node.children[child]];
+          if (!childBounds.has_value()) {
+            independent = false;
+            children[child] = ValueBounds::unbounded(
+                types[node.children[child]], true);
+            continue;
+          }
+          children[child] = *childBounds;
+        }
+        ValueBounds value = node.function->bounds(
+            node, std::span<const ValueBounds>(children.data(), node.childCount));
+        if (value.certainty == BoundsCertainty::INVALID) {
+          if (value.invalidNode == UINT32_MAX) value.invalidNode = index;
+          result = value;
+        } else if (independent) {
+          result = value;
+        }
+      }
+      bounds.push_back(result);
+      types.push_back(node.type);
+    }
+
+    std::optional<ValueResult> scalar(uint32_t index) const {
+      const auto& rootBounds = bounds[index];
+      ValueType rootType = rootBounds.has_value() ? rootBounds->type : ValueType::COLUMN_ONLY;
+      if (!rootBounds.has_value()
+          || rootBounds->certainty != BoundsCertainty::BOUNDED
+          || rootBounds->mayBeMissing || rootBounds->alwaysMissing
+          || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
+        return std::nullopt;
+      }
+      if (rootType == ValueType::INT64
+          && rootBounds->intMin == rootBounds->intMax) {
+        return ValueResult::integer(rootBounds->intMin);
+      }
+      if (rootType == ValueType::DOUBLE
+          && rootBounds->doubleMin == rootBounds->doubleMax
+          && std::isfinite(rootBounds->doubleMin)) {
+        return ValueResult::floating(rootBounds->doubleMin);
+      }
+      return std::nullopt;
+    }
+  };
+
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
 
   const ValueExprOptions& opts;
   google::protobuf::Arena& arena;
   Cursor* cur = nullptr;
   ValueProgram* program = nullptr;
+  ValueConstantAnalysis constants;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
@@ -66,11 +133,15 @@ public:
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
+    constants.clear();
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
-    program->constantScalar = findConstantScalar();
+    if (program->root().nature == ValueNature::GEO_POINT) {
+      fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance()");
+    }
+    program->constantScalar = constants.scalar(program->rootNode);
     return program;
   }
 
@@ -96,80 +167,12 @@ public:
   }
 
 private:
-  std::optional<ValueResult> findConstantScalar() const {
-    std::vector<std::optional<ValueBounds>> bounds(program->nodes.size());
-    for (uint32_t index = 0; index < program->nodes.size(); index++) {
-      const ValueNode& node = program->nodes[index];
-      if (node.kind == ValueNodeKind::CONSTANT
-          || node.kind == ValueNodeKind::VARIABLE) {
-        if (node.type == ValueType::INT64) {
-          bounds[index] = ValueBounds::integer(node.intValue, node.intValue);
-        } else if (node.type == ValueType::DOUBLE) {
-          bounds[index] =
-              ValueBounds::floating(node.doubleValue, node.doubleValue);
-        } else if (node.arraySize != 0) {
-          if (node.type == ValueType::INT64_ARRAY) {
-            auto begin = program->intArrays.begin() + node.arrayOffset;
-            auto extrema =
-                std::minmax_element(begin, begin + node.arraySize);
-            ValueBounds value =
-                ValueBounds::integer(*extrema.first, *extrema.second);
-            value.type = node.type;
-            bounds[index] = value;
-          } else {
-            auto begin = program->doubleArrays.begin() + node.arrayOffset;
-            auto extrema =
-                std::minmax_element(begin, begin + node.arraySize);
-            ValueBounds value =
-                ValueBounds::floating(*extrema.first, *extrema.second);
-            value.type = node.type;
-            bounds[index] = value;
-          }
-        }
-      } else if (node.kind == ValueNodeKind::FUNCTION) {
-        std::array<ValueBounds, VALUE_MAX_ARITY> children;
-        bool independent = true;
-        for (uint8_t child = 0; child < node.childCount; child++) {
-          const auto& childBounds = bounds[node.children[child]];
-          if (!childBounds.has_value()) {
-            independent = false;
-            break;
-          }
-          children[child] = *childBounds;
-        }
-        if (independent) {
-          ValueBounds value = node.function->boundsPropagate(
-              node, std::span<const ValueBounds>(
-                        children.data(), node.childCount));
-          if (value.certainty != BoundsCertainty::INVALID) {
-            bounds[index] = value;
-          }
-        }
-      }
-    }
-
-    const auto& rootBounds = bounds[program->rootNode];
-    ValueType rootType = program->root().type;
-    if (!rootBounds.has_value()
-        || rootBounds->certainty != BoundsCertainty::BOUNDED
-        || rootBounds->mayBeMissing || rootBounds->alwaysMissing
-        || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
-      return std::nullopt;
-    }
-    if (rootType == ValueType::INT64
-        && rootBounds->intMin == rootBounds->intMax) {
-      return ValueResult::integer(rootBounds->intMin);
-    }
-    if (rootType == ValueType::DOUBLE
-        && rootBounds->doubleMin == rootBounds->doubleMax) {
-      return ValueResult::floating(rootBounds->doubleMin);
-    }
-    return std::nullopt;
-  }
-
   uint32_t append(ValueNode node) {
     program->addNode(node);
-    return (uint32_t)program->nodes.size() - 1;
+    uint32_t index = (uint32_t)program->nodes.size() - 1;
+    constants.append(node, node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE
+        ? std::optional<ValueBounds>(program->constantBounds(index)) : std::nullopt);
+    return index;
   }
 
   template <class Grammar>
@@ -304,7 +307,8 @@ private:
     bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
                    field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
     bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING;
-    if (!numeric && !stringSortable) fail(pos, fmt::format("field '{}' is not sortable", name));
+    bool geo = field->type() == FieldType::GEO_POINT;
+    if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));
     if (!field->hasColumn()) {
       fail(pos, fmt::format("field '{}' has no column values", name));
     }
@@ -314,7 +318,7 @@ private:
     node.columnType = field->type();
     node.columnMultiValued = field->multiValued();
     node.columnIndexed = field->indexed();
-    if (!numeric) {
+    if (!numeric && !geo) {
       node.type = ValueType::COLUMN_ONLY;
     } else {
       bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
@@ -322,7 +326,8 @@ private:
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->type() == FieldType::DATE
-          ? ValueNature::DATE : ValueNature::NUMBER;
+          ? dateValueNature(DateFieldType::unitOf(*field))
+          : geo ? ValueNature::GEO_POINT : ValueNature::NUMBER;
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
@@ -332,7 +337,6 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
-    if (name == "geo_distance") return parseGeoDistance(grammar, pos);
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -378,6 +382,25 @@ private:
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
     }
+    for (uint8_t i = 0; i < count; i++) {
+      if (function->operands[i].constant && !foldConstant(args[i])) {
+        fail(program->nodes[args[i]].sourcePos, fmt::format(
+            "{}() argument {} must be a constant numeric scalar", function->name, i + 1));
+      }
+    }
+    auto conversions = function->dateConversionOperands(
+        std::span<const ResolvedValue>(resolvedArgs.data(), count));
+    for (size_t convert = 0; convert < count; convert++) {
+      if (!conversions[convert]) continue;
+      ValueNode scale;
+      scale.intValue = 1000000;
+      scale.sourcePos = pos;
+      uint32_t factor = append(scale);
+      args[convert] = appendFunction(ValueFunctionRegistry::find("mul"), pos,
+                                     {args[convert], factor}, 2);
+      program->nodes[args[convert]].nature = ValueNature::DATE_NS;
+      resolvedArgs[convert].nature = ValueNature::DATE_NS;
+    }
 
     ValueNode node;
     node.kind = ValueNodeKind::FUNCTION;
@@ -388,81 +411,36 @@ private:
     node.sourcePos = pos;
     node.text = function->name;
     try {
-      ResolvedValue resolved = function->resolve(
+      ResolvedValue resolved = function->resolveOperands(
           std::span<const ResolvedValue>(resolvedArgs.data(), count));
       node.type = resolved.type;
       node.nature = resolved.nature;
+      if (function->prepare != nullptr) {
+        std::array<const ValueNode*, VALUE_MAX_ARITY> operands{};
+        for (uint8_t i = 0; i < count; i++) operands[i] = &program->nodes[args[i]];
+        function->prepare(node, {operands.data(), count});
+      }
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
     return append(node);
   }
 
-  double constantArg(uint32_t index, std::string_view function,
-                     std::string_view argument) {
-    const ValueNode& node = program->nodes[index];
-    bool constant = node.kind == ValueNodeKind::CONSTANT
-        || node.kind == ValueNodeKind::VARIABLE;
-    if (!constant || valueArray(node.type)) {
-      fail(node.sourcePos, fmt::format(
-          "{}() {} must be a numeric literal or scalar $variable", function, argument));
-    }
-    return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
+  bool foldConstant(uint32_t index) {
+    auto value = constants.scalar(index);
+    if (!value.has_value()) return false;
+    ValueNode& node = program->nodes[index];
+    ValueNode literal;
+    literal.type = value->type;
+    literal.nature = node.nature;
+    literal.sourcePos = node.sourcePos;
+    literal.text = node.text;
+    literal.intValue = value->intValue;
+    literal.doubleValue = value->doubleValue;
+    node = literal;
+    return true;
   }
 
-  // geo_distance(field, lat, lon): meters from (lat, lon) to each point of a
-  // GEO_POINT field, by the haversine formula geo_distance queries use.
-  template <class Grammar>
-  uint32_t parseGeoDistance(Grammar& grammar, size_t pos) {
-    std::array<uint32_t, VALUE_MAX_ARITY> args{};
-    grammar.parseArguments("geo_distance", pos, 3, 3, [&](uint8_t argument) {
-      if (argument != 0) {
-        args[argument] = grammar.parseExpression();
-        return;
-      }
-      cur->skipWs();
-      size_t fieldPos = cur->position();
-      std::string_view name = cur->peek() == '"' || cur->peek() == '\''
-          ? value::lex::scanQuoted(
-                *cur, program->resource,
-                [&](size_t at, std::string_view message) { fail(at, message); })
-          : value::lex::scanIdentifier(*cur);
-      if (name.empty()) fail(fieldPos, "geo_distance() expects a GEO_POINT field name first");
-      args[0] = parseGeoColumn(name, fieldPos);
-    });
-    double latitude = constantArg(args[1], "geo_distance", "latitude");
-    double longitude = constantArg(args[2], "geo_distance", "longitude");
-    try {
-      geo::checkLatitude(latitude);
-      geo::checkLongitude(longitude);
-    } catch (const std::invalid_argument& error) {
-      fail(pos, fmt::format("geo_distance(): {}", error.what()));
-    }
-    return appendFunction(ValueFunctionRegistry::find("geo_distance"), pos, args, 3);
-  }
-
-  uint32_t parseGeoColumn(std::string_view name, size_t pos) {
-    ResolvedFieldHandle target;
-    try {
-      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
-          : opts.schema->resolveFor(name, OpClass::VALUE);
-    } catch (const RequestError& e) {
-      fail(pos, e.what());
-    }
-    FieldType* field = target.fieldType;
-    if (field->type() != FieldType::GEO_POINT || !field->hasColumn()) {
-      fail(pos, fmt::format("geo_distance(): field '{}' is not a GEO_POINT field with column values",
-                            name));
-    }
-    ValueNode node;
-    node.kind = ValueNodeKind::COLUMN;
-    node.columnType = FieldType::GEO_POINT;
-    node.columnMultiValued = field->multiValued();
-    node.type = field->multiValued() ? ValueType::INT64_ARRAY : ValueType::INT64;
-    node.sourcePos = pos;
-    node.text = program->copyString(target.physicalName);
-    return append(node);
-  }
 };
 
 } // namespace luxir

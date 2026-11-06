@@ -47,14 +47,14 @@ protected:
     for (auto name : {"number", "numbers", "scan", "middle"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::INT;
-      field.multi = std::string_view(name) == "numbers";
+      field.multi = (std::string_view(name) == "numbers") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }
     for (auto name : {"geo", "geos", "geo_scan", "geo_full"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::GEO_POINT;
-      field.multi = std::string_view(name) == "geos";
+      field.multi = (std::string_view(name) == "geos") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "geo_scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }

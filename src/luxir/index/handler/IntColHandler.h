@@ -9,14 +9,15 @@
 #include "luxir/index/BKDWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IntColWriter.h"
-#include "luxir/index/handler/GeoPointWire.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <ranges>
+#include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
@@ -115,6 +116,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -194,11 +196,14 @@ public:
 };
 
 
+// Numeric sets sort and deduplicate encoded values before appending. Arrays
+// retain source order and repeats. GEO_POINT is always an array.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   IntStream lengthStream;
   DocStream docsWithVal;
+  std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
   int64_t numVals = 0;
   int32_t numDocs = 0;
 
@@ -223,21 +228,19 @@ public:
       return;
     }
     if (coerce::isNull(val)) return;
-    // Coercions last, element-wise through the field type.  Materialize the
-    // full array before indexMulti: a throw partway through a lazy transform
-    // would leave already-appended values without their doc/length entries
-    // (the column reconstructs positionally, corrupting later docs); a throw
-    // before any stream mutation just fails the doc.
-    std::vector<int64_t> encoded;
+    // Validate/materialize before mutating any stream. A failed coercion may
+    // retain scratch capacity, which still belongs to the inverter's budget.
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           elem, std::string_view(fieldName), inverter.coerceContext));
     });
     if (!wasArray) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           val, std::string_view(fieldName), inverter.coerceContext));
     }
-    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
+    appendDocValues(inverter);
   }
 
   void index(Inverter& inverter, int64_t int64) override {
@@ -256,12 +259,20 @@ public:
   }
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
-    int64_t n = 0;
-    for (auto val : values) {
-      longStream.addVal(inverter.pool, val);
-      n++;
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
+    for (auto val : values) docValues.push_back(val);
+    appendDocValues(inverter);
+  }
+
+  void appendDocValues(Inverter& inverter) {
+    if (docValues.empty()) return;
+    if (fieldType->multiSet()) {
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
     }
-    if (n == 0) return;
+    for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
+    int64_t n = (int64_t)docValues.size();
     numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);
@@ -283,6 +294,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -382,20 +394,11 @@ public:
   }
 };
 
-inline GeoPointWire geoPointWire(const PackedTerm& fieldName, FieldType& fieldType) {
-  const auto& geo = static_cast<const GeoPointFieldType&>(fieldType);
-  return {std::string_view(fieldName), geo.ignoreMalformed, geo.ignoreZValue};
-}
-
 class GeoPointHandler final : public IntColHandler {
 public:
   GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
                   const std::shared_ptr<FieldType>& fieldType)
     : IntColHandler(inverter, fieldName, fieldType) {}
-
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    indexSingle(inverter, geo::encodePoint(latitude, longitude));
-  }
 
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
@@ -404,20 +407,7 @@ public:
           "Field '{}' is single-valued but received multiple values",
           std::string_view(fieldName)));
     }
-    index(inverter, points[0].latitude, points[0].longitude);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    std::optional<GeoPoint> point;
-    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
-      if (point) {
-        throw DocumentError(fmt::format(
-            "Field '{}' is single-valued but received multiple values",
-            std::string_view(fieldName)));
-      }
-      point = p;
-    });
-    if (point) index(inverter, point->latitude, point->longitude);
+    indexSingle(inverter, geo::encodePoint(points[0].latitude, points[0].longitude));
   }
 };
 
@@ -427,29 +417,11 @@ public:
                        const std::shared_ptr<FieldType>& fieldType)
     : MultiIntColHandler(inverter, fieldName, fieldType) {}
 
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    int64_t packed = geo::encodePoint(latitude, longitude);
-    indexMulti(inverter, std::views::single(packed));
-  }
-
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
-    std::vector<int64_t> packed;
-    packed.reserve(points.size());
-    for (const auto& point : points) {
-      packed.push_back(geo::encodePoint(point.latitude, point.longitude));
-    }
-    indexMulti(inverter, packed);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    // Parse every point before indexing any (validate before mutate).
-    std::vector<GeoPoint> points;
-    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
-      points.push_back(p);
-    });
-    index(inverter, std::span<const GeoPoint>(points));
+    indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {
+      return geo::encodePoint(point.latitude, point.longitude);
+    }));
   }
 };
-
 
 } // namespace luxir::handler

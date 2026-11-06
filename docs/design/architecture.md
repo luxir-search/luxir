@@ -40,10 +40,10 @@ Most of what follows depends on segments being immutable:
 - Writers never modify what readers are using. A search pins a consistent
   snapshot for its whole lifetime; new commits swap in atomically without
   pausing queries.
-- Crash safety comes from the write protocol: files are written to a
-  temporary name, synced, and atomically renamed, and a commit point is
-  published only after the files it names are durable. After a crash the
-  index reopens at the previous commit.
+- Crash safety comes from the write protocol: `Directory::sync` makes both
+  file bytes and names durable before `publishFile` atomically publishes a
+  durable commit point. `deleteDurably` persists removals. After a crash the
+  index reopens at a complete commit.
 - Compaction is concurrent merging: merges produce new segments in the
   background and never stall ingest or search.
 
@@ -69,7 +69,10 @@ every core busy even when work is skewed.
   output streams with no coordination. Tasks are admitted against a
   node-wide indexing-RAM budget: merge memory is predictable up front from
   segment statistics, so heavy fields are priced exactly, scheduled
-  largest-first, and light column merges pack around them.
+  largest-first, and light column merges pack around them. A merge waiting
+  for that budget claims at most half of it from in-progress indexing, so
+  ingest keeps building large segments instead of flushing a small one per
+  batch to make room.
 
 ### Asynchronous network IO
 

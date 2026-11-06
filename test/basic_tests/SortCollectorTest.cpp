@@ -5178,3 +5178,31 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
     }
   }
 }
+
+// A non-indexed string column sorts by value; an empty string is a value and
+// must not tie with a missing one.
+TEST_F(SortCollectorTest, columnStringSortSeparatesEmptyFromMissing) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("col_s");
+  field.type = luxir::api::FieldDef::FieldClass::STRING;
+  field.index = luxir::api::FieldDef::IndexMode::NONE;
+  field.column = true;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "missing"),
+      flatdoc("id", "empty", "col_s", ""),
+      flatdoc("id", "x", "col_s", "x"),
+  }, UpdateMessage::COMMIT).success);
+  auto sortedIds = [&](qb::SortDir dir) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+    qb::sort(cur, "col_s", dir);
+    req->execute();
+    std::vector<std::string> ids;
+    for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
+    return ids;
+  };
+  EXPECT_EQ((std::vector<std::string>{"empty", "x", "missing"}), sortedIds(qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"x", "empty", "missing"}), sortedIds(qb::DESC));
+}

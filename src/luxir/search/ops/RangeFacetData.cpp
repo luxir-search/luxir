@@ -125,7 +125,8 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
     auto& segment = range.reader.segments()[(size_t)segnum];
     const auto* info = range.segInfos.at((size_t)segnum);
     if (disablePointsRangeFacetForTests || domain || segment.liveDocs() || !range.subOps.empty()
-        || !info || !info->columnBounds || !numericIdentityPoints(*info)) return false;
+        || !info || !info->columnBounds || !numericIdentityPoints(*info)
+        || !valuesAreDocuments(*info)) return false;
     auto [lo, hi] = *info->columnBounds;
     auto pool = MemPool::threadLocalPoolGuard();
     IntColReader column(segment.postingsReader(), *info);
@@ -233,11 +234,15 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
         }
       } counter{*this, *range.grid, data.window};
       if (range.facetSegIntZones(domain, segnum, data.missing_num, counter)) return;
-      range.facetSegIntCol(domain, segnum, data.missing_num,
-          [&](int32_t, int64_t value) LUXIR_INLINE {
-            if constexpr (Floating) if (!finite(value)) return;
-            data.window.add(value);
-          });
+      // observe() may rebase the directory. Dedup by the stable cell key,
+      // then increment the index from this observation before the next value.
+      size_t index = 0;
+      range.facetSegIntBuckets(domain, segnum, data.missing_num,
+          [&](int64_t value) -> std::optional<int64_t> {
+            if constexpr (Floating) if (!finite(value)) return std::nullopt;
+            index = data.window.observe(value);
+            return data.window.cellKey(index);
+          }, [&](int32_t, int64_t) LUXIR_INLINE { data.window.entry(index)++; });
     }
   }
 

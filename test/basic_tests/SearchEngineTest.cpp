@@ -7096,9 +7096,11 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
   EXPECT_EQ(0, planned.island);
   EXPECT_EQ(0, planned.numericGeoIsland);
   EXPECT_GT(planned.denseWindows, 0);
-  EXPECT_GT(planned.pointsArms, 0);
+  // The range covers a docid run: zones emit it as whole words, below the
+  // cost of decoding its points.
+  EXPECT_EQ(0, planned.pointsArms);
   EXPECT_EQ(0, planned.complementArms);
-  EXPECT_EQ(0, planned.zoneArms);
+  EXPECT_GT(planned.zoneArms, 0);
   EXPECT_EQ(0, planned.sparseVerifyArms);
   EXPECT_EQ(oracle.pointsArms, planned.pointsArms);
   EXPECT_EQ(oracle.complementArms, planned.complementArms);
@@ -7111,7 +7113,7 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
 }
 
 TEST_F(SearchEngineTest,
-       exhaustiveNumericCountBuildsPointsWhileFieldSortKeepsSparseVerify) {
+       exhaustiveNumericCountAndFieldSortMaterializeDensePoints) {
   constexpr std::string_view collection = "numeric_count_consumption";
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
@@ -7182,9 +7184,9 @@ TEST_F(SearchEngineTest,
   EXPECT_GT(count.pointsArms + count.complementArms, 0);
   EXPECT_EQ(0, count.sparseVerifyArms);
   EXPECT_EQ(0, count.island);
-  EXPECT_EQ(0, countShapesDisabled.pointsArms
-                   + countShapesDisabled.complementArms);
-  EXPECT_GT(countShapesDisabled.sparseVerifyArms, 0);
+  EXPECT_GT(countShapesDisabled.pointsArms
+                   + countShapesDisabled.complementArms, 0);
+  EXPECT_EQ(0, countShapesDisabled.sparseVerifyArms);
   EXPECT_EQ(0, countShapesDisabled.island);
 
   Run sorted = run(true, false);
@@ -7193,13 +7195,13 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(sorted.found, sortedShapesDisabled.found);
   EXPECT_EQ(sorted.ids, sortedShapesDisabled.ids);
   EXPECT_EQ(25u, sorted.ids.size());
-  EXPECT_EQ(0, sorted.pointsArms + sorted.complementArms);
-  EXPECT_GT(sorted.sparseVerifyArms, 0);
+  EXPECT_GT(sorted.pointsArms + sorted.complementArms, 0);
+  EXPECT_EQ(0, sorted.sparseVerifyArms);
   EXPECT_GT(sorted.fieldSortBulkCollections, 0);
 }
 
 TEST_F(SearchEngineTest,
-       exhaustiveNumericCountPricesMaterializationFromDemandSpan) {
+       exhaustiveNumericCountVerificationIgnoresUnconsumedSpan) {
   constexpr std::string_view collection = "numeric_count_lead_exposure";
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
@@ -7216,10 +7218,9 @@ TEST_F(SearchEngineTest,
   docs.reserve(N);
   int64_t expected = 0;
   for (int32_t doc = 0; doc < N; doc++) {
-    // One survivor per required term keeps the default
-    // minOther * WINDOW_SIZE span below the fat range fence. The scoped
-    // dense-threshold override only keeps this provably-tiny fixture on the
-    // refresh path so both build choices remain observable.
+    // A tiny candidate set should use verification even when a window fill
+    // would touch the whole segment. Keep the fixture on the dense count
+    // route to exercise candidate-only consumption within a window producer.
     bool first = doc % 10000 == 0;
     bool second = doc % 10001 == 0;
     expected += first && second && doc <= hi;
@@ -7272,8 +7273,9 @@ TEST_F(SearchEngineTest,
   EXPECT_GT(scaled.denseWindows, 0);
   EXPECT_EQ(0, scaled.pointsArms + scaled.complementArms);
   EXPECT_GT(scaled.sparseVerifyArms, 0);
-  EXPECT_GT(maxDocLike.pointsArms + maxDocLike.complementArms, 0);
-  EXPECT_EQ(0, maxDocLike.sparseVerifyArms);
+  EXPECT_GT(maxDocLike.denseWindows, 0);
+  EXPECT_EQ(0, maxDocLike.pointsArms + maxDocLike.complementArms);
+  EXPECT_GT(maxDocLike.sparseVerifyArms, 0);
 }
 
 TEST_F(SearchEngineTest,

@@ -35,7 +35,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 24> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 26> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -57,8 +57,10 @@ inline constexpr std::array<std::string_view, 24> ARM_NAMES = {
     "regex",          // RegexQuery
     "any_of",         // AnyOfQuery - exact scalar/list input
     "multi_match",    // MultiMatchQuery
-    "dis_max",        // DisMaxQuery
     "geo_nearest",    // GeoNearestQuery - not callable in this pass
+    "geo_polygon",    // GeoPolygonQuery - not callable in this pass
+    "dis_max",        // DisMaxQuery
+    "plugin",         // PluginQuery - called by the plugin's own name (QueryRegistry)
     "distance_feature", // DistanceFeatureQuery - not callable in this pass
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),

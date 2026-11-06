@@ -587,6 +587,13 @@ public:
   // Test hook: use the pull DisjunctionScorer for sparse filtered term unions
   // instead of head/tail WAND candidate formation.
   static inline bool disableFilteredUnionWandForTests = false;
+  // Test hook: keep every required verifier beside a constraining optional
+  // group instead of confirming the one the plan selects inside the leading
+  // exact group (sourceGroupVerifier).
+  static inline bool disableSourceGroupingForTests = false;
+  // Test hook: group the one verifier a source group's scope admits whatever
+  // its price, to compare the grouped schedule with the flat one.
+  static inline bool forceSourceGroupingForTests = false;
   // Test hook: use pull MandNot for prohibited scored disjunctions.
   static inline bool disableBulkExclusionForTests = false;
   // Test hook: bypass prohibited membership whose benefit comes from removing
@@ -657,6 +664,17 @@ public:
       DocsEnumMeta::L1_DOCS;
   static inline int64_t windowFillSpanScaleForTests =
       WINDOW_FILL_SPAN_SCALE;
+
+  // Flat exhaustive conjunctions only. Entry ordinals precede cost sorting.
+  struct ConjunctionControlForTests {
+    std::span<const size_t> order;
+    std::span<const MembershipConsumption> consumption;
+    bool proofs = true;
+    // Original ordinal, consumption stage, and position within that stage.
+    std::function<void(size_t, MembershipConsumption, size_t, ScorerSupplier&,
+                       const PlanContext&, const ScorerShape&)> observe;
+  };
+  static inline const ConjunctionControlForTests* conjunctionControlForTests = nullptr;
   // A cached DocSet has a cheap mask route, so a term may own the candidate
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.
@@ -1120,6 +1138,19 @@ public:
   static Query::Weight* makeDisjunctionWeight(
       Context& context, const Query& owner, std::span<Query*> clauses,
       ScorePolicy policy, int32_t flags, float multiplier);
+
+  // The route selected at construction/admission time. Runtime sampling
+  // may later latch a candidate route back to dense execution.
+  enum class ConjunctionRoute : uint8_t {
+    GENERIC,
+    CANDIDATE_DOC_SET_FILTER,
+    CANDIDATE_POSTINGS_FILTER,
+    CANDIDATE_SCORING_TERM,
+    COUNT_EXACT_DOCS_ONLY,
+    COUNT_POSTINGS_SAMPLE,
+    COUNT_DENSE,
+    COUNT_DOC_SET_SPARSE,
+  };
 
   struct ConjunctionClauseLayout {
     Query::ClauseShape windowFillKind = Query::ClauseShape::NONE;

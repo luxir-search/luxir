@@ -54,8 +54,10 @@ public:
   static Automaton charRange(int32_t min, int32_t max, Budget& budget);
   static Automaton codepoint(int32_t cp, Budget& budget) { return charRange(cp, cp, budget); }
   // A literal atom, folded through `folder` when one is supplied: the folded
-  // sequence concatenates as a unit (zero codepoints = epsilon).
-  static Automaton literal(int32_t cp, const CodepointFolder* folder, Budget& budget);
+  // sequence concatenates as a unit (zero codepoints = epsilon). With
+  // `caseInsensitive`, each folded codepoint also accepts its case alternates.
+  static Automaton literal(int32_t cp, const CodepointFolder* folder, bool caseInsensitive,
+                           Budget& budget);
   static Automaton anyChar(Budget& budget);
   static Automaton anyString(Budget& budget);
   static Automaton anyStringBytes(Budget& budget);

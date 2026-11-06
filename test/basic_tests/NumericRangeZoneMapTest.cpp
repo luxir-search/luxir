@@ -36,6 +36,7 @@ struct RangeRun {
   int64_t count = -1;
   int64_t cost = -1;
   bool zoneBulkAvailable = false;
+  Query::MatchState matchState = Query::MatchState::UNKNOWN;
 };
 
 std::vector<int32_t> collect(Query::Scorer* scorer) {
@@ -66,8 +67,12 @@ RangeRun runQuery(IndexReader& reader, NumericPredicateQuery& query) {
     run.zoneBulkAvailable = sparseSupplier->bulkScorer(pool) != nullptr;
     auto* sparsePlan = resolveScorerPlanForTests(pool, *sparseSupplier, 0);
     auto* sparse = sparsePlan->build(pool);
-    EXPECT_EQ(Query::ReportedTwoPhase::YES,
-              sparsePlan->shape().reportedTwoPhase);
+    run.matchState = sparsePlan->shape().matchState;
+    // A segment proven empty needs no verification phase.
+    if (run.matchState != Query::MatchState::EMPTY) {
+      EXPECT_EQ(Query::ReportedTwoPhase::YES,
+                sparsePlan->shape().reportedTwoPhase);
+    }
     run.sparseVerify = collect(sparse);
   }
 
@@ -276,6 +281,19 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
               oracle(extremeGcd, endpoint, endpoint));
   }
 
+  // Ranges strictly between lattice points cross a leaf's zone but hold no
+  // representable value. Execution still settles the blocks OUTSIDE; cheap
+  // supplier estimates need not discover their residual lattice gaps.
+  for (auto [field, values, lo, hi] : std::array<std::tuple<std::string_view,
+           const std::vector<std::vector<int64_t>>*, int64_t, int64_t>, 2>{{
+           {"dense_i", &dense, -119'999, -119'995},
+           {"extreme_gcd_i", &extremeGcd, std::numeric_limits<int64_t>::min() + 1,
+            std::numeric_limits<int64_t>::max() - 1}}}) {
+    auto run = runRange(*index.reader, field, lo, hi);
+    expectRun(run, oracle(*values, lo, hi));
+    EXPECT_NE(Query::MatchState::NONEMPTY, run.matchState) << field;
+  }
+
   // A selective correlated range must advertise its selective estimate.
   auto selective = runRange(*index.reader, "dense_i", -120'000, -119'800);
   EXPECT_GT(selective.cost, 0);
@@ -360,9 +378,9 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   index.flush();
   index.initReader();
 
-  auto makeFilter = [&](MemPool& pool) {
-    Query::Context context(pool, *index.reader);
-    NumericPredicateQuery query("window_i", 1, 1);
+  // Scorers classify blocks lazily, so the query and context must outlive them.
+  NumericPredicateQuery query("window_i", 1, 1);
+  auto makeFilter = [&](MemPool& pool, Query::Context& context) {
     auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
@@ -376,7 +394,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   };
 
   MemPool fillPool;
-  WindowFilter fill(fillPool, makeFilter(fillPool));
+  Query::Context fillContext(fillPool, *index.reader);
+  WindowFilter fill(fillPool, makeFilter(fillPool, fillContext));
   int32_t start = IntColReader::BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
   int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
@@ -385,7 +404,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   }
 
   MemPool probePool;
-  WindowFilter probe(probePool, makeFilter(probePool), true);
+  Query::Context probeContext(probePool, *index.reader);
+  WindowFilter probe(probePool, makeFilter(probePool, probeContext), true);
   for (int32_t doc = 0; doc < nDocs; doc += 7) {
     EXPECT_EQ(probe.acceptsProbe(doc), expected(doc)) << "doc=" << doc;
   }
@@ -532,7 +552,7 @@ namespace {
 
 #ifndef NDEBUG
 thread_local int64_t verifications = 0;
-void countVerification(int32_t) { verifications++; }
+void countVerification(const NumericPredicateQuery&, int32_t) { verifications++; }
 #endif
 
 // Docs the zone-map scorer verifies value by value for [lo, hi], or -1
@@ -713,3 +733,148 @@ TEST_F(NumericRangeZoneMapTest, leafZonesResolveCrossingBlocks) {
     EXPECT_EQ(verified, 0);
   }
 }
+
+namespace {
+
+// Zone fills over sparse and multivalued columns, against values kept per
+// doc. 70,000 docs span two docsWithValue buckets: sparse_i's first is a
+// bitset and its second a sorted array; rare_i's are both arrays.
+class ZoneFillWindowTest : public LuxirTest {
+protected:
+  static constexpr int32_t N = 70'000;
+  static constexpr std::array<std::string_view, 4> FIELDS = {
+      "dense_i", "sparse_i", "rare_i", "multi_is"};
+  // Ramps settle whole leaves OUTSIDE or INSIDE, the scattered band crosses
+  // every leaf, and the rising tail leaves whole blocks OUTSIDE [1000, 2999].
+  static constexpr std::array<std::pair<int64_t, int64_t>, 2> RANGES = {{
+      {1000, 2999}, {60'000, 70'000}}};
+
+  CollectionHelper helper;
+  std::shared_ptr<IndexReader> reader;
+  std::array<std::vector<std::vector<int64_t>>, FIELDS.size()> values;
+
+  void SetUp() override {
+    SplitMix64 rng(0x5a4e);
+    std::vector<Doc> docs;
+    docs.reserve(N);
+    for (auto& field : values) field.resize(N);
+    for (int32_t doc = 0; doc < N; doc++) {
+      int64_t value = doc < 30'000 ? doc % 5000
+          : doc < 45'000 ? (int64_t)rng.rint(5000) : 10'000 + doc;
+      values[0][(size_t)doc] = {value};
+      if (doc % 3 != 0) values[1][(size_t)doc] = {value};
+      if (doc % 17 == 5) values[2][(size_t)doc] = {value};
+      if (doc % 5 != 0) {
+        for (int32_t i = 0; i <= doc % 3; i++) {
+          values[3][(size_t)doc].push_back(value + i * 1500);
+        }
+      }
+      docs.push_back(flatdoc("id", std::to_string(doc)));
+      for (size_t f = 0; f < FIELDS.size(); f++) {
+        const auto& v = values[f][(size_t)doc];
+        if (v.empty()) continue;
+        if (FIELDS[f].ends_with("_is")) docs.back().push_back({std::string(FIELDS[f]), v});
+        else docs.back().push_back({std::string(FIELDS[f]), v[0]});
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+  }
+
+  bool matches(size_t field, int32_t doc, int64_t lo, int64_t hi) const {
+    return std::ranges::any_of(values[field][(size_t)doc],
+                               [=](int64_t v) { return lo <= v && v <= hi; });
+  }
+
+  // A zone scorer per field, range and plan mode.
+  template <typename Fn>
+  void forEachCase(Fn&& fn) {
+    for (size_t f = 0; f < FIELDS.size(); f++) {
+      for (auto [lo, hi] : RANGES) {
+        for (bool eager : {true, false}) {
+          SCOPED_TRACE(::testing::Message() << FIELDS[f] << " [" << lo << ", " << hi
+                                            << "] eager=" << eager);
+          MemPool pool;
+          Query::Context context(pool, *reader);
+          NumericPredicateQuery query(FIELDS[f], lo, hi);
+          auto* weight = static_cast<NumericPredicateQuery::Weight*>(
+              query.createWeight(context, 0));
+          auto* scorer = weight->createZoneMapScorerForTests(
+              pool, reader->segments()[0], eager);
+          ASSERT_NE(nullptr, scorer);
+          fn(f, lo, hi, scorer);
+        }
+      }
+    }
+  }
+};
+
+// Forward windows that start and end on holes (multiples of 3 and 5 have
+// no sparse_i or multi_is value), start unaligned, jump, overlap the
+// previous window, span one doc, cross the bucket edge and end in a partial
+// tail; replayed after reset.
+TEST_F(ZoneFillWindowTest, fillsMatchValuesAcrossWindowSequences) {
+  constexpr std::array<std::pair<int32_t, int32_t>, 14> WINDOWS = {{
+      {0, 4096}, {4096, 8192}, {9001, 9002}, {9003, 9004}, {9004, 9005},
+      {12'000, 16'096}, {20'003, 24'000}, {22'001, 22'100}, {29'990, 30'010},
+      {44'000, 48'096}, {65'000, 66'100}, {66'101, 66'102}, {N - 777, N - 1},
+      {N - 1, N}}};
+  forEachCase([&](size_t f, int64_t lo, int64_t hi, Query::Scorer* scorer) {
+    for (int pass = 0; pass < 2; pass++) {
+      for (auto [min, max] : WINDOWS) {
+        size_t count = (size_t)(max - min + 63) / 64;
+        std::vector<uint64_t> expected(count), actual(count);
+        for (int32_t doc = min; doc < max; doc++) {
+          int32_t i = doc - min;
+          if (matches(f, doc, lo, hi)) expected[(size_t)i / 64] |= 1ULL << (i % 64);
+        }
+        scorer->fillWindowBits(actual, min, max);
+        EXPECT_EQ(expected, actual) << "pass " << pass << " [" << min << ", " << max << ")";
+      }
+      scorer->reset();
+    }
+  });
+}
+
+// Alternating point probes and 300-doc spans, consecutive across holes and
+// then strided; replayed after reset.
+TEST_F(ZoneFillWindowTest, probesMatchValues) {
+  forEachCase([&](size_t f, int64_t lo, int64_t hi, Query::Scorer* scorer) {
+    std::vector<int32_t> starts;
+    for (int32_t min = 11'000; min < 11'012; min++) starts.push_back(min);
+    for (int32_t min = 11'017; min < N; min += 997) starts.push_back(min);
+    for (int pass = 0; pass < 2; pass++) {
+      for (int32_t min : starts) {
+        int32_t max = std::min(N, min + (min % 2 == 0 ? 1 : 300));
+        int32_t expected = min;
+        while (expected < max && !matches(f, expected, lo, hi)) expected++;
+        int32_t found = scorer->advanceWindow(min, max);
+        if (expected < max) EXPECT_EQ(expected, found) << "[" << min << ", " << max << ")";
+        else EXPECT_GE(found, max) << "[" << min << ", " << max << ")";
+      }
+      scorer->reset();
+    }
+  });
+}
+
+// Sparse fills walk ranks with a cursor and select only to jump past an
+// OUTSIDE run: far fewer selects than ranks.
+TEST_F(ZoneFillWindowTest, sparseFillsSelectOnlyAtOutsideJumps) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "select counts are debug-only";
+#else
+  forEachCase([&](size_t f, int64_t, int64_t, Query::Scorer* scorer) {
+    std::array<uint64_t, 64> words{};
+    NumericPredicateQuery::rankSelectsForTests = 0;
+    for (int32_t min = 0; min < N; min += 4096) {
+      scorer->fillWindowBits(words, min, std::min(N, min + 4096));
+    }
+    int64_t ranks = std::ranges::count_if(values[f],
+                                          [](const auto& v) { return !v.empty(); });
+    EXPECT_LT(NumericPredicateQuery::rankSelectsForTests * 64, ranks);
+  });
+#endif
+}
+
+} // namespace
