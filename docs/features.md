@@ -131,7 +131,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
 - **Cost-aware filter cache:** Favors filters that are expensive to rebuild
-  relative to their size, saving more computation per byte of cache.
+  (by measured build time) and often reused, relative to their size, saving
+  more computation per byte of cache.
 - **Arena allocation:** Indexing runs on rollback-capable memory pools, and
   requests decode into arena-backed message objects with no per-field heap
   allocation on the way in.

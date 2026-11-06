@@ -123,15 +123,26 @@ public:
     uint64_t readerStableHits = 0;
     uint64_t readerStableRefreshes = 0;
     uint64_t readerStableRetires = 0;
+    // Sum of the measured build cost of every value served as a shared hit:
+    // the recompute time the cache saved.
+    uint64_t recomputeMicrosSaved = 0;
     size_t residentBytes = 0;
     size_t metadataBytes = 0;
   };
 
-  // GDSF priority is the inflation clock plus a frozen density. The clock
-  // only moves forward, so a hit changes the priority only after a sweep has
-  // advanced it; skip the store otherwise to keep hot values' cache lines
-  // shared across cores. Concurrent relaxed touches may still overwrite one
-  // another; that race is a benign approximation in GDSF.
+  // GDSF priority is the inflation clock plus frozen density (measured build
+  // cost per effective byte) times a frequency weight. The weight counts hits
+  // up to FREQUENCY_CAP, so a value that stops being hit sits at most
+  // (1 + FREQUENCY_CAP) densities above the clock of its last hit and ages
+  // out once evictions advance the clock past it. Past the cap a priority
+  // changes only after a sweep advances the clock; skip the store otherwise
+  // to keep hot values' cache lines shared across cores. Concurrent relaxed
+  // touches may still overwrite one another; that race is a benign
+  // approximation in GDSF.
+  static constexpr uint64_t FREQUENCY_CAP = 15;
+  static double benefit(double density, uint64_t hits) {
+    return density * (double) (1 + std::min(hits, FREQUENCY_CAP));
+  }
   static void touchPriority(std::atomic<double>& priority, double next) {
     if (priority.load(std::memory_order_relaxed) != next) {
       priority.store(next, std::memory_order_relaxed);
@@ -177,8 +188,11 @@ public:
       return docs->cachedCard();
     }
     size_t ramBytesUsed() const { return charge; }
+    void touch(double evictionClock, uint64_t hits) const {
+      touchPriority(priority, evictionClock + benefit(density, hits));
+    }
     void touch(double evictionClock) const {
-      touchPriority(priority, evictionClock + density);
+      touch(evictionClock, cacheHits.load(std::memory_order_relaxed));
     }
     double evictionPriority() const {
       return priority.load(std::memory_order_relaxed);
@@ -216,8 +230,11 @@ public:
     uint64_t readerVersion() const { return readerVersion_; }
     size_t ramBytesUsed() const { return charge; }
     DocSet* docSet(size_t segmentOrd, const SegmentIdentity& identity) const;
+    void touch(double evictionClock, uint64_t hits) const {
+      touchPriority(priority, evictionClock + benefit(density, hits));
+    }
     void touch(double evictionClock) const {
-      touchPriority(priority, evictionClock + density);
+      touch(evictionClock, cacheHits.load(std::memory_order_relaxed));
     }
     double evictionPriority() const {
       return priority.load(std::memory_order_relaxed);
@@ -607,6 +624,8 @@ private:
     std::atomic<uint64_t> readerStableHits{0};
     std::atomic<uint64_t> readerStableRefreshes{0};
     std::atomic<uint64_t> readerStableRetires{0};
+    // Bumped on every shared hit, like hits.
+    StripedCounter recomputeMicrosSaved;
   };
 
   // Fingerprints are admission hints only. A collision can admit early, but
@@ -756,6 +775,8 @@ public:
     size_t bytes = 0;
     uint32_t segmentsResident = 0;
     uint64_t hits = 0;
+    // Summed measured build cost of the resident values.
+    uint64_t buildMicros = 0;
     uint64_t lastUsed = 0;
   };
   std::vector<EntryDump> dump(size_t limit, size_t* totalResident);

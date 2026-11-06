@@ -2163,6 +2163,9 @@ message QueryCacheStats {
   uint64 thrash_build_skips = 19;
   uint64 reader_dead_builds = 20;
   uint64 reader_thrash_build_skips = 21;
+  // Summed measured build cost (microseconds) of the values served as shared
+  // hits: the recompute time the cache saved.
+  uint64 recompute_micros_saved = 22;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2248,6 +2251,7 @@ message CacheEntryDump {
   uint32 segments_resident = 7;
   uint64 hits = 8;
   uint64 last_used_epoch = 9;
+  uint64 build_micros = 10;  // summed measured build cost of the resident values
 }
 
 message ShardCacheControl {

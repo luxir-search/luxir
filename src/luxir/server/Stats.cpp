@@ -220,6 +220,7 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
   dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
   dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
+  dst.recompute_micros_saved = src.filterCacheCounters.recomputeMicrosSaved;
 }
 
 template<class Stats>
@@ -462,6 +463,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.segments_resident = row.segmentsResident;
       out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
+      out.build_micros = row.buildMicros;
     }
   }
 }

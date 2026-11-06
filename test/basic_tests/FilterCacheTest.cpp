@@ -1887,10 +1887,11 @@ TEST(FilterCacheTest, evictionBackoffRecoversAndHitResetsDebt) {
   FilterKey winner("phase-winner");
   FilterKey recovering("phase-recovering");
 
+  // One hit doubles the winner's benefit to 10 cost units per byte.
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
-            servePolicyValue(cache, segments, winner, 1, 10));
+            servePolicyValue(cache, segments, winner, 1, 5));
   EXPECT_EQ(FilterCache::Probe::Kind::HIT,
-            servePolicyValue(cache, segments, winner, 1, 10));
+            servePolicyValue(cache, segments, winner, 1, 5));
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             servePolicyValue(cache, segments, recovering, 2, 1));
   EXPECT_EQ(1u, cache.counters().capacityDeadBuilds);
@@ -2059,6 +2060,92 @@ TEST(FilterCacheTest, inflationClockEventuallyAgesOutColdExpensiveValue) {
             verify.get(expensive)->probe(0).kind());
   EXPECT_EQ(FilterCache::Probe::Kind::HIT,
             verify.get(FilterKey("cheap-11"))->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, hitFrequencyOutweighsSlightlyHigherBuildCost) {
+  size_t charge = bitDocs(4096, 0)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 3 - 1;
+  config.lowWatermarkBytes = charge * 2;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey hot("freq-hot");
+  FilterKey cold("freq-old");
+  FilterKey next("freq-new");
+
+  // Cost alone ranks hot lowest; its hits must outweigh that.
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, hot, 1, 9));
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, cold, 2, 10));
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT,
+              servePolicyValue(cache, segments, hot, 1, 9));
+  }
+  EXPECT_EQ(27u, cache.counters().recomputeMicrosSaved);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, next, 3, 11));
+
+  EXPECT_EQ(1u, cache.counters().evictions);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            servePolicyValue(cache, segments, hot, 1, 9));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            servePolicyValue(cache, segments, next, 3, 11));
+  size_t resident = 0;
+  auto rows = cache.dump(8, &resident);
+  EXPECT_EQ(2u, resident);
+  uint64_t buildMicros = 0;
+  for (const auto& row : rows) buildMicros += row.buildMicros;
+  EXPECT_EQ(20u, buildMicros);
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, inflationClockAgesOutColdHotValue) {
+  size_t charge = bitDocs(1024, 0)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey hot("formerly-hot");
+  auto serve = [&](const FilterKey& key, int doc, uint32_t cost) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key);
+    auto probe = use->probe(0);
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      use->publishRaw(0, probe, bitDocs(1024, doc), cost);
+    }
+    return probe.kind();
+  };
+  serve(hot, 1, 100);
+  // Far more hits than the frequency cap counts.
+  for (int i = 0; i < 100; i++) {
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT, serve(hot, 1, 100));
+  }
+
+  // Hot and rarely recomputed, it outlives the first cheaper newcomers...
+  for (int i = 0; i < 4; i++) {
+    serve(FilterKey("newcomer-" + std::to_string(i)), i + 2, 90);
+  }
+  EXPECT_EQ(4u, cache.counters().evictions);
+  {
+    FilterCache::UseRegistry verify(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+              verify.get(hot)->probe(0).kind());
+  }
+  // ...but once it goes cold, evictions advance the clock past it.
+  for (int i = 4; i < 40; i++) {
+    serve(FilterKey("newcomer-" + std::to_string(i)), i + 2, 90);
+  }
+  FilterCache::UseRegistry verify(cache, 1, segments);
+  EXPECT_NE(FilterCache::Probe::Kind::HIT, verify.get(hot)->probe(0).kind());
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
