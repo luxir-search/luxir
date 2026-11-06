@@ -6,6 +6,7 @@
 #include <memory_resource>
 
 #include "StorageMemory.h"
+#include "RangeFetch.h"
 
 #include <stdexcept>
 #include <xxhash.h>
@@ -492,6 +493,20 @@ public:
 
   virtual size_t size() = 0;
 
+  // Makes every range resident, then calls `done` exactly once: with null on
+  // success, otherwise with the error (FetchTimeoutError past `deadline`). A
+  // file that fetches on first touch does this without holding the calling
+  // thread, and `done` may run on a fetch thread; the caller keeps the file
+  // alive until then. Memory-backed and mapped files call `done` inline, before
+  // this returns. A range outside the file is an error. This default fetches
+  // nothing and reports FetchNotResidentError: the caller then reads as usual,
+  // which fetches (and blocks) on first touch.
+  virtual void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline deadline, FetchDone done) {
+    (void)ranges;
+    (void)deadline;
+    done(std::make_exception_ptr(FetchNotResidentError()));
+  }
+
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
   virtual std::string_view read() = 0;
 
@@ -525,6 +540,10 @@ public:
 
   InputStream getInputStream() override {
     return InputStream(data.get(), data.get() + sz);
+  }
+
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline, FetchDone done) override {
+    fetchResident(ranges, (uint64_t)sz, done);
   }
 
 };
