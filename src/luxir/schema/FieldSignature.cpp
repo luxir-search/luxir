@@ -36,6 +36,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
         throw std::runtime_error("Cannot serialize normalizer signature");
       }
     }
+    // Keys of different definitions are not comparable, so the definition is
+    // part of the field's identity: a change introduces a new representation.
+    if (str->collation) properties["collation"] = str->collation->canonical;
   }
   if (auto* date = dynamic_cast<DateFieldType*>(&type)) {
     properties["unit"] = "\"" + std::string(dateUnitName(date->unit)) + "\"";

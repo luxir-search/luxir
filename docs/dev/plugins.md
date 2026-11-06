@@ -310,6 +310,10 @@ Rules:
   when it next loads, for queries and new documents alike.
 - The fused `unicode_word` + `nfkc_cf` fast path applies only to exactly those built-in
   components; plugin stages always run as written.
+- `Token` carries more than its text, offsets and `positionIncrement`. The whole chain shares
+  one `Token`, so a filter that rewrites or drops tokens in place forwards every attribute;
+  one that buffers tokens past the current pull saves and restores what it needs. See
+  [Token attributes](#token-attributes).
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
@@ -349,6 +353,95 @@ A schema then uses the plugin by name (`"analyzer": "example"`) or composes its 
 (`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+### Token attributes
+
+Besides `text`, `positionIncrement` and the offsets, a `Token` has three attributes, all
+reset by `Token::clear()` when a tokenizer starts a token:
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `positionLength` | 1 | Positions the token spans: its arc length in the token graph (Lucene's `PositionLengthAttribute`), 2 for a synonym covering two source words. `uint16_t`. |
+| `type` | `UNKNOWN` | `TokenType`: `ALPHA` (letters or ideographs), `NUMERIC`, `ALNUM`, `OTHER`. |
+| `script` | `UNKNOWN` | `Script` of the token's first letter: `LATIN`, `HAN`, `HIRAGANA`, `KATAKANA`, `HANGUL`, `THAI`, `ARABIC`, `CYRILLIC`, `GREEK`, `OTHER`; `COMMON` when it has no letter (digits). |
+
+`unicode_word`, and so the fused `unicode_word` + `nfkc_cf` tokenizer, sets `type` and
+`script` (the fused ASCII path from its byte classes, other words from their code points;
+both give the same answer). `whitespace`, `keyword` and a plugin tokenizer leave them
+`UNKNOWN` unless they set them; `scriptOf(char32_t)` is the per-code-point lookup. The
+attributes are read before any filter rewrites the text, so `type` and `script` describe the
+source word: a CJK bigram filter can branch on `token.script == Script::HAN` instead of
+guessing from the first byte. The three sit next to `positionIncrement`, so `clear()`
+resets all four with one 8-byte store (`Analyzer.h` has a `static_assert`).
+
+`positionLength` is carried and nothing reads it yet. Postings store only each term's start
+position (as Lucene's do), and phrase queries are built from position increments, so a
+token spanning several positions indexes and matches exactly like a one-position token.
+Honouring it needs a query-side graph (a phrase over alternative paths); a filter that
+produces graph tokens can set it today and a later query builder can consume it.
+
+`TokenAttributesExampleTest` shows a plugin filter (`describe`) reading all three, and the
+example `span2` filter setting `positionLength`.
+
+## Collations
+
+`Registries::collation` (`src/luxir/collation/CollationRegistry.h`) maps names to makers of
+collators: objects that turn a string into a binary sort key, so that comparing keys as
+unsigned bytes orders the strings by a locale or custom rule. A maker receives the authored
+`api::AnalyzerComponent` (`name` and typed `params`, for example a locale or strength),
+validates the params, and returns an immutable `CollatorFactory`; `create()` makes a
+`Collator` per use, which is not thread-safe.
+
+```cpp
+class MyCollator : public luxir::Collator {
+public:
+  void appendKey(std::string_view value, std::string& key) override { /* append key bytes */ }
+};
+
+void registerComponents(luxir::Registries& r) override {
+  r.collation.add("my_collation", [](const luxir::api::AnalyzerComponent& def) {
+    // validate def.params, throw std::invalid_argument("... valid values: ...") on a bad one
+    struct Factory : luxir::CollatorFactory {
+      std::unique_ptr<luxir::Collator> create() const override { return std::make_unique<MyCollator>(); }
+    };
+    return std::unique_ptr<const luxir::CollatorFactory>(std::make_unique<Factory>());
+  });
+}
+```
+
+Rules are the analysis ones: `[a-z0-9_]+` names, a duplicate or an add after the freeze
+throws, and the registry adds "unknown collation 'x'; valid collations: ..." for unknown
+names. There are no built-in collations.
+
+A string field names a collation in its schema:
+
+```json
+{"fields": {"title": {
+  "type": "string",
+  "variants": {"sort": {"type": "string", "index": "none", "column": true,
+                        "collation": {"name": "my_collation", "params": {"locale": "sv"}}}},
+  "defaults": {"value": "sort"}}}}
+```
+
+At ingest the field's column stores the collator's key for each (normalized) value instead of
+the value, so the existing string column sort orders by it and nothing else in the sort path
+changes. Because the column then holds opaque bytes, the field must be column-only
+(`index: "none"`, `column: true`; anything else is a schema error), which is why it is
+normally a variant of the field it sorts: `defaults.value` makes sorts on `title` use it,
+while search, retrieval and the `title` primary keep the text. Facets and value expressions
+over the collated field see keys. Range queries on the primary field are untouched.
+
+The collation is part of the field's identity. The authored definition is in the persisted
+schema, and the canonical name and parameters are in the field signature, so changing a
+collation (different params, or a plugin upgrade that changes keys under the same name) makes
+the field a new representation: segments written before the change are not read as holding
+the new keys, the same contract as other schema changes. A collection whose schema names a
+collation this binary lacks fails to load with "unknown collation 'x'; valid collations: ...";
+the node keeps serving its other collections.
+
+The example plugin registers `example_ci` (ASCII case-insensitive order, `strength` of
+`primary` or `tertiary`); `CollationExampleTest` covers sorting, params, signatures,
+persistence and the missing-collation failure.
 
 ## Storage backends and layers
 
