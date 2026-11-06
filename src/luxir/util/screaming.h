@@ -768,6 +768,32 @@ public:
 
   }; // end Iterator
 
+  // Count an intersection without expanding compressed buckets. Dense
+  // buckets AND words; sparse buckets probe only their stored members.
+  int32_t intersectionCardinality(const FixedBitSet& other) const {
+    int32_t count = 0;
+    for (int32_t i = 0; i < nBuckets; i++) {
+      const auto& desc = descriptors[i];
+      int32_t base = (int32_t)desc.upperBits << BUCKET_BITS;
+      if (base >= other.size()) break;
+      int32_t card = (int32_t)desc.size + 1;
+      if (card <= (int32_t)BUCKET_SPARSE_MAX) {
+        const auto* values = (const uint16_t*)(start + desc.offset);
+        for (int32_t j = 0; j < card; j++) {
+          int32_t doc = base + values[j];
+          if (doc >= other.size()) break;
+          count += other.get(doc) != 0;
+        }
+      } else {
+        const auto* words = (const uint64_t*)(start + desc.offset);
+        int32_t offset = base >> 6;
+        int32_t end = std::min((int32_t)Bits::fixedNumWords, (int32_t)FixedBitSet::sizeInWords(other.size()) - offset);
+        for (int32_t j = 0; j < end; j++) count += std::popcount(words[j] & other.words[offset + j]);
+      }
+    }
+    return count;
+  }
+
   // Total number of set bits in the whole set, by summing bucket cardinalities
   // (O(nBuckets); there is no stored count or fast path).  Test-only: production
   // never needs a set's cardinality because it is always redundant with other

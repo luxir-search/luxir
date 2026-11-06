@@ -75,7 +75,7 @@ TEST_F(FieldVariantsGenerationTest, cachedRootVariantCoverageSurvivesReopenAndMe
     auto durable = readDurableIndexInfo(writer->dir);
     ASSERT_EQ(2u, durable->segments.size());
     std::vector<uint64_t> generations;
-    for (const auto& segment : durable->segments) generations.push_back(segment.schema_gen);
+    for (const auto& segment : durable->segments) generations.push_back(segment.schema.version.generation());
     std::sort(generations.begin(), generations.end());
     EXPECT_EQ((std::vector<uint64_t>{before, introduced}), generations);
     auto json = view(*writer);
@@ -98,7 +98,7 @@ TEST_F(FieldVariantsGenerationTest, cachedRootVariantCoverageSurvivesReopenAndMe
     ASSERT_TRUE(helper.submit(merge).success);
     auto durable = readDurableIndexInfo(writer->dir);
     ASSERT_EQ(1u, durable->segments.size());
-    EXPECT_EQ(before, durable->segments[0].schema_gen);
+    EXPECT_EQ(before, durable->segments[0].schema.version.generation());
     EXPECT_FALSE(view(*writer)["fields"]["author"]["representations"]["s"]["coverage_complete"].get<bool>());
     EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__s:=\"le guin\""));
     ASSERT_TRUE(helper.deleteById("old", UpdateMessage::COMMIT).success);
@@ -109,7 +109,7 @@ TEST_F(FieldVariantsGenerationTest, cachedRootVariantCoverageSurvivesReopenAndMe
   {
     LuxirNode node(config());
     CollectionHelper helper(node);
-    EXPECT_EQ(introduced, readDurableIndexInfo(helper.getIndexWriter()->dir)->segments[0].schema_gen);
+    EXPECT_EQ(introduced, readDurableIndexInfo(helper.getIndexWriter()->dir)->segments[0].schema.version.generation());
   }
 }
 
@@ -173,7 +173,7 @@ TEST_F(FieldVariantsGenerationTest, admissionPinsBeforeSchemaEditEvenWhenAcquisi
   EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__self:=\"le guin\""));
   auto durable = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(2u, durable->segments.size());
-  EXPECT_NE(durable->segments[0].schema_gen, durable->segments[1].schema_gen);
+  EXPECT_NE(durable->segments[0].schema.version.generation(), durable->segments[1].schema.version.generation());
 }
 
 TEST_F(FieldVariantsGenerationTest, busyOldInverterFinishesAndRetiresWithoutRefreshingUnknownNames) {
@@ -241,8 +241,8 @@ TEST_F(FieldVariantsGenerationTest, removedVariantAndMaterializedTemplateCanBeRe
     EXPECT_FALSE(json["fields"].get<Json::object_t>().contains("city_name"));
     auto durable = readDurableIndexInfo(writer->dir);
     ASSERT_EQ(2u, durable->segments.size());
-    EXPECT_EQ(before, durable->segments[0].schema_gen);
-    EXPECT_EQ(after->gen_, durable->segments[1].schema_gen);
+    EXPECT_EQ(before, durable->segments[0].schema.version.generation());
+    EXPECT_EQ(after->gen_, durable->segments[1].schema.version.generation());
   }
 }
 
@@ -276,7 +276,7 @@ TEST_F(FieldVariantsGenerationTest, staleIdleInverterFlushesOnCheckoutEvenWithAn
   helper.commit();
   auto durable = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(1u, durable->segments.size());
-  EXPECT_EQ(before->gen_, durable->segments[0].schema_gen);
+  EXPECT_EQ(before->gen_, durable->segments[0].schema.version.generation());
 }
 
 TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsAndAuthoredHttpEcho) {

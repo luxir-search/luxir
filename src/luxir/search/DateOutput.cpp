@@ -8,6 +8,17 @@
 
 namespace luxir {
 
+namespace {
+
+// Whether a double lies in the ns range [INT64_MIN + 1, INT64_MAX - 1].
+// Doubles just below 2^63 in magnitude are 1024 apart, so that range holds
+// exactly the doubles strictly between -2^63 and 2^63. NaN is outside.
+bool insideNanos(double value) {
+  return value > -0x1p63 && value < 0x1p63;
+}
+
+} // namespace
+
 int64_t NumericDateOutput::operator()(int64_t value) const {
   __int128 converted = convertDateUnits(value, from, to);
   if (converted <= std::numeric_limits<int64_t>::min()
@@ -19,10 +30,7 @@ int64_t NumericDateOutput::operator()(int64_t value) const {
 
 double NumericDateOutput::operator()(double value) const {
   double converted = from == DateUnit::MILLIS ? value * 1000000.0 : value / 1000000.0;
-  if (to == DateUnit::NANOS
-      && (!std::isfinite(converted)
-          || (long double)converted < (long double)std::numeric_limits<int64_t>::min() + 1
-          || (long double)converted > (long double)std::numeric_limits<int64_t>::max() - 1)) {
+  if (to == DateUnit::NANOS && !insideNanos(converted)) {
     throw RequestError("date output for " + source + " is outside the ns date range");
   }
   return converted;
@@ -37,12 +45,11 @@ std::string_view IsoDateOutput::operator()(int64_t value) const {
 }
 
 std::string_view IsoDateOutput::operator()(double value) const {
-  long double tick = std::floor((long double)value);
-  long double lo = unit == DateUnit::MILLIS ? (long double)datetime_detail::kMinEpochMs
-      : (long double)std::numeric_limits<int64_t>::min() + 1;
-  long double hi = unit == DateUnit::MILLIS ? (long double)datetime_detail::kMaxEpochMs
-      : (long double)std::numeric_limits<int64_t>::max() - 1;
-  if (!std::isfinite(value) || tick < lo || tick > hi) {
+  double tick = std::floor(value);
+  bool inside = unit == DateUnit::MILLIS
+      ? tick >= (double)datetime_detail::kMinEpochMs && tick <= (double)datetime_detail::kMaxEpochMs
+      : insideNanos(tick);
+  if (!inside) {
     throw RequestError("date_iso output for " + source + " is non-finite or outside the date range");
   }
   return (*this)((int64_t)tick);
