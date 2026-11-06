@@ -26,15 +26,15 @@ public:
   /// @param liveBits The bitmap of live documents
   /// @param maxDoc Maximum document ID (total documents in segment)
   /// @param numLiveDocs Number of live documents (bits set in liveBits)
-  static uint64_t writeLiveDocs(Directory& dir, uint64_t segId, uint64_t liveGen,
+  static uint64_t writeLiveDocs(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t writerEpoch,
                                    const screaming::FixedBitSet& liveBits, int32_t maxDoc, int32_t numLiveDocs, std::vector<FileDescriptor>* descriptors = nullptr) {
     assert(liveGen > 0 && numLiveDocs >= 0 && numLiveDocs <= maxDoc);
     if (liveGen == 0) {
       throw std::invalid_argument("liveDocs generation must be > 0");
     }
 
-    std::string segStr = Postings::getSortableString(segId);
-    std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen);
+    std::string segStr = Postings::segmentKey(segId, creatorEpoch);
+    std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen, writerEpoch);
 
     uint64_t bytes = fileBytes(maxDoc);
     Directory::FileCreateOptions options;
@@ -63,12 +63,12 @@ public:
   }
 
   // Overload that also appends the written filename for fsync at commit time.
-  static uint64_t writeLiveDocs(Directory& dir, uint64_t segId, uint64_t liveGen,
+  static uint64_t writeLiveDocs(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t writerEpoch,
                                 const screaming::FixedBitSet& liveBits, int32_t maxDoc, int32_t numLiveDocs,
                                 std::vector<std::string>& filenames, std::vector<FileDescriptor>* descriptors = nullptr) {
-    std::string segStr = Postings::getSortableString(segId);
-    std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen);
-    uint64_t bytes = writeLiveDocs(dir, segId, liveGen, liveBits, maxDoc, numLiveDocs, descriptors);
+    std::string segStr = Postings::segmentKey(segId, creatorEpoch);
+    std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen, writerEpoch);
+    uint64_t bytes = writeLiveDocs(dir, segId, creatorEpoch, liveGen, writerEpoch, liveBits, maxDoc, numLiveDocs, descriptors);
     filenames.push_back(std::move(deleteFileName));
     return bytes;
   }

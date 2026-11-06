@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <optional>
@@ -16,6 +17,7 @@
 #include <xxhash.h>
 #include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
+#include "luxir/util/Signal.h"
 #include "OutputStream.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -55,6 +57,24 @@ public:
 // Implementations of Directory are thread safe.
 class Directory {
 public:
+  enum class PublishMode { CREATE_ONLY, REPLACE };
+  // Backend-defined value, compared only for equality.
+  using PublicationVersion = std::string;
+  struct PublishCondition {
+    PublishMode mode;
+    std::optional<PublicationVersion> version;
+    PublishCondition(PublishMode mode) : mode(mode) {}
+    static PublishCondition match(PublicationVersion version) {
+      PublishCondition result(PublishMode::REPLACE);
+      result.version = std::move(version);
+      return result;
+    }
+  };
+  struct Publication {
+    std::string bytes;
+    PublicationVersion version;
+  };
+
   struct FileCreateOptions {
     std::function<void(int64_t)> ramBytesChanged;
     size_t ramSpillBytes = 0;
@@ -71,7 +91,7 @@ public:
   // (reuseFiles) check a flag instead of assuming the strongest behavior.
   using Capabilities = uint32_t;
   static constexpr Capabilities HARD_LINK = 1u << 0;       // linkFile shares bytes instead of copying
-  static constexpr Capabilities ATOMIC_RENAME = 1u << 1;   // renameFile replaces the target atomically
+  static constexpr Capabilities ATOMIC_RENAME = 1u << 1;   // backing store supports atomic name replacement
   static constexpr Capabilities DURABLE_SYNC = 1u << 2;    // sync() makes the files crash-safe (fsync)
   static constexpr Capabilities MEMORY_MAPPED = 1u << 3;   // openFile returns stable mapped bytes
   static constexpr Capabilities REMOTE = 1u << 4;          // bytes may be fetched over a network
@@ -113,6 +133,9 @@ public:
   // Returns true if file was found and deleted, false if not found.
   virtual bool deleteFile(const std::string_view name) = 0;
 
+  // Removes the named files durably. Missing names are allowed.
+  virtual void deleteDurably(std::span<const std::string> names) = 0;
+
   virtual void deletePrefix(const std::string_view prefix) {
     std::vector<FileInfo> files;
     listFiles(files);
@@ -126,17 +149,19 @@ public:
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
+  // Installs a complete immutable file; an existing name is an error.
   virtual void finishFile(File &file) = 0;
 
-  // Atomically replace `to` with the already-finished file `from` when the
-  // backing store supports it. Offline derivative builders use this only
-  // after reopening and validating the unique source name.
-  virtual void renameFile(std::string_view from, std::string_view to) = 0;
+  // Installs bytes atomically and durably, returning a fresh version even for identical bytes.
+  // An empty result means the condition failed and nothing changed.
+  // A throw leaves the outcome unknown: publication may have taken place.
+  virtual std::optional<PublicationVersion> publishFile(
+      std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) = 0;
+  // Bytes and version from one observation. Only absence returns nullopt.
+  virtual std::optional<Publication> readPublished(std::string_view name) = 0;
 
-  // Fsync the given files to ensure durability.
-  // Use "." to fsync the directory itself (to persist renames/creates).
-  // The default implementation is a no-op (e.g. for RAMDir).
-  virtual void sync(std::span<const std::string> filenames) { unused(filenames); }
+  // Makes the named files' bytes AND directory entries durable. RAM is volatile.
+  virtual void sync(std::span<const std::string> names) = 0;
 
   // remove all files from the directory
   virtual void clear() = 0;
@@ -164,10 +189,7 @@ public:
     auto data = input->read();
     auto file = createFile(name);
     OutputStream out(file.get());
-    constexpr size_t kChunk = 1 << 20;
-    for (size_t offset = 0; offset < data.size(); offset += kChunk) {
-      out.write(data.data() + offset, std::min(kChunk, data.size() - offset));
-    }
+    out.write(data.data(), data.size());
     out.close();
     finishFile(*file);
   }
@@ -223,26 +245,34 @@ public:
 
 private:
   std::shared_ptr<StorageMemory> memory;
-  gtl::btree_map<std::string, InputReferenceType> files;
+  struct Entry {
+    InputReferenceType file;
+    uint64_t version;
+  };
+  gtl::btree_map<std::string, Entry> files;
+  inline static std::atomic<uint64_t> nextVersion{0};
+  std::atomic<bool> materialized{false};
   std::mutex mutex;
 
 public:
   explicit RAMDir(std::shared_ptr<StorageMemory> memory = std::make_shared<StorageMemory>()) : memory(std::move(memory)) {}
-  // linkFile shares the immutable buffer; renames happen under the lock.
+  // linkFile shares the immutable buffer; publication replaces names under the lock.
   Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | MEMORY_MAPPED; }
   uint64_t storageBytes() const { return memory->bytes(); }
+  bool exists() const { return materialized.load(std::memory_order_acquire); }
 
   // Only used by tests to clear (e.g. dir = RAMDir())
   void operator=(RAMDir&& other) {
     std::lock_guard<std::mutex> lock(mutex);
     files = std::move(other.files);
+    materialized.store(other.exists(), std::memory_order_release);
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
     std::lock_guard<std::mutex> lock(mutex);
     target.reserve(target.size() + files.size());
     for (const auto&[name, ifile] : files) {
-      target.push_back({name, (uint64_t)ifile->size()});
+      target.push_back({name, (uint64_t)ifile.file->size()});
     }
   }
 
@@ -254,8 +284,8 @@ public:
     if (find != files.end()) {
       // redefine DEBUG to TRACE level which shouldn't currently be logged!
       // #define INDEX_DEBUG LOG_TRACE
-      DIR_DEBUG("DIR openFile: found file {} size={}", name, find->second->size());
-      return find->second;
+      DIR_DEBUG("DIR openFile: found file {} size={}", name, find->second.file->size());
+      return find->second.file;
     } else {
       DIR_DEBUG("DIR openFile: file {} not found", name);
       return {};
@@ -341,28 +371,53 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex);
 
-      // overwrite existing entries.
-      // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
-      files[file.name()] = std::move(inputFile);
+      if (!files.emplace(file.name(), Entry{std::move(inputFile), ++nextVersion}).second) {
+        throw FileIOException("File already exists: " + std::string(file.name()));
+      }
+      materialized.store(true, std::memory_order_release);
     }
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = files.find(from);
-    if (it == files.end()) {
-      throw std::runtime_error("RAMDir::renameFile: source not found");
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    if (condition.mode == PublishMode::CREATE_ONLY) {
+      std::lock_guard lock(mutex);
+      if (files.contains(name)) return {};
     }
-    auto value = std::move(it->second);
-    files.erase(it);
-    files[std::string(to)] = std::move(value);
+    StorageCharge charge(memory, bytes.size());
+    auto buffer = std::make_unique_for_overwrite<char[]>(bytes.size());
+    if (!bytes.empty()) std::memcpy(buffer.get(), bytes.data(), bytes.size());
+    auto input = std::make_shared<RAMInputFile>(std::move(buffer), bytes.size(), std::move(charge));
+    Signal::emit("publishWritten", this, &name);
+    Signal::emit("publishSynced", this, &name);
+    std::lock_guard lock(mutex);
+    if (condition.mode == PublishMode::CREATE_ONLY && files.contains(name)) return {};
+    if (condition.version && (!files.contains(name) || PublicationVersion(std::to_string(files.find(name)->second.version)) != *condition.version)) return {};
+    auto version = ++nextVersion;
+    files[std::string(name)] = {std::move(input), version};
+    materialized.store(true, std::memory_order_release);
+    return std::to_string(version);
+  }
+
+  std::optional<Publication> readPublished(std::string_view name) override {
+    std::lock_guard lock(mutex);
+    auto it = files.find(name);
+    if (it == files.end()) return {};
+    return Publication{std::string(it->second.file->read()), std::to_string(files.find(name)->second.version)};
+  }
+
+  void sync(std::span<const std::string> names) override { unused(names); }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    std::lock_guard lock(mutex);
+    for (const auto& name : names) files.erase(name);
   }
 
   void linkFile(Directory& source, std::string_view name) override {
     auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
     if (!input) throw std::runtime_error("RAM link source missing or incompatible");
     std::lock_guard lock(mutex);
-    files[std::string(name)] = std::move(input);
+    files[std::string(name)] = {std::move(input), ++nextVersion};
+    materialized.store(true, std::memory_order_release);
   }
 
   void clear() override {

@@ -41,10 +41,12 @@ struct PointsMaterialize {
   static constexpr double ARRAY_POINTS = 10;    // one point through the sorted array
   static constexpr double VERIFY_POINTS = 20;   // verify one candidate in the column
 
-  // Verifying `candidates` instead of producing, plus the consumer's own work
-  // that producing would spare it (Query::Demand::sparedWork).
-  static double verifyPrice(double candidates, const Query::Demand& demand) {
-    return VERIFY_POINTS * candidates + demand.sparedWork;
+  // Verifying `candidates` at `checkPoints` each instead of producing, plus
+  // the consumer's own work that producing would spare it
+  // (Query::Demand::sparedWork).
+  static double verifyPrice(double candidates, const Query::Demand& demand,
+                            double checkPoints = VERIFY_POINTS) {
+    return checkPoints * candidates + demand.sparedWork;
   }
 
   // Materializing `emitted` points: into a bitset (a complement fills it

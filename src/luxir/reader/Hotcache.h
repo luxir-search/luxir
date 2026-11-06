@@ -41,11 +41,11 @@ public:
 
   std::vector<Entry> entries;  // sorted by (fileNum, offset), non-overlapping
 
-  /// "s<seg>__hot" for the segment (segId's sortable string is the key).
-  static std::string fileName(uint64_t segId);
+  /// "s<seg>__hot" for the segment, where <seg> is Postings::segmentKey.
+  static std::string fileName(uint64_t segId, uint64_t creatorEpoch);
   static std::string fileName(std::string_view segStr);
 
-  /// If `name` is a segment data file ("s<seg>_<filenum>"), its segment string
+  /// If `name` is a segment data file ("s<seg>_<filenum>"), its segment key
   /// (the part after the 's') and file number.
   struct DataFile {
     std::string_view segStr;
@@ -63,17 +63,17 @@ public:
   /// Opens the finished segment through a recording directory and returns the
   /// ranges the open read, merged and rounded to kAlign. Needs every file of
   /// the segment in `dir`.
-  static Hotcache record(Directory& dir, uint64_t segId);
+  static Hotcache record(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
 
   /// record() + the `s<seg>__hot` file; returns its descriptor.
-  static FileDescriptor write(Directory& dir, uint64_t segId);
+  static FileDescriptor write(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
 };
 
 /// For a directory that fetches remotely, writes the segment's hotcache and
 /// appends its name and descriptor to the lists a finished segment reports.
 /// Other directories do nothing: their open reads are local. A failure to
 /// record is logged and leaves the segment without a hotcache.
-void writeHotcacheIfRemote(Directory& dir, uint64_t segId, std::vector<std::string>* filenames,
+void writeHotcacheIfRemote(Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::vector<std::string>* filenames,
                            std::vector<FileDescriptor>* descriptors);
 
 /// A directory whose input files record the ranges read through them. Reads of

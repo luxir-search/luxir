@@ -84,6 +84,10 @@ public:
   struct SegInput {
     uint64_t segId;
     PostingsReader* postingsReader;
+    uint64_t creatorEpoch;
+
+    SegInput(uint64_t segId, PostingsReader* postingsReader, uint64_t creatorEpoch)
+      : segId(segId), postingsReader(postingsReader), creatorEpoch(creatorEpoch) {}
   };
 
   /// overlayGen is the per-(segment, field) rebuild ordinal used in filenames
@@ -91,9 +95,9 @@ public:
   /// (getSegmentOverlayFileName), so gen only has to distinguish rebuilds for
   /// the same live segment and field.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t overlayGen)
+                     const Schema& schema, uint64_t overlayGen, uint64_t writerEpoch)
     : dir_(dir), segments_(segments), schema_(schema),
-      overlayGen_(overlayGen) {}
+      overlayGen_(overlayGen), writerEpoch_(writerEpoch) {}
 
   /// Expand selectors to concrete eligible overlay names present in this
   /// builder's segment inputs.  This applies schema and field eligibility but
@@ -119,6 +123,7 @@ private:
   std::span<const SegInput> segments_;
   const Schema& schema_;
   uint64_t overlayGen_;
+  uint64_t writerEpoch_;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);

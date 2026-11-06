@@ -1,405 +1,197 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
-
 #pragma once
 
 #include <map>
 #include <mutex>
-#include <optional>
-#include <fstream>
+#include <set>
 #include "Directory.h"
 #include "FileLock.h"
 #include "FSDirectory.h"
-#include "Manifest.h"
-#include "CollectionId.h"
-#include "luxir/util/Uuid.h"
-#include "luxir/util/log.h"
 
 namespace luxir {
 
-class DirectoryFactory;
+enum class StorageRoot { AUTHORITATIVE, NODE_PRIVATE };
 
-/// One collection's storage: a container directory whose CURRENT selects one of
-/// its incarnation directories. A cheap handle; the factory must outlive it.
-class CollectionStorage {
-  DirectoryFactory* factory;
-  CollectionId id_;
-  struct Selection {
-    std::string incarnation;
-  };
-public:
-  CollectionStorage(DirectoryFactory& factory, CollectionId id) : factory(&factory), id_(std::move(id)) {}
-  const CollectionId& id() const { return id_; }
-
-  // The incarnation CURRENT selects in `container`, or nullopt without CURRENT.
-  static std::optional<std::string> current(Directory& container);
-  std::optional<std::string> current();
-  // Durably switch CURRENT to an existing incarnation.
-  void select(std::string_view incarnation);
-  // Exclusively creates the collection; throws if its directory already exists.
-  void createExclusive();
-  // Creates the tenant, collection and incarnation directories as needed. Their
-  // entries are durable on return, so a later durable root inside is reachable.
-  std::shared_ptr<Directory> create(std::string_view incarnation);
-  // Opens an existing incarnation without creating anything.
-  std::shared_ptr<Directory> open(std::string_view incarnation);
-  std::vector<std::string> incarnations();
-  // Files directly in the collection directory, CURRENT included.
-  bool hasFiles();
-  void removeIncarnation(std::string_view incarnation);
-  // Best-effort removal of every other incarnation directory.
-  void retainOnly(std::string_view incarnation) noexcept;
-  void remove();
-  uint64_t bytes();
-};
-
-/// Opens collection storage under t/: t/tenant/name holds CURRENT, which
-/// selects t/tenant/name/incarnation. Lives on LuxirNode - one per instance.
-/// The virtual members are backend primitives behind CollectionStorage; wrapping
-/// factories override every one of them.
 class DirectoryFactory {
 public:
+  struct ViewOptions { std::shared_ptr<StorageMemory> account; };
+  struct Child { std::string name; bool directory; };
   virtual ~DirectoryFactory() = default;
-  CollectionStorage collection(CollectionId id) { return {*this, std::move(id)}; }
-
-  // Every tenant's collections, ordered.
-  virtual std::vector<CollectionId> collections() = 0;
-  virtual uint64_t storageBytes() { return 0; }
-  virtual uint64_t collectionBytes(const CollectionId& id) { unused(id); return 0; }
-
-  // Opens t/tenant/name. Without `create` a missing directory is an error and
-  // nothing is created; with it, created directory entries are durable on return.
-  virtual std::shared_ptr<Directory> container(const CollectionId& id, bool create) = 0;
-  // As container(), for t/tenant/name/incarnation; creation includes the container.
-  virtual std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) = 0;
-  // Exclusive, durable creation of t/tenant/name; throws if it already exists.
-  virtual void createCollection(const CollectionId& id) = 0;
-  virtual std::vector<std::string> incarnations(const CollectionId& id) = 0;
-  virtual void removeIncarnation(const CollectionId& id, std::string_view incarnation) = 0;
-  /// Remove all storage for the collection.
-  virtual void remove(const CollectionId& id) = 0;
-
-  /// Node-level metadata files (replication.json), outside every collection.
-  /// Always the same logical directory for one factory.
-  virtual std::shared_ptr<Directory> nodeDirectory() = 0;
-  /// True when this storage holds nothing a follower must not overwrite: no
-  /// collections and no foreign files. The default asks collections().
-  virtual bool holdsNoCollections() { return collections().empty(); }
-  /// One line for the startup log, e.g. "fs:/data" or "checked(ram)".
+  // Opening a view creates no namespace entries. Paths are relative to the root.
+  virtual std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) = 0;
+  virtual std::vector<Child> children(StorageRoot root, std::string_view path) = 0;
+  // Removes a subtree durably. Missing subtrees are allowed; roots cannot be removed.
+  virtual void removeTree(StorageRoot root, std::string_view path) = 0;
+  virtual std::shared_ptr<StorageMemory> memory() { return {}; }
   virtual std::string describe() const = 0;
-  /// Local filesystem path whose disk usage and device describe this storage
-  /// (reported by system stats); empty when the backend has none.
+  // Local path for disk statistics, or empty for a backend without one.
   virtual std::string diskPath() const { return {}; }
-  /// Byte limit of memory-resident storage, for memory stats; zero when unlimited or not RAM.
-  virtual uint64_t memoryLimitBytes() const { return 0; }
+  // The wrapped factory, or null for a backend. find<T>() walks the stack, so a
+  // plugin reaches its own factory (and state kept there) through the core wrappers.
+  virtual DirectoryFactory* inner() { return nullptr; }
+  template <class T> T* find() {
+    for (auto* factory = this; factory; factory = factory->inner()) {
+      if (auto* found = dynamic_cast<T*>(factory)) return found;
+    }
+    return nullptr;
+  }
+  uint64_t storageBytes() { auto account = memory(); return account ? account->bytes() : 0; }
+
+  static std::string checkedPath(StorageRoot root, std::string_view path) {
+    if (path.find_first_of("\\\0", 0, 2) != std::string_view::npos) throw std::invalid_argument("invalid storage path");
+    size_t start = 0;
+    while (start < path.size()) {
+      auto end = path.find('/', start);
+      if (end == std::string_view::npos) end = path.size();
+      auto part = path.substr(start, end - start);
+      if (part.empty() || part == "." || part == ".." || (start == 0 && root == StorageRoot::AUTHORITATIVE && part == "node")) {
+        throw std::invalid_argument("invalid storage path: " + std::string(path));
+      }
+      start = end + 1;
+    }
+    if (!path.empty() && path.back() == '/') throw std::invalid_argument("invalid storage path");
+    return std::string(path);
+  }
 };
 
-inline std::optional<std::string> CollectionStorage::current() {
-  return current(*factory->container(id_, false));
-}
-
-inline void CollectionStorage::createExclusive() { factory->createCollection(id_); }
-inline std::shared_ptr<Directory> CollectionStorage::create(std::string_view incarnation) {
-  return factory->incarnation(id_, incarnation, true);
-}
-inline std::shared_ptr<Directory> CollectionStorage::open(std::string_view incarnation) {
-  return factory->incarnation(id_, incarnation, false);
-}
-inline std::vector<std::string> CollectionStorage::incarnations() { return factory->incarnations(id_); }
-inline bool CollectionStorage::hasFiles() {
-  std::vector<Directory::FileInfo> files;
-  factory->container(id_, false)->listFiles(files);
-  return !files.empty();
-}
-inline void CollectionStorage::removeIncarnation(std::string_view incarnation) {
-  factory->removeIncarnation(id_, incarnation);
-}
-inline void CollectionStorage::retainOnly(std::string_view incarnation) noexcept {
-  try {
-    for (const auto& other : incarnations()) {
-      if (other == incarnation) continue;
-      try { removeIncarnation(other); }
-      catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}/{}' failed: {}", id_.label(), other, e.what()); }
-    }
-  } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' failed: {}", id_.label(), e.what()); }
-}
-inline void CollectionStorage::remove() { factory->remove(id_); }
-inline uint64_t CollectionStorage::bytes() { return factory->collectionBytes(id_); }
-
-
-/// Factory that retains RAMDir instances. Storage accounts form a tree: node,
-/// tenant, collection. A collection's container and incarnations share its
-/// account, which outlives removal while buffers it charged are referenced.
 class RAMDirFactory : public DirectoryFactory {
-  struct Entry {
-    std::shared_ptr<Directory> container;
-    std::map<std::string, std::shared_ptr<Directory>, std::less<>> incarnations;
-  };
   std::mutex mutex;
-  std::map<CollectionId, Entry> entries;
-  uint64_t limit;
-  std::shared_ptr<StorageMemory> memory;
-  std::shared_ptr<Directory> node = std::make_shared<RAMDir>();
-  std::map<std::string, std::weak_ptr<StorageMemory>, std::less<>> tenantAccounts;
-  std::map<CollectionId, std::weak_ptr<StorageMemory>> accounts;
-
-  std::shared_ptr<StorageMemory> account(const CollectionId& id) {
-    auto& weakTenant = tenantAccounts[id.tenant];
-    auto tenant = weakTenant.lock();
-    if (!tenant) { tenant = std::make_shared<StorageMemory>(0, memory); weakTenant = tenant; }
-    auto& weak = accounts[id];
-    auto result = weak.lock();
-    if (!result) { result = std::make_shared<StorageMemory>(0, std::move(tenant)); weak = result; }
-    return result;
-  }
-  Entry& entry(const CollectionId& id, bool create) {
-    auto it = entries.find(id);
-    if (it != entries.end()) return it->second;
-    if (!create) throw std::runtime_error("collection directory does not exist: " + id.label());
-    auto& added = entries[id];
-    added.container = std::make_shared<RAMDir>(account(id));
-    return added;
-  }
+  std::map<std::pair<StorageRoot, std::string>, std::shared_ptr<RAMDir>> views;
+  std::shared_ptr<StorageMemory> account;
 public:
   explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
-      : limit(limit), memory(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
-  std::shared_ptr<Directory> nodeDirectory() override { return node; }
+      : account(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
   std::string describe() const override { return "ram"; }
-  uint64_t memoryLimitBytes() const override { return limit; }
-  uint64_t storageBytes() override { return memory->bytes(); }
-  uint64_t collectionBytes(const CollectionId& id) override {
+  std::shared_ptr<StorageMemory> memory() override { return account; }
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    auto key = std::pair(root, checkedPath(root, path));
     std::lock_guard lock(mutex);
-    std::erase_if(accounts, [](const auto& entry) { return entry.second.expired(); });
-    std::erase_if(tenantAccounts, [](const auto& entry) { return entry.second.expired(); });
-    auto it = accounts.find(id);
-    auto account = it == accounts.end() ? nullptr : it->second.lock();
-    return account ? account->bytes() : 0;
+    auto& dir = views[key];
+    if (!dir) dir = std::make_shared<RAMDir>(options.account ? std::move(options.account) : account);
+    return dir;
   }
-  std::vector<CollectionId> collections() override {
+  std::vector<Child> children(StorageRoot root, std::string_view path) override {
+    auto key = checkedPath(root, path);
+    auto prefix = key.empty() ? key : key + '/';
     std::lock_guard lock(mutex);
-    std::vector<CollectionId> ids;
-    for (const auto& [id, entry] : entries) ids.push_back(id);
-    return ids;
-  }
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
-    std::lock_guard lock(mutex);
-    return entry(id, create).container;
-  }
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
-    std::lock_guard lock(mutex);
-    auto& owner = entry(id, create);
-    auto it = owner.incarnations.find(incarnation);
-    if (it != owner.incarnations.end()) return it->second;
-    if (!create) throw std::runtime_error("incarnation directory does not exist: " + id.label() + "/" + std::string(incarnation));
-    return owner.incarnations[std::string(incarnation)] = std::make_shared<RAMDir>(account(id));
-  }
-  void createCollection(const CollectionId& id) override {
-    std::lock_guard lock(mutex);
-    if (entries.contains(id)) throw std::runtime_error("collection directory already exists");
-    entry(id, true);
-  }
-  std::vector<std::string> incarnations(const CollectionId& id) override {
-    std::lock_guard lock(mutex);
-    std::vector<std::string> names;
-    for (const auto& [incarnation, dir] : entry(id, false).incarnations) names.push_back(incarnation);
-    return names;
-  }
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
-    std::lock_guard lock(mutex);
-    if (auto it = entries.find(id); it != entries.end()) {
-      if (auto dir = it->second.incarnations.find(incarnation); dir != it->second.incarnations.end()) it->second.incarnations.erase(dir);
-    }
-  }
-  void remove(const CollectionId& id) override {
-    std::lock_guard lock(mutex);
-    if (auto it = entries.find(id); it != entries.end()) entries.erase(it);
-  }
-};
-
-
-/// Factory that opens FSDirectory instances under basePath_/t/tenant/.
-/// Shared resources (dictionaries, etc.) live directly under basePath_.
-///
-/// `unowned` opens an existing data directory without claiming it: no
-/// write.lock or directory creation.  It suppresses only the
-/// open-time side effects, which a Directory wrapper cannot reach because they
-/// happen here in the constructor; rejecting mutations is ReadOnlyDirFactory's
-/// job, and the two are meant to be composed (see Collections).
-class FSDirFactory : public DirectoryFactory {
-  std::filesystem::path basePath_;
-  std::filesystem::path collectionsPath_;  // basePath_/t
-  std::optional<FileLock> lock_;
-  bool unowned;
-
-  std::filesystem::path pathOf(const CollectionId& id) const { return collectionsPath_ / id.tenant / id.name; }
-
-  // t/LAYOUT names the directory layout, so data from an incompatible layout is
-  // refused as a whole instead of misread collection by collection. Collections
-  // of earlier layouts lived under c/.
-  static constexpr std::string_view kLayoutFile = "LAYOUT";
-  static constexpr std::string_view kLayout = "tenant/collection/incarnation 1\n";
-  void checkLayout() {
-    auto marker = collectionsPath_ / kLayoutFile;
-    if (std::filesystem::exists(marker)) {
-      std::ifstream in(marker, std::ios::binary);
-      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      if (text != kLayout) throw std::runtime_error("unsupported data directory layout in " + marker.string() + "; reindex it");
-      return;
-    }
-    if (!layoutHoldsNoCollections(collectionsPath_) || std::filesystem::exists(basePath_ / "c")) {
-      throw std::runtime_error("data directory " + basePath_.string() + " predates the tenant layout; reindex it");
-    }
-    if (unowned) return;
-    FSDirectory collections(collectionsPath_, false);
-    auto pending = std::string(kLayoutFile) + ".pending";
-    auto file = collections.createFile(pending);
-    OutputStream out(file.get());
-    out.write(kLayout.data(), kLayout.size()); out.close();
-    collections.finishFile(*file);
-    std::array<std::string, 1> written{pending};
-    collections.sync(written);
-    collections.renameFile(pending, std::string(kLayoutFile));
-    syncDirectory(collectionsPath_);
-  }
-
-public:
-  explicit FSDirFactory(std::filesystem::path path, bool unowned = false)
-      : basePath_(std::move(path)),
-        collectionsPath_(basePath_ / "t"), unowned(unowned) {
-    if (unowned) {
-      if (!std::filesystem::is_directory(collectionsPath_)) {
-        if (std::filesystem::exists(basePath_ / "c")) {
-          throw std::runtime_error("data directory " + basePath_.string() + " predates the tenant layout; reindex it");
-        }
-        throw ReadOnlyError("data directory does not exist (or holds no collections): " +
-                            basePath_.string());
+    std::map<std::string, bool> found;
+    for (const auto& [view, dir] : views) {
+      if (view.first != root || !dir->exists()) continue;
+      if (view.second == key) {
+        std::vector<Directory::FileInfo> files;
+        dir->listFiles(files);
+        for (const auto& file : files) found.emplace(file.name, false);
+      } else if (view.second.starts_with(prefix)) {
+        auto rest = std::string_view(view.second).substr(prefix.size());
+        found[std::string(rest.substr(0, rest.find('/')))] = true;
       }
-      LOG_INFO("Using existing data directory unowned (no write lock): {}", basePath_.string());
-      checkLayout();
-      return;
     }
-
-    bool baseExisted = std::filesystem::is_directory(basePath_);
-    bool created = std::filesystem::create_directories(collectionsPath_);
-    if (created) {
-      LOG_INFO("Created data directory: {}", basePath_.string());
-    } else {
-      LOG_INFO("Using existing data directory: {}", basePath_.string());
-    }
-    lock_.emplace(basePath_ / "write.lock");
-    // Every owned open re-syncs the entry for t/: an earlier creation may have
-    // failed after mkdir, before the entry was durable.
-    if (!baseExisted && basePath_.has_parent_path()) syncDirectory(basePath_.parent_path());
-    syncDirectory(basePath_);
-    checkLayout();
-  }
-
-  // An empty collections directory, apart from its layout marker and what an
-  // interrupted marker write leaves behind (LAYOUT.pending and its staging).
-  static bool layoutHoldsNoCollections(const std::filesystem::path& collections) {
-    for (const auto& entry : std::filesystem::directory_iterator(collections)) {
-      if (!entry.is_regular_file() || !entry.path().filename().string().starts_with(kLayoutFile)) return false;
-    }
-    return true;
-  }
-
-  std::shared_ptr<Directory> nodeDirectory() override { return std::make_shared<FSDirectory>(basePath_, false); }
-
-  // A fresh or follower data directory: the write lock, the layout marker and
-  // an interrupted replication.json write are not collections.
-  bool holdsNoCollections() override {
-    for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
-      auto name = entry.path().filename().string();
-      if (name == "write.lock" || name == "replication.json.pending") continue;
-      if (name == "t" && layoutHoldsNoCollections(entry.path())) continue;
-      return false;
-    }
-    return true;
-  }
-
-  std::string describe() const override { return "fs:" + basePath_.string(); }
-  std::string diskPath() const override { return basePath_.string(); }
-
-  std::vector<CollectionId> collections() override {
-    std::vector<CollectionId> ids;
-    for (const auto& tenant : directoriesIn(collectionsPath_)) {
-      for (auto& name : directoriesIn(collectionsPath_ / tenant)) ids.emplace_back(tenant, std::move(name));
-    }
-    return ids;
-  }
-
-  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
-    auto path = pathOf(id);
-    if (create) { ensureDirectory(path.parent_path()); ensureDirectory(path); }
-    return std::make_shared<FSDirectory>(path, false);
-  }
-
-  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
-    auto path = pathOf(id) / incarnation;
-    if (create) { ensureDirectory(path.parent_path().parent_path()); ensureDirectory(path.parent_path()); ensureDirectory(path); }
-    return std::make_shared<FSDirectory>(path, false);
-  }
-
-  void createCollection(const CollectionId& id) override {
-    auto path = pathOf(id);
-    if (unowned) throw ReadOnlyError("cannot create a collection in an unowned data directory");
-    ensureDirectory(path.parent_path());
-    if (!std::filesystem::create_directory(path)) {
-      throw std::filesystem::filesystem_error("collection directory already exists", path,
-          std::make_error_code(std::errc::file_exists));
-    }
-    try { syncDirectory(path.parent_path()); }
-    catch (...) {
-      std::error_code ignored;
-      std::filesystem::remove(path, ignored); // not created, as far as the caller knows
-      throw;
-    }
-  }
-
-  std::vector<std::string> incarnations(const CollectionId& id) override { return directoriesIn(pathOf(id)); }
-
-  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
-    std::filesystem::remove_all(pathOf(id) / incarnation);
-    syncDirectory(pathOf(id));
-  }
-
-  // The tenant directory stays: removing it would race a concurrent creation.
-  void remove(const CollectionId& id) override {
-    auto path = pathOf(id);
-    if (std::filesystem::exists(path / "CURRENT")) {
-      FSDirectory container(path, false);
-      container.deleteFile("CURRENT");
-      syncDirectory(path);
-    }
-    std::filesystem::remove_all(path);
-    if (std::filesystem::is_directory(path.parent_path())) syncDirectory(path.parent_path());
-  }
-
-private:
-  static void syncDirectory(const std::filesystem::path& path) {
-    std::array<std::string, 1> directory{"."};
-    FSDirectory(path, false).sync(directory);
-  }
-  // Creates `path` if missing and makes its entry in the parent durable. The
-  // parent is synced even for an existing entry: an earlier creation may have
-  // failed after mkdir, before its entry was durable.
-  void ensureDirectory(const std::filesystem::path& path) {
-    if (unowned) {
-      if (std::filesystem::is_directory(path)) return;
-      throw ReadOnlyError("directory does not exist: " + path.string());
-    }
-    std::filesystem::create_directory(path);
-    syncDirectory(path.parent_path());
-  }
-  static std::vector<std::string> directoriesIn(const std::filesystem::path& path) {
-    std::vector<std::string> result;
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-      if (entry.is_directory()) result.push_back(entry.path().filename().string());
-    }
-    std::sort(result.begin(), result.end());
+    std::vector<Child> result;
+    for (const auto& [name, directory] : found) result.push_back({name, directory});
     return result;
   }
+  void removeTree(StorageRoot root, std::string_view path) override {
+    auto key = checkedPath(root, path);
+    if (key.empty()) throw std::invalid_argument("cannot remove a storage root");
+    std::lock_guard lock(mutex);
+    std::erase_if(views, [&](const auto& view) {
+      if (view.first.first != root || (view.first.second != key && !view.first.second.starts_with(key + '/'))) return false;
+      view.second->clear();
+      return true;
+    });
+  }
 };
 
+// Both roots use the configured data directory: node/ is exclusively node-private.
+// An unowned open creates nothing and takes no lock. ReadOnlyDirFactory rejects writes.
+class FSDirFactory : public DirectoryFactory {
+  std::filesystem::path basePath;
+  std::optional<FileLock> lock;
+  bool unowned;
+  std::mutex mutex;
+  std::set<std::filesystem::path> cleaned;
+  std::map<std::filesystem::path, std::shared_ptr<FSDirectory::ParentSync>> parentSync;
+
+  std::shared_ptr<FSDirectory::ParentSync> parentsOf(const std::filesystem::path& path) {
+    std::lock_guard guard(mutex);
+    auto& state = parentSync[path];
+    if (!state) state = std::make_shared<FSDirectory::ParentSync>();
+    return state;
+  }
+
+  std::filesystem::path rootPath(StorageRoot root) const {
+    return root == StorageRoot::AUTHORITATIVE ? basePath : basePath / "node";
+  }
+  std::filesystem::path pathOf(StorageRoot root, std::string_view relative) const {
+    auto base = rootPath(root);
+    auto key = checkedPath(root, relative);
+    auto path = key.empty() ? base : base / key;
+    auto within = std::filesystem::weakly_canonical(path).lexically_relative(base);
+    if (within.empty() || *within.begin() == ".."
+        || (root == StorageRoot::AUTHORITATIVE && *within.begin() == "node")) {
+      throw std::invalid_argument("storage path escapes its root");
+    }
+    return path; // removeTree must unlink a final symlink, not remove its target.
+  }
+public:
+  explicit FSDirFactory(std::filesystem::path path, bool unowned = false)
+      : basePath(std::filesystem::weakly_canonical(std::filesystem::absolute(path))), unowned(unowned) {
+    if (unowned) {
+      if (!std::filesystem::is_directory(basePath)) throw ReadOnlyError("data directory does not exist: " + basePath.string());
+    } else {
+      if (std::filesystem::is_symlink(basePath / "node")) throw std::invalid_argument("node-private root must not be a symlink");
+      FSDirectory(basePath / "node", {}, parentsOf(basePath / "node")).sync({});
+      lock.emplace(basePath / "node" / "write.lock");
+    }
+  }
+  std::string describe() const override { return "fs:" + basePath.string(); }
+  std::string diskPath() const override { return basePath.string(); }
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view relative, ViewOptions options = {}) override {
+    auto path = pathOf(root, relative);
+    if (!unowned && std::filesystem::is_directory(path)) {
+      std::lock_guard guard(mutex);
+      if (cleaned.insert(path).second) FSDirectory::cleanPublicationTemps(path);
+    }
+    return std::make_shared<FSDirectory>(path, basePath, parentsOf(path));
+  }
+  std::vector<Child> children(StorageRoot root, std::string_view relative) override {
+    auto path = pathOf(root, relative);
+    if (!std::filesystem::exists(path)) return {};
+    std::vector<Child> result;
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+      auto name = entry.path().filename().string();
+      if (FSDirectory::isPublishTemp(name) || (root == StorageRoot::AUTHORITATIVE && relative.empty() && name == "node")) continue;
+      result.push_back({name, entry.symlink_status().type() == std::filesystem::file_type::directory});
+    }
+    std::ranges::sort(result, {}, &Child::name);
+    return result;
+  }
+  void removeTree(StorageRoot root, std::string_view relative) override {
+    if (relative.empty()) throw std::invalid_argument("cannot remove a storage root");
+    auto path = pathOf(root, relative);
+    std::vector<std::shared_ptr<FSDirectory::ParentSync>> forgotten;
+    {
+      std::lock_guard guard(mutex);
+      auto removed = [&](const auto& item) { return item == path || item.string().starts_with(path.string() + '/'); };
+      std::erase_if(cleaned, removed);
+      std::erase_if(parentSync, [&](const auto& entry) {
+        if (!removed(entry.first)) return false;
+        forgotten.push_back(entry.second);
+        return true;
+      });
+    }
+    // Invalidate before removal, including views still held if removal fails.
+    for (const auto& state : forgotten) {
+      std::lock_guard guard(state->mutex);
+      state->durable = false;
+    }
+    std::filesystem::remove_all(path);
+    // An interrupted removal still needs its surviving ancestor synced.
+    auto parent = path.parent_path();
+    while (!std::filesystem::is_directory(parent)) parent = parent.parent_path();
+    FSDirectory(parent).sync({});
+  }
+};
 
 } // namespace luxir
