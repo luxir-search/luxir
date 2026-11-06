@@ -1631,6 +1631,19 @@ uint64_t IndexWriter::retirePendingLocked(const DeleteApplication& app) {
   return bytes;
 }
 
+static std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> seen;
+  for (const auto& selector : buildAuxIndexes) {
+    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (seen.emplace(selector).second) {
+        selectors.push_back(selector);
+      }
+    }
+  }
+  return selectors;
+}
+
 // This applies deletes and writes out the new segments file.
 // called from the commitFinishNode which has concurrency==1 (single-threaded)
 bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
@@ -1651,8 +1664,23 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // diffs source liveDocs before swapping; applications finishing after that
   // swap forward their packets to its output for the next application.
   DeleteApplication app(*this);
+  // Serial node: at most one commit holds this intent, and it ends on every path.
+  auto vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
+  auto endVectorIntent = scope_guard([this, active = !vectorSelectors.empty()] {
+    if (!active) return;
+    {
+      const std::lock_guard lock(indexMutex);
+      inFlightVectorSelectors.clear();
+      vectorOverlayIntentGen++;
+    }
+    vectorCommitFinished.notify_all();
+  });
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    if (!vectorSelectors.empty()) {
+      inFlightVectorSelectors = std::move(vectorSelectors);
+      vectorOverlayIntentGen++;
+    }
     // A commit applies every pending batch and carried packet. publishOnly
     // commits retire nothing; their batches stay pending.
     for (const auto& batch : pendingDeletes.deletes) app.select(batch, true);
@@ -1979,19 +2007,6 @@ std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
 
 namespace {
 
-std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
-  std::vector<std::string> selectors;
-  boost::unordered_flat_set<std::string> seen;
-  for (const auto& selector : buildAuxIndexes) {
-    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
-      if (seen.emplace(selector).second) {
-        selectors.push_back(selector);
-      }
-    }
-  }
-  return selectors;
-}
-
 bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
   if (!overlayName.starts_with(VectorIndexBuilder::NAME_PREFIX)) return false;
   overlayName.remove_prefix(VectorIndexBuilder::NAME_PREFIX.size());
@@ -2088,19 +2103,94 @@ void IndexWriter::activateVectorOverlayNames(std::span<const std::string> names)
   for (const auto& name : names) {
     activeVectorOverlayNames.emplace(name);
   }
+  vectorOverlayIntentGen++;
 }
 
-std::vector<std::string> IndexWriter::snapshotActiveVectorOverlayNames() {
-  std::vector<std::string> names;
-  {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    names.reserve(activeVectorOverlayNames.size());
-    for (const auto& name : activeVectorOverlayNames) {
-      names.push_back(name);
+// The output stays private while this runs, so its overlay entries publish
+// atomically with it.  Waiting costs no visibility: commits are serial, so an
+// output swapped during the in-flight commit could not publish before that
+// commit ends anyway.  Only the commit decides whether its names activate, so a
+// failed commit leaves the output without an overlay, as if it never ran.  The
+// commit path never waits for a merge, and its TBB waits are isolated, so this
+// merge cannot be running on the stack of the commit it waits for.
+uint64_t IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
+                                                  boost::unordered_flat_set<std::string>& attempted,
+                                                  const char*& phase) {
+  std::shared_ptr<PostingsReader> pr;
+  for (;;) {
+    uint64_t gen;
+    std::vector<std::string> selectors;
+    std::vector<std::string> names;
+    {
+      std::lock_guard<std::mutex> lock(indexMutex);
+      gen = vectorOverlayIntentGen;
+      selectors = inFlightVectorSelectors;
+      for (const auto& name : activeVectorOverlayNames) {
+        if (!attempted.contains(name)) names.push_back(name);
+      }
+    }
+    if (names.empty() && selectors.empty()) return gen;
+    std::sort(names.begin(), names.end());
+
+    phase = "schema_snapshot";
+    auto schema = getSchema();
+    if (!pr) {
+      phase = "merged_postings_reader";
+      // Test hook: a listener may throw to exercise containment of a
+      // post-merge, pre-swap failure.
+      Signal::emit("mergedPostingsReader", &output);
+      pr = getSegmentPostingsReader(output);
+      #ifndef NDEBUG
+      {
+        std::lock_guard<std::mutex> lock(indexMutex);
+        assert(!segInfos.contains(output.segId));
+      }
+      #endif
+    }
+
+    // An already attempted or active name needs nothing from the commit, so
+    // repeated commits with the same selectors do not stall merges.
+    if (!selectors.empty()) {
+      VectorIndexBuilder::SegInput input{output.segId, pr.get(), output.creatorEpoch};
+      VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                                 *schema, 0, writerEpoch);
+      bool undecided = std::ranges::any_of(matcher.matchingOverlayNames(selectors), [&](const auto& name) {
+        return !attempted.contains(name) && std::ranges::find(names, name) == names.end();
+      });
+      if (undecided) {
+        phase = "await_vector_commit";
+        Signal::emit("mergeAwaitsVectorCommit", &output);
+        std::unique_lock lock(indexMutex);
+        vectorCommitFinished.wait(lock, [&] { return vectorOverlayIntentGen != gen; });
+        continue;
+      }
+    }
+    if (names.empty()) return gen;
+
+    // A failed name is not retried by this merge: the output falls back to flat.
+    attempted.insert(names.begin(), names.end());
+    std::vector<std::string> stagedOverlayFiles;
+    try {
+      phase = "merge_vector_overlay";
+      auto built = buildConcreteVectorOverlays(output, *pr, names, *schema,
+                                               VectorIndexBuilder::BuildSite::MERGE,
+                                               stagedOverlayFiles);
+      for (auto& file : stagedOverlayFiles) {
+        output.unsyncedFiles.push_back(file);
+      }
+      for (auto& info : built) {
+        output.auxOverlays.push_back(std::move(info));
+      }
+    } catch (const std::exception& e) {
+      deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+      LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
+                output.name(), e.what());
+    } catch (...) {
+      deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+      LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
+                output.name());
     }
   }
-  std::sort(names.begin(), names.end());
-  return names;
 }
 
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
@@ -2781,55 +2871,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
-      phase = "active_overlay_snapshot";
-      auto activeOverlayNames = snapshotActiveVectorOverlayNames();
-      if (!activeOverlayNames.empty()) {
-        phase = "schema_snapshot";
-        auto schema = getSchema();
-        // The merged segment is private until the swap below.  Building here
-        // avoids reading live source overlays and publishes segment plus
-        // overlay entries atomically at the later commit.
-        phase = "merged_postings_reader";
-        // Test hook: a listener may throw to exercise containment of a
-        // post-merge, pre-swap failure.
-        Signal::emit("mergedPostingsReader", newSegInfo.get());
-        auto pr = getSegmentPostingsReader(*newSegInfo);
-        #ifndef NDEBUG
-        {
-          std::lock_guard<std::mutex> lock(indexMutex);
-          assert(!segInfos.contains(newSegInfo->segId));
-        }
-        #endif
-        std::vector<std::string> stagedOverlayFiles;
-        try {
-          phase = "merge_vector_overlay";
-          auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
-                                                   *schema, VectorIndexBuilder::BuildSite::MERGE,
-                                                   stagedOverlayFiles);
-          for (auto& file : stagedOverlayFiles) {
-            newSegInfo->unsyncedFiles.push_back(file);
-          }
-          for (auto& info : built) {
-            newSegInfo->auxOverlays.push_back(std::move(info));
-          }
-        } catch (const std::exception& e) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
-                    newSegInfo->name(), e.what());
-        } catch (...) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
-                    newSegInfo->name());
-        }
-        phase = "after_merge_vector_overlay";
-      }
-
       std::vector<uint64_t> coveredGens;
       coveredGens.reserve(segs.size());
       for (auto* seg : segs) coveredGens.push_back(seg->mergedLiveGen);
       auto diffGuard = indexRamBudget->forceAcquire(0);
       std::unique_ptr<screaming::RAMFixedBitSet> outputLiveBits;
+      boost::unordered_flat_set<std::string> attemptedOverlays;
       for (;;) {
+        uint64_t overlayIntentGen = prepareMergedVectorOverlays(*newSegInfo, attemptedOverlays, phase);
         std::vector<uint64_t> currentGens;
         currentGens.reserve(segs.size());
         {
@@ -2891,6 +2940,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (size_t i = 0; i < segs.size(); i++) {
           if (segs[i]->liveGen != coveredGens[i]) retry = true;
         }
+        // Atomic with the swap: an output swapped from here on is covered, and
+        // one swapped before a commit's capture is in that commit's segments.
+        if (vectorOverlayIntentGen != overlayIntentGen) retry = true;
         if (retry) continue;
         segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
         if (newSegInfo->liveDocs > 0) {
