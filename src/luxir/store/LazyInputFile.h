@@ -5,10 +5,13 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "ObjectStore.h"
 #include "OutputStream.h"
@@ -28,6 +31,10 @@ namespace luxir {
 /// the fetch holds the lock stripes of the chunks it covers, so readers of
 /// unrelated ranges proceed in parallel.
 ///
+/// fetchRanges and prefetchRanges fetch on a small process-wide pool of fetch
+/// threads, so the caller's thread is free while the store answers. The
+/// destructor waits for the fetches this file still has in flight.
+///
 /// Eviction is not implemented: a resident chunk stays until the file is
 /// destroyed.
 class LazyInputFile : public InputFile {
@@ -46,10 +53,23 @@ class LazyInputFile : public InputFile {
   std::atomic<uint64_t> residentChunks_{0};
   std::function<void()> onRelease;
   uint64_t prefetchGap = kDefaultPrefetchGap;
+  std::mutex inflightMutex;
+  std::condition_variable inflightDone;
+  size_t inflight = 0;
 
-  // Makes chunks [first, last] resident; one readRange per run of missing chunks.
-  void ensureChunks(size_t first, size_t last);
+  using ChunkSpans = std::vector<std::pair<size_t, size_t>>;
+
+  // Makes chunks [first, last] resident; one readRange per run of missing
+  // chunks. Throws FetchTimeoutError instead of starting a read past `deadline`.
+  void ensureChunks(size_t first, size_t last, ReadDeadline deadline = kNoReadDeadline);
   void ensure(uint64_t offset, uint64_t length);
+  // The chunk runs that cover `ranges` (clipped to the file), merged across
+  // gaps of at most prefetchGap bytes, ascending.
+  ChunkSpans spansOf(std::span<const ByteRange> ranges) const;
+  bool allResident(const ChunkSpans& spans) const;
+  void fetchSpans(const ChunkSpans& spans, ReadDeadline deadline);
+  // Fetches `spans` on the fetch pool and calls `done` there.
+  void startFetch(ChunkSpans spans, ReadDeadline deadline, FetchDone done);
 
 public:
   /// `size` is the object's size as the store reported it. `onRelease` runs
@@ -65,8 +85,17 @@ public:
   std::string_view read() override;
   InputStream getInputStream() override;
   InputStream rangeStream(uint64_t offset, uint64_t length) override;
+  /// Asynchronous: returns at once and fetches on the fetch pool. Resident
+  /// ranges call `done` inline.
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline deadline, FetchDone done) override;
+  /// Asynchronous and advisory: a failure is logged, and the read that needs
+  /// the bytes fetches again and reports it.
   void prefetchRanges(std::span<const ByteRange> ranges) override;
+  /// prefetchRanges on the calling thread: returns once the fetch finished.
+  void prefetchRangesNow(std::span<const ByteRange> ranges);
   void prefetch(size_t offset, size_t length) override;
+  /// Waits until the fetches started by fetchRanges and prefetchRanges finished.
+  void drain();
   bool lazy() const override { return true; }
 
   /// prefetchRanges fetches the chunks between two ranges too when the gap is

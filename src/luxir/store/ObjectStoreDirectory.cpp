@@ -250,7 +250,7 @@ std::shared_ptr<InputFile> ObjectStoreDirectory::openCounted(std::string_view na
     file->read();
   } else if (auto cache = hotcacheOf(data->segStr)) {
     auto ranges = cache->rangesOf(data->fileNum);
-    if (!ranges.empty()) file->prefetchRanges(ranges);
+    if (!ranges.empty()) file->prefetchRangesNow(ranges);  // the open blocks anyway: fetch the hot ranges in it
   }
   return file;
 }
