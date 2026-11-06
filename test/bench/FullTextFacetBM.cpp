@@ -9,7 +9,9 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -1571,6 +1573,111 @@ static void BM_SkipEffectiveness(benchmark::State& state,
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
+//
+// Term-count ladder over the Zipfian body_w corpus, through the full request
+// path. Rung n queries the first n terms of a fixed list, so latency reads
+// against term count, operator and k. Under MaxScore the cost follows the
+// postings of the essential clauses, not the number of terms: adding a rarer
+// term can lift the top-k threshold sooner and demote a frequent one, so a
+// longer OR query may be faster than its prefix. Both ladders include t0
+// (in about 80% of docs) as the stopword. The AND ladder uses denser terms so
+// later rungs still match; its last rung matches fewer docs than k=1000.
+//
+// countLimit: 0 omits the total (pruning on), N > 0 bounds it at N (pruning
+// opens once N hits are counted), -1 counts exactly. Every case first checks
+// that its ranked scores equal the exact-count run's. found_gte=0 under a
+// bound means the engine produced the exact total anyway.
+//
+enum class LadderOp { Or, And };
+
+constexpr std::array<std::string_view, 7> kOrLadder =
+    {"t200", "t50", "t2000", "t20", "t5000", "t0", "t5"};
+constexpr std::array<std::string_view, 6> kAndLadder =
+    {"t10", "t0", "t3", "t30", "t1", "t100"};
+
+struct LadderResult {
+  int64_t found = 0;
+  bool foundGte = false;
+  std::vector<float> scores;
+};
+
+static LadderResult runTermLadder(const std::string& text, LadderOp op, int32_t topK,
+                                  int64_t countLimit) {
+  auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs("q");
+  topDocs.matchQuery("body_w", text,
+                     op == LadderOp::Or ? api::Match_::Operator::OR : api::Match_::Operator::AND);
+  topDocs.limit(topK).fields({"id"}).getScores(true).documentFormat(api::DocFormat::COLUMNS);
+  if (countLimit != 0) {
+    topDocs.countLimit(countLimit);
+  }
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+  LadderResult out;
+  const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
+  out.found = docs->found.value_or(0);
+  out.foundGte = docs->found_gte;
+  if (docs->row_count > 0) {
+    const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind);
+    out.scores.assign(scores.v.begin(), scores.v.end());
+  }
+  return out;
+}
+
+static void BM_TermLadder(benchmark::State& state, int64_t nDocs, std::string_view shape,
+                          LadderOp op, int32_t rungs, int32_t topK, int64_t countLimit) {
+  int mergeFactor = 10;
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
+  }
+
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+  CollectionHelper helper;
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
+  }
+
+  std::span<const std::string_view> ladder = op == LadderOp::Or
+      ? std::span<const std::string_view>(kOrLadder)
+      : std::span<const std::string_view>(kAndLadder);
+  ASSERT_LE((size_t) rungs, ladder.size());
+  std::string text;
+  for (int32_t i = 0; i < rungs; i++) {
+    if (i) text.push_back(' ');
+    text.append(ladder[i]);
+  }
+
+  // Rank safety: the pruned or bounded run must rank the same scores as the
+  // exhaustive one. Summation order may differ across paths, so compare with
+  // a relative tolerance per rank rather than bit-for-bit.
+  LadderResult exact = runTermLadder(text, op, topK, -1);
+  LadderResult measured = runTermLadder(text, op, topK, countLimit);
+  ASSERT_EQ(exact.scores.size(), measured.scores.size()) << text;
+  for (size_t i = 0; i < exact.scores.size(); i++) {
+    ASSERT_NEAR(exact.scores[i], measured.scores[i], std::abs(exact.scores[i]) * 1e-5f)
+        << text << " rank " << i;
+  }
+
+  for (auto _ : state) {
+    LadderResult result = runTermLadder(text, op, topK, countLimit);
+    benchmark::DoNotOptimize(result.found);
+    ASSERT_EQ(measured.scores.size(), result.scores.size());
+  }
+
+  state.counters["terms"] = rungs;
+  state.counters["k"] = topK;
+  state.counters["count_limit"] = (double) countLimit;
+  state.counters["matches"] = (double) exact.found;
+  state.counters["found"] = (double) measured.found;
+  state.counters["found_gte"] = measured.foundGte ? 1 : 0;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
 static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
                                                 BulkDisjunctionCorpus corpus, bool useBulk,
                                                 int32_t domainStep,
@@ -1943,6 +2050,38 @@ LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k100,
                         SkipQueryClass::TwoTermRare, 100, true);
 LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k1000,
                         SkipQueryClass::TwoTermRare, 1000, true);
+
+// Term-count ladder: OR and AND, rungs 1..N, at k=10 and k=1000, with the
+// total omitted. Read latency per rung against matches; a rung faster than
+// its prefix is the expected MaxScore behavior, not noise.
+#define LUXIR_TERM_LADDER(op, name, rungs)                                         \
+  LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_k10, nDocs, shape,       \
+                          LadderOp::op, rungs, 10, 0);                             \
+  LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_k1000, nDocs, shape,     \
+                          LadderOp::op, rungs, 1000, 0)
+LUXIR_TERM_LADDER(Or, disj, 1);
+LUXIR_TERM_LADDER(Or, disj, 2);
+LUXIR_TERM_LADDER(Or, disj, 3);
+LUXIR_TERM_LADDER(Or, disj, 4);
+LUXIR_TERM_LADDER(Or, disj, 5);
+LUXIR_TERM_LADDER(Or, disj, 6);
+LUXIR_TERM_LADDER(Or, disj, 7);
+LUXIR_TERM_LADDER(And, conj, 2);
+LUXIR_TERM_LADDER(And, conj, 3);
+LUXIR_TERM_LADDER(And, conj, 4);
+LUXIR_TERM_LADDER(And, conj, 5);
+LUXIR_TERM_LADDER(And, conj, 6);
+#undef LUXIR_TERM_LADDER
+
+// Cost of the total on a long ladder query: omitted vs bounded at 10,000 vs
+// exact. An exact count may force exhaustive evaluation; a bounded one can
+// prune once 10,000 hits are counted.
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_none,  nDocs, shape, LadderOp::Or, 6, 10, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_10k,   nDocs, shape, LadderOp::Or, 6, 10, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_exact, nDocs, shape, LadderOp::Or, 6, 10, -1);
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_none,  nDocs, shape, LadderOp::And, 3, 10, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_10k,   nDocs, shape, LadderOp::And, 3, 10, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_exact, nDocs, shape, LadderOp::And, 3, 10, -1);
 
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.
