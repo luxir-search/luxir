@@ -189,6 +189,9 @@ public:
     int32_t doc = -1;
     float freq = 0.0f;
 
+    // TODO: OPT: settle() and next()/advance() visit every term's postings per
+    // matching doc, so cost is linear in terms. A case_insensitive match has one
+    // term per indexed case variant, with no cap; use a heap if that shows up.
     int32_t settle() {
       int32_t minDoc = PostingsReader::END;
       for (auto& p : postings) minDoc = std::min(minDoc, p.docs->docId());

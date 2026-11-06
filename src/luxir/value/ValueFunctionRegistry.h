@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -32,9 +34,38 @@ enum class ValueOpcode : uint8_t {
   MIN,
   MAX,
   AVG,
+  EXP,
+  POW,
+  LT,
+  LE,
+  GT,
+  GE,
+  EQ,
+  NE,
+  AND,
+  OR,
+  NOT,
+  IF,
+  RANDOM,
+  GEO_DISTANCE,
+  DECAY,
 };
 
+// Decays take a value, origin, scale, offset, and decay.
+inline constexpr size_t VALUE_MAX_ARITY = 5;
+
 struct ValueFunction {
+  enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
+  // ANY also takes GEO_POINT values and non-numeric (STRING or ID) columns.
+  enum class Kind : uint8_t { NUMERIC, GEO_POINT, ANY };
+  struct Operand {
+    DateUnit unit = DateUnit::UNSET;
+    bool lazy = false;
+    bool constant = false;
+    Kind kind = Kind::NUMERIC;
+  };
+
+  using Prepare = void (*)(ValueNode& node, std::span<const ValueNode* const> args);
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                     int32_t docid, float score);
@@ -59,16 +90,34 @@ struct ValueFunction {
   EvalElement evalElement = nullptr;
   uint8_t minArity = 0;
   uint8_t maxArity = 0;
+  std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
-  bool combinesDates = false;
+  Prepare prepare = nullptr;
 
-  // Normalize only date-combining functions; explicit scaling still uses raw
-  // numbers. Parsers insert the conversion once, before resolving the parent.
-  int dateConversionOperand(std::span<const ResolvedValue> args) const {
-    if (!combinesDates || args.size() != 2
-        || !valueDate(args[0].nature) || !valueDate(args[1].nature)
-        || args[0].nature == args[1].nature) return -1;
-    return args[0].nature == ValueNature::DATE_MS ? 0 : 1;
+  // Strict failures propagate before the bucket kernel selects lazy operands.
+  BucketScalar bucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) const;
+
+  ResolvedValue resolveOperands(std::span<const ResolvedValue> args) const;
+
+  // Strict INVALID operands make the result INVALID; only lazy operands reach
+  // boundsPropagate possibly INVALID.
+  ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) const;
+
+  // Shared DATE operands use ns when any of them uses ns. RAW operands keep
+  // their native numeric representation.
+  std::array<bool, VALUE_MAX_ARITY> dateConversionOperands(
+      std::span<const ResolvedValue> args) const {
+    bool nanos = false;
+    for (size_t i = 0; i < args.size(); i++) {
+      if (operands[i].unit == DateUnit::SHARED
+          && args[i].nature == ValueNature::DATE_NS) nanos = true;
+    }
+    std::array<bool, VALUE_MAX_ARITY> convert{};
+    for (size_t i = 0; i < args.size(); i++) {
+      convert[i] = nanos && operands[i].unit == DateUnit::SHARED
+          && args[i].nature == ValueNature::DATE_MS;
+    }
+    return convert;
   }
 };
 

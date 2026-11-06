@@ -392,3 +392,62 @@ TEST_F(BKDIndexTest, randomizedBoxOracleWrappedBoundsAndCount) {
     EXPECT_GT(tightCrosses, 0);
   });
 }
+
+TEST_F(BKDIndexTest, insideSubtreeCountsFromFullLeaves) {
+  SplitMix64 rng(0x5d1f02b3);
+  // One leaf, an exact multiple of the leaf size, and a short final leaf
+  // whose documents repeat (counts are points, not documents).
+  for (int32_t size : {5, 128, 117}) {
+    std::vector<Point> points;
+    for (int32_t i = 0; i < size; i++) {
+      points.push_back(
+          {geo::encodeLatitude(-60.0 + (double)(rng() % 120000) / 1000.0),
+           geo::encodeLongitude(-170.0 + (double)(rng() % 340000) / 1000.0),
+           size == 117 ? i / 2 : i});
+    }
+    withBKD(points, {.maxPointsPerLeaf = 16},
+            [&](const BKDReader& reader, const BKDWriter::Data&,
+                const InputStream&) {
+      for (uint32_t first = 0; first < reader.leafCount(); first++) {
+        uint64_t sum = 0;
+        for (uint32_t leaves = 1; first + leaves <= reader.leafCount();
+             leaves++) {
+          sum += reader.leafInfo(first + leaves - 1).count;
+          EXPECT_EQ(sum, reader.leafRangePoints(first, leaves));
+        }
+      }
+
+      std::vector<uint32_t> latScratch(reader.maxPointsPerLeaf());
+      std::vector<uint32_t> lonScratch(reader.maxPointsPerLeaf());
+      BKDReader::Scratch scratch{{}, latScratch, lonScratch};
+      auto check = [&](auto&& relation) {
+        uint64_t expected = 0;
+        for (const Point& point : points) {
+          expected += relation.matches(point.lat, point.lon);
+        }
+        EXPECT_EQ(expected, reader.countIntersect(relation, scratch).exactCount);
+        auto estimate = reader.estimateIntersect(relation);
+        EXPECT_LE(estimate.upperBound - estimate.crossingPoints, expected);
+        EXPECT_GE(estimate.upperBound, expected);
+        return estimate;
+      };
+
+      auto all = check(BKDBoxRelation(INT32_MIN, INT32_MAX, INT32_MIN, INT32_MAX));
+      EXPECT_EQ((uint64_t)size, all.estimatedCount);
+      EXPECT_EQ((uint64_t)size, all.upperBound);
+      EXPECT_EQ(0U, all.crossingPoints);
+      for (int32_t i = 0; i + 1 < size; i += 3) {
+        const Point& a = points[i];
+        const Point& b = points[size - 1 - i];
+        check(BKDBoxRelation(std::min(a.lat, b.lat), std::max(a.lat, b.lat),
+                             std::min(a.lon, b.lon), std::max(a.lon, b.lon)));
+        double latA = geo::decodeLatitude(a.lat);
+        double lonA = geo::decodeLongitude(a.lon);
+        double radius = geo::haversinMeters(latA, lonA,
+            geo::decodeLatitude(b.lat), geo::decodeLongitude(b.lon));
+        check(BKDDistanceRelation(latA, lonA, radius));
+        check(BKDDistanceRelation(latA, lonA, 4000000.0 + i * 100000.0));
+      }
+    });
+  }
+}

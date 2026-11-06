@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <chrono>
 #include <thread>
@@ -46,12 +47,18 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
     EXPECT_TRUE(w->snapshots.touch(pin->id, data.size()));
     bytes += desc.size;
   }
+  for (const auto& file : pin->files) {
+    if (std::ranges::find(w->snapshots.snapshot()->files, file) != w->snapshots.snapshot()->files.end()) bytes -= file.size;
+  }
   EXPECT_EQ(bytes, w->snapshots.stats().retainedBytes);
   auto names = pin->files;
   auto inFlight = w->snapshots.openFile(pin->id, names.front().name);
   w->snapshots.testEvictOldest();
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
-  for (const auto& file : names) EXPECT_EQ(nullptr, w->dir.openFile(file.name));
+  for (const auto& file : names) {
+    bool current = std::ranges::find(w->snapshots.snapshot()->files, file) != w->snapshots.snapshot()->files.end();
+    EXPECT_EQ(current, w->dir.openFile(file.name) != nullptr);
+  }
   auto data = inFlight->read();
   EXPECT_EQ(names.front().xxh3, XXH3_64bits(data.data(), data.size()));
   expectValidInventory(w->dir, *readDurableIndexInfo(w->dir));
@@ -71,7 +78,9 @@ TEST_F(CommitSnapshotTest, budgetCountsUniqueRetiredBytesAndEvictsOldest) {
   w->snapshots.setPolicy({60s, UINT64_MAX});
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
   uint64_t bytes = 0;
-  for (const auto& file : first->files) bytes += file.size;
+  for (const auto& file : first->files) {
+    if (std::ranges::find(w->snapshots.snapshot()->files, file) == w->snapshots.snapshot()->files.end()) bytes += file.size;
+  }
   EXPECT_EQ(bytes, w->snapshots.stats().retainedBytes); // not twice the bytes
   auto current = w->snapshots.acquire();
   w->snapshots.setPolicy({60s, bytes - 1});
@@ -87,7 +96,7 @@ TEST_F(CommitSnapshotTest, budgetCountsUniqueRetiredBytesAndEvictsOldest) {
 TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now();
-  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), {}, [&] { return time; });
   IndexWriter writer(snapshots);
   snapshots.setPolicy({100ms, UINT64_MAX});
   auto first = snapshots.acquire();
@@ -108,7 +117,7 @@ TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
 TEST_F(CommitSnapshotTest, reacquireRenewsSharedPin) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now();
-  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), {}, [&] { return time; });
   IndexWriter writer(snapshots);
   snapshots.setPolicy({100ms, UINT64_MAX});
   auto first = snapshots.acquire();
@@ -120,7 +129,7 @@ TEST_F(CommitSnapshotTest, reacquireRenewsSharedPin) {
   EXPECT_EQ(0u, snapshots.stats().pins);
 }
 
-TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
+TEST_F(CommitSnapshotTest, currentSnapshotsAreFreeAndRetiredSchemasConsumeBudget) {
   LuxirNode node;
   CollectionHelper h(node, "main");
   auto w = h.getIndexWriter();
@@ -130,8 +139,9 @@ TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
   w->setSchema(Schema::createDefaultSchema());
   auto reader = w->snapshots.readers.getReader();
   EXPECT_NE(pin->id.index_gen, reader->commitId());
-  EXPECT_EQ(0u, w->snapshots.stats().budgetDrops);
+  EXPECT_EQ(1u, w->snapshots.stats().budgetDrops);
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
+  EXPECT_FALSE(w->dir.openFile(pin->schema->file.name));
   EXPECT_THROW(w->snapshots.openFile(pin->id, "../write.lock"), ApiError);
   w->snapshots.testEvictOldest();
   EXPECT_THROW(w->snapshots.openFile(pin->id, pin->files.front().name), SnapshotExpiredError);
@@ -155,7 +165,7 @@ TEST_F(CommitSnapshotTest, writerlessManagerInstallsExplicitSnapshots) {
   }
   CommitSnapshotRegistry installed(follower);
   auto& readers = installed.readers;
-  auto snapshot = CommitSnapshot::fromBytes(pin->bytes);
+  auto snapshot = installed.resolve(pin->bytes);
   installed.publish(snapshot, readers.prepare(*snapshot));
   auto first = readers.getReader();
   EXPECT_EQ(1, first->liveDocs());
@@ -276,7 +286,10 @@ TEST_F(CommitSnapshotTest, concurrentBudgetEviction) {
   EXPECT_EQ(0u, stats.pins);
   EXPECT_EQ(0u, stats.retainedBytes);
   EXPECT_LE(stats.budgetDrops, 1u);
-  for (const auto& file : first->files) EXPECT_EQ(nullptr, snapshots.dir.openFile(file.name));
+  for (const auto& file : first->files) {
+    bool current = std::ranges::find(snapshots.snapshot()->files, file) != snapshots.snapshot()->files.end();
+    EXPECT_EQ(current, snapshots.dir.openFile(file.name) != nullptr);
+  }
   expectValidInventory(snapshots.dir, *readDurableIndexInfo(snapshots.dir));
 }
 
@@ -290,18 +303,16 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
   auto newest = writer->snapshots.snapshot();
   writer->close();
-  Manifest::write(writer->dir, previous->id.index_gen, *previous->bytes);
-  auto name = Manifest::name(newest->id.index_gen);
-  auto file = writer->dir.createFile(name);
-  OutputStream out(file.get());
-  out.writeInt(42); // Simulate a torn newest root with recoverable data still present.
-  out.close();
-  writer->dir.finishFile(*file);
+  writer->dir.publishFile(previous->manifestName(), Manifest::withFooter(*previous->bytes), Directory::PublishMode::REPLACE);
+  writer->dir.publishFile(newest->manifestName(), std::as_bytes(std::span("torn", 4)), Directory::PublishMode::REPLACE);
+  auto fallback = Manifest::load(writer->dir);
+  EXPECT_EQ(previous->id.index_gen, fallback.generation);
+  EXPECT_EQ(newest->id.index_gen, fallback.highestGeneration);
   CommitSnapshotRegistry recovered(writer->dir);
-  IndexWriter reopened(recovered);
-  EXPECT_NE(previous->id.incarnation, recovered.snapshot()->id.incarnation);
-  EXPECT_GT(recovered.snapshot()->id.index_gen, newest->id.index_gen);
-  EXPECT_EQ(1, recovered.readers.getReader()->liveDocs());
+  // Recovery must copy into a new incarnation through the catalog. A direct
+  // writer cannot change identity inside this directory or sweep its data.
+  EXPECT_THROW(IndexWriter{recovered}, std::runtime_error);
+  EXPECT_EQ(1, IndexReader(writer->dir).liveDocs());
   for (const auto& desc : newest->files) EXPECT_NE(nullptr, writer->dir.openFile(desc.name));
 }
 

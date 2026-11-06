@@ -21,6 +21,7 @@ namespace luxir::QueryPrep {
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
 inline bool disableProhibitedCacheForTests = false;
+inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
@@ -98,6 +99,13 @@ struct PreparedSource {
 inline bool anyNeedsPrepare(std::span<Query::Weight*> weights) {
   for (auto* weight : weights) {
     if (weight->needsPrepare()) return true;
+  }
+  return false;
+}
+
+inline bool anyConsumesDomain(std::span<Query::Weight*> weights) {
+  for (auto* weight : weights) {
+    if (weight->consumesDomain()) return true;
   }
   return false;
 }
@@ -1520,6 +1528,35 @@ inline DomainHandle materializeEffectiveIntersection(
   if (ptrs.empty()) return {};
   if (ptrs.size() == 1) return std::move(sets[0]);
   return DomainHandle(DocSet::intersect(ptrs));
+}
+
+// domain AND NOT (union of sources), under the live-filtered domain contract:
+// a null domain is every doc of a segment without deletes. Each source is
+// materialized inside the domain through its filter cache use, exactly like a
+// filter clause, so a cached exclusion is reused rather than re-run. The
+// result is never null: callers install it as a required domain supplier.
+inline DomainHandle materializeEffectiveExclusion(
+    std::span<const PreparedSource> sources, IndexReader& reader,
+    IndexReader::Segment& segment, DomainHandle domain) {
+  DocSet* base = domain.get();
+  assert(base != nullptr || !segment.hasDeletes());
+  std::vector<DomainHandle> excluded;
+  std::vector<DocSet*> ptrs;
+  excluded.reserve(sources.size());
+  ptrs.reserve(sources.size());
+  for (auto& source : sources) {
+    DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
+    if (set.get() == nullptr) {
+      set = DomainHandle(materialize(
+          source.segmentSource(), segment, base));
+    }
+    if (set.get()->card() > 0) {
+      ptrs.push_back(set.get());
+      excluded.push_back(std::move(set));
+    }
+  }
+  if (excluded.empty() && base != nullptr) return domain;
+  return DomainHandle(DocSet::andNot(base, ptrs, segment.maxDoc()));
 }
 
 } // namespace luxir::QueryPrep

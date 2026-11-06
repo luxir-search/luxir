@@ -24,8 +24,8 @@ class LuxirNode;
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
 // degradations, surfaced as SearchResponse.warnings), and the shared nesting
-// budget.  This is the request-scoped parse/build context from the
-// query-string design; the limits-config snapshot joins it later.
+// budget and operator rules. This is the request-scoped parse/build context
+// from the query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
   const CollapsePlan* collapse = nullptr;
   // The searched reader, when there is one: wildcard field lists reuse its
@@ -51,6 +51,8 @@ struct ParseContext {
   // limit: deterministic for a given request, so exceeding it errors freely.
   // The value is a generous default until the limits-config snapshot exists.
   int nestingBudget = 128;
+  // Operator rule for unbounded prefix, wildcard, and regex queries; zero is off.
+  int32_t minLiteralPrefix = 0;
 
   // Stable across every short-lived QueryBuilder participating in this parse.
   // Request-facing constructors require this explicitly so adding a parser
