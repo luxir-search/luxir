@@ -4,8 +4,11 @@
 #include <gtest/gtest.h>
 #include <oneapi/tbb/task_group.h>
 
+#include <condition_variable>
 #include <filesystem>
+#include <future>
 
+#include "luxir/store/FetchCountdown.h"
 #include "luxir/store/LazyInputFile.h"
 #include "luxir/store/ObjectStore.h"
 
@@ -20,6 +23,48 @@ std::string pattern(size_t size) {
 }
 
 std::string_view view(InputStream& is) { return {is.ptr(), (size_t)is.left()}; }
+
+// A store whose reads wait until the test opens the gate.
+class GatedStore : public RamObjectStore {
+  std::mutex mutex;
+  std::condition_variable opened;
+  bool open = false;
+
+public:
+  void readRange(std::string_view name, uint64_t offset, std::span<char> out) override {
+    {
+      std::unique_lock lock(mutex);
+      opened.wait(lock, [&] { return open; });
+    }
+    RamObjectStore::readRange(name, offset, out);
+  }
+  void openGate() {
+    {
+      std::lock_guard lock(mutex);
+      open = true;
+    }
+    opened.notify_all();
+  }
+};
+
+// Starts fetchRanges; the future completes with what done received.
+std::future<std::exception_ptr> fetch(InputFile& file, std::vector<ByteRange> ranges,
+                                      ReadDeadline deadline = kNoReadDeadline) {
+  auto promise = std::make_shared<std::promise<std::exception_ptr>>();
+  auto result = promise->get_future();
+  file.fetchRanges(ranges, deadline, [promise](std::exception_ptr error) { promise->set_value(error); });
+  return result;
+}
+
+template <typename E>
+bool failsWith(std::exception_ptr error) {
+  try {
+    if (error) std::rethrow_exception(error);
+  } catch (const E&) {
+    return true;
+  } catch (...) {}
+  return false;
+}
 
 class LazyInputFileTest : public ::testing::Test {
 protected:
@@ -75,6 +120,7 @@ TEST_F(LazyInputFileTest, prefetchCoalescesAdjacentRanges) {
   auto file = open();
   std::vector<ByteRange> ranges{{0, 10}, {10, 10}, {40, 5}, {90, 5}, {50, 0}};
   file->prefetchRanges(ranges);
+  file->drain();
   // [0,20) and [40,45) are chunks 0-1 and 2, adjacent: one request; 90 is chunk 5: another.
   EXPECT_EQ(2u, store->requests("read"));
   EXPECT_EQ(64u, file->fetchedBytes());  // chunks 0-2 and chunk 5
@@ -92,11 +138,13 @@ TEST_F(LazyInputFileTest, prefetchFetchesSmallGapsAlong) {
   auto file = open();
   file->setPrefetchGap(47);
   file->prefetchRanges(ranges);
+  file->drain();
   EXPECT_EQ(2u, store->requests("read"));
 
   file = open();
   file->setPrefetchGap(48);
   file->prefetchRanges(ranges);
+  file->drain();
   EXPECT_EQ(1u, store->requests("read"));
   EXPECT_EQ(80u, file->fetchedBytes());  // chunks 0-4, the gap included
   EXPECT_EQ(LazyInputFile::kDefaultPrefetchGap, 64u << 10);
@@ -171,6 +219,9 @@ TEST_F(LazyInputFileTest, aFailedFetchLeavesTheChunkMissing) {
   store->remove("obj");
   std::vector<ByteRange> ranges{{64, 10}};
   EXPECT_NO_THROW(file->prefetchRanges(ranges));
+  file->drain();
+  EXPECT_NO_THROW(file->prefetchRangesNow(ranges));
+  EXPECT_EQ(1u, file->residentChunkCount());
 }
 
 TEST_F(LazyInputFileTest, releaseCallbackRunsOnDestruction) {
@@ -191,4 +242,120 @@ TEST_F(LazyInputFileTest, defaultRangeStreamSlicesTheWholeStream) {
   EXPECT_THROW(ram.rangeStream(8, 3), FileIOException);
   std::vector<ByteRange> ranges{{0, 5}};
   EXPECT_NO_THROW(ram.prefetchRanges(ranges));  // memory needs no readahead
+}
+
+TEST_F(LazyInputFileTest, fetchRangesMakesTheRangesResident) {
+  auto file = open();
+  auto done = fetch(*file, {{0, 10}, {10, 10}, {40, 5}, {90, 5}});
+  EXPECT_EQ(nullptr, done.get());
+  EXPECT_EQ(2u, store->requests("read"));  // chunks 0-2 coalesce; chunk 5 is another
+  auto is = file->rangeStream(40, 5);
+  EXPECT_EQ(bytes.substr(40, 5), view(is));
+  EXPECT_EQ(2u, store->requests("read"));
+
+  // Resident ranges complete inline, before fetchRanges returns.
+  auto again = fetch(*file, {{2, 3}});
+  EXPECT_EQ(std::future_status::ready, again.wait_for(std::chrono::seconds(0)));
+  EXPECT_EQ(nullptr, again.get());
+}
+
+TEST_F(LazyInputFileTest, fetchRangesDoesNotHoldTheCaller) {
+  auto gated = std::make_shared<GatedStore>();
+  gated->put("obj", bytes);
+  auto file = std::make_shared<LazyInputFile>(gated, "obj", bytes.size(), 16);
+  auto done = fetch(*file, {{20, 30}});
+  // The store has not answered, yet fetchRanges returned.
+  EXPECT_EQ(std::future_status::timeout, done.wait_for(std::chrono::milliseconds(20)));
+  gated->openGate();
+  EXPECT_EQ(nullptr, done.get());
+  EXPECT_EQ(3u, file->residentChunkCount());
+
+  // prefetchRanges does not wait either.
+  file->prefetchRanges(std::vector<ByteRange>{{80, 10}});
+  file->drain();
+  EXPECT_EQ(4u, file->residentChunkCount());
+}
+
+TEST_F(LazyInputFileTest, fetchRangesReportsFailures) {
+  auto file = open();
+  // A range outside the file fails inline and fetches nothing.
+  auto outside = fetch(*file, {{0, 10}, {95, 10}});
+  EXPECT_EQ(std::future_status::ready, outside.wait_for(std::chrono::seconds(0)));
+  EXPECT_TRUE(failsWith<FileIOException>(outside.get()));
+  EXPECT_EQ(0u, store->requests("read"));
+
+  // A deadline that passed fails without a request.
+  auto late = fetch(*file, {{0, 10}}, std::chrono::steady_clock::now() - std::chrono::seconds(1));
+  EXPECT_TRUE(failsWith<FetchTimeoutError>(late.get()));
+  EXPECT_EQ(0u, store->requests("read"));
+
+  // A missing object reports a missing file and leaves the chunks missing.
+  store->remove("obj");
+  EXPECT_TRUE(failsWith<std::filesystem::filesystem_error>(fetch(*file, {{0, 10}}).get()));
+  EXPECT_EQ(0u, file->residentChunkCount());
+}
+
+TEST_F(LazyInputFileTest, filesThatNeedNoFetchCompleteInline) {
+  RAMInputFile ram(std::make_unique_for_overwrite<char[]>(10), 10);
+  auto done = fetch(ram, {{0, 10}});
+  EXPECT_EQ(std::future_status::ready, done.wait_for(std::chrono::seconds(0)));
+  EXPECT_EQ(nullptr, done.get());
+  EXPECT_TRUE(failsWith<FileIOException>(fetch(ram, {{8, 3}}).get()));
+
+  // A file that cannot fetch ahead says so, and its reads still work.
+  struct Plain : InputFile {
+    std::string bytes = "abc";
+    size_t size() override { return bytes.size(); }
+    std::string_view read() override { return bytes; }
+    InputStream getInputStream() override { return InputStream(bytes.data(), bytes.data() + bytes.size()); }
+  } plain;
+  auto error = fetch(plain, {{0, 3}}).get();
+  EXPECT_TRUE(isFetchNotResident(error));
+  EXPECT_FALSE(isFetchNotResident(nullptr));
+}
+
+TEST_F(LazyInputFileTest, countdownLetsTheCallerGoOnWhenNothingWaits) {
+  tbb::task_arena arena(2);
+  auto ram = std::make_shared<RAMInputFile>(std::make_unique_for_overwrite<char[]>(10), 10);
+  int runs = 0;
+  auto countdown = FetchCountdown::create(arena, [&](std::exception_ptr) { runs++; });
+  countdown->fetch(ram, std::vector<ByteRange>{{0, 4}}, kNoReadDeadline);
+  countdown->fetch(ReadSet{{ram, {{4, 6}}}, {ram, {{9, 2}}}}, kNoReadDeadline);
+  EXPECT_TRUE(countdown->arm());
+  EXPECT_EQ(0, runs);  // the caller goes on: no continuation
+  EXPECT_TRUE(failsWith<FileIOException>(countdown->failure()));  // [9, +2) leaves the file
+
+  auto empty = FetchCountdown::create(arena, [&](std::exception_ptr) { runs++; });
+  EXPECT_TRUE(empty->arm());
+  EXPECT_EQ(nullptr, empty->failure());
+  EXPECT_EQ(0, runs);
+}
+
+TEST_F(LazyInputFileTest, countdownResumesOnTheArenaAfterTheLastFetch) {
+  tbb::task_arena arena(2);
+  auto gated = std::make_shared<GatedStore>();
+  gated->put("a", bytes);
+  gated->put("b", bytes);
+  std::weak_ptr<LazyInputFile> watched;
+  std::promise<std::pair<std::exception_ptr, bool>> resumed;
+  {
+    auto a = std::make_shared<LazyInputFile>(gated, "a", bytes.size(), 16);
+    auto b = std::make_shared<LazyInputFile>(gated, "b", bytes.size(), 16);
+    watched = a;
+    std::weak_ptr<LazyInputFile> wa = a, wb = b;
+    auto countdown = FetchCountdown::create(arena, [&, wa, wb](std::exception_ptr error) {
+      auto a = wa.lock(), b = wb.lock();  // still held by the countdown
+      bool resident = a && b && a->residentChunkCount() == 2 && b->residentChunkCount() == 1;
+      resumed.set_value({error, resident && tbb::this_task_arena::current_thread_index() >= 0});
+    });
+    countdown->fetch(a, std::vector<ByteRange>{{0, 20}}, kNoReadDeadline);
+    countdown->fetch(b, std::vector<ByteRange>{{50, 5}}, kNoReadDeadline);
+    countdown->fetch(b, std::vector<ByteRange>{{60, 50}}, kNoReadDeadline);  // outside b: the first error
+    EXPECT_FALSE(countdown->arm());
+  }
+  EXPECT_FALSE(watched.expired());  // the countdown holds its files
+  gated->openGate();
+  auto [error, onArena] = resumed.get_future().get();
+  EXPECT_TRUE(failsWith<FileIOException>(error));
+  EXPECT_TRUE(onArena);
 }
