@@ -13,6 +13,8 @@
 #include <oneapi/tbb/info.h>
 #include <oneapi/tbb/task_group.h>
 
+#include "luxir/util/IoContext.h"
+
 namespace luxir {
 
 /// Label the calling thread for ps/top/gdb (15-char kernel limit).
@@ -38,12 +40,13 @@ inline std::atomic<int64_t> taskSpawnsForTests{0};
 
 /// makeTask runs on the caller and may read borrowed state; its returned
 /// callable owns its captures. Publish indices 0..n-2 and run n-1 here.
-/// A null group runs every index here, in order.
+/// A null group runs every index here, in order. Published tasks run under the
+/// caller's IoContext and restore their thread's own when they finish.
 template <typename MakeTask>
 void task_group_fanout(oneapi::tbb::task_group* tg, size_t n, MakeTask&& makeTask) {
   for (size_t i = 0; i < n; i++) {
     if (tg && i + 1 < n) {
-      tg->run(makeTask(i));
+      tg->run(bindIoContext(makeTask(i)));
       if (countTaskSpawnsForTests.load(std::memory_order_relaxed)) {
         taskSpawnsForTests.fetch_add(1, std::memory_order_relaxed);
       }
@@ -56,8 +59,9 @@ void task_group_fanout(oneapi::tbb::task_group* tg, size_t n, MakeTask&& makeTas
 
 /// Scope guard for a maybe-parallel fan-out over one (lazily created)
 /// task_group: pass group() to task_group_fanout, or run(spawn, f) to spawn f
-/// or run it inline.  Call join() on the success path: it waits and
-/// propagates the first task exception.  If the scope unwinds before join(),
+/// or run it inline (a spawned f carries the caller's IoContext).  Call
+/// join() on the success path: it waits and propagates the first task
+/// exception.  If the scope unwinds before join(),
 /// the destructor cancels the group and waits while swallowing any parked
 /// task exception, so the unwind never double-throws (a bare ~task_group
 /// rethrowing a captured task exception during active unwinding would
@@ -75,7 +79,7 @@ public:
   template <typename F>
   void run(bool spawn, F&& f) {
     if (spawn) {
-      group()->run(std::forward<F>(f));
+      group()->run(bindIoContext(std::forward<F>(f)));
     } else {
       std::forward<F>(f)();
     }

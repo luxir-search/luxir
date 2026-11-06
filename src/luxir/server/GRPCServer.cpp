@@ -728,6 +728,11 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
+  // The client's deadline is the storage layer's hint for hedging (IoContext).
+  if (auto left = call.genericCtx.deadline() - std::chrono::system_clock::now();
+      left < std::chrono::hours(24 * 365)) {
+    req.io.deadline = startTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(left);
+  }
   if (!req.proto.min_commit.empty()) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;

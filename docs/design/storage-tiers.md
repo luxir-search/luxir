@@ -61,6 +61,43 @@ A fetched chunk is never evicted: its memory is released when the file is
 destroyed. A collection that is queried broadly ends up with its touched files
 resident, like a page cache that never drops pages.
 
+## The request I/O context
+
+A lazy read happens deep below the search that needs it, often on a worker
+thread, so the storage layer cannot be handed the request through its
+interfaces. Instead the search installs an `IoContext`
+(`src/luxir/util/IoContext.h`) in a thread-local slot, and storage code reads
+it with `IoContext::current()`. It carries the request's query id and
+`request_id`, its deadline (the gRPC client deadline; none over HTTP), a fill
+hint (`fillCache`: false for reads that should not displace cached data, such
+as a scan) and the request's `IoCounters`.
+
+The slot is set by an `IoScope`, a guard that restores the previous value when
+it ends, also on unwind:
+
+- `SearchEngine::submitBody` sets it for the request body, on whichever thread
+  runs it (an HTTP io shard, an arena worker, a gRPC worker).
+- `task_group_fanout` and `TaskGroupRunner::run` wrap each task they publish
+  with `bindIoContext`: the task copies the spawner's context and installs it
+  on the thread that runs it, then restores that thread's own. A worker that
+  steals a task while waiting nests correctly, and a context never outlives
+  its task.
+- A streaming emitter resumed after backpressure installs the request's
+  context again on the thread that resumes it.
+- A `SharedLazyBuild` runs under `IoContext::shared()`: the reads count for the
+  request that builds, but its deadline and fill hint do not decide a value
+  other requests take.
+
+A context is a small value; only its counters point at request-owned state,
+which outlives every task and stream of the request. Reads with no context
+(merges, startup, verification, replication) see null and behave as before;
+the cost on the read path is one thread-local load. `LazyInputFile` counts
+requests, rounds, fetched and touched bytes and whole-file reads into the
+current context, the hotcache load and checksum streaming count their
+requests, and the totals appear in the request's profile and in the
+`search_io_*` service counters. A layer that issues requests of its own adds
+them through `IoContext::countFetch`.
+
 ## The open path contract
 
 > Open-time reads go through `rangeStream`. Bulk reads materialize whole files on
@@ -211,6 +248,9 @@ conditional publish fails once another writer has claimed it.
   resident chunks fits the bitmap; it needs the readers to stop assuming a pointer
   stays valid, or readers to pin ranges.
 - **Parallel fetches.** A `prefetchRanges` call fetches its runs one after another.
+- **Acting on the I/O context in core.** Core counts and carries the deadline and
+  fill hint but never hedges, gives up early or skips a cache on them; that is
+  for a storage layer. Nothing in core sets `fillCache` to false yet.
 - **Multipart upload and write-behind.** `put` takes a whole object, which an S3
   plugin has to split itself, and a flush uploads from the staged file before it
   returns.

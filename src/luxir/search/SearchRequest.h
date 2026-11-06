@@ -27,6 +27,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/IoContext.h"
 #include "luxir/util/proto.h"
 
 namespace luxir {
@@ -79,6 +80,13 @@ public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
+  // Storage I/O done for this request, from every thread that works for it.
+  IoCounters ioCounters;
+  // What the storage layer sees of this request (IoContext::current()) while
+  // the request body runs, in its tasks, and in a resumed streaming emitter.
+  // A transport sets the deadline and fill hint before dispatch; queryId,
+  // requestId and counters are set by the constructor and submitBody.
+  IoContext io;
   uint64_t flags = 0;             // effective packed options, resolved during parsing
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.

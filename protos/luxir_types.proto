@@ -1060,6 +1060,21 @@ message Error {
 // provide profiles; other operations may be absent from this list.
 message ExecutionProfile {
   repeated ExecutionProfileOp ops = 1;
+
+  // Storage I/O of the whole request, counted on lazily read storage (an
+  // object-store backend) and by storage plugins; zero on local files.
+  // io_requests: ranged requests issued to the store.
+  uint64 io_requests = 10;
+  // Sequential waits on the store: requests awaited together count once.
+  uint64 io_rounds = 11;
+  // Bytes those requests returned.
+  uint64 io_fetched_bytes = 12;
+  // Bytes of lazily read files the search resolved, already resident or not.
+  // Ranges a reader resolved before (at open, or for an earlier search) and
+  // keeps are read again without counting.
+  uint64 io_touched_bytes = 13;
+  // Reads that needed a whole lazily read file at once.
+  uint64 io_whole_file_reads = 14;
 }
 
 message ExecutionProfileOp {
@@ -1681,6 +1696,12 @@ message ServiceStats {
   HistogramStats search_execution = 7;
   uint64 search_resource_exhausted = 8;
   uint64 search_warnings = 9;
+  // Storage I/O of finished searches, summed over their ExecutionProfile
+  // io_* counts (counted whether or not a search asked for a profile).
+  uint64 search_io_requests = 28;
+  uint64 search_io_rounds = 29; // requests awaited together count once
+  uint64 search_io_fetched_bytes = 30;
+  uint64 search_io_whole_file_reads = 31;
   ActivityStats index_batches = 10;
   // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
   uint64 documents_accepted = 11;
