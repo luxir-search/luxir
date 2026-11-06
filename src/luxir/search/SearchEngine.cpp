@@ -6,6 +6,7 @@
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
+#include "luxir/store/FetchCountdown.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 
@@ -57,14 +58,30 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
 
 Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
-void SearchEngine::submitBody(SearchRequest& req) {
-  MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
+void SearchEngine::failBody(SearchRequest& req, std::exception& e, ErrorKind fallback) {
+  // Cancel and drain in-flight tasks before tearing down their response.
+  // Swallow any parked task exception so the original error is preserved.
+  if (req.tg) {
+    req.tg->cancel();
+    try { req.tg->wait(); } catch (...) {}
+  }
+  ErrorInfo info = classifyException(e, fallback);
+  if (info.kind == ErrorKind::INTERNAL) {
+    LOG_ERROR("Search request failed: {}", info.message);
+  } else {
+    LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
+  }
+  req.setError(info);
+}
+
+void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg) {
+  auto execution = std::make_shared<MetricScope>(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
-  ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
+  SegmentMask segments;
   try {
     root = prepare(req);
     root->init();
@@ -75,8 +92,60 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Planning itself opens only what statistics need (a segment's base for
     // term dictionary seeks), never live docs or overlays; a pruned segment
     // nothing prepares over gets nothing more.
-    SegmentMask segments = root->neededSegments();
+    segments = root->neededSegments();
     segments |= root->preparationSegments();
+  } catch (std::exception& e) {
+    failBody(req, e, ErrorKind::INVALID_REQUEST);
+    finishBody(req, root, *execution);
+    return;
+  }
+  if (mayDefer) {
+    ReadSet reads;
+    req.reader->declareMaterialize(segments, reads);
+    auto resume = [this, &req, root, segments, execution](oneapi::tbb::task_group*) {
+      execute(req, root, segments, *execution);
+    };
+    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+  }
+  execute(req, root, segments, *execution);
+}
+
+bool SearchEngine::fetchAhead(SearchRequest& req, ReadSet reads, oneapi::tbb::task_group* ownTg,
+                              std::function<void(oneapi::tbb::task_group*)> resume) {
+  if (reads.empty()) return false;
+  // The fetch may finish on a worker after this thread returned: the request
+  // must not point at the caller's task group then. Nothing ran in it yet.
+  bool tookTg = ownTg && req.tg == ownTg;
+  if (tookTg) req.tg = nullptr;
+  auto countdown = FetchCountdown::create(node.getTaskArena(),
+      [&req, resume = std::move(resume)](std::exception_ptr error) {
+        // A failed fetch is no failed search: the reads that need the bytes
+        // fetch again and report what they find, as they would without it.
+        if (error && !isFetchNotResident(error)) {
+          try {
+            std::rethrow_exception(error);
+          } catch (const std::exception& e) {
+            LOG_DEBUG("fetch ahead of a search failed: {}", e.what());
+          } catch (...) {}
+        }
+        // Isolated like enqueueSubmit: a -1 request waiting on its task group
+        // helps only with its own tasks.
+        oneapi::tbb::this_task_arena::isolate([&] {
+          std::optional<oneapi::tbb::task_group> tg;
+          if (req.maxParallel == -1 && req.tg == nullptr) req.tg = &tg.emplace();
+          resume(tg ? &*tg : nullptr);
+        });
+      });
+  countdown->fetch(reads, kNoReadDeadline);
+  reads.clear();
+  if (!countdown->arm()) return true;  // resumes on a worker; req may be gone
+  if (tookTg) req.tg = ownTg;
+  return false;
+}
+
+void SearchEngine::execute(SearchRequest& req, RootOp* root, const SegmentMask& segments, MetricScope& execution) {
+  ErrorKind fallback = ErrorKind::INVALID_REQUEST;
+  try {
     req.reader->materialize(segments);
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -93,21 +162,12 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
-    // Cancel and drain in-flight tasks before tearing down their response.
-    // Swallow any parked task exception so the original error is preserved.
-    if (req.tg) {
-      req.tg->cancel();
-      try { req.tg->wait(); } catch (...) {}
-    }
-    ErrorInfo info = classifyException(e, fallback);
-    if (info.kind == ErrorKind::INTERNAL) {
-      LOG_ERROR("Search request failed: {}", info.message);
-    } else {
-      LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
-    }
-    req.setError(info);
+    failBody(req, e, fallback);
   }
+  finishBody(req, root, execution);
+}
 
+void SearchEngine::finishBody(SearchRequest& req, RootOp* root, MetricScope& execution) {
   if (root != nullptr) {
     for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
   }
@@ -138,7 +198,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
     // Isolated: a -1 request waiting on its task group helps only with its own
     // tasks, never stealing another request's.
     node.getTaskArena().enqueue([this, &req, maxParallel] {
-      oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
+      oneapi::tbb::this_task_arena::isolate([&] { run(req, maxParallel, true); });
     });
   } catch (const std::exception& e) {
     // Nothing was queued: complete the request here so its transport still
@@ -194,25 +254,29 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
     // transport thread.  No scheduler hop, and the arena's parked width never
     // wakes - the transport accepts that this thread is occupied for the
     // query's duration.
-    submit(req, maxParallel);
+    run(req, maxParallel, true);
   } else {
     // Parallel lane: the request starts right here, inside the arena, so it
     // pays no handoff; arena workers steal the tasks it spawns and this thread
     // helps in its own waits.  Entry takes a reserved slot (never queues
     // behind arena backlog).  Like the default lane, this transport thread is
     // occupied for the query's (now parallel) duration.
-    node.executeIsolated([&] { submit(req, maxParallel); });
+    node.executeIsolated([&] { run(req, maxParallel, true); });
   }
 }
 
 void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
+  run(req, maxParallel, false);
+}
+
+void SearchEngine::run(SearchRequest& req, int32_t maxParallel, bool mayDefer) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
   req.maxParallel = maxParallel;
   std::optional<oneapi::tbb::task_group> stackTg;
   if (maxParallel == -1 && req.tg == nullptr) {
     req.tg = &stackTg.emplace();
   }
-  submitBody(req);
+  submitBody(req, mayDefer, stackTg ? &*stackTg : nullptr);
 }
 
 void SearchEngine::getResources(SearchRequest& req) {

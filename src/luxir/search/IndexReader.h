@@ -103,6 +103,9 @@ class SegmentPart {
 protected:
   SharedLazyCell<Value, false> cell;
   std::unique_ptr<HeldFiles> files;
+  // Guards `files` between the build and declareReads, which another request
+  // may run while this one builds.
+  std::mutex filesMutex;
   std::shared_ptr<Metrics> metrics;
   std::shared_ptr<const UnreadableHook> onUnreadable;  // null: nobody to tell
   // Set once by the (serialized) build that found the bytes unreadable;
@@ -126,6 +129,9 @@ public:
   bool isUnreadable() const noexcept { return unreadable.load(std::memory_order_acquire); }
   // peek() without a reference count; valid while the part lives.
   Value* peekRaw() const noexcept { return cell.peekRaw(); }
+  // Adds the reads a build would make, for a fetch ahead of it; nothing once
+  // built or found unreadable.
+  void declareReads(ReadSet& reads);
 };
 
 // A segment's base data: its PostingsReader over the segment files.
@@ -228,6 +234,8 @@ public:
     bool isMaterialized() const noexcept;
     // Materializes the base, live docs and every overlay.
     void materialize() const;
+    // Adds the reads materialize() would make, for a fetch ahead of it.
+    void declareReads(ReadSet& reads) const;
 
     // Whether the segment carries a live-docs generation (live_gen > 0), so
     // liveDocs() is non-null and must be consulted. It does not guarantee a
@@ -584,6 +592,11 @@ public:
   // that is not yet, in parallel: the one batched point where a search opens
   // the segments its root masks kept. Counts into the reader's metrics.
   void materialize(const SegmentMask& mask = {});
+  // Adds the reads materialize(mask) would make, for a fetch ahead of it, so
+  // that a search can wait for them without holding a thread
+  // (FetchCountdown) and then materialize on resident bytes. Reads of
+  // memory-backed and mapped files complete inline.
+  void declareMaterialize(const SegmentMask& mask, ReadSet& reads) const;
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the readers its publisher holds open (CommitSnapshot::openReaders).

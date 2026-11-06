@@ -176,6 +176,7 @@ std::shared_ptr<Value> SegmentPart<Value>::getOrOpen(std::string_view what, Open
   if (isUnreadable()) rethrowUnreadable();
   return cell.getOrCreate([&] {
     if (isUnreadable()) rethrowUnreadable();  // marked while this call waited to build
+    std::lock_guard filesLock(filesMutex);
     assert(files);
     // Unreadable bytes do not heal: record the failure, release the
     // handles, and never build again.
@@ -264,6 +265,19 @@ bool Segment::isMaterialized() const noexcept {
   return true;
 }
 
+template <class Value>
+void SegmentPart<Value>::declareReads(ReadSet& reads) {
+  if (peek() || isUnreadable()) return;
+  std::lock_guard filesLock(filesMutex);
+  if (files && !peek()) files->declareReads(reads);
+}
+
+void Segment::declareReads(ReadSet& reads) const {
+  sharedBase->declareReads(reads);
+  if (sharedLive) sharedLive->declareReads(reads);
+  for (const auto& overlay : sharedOverlays) overlay->declareReads(reads);
+}
+
 void Segment::materialize() const {
   sharedBase->get();
   if (sharedLive) sharedLive->get();
@@ -282,6 +296,12 @@ std::shared_ptr<AuxReader> Segment::getAuxReader(std::string_view name) const {
     if (overlay->info.name == name) return overlay->get();
   }
   return nullptr;
+}
+
+void IndexReader::declareMaterialize(const SegmentMask& mask, ReadSet& reads) const {
+  for (const auto& segment : core->segs) {
+    if (mask.test((size_t)segment.ord) && !segment.isMaterialized()) segment.declareReads(reads);
+  }
 }
 
 void IndexReader::materialize(const SegmentMask& mask) {
