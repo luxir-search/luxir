@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1373,7 +1374,7 @@ static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
   constexpr int32_t topK = 100;
 
   RAMDir dir;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   buildClusteredScoreTopKIndex(iw, clusteredDocs);
   auto reader = iw.snapshots.readers.getReader();

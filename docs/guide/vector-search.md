@@ -345,9 +345,21 @@ later filter would have discarded. With an approximate index, the search
 deepens its breadth automatically when a filter or multi-value collapse leaves
 too few documents.
 
+Each segment with an index chooses between its index and an exact scan of the
+filtered vectors from the filter's size and an estimated cost of each. A
+selective filter is usually cheaper to score exactly, and then returns exact
+results for that segment. If a segment on its index ends up costing more than
+an exact scan would, for example because the filter excludes the vectors
+nearest the query, it switches to an exact scan partway through the query.
+
 The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
-[query facet](faceting.md#query-facets) bucket.
+[query facet](faceting.md#query-facets) bucket. A boolean's `filter` and
+`prohibited` clauses both apply inside the vector search of its `required`
+and `optional` kNN clauses: a required kNN beside `prohibited: [X]` returns
+`k` neighbors that do not match `X`. Other scoring clauses beside the kNN
+(another `required` clause, or `optional` clauses made a constraint through
+`min_match`) still intersect with its top `k` afterwards.
 
 ## Hybrid search
 
@@ -788,7 +800,7 @@ every index type.
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Select the bounded candidate policy for every approximate codec, with this document budget clamped up to `k`. Unset: RaBitQ uses intervals; PQ uses the count formula below. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
-| `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
+| `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned in the searched IVF segments, in `[0,1]`; `0.001` means 0.1%. |
 
 An explicit `refine_candidates` selects bounded collection for every approximate
 segment, including RaBitQ. Without it, PQ uses
@@ -829,6 +841,19 @@ measurements on GIST and Cohere embeddings showed recall@10 rising from
 0.82-0.87 to about 0.95. Selected lists are always traversed in full. Within
 them, multi-bit RaBitQ skips the extra-bit evaluation for vectors that cannot
 compete, and candidate selection decides which vectors are read exactly.
+
+The reference size includes all live vectors; the scan fraction is charged
+only against segments searched through IVF. With default probes, a filter
+expands that fraction by `s^(-1/4)`, capped at one, where `s` is the eligible
+fraction of vectors in those IVF segments. The default fraction itself scales
+as `N^(-1/4)` with index size, so this treats the eligible vectors like an
+index of their own and keeps filtered recall near unfiltered recall. Explicit
+`nprobe` keeps its pin and receives no filter expansion. Default-probe queries
+also keep widening until newly scanned lists have yielded the number of
+filter-passing vectors expected at that initial fraction, or all lists are
+exhausted. Widening projects from observed yield instead of adding one list at
+a time. These are effort heuristics; approximate candidate selection can still
+miss neighbors even when every list is scanned.
 
 ### Scoring
 
@@ -910,11 +935,10 @@ bit-identical results to a serial run of the same query.
   no HNSW yet.
 - An `ann` change does not rebuild existing overlays; only segments built
   afterwards use it (see [Index settings](#index-settings)).
-- Filters are always applied inside the vector search. There is no cost-based
-  choice between filtered approximate search and exact search over the
-  filtered set, and no automatic exact fallback when a selective filter still
-  starves the approximate search after breadth deepening. Use `exact: true`
-  when exact filtered top-k is the required contract.
+- The choice between index and exact scan is made on cost, not recall. When
+  a filter excludes most vectors near the query but the index stays cheaper,
+  results keep the index's approximate recall, which can be poor for such
+  filters. Use `exact: true` when exact filtered top-k is the required contract.
 - There is no public command to remove or rebuild an overlay that a segment
   already has. New and merged segments build from their columns, and a segment
   without an overlay can receive one through a later selected commit.
