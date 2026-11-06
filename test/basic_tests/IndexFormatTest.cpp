@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/server/HttpServer.h"
@@ -36,8 +37,8 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 9;
-constexpr uint64_t kReferenceDigest = 0x07f1cf29172c53f3;
+constexpr uint64_t kReferenceVersion = 10;
+constexpr uint64_t kReferenceDigest = 0x62b02a328ada5f26;
 
 // A small index over every default field template's kind, with two segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -76,8 +77,15 @@ uint64_t referenceDigest(Directory& dir) {
   EXPECT_TRUE(info.aux_indexes.empty());
   std::vector<api::SegmentInfo> segments(info.segments.begin(), info.segments.end());
   std::vector<std::vector<api::FileDescriptor>> files;
+  std::vector<std::vector<api::AuxIndexInfo>> overlays;
   for (auto& segment : segments) {
-    EXPECT_TRUE(segment.overlays.empty());
+    // Only the segment summary, whose entry carries a commit time.
+    auto& summaries = overlays.emplace_back(segment.overlays.begin(), segment.overlays.end());
+    for (auto& overlay : summaries) {
+      EXPECT_EQ(SegmentSummary::OVERLAY_KIND, overlay.kind);
+      overlay.commit_time = 0;
+    }
+    segment.overlays = summaries;
     segment.commit_time = 0;
     segment.schema = {};
     auto& kept = files.emplace_back();
