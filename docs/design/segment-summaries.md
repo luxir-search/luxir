@@ -66,7 +66,7 @@ never narrower.
 
 The summary is a segment overlay (`SegmentInfo.overlays`) of kind
 `segment_summary`, name `summary`, at a fixed generation 0, in the file
-`s<seg>__summary_00_00`. It takes no overlay generation, so the numbering of
+`s<seg>.<creator epoch>__summary_00.<writer epoch>_00`. It takes no overlay generation, so the numbering of
 vector overlays is unchanged. As an overlay it gets the existing manifest file
 descriptor, sync, verify-on-open, scrub, replication, reopen reuse and
 retirement with its segment, and it is listed with its size by
