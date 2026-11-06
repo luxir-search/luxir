@@ -72,7 +72,13 @@ public:
   bool deleteFile(std::string_view) override { refuse("deleteFile"); }
   void deletePrefix(std::string_view) override { refuse("deletePrefix"); }
   void finishFile(File&) override { refuse("finishFile"); }
-  void renameFile(std::string_view, std::string_view) override { refuse("renameFile"); }
+  void deleteDurably(std::span<const std::string>) override { refuse("deleteDurably"); }
+  std::optional<PublicationVersion> publishFile(std::string_view, std::span<const std::byte>,
+                                                PublishCondition) override {
+    refuse("publishFile");
+  }
+  std::optional<Publication> readPublished(std::string_view) override { refuse("readPublished"); }
+  void sync(std::span<const std::string>) override { refuse("sync"); }
   void clear() override { refuse("clear"); }
   void linkFile(Directory&, std::string_view) override { refuse("linkFile"); }
 };
