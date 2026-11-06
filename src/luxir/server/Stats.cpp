@@ -41,8 +41,10 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.indexing_budget.retained_delete_bytes = (uint64_t)ram.retainedDeleteBytesCount();
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
   memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
+  memory.schema_cache_bytes = node.collections().schemaBytes();
   memory.storage_ram.used_bytes = node.storageBytes();
-  memory.storage_ram.limit_bytes = node.collections().storage().memoryLimitBytes();
+  auto storageMemory = node.collections().storage().memory();
+  memory.storage_ram.limit_bytes = storageMemory ? storageMemory->limitBytes() : 0;
   auto& fields = memory.field_metadata;
   fields.directories = fieldMetadataMemory.directories.load(std::memory_order_relaxed);
   fields.directory_bytes = fieldMetadataMemory.directoryBytes.load(std::memory_order_relaxed);
@@ -136,8 +138,10 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   auto& metrics = *node.metrics;
   auto counts = metrics.counts();
   auto counter = [&](MetricCounter c) { return counts.counters[(size_t)c]; };
-  dst.version = buildVersion();
-  dst.cpu_target = buildCpuTarget();
+  const auto& build = buildInfo();
+  dst.version = build.version;
+  dst.cpu_target = build.cpuTarget;
+  dst.source_commit = build.sourceCommit;
   dst.read_only = node.readOnly();
   dst.request_duration_bounds = requestBounds;
   dst.background_duration_bounds = backgroundBounds;
@@ -245,7 +249,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
   for (std::size_t i = 0; i < src.segmentStats.size(); i++) {
     const auto& in = src.segmentStats[i];
     auto& out = segments[i];
-    out.seg = api::build::arenaStr(resource, Postings::getIndexFileNamePrefix(in.segId));
+    out.seg = api::build::arenaStr(resource, "s" + Postings::segmentKey(in.segId, in.creatorEpoch));
     out.live_gen = sortableGen(in.liveGen, resource);
     out.min_update_version = in.minUpdateVersion;
     out.max_update_version = in.maxUpdateVersion;
@@ -308,7 +312,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
       auto& collectionStats = collections[i];
       collectionStats.name = api::build::arenaStr(resource, entry.id.name);
       collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
-      collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
+      collectionStats.storage_ram_bytes = node.collections().storageBytes(*entry.collection);
       auto unavailable = [&](const ErrorInfo& info) {
         collectionStats.schema_gen = 0;
         collectionStats.shards = {};

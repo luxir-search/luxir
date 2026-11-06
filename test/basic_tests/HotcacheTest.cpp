@@ -46,15 +46,16 @@ TEST(HotcacheTest, roundTripsAndRejectsDamage) {
 }
 
 TEST(HotcacheTest, namesAreRecognized) {
-  EXPECT_EQ("s01__hot", Hotcache::fileName(1));
-  EXPECT_EQ("s110__hot", Hotcache::fileName(36));
-  auto data = Hotcache::parseDataFile("s01_03");
+  EXPECT_EQ("s01.1__hot", Hotcache::fileName(1, 1));
+  EXPECT_EQ("s110.a__hot", Hotcache::fileName(36, 10));
+  auto data = Hotcache::parseDataFile("s01.2_03");
   ASSERT_TRUE(data);
-  EXPECT_EQ("01", data->segStr);
+  EXPECT_EQ("01.2", data->segStr);
   EXPECT_EQ(3u, data->fileNum);
-  EXPECT_EQ(36u, Hotcache::parseDataFile("s0a_110")->fileNum);
-  for (std::string_view other : {"s01__hot", "s01__L01", "s01__vec.title_v_00_00", "commit_3", "CURRENT", "s01", "s01_",
-                                 "s01_0", "x01_00", "s01_00_00", "s01_0A"}) {
+  EXPECT_EQ(36u, Hotcache::parseDataFile("s0a.1_110")->fileNum);
+  for (std::string_view other : {"s01.1__hot", "s01.1__L01.1", "s01.1__vec.title_v_00_00", "commit_3.1", "STATE", "s01.1",
+                                 "s01.1_", "s01.1_0", "x01.1_00", "s01.1_00_00", "s01.1_0A", "s01_00", "s01._00",
+                                 "s01.0_00", "s01.1.1_00"}) {
     EXPECT_FALSE(Hotcache::parseDataFile(other)) << other;
   }
 }
@@ -102,8 +103,8 @@ protected:
     staging = std::filesystem::temp_directory_path() / ("luxir-hot-" + newUuid());
     store = RamObjectStore::named(storeName);
     config.store.backend = "ram_object";
-    config.store.options = {{"store_name", storeName}, {"chunk_bytes", "4096"}, {"staging_dir", staging.string()},
-                            {"spill_bytes", "8K"}};
+    config.store.options = {{"ram_object", {{"store_name", storeName}, {"chunk_bytes", "4096"},
+                                            {"staging_dir", staging.string()}, {"spill_bytes", "8K"}}}};
     options.chunkBytes = 4096;
     {
       LuxirNode node(config);
@@ -119,7 +120,7 @@ protected:
                                "c_s", "c" + std::to_string(i % 7)));
       }
       ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
-      key = "t/t0/main/" + node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation + "/";
+      key = "t/t0/i/" + node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation + "/";
     }
   }
   void TearDown() override {
@@ -131,6 +132,7 @@ protected:
 
   struct Segment {
     uint64_t id = 0;
+    uint64_t epoch = 0;
     std::string segStr;
     std::vector<std::string> dataFiles;
   };
@@ -141,7 +143,9 @@ protected:
     for (const auto& f : files) {
       if (auto parsed = Hotcache::parseDataFile(f.name)) {
         seg.segStr = std::string(parsed->segStr);
-        seg.id = Postings::parseSortableString(parsed->segStr);
+        auto dot = parsed->segStr.find('.');
+        seg.id = Postings::parseSortableString(parsed->segStr.substr(0, dot));
+        seg.epoch = Postings::parseEpoch(parsed->segStr.substr(dot + 1));
         seg.dataFiles.push_back(f.name);
       }
     }
@@ -204,7 +208,7 @@ TEST_F(HotcacheSegmentTest, openingASegmentFetchesNothingOutsideTheHotcache) {
   std::map<std::string, uint64_t> before;
   for (const auto& [name, file] : lazy) before[name] = file->fetchRequests();
   store->resetStats();
-  auto reader = PostingsReader::create(pre, seg.id);
+  auto reader = PostingsReader::create(pre, seg.id, seg.epoch);
   EXPECT_EQ(1500, reader->maxDoc());
   EXPECT_GT(reader->numFields(), 3);
   ASSERT_NE(nullptr, reader->fieldInfo("a_un"));  // the field catalog is part of the open
@@ -228,7 +232,7 @@ TEST_F(HotcacheSegmentTest, aVerifiedOpenUsesTheHotcache) {
       pre.files[name] = verified ? fresh->openChecksum(name)->map() : fresh->openFile(name);
       EXPECT_NE(nullptr, pre.files[name]) << name;
     }
-    auto reader = PostingsReader::create(pre, seg.id);
+    auto reader = PostingsReader::create(pre, seg.id, seg.epoch);
     EXPECT_EQ(1500, reader->maxDoc());
     return store->requests("read", key + "s");
   };
@@ -243,7 +247,7 @@ TEST_F(HotcacheSegmentTest, aMissingOrDamagedHotcacheOnlyCostsRequests) {
   auto openCost = [&] {
     auto fresh = std::make_shared<ObjectStoreDirectory>(store, key, options);
     store->resetStats();
-    auto reader = PostingsReader::create(*fresh, seg.id);
+    auto reader = PostingsReader::create(*fresh, seg.id, seg.epoch);
     EXPECT_EQ(1500, reader->maxDoc());
     EXPECT_NE(nullptr, reader->fieldInfo("b_un"));
     return store->requests("read", key + "s");

@@ -463,9 +463,9 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
 
     // Start with generation 1 for the first liveDocs file.
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, nullptr);
     }
     liveGen = 1;
     liveDocs = numLiveDocs;

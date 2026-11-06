@@ -13,6 +13,7 @@
 #include "luxir/codec/LinearPack.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/index/OrdColWriter.h"
+#include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/SortField.h"
@@ -165,6 +166,44 @@ TEST_F(OrdColFormatTest, declaredMultiObservedSingleUsesDocIdWithoutMono) {
         calls++;
       });
   EXPECT_EQ(2, calls);
+}
+
+TEST_F(OrdColFormatTest, columnShapeSeeksInAnyOrder) {
+  TestIndex index;
+  TestField field(index, "tags_ss");
+  field.startIndexing();
+  field.addStrings(1, {"a", "b"});
+  field.addStrings(3, {"c"});
+  field.addStrings(6, {"d", "e", "f"});
+  index.flush();
+  field.startReading();
+  ASSERT_EQ(1, field.nextDoc());
+  ColumnShape shape(field.currentSegment()->postingsReader(), field.fieldInfo);
+  ASSERT_TRUE(shape.multiValued());
+  ColumnShape::Cursor cursor(shape);
+  auto count = [&](int32_t doc) { return cursor.seek(doc) ? cursor.count() : -1; };
+  EXPECT_EQ(1, count(3));
+  EXPECT_EQ(2, count(1));
+  EXPECT_EQ(2, count(1));
+  EXPECT_EQ(-1, count(2));
+  EXPECT_EQ(-1, count(2));
+  EXPECT_EQ(1, count(3));
+  EXPECT_EQ(3, count(6));
+  EXPECT_EQ(-1, count(5));
+  EXPECT_EQ(3, count(6));
+
+  TestIndex denseIndex;
+  TestField dense(denseIndex, "tag_s");
+  dense.startIndexing();
+  for (int32_t doc = 0; doc < 3; doc++) dense.add(doc, "v");
+  denseIndex.flush();
+  dense.startReading();
+  ASSERT_EQ(0, dense.nextDoc());
+  ColumnShape denseShape(dense.currentSegment()->postingsReader(), dense.fieldInfo);
+  ColumnShape::Cursor denseCursor(denseShape);
+  EXPECT_TRUE(denseCursor.seek(2));
+  EXPECT_TRUE(denseCursor.seek(0));
+  EXPECT_EQ(1, denseCursor.count());
 }
 
 TEST_F(OrdColFormatTest, observedMultiUsesRankAndMono) {

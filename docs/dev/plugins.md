@@ -742,45 +742,96 @@ backends and layers. `ram`, `fs` and `ram_object` are built in and registered be
   the core wrappers: `checked_dir` and `read_only` stay outermost, so a mutation is
   refused before any layer sees it.
 
-Both makers receive a `StorageContext`: the whole `LuxirConfig`, the free-form
-`options` map (`--store.option KEY=VALUE`, read directly or through `option()`,
-`optionOr()` and `optionBytes()`), and `reclaim`, the callback RAM backends call
-under memory pressure. Unknown names fail when the node opens its storage, with a
-message listing the registered names.
+Both makers receive a `StorageContext`: the whole `LuxirConfig`, `params` (a
+`ParamReader` over only that component's options), and `reclaim`, the callback RAM
+backends call under memory pressure. The context's references are valid only for
+the maker call; copy any values the factory needs to retain.
+
+Pass options as `--store.option COMPONENT.KEY=VALUE`, where `COMPONENT` is the
+backend or layer name (`[a-z0-9_]+`) and `KEY` is non-empty. Missing components,
+keys, dots or equals signs fail parsing. Values that parse as JSON integers,
+doubles, booleans or quoted strings retain that type; everything else is a bare
+string. For example, `s3.bucket=logs` and `cache.bytes=10G` are strings,
+`cache.bytes=1048576` is an integer, and `--store.option 's3.bucket="123"'`
+preserves a numeric string (the shell quotes keep the JSON quotes intact).
+`getBytes()` accepts non-negative integers or strings using the same size syntax
+as CLI size options, with binary units (`KB` is 1024 bytes).
+
+After the makers return, `Collections` calls `rejectUnknown()` on their readers.
+An unknown key names its component and lists the keys the maker read; `ram` and
+`fs` take no parameters. Options for an unconfigured component fail startup and
+list the configured components. Repeated layers receive the same component's
+options, and each maker call validates them independently. Repeated assignments
+to a component key use the last value. Unknown backend or layer names list the
+registered names.
 
 ```cpp
 void registerComponents(luxir::Registries& r) override {
   r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
-    return std::make_unique<S3DirFactory>(ctx.option("bucket").value_or(""));
+    return std::make_unique<S3DirFactory>(std::string(ctx.params.getString("bucket")), ctx.config.read_only);
   });
   r.storage.addLayer("cache", [](std::unique_ptr<luxir::DirectoryFactory> inner, const luxir::StorageContext& ctx) {
-    return std::make_unique<CacheLayer>(std::move(inner), ctx.optionBytes("cache_bytes", 1ULL << 30));
+    return std::make_unique<CacheLayer>(std::move(inner), ctx.params.getBytes("bytes", 1ULL << 30));
   });
 }
 ```
 
-A backend implements `DirectoryFactory`. Beyond the collection primitives it provides
-`nodeDirectory()` (a stable directory for node-level files such as `replication.json`),
-may override `holdsNoCollections()` (a follower refuses a data directory that holds
-anything else) and `describe()` (one line for the startup log).
+A backend implements `DirectoryFactory` over two roots: `AUTHORITATIVE` for the
+portable `LAYOUT` and `t/` tree, and `NODE_PRIVATE` for local files such as
+`write.lock` and `replication.json`. `directory(root, path, options)` opens a
+relative path view without creating namespace entries; `children(root, path)`
+lists children, and `removeTree(root, path)` removes a subtree durably. Paths
+cannot escape their root. Collection names, catalogs and incarnations are engine
+logic over these views, not backend primitives.
+
+`memory()` exposes the backend's `StorageMemory` account when it has one. A view
+receives its opaque accounting scope in `ViewOptions::account`, and reopening
+must not charge the same bytes twice. `describe()` supplies one line for the
+startup log; `diskPath()` supplies a local path for disk statistics, or empty.
+FS uses `node/` for its node-private root and reserves it from authoritative views.
+A backend must either honor `ctx.config.read_only` by opening without a lock,
+namespace creation or cleanup, or reject it. The read-only wrapper cannot undo
+side effects inside the maker; the built-in RAM maker rejects read-only.
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
-`container()` and `incarnation()` to hand out `DelegatingDirectory` subclasses. Both
+`directory()` to hand out `DelegatingDirectory` subclasses. Both
 bases forward every virtual, including `createFile` with options, `expectSynced`,
-`deletePrefix`, `sync`, `underlying`, `linkFile`, `openChecksum` and `capabilities`.
-A wrapper that changes the semantics of a mutator must override it explicitly.
+`publishFile`, `readPublished`, `deleteDurably`, `deletePrefix`, `sync`,
+`underlying`, `linkFile`, `openChecksum` and `capabilities`.
+Core wrappers that refuse or track mutations implement the bare interface;
+layers derive from the delegating bases. `ReadOnlyDirectory`, `ReadOnlyDirFactory`
+and `CheckedDirectory` therefore implement their interfaces explicitly. New pure
+virtuals require an implementation there; default methods call their own virtuals.
+`CheckedDirFactory` still delegates because it wraps views rather than policing
+namespace operations.
+
+Layers must be **byte-transparent**: the bytes at rest must be those the engine
+wrote, in a complete, durable namespace readable by the backend. FS `linkFile`
+reaches the source through `underlying()`, offline promotion opens `FSDirFactory`
+directly, and replication compares file digests. Observation, counting and caching
+fit this contract; encryption or compression at rest must be a backend, not a layer.
+
+Storage makers run before `PluginNodeState` is created. Keep storage state on the
+factory instance, shared with its views as needed. Once the node exists, its plugin
+state or routes can use `node.collections().storage().find<MyFactory>()` to reach
+that state through the core wrappers. `find<T>()` checks each factory with
+`dynamic_cast` and follows `inner()` to its delegate, returning null if absent.
+Repeated layers return the outermost matching type. The pointer is borrowed for
+the factory's lifetime; process-wide plugin objects must not retain it.
 
 `LuxirNode::detachCollection` stops serving a collection without removing its storage
 (the writer commits what it holds and closes), and `attachCollection` opens one that
-storage lists but the node has not opened, as startup does. Together they let a plugin
-hand a collection's storage from one node to another. Storage is not touched, so a
-layer that writes in the background settles its own directories after the detach, and
-it must stop listing a detached collection, or the next startup opens it again.
+the tenant catalog in storage selects but the node has not opened, as startup does.
+Together they let a plugin hand a collection's storage from one node to another.
+Storage is not touched, including the catalog entry, so a layer that writes in the
+background settles its own directories after the detach, and it must stop exposing a
+detached collection's catalog entry, or the next startup opens it again.
 
 ### Capabilities
 
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
-shares bytes), `ATOMIC_RENAME`, `DURABLE_SYNC` (`sync` is an fsync), `MEMORY_MAPPED`
+shares bytes), `ATOMIC_RENAME` (the backing store supports atomic name
+replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
 (`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
 selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
@@ -799,7 +850,9 @@ public:
   std::vector<ObjectInfo> list(std::string_view prefix) override;          // sorted; full keys
   std::optional<uint64_t> size(std::string_view name) override;            // HEAD; nullopt when absent
   void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;  // GET with Range
-  void put(std::string_view name, std::string_view bytes, bool ifAbsent) override;      // If-None-Match: *
+  std::optional<Object> get(std::string_view name) override;               // GET; bytes and ETag
+  std::optional<std::string> put(std::string_view name, std::string_view bytes,
+                                 const PutCondition& condition) override;  // PUT, If-None-Match / If-Match
   bool remove(std::string_view name) override;
   void copy(std::string_view from, std::string_view to) override;           // CopyObject
   std::vector<std::string> listDirectories(std::string_view prefix) override;  // optional: a delimiter listing
@@ -807,7 +860,7 @@ public:
 
 void registerComponents(luxir::Registries& r) override {
   r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
-    auto store = std::make_shared<S3Store>(ctx.option("bucket").value_or(""));
+    auto store = std::make_shared<S3Store>(std::string(ctx.params.requireString("bucket")));
     return std::make_unique<luxir::ObjectStoreDirFactory>(std::move(store), ctx);
   });
 }
@@ -820,20 +873,21 @@ The contract the directory relies on:
   called from query threads, in chunks of `chunk_bytes`, so it should be cheap to
   issue concurrently.
 - `put` replaces the object atomically: a reader sees the old or the new bytes.
-  With `ifAbsent` it is a conditional create, and a conflict throws a
-  `std::runtime_error` whose message contains `already exists` (collection creation
-  is exclusive through it). `put` receives a whole object; split large ones
-  (multipart) inside the plugin.
+  It returns the new version (an ETag, fresh on every put), or nullopt when its
+  condition fails: `ifAbsent` (If-None-Match: *) or `ifMatch` (If-Match on a
+  version from `get` or an earlier `put`). `publishFile`, and so the fencing of a
+  superseded writer, rests on these. `put` receives a whole object; split large
+  ones (multipart) inside the plugin.
 - `list` returns full keys relative to the store, sorted. A plugin with a key prefix
   option strips it again.
 - `ObjectStoreDirFactory` reads `chunk_bytes`, `staging_dir` and `spill_bytes` from
-  `ctx.options`; the plugin's own options (bucket, region, ...) are read by its
-  maker from the same map.
+  `ctx.params`; the plugin's own options (bucket, region, ...) are read by its
+  maker from the same reader (`--store.option s3.bucket=...`).
 
 `ram_object` is the built-in backend over `RamObjectStore`, whose request counters
 and request log (`requests("read", prefix)`, `bytesRead(prefix)`, `requestLog()`)
 let a test assert what a read cost; `RamObjectStore::named(name)` is the store a
-`ram_object` node with `--store.option store_name=<name>` uses.
+`ram_object` node with `--store.option ram_object.store_name=<name>` uses.
 `ObjectStoreDirectoryTest.aReopenedCollectionOpensItsFilesWithoutSizeRequests`
 is a small end-to-end example: a node on `ram_object`, reopened, with its
 requests asserted through the counters.
@@ -845,6 +899,7 @@ must read through `rangeStream`, and code that wants the whole file through `rea
 ### The example plugin
 
 `test/plugins/example` registers a `counting_ram` backend (RAM storage counting
-directory opens and creates per collection) and a `counting` layer (counting file
-opens and creates). `StorageExampleTest` runs a node on both and asserts the counters
-(`CountingStorage::count`).
+directory view opens by path) and a `counting` layer (counting file
+opens and creates). Each factory owns its counters; directory views share the
+layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
+`CountingLayer` through `find<T>()` and verifies that two nodes count independently.
