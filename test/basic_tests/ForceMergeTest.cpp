@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -252,7 +253,7 @@ TEST_F(ForceMergeTest, policyMergesYieldToPendingForceMerge) {
   });
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("mergeStart"); });
 
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, schema);
   iw.mergePolicy->setMergeFactor(2);
   // Three concurrently busy inverters, released idle: the commit flushes all

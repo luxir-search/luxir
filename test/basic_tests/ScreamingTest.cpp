@@ -405,6 +405,26 @@ TEST_F(ScreamingTest, fixedRangeOr) {
   }
 }
 
+TEST_F(ScreamingTest, intersectionCardinalityAcrossBuckets) {
+  SStreamBuilder set;
+  std::vector<int32_t> members;
+  for (int doc = 0; doc < 4 * 65536; doc++) {
+    if ((doc / 65536 == 0 && doc % 97 == 0) || (doc / 65536 == 2 && doc % 3 != 0)
+        || doc == 3 * 65536 + 17) {
+      set.add(doc);
+      members.push_back(doc);
+    }
+  }
+  set.finishBuild();
+  for (int size : {0, 13, 65536, 2 * 65536 + 101, 4 * 65536 + 3}) {
+    screaming::RAMFixedBitSet bits(size);
+    for (int doc = 0; doc < size; doc += 7) bits.set(doc);
+    int expected = 0;
+    for (int doc : members) if (doc < size && bits.get(doc)) expected++;
+    EXPECT_EQ(expected, set.bitset->intersectionCardinality(bits));
+  }
+}
+
 TEST_F(ScreamingTest, debug) {
 }
 

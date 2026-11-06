@@ -1973,8 +1973,7 @@ private:
         // Cuts land on block-leading terms, so a range holding a heavy term
         // runs long: queue ranges by their share of the source bytes.
         batch.work = planBytes == 0 ? fieldWork / (int64_t) outputs.size()
-            : (int64_t) ((long double) fieldWork * (long double) outputs[i]->plan.bytes
-                         / (long double) planBytes);
+            : (int64_t) ((__int128) fieldWork * outputs[i]->plan.bytes / planBytes);
         batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);

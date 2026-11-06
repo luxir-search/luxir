@@ -102,7 +102,8 @@ inline std::span<const uint8_t> singlePhaseScorersForTests(
 
 using FieldVal = std::variant<bool, int64_t, float, double, std::string,
                               std::vector<bool>, std::vector<int64_t>, std::vector<float>, std::vector<double>, std::vector<std::string>,
-                              std::vector<std::vector<float>>  // multi-valued vectors (one float-array per slot)
+                              std::vector<std::vector<float>>,  // multi-valued vectors (one float-array per slot)
+                              std::vector<std::vector<double>>  // multi-valued geo points (one [lon, lat] per point)
 >;
 
 struct NameVal {
@@ -285,7 +286,7 @@ inline std::string docToString(const Doc& doc) {
         }
         result += "]";
       },
-      [&](const std::vector<std::vector<float>>& v) {
+      [&]<class T>(const std::vector<std::vector<T>>& v) {
         result += "[";
         for (size_t i = 0; i < v.size(); ++i) {
           if (i > 0) result += ",";
