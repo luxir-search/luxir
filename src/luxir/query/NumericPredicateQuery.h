@@ -48,35 +48,13 @@ class NumericPredicateQuery final : public Query {
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
 
-  static constexpr int64_t kPointsVerifyWeight = 8;
-
-  static constexpr int64_t pointsVerifyLimit(int64_t cost) {
-    return cost / kPointsVerifyWeight + (cost % kPointsVerifyWeight != 0);
-  }
-
-  // Routing weights of one sparse candidate verification, in units of one
-  // column value of window production. Against a full scan, forced-arm runs
-  // favored verification at 1-10% candidates (10M docs) and 30-40% (131k).
-  // Membership proofs retain the producer's OUTSIDE skips for single-valued
-  // candidate filters. Multivalued zone producers keep the conservative
-  // weight when those proofs cannot be reproduced. Read once so description
-  // and resolution agree; the zone override applies only to that fallback.
-  static constexpr double kCandidateValueWeight = 1.25;
-  static constexpr double kUnprovenZoneCandidateValueWeight = 8;
-  static inline const double candidateValueWeight = [] {
-    const char* value = std::getenv("LUXIR_NUMERIC_CANDIDATE_WEIGHT");
-    return value != nullptr ? std::atof(value) : kCandidateValueWeight;
-  }();
-  static inline const double unprovenZoneCandidateValueWeight = [] {
-    const char* value = std::getenv("LUXIR_NUMERIC_ZONE_CANDIDATE_WEIGHT");
-    return value != nullptr ? std::atof(value) : kUnprovenZoneCandidateValueWeight;
-  }();
-
   static inline bool disableShapesForTests = false;
 #ifndef NDEBUG
   // Observe actual verification, not column decoding or metadata navigation.
   // Tests install this only after the product has been built.
   static inline thread_local void (*verificationObserver)(const NumericPredicateQuery&, int32_t) = nullptr;
+  // Rank-to-document selects on sparse docsWithValue in zone fills.
+  static inline thread_local int64_t rankSelectsForTests = 0;
 #endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
@@ -789,13 +767,23 @@ public:
   }
 
   class ZoneMapScorer final : public Query::ConstantScorer {
+  public:
+    // Pull iteration refines one window of documents at a time.
     static constexpr int32_t ITER_WINDOW_SIZE = 4096;
+
+  private:
     static constexpr int32_t ITER_WINDOW_WORDS = ITER_WINDOW_SIZE / 64;
 
     IntColReader& reader;
     BlockPlans& blockPlans;
     std::span<const BlockPlan> plans;
+    // Sparse docsWithValue only. docs sits on the first document with a
+    // value at or after docsTarget; fills step walk from rank to rank and
+    // select only to jump past an OUTSIDE run.
     screaming::BitSet::Selector* selector = nullptr;
+    screaming::BitSet::Iterator* docs = nullptr;
+    screaming::BitSet::Iterator* walk = nullptr;
+    int32_t docsTarget = -1;
     CrossingValues crossing;
     std::span<uint64_t> iterBits;
     const NumericPredicateQuery& query;
@@ -833,26 +821,64 @@ public:
       words[(size_t)lastWord] |= lastMask;
     }
 
-    int32_t docForRank(int32_t rank) const {
-      return selector == nullptr ? rank : selector->select(rank);
-    }
-
-    std::pair<int32_t, int32_t> firstDocRank(int32_t min) const {
-      if (reader.denseDocsWithValue()) {
-        if (min >= reader.docsWithValue()) return {PostingsReader::END, 0};
-        return {min, min};
+    // The first document with a value at or after target, and its rank; past
+    // the last one, {END, docsWithValue}. Sparse: from the docs cursor, which
+    // a target below docsTarget rewinds.
+    template <bool SPARSE>
+    LUXIR_INLINE std::pair<int32_t, int32_t> firstDocRank(int32_t target) {
+      if constexpr (SPARSE) {
+        if (target < docsTarget) docs->reset();
+        docsTarget = target;
+        int32_t doc = target > docs->val() ? docs->advance(target) : docs->val();
+        if (doc != screaming::BitSet::END) return {doc, docs->rank()};
+      } else if (target < reader.docsWithValue()) {
+        return {target, target};
       }
-      screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
-      int32_t doc = iter.advance(min);
-      if (doc == screaming::BitSet::END) return {PostingsReader::END, 0};
-      return {doc, iter.rank()};
+      return {PostingsReader::END, reader.docsWithValue()};
     }
 
-    // Separate functions keep each loop's per-value work inlined and its
-    // registers independent of the other loop.
-    LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
-                                   int32_t max) {
-      auto [doc, rank] = firstDocRank(min);
+    // Position walk on doc, a document with a value.
+    void walkTo(int32_t doc) {
+      if (doc < walk->val()) walk->reset();
+      if (doc > walk->val()) walk->advance(doc);
+    }
+
+    // The document of rank, the rank after the one a fill just visited.
+    template <bool SPARSE>
+    LUXIR_INLINE int32_t nextDoc(int32_t rank) {
+      if constexpr (SPARSE) {
+        return walk->next();
+      } else {
+        return rank;
+      }
+    }
+
+    // The document of rank, past an OUTSIDE run. Sparse: a select; past max,
+    // walk stays behind for the next window.
+    template <bool SPARSE>
+    LUXIR_INLINE int32_t jumpDoc(int32_t rank, int32_t max) {
+      if constexpr (SPARSE) {
+#ifndef NDEBUG
+        rankSelectsForTests++;
+#endif
+        int32_t doc = selector->select(rank);
+        if (doc < max) walk->advance(doc);
+        return doc;
+      } else {
+        return rank;
+      }
+    }
+
+    // One source per loop, instantiated per docsWithValue density: dense
+    // fills step doc with rank and set INSIDE runs whole, sparse fills step
+    // walk. Separate functions keep each loop's per-value work inlined and its
+    // registers independent of the other loop. Pin the start alignment: zone
+    // fills dominate column-only range filters, and a 16-byte shift from
+    // unrelated edits cost frange2 r01_old10 TOP_10 11-18% more cycles at
+    // identical instruction counts (hugin, 2026-10-29).
+    template <bool SPARSE>
+    [[gnu::aligned(64)]] LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
+                                   int32_t max, int32_t doc, int32_t rank) {
       int64_t nvals = reader.numValues();
       while (doc < max && rank < nvals) {
         int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
@@ -863,21 +889,17 @@ public:
         if (run.relation == BlockRelation::OUTSIDE) {
           rank = (int32_t)runEnd;
           if (rank >= nvals) break;
-          doc = docForRank(rank);
+          doc = jumpDoc<SPARSE>(rank, max);
           continue;
         }
-        if (run.relation == BlockRelation::INSIDE
-            && reader.denseDocsWithValue()) {
+        if (!SPARSE && run.relation == BlockRelation::INSIDE) {
           int32_t insideEnd = (int32_t)std::min<int64_t>(runEnd, max);
           setRun(words, min, doc, insideEnd);
           rank = insideEnd;
           doc = insideEnd;
           continue;
         }
-
-        while (rank < runEnd) {
-          doc = docForRank(rank);
-          if (doc >= max) return;
+        while (rank < runEnd && doc < max) {
 #ifndef NDEBUG
           if (run.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
             verificationObserver(query, doc);
@@ -888,14 +910,14 @@ public:
             setBit(words, min, doc);
           }
           rank++;
+          doc = nextDoc<SPARSE>(rank);
         }
-        if (rank < nvals) doc = docForRank(rank);
       }
     }
 
+    template <bool SPARSE>
     LUXIR_NOINLINE void fillMulti(std::span<uint64_t> words, int32_t min,
-                                  int32_t max) {
-      auto [doc, docRank] = firstDocRank(min);
+                                  int32_t max, int32_t doc, int32_t docRank) {
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
 #ifndef NDEBUG
@@ -907,8 +929,45 @@ public:
         }
         docRank++;
         if (docRank >= reader.docsWithValue()) break;
-        doc = docForRank(docRank);
+        doc = nextDoc<SPARSE>(docRank);
       }
+    }
+
+    // Once per eager scorer. Out of line so both fill instantiations share one
+    // call to all(): a call in each made GCC outline all() at every site,
+    // which moved Supplier::exactCount's count loop across a line boundary
+    // (range_col COUNT +6% at equal instructions, hugin, 2026-11-01).
+    LUXIR_NOINLINE void classifyAllPlans() { plans = blockPlans.all(); }
+
+    template <bool SPARSE>
+    LUXIR_INLINE void fillWindow(std::span<uint64_t> words, int32_t min, int32_t max) {
+      auto [doc, rank] = firstDocRank<SPARSE>(min);
+      if (doc >= max) return;
+      if (eager) {
+        if (plans.empty()) classifyAllPlans();
+      } else {
+        int32_t lastRank = firstDocRank<SPARSE>(max).second;
+        int64_t begin = rank;
+        int64_t end = lastRank;
+        if (reader.multiValued()) {
+          begin = reader.getStartValueRank(rank);
+          end = reader.getStartValueRank(lastRank);
+        }
+        if (begin == end) return;
+        plans = blockPlans.forValues(begin, end);
+      }
+      if constexpr (SPARSE) walkTo(doc);
+      if (reader.multiValued()) fillMulti<SPARSE>(words, min, max, doc, rank);
+      else fillSingle<SPARSE>(words, min, max, doc, rank);
+    }
+
+    // Out of line, so fillWindowBits' dense entry carries no sparse code: an
+    // entry shared at run time cost short dense fills 20% more cycles at
+    // equal instructions, in branch mispredictions (frange_ts_old50 COUNT,
+    // hugin, 2026-10-31).
+    LUXIR_NOINLINE void fillSparseWindow(std::span<uint64_t> words, int32_t min,
+                                         int32_t max) {
+      fillWindow<true>(words, min, max);
     }
 
     int32_t findInIterationWindow(int32_t target) const {
@@ -954,6 +1013,11 @@ public:
       docid = -1;
       maxDoc = initialMaxDoc;
       iterWindowStart = iterWindowEnd = 0;
+      if (docs != nullptr) {
+        docs->reset();
+        walk->reset();
+      }
+      docsTarget = -1;
     }
 
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
@@ -968,6 +1032,8 @@ public:
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
             bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+        docs = pool.make<screaming::BitSet::Iterator>(bits);
+        walk = pool.make<screaming::BitSet::Iterator>(bits);
       }
       std::fill(iterBits.begin(), iterBits.end(), 0);
     }
@@ -981,24 +1047,8 @@ public:
                         int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
       if (min == max) return;
-      if (eager) {
-        if (plans.empty()) plans = blockPlans.all();
-      } else {
-        auto [firstDoc, firstRank] = firstDocRank(min);
-        if (firstDoc >= max) return;
-        auto [lastDoc, lastRank] = firstDocRank(max);
-        if (lastDoc == PostingsReader::END) lastRank = reader.docsWithValue();
-        int64_t begin = firstRank;
-        int64_t end = lastRank;
-        if (reader.multiValued()) {
-          begin = reader.getStartValueRank(firstRank);
-          end = reader.getStartValueRank(lastRank);
-        }
-        if (begin == end) return;
-        plans = blockPlans.forValues(begin, end);
-      }
-      if (reader.multiValued()) fillMulti(words, min, max);
-      else fillSingle(words, min, max);
+      if (selector == nullptr) fillWindow<false>(words, min, max);
+      else fillSparseWindow(words, min, max);
     }
 
     int32_t next() override {
@@ -1295,9 +1345,14 @@ public:
         bool hasOutside;
         int32_t possibleDocs;
         int32_t insideDocs;
-        double setupWork;
-        double blockWork;
-        double valueWork;
+        // Zone production over the whole column: `checks` counts the values
+        // tested in unprunable blocks and `docVisits` the documents whose
+        // value ranges a multivalued column combines; `inside` is already in
+        // points, the emission of the inside runs (whole mask words for dense
+        // single-valued columns, values otherwise).
+        double checks;
+        double inside;
+        double docVisits;
       };
       mutable std::optional<ColumnCosts> columnCosts;
 
@@ -1308,19 +1363,18 @@ public:
         // Only dense single-valued INSIDE runs can emit whole mask words.
         // Sparse columns map each rank to a doc; multivalued producers also
         // visit documents whose values are entirely outside the predicate.
-        double insideWork = single && reader.denseDocsWithValue()
-            ? (double)((summary.insideLower + 63) / 64)
-            : (double)summary.insideLower;
+        double insideWords = single && reader.denseDocsWithValue()
+            ? (double)((summary.insideLower + 63) / 64) : -1;
         return {
           prunable >= reader.numValues() / denominator
               + (reader.numValues() % denominator != 0),
           summary.outside != 0,
           reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
           single ? (int32_t)summary.insideLower : 0,
-          8.0,
-          8.0 * reader.numBlocks(),
-          2.0 * (reader.numValues() - prunable) + insideWork
-              + (single ? 0.0 : (double)reader.docsWithValue()),
+          (double)(reader.numValues() - prunable),
+          insideWords >= 0 ? INSIDE_WORD_POINTS * insideWords
+              : INSIDE_VALUE_POINTS * (double)summary.insideLower,
+          single ? 0.0 : (double)reader.docsWithValue(),
         };
       }
 
@@ -1338,37 +1392,91 @@ public:
         return *columnCosts;
       }
 
-      double columnCandidateWork() const {
-        const auto& costs = column();
-        double weight = costs.useZones && reader.multiValued() && costs.hasOutside
-            ? unprovenZoneCandidateValueWeight : candidateValueWeight;
-        return weight * std::max(1.0,
-            (double)reader.numValues() / std::max(1, reader.docsWithValue()));
-      }
+      // Prices in point emissions (see Query::Demand); points production and
+      // verification are PointsMaterialize's. Block classification was
+      // measured by forcing each arm under a 35-candidate pull lead (5M docs,
+      // one segment, 2026-10-28). The rest are fitted on that board's
+      // forced-arm oracle: a scan tests a value in about 5 ns; zone checks and
+      // inside words are priced per unit of the column summary, which a dense
+      // lead's refills can reach about twice.
+      static constexpr double CLASSIFY_POINTS = 25;       // classify one column block
+      static constexpr double CHECK_POINTS = 4;           // test one value of an unprunable block
+      static constexpr double INSIDE_WORD_POINTS = 3;     // emit one dense inside mask word
+      static constexpr double INSIDE_VALUE_POINTS = 1;    // emit one inside value's document
+      static constexpr double DOC_VISIT_POINTS = CHECK_POINTS;  // combine one document's values
+      static constexpr double SCAN_POINTS = 6;            // test one value of a scanned column
 
       struct Production {
         ScorerArm arm;
-        double work;
+        double points;
       };
 
-      Production selectProducer(int64_t span) const {
+      double pointsPrice() const {
+        bool complement = useComplement(pointValueCount);
+        return PointsMaterialize::price(
+            complement ? points->pointCount() - pointValueCount : pointValueCount,
+            segment.maxDoc(), complement);
+      }
+
+      // Fractions of the column a consumer makes a producer refine (zones),
+      // classify (zone blocks) and test (scan).
+      struct Reach {
+        double zones;
+        double scan;
+        double classified;
+      };
+
+      // A single-valued column's OUTSIDE leaves are docid runs no match can
+      // occupy; the hull is the rest of the docid space. Its share of the
+      // documents with a value estimates its share of every docid, because a
+      // sibling's documents fall in those runs whether or not they have a
+      // value. EITHER's proof factor (possibleDocs over maxDoc) is a different
+      // fraction: the candidates inside the hull that also have a value.
+      double hull() const {
         const auto& costs = column();
-        double fraction = std::min(1.0, (double)span / std::max(1, segment.maxDoc()));
-        // Normalize the existing pairwise crossovers to candidate-verification
-        // units; point emission and column scanning do not cost the same.
-        Production result = points != nullptr
-            ? Production{ScorerArm::POINTS, (double)estimatedCost / kPointsVerifyWeight}
-            : Production{ScorerArm::SCAN,
-                fraction * reader.numValues() / columnCandidateWork()};
+        return !reader.multiValued() && costs.hasOutside
+            ? (double)costs.possibleDocs / std::max(1, reader.docsWithValue()) : 1.0;
+      }
+
+      // A window consumer fills `span` documents.
+      Reach windowReach(int64_t span) const {
+        double fraction = std::clamp(
+            (double)span / std::max(1, segment.maxDoc()), 0.0, 1.0);
+        return {fraction, fraction, fraction};
+      }
+
+      // A pull consumer's candidates each land in one zone iteration window,
+      // and a scan advanced to a candidate tests values up to the next match.
+      // A candidate ahead of the next zone match walks the windows up to it,
+      // classifying the blocks of the OUTSIDE runs between.
+      Reach pullReach(int64_t candidates) const {
+        double count = (double)std::max<int64_t>(candidates, 0);
+        double maxDoc = (double)std::max(1, segment.maxDoc());
+        double zones = std::min(1.0, count * ZoneMapScorer::ITER_WINDOW_SIZE / maxDoc);
+        return {zones, std::min(1.0, count / std::max(1.0, estimatedMatches())),
+                std::max(zones, 1 - hull())};
+      }
+
+      // The cheapest producer under `reach`. Points materialize every match;
+      // zones classify the column's blocks (all of them when built for the
+      // whole segment) and refine what is reached; a scan tests the values
+      // it passes.
+      Production cheapestProducer(Reach reach, int64_t producerSpan) const {
+        const auto& costs = column();
+        std::optional<Production> best;
+        if (points != nullptr) best = Production{ScorerArm::POINTS, pointsPrice()};
         if (costs.useZones) {
-          // Allocation/bookkeeping is fixed; refinement follows the blocks
-          // reached by execution. A short span still touches at least a block.
-          double blocks = std::max(8.0, fraction * costs.blockWork);
-          double work = (costs.setupWork + blocks + fraction * costs.valueWork)
-              / columnCandidateWork();
-          if (points == nullptr || work < result.work) result = {ScorerArm::ZONE_MAP, work};
+          double classified = producerSpan >= segment.maxDoc() ? 1.0 : reach.classified;
+          double zones = CLASSIFY_POINTS * (double)reader.numBlocks() * classified
+              + reach.zones * (CHECK_POINTS * costs.checks + costs.inside
+                  + DOC_VISIT_POINTS * costs.docVisits);
+          if (!best || zones < best->points) best = Production{ScorerArm::ZONE_MAP, zones};
         }
-        return result;
+        if (!best) {
+          best = Production{ScorerArm::SCAN,
+              SCAN_POINTS * reach.scan * (double)reader.numValues()};
+        }
+        return *best;
       }
 
       double estimatedMatches() const {
@@ -1508,92 +1616,73 @@ public:
             && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
       }
 
+      // Candidates a single-valued verifier can face: no more than the docs
+      // that can match.
+      double verifiableCandidates(int64_t candidates) const {
+        return reader.multiValued() ? (double)candidates
+            : (double)std::min<int64_t>(candidates, column().possibleDocs);
+      }
+
+      // EITHER verifies the survivors of the entries ahead, whose proof skips
+      // the docs that cannot match: only survivors inside the hull with a value
+      // face a check. An unknown yield verifies every candidate. The
+      // consumer's spared work is what producing instead would save it.
+      double eitherVerifyPoints(const Query::Demand& demand) const {
+        const auto& costs = column();
+        double verified = verifiableCandidates(demand.candidates);
+        if (demand.expectedCandidates >= 0) {
+          verified = std::min(demand.expectedCandidates, (double)demand.candidates);
+          if (!reader.multiValued() && costs.hasOutside) {
+            verified *= costs.possibleDocs / (double)std::max(1, segment.maxDoc());
+          }
+        }
+        return PointsMaterialize::verifyPrice(verified, demand);
+      }
+
+      // Verify each candidate or produce the range: one comparison in point
+      // emissions at every consumption site.
       Selection selectScorer(const Query::PlanContext& context) const {
         using Consumption = Query::MembershipConsumption;
         const auto& demand = context.demand;
         if (context.membershipConsumption == Consumption::CANDIDATES) {
-          // ZoneMap's window quote does not price its per-candidate protocol.
-          ScorerArm arm = points != nullptr
-                  && demand.candidates >= pointsVerifyLimit(estimatedCost)
-              ? ScorerArm::POINTS : ScorerArm::SPARSE_VERIFY;
-          return {arm, Consumption::CANDIDATES};
+          // Zones' per-candidate protocol is not priced; only points produce.
+          int64_t candidates = demand.expectedCandidates >= 0
+              ? std::min(demand.candidates, (int64_t)std::ceil(demand.expectedCandidates))
+              : demand.candidates;
+          bool produce = points != nullptr && pointsPrice()
+              < PointsMaterialize::verifyPrice(verifiableCandidates(candidates), demand);
+          return {produce ? ScorerArm::POINTS : ScorerArm::SPARSE_VERIFY,
+                  Consumption::CANDIDATES};
         }
         if (context.membershipConsumption == Consumption::WINDOWS) {
-          if (isMembershipWindowUse(demand.horizon)
-              && context.expectedSpan != std::numeric_limits<int64_t>::max()) {
-            // An explicit consumer exposure prices physical production. The
-            // legacy lead-cost fence below can otherwise turn a short zone
-            // producer into per-doc verification across every filled window.
-            Production producer = selectProducer(context.expectedSpan);
-            return {(double)demand.span < producer.work ? ScorerArm::SPARSE_VERIFY : producer.arm,
-                    Consumption::WINDOWS};
-          }
-          if (points == nullptr) {
-            if (demand.span < estimatedCost) return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
-            return {column().useZones ? ScorerArm::ZONE_MAP : ScorerArm::SCAN,
-                    Consumption::WINDOWS};
-          }
-          // Retain the bounded verifier fence. It also serves pull callers,
-          // whose span is a lead-cost estimate rather than a window schedule.
-          if (demand.span < pointsVerifyLimit(estimatedCost)) {
-            return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
-          }
-          return {selectProducer(context.expectedSpan).arm, Consumption::WINDOWS};
+          // An explicit exposure fills windows; any other window consumer
+          // pulls the candidates of its lead, or those the consumer expects
+          // to reach this clause.
+          bool windows = fillsExposedWindows(context);
+          Production producer = cheapestProducer(
+              windows ? windowReach(context.expectedSpan) : pullReach(demand.span),
+              context.expectedSpan);
+          // A pull verifier sees only the candidates its approximation, the
+          // documents with a value, lands on.
+          double candidates = windows ? (double)demand.candidates
+              : demand.expectedCandidates >= 0
+                  ? std::min(demand.expectedCandidates, (double)reader.docsWithValue())
+                  : (double)demand.span;
+          double verify = PointsMaterialize::verifyPrice(candidates, demand);
+          return {verify <= producer.points ? ScorerArm::SPARSE_VERIFY : producer.arm,
+                  Consumption::WINDOWS};
         }
-        Production producer = selectProducer(demand.span);
-        if (eitherVerifies(demand, producer)) {
+        Production producer = cheapestProducer(windowReach(demand.span), demand.span);
+        if (eitherVerifyPoints(demand) <= producer.points) {
           return {ScorerArm::SPARSE_VERIFY, Consumption::CANDIDATES};
         }
         return {producer.arm, Consumption::WINDOWS};
       }
 
-      // EITHER: verify the incoming candidates against the column, or produce
-      // the range and intersect it in windows. Both sides are priced in point
-      // emissions (decoding one matching point into the result), from exact
-      // counts and no codec headers. VERIFY_POINTS prices one verified
-      // survivor, ZERO_WORD_POINTS zeroing one bitset word, and
-      // TAIL_ALIGNMENT_POINTS each lead candidate a producer rejects before a
-      // sibling ahead of this entry aligns it. Fitted on forced-arm boards
-      // (5M docs, single segment, hugin, 2026-10-27); the optimum is flat for
-      // VERIFY_POINTS 16-28. Without a survivor estimate (a phrase body, whose
-      // verifier runs after positional confirmation) a raw candidate keeps the
-      // kPointsVerifyWeight price. Column producers keep their candidate-unit
-      // quote.
-      static constexpr double VERIFY_POINTS = 24;
-      static constexpr double ZERO_WORD_POINTS = 1;
-      static constexpr double TAIL_ALIGNMENT_POINTS = 4;
-
-      bool eitherVerifies(const Query::Demand& demand, const Production& producer) const {
-        const auto& costs = column();
-        int64_t candidates = reader.multiValued() ? demand.candidates
-            : std::min<int64_t>(demand.candidates, costs.possibleDocs);
-        if (producer.arm != ScorerArm::POINTS) return (double)candidates < producer.work;
-        double maxDoc = (double)std::max(1, segment.maxDoc());
-        double verify = (double)kPointsVerifyWeight * (double)candidates;
-        if (demand.expectedCandidates >= 0) {
-          double survivors = std::min(demand.expectedCandidates, (double)demand.candidates);
-          // A single-valued verifier's proof skips candidates outside the
-          // docs that can match.
-          if (!reader.multiValued() && costs.hasOutside) survivors *= costs.possibleDocs / maxDoc;
-          verify = VERIFY_POINTS * survivors + TAIL_ALIGNMENT_POINTS
-              * demand.precedingAlignments * (1 - (double)pointValueCount / maxDoc);
-        }
-        bool complement = useComplement(pointValueCount);
-        double produce = complement ? (double)(points->pointCount() - pointValueCount)
-            : (double)pointValueCount;
-        if (complement || PointsMaterialize::useBitset(pointValueCount, segment.maxDoc())) {
-          // The complement also fills the base set before clearing.
-          produce += (complement ? 2 : 1) * ZERO_WORD_POINTS
-              * (double)FixedBitSet::sizeInWords(segment.maxDoc());
-        }
-        return verify < produce;
-      }
-
       static Query::ScorerShape shapeFor(
-          Selection selection, Query::MatchState matchState) {
+          Selection selection, Query::MatchState matchState, bool pricedCheck) {
         ScorerArm arm = selection.arm;
-        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
-            || arm == ScorerArm::SCAN;
+        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY;
         return {
           .matchState = matchState,
           .directKind = Query::DirectScorerKind::OTHER,
@@ -1607,6 +1696,10 @@ public:
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
           .membershipConsumption = selection.consumption,
+          // The sparse verifier's check of one value against one interval, the
+          // case VERIFY_POINTS was fitted on; other predicates do not quote.
+          .verificationPoints = twoPhase && pricedCheck
+              ? std::optional<double>(PointsMaterialize::VERIFY_POINTS) : std::nullopt,
         };
       }
 
@@ -1753,6 +1846,13 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
+      // Whether a sparse verifier's check is the calibrated one: a single
+      // value against one interval.
+      bool pricedCheck() const {
+        return !reader.multiValued() && !weight.query.isExactSet()
+            && weight.query.intervals().size() == 1;
+      }
+
       MembershipWork membershipWork(int32_t maxDoc) override {
         unused(maxDoc);
         // A sparse verifier can touch every value in its requested span.
@@ -1762,7 +1862,10 @@ public:
         // bounded demand. Only a resolved materialized supplier can claim the
         // cheaper retained-set price; this prior must cover either arm.
         double production = 64.0 * reader.numValues();
-        return {estimatedMatches(), production, 0, 64, 192, 0, true};
+        // A dense single-valued column's leaf summary places the matches'
+        // docids; sparse columns' value-less documents need not spread evenly.
+        return {estimatedMatches(), production, 0, 64, 192, 0, true, hull(),
+                !reader.multiValued() && reader.docsWithValue() == segment.maxDoc()};
       }
 
       std::optional<MembershipQuote> quoteMembership(
@@ -1797,7 +1900,7 @@ public:
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.numericPredicateDisableShapesForTests) return {};
-        return shapeFor(selectScorer(buildContext), matchState);
+        return shapeFor(selectScorer(buildContext), matchState, pricedCheck());
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -1824,8 +1927,11 @@ public:
         ScorerArm arm = selection.arm;
         bool complement = arm == ScorerArm::POINTS
             && useComplement(pointValueCount);
+        // A verifier iterates every document with a value.
+        int64_t iterated = arm == ScorerArm::SPARSE_VERIFY
+            ? std::max(cost(), (int64_t)reader.docsWithValue()) : cost();
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(selection, matchState), cost(), arm,
+            *this, planContext, shapeFor(selection, matchState, pricedCheck()), iterated, arm,
             complement);
       }
 
@@ -1869,7 +1975,8 @@ public:
             BulkAnswer::NO,
           };
         }
-        Production producer = selectProducer(bulkContext.expectedConsumption.span);
+        int64_t span = bulkContext.expectedConsumption.span;
+        Production producer = cheapestProducer(windowReach(span), span);
         if (producer.arm == ScorerArm::POINTS || producer.arm == ScorerArm::ZONE_MAP) {
           auto* state = planPool.make<BulkState>(this,
               producer.arm == ScorerArm::POINTS ? BulkState::Arm::POINTS : BulkState::Arm::ZONE_MAP,
@@ -2017,7 +2124,8 @@ public:
     }
 
     Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
-                                               IndexReader::Segment& segment) {
+                                               IndexReader::Segment& segment,
+                                               bool eager = true) {
       const auto* segInfo = segmentInfo(segment);
       if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
@@ -2029,7 +2137,7 @@ public:
       auto* plans = targetPool.make<BlockPlans>(targetPool, *reader, query);
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, *plans, query,
-          segment.maxDoc(), constantScore, true);
+          segment.maxDoc(), constantScore, eager);
     }
 
   };

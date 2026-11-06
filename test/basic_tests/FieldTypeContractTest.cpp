@@ -48,9 +48,9 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
         "nano", 7, "nanos", vec_i(1, 2), "text_w", "words", "many_is", vec_i(1, 2)), UpdateMessage::COMMIT).success);
   }
   auto check = [&] {
-    IndexReader reopened(writer->dir);
-    for (auto& segment : reopened.segments()) {
-      PostingsReader postings(writer->dir, segment.segInfo.seg_id);
+    auto reopened = readDurableIndexInfo(writer->dir);
+    for (const auto& segment : reopened->segments) {
+      PostingsReader postings(writer->dir, segment.seg_id, segment.creator_epoch);
       FieldReader fields(postings);
       while (fields.readNextField()) {
         SegFieldInfo info{};
@@ -75,13 +75,13 @@ TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
   for (int type = FieldType::NONE; type <= FieldType::GEO_POINT; type++) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
-    PostingsWriter writer(dir, 1, 0);
+    PostingsWriter writer(dir, 1, 1, 0);
     auto& info = writer.addField("value");
     info.type = (FieldType::Type)type;
     info.typeFlags = type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
     writeUnversionedRuns(writer);
     writer.finish();
-    PostingsReader reader(dir, 1);
+    PostingsReader reader(dir, 1, 1);
     FieldReader fields(reader);
     ASSERT_TRUE(fields.readNextField());
     SegFieldInfo decoded{};

@@ -2,9 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
+#include <barrier>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <thread>
+#include <vector>
+
+// Standalone BLAS/LAPACK check against the OpenBLAS overlay: compiled by
+// test/CMakeLists.txt (blas_lapack_test) and directly by the dev-container
+// image and tools/build-arm64 before the full dependency set exists.  Links
+// only libopenblas, so it stays free of Luxir and gtest headers.
 
 // FAISS uses these ten entry points, all with 32-bit Fortran INTEGER ABI.
 extern "C" {
@@ -18,18 +28,60 @@ void sgetri_(const int*, float*, const int*, const int*, float*, const int*, int
 void sgeqrf_(const int*, const int*, float*, const int*, float*, float*, const int*, int*);
 void sorgqr_(const int*, const int*, const int*, float*, const int*, const float*, float*, const int*, int*);
 void sgelsd_(const int*, const int*, const int*, float*, const int*, float*, const int*, float*, const float*, int*, float*, const int*, int*, int*);
+void sgemm_(const char*, const char*, const int*, const int*, const int*, const float*, const float*, const int*, const float*, const int*, const float*, float*, const int*);
 const char* openblas_get_config();
 const char* openblas_get_corename();
+int openblas_get_parallel();
+int openblas_get_num_threads();
 }
 
 void check(bool ok) {
   if (!ok) {
-    std::cerr << "C LAPACK numerical/ABI check failed\n";
+    std::cerr << "BLAS/LAPACK numerical, ABI, or threading check failed\n";
     std::exit(1);
   }
 }
 
+// FAISS applies its rotation and coarse assignment with transposed SGEMM.
+// Luxir issues these from concurrent TBB tasks: distinct dense inputs and
+// independent caller buffers check both the layout and concurrent use of the
+// serial library's locked scratch buffers.
+void checkSgemm(int seed) {
+  const int m = 128, n = 96, k = 128;
+  std::vector<float> a(k * m), b(k * n), c(m * n), expected(m * n);
+  for (int i = 0; i < k * m; ++i) a[i] = (float)((i * 13 + seed) % 31 - 15) / 16;
+  for (int i = 0; i < k * n; ++i) b[i] = (float)((i * 7 + seed) % 23 - 11) / 16;
+  for (int col = 0; col < n; ++col) for (int row = 0; row < m; ++row) {
+    double sum = 0;
+    for (int j = 0; j < k; ++j) sum += (double)a[j + row * k] * b[j + col * k];
+    expected[row + col * m] = (float)sum;
+  }
+  const float alpha = 1, beta = 0;
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    std::fill(c.begin(), c.end(), -123.0f);
+    sgemm_("T", "N", &m, &n, &k, &alpha, a.data(), &k, b.data(), &k,
+           &beta, c.data(), &m);
+    for (int i = 0; i < m * n; ++i) check(std::abs(c[i] - expected[i]) < 1e-5);
+  }
+}
+
 int main() {
+  // Luxir partitions its own GEMM-heavy build steps across TBB tasks and
+  // needs a serial BLAS: a threaded library holds a per-variant level-3 lock
+  // across every call and would queue query-time work behind builds.  Thread
+  // environment variables must have no effect on this build.
+  check(openblas_get_parallel() == 0);
+  check(openblas_get_num_threads() == 1);
+  check(std::strstr(openblas_get_config(), "USE64BITINT") == nullptr);
+  checkSgemm(1);
+  std::barrier start(4);
+  std::array<std::thread, 4> callers;
+  for (int i = 0; i < 4; ++i) callers[i] = std::thread([&, i] {
+    start.arrive_and_wait();
+    checkSgemm(i + 2);
+  });
+  for (auto& caller : callers) caller.join();
+
   const int n = 2, lwork = 1024;
   int info = -1;
   double work[1024], a[] = {2, 1, 1, 2}, eigenvalues[2];
@@ -94,6 +146,6 @@ int main() {
   int rank = 0, iwork[1024];
   sgelsd_(&m, &n, &nrhs, rect, &m, rhs, &m, fs, &rcond, &rank, fw, &lwork, iwork, &info);
   check(info == 0 && rank == 2 && std::abs(rhs[0] - 2) < 1e-5 && std::abs(rhs[1] - 3) < 1e-5);
-  std::cout << "All ten LAPACK entry points passed: " << openblas_get_config()
-            << "; selected " << openblas_get_corename() << '\n';
+  std::cout << "Concurrent SGEMM and all ten LAPACK entry points passed: "
+            << openblas_get_config() << "; selected " << openblas_get_corename() << '\n';
 }

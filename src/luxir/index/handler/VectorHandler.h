@@ -125,8 +125,9 @@ private:
       throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
-    // The field's input contract (length, and every element finite whatever
-    // arm it arrived in: a double past float32 range has narrowed to inf).
+    // The field's input contract (length, and every element finite and within
+    // the magnitude limit whatever arm it arrived in: a double past float32
+    // range has narrowed to inf).
     const auto& vft = (const VectorFieldType&)*fieldType;
     if (std::string err = vft.inputError(vec); !err.empty()) {
       throw DocumentError(fmt::format("field '{}': {}{}", std::string_view(fieldName), prefix(), err));

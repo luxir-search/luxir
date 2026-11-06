@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -61,10 +62,16 @@ public:
   }
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
+  // A box test is two value compares; other relations scale it by their
+  // average test (BKDPointCost).
+  static constexpr double BOX_MATCH_COST = 2.0;
+
   float matchCost() override {
-    if (!multi) return 2.0f;
+    float point = (float)(BOX_MATCH_COST
+        * (1.0 + relation.pointCost().average / BOX_TEST_POINTS));
+    if (!multi) return point;
     int64_t docs = reader.docsWithValue();
-    return docs > 0 ? 2.0f * (float)reader.numValues() / (float)docs : 2.0f;
+    return docs > 0 ? point * (float)reader.numValues() / (float)docs : point;
   }
 
   int32_t next() override {
@@ -143,6 +150,16 @@ public:
     Relation relation;
     int64_t estimatedCost;
     uint64_t materializeUpperBound;
+    // Points of the crossing leaves, which the traversal tests one by one.
+    uint64_t crossingPoints;
+
+    // Testing one point of a crossing leaf against a box, in point
+    // emissions. Measured by forcing the BKD for lone boxes under a
+    // 35-candidate lead (5M docs, one segment, 2026-10-28): 0.69 ns per
+    // emitted point, 1.3 ns per crossing point (nine boxes, emitted
+    // 0.8k-2.5M, crossing 1.5k-88k). Other relations add their exact test's
+    // extra (BKDPointCost).
+    static constexpr double CROSSING_POINTS = 2;
 
     BKDReader::Scratch scratch(MemPool& pool) const {
       size_t size = bkd->maxPointsPerLeaf();
@@ -196,14 +213,48 @@ public:
       return {docs.first(size), nullptr};
     }
 
-    ScorerArm selectScorerArm(int64_t candidateCost) const {
-      if (candidateCost < estimatedCost) {
-        return ScorerArm::SPARSE_VERIFY;
+    // Producing the box's BKD membership: its matches into a bitset or a
+    // sorted array, plus the point tests of crossing leaves. It charges the
+    // estimate capped at the documents with a value; a multivalued box's BKD
+    // emits each matching point.
+    double bkdPrice() const {
+      return PointsMaterialize::price((uint64_t)estimatedCost, segment.maxDoc())
+          + (CROSSING_POINTS + relation.pointCost().exact) * (double)crossingPoints;
+    }
+
+    // Verifying one candidate: a column check, VERIFY_POINTS as fitted on
+    // boxes, plus the relation's average test extra, since candidates fall
+    // anywhere in its box.
+    double verifyPoints() const {
+      return PointsMaterialize::VERIFY_POINTS + relation.pointCost().average;
+    }
+
+    // Verify or produce the BKD. A consumer that fills windows over an
+    // explicit exposure (its candidates there), or that supplies the
+    // candidates it expects to reach the box (a pull conjunction's demands),
+    // gets the point emission comparison a numeric range makes: verifying
+    // those candidates plus the work producing would spare it, against
+    // producing. Under an exposure a verifying box, which cannot fill
+    // windows, also turns the consumer away from its window plan. The verify
+    // price is flat against the values per document a multivalued verifier
+    // tests (matchCost). Elsewhere the box verifies for a lead sparser than
+    // its matches.
+    ScorerArm selectScorerArm(const Query::PlanContext& context) const {
+      const Query::Demand& demand = context.demand;
+      bool exposure = fillsExposedWindows(context);
+      if (bkd != nullptr && (exposure || demand.expectedCandidates >= 0)) {
+        double candidates = exposure ? (double)demand.candidates
+            : std::min(demand.expectedCandidates, (double)reader.docsWithValue());
+        return PointsMaterialize::verifyPrice(candidates, demand, verifyPoints())
+                <= bkdPrice()
+            ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
       }
+      if (demand.candidates < estimatedCost) return ScorerArm::SPARSE_VERIFY;
       return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
     }
 
-    static Query::ScorerShape shapeFor(ScorerArm arm) {
+    static Query::ScorerShape shapeFor(ScorerArm arm,
+                                       std::optional<double> checkPrice) {
       bool bkdArm = arm == ScorerArm::BKD;
       return {
         .matchState = Query::MatchState::NONEMPTY,
@@ -221,6 +272,9 @@ public:
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
         // Candidate consumption requires a bounded verifier before opting in.
         .membershipConsumption = Query::MembershipConsumption::WINDOWS,
+        // The sparse verifier's check of one point; scans do not quote.
+        .verificationPoints = arm == ScorerArm::SPARSE_VERIFY
+            ? checkPrice : std::nullopt,
       };
     }
 
@@ -272,13 +326,21 @@ public:
           relation(weight.query.makeRelation()),
           estimatedCost((int64_t)std::min<uint64_t>(
               estimate.estimatedCount, (uint64_t)reader.docsWithValue())),
-          materializeUpperBound(estimate.upperBound) {}
+          materializeUpperBound(estimate.upperBound),
+          crossingPoints(estimate.crossingPoints) {}
 
     int64_t cost() override { return estimatedCost; }
 
+    // The sparse verifier quotes its check when the relation's price is
+    // measured; multivalued fields do not quote.
+    std::optional<double> checkPrice() const {
+      if (reader.multiValued() || !relation.pointCost().quoted) return std::nullopt;
+      return verifyPoints();
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      return shapeFor(selectScorerArm(buildContext.demand.candidates));
+      return shapeFor(selectScorerArm(buildContext), checkPrice());
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -290,9 +352,12 @@ public:
     Query::ScorerPlan* resolve(
         MemPool& planPool,
         const Query::PlanContext& planContext) override {
-      ScorerArm arm = selectScorerArm(planContext.demand.candidates);
+      ScorerArm arm = selectScorerArm(planContext);
+      // Verifying and scanning arms iterate every document with a value.
+      int64_t iterated = arm == ScorerArm::BKD ? cost()
+          : std::max(cost(), (int64_t)reader.docsWithValue());
       return planPool.make<Plan>(
-          *this, planContext, shapeFor(arm), cost(), arm);
+          *this, planContext, shapeFor(arm, checkPrice()), iterated, arm);
     }
 
     BulkPlan planBulk(

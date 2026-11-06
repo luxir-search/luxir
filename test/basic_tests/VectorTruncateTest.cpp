@@ -259,6 +259,8 @@ TEST_F(VectorTruncateTest, inputValidation) {
   EXPECT_NE(std::string::npos, error.find("expected dims=5 or truncate_dims=3, got 4"));
   EXPECT_FALSE(topHit(h.getSearchEngine(), "emb_v", {1, 2, 3, 0, nan}, &error));
   EXPECT_NE(std::string::npos, error.find("element 4 is not a finite float32"));
+  EXPECT_FALSE(topHit(h.getSearchEngine(), "emb_v", {1, 2, 3, 0, 1e13f}, &error));
+  EXPECT_NE(std::string::npos, error.find("element 4 (1e+13) exceeds the magnitude limit 2^40"));
   // A non-zero full vector whose prefix is zero: skipped on index (cosine has
   // no direction), rejected as a query.
   r = h.index(flatdoc("id", std::string("z"), "emb_v", std::vector<float>{0, 0, 0, 1, 1}),

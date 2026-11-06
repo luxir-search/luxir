@@ -302,7 +302,7 @@ TEST_F(FieldVariantsIngestTest, rejectedTextRemainsFlushableAndAccountsRetainedM
   body.type = FieldClass::TEXT;
   body.long_terms = api::FieldDef::LongTerms::REJECT;
   auto schema = b.build();
-  Inverter inv(dir, 1, [schema] { return schema; });
+  Inverter inv(dir, 1, 1, [schema] { return schema; });
   auto& input = inv.getIndexHandler("body");
   std::string text;
   for (int i = 0; i < 1000; i++) text += "word" + std::to_string(i) + " ";
@@ -578,7 +578,7 @@ TEST_F(FieldVariantsIngestTest, schemaPinnedAtConstructionNeverRefreshes) {
   RAMDir dir;
   auto schema = Schema::createDefaultSchema();
   int acquisitions = 0;
-  Inverter inv(dir, 1, [&] { acquisitions++; return schema; });
+  Inverter inv(dir, 1, 1, [&] { acquisitions++; return schema; });
   EXPECT_EQ(1, acquisitions);
   auto& existing = inv.getIndexHandler("old_s");
   EXPECT_EQ(1, acquisitions);

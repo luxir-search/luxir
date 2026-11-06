@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include "bench/luxir_bench.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/SkipStats.h"
@@ -26,6 +28,7 @@
 #include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
+#include "test/LinearPolygon.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -357,6 +360,7 @@ public:
         points((uint64_t)docs * (corpus.multi ? 2ULL : 1ULL)),
         boxes(boxesFor(corpus.shape)), circles(circlesFor(corpus.shape)) {
     schema = geoSchema(corpus.multi);
+    test::reserveIncarnation(index.dir);
     index.iw = std::make_unique<IndexWriter>(
         index.snapshots, schema);
     Inverter& inverter = index.getInverter();
@@ -716,7 +720,7 @@ void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    CommitSnapshotRegistry snapshots(*dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(*dir));
     auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     Inverter& inverter = writer->obtainInverter();
     populate(inverter, shape, corpus.multi, docs,
@@ -751,7 +755,7 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    CommitSnapshotRegistry snapshots(*dir);
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(*dir));
     auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     for (int32_t half = 0; half < 2; half++) {
       int32_t halfDocs = half == 0 ? firstHalf : docs - firstHalf;
@@ -780,6 +784,208 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
   }
   state.counters["points_per_second"] = benchmark::Counter(
       (double)pointCount, benchmark::Counter::kIsRate);
+}
+
+// A noisy circle of V vertices around (0, 0): a 20 degree radius wandering
+// by a few octaves of sine noise plus jitter, shaped like an administrative
+// boundary. Owns the ring the polygon query borrows.
+struct NoisyCircle {
+  std::vector<geo::LatLon> ring;
+  std::array<geo::PolygonRings, 1> polygons;
+
+  static constexpr double RADIUS = 20.0;
+
+  explicit NoisyCircle(int32_t vertices) {
+    SplitMix64 rng(0x9e3779b97f4a7c15ULL + (uint64_t)vertices);
+    auto unit = [&] { return (double)(rng() >> 11) * (1.0 / 9007199254740992.0); };
+    std::array<double, 4> phase{};
+    for (double& p : phase) p = 2.0 * PI * unit();
+    for (int32_t i = 0; i < vertices; i++) {
+      double angle = 2.0 * PI * i / vertices;
+      double radius = RADIUS * (1.0 + 0.05 * std::sin(3 * angle + phase[0])
+                                + 0.02 * std::sin(17 * angle + phase[1])
+                                + 0.008 * std::sin(101 * angle + phase[2])
+                                + 0.003 * std::sin(997 * angle + phase[3])
+                                + 0.001 * (unit() - 0.5));
+      ring.push_back({radius * std::sin(angle), radius * std::cos(angle)});
+    }
+    polygons[0] = {ring, {}};
+  }
+};
+
+enum PolygonImpl : uint8_t { INDEXED, LINEAR };
+
+constexpr std::array<int32_t, 4> POLYGON_VERTICES{{100, 1'000, 10'000, 100'000}};
+
+bool unitPolygonCase(int32_t vertices) {
+  return !luxir::unit_tests || vertices <= 1'000;
+}
+
+// Random encoded cells and points over the circle's box plus a margin:
+// cells from about a meter to a few degrees on a side.
+struct PolygonProbes {
+  std::vector<std::array<int32_t, 4>> cells;
+  std::vector<std::pair<int32_t, int32_t>> points;
+
+  PolygonProbes() {
+    SplitMix64 rng(0x51ed270b2f3c8d45ULL);
+    auto unit = [&] { return (double)(rng() >> 11) * (1.0 / 9007199254740992.0); };
+    double reach = NoisyCircle::RADIUS * 1.2;
+    for (int32_t i = 0; i < 1024; i++) {
+      double lat = reach * (2 * unit() - 1), lon = reach * (2 * unit() - 1);
+      double half = std::exp(std::log(1e-5) + unit() * (std::log(2.0) - std::log(1e-5)));
+      cells.push_back({geo::encodeLatitude(std::max(-90.0, lat - half)),
+                       geo::encodeLatitude(std::min(90.0, lat + half)),
+                       geo::encodeLongitude(std::max(-180.0, lon - half)),
+                       geo::encodeLongitude(std::min(180.0, lon + half))});
+    }
+    for (int32_t i = 0; i < 4096; i++) {
+      points.push_back({geo::encodeLatitude(reach * (2 * unit() - 1)),
+                        geo::encodeLongitude(reach * (2 * unit() - 1))});
+    }
+  }
+};
+
+const PolygonProbes& polygonProbes() {
+  static PolygonProbes probes;
+  return probes;
+}
+
+// Builds the edge trees and grid of one query.
+void BM_GeoPolygonBuild(benchmark::State& state) {
+  int32_t vertices = (int32_t)state.range(0);
+  if (!unitPolygonCase(vertices)) return skipReduced(state);
+  NoisyCircle circle(vertices);
+  BKDPointCost cost;
+  for (auto _ : state) {
+    MemPool pool;
+    BKDPolygonRelation relation = BKDPolygonRelation::build(pool, circle.polygons);
+    cost = relation.pointCost();
+    benchmark::DoNotOptimize(relation);
+  }
+  state.counters["exact_points"] = cost.exact;
+  state.counters["average_points"] = cost.average;
+}
+
+// One cell relation, as the BKD walk and its estimate call it, against the
+// linear scan of every edge.
+void BM_GeoPolygonCompare(benchmark::State& state, PolygonImpl impl) {
+  int32_t vertices = (int32_t)state.range(0);
+  if (!unitPolygonCase(vertices)) return skipReduced(state);
+  NoisyCircle circle(vertices);
+  MemPool pool;
+  BKDPolygonRelation indexed = BKDPolygonRelation::build(pool, circle.polygons);
+  LinearPolygonRelation linear(circle.polygons);
+  const auto& cells = polygonProbes().cells;
+  std::array<int32_t, 3> relations{};
+  for (const auto& c : cells) {
+    BKDRelation relation = indexed.compare(c[0], c[1], c[2], c[3]);
+    if (relation != linear.compare(c[0], c[1], c[2], c[3])) {
+      return state.SkipWithError("indexed polygon compare differs from the linear scan");
+    }
+    relations[(size_t)relation]++;
+  }
+  for (auto _ : state) {
+    for (const auto& c : cells) {
+      BKDRelation relation = impl == INDEXED ? indexed.compare(c[0], c[1], c[2], c[3])
+                                             : linear.compare(c[0], c[1], c[2], c[3]);
+      benchmark::DoNotOptimize(relation);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * (int64_t)cells.size());
+  state.counters["crosses"] = relations[(size_t)BKDRelation::CROSSES];
+}
+
+// One point test, as a crossing leaf or a column verifier calls it, against
+// the linear scan; a box over the same points sets the cost scale.
+void BM_GeoPolygonMatches(benchmark::State& state, PolygonImpl impl) {
+  int32_t vertices = (int32_t)state.range(0);
+  if (!unitPolygonCase(vertices)) return skipReduced(state);
+  NoisyCircle circle(vertices);
+  MemPool pool;
+  BKDPolygonRelation indexed = BKDPolygonRelation::build(pool, circle.polygons);
+  LinearPolygonRelation linear(circle.polygons);
+  const auto& points = polygonProbes().points;
+  int32_t inside = 0;
+  for (const auto& [lat, lon] : points) {
+    bool match = indexed.matches(lat, lon);
+    if (match != linear.matches(lat, lon)) {
+      return state.SkipWithError("indexed polygon matches differs from the linear scan");
+    }
+    inside += match;
+  }
+  for (auto _ : state) {
+    for (const auto& [lat, lon] : points) {
+      bool match = impl == INDEXED ? indexed.matches(lat, lon) : linear.matches(lat, lon);
+      benchmark::DoNotOptimize(match);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * (int64_t)points.size());
+  state.counters["inside"] = inside;
+  // The modeled test, in box tests, beside the measured ratio of rates.
+  state.counters["model_box_tests"] = 1.0 + indexed.pointCost().average / BOX_TEST_POINTS;
+  state.counters["cross_share"] = indexed.grid.crossShare();
+}
+
+void BM_GeoBoxMatches(benchmark::State& state) {
+  double reach = NoisyCircle::RADIUS;
+  BKDBoxRelation box(geo::encodeLatitude(-reach), geo::encodeLatitude(reach),
+                     geo::encodeLongitude(-reach), geo::encodeLongitude(reach));
+  const auto& points = polygonProbes().points;
+  for (auto _ : state) {
+    for (const auto& [lat, lon] : points) {
+      bool match = box.matches(lat, lon);
+      benchmark::DoNotOptimize(match);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * (int64_t)points.size());
+}
+
+// One polygon query over the uniform corpus through the planned arm, query
+// construction included; the forced scan's count is the expected one.
+void BM_GeoPolygonQuery(benchmark::State& state) {
+  int32_t vertices = (int32_t)state.range(0);
+  if (!unitPolygonCase(vertices)) return skipReduced(state);
+  GeoFixture& data = fixture(UNIFORM);
+  NoisyCircle circle(vertices);
+  auto& segment = data.testIndex().reader->segments()[0];
+  auto run = [&](bool scan) {
+    MemPool pool;
+    Query::Context context(pool, *data.testIndex().reader);
+    GeoPolygonQuery query(pool, FIELD, circle.polygons);
+    auto* weight = static_cast<GeoPolygonQuery::Weight*>(query.createWeight(context, 0));
+    return countMatches(scan ? weight->createScanScorerForTests(pool, segment)
+                             : weight->createScorer(pool, segment));
+  };
+  int32_t expected = run(true);
+  for (auto _ : state) {
+    int32_t count = run(false);
+    benchmark::DoNotOptimize(count);
+    if (count != expected) {
+      state.SkipWithError("geo polygon scorer differs from the forced scan");
+      break;
+    }
+  }
+  state.counters["docs"] = data.docCount();
+  state.counters["matches"] = expected;
+}
+
+void registerPolygonCases() {
+  auto vertexArgs = [](auto* b) {
+    for (int32_t vertices : POLYGON_VERTICES) b->Arg(vertices);
+    b->ArgName("vertices")->UseRealTime();
+  };
+  vertexArgs(benchmark::RegisterBenchmark("BM_GeoPolygon/build", BM_GeoPolygonBuild));
+  for (auto [impl, name] : {std::pair{INDEXED, "indexed"}, std::pair{LINEAR, "linear"}}) {
+    vertexArgs(benchmark::RegisterBenchmark(
+        "BM_GeoPolygon/compare/" + std::string(name),
+        [impl](benchmark::State& state) { BM_GeoPolygonCompare(state, impl); }));
+    vertexArgs(benchmark::RegisterBenchmark(
+        "BM_GeoPolygon/matches/" + std::string(name),
+        [impl](benchmark::State& state) { BM_GeoPolygonMatches(state, impl); }));
+  }
+  benchmark::RegisterBenchmark("BM_GeoPolygon/matches/box", BM_GeoBoxMatches)->UseRealTime();
+  vertexArgs(benchmark::RegisterBenchmark("BM_GeoPolygon/uniform/query", BM_GeoPolygonQuery));
 }
 
 std::string benchName(const CorpusSpec& corpus, std::string_view op,
@@ -867,6 +1073,7 @@ void registerBuildMerge(const CorpusSpec& corpus, bool merge) {
     registerBuildMerge(corpus, false);
     registerBuildMerge(corpus, true);
   }
+  registerPolygonCases();
   return true;
 }();
 

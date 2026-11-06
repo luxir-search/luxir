@@ -45,6 +45,11 @@ vcpkg_cmake_configure(
 )
 
 vcpkg_cmake_install()
+# RaBitQUtils.h includes rabitq_simd.h, which needs this public header.
+# FAISS leaves it out of its install list through 1.15.1 (fixed upstream by
+# facebookresearch/faiss#5744); drop this once the port includes that fix.
+file(INSTALL "${SOURCE_PATH}/faiss/utils/popcount.h"
+     DESTINATION "${CURRENT_PACKAGES_DIR}/include/faiss/utils")
 vcpkg_copy_pdbs()
 vcpkg_cmake_config_fixup()
 

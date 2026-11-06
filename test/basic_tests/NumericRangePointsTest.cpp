@@ -207,8 +207,8 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
                     : Query::MembershipConsumption::WINDOWS
                 : consumption,
             shape.membershipConsumption);
-  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
-      || expectedKind == ExpectedScorerKind::SCAN;
+  // A scan produces matches; only the sparse verifier defers its value test.
+  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY;
   EXPECT_EQ(expectedMatchState, shape.matchState);
   EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
   EXPECT_EQ(expectedTwoPhase ? Query::ReportedTwoPhase::YES
@@ -510,6 +510,8 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
+  // Each range verifies below the lead cost where producing becomes
+  // cheaper and produces at and above it.
   auto sweepShape = [&](std::string_view field, int64_t lo, int64_t hi,
                         ExpectedScorerKind denseKind,
                         Query::MatchState matchState =
@@ -518,18 +520,29 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     QueryState state(pool, *reader, field, lo, hi);
     auto* supplier = state.weight->scorerSupplier(pool, segment);
     ASSERT_NE(nullptr, supplier);
-    int64_t supplierCost = supplier->cost();
-    ASSERT_GT(supplierCost, 0);
-    int64_t fence = denseKind == ExpectedScorerKind::POINTS_ARRAY
-            || denseKind == ExpectedScorerKind::POINTS_BIT
-        ? NumericPredicateQuery::pointsVerifyLimit(supplierCost) : supplierCost;
-    expectShapeAndScorer(*reader, field, lo, hi, fence - 1,
-                         ExpectedScorerKind::SPARSE_VERIFY, matchState);
-    expectShapeAndScorer(
-        *reader, field, lo, hi,
-        Query::Demand::fromCandidatesAndSpan(
-            fence - 1, fence),
-        denseKind, matchState);
+    auto verifies = [&](int64_t leadCost) {
+      Query::PlanContext context;
+      context.demand = Query::Demand::fromLeadCost(leadCost);
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      return supplier->describeScorer(context).reportedTwoPhase
+          == Query::ReportedTwoPhase::YES;
+    };
+    ASSERT_FALSE(verifies(N));
+    int64_t fence = 0;
+    for (int64_t high = N; fence < high;) {
+      int64_t mid = fence + (high - fence) / 2;
+      if (verifies(mid)) fence = mid + 1;
+      else high = mid;
+    }
+    if (fence > 0) {
+      expectShapeAndScorer(*reader, field, lo, hi, fence - 1,
+                           ExpectedScorerKind::SPARSE_VERIFY, matchState);
+      // A pull consumer prices its lead's span, not the candidates.
+      expectShapeAndScorer(
+          *reader, field, lo, hi,
+          Query::Demand::fromCandidatesAndSpan(fence - 1, fence),
+          denseKind, matchState);
+    }
     expectShapeAndScorer(
         *reader, field, lo, hi, fence, denseKind, matchState);
     expectShapeAndScorer(
@@ -551,13 +564,17 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
              ExpectedScorerKind::ZONE_MAP);
   sweepShape("arm_scan_shuffled_i", 0, 9'999,
              ExpectedScorerKind::SCAN, Query::MatchState::UNKNOWN);
+  sweepShape("arm_scan_shuffled_i", 0, 99,
+             ExpectedScorerKind::SCAN, Query::MatchState::UNKNOWN);
 
   using Consumption = Query::MembershipConsumption;
   for (int64_t hi : {4095, 26'000, N - 1}) {
     expectShapeAndScorer(*reader, "arm_sorted", 0, hi, 0,
                         ExpectedScorerKind::SPARSE_VERIFY);
+    // Producing every document is a complement fill, cheaper than zones.
     expectShapeAndScorer(*reader, "arm_sorted", 0, hi, N,
-                        ExpectedScorerKind::ZONE_MAP);
+                        hi == N - 1 ? ExpectedScorerKind::POINTS_BIT
+                                    : ExpectedScorerKind::ZONE_MAP);
   }
   for (auto consumption : {Consumption::EITHER, Consumption::CANDIDATES}) {
     expectShapeAndScorer(*reader, "arm_sorted", 0, 4095,
