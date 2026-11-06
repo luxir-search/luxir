@@ -6,6 +6,8 @@
 
 #include <stdexcept>
 
+#include "luxir/api/build.h"
+
 namespace luxir {
 
 namespace {
@@ -47,28 +49,23 @@ std::string joined(const std::vector<std::string>& list) {
 
 }  // namespace
 
-uint64_t StorageContext::optionBytes(const std::string& key, uint64_t fallback) const {
-  auto value = option(key);
-  if (!value) return fallback;
-  const std::string& text = *value;
-  size_t pos = 0;
-  uint64_t number = 0;
-  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
-    uint64_t digit = (uint64_t)(text[pos] - '0');
-    if (number > (UINT64_MAX - digit) / 10) throw std::invalid_argument("store option '" + key + "' is too large");
-    number = number * 10 + digit;
-    pos++;
+StorageOptions::StorageOptions(const StoreConfig& config) {
+  for (const auto& [component, options] : config.options) {
+    auto& map = components[component];
+    for (const auto& [key, text] : options) {
+      auto* val = api::build::mapSlot(map.fields, options.size(), api::build::arenaStr(arena, key), arena);
+      bool parsed = api::read_json(*val, text, arena);
+      if (!parsed || !(std::holds_alternative<int64_t>(val->kind) || std::holds_alternative<double>(val->kind) ||
+                       std::holds_alternative<bool>(val->kind) || std::holds_alternative<std::string_view>(val->kind))) {
+        val->kind = api::build::arenaStr(arena, text);
+      }
+    }
   }
-  if (pos == 0) throw std::invalid_argument("store option '" + key + "' must be a byte count, got '" + text + "'");
-  std::string suffix = text.substr(pos);
-  uint64_t unit = 1;
-  if (suffix.empty() || suffix == "B") unit = 1;
-  else if (suffix == "K" || suffix == "KB" || suffix == "KiB") unit = 1ULL << 10;
-  else if (suffix == "M" || suffix == "MB" || suffix == "MiB") unit = 1ULL << 20;
-  else if (suffix == "G" || suffix == "GB" || suffix == "GiB") unit = 1ULL << 30;
-  else throw std::invalid_argument("store option '" + key + "' has an unknown size suffix '" + suffix + "'");
-  if (number > UINT64_MAX / unit) throw std::invalid_argument("store option '" + key + "' is too large");
-  return number * unit;
+}
+
+ParamReader StorageOptions::reader(std::string_view component, std::string owner) const {
+  auto it = components.find(component);
+  return ParamReader(std::move(owner), it == components.end() ? ParamReader::Entries{} : it->second.fields);
 }
 
 void StorageRegistry::addBackend(std::string name, BackendMaker maker) {
@@ -104,6 +101,10 @@ std::unique_ptr<DirectoryFactory> StorageRegistry::makeLayer(std::string_view na
 
 void registerBuiltinStorage(StorageRegistry& registry) {
   registry.addBackend("ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
+    if (ctx.config.read_only) {
+      throw std::runtime_error("--read-only requires a persistent --store.backend such as fs; there is no "
+                               "existing data to serve with backend=" + ctx.config.store.backend);
+    }
     uint64_t limitMb = ctx.config.store.ram_limit_mb;
     if (limitMb > UINT64_MAX / (1024 * 1024)) throw std::invalid_argument("store.ram_limit_mb is too large");
     return std::make_unique<RAMDirFactory>(limitMb * 1024 * 1024, ctx.reclaim);
@@ -122,7 +123,5 @@ StorageRegistry& StorageRegistry::global() {
   }();
   return instance;
 }
-
-const StorageRegistry& globalStorageRegistry() { return StorageRegistry::global(); }
 
 }  // namespace luxir

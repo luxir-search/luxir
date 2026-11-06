@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <charconv>
 #include <map>
 #include "Directory.h"
+#include "luxir/schema/SchemaBinding.h"
+#include "IncarnationState.h"
+#include "luxir/reader/Postings.h"
+#include "IndexFormat.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
-#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -21,27 +25,72 @@ struct Manifest {
   uint64_t generation = 0;
   uint64_t highestGeneration = 0;
 
-  // commit_<index_gen>: the generation in decimal, as in commit tokens.
+  uint64_t epoch = 0;
   static constexpr std::string_view kPrefix = "commit_";
 
-  static bool indexFile(std::string_view name) {
-    return name.starts_with(kPrefix) || (name.starts_with("s") && name.find('_') != std::string_view::npos);
+  static std::string tip(uint64_t gen, uint64_t epoch) {
+    return std::to_string(gen) + "." + Postings::epochString(epoch);
+  }
+  static std::string name(uint64_t gen, uint64_t epoch) { return std::string(kPrefix) + tip(gen, epoch); }
+
+  static std::pair<uint64_t, uint64_t> candidate(std::string_view name) {
+    if (!name.starts_with(kPrefix)) return {};
+    name.remove_prefix(kPrefix.size());
+    auto dot = name.find('.');
+    if (dot == std::string_view::npos) return {};
+    uint64_t gen = 0;
+    auto [end, error] = std::from_chars(name.data(), name.data() + dot, gen);
+    auto epoch = Postings::parseEpoch(name.substr(dot + 1));
+    if (error != std::errc() || end != name.data() + dot || !gen || !epoch || tip(gen, epoch) != name) return {};
+    return {gen, epoch};
+  }
+  static uint64_t generationOf(std::string_view name) { return candidate(name).first; }
+
+  static uint64_t fileEpoch(std::string_view name) {
+    if (auto id = candidate(name); id.first) return id.second;
+    if (name.ends_with(".tmp")) name.remove_suffix(4);
+    auto dot = name.rfind('.');
+    if (dot == std::string_view::npos) return 0;
+    auto end = name.find('_', dot);
+    return Postings::parseEpoch(name.substr(dot + 1, end == std::string_view::npos ? end : end - dot - 1));
   }
 
-  static std::string name(uint64_t gen) { return std::string(kPrefix) + std::to_string(gen); }
-
-  static uint64_t generationOf(std::string_view name) {
-    if (!name.starts_with(kPrefix)) return 0;
-    name.remove_prefix(kPrefix.size());
-    uint64_t gen = 0;
-    auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), gen);
-    return error == std::errc() && end == name.data() + name.size() ? gen : 0;
+  static bool indexFile(std::string_view name) {
+    if (name.ends_with(".tmp")) return false;
+    if (candidate(name).first || SchemaBinding::isFile(name)) return true;
+    if (!name.starts_with("s")) return false;
+    auto dot = name.find('.'), underscore = name.find('_');
+    if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return false;
+    auto sortable = [](std::string_view text) {
+      return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
+    };
+    auto seg = name.substr(1, dot - 1);
+    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return false;
+    auto suffix = name.substr(underscore + 1);
+    if (!suffix.starts_with('_')) return sortable(suffix);
+    suffix.remove_prefix(1);
+    if (suffix == "hot") return true;  // the segment's hotcache (reader/Hotcache.h)
+    if (suffix.starts_with('L') && suffix.find('_') == std::string_view::npos) suffix.remove_prefix(1);
+    else {
+      auto file = suffix.rfind('_');
+      if (file == std::string_view::npos || !sortable(suffix.substr(file + 1))) return false;
+      suffix = suffix.substr(0, file);
+      auto generation = suffix.rfind('_');
+      if (generation == std::string_view::npos || generation == 0) return false;
+      suffix.remove_prefix(generation + 1);
+    }
+    dot = suffix.find('.');
+    return dot != std::string_view::npos && sortable(suffix.substr(0, dot))
+        && Postings::parseEpoch(suffix.substr(dot + 1));
   }
 
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {
     api::IndexInfo info;
-    if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)
-        || !info.schema || info.incarnation.empty()) {
+    if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)) {
+      throw std::runtime_error("Invalid snapshot manifest");
+    }
+    if (info.version != IndexFormat::VERSION) throw IndexFormatError(info.version);
+    if (!info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
     return info;
@@ -53,8 +102,8 @@ struct Manifest {
     return filesOf(decode(bytes, arena));
   }
 
-  static Bytes read(Directory& dir, uint64_t gen) {
-    auto file = dir.openFile(name(gen));
+  static Bytes read(Directory& dir, uint64_t gen, uint64_t epoch) {
+    auto file = dir.openFile(name(gen, epoch));
     if (!file) return {};
     auto input = file->getInputStream();
     if (input.size() < 16) return {};
@@ -66,109 +115,119 @@ struct Manifest {
     auto bytes = std::make_shared<const std::vector<std::byte>>(data, data + length);
     std::pmr::monotonic_buffer_resource arena;
     try {
-      if (decode(bytes, arena).index_gen != gen) return {};
+      auto info = decode(bytes, arena);
+      if (info.index_gen != gen || info.writer_epoch != epoch) return {};
+    } catch (const IndexFormatError&) {
+      throw; // not torn: falling back to an older generation would not help
     } catch (const std::runtime_error&) { return {}; }
     return bytes;
   }
 
-  // Data and its directory entries are durable before a manifest is written.
-  // Only a fallback needs a presence check: obsolete names can reappear after
-  // a crash because retirement does not fsync removals.
-  static Manifest load(Directory& dir) {
-    std::vector<std::string> failedNames;
-    bool retried = false;
-    uint64_t highestGeneration = 0;
+  // Only STATE selects a root. Scans are recovery fallback, never publication.
+  static Manifest load(Directory& dir, const IncarnationState* claimed = nullptr) {
+    auto readCandidate = [&](uint64_t gen, uint64_t epoch) -> Bytes {
+      try { return read(dir, gen, epoch); }
+      catch (const FileIOException&) { return {}; }
+    };
+    auto state = claimed ? std::optional(*claimed) : IncarnationState::read(dir);
+    if (!state) throw WriterSupersededError();
     for (;;) {
-      std::vector<Directory::FileInfo> listing;
-      dir.listFiles(listing);
-      std::vector<uint64_t> generations;
-      std::map<std::string, uint64_t> sizes;
       Manifest result;
-      bool indexFiles = false;
-      for (const auto& f : listing) {
-        sizes.emplace(f.name, f.size);
-        if (f.name.starts_with(kPrefix)) result.names.push_back(f.name);
-        if (auto gen = generationOf(f.name)) generations.push_back(gen);
-        if (indexFile(f.name)) indexFiles = true;
-      }
-      if (generations.empty() && !indexFiles) return result;
-      if (retried && result.names == failedNames) {
-        throw std::runtime_error(generations.empty()
-            ? "Index files exist without a snapshot manifest" : "No valid snapshot manifest");
-      }
-      std::ranges::sort(generations, std::greater<>());
-      if (!generations.empty()) highestGeneration = std::max(highestGeneration, generations.front());
-      result.highestGeneration = highestGeneration;
-      for (size_t i = 0; i < generations.size(); i++) {
-        auto bytes = read(dir, generations[i]);
-        if (!bytes) continue;
-        if (i != 0) {
-          bool present = true;
-          for (const auto& file : files(bytes)) {
-            auto entry = sizes.find(file.name);
-            if (entry == sizes.end() || entry->second != file.size) { present = false; break; }
-          }
-          if (!present) continue;
-        }
+      dir.listFiles(result.listing);
+      if (state->value.tip.empty()) return result;
+      auto [gen, epoch] = candidate(std::string(kPrefix) + state->value.tip);
+      if (!gen) throw std::runtime_error("invalid STATE tip");
+      result.highestGeneration = gen;
+      if (auto bytes = readCandidate(gen, epoch)) {
         result.bytes = std::move(bytes);
-        result.generation = generations[i];
-        result.listing = std::move(listing);
+        result.generation = gen;
+        result.epoch = epoch;
+        result.names.push_back(name(gen, epoch));
         // The chosen root names every committed file with its size.
         dir.knownFiles(files(result.bytes));
         return result;
       }
-      // Publication can retire a root after this scan, before read() opens it.
-      // Retry a changed root listing; a stable invalid listing is an error.
-      failedNames = std::move(result.names);
-      retried = true;
+      auto latest = IncarnationState::read(dir);
+      if (!latest) throw WriterSupersededError();
+      if (!claimed && latest->version != state->version) { state = std::move(latest); continue; }
+      std::vector<std::pair<uint64_t, uint64_t>> older;
+      std::map<std::string, uint64_t> sizes;
+      for (const auto& file : result.listing) {
+        sizes.emplace(file.name, file.size);
+        auto id = candidate(file.name);
+        if (id.first && id.first < gen) older.push_back(id);
+      }
+      // Higher (gen, epoch) favors lineage candidates; writer-open sweeps remove older-epoch strays.
+      // An unswept, never-published candidate can still win if every lineage candidate above it is unusable.
+      std::ranges::sort(older, std::greater<>());
+      for (auto [oldGen, oldEpoch] : older) {
+        auto bytes = readCandidate(oldGen, oldEpoch);
+        if (!bytes) continue;
+        bool present = true;
+        for (const auto& file : files(bytes)) {
+          auto entry = sizes.find(file.name);
+          if (entry == sizes.end() || entry->second != file.size) { present = false; break; }
+        }
+        if (!present) continue;
+        result.bytes = std::move(bytes);
+        result.generation = oldGen;
+        result.epoch = oldEpoch;
+        result.names.push_back(name(oldGen, oldEpoch));
+        // The chosen root names every committed file with its size.
+        dir.knownFiles(files(result.bytes));
+        return result;
+      }
+      throw std::runtime_error("No valid snapshot manifest");
     }
   }
 
-  // A root is durable only after its file and directory entry are synced. It
-  // is written and synced under a pending name and renamed into place, so a failure
-  // never leaves a partial root and never removes one that already existed; an
-  // identical existing root (an interrupted earlier commit) is only re-synced.
-  // After a failure the root's durability is unknown. `source` identifies the
-  // committer to failure-injection signals. Every file the root references
-  // must already be synced (Directory::expectSynced).
-  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, void* source = nullptr) {
+  // A candidate is immutable. An identical retry re-establishes durability;
+  // it becomes authoritative only when the caller advances STATE.
+  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, uint64_t epoch) {
     {
       std::pmr::monotonic_buffer_resource arena;
       api::IndexInfo info;
       if (api::decode(info, api::copyToPaddedInput(bytes, arena), arena)) dir.expectSynced(filesOf(info));
     }
-    Bytes existing;
-    try { existing = read(dir, gen); }
-    catch (const FileIOException&) {} // an unreadable root is what a repair replaces
-    std::array<std::string, 1> root{name(gen)};
-    if (!existing || *existing != bytes) {
-      auto pending = name(gen) + ".pending";
-      try {
-        write(dir, pending, bytes);
-        Signal::emit("manifestWritten", source);
-        std::array<std::string, 1> written{pending};
-        dir.sync(written);
-        Signal::emit("manifestSynced", source);
-        dir.renameFile(pending, root[0]);
-      } catch (...) {
-        try { dir.deleteFile(pending); } catch (...) {}
-        throw;
-      }
-    } else dir.sync(root);
-    std::array<std::string, 1> directory{"."};
-    dir.sync(directory);
+    std::array<std::string, 1> root{name(gen, epoch)};
+    auto contents = withFooter(bytes);
+    if (dir.publishFile(root[0], contents, Directory::PublishMode::CREATE_ONLY)) return;
+    auto existing = dir.openFile(root[0]);
+    auto body = existing ? existing->read() : std::string_view{};
+    if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size())) {
+      throw std::runtime_error("manifest candidate name already contains different bytes");
+    }
+    dir.sync(root);
   }
 
-  static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
-    write(dir, name(gen), bytes);
+  // A follower can repair a corrupt local copy from the authoritative bytes.
+  static void install(Directory& dir, const Bytes& bytes) {
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = decode(bytes, arena);
+    dir.expectSynced(filesOf(info));
+    auto state = IncarnationState::read(dir);
+    if (!state) throw WriterSupersededError();
+    dir.publishFile(name(info.index_gen, info.writer_epoch), withFooter(*bytes), Directory::PublishMode::REPLACE);
+    IncarnationState::install(dir, tip(info.index_gen, info.writer_epoch));
+  }
+
+  static std::vector<std::byte> withFooter(const std::vector<std::byte>& bytes) {
+    std::vector<std::byte> result(bytes);
+    std::array<uint64_t, 2> footer{bytes.size(), XXH3_64bits(bytes.data(), bytes.size())};
+    auto encoded = std::as_bytes(std::span(footer));
+    result.insert(result.end(), encoded.begin(), encoded.end());
+    return result;
+  }
+
+  static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, uint64_t epoch) {
+    write(dir, name(gen, epoch), bytes);
   }
   static void write(Directory& dir, const std::string& fileName, const std::vector<std::byte>& bytes) {
-    Directory::FileCreateOptions options; options.expectedSize = bytes.size() + 16;
+    auto contents = withFooter(bytes);
+    Directory::FileCreateOptions options; options.expectedSize = contents.size();
     auto file = dir.createFile(fileName, options);
     OutputStream out(file.get());
-    out.write(bytes.data(), bytes.size());
-    out.writeLong(bytes.size());
-    out.writeLong(XXH3_64bits(bytes.data(), bytes.size()));
+    out.write(contents.data(), contents.size());
     out.close();
     dir.finishFile(*file);
   }

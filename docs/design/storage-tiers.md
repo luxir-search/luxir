@@ -139,16 +139,18 @@ The request count depends on the number of files, not on the size of the segment
   nothing to do: an acknowledged put is durable. With a staging directory,
   `spill_bytes` sets when a stream stops being folded into the segment's first
   file and becomes an object of its own (see below).
-- **`renameFile`** is a server-side copy and a remove. The target object is
-  replaced atomically, which is all `CURRENT` needs.
+- **`publishFile`** is a conditional `put`: `CREATE_ONLY` maps to If-None-Match,
+  a `REPLACE` that matches a version to If-Match on the object's version (its
+  ETag). `readPublished` is a `get` that returns the bytes with that version, so
+  `STATE` and `CATALOG` advance by compare-and-swap as on the other backends.
 - **`linkFile`** is a server-side copy; between different stores it streams the
   bytes. `reuseFiles` copies, as the directory has no `HARD_LINK`.
-- **`listFiles`** lists the prefix, hiding marker objects and other directories.
+- **`listFiles`** lists the prefix, hiding other directories.
 - **Known sizes.** `Manifest::load` passes the committed files of the manifest it
   chose to `Directory::knownFiles`. The directory keeps their sizes, so opening a
   committed file needs no size request, and a segment listed without an
   `s<seg>__hot` has no hotcache, so its open does not probe for one. A name is
-  forgotten when the directory deletes, writes, renames or links over it.
+  forgotten when the directory deletes, writes, publishes or links over it.
   Reopening a small two-commit collection takes 27 requests instead of 31, and
   none of them asks for the size of a segment file.
 - **`openChecksum`** streams `chunk_bytes` ranges through the hash without a
@@ -165,7 +167,7 @@ The request count depends on the number of files, not on the size of the segment
   unlinked descriptor does on a filesystem. A crash
   in between leaves an unreferenced object, which the startup sweep of unreferenced
   index files removes.
-- Files that are not segment data (`CURRENT`, commit manifests, live docs,
+- Files that are not segment data (`STATE`, commit manifests, live docs,
   overlays) are read whole when opened: they are small, and unlike a segment file
   they can be replaced in place.
 
@@ -178,26 +180,28 @@ Choose `spill_bytes` for the trade between many small objects and coarse ones.
 
 ## The backend
 
-`ObjectStoreDirFactory(std::shared_ptr<ObjectStore>, const StorageContext&)` lays
-collections out as keys, the layout of the `fs` backend:
+`ObjectStoreDirFactory(std::shared_ptr<ObjectStore>, const StorageContext&)` maps
+a view `(root, path)` to the key prefix `<path>/`, or `node/<path>/` for the
+node-private root, so the keys follow the layout of the `fs` backend:
 
 ```
-t/<tenant>/<collection>/CURRENT
-t/<tenant>/<collection>/<incarnation>/<file>
-node/<file>                                   (node-level files, replication.json)
+LAYOUT
+t/<tenant>/CATALOG
+t/<tenant>/i/<incarnation>/<file>             (STATE, commit manifests, segments)
+node/<file>                                   (node-private files, replication.json)
 ```
 
-`createCollection` is a conditional `put` (`ifAbsent`) of a marker object, so two
-writers cannot both create a collection; a conflict is an exception whose
-message contains "already exists". `collections()` and `incarnations()` use
-`listDirectories`, which a store with a delimiter listing can answer cheaply and
-which defaults to listing everything under the prefix.
+A "directory" exists while some object has its prefix; opening a view creates
+nothing. `children` lists the prefix and `removeTree` removes every object under
+it. Live views are shared, so a delete through one view waits for the readers of
+another.
 
 `ram_object` is the built-in backend over a `RamObjectStore`: it is for tests and
 demos, and the reference for what a plugin provides. A plugin registers its own
 backend by constructing `ObjectStoreDirFactory` over its own `ObjectStore`; see
-[plugins](../dev/plugins.md#object-stores). The backend is writer-owned like `fs`
-is: a second writer on the same keys is not detected beyond the collection marker.
+[plugins](../dev/plugins.md#object-stores). A superseded writer is fenced as on the
+other backends: it claims an incarnation by publishing `STATE`, and its next
+conditional publish fails once another writer has claimed it.
 
 ## What is deferred
 

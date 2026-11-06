@@ -43,6 +43,7 @@ public:
 
   struct SegmentStats {
     uint64_t segId = 0;
+    uint64_t creatorEpoch = 0;
     uint64_t liveGen = 0;
     uint64_t minUpdateVersion = 0;
     uint64_t maxUpdateVersion = 0;
