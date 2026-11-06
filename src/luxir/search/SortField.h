@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/search/FieldComparator.h"
+#include "luxir/search/GeoDistanceComparator.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/log.h"
@@ -37,6 +38,8 @@ private:
     FieldComparator::MissingValue missingValue;
     const FieldType* fieldType;
     StringSortMode stringSortMode;
+    // Set for a distance sort over a GEO_POINT field.
+    std::optional<GeoSortOrigin> geoOrigin;
     inline static std::atomic<StringSortMode> stringSortModeOverride =
         StringSortMode::DEFAULT;
     
@@ -61,9 +64,19 @@ public:
         }
     }
     
+    // Distance from `origin` over a GEO_POINT column, in meters. Docs
+    // without a value sort last in both directions.
+    SortField(std::string_view field, const FieldType& fieldType, SortOrder order,
+              GeoSortOrigin origin)
+        : SortField(field, fieldType, order, FieldComparator::MISSING_LAST,
+                    StringSortMode::SEGMENT) {
+        geoOrigin = origin;
+    }
+
 public:
     
     const std::string& getFieldName() const { return fieldName; }
+    const std::optional<GeoSortOrigin>& getGeoOrigin() const { return geoOrigin; }
     const FieldType& getFieldType() const { return *fieldType; }
     SortOrder getOrder() const { return order; }
     bool isReversed() const { 
@@ -103,6 +116,9 @@ public:
     std::unique_ptr<FieldComparator> createComparator(
         IndexReader& reader) const {
         auto fields = reader.field(fieldName);
+        if (geoOrigin.has_value()) {
+            return std::make_unique<GeoDistanceComparator>(isReversed(), *geoOrigin, fields);
+        }
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
         if (FieldType::sortsByIntColumn(type)) {

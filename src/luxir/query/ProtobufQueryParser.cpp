@@ -26,6 +26,7 @@
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/GeoPolygonQuery.h"
+#include "luxir/query/GeoNearestQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/QueryRegistry.h"
@@ -254,6 +255,32 @@ luxir::Query* ProtobufQueryParser::parseGeoPolygon(
   }
   return pool.make<luxir::GeoPolygonQuery>(
       pool, api::build::arenaStr(pool, target.physicalName), polygons);
+}
+
+luxir::Query* ProtobufQueryParser::parseGeoNearest(
+    const luxir::api::GeoNearestQuery& geoNearestQuery) {
+  const auto& target = context.fields.resolve(geoNearestQuery.field, OpClass::PRIMARY, context.opName);
+  if (target.fieldType->type() != FieldType::GEO_POINT) {
+    throw std::runtime_error(std::format("GeoNearest query on non-geo field: {}", geoNearestQuery.field));
+  }
+  if (!target.fieldType->hasColumn()) {
+    throw std::runtime_error(std::format("GeoNearest query on geo field without a column: {}",
+                                         geoNearestQuery.field));
+  }
+  if (geoNearestQuery.k <= 0) {
+    throw std::runtime_error(std::format("GeoNearest query for field '{}' must have k > 0 (got {})",
+                                         geoNearestQuery.field, geoNearestQuery.k));
+  }
+  double maxDistance = geoNearestQuery.max_distance_meters.value_or(
+      std::numeric_limits<double>::infinity());
+  if (!(maxDistance >= 0.0)) {
+    throw std::runtime_error(std::format(
+        "GeoNearest query for field '{}' must have a non-negative max_distance_meters",
+        geoNearestQuery.field));
+  }
+  return pool.make<luxir::GeoNearestQuery>(
+      api::build::arenaStr(pool, target.physicalName), geoNearestQuery.lat, geoNearestQuery.lon,
+      geoNearestQuery.k, maxDistance, target.fieldType->multiValued());
 }
 
 luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery) {
@@ -659,6 +686,9 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     },
     [&](const luxir::api::GeoPolygonQuery& g) -> luxir::Query* {
       return parseGeoPolygon(g);
+    },
+    [&](const luxir::api::GeoNearestQuery& g) -> luxir::Query* {
+      return parseGeoNearest(g);
     },
     [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseFuzzy(f); },
     [&](const luxir::api::SimpleQuery& s) -> luxir::Query* { return parseSimpleQuery(s, pquery); },

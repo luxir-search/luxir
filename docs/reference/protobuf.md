@@ -130,6 +130,7 @@ defaults and constraints are described in the comments and guides.
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
 - [`GeoLatLon`](#message-luxir.geolatlon)
+- [`GeoNearestQuery`](#message-luxir.geonearestquery)
 - [`GeoPolygon`](#message-luxir.geopolygon)
 - [`GeoPolygonQuery`](#message-luxir.geopolygonquery)
 - [`GeoRing`](#message-luxir.georing)
@@ -1260,6 +1261,22 @@ A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the VALUE array
 | <a id="field-luxir.geolatlon.lat"></a>[`lat`](#field-luxir.geolatlon.lat) | 1 | `double` | singular | degrees in \[-90, 90\], finite |
 | <a id="field-luxir.geolatlon.lon"></a>[`lon`](#field-luxir.geolatlon.lon) | 2 | `double` | singular | degrees in \[-180, 180\], finite |
 
+<a id="message-luxir.geonearestquery"></a>
+
+### luxir.GeoNearestQuery
+
+The k documents nearest a point of a GEO\_POINT field, by the great-circle distance geo\_distance uses. A multi-valued field counts each document once, at its nearest point; ties keep index order. Deleted documents and documents outside the enclosing domain (filters, facet buckets) are not candidates, so k counts eligible documents. Hits score 1 / (1 + meters), times any enclosing boost; sort by geo\_distance(field, lat, lon) to return the exact distance.<br><br>Named center scalars deliberately avoid positional ambiguity: the VALUE array contract \[x, y\] = \[lon, lat\] does not apply to this message.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.geonearestquery.field"></a>[`field`](#field-luxir.geonearestquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.geonearestquery.lat"></a>[`lat`](#field-luxir.geonearestquery.lat) | 2 | `double` | singular | center latitude, degrees in \[-90, 90\] |
+| <a id="field-luxir.geonearestquery.lon"></a>[`lon`](#field-luxir.geonearestquery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
+| <a id="field-luxir.geonearestquery.k"></a>[`k`](#field-luxir.geonearestquery.k) | 4 | `int32` | singular | documents to return; must be positive |
+| <a id="field-luxir.geonearestquery.max_distance_meters"></a>[`max_distance_meters`](#field-luxir.geonearestquery.max_distance_meters) | 5 | `double` | optional | Inclusive distance limit, so fewer than k may match. Unset = no limit; must be non-negative. |
+
 <a id="message-luxir.geopolygon"></a>
 
 ### luxir.GeoPolygon
@@ -1852,6 +1869,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
+| <a id="field-luxir.query.geo_nearest"></a>[`geo_nearest`](#field-luxir.query.geo_nearest) | 21 | [`GeoNearestQuery`](#message-luxir.geonearestquery) | oneof [`kind`](#oneof-luxir.query.kind) | the k documents nearest a point of a GEO\_POINT field |
 | <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside any of several polygons |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
@@ -2543,7 +2561,7 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte. An exact count is also valid for N. Must be &gt;= -1. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
-| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
+| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. "\_sort\_" returns each document's sort values, one per sort clause (the score for a list ranked by score), as an ArrVal. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | placement of returned fields: rows, columns, or adaptive (see DocFormat) |

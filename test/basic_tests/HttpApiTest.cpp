@@ -1174,6 +1174,51 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoNearestAndDistanceSortOverJson) {
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"ny","geo":[-74.0060,40.7128]},{"id":"philly","geo":[-75.1652,39.9526]},)"
+      R"({"id":"la","geo":[-118.2437,34.0522]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto nearest = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_nearest":{"field":"geo","lat":40.0,"lon":-75.0,"k":2,"max_distance_meters":1000000}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, nearest.result_int()) << nearest.body();
+  size_t philly = nearest.body().find(R"("philly")");
+  size_t ny = nearest.body().find(R"("ny")");
+  ASSERT_NE(std::string::npos, philly) << nearest.body();
+  ASSERT_NE(std::string::npos, ny) << nearest.body();
+  EXPECT_LT(philly, ny) << nearest.body();
+  EXPECT_EQ(std::string::npos, nearest.body().find(R"("la")")) << nearest.body();
+
+  auto sorted = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"sort":["geo_distance(geo, 40.0, -75.0) desc"],)"
+      R"("fields":["id","_sort_"]})");
+  ASSERT_EQ(200, sorted.result_int()) << sorted.body();
+  size_t la = sorted.body().find(R"("la")");
+  ASSERT_NE(std::string::npos, la) << sorted.body();
+  EXPECT_LT(la, sorted.body().find(R"("philly")")) << sorted.body();
+  EXPECT_NE(std::string::npos, sorted.body().find(R"("_sort_")")) << sorted.body();
+  // la is 3,857 km from the origin.
+  EXPECT_NE(std::string::npos, sorted.body().find(R"("_sort_":[3857)")) << sorted.body();
+
+  // A diversified list reports its sort values too.
+  auto diverse = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"x({"query":{"all":true},"sort":["geo_distance(geo, 40.0, -75.0)"],)x"
+      R"("diversify":{"field":"id","max_per_key":1},"fields":["id","_sort_"],"limit":1})");
+  ASSERT_EQ(200, diverse.result_int()) << diverse.body();
+  EXPECT_NE(std::string::npos, diverse.body().find(R"x("_sort_":[15031.)x")) << diverse.body();
+
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_nearest":{"field":"geo","lat":40.0,"lon":-75.0,"k":0}}})");
+  EXPECT_NE(std::string::npos, bad.body().find("k > 0")) << bad.body();
+}
+
 TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {

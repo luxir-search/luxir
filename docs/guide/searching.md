@@ -618,6 +618,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
 | Geo distance | `{"geo_distance":{"field":"location","lat":40.71,"lon":-74.01,"radius_meters":5000}}` | Inclusive great-circle radius. |
 | Geo polygon | `{"geo_polygon":{"field":"location","polygons":[{"points":[{"lat":40,"lon":-75},{"lat":42,"lon":-75},{"lat":42,"lon":-72}]}]}}` | Union of polygons, each with optional `holes`; no dateline crossing. |
+| Geo nearest | `{"geo_nearest":{"field":"location","lat":40.71,"lon":-74.01,"k":10}}` | The `k` nearest documents within filters; optional `max_distance_meters`. See [Geo search](geo-search.md#nearest-documents). |
 
 `match` accepts `operator: "and"` or a numeric `min_match` when analysis
 produces several terms. Boolean `optional` clauses rank but do not constrain a
@@ -792,7 +793,9 @@ to its following value. The function spellings remain available:
   segments merge.
 - `geo_distance(field, lat, lon)` is the haversine distance in meters from a
   point to each value of a GEO_POINT field, the same distance `geo_distance`
-  queries use.
+  queries use. A sort on it alone (or on `min`/`max` of it for a
+  multi-valued field) prunes through the points index; see
+  [Sort by distance](geo-search.md#sort-by-distance).
 - Decay functions `gauss_decay`, `exp_decay`, and `linear_decay` (see
   [Decay functions](#decay-functions)).
 - Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Missing or
@@ -926,7 +929,11 @@ that under `columns` a discovered field with no value in a batch is left out
 of that batch, while a named column is always present. A field both named
 and matched by a pattern is returned once, so `"fields": ["id", "*"]` returns
 `id` and everything else. `_score_` is requested explicitly (`get_scores`)
-and is a column except under `rows`.
+and is a column except under `rows`. `_sort_`, requested by name, is each
+document's sort values as an array, one per sort clause (the score for a list
+ranked by score); a document missing a sort value has `null` there. Under
+collapse it is the returned document's values under the list sort; the
+group's rank is in `groups.ranks`.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and

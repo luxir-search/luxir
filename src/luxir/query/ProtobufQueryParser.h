@@ -67,6 +67,7 @@ class ProtobufQueryParser {
   Query* parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery);
   Query* parseGeoDistance(const luxir::api::GeoDistanceQuery& geoDistanceQuery);
   Query* parseGeoPolygon(const luxir::api::GeoPolygonQuery& geoPolygonQuery);
+  Query* parseGeoNearest(const luxir::api::GeoNearestQuery& geoNearestQuery);
   Query* parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery);
   Query* parseKnn(const luxir::api::KnnQuery& knnQuery);
   std::span<Query*> parseQueryList(std::span<const luxir::api::Query> queries);

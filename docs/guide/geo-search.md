@@ -250,6 +250,82 @@ polygon and accepts whole regions inside one. A point check does not test
 every edge, so polygons with many vertices, such as administrative
 boundaries, stay practical.
 
+## Nearest documents
+
+`geo_nearest` matches the `k` documents closest to a point, nearest first:
+
+```http
+POST /collections/places/_search
+
+{
+  "query": {
+    "geo_nearest": {
+      "field":"location",
+      "lat":40.7128,
+      "lon":-74.0060,
+      "k":5
+    }
+  },
+  "fields":["id","name_s"]
+}
+```
+
+Distances are the same great-circle distances `geo_distance` uses. A
+multi-valued document counts once, at its nearest point, and documents at the
+same distance keep index order. `max_distance_meters` (inclusive) stops the
+search at a radius, so fewer than `k` documents may match.
+
+Filters, deletes, and an enclosing facet bucket narrow the candidates before
+the `k` nearest are chosen, as they do for `knn`: with a filter,
+`geo_nearest` returns the `k` nearest documents that pass it. With a points
+index the search walks the index outward from the center and stops once no
+unvisited cell can hold a nearer point, so its cost follows `k` rather than
+the collection size. A filter that admits only a few documents is checked
+document by document instead, and a field without a points index is scanned.
+
+Hits score `1 / (1 + meters)`, so the nearest ranks first. The score is a
+32-bit float, so documents within about one part in ten million of each
+other's distance (a meter at 10,000 km) score alike and fall back to index
+order. To order by the exact distance and return it, sort by it and request
+`_sort_` (next section); with only `k` hits the sort is cheap.
+
+## Sort by distance
+
+`geo_distance(field, lat, lon)` is the distance in meters from a point to a
+document's location. As a sort clause it orders any query's matches by
+distance, and `_sort_` in `fields` returns each hit's sort values:
+
+```http
+POST /collections/places/_search
+
+{
+  "query": {"match":{"description_t":"coffee"}},
+  "sort": ["geo_distance(location, 40.0, -75.0)"],
+  "fields": ["id","name_s","_sort_"]
+}
+```
+
+```json
+{
+  "docs": [
+    {"id": "nyc", "name_s": "New York", "_sort_": [115653.49817598039]}
+  ]
+}
+```
+
+The sort is ascending unless `desc` is given, and documents without a point
+sort last in both directions. For a multi-valued field, choose the point:
+`min(geo_distance(...))` sorts by the nearest and `max(geo_distance(...))` by
+the farthest. `lat` and `lon` must be numbers or `$variables`.
+
+An ascending sort prunes as it goes. Once it holds a full page, a document
+whose points all lie outside the bounding box of the circle at the current
+last distance is rejected without computing a distance. With a points index,
+the circle is looked up in the index and the query skips straight to the
+documents inside it; the lookup repeats each time the last distance halves.
+Inside a larger value expression (`geo_distance(...) / 1000`),
+`geo_distance` is evaluated per document without this pruning.
+
 ## Combine place with relevance
 
 Geo queries are constant-scoring when used as queries and non-scoring when
@@ -329,8 +405,6 @@ field.
 
 ## Limits
 
-- Geo-distance sorting is not implemented.
-- The query does not emit the computed distance as a result field.
 - Polygons cannot cross the date line.
 - Polygon vertices are `{"lat","lon"}` objects; GeoJSON `Polygon` and
   `MultiPolygon` coordinates are not accepted as query input yet.

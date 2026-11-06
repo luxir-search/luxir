@@ -75,6 +75,7 @@ enum class QueryKind : uint8_t {
   // Every query a plugin query type builds (QueryRegistry). Shape questions
   // get the conservative answers, as for TEST.
   PLUGIN,
+  GEO_NEAREST,
   TEST,
 };
 

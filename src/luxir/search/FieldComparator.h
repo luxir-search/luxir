@@ -365,6 +365,25 @@ public:
     return OrdIntervalStatus::UNSUPPORTED;
   }
 
+  // Optional competitive doc source for comparators whose competitive docs
+  // come from an index walk rather than an ord interval (a geo distance
+  // sort through the points index). Like competitiveOrdInterval it derives
+  // from the heap bottom. READY yields [begin, end), the first run of docs
+  // at or after `from` that may still enter the heap (begin == END: none
+  // can); docs between from and begin cannot. `sourceDocs` estimates the
+  // docs the collection source still produces from `from` on, the work a
+  // source must undercut. PENDING means no usable source yet (no bound, or
+  // one not worth building); UNSUPPORTED means this comparator or segment
+  // never provides one.
+  enum class CompetitiveDocStatus { UNSUPPORTED, PENDING, READY };
+  virtual bool offersCompetitiveDocs() const { return false; }
+  virtual CompetitiveDocStatus competitiveDocs(int32_t bottomSlot,
+                                               int32_t from, int64_t sourceDocs,
+                                               int32_t& begin, int32_t& end) {
+    unused(bottomSlot, from, sourceDocs, begin, end);
+    return CompetitiveDocStatus::UNSUPPORTED;
+  }
+
   enum MissingValue {
     MISSING_FIRST,
     MISSING_LAST
