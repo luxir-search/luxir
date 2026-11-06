@@ -1,7 +1,8 @@
 # Segment summaries
 
 Status: the per-segment sidecar, query-time pruning with one root mask per
-operation, and lazy segment materialization are implemented. Related:
+operation, lazy segment materialization and the collection summary in the
+manifest are implemented. Related:
 [storage design](storage.md) for the object-store direction.
 
 ## What a summary is
@@ -381,6 +382,118 @@ materializations and `service.segment_bytes_mapped`
 materialization (base files, live docs, overlays). A base handed over by the
 writer was opened by the writer and is not counted.
 
+## Collection summary
+
+The manifest root carries the union of every segment's summary
+(`IndexInfo.field_summaries`, `IndexInfo.summary_complete`), so a search can
+prove an op empty for the whole collection before it looks at any segment.
+
+### Contents
+
+One record per physical field present in any segment, sorted by name, with
+the per-segment record's layout plus `segments_with_field` (how many segments
+have a record):
+
+- counts (`docs_with_field`, `num_values`, BM25 totals, `n_terms`) sum,
+  saturating; FieldType `flags` and the `MULTI_VALUED`,
+  `TERM_BOUNDS_TRUNCATED` and `TERM_MAX_UNBOUNDED` markers OR;
+- numeric bounds, geo boxes and term bounds union. A bound survives only
+  when every segment holding a value of the field has it: a segment with
+  values and no such bound leaves the union unbounded, and an `EMPTY` record
+  constrains nothing. One segment's unbounded term maximum makes the
+  union's unbounded;
+- a field whose segments disagree on `type` or `type_flags` keeps its record
+  (presence and counts) but loses every bound, since encoded values of
+  different types do not compare;
+- `EMPTY` when every segment's record is empty.
+
+The aggregate is complete only when every segment has a readable, complete
+summary. Otherwise a field absent from it may still exist in that segment,
+and its bounds may miss that segment's values, so it is stored with
+`summary_complete = false` and no records, and proves nothing. Readers use
+only a complete aggregate (`IndexReader::collectionSummary()`); bounds are
+supersets over deleted documents too, like the segment summaries they come
+from.
+
+### Size budget
+
+The manifest is read on every reader open and every replication step, so
+the aggregate is bounded: `--indexing.collection-summary-max-bytes` (default
+`64KB`, `IndexWriter::collectionSummaryMaxBytes`) caps the encoded bytes of
+the two manifest fields. When the full aggregate is over the budget
+(`CollectionSummary::fit`):
+
+1. every term bound is dropped (term bounds are the largest part);
+2. then every numeric bound and geo box, leaving presence, types and counts;
+3. if those presence records alone are still over, the aggregate is stored
+   with `summary_complete = false` and no records.
+
+A presence record is never dropped while the aggregate claims completeness:
+completeness is what makes a missing record a proof of absence. `0` stores
+no aggregate.
+
+### When it is computed
+
+`IndexWriter::writeCollectionSummary` builds it while writing the manifest,
+from the segments' sidecars (opened once per segment and kept on its
+`SegInfo`), and caches it with the `core_gen` and segment ids it covers. A
+commit whose segment set is unchanged, such as a delete-only commit, copies
+the cached aggregate without reading anything; a flush or merge recomputes
+it. A reopened writer seeds the cache from the manifest it loads, so a later
+delete-only commit copies the stored aggregate (a budget change therefore
+applies from the next segment change). Deletes never change it: the
+aggregate, like the segment summaries, covers deleted documents.
+Replication copies the manifest, so a follower's reader has the same
+aggregate.
+
+### The collection-level proof
+
+`QueryPruning::collectionEmpty` evaluates a query once against the aggregate
+(through the same `Query::mayMatch` rules, the aggregate standing in for a
+segment's summary). A query it proves empty gets the empty segment mask
+without a proof per segment, so every mask built from it (an op's root mask,
+domain variants, Fusion shared filters) is empty with no per-segment work.
+
+For a TopDocs op the parser goes further, before any weight exists: when the
+aggregate proves the op's own matches empty (its query, filters folded in)
+and no domain variant widens its root mask (no `domain.query`, no routed
+filter), the op plans a `MatchNoDocsQuery` in place of its query. Planning
+then seeks no term dictionary for statistics and builds no count or
+membership plan over the segments; the op's root mask is empty, so the
+batched materialization point (layer 4) excludes every segment for it, and
+collection treats each segment as pruned. The response is that of an empty
+match: zero hits and counts, children (facets, nested ops) over the empty
+domain, and a Fusion source with no candidates.
+
+The exception is whole-index preparation. A query that may prepare over the
+whole index (kNN, or the test-only force-prepare wrapper; logical validation
+sets `PlanningContext::mayPrepare` when it visits one) keeps its weights:
+its root mask is still empty, but the request's preparation rules from the
+pruning and lazy-opening layers hold unchanged, so every segment is
+materialized and prepared as before, and only collection is skipped.
+
+A proof answers without weights, so it must not hide an error their creation
+raises. The one reachable case is a schema that types a field differently
+from what its segments persist (an `int` field redefined as `date`):
+`IndexReader::field()` fails every request using that field with
+`field_type_mismatch`. A reader whose schema disagrees with any type the
+aggregate records therefore uses no collection summary
+(`IndexReader::collectionSummary()` is null): requests using the field raise
+the error as before, and the others are answered through the segment
+summaries. A field whose segments persist different types (which merges
+refuse, and `field()` rejects) keeps no bounds in the aggregate and is never
+marked empty, so it proves nothing either.
+
+Under `profile` and explain, an op proven empty this way reports once:
+`op <name>: proven empty by the collection summary: <reason>`, and the
+`pruning` profile op marks every segment `pruned` with
+`op <name>: collection summary: <reason>`.
+
+What still reads segments for such an op: projecting every stored field (no
+`fields` list) builds the wildcard field catalogs, which read every
+segment's data, and a string facet below it builds its global ordinal map
+over every segment.
+
 ## Deferred
 
 - Per-node enforcement: masks for nested clauses, query facet buckets and
@@ -388,7 +501,12 @@ writer was opened by the writer and is not counted.
   when the op's root mask keeps them. It pays where opening is expensive.
 - Matching-only statistics (one population per search), which would also
   skip dictionary reads in pruned segments.
-- A collection-level aggregate in the manifest, under a size budget.
+- `_can_match`, a cheap "may this collection match" call against the
+  collection summary, once multi-collection search has a caller for it.
+- Short-circuiting a Fusion whose shared filters are proven empty before its
+  sources plan (today its sources plan normally and their root masks prune
+  every segment), and facets below a proven-empty op that build global
+  ordinal maps over every segment.
 - Membership structures (exact term sets, term and prefix filters). They help
   most on cold segments, where they are much smaller than the dictionary and
   can stay cached, but they cost build memory and space. They will come as a
