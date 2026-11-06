@@ -13,6 +13,7 @@
 #include "LuxirTest.h"
 #include "GrpcLuxirTest.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
@@ -101,6 +102,14 @@ bool LuxirTest::isDefaultSchema(const std::shared_ptr<Schema>& schema) {
   for (const auto& [name, defaultField] : defaultSchema->fieldTypeMap) {
     auto it = schema->fieldTypeMap.find(name);
     if (it == schema->fieldTypeMap.end() || !fieldTypesEqual(*it->second, *defaultField)) return false;
+  }
+  // Signatures carry the remaining per-field properties, such as long_terms.
+  static const FieldSignatures defaultSignatures = defaultSchema->signatures(true);
+  auto signatures = schema->signatures(true);
+  if (signatures.size() != defaultSignatures.size()) return false;
+  for (const auto& [name, signature] : defaultSignatures) {
+    auto it = signatures.find(name);
+    if (it == signatures.end() || it->second.properties != signature.properties) return false;
   }
   return true;
 }
@@ -314,6 +323,7 @@ int main(int argc, char **argv) {
   testing::AddGlobalTestEnvironment(new luxir::LuxirEnvironment());
 
   int ret = 0;
+  luxir::initPlugins(luxir::addConfiguredPlugins);
   luxir::LuxirNode node{config};
   luxir::LuxirTest::luxirNode = &node;
 

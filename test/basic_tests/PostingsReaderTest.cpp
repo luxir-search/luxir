@@ -201,7 +201,8 @@ protected:
     auto writer = helper.getIndexWriter();
     auto reader = writer->snapshots.readers.getReader();
     EXPECT_EQ(1u, reader->segments().size());
-    return PostingsReader::create(writer->dir, reader->segments()[0].segInfo.seg_id);
+    auto stored = test::readDurableIndexInfo(writer->dir);
+    return PostingsReader::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch, false, false);
   }
 };
 

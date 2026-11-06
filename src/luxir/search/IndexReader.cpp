@@ -10,6 +10,7 @@
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/SchemaCache.h"
 #include "luxir/store/FileIOException.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/MemPool.h"
@@ -55,26 +56,26 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
+std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
   std::string deleteFileName = Postings::getLiveDocsFileName(
-    Postings::getSortableString(segId), liveGen);
+    Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
 
   auto deleteFile = dir.openFile(deleteFileName, expectSynced);
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing
-      IREADER_DEBUG("Delete file {} not found for segment {} (liveGen={})",
-                deleteFileName, segId, liveGen);
+      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})",
+                deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen);
       return nullptr;
     } else {
       throw std::filesystem::filesystem_error(
-              std::format("Delete file {} not found for segment {} (liveGen={})",
-                         deleteFileName, segId, liveGen),
+              std::format("Delete file {} not found for segment s{} (liveGen={})",
+                         deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
   }
-  IREADER_DEBUG("Successfully opened delete file {} for segment {}", deleteFileName, segId);
+  IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
 
   InputStream deleteStream = deleteFile->getInputStream();
 
@@ -123,8 +124,8 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   // FixedBitSet with live docs - memory map directly!
   uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
 
-  IREADER_DEBUG("Loaded {} deleted documents from {} for segment {}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, segId, numLiveDocs);
+  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
+            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
 
   return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), numLiveDocs);
 }
@@ -226,7 +227,7 @@ std::shared_ptr<Value> SegmentPart<Value>::getOrOpen(std::string_view what, Open
 std::shared_ptr<PostingsReader> SegmentBase::get() {
   if (auto value = cell.peek()) return value;  // the warm path builds no message
   return getOrOpen("segment " + std::to_string(segId), [this](HeldFiles& held) {
-    auto reader = PostingsReader::create(held, segId, false, true, summary);
+    auto reader = PostingsReader::create(held, segId, creatorEpoch, false, true, summary);
     if (reader->maxDoc() != maxDoc) {
       throw std::runtime_error(std::format("maxDoc {} disagrees with the manifest's {}", reader->maxDoc(), maxDoc));
     }
@@ -239,7 +240,7 @@ std::shared_ptr<PostingsReader> SegmentBase::get() {
 std::shared_ptr<LiveDocs> SegmentLive::get() {
   if (auto value = cell.peek()) return value;  // the warm path builds no message
   return getOrOpen("live docs of segment " + std::to_string(segId), [this](HeldFiles& held) {
-    auto live = LiveDocs::create(held, segId, liveGen, maxDoc, false, true);
+    auto live = LiveDocs::create(held, segId, creatorEpoch, liveGen, liveEpoch, maxDoc, false, true);
     if (live->numLive() != numLive) {
       throw std::runtime_error(std::format("{} live docs disagree with the manifest's {}", live->numLive(), numLive));
     }
@@ -365,12 +366,13 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         prevAuxByName.clear();
         prevSegAuxByKey.clear();
       }
-      if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
+      if (preferredSchema && preferredSchema->binding == SchemaBinding(*indexInfo.schema)) {
         schema = preferredSchema;
-      } else if (previous && previousReader->schema()->gen_ == indexInfo.schema_gen) {
+      } else if (previous && previousReader->schema()->binding == SchemaBinding(*indexInfo.schema)) {
         schema = previousReader->schema();
       } else {
-        schema = Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen);
+        SchemaCache schemas; // standalone readers have no node owner
+        schema = schemas.load(dir, indexInfo);
       }
       indexGen = indexInfo.index_gen;
       core->segmentFiles.clear();
@@ -379,7 +381,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         auto& files = core->segmentFiles.emplace_back();
         files.segId = segment.seg_id;
         std::string liveName = segment.live_gen == 0 ? std::string()
-            : Postings::getLiveDocsFileName(Postings::getSortableString(segment.seg_id), segment.live_gen);
+            : Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), segment.live_gen, segment.live_epoch);
         for (const auto& file : segment.files) {
           (file.name == liveName ? files.liveDocs : files.files)
               .push_back({std::string(file.name), file.size, file.xxh3});
@@ -491,14 +493,14 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             && (!handed || handed == prevSeg->sharedBase->peek())) {
           base = prevSeg->sharedBase;
         } else if (handed) {
-          base = std::make_shared<SegmentBase>(segId, nDocs, std::move(handed));
+          base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(handed));
         } else if (files.files.empty()) {
-          auto opened = PostingsReader::create(dir, segId, missingFileOK, true, summary);
+          auto opened = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true, summary);
           if (!opened) {
             retry = true;
             break;
           }
-          base = std::make_shared<SegmentBase>(segId, nDocs, std::move(opened));
+          base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(opened));
         } else {
           auto held = std::make_unique<HeldFiles>();
           bool secured = true;
@@ -514,7 +516,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             break;
           }
           dir.expectSynced(files.files);
-          base = std::make_shared<SegmentBase>(segId, nDocs, std::move(held), summary, metrics, onUnreadable);
+          base = std::make_shared<SegmentBase>(segId, segment.creator_epoch, nDocs, std::move(held), summary, metrics,
+                                               onUnreadable);
         }
 
         std::shared_ptr<SegmentLive> live;
@@ -523,7 +526,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           live = prevSeg->sharedLive;
         } else if (liveGen > 0) {
           auto held = std::make_unique<HeldFiles>();
-          std::string liveName = Postings::getLiveDocsFileName(Postings::getSortableString(segId), liveGen);
+          std::string liveName = Postings::getLiveDocsFileName(Postings::segmentKey(segId, segment.creator_epoch), liveGen, segment.live_epoch);
           if (!held->hold(dir, liveName)) {
             if (!missingFileOK) {
               throw std::filesystem::filesystem_error(
@@ -534,8 +537,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             break;
           }
           dir.expectSynced(files.liveDocs);
-          live = std::make_shared<SegmentLive>(segId, liveGen, nDocs, segment.live_docs, std::move(held), metrics,
-                                              onUnreadable);
+          live = std::make_shared<SegmentLive>(segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs,
+                                              segment.live_docs, std::move(held), metrics, onUnreadable);
         }
         // If liveGen == 0, live remains null (no deletes)
 
@@ -951,6 +954,7 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
         case FieldType::FLOAT:
         case FieldType::DOUBLE:
         case FieldType::DATE:
+        case FieldType::GEO_POINT:
           retrievable = source.column && type->hasColumn();
           break;
         default:

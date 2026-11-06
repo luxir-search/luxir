@@ -122,17 +122,18 @@ private:
 public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
+  uint64_t creatorEpoch;
 
 public:
-  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc = -1,
+  PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
                  IndexRamBudget* ramBudget = nullptr,
                  bool ramDelegatingFiles = false)
       : directory(dir), maxDoc(maxDoc),
         delegatedRamGuard(ramBudget == nullptr
             ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
-        ramDelegatingFiles(ramDelegatingFiles), segId(segId)
+        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
   {
-    segStr = Postings::getSortableString(segId);
+    segStr = Postings::segmentKey(segId, creatorEpoch);
   }
 
   void configureRamDelegation(bool enabled,

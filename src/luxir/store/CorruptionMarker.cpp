@@ -12,14 +12,9 @@ void CorruptionMarker::write(Directory& dir, std::span<const std::string> files,
   text += reason;
   text += '\n';
   for (const auto& file : files) { text += file; text += '\n'; }
-  auto name = std::string(kPrefix) + newUuid();
-  Directory::FileCreateOptions options; options.expectedSize = text.size();
-  auto file = dir.createFile(name, options);
-  OutputStream out(file.get());
-  out.write(text.data(), text.size()); out.close();
-  dir.finishFile(*file);
-  std::array<std::string, 2> synced{name, "."};
-  dir.sync(synced);
+  // Each report adds a marker; an existing one must not lose its suspects.
+  while (!dir.publishFile(std::string(kPrefix) + newUuid(), std::as_bytes(std::span(text)),
+                         Directory::PublishMode::CREATE_ONLY)) {}
 }
 
 std::vector<std::string> CorruptionMarker::read(Directory& dir) {
@@ -52,11 +47,9 @@ bool CorruptionMarker::present(Directory& dir) {
 void CorruptionMarker::clear(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
-  bool removed = false;
-  for (const auto& entry : listing) if (isMarker(entry.name)) removed = dir.deleteFile(entry.name) || removed;
-  if (!removed) return;
-  std::array<std::string, 1> directory{"."};
-  dir.sync(directory);
+  std::vector<std::string> names;
+  for (const auto& entry : listing) if (isMarker(entry.name)) names.push_back(entry.name);
+  dir.deleteDurably(names);
 }
 
 }

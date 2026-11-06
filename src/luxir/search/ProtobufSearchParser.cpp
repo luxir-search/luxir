@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "luxir/api/RequestFlags.h"
+#include "luxir/search/SearchOpRegistry.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
@@ -26,6 +28,7 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/FittedTerms.h"
 #include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -147,6 +150,7 @@ struct SearchParserImpl {
     FACET_BUCKET,
     GROUP_BUCKET,
     FUSION,
+    PLUGIN,
   };
 
   struct ParsedFences {
@@ -219,6 +223,7 @@ public:
   // The provided pool will be used to store the parsed query tree.
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
+
   explicit SearchParserImpl(SearchRequest& req)
     : req(req), fields(*req.schema, req.resolvedFields), pruning(*req.reader),
       maxOpDepth(req.searchConfig.max_op_depth) {
@@ -329,6 +334,26 @@ public:
     }
   }
 
+  // Every planning context of the request draws on one multi-term budget.
+  Query::PlanningContext* createPlanningContext() {
+    Query::PlanningContext::Limits limits;
+    limits.multiTermBudget = &req.multiTermBudget;
+    return luxir::arenaCreate<Query::PlanningContext>(
+        req.arena, req.requestPool, *req.reader, limits, &req.warnings,
+        FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone},
+        req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+  }
+
+  // All request parse paths share the operator rules and field resolver.
+  ParseContext createParseContext(std::string_view name) {
+    ParseContext parseContext{req.requestPool, *req.schema, req.arena,
+        coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
+    parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
+    parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
+    return parseContext;
+  }
+
   CoerceContext coerceContext(const TimeZone& zone) const {
     return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags)};
   }
@@ -340,19 +365,10 @@ public:
     rootOp.parent = nullptr;
     rootOp.flags = options.flags;
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone),
-      "root", &req.warnings, &fields};
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext("root");
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
-      rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
-          req.arena, req.requestPool, *req.reader,
-          Query::PlanningContext::Limits{}, &req.warnings,
-          FilterKeyContext{.schemaGen = req.schema->gen_,
-                           .timeZone = req.proto.time_zone},
-          req.filterUses);
+      rootOp.planning = createPlanningContext();
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -444,11 +460,7 @@ public:
         ? (listFilters ? listFilters : &static_cast<TopDocsReq&>(currOp).filters) : nullptr;
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
-      ParseContext context{req.requestPool, *req.schema, req.arena,
-          coerceContext(*req.timeZone),
-          currOp.name, &req.warnings, &fields};
-      context.collapse = enclosingCollapse;
-      context.reader = req.reader.get();
+      auto context = createParseContext(currOp.name);
       auto domains = parseChildDomains(ops, context);
       if (!domains.empty()) {
         std::vector<Query*> filters;
@@ -466,9 +478,7 @@ public:
           domain.applyParentFilters = false;
         }
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
-        bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
-            req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+        bucketPlan->planning = createPlanningContext();
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -526,6 +536,9 @@ public:
     auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
+    }
+    if (searchOp.domain && placement == OpsPlacement::PLUGIN) {
+      throw RequestError("domain is not supported under a plugin operation's ops");
     }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     SearchOp* op = std::visit(luxir::overloaded{
@@ -597,12 +610,7 @@ public:
           plan = prepared->second;
           preparedFacets.erase(prepared);
         } else {
-          ParseContext parseContext{
-            req.requestPool, *req.schema, req.arena,
-            coerceContext(*req.timeZone),
-            name, &req.warnings, &fields};
-          parseContext.collapse = enclosingCollapse;
-          parseContext.reader = req.reader.get();
+          auto parseContext = createParseContext(name);
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -623,6 +631,9 @@ public:
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
+      },
+      [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
+        return parsePluginOp(name, pluginOp, depth);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
@@ -656,6 +667,7 @@ public:
       std::string location = placement == OpsPlacement::REQUEST_ROOT
           ? "request root"
           : placement == OpsPlacement::FUSION ? "Fusion.ops"
+          : placement == OpsPlacement::PLUGIN ? "a plugin operation's ops"
                                               : "nested facet bucket";
       throw std::runtime_error("facet '" + std::string(facetName) + "' at "
           + location
@@ -762,6 +774,73 @@ public:
     facetGroupPlans.push_back(facet.groupPlan);
   }
 
+  // FieldFacet.term_filter with literals normalized as the field normalizes
+  // query text: prefix as a prefix query, regex and exclude_regex as a regex
+  // query, include and exclude as any_of values.
+  FacetTermFilterSpec parseTermFilter(std::string_view facetName,
+                                      const ResolvedFieldHandle& target,
+                                      const luxir::api::TermFilter& termFilter) {
+    std::string context = std::format("facet '{}': term_filter", facetName);
+    if (termFilter.num_partitions == 0 && termFilter.partition != 0) {
+      throw RequestError(context + ": partition requires num_partitions");
+    }
+    if (termFilter.num_partitions != 0 && termFilter.partition >= termFilter.num_partitions) {
+      throw RequestError(std::format("{}: partition {} must be less than num_partitions {}",
+                                     context, termFilter.partition, termFilter.num_partitions));
+    }
+    QueryBuilder builder(req.requestPool, *req.schema, coerceContext(*req.timeZone),
+                         facetName, &req.warnings, &fields);
+    FacetTermFilterSpec spec;
+    // Errors name the term_filter field they came from.
+    auto within = [&](std::string_view name, auto&& build) {
+      try {
+        return build();
+      } catch (const std::runtime_error& e) {
+        throw RequestError(std::format("{} {}: {}", context, name, e.what()));
+      }
+    };
+    // A positive regex whose literal outgrows fitted terms matches by the kept
+    // prefix instead, as the regex query does, so only the others can warn.
+    auto compile = [&](std::string_view pattern, bool positive) {
+      TermPattern compiled = builder.compileRegexPattern(target, pattern);
+      if (compiled.fittedPolicy && !(positive && compiled.fittedPrefix)) {
+        warnIfFittedTermsReachable(*req.reader, &req.warnings, req.requestPool,
+            target.physicalName, *compiled.fittedPolicy, [&] {
+              return compiled.dfa.maxAcceptedLength() >= (int32_t)PackedTerm::MIN_FITTED_LEN;
+            });
+      }
+      return compiled;
+    };
+    auto normalize = [&](std::span<const std::string_view> values) {
+      std::vector<std::string> terms;
+      terms.reserve(values.size());
+      for (std::string_view value : values) {
+        terms.emplace_back(builder.normalizeLiteral(target, value, true));
+      }
+      return terms;
+    };
+    if (!termFilter.prefix.empty()) {
+      spec.prefix = within("prefix", [&] {
+        return std::string(builder.normalizePrefix(target, termFilter.prefix));
+      });
+    }
+    if (!termFilter.regex.empty()) {
+      spec.regex = within("regex", [&] { return compile(termFilter.regex, true); });
+    }
+    if (!termFilter.exclude_regex.empty()) {
+      spec.excludeRegex = within("exclude_regex", [&] {
+        return compile(termFilter.exclude_regex, false);
+      });
+    }
+    if (!termFilter.include.empty()) {
+      spec.include = within("include", [&] { return normalize(termFilter.include); });
+    }
+    spec.exclude = within("exclude", [&] { return normalize(termFilter.exclude); });
+    spec.partition = termFilter.partition;
+    spec.numPartitions = termFilter.num_partitions;
+    return spec;
+  }
+
   FacetReq* createFieldFacetReq(
       std::string_view facetName, const luxir::api::FieldFacet& facetReq,
       OpsPlacement placement,
@@ -804,8 +883,7 @@ public:
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
-      if (ftype->type() == FieldType::Type::DATE
-          || ftype->type() == FieldType::Type::INT) {
+      if (QueryBuilder::isNumericColumnType(ftype->type())) {
         selectedInts = preparedSelected->numericsInInputOrder();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
@@ -814,15 +892,23 @@ public:
       }
     }
 
+    if (facetReq.term_filter.has_value() && ftype->type() != FieldType::Type::ID
+        && ftype->type() != FieldType::Type::STRING) {
+      throw RequestError("facet '" + std::string(facetName)
+          + "': term_filter is supported only on STRING and ID fields");
+    }
+
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
-      // DATE stores native ticks in the int column; it terms-facets exactly
-      // like INT (distinct values). Date-histogram bucketing is a range
-      // facet, not a terms facet.
+      // Numeric columns hold raw integers, date ticks, or sortable floating
+      // bits. Field facets count distinct encoded values for all of them;
+      // date-histogram bucketing is a range facet, not a terms facet.
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
+          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedInts);
@@ -842,10 +928,14 @@ public:
               + std::string(facetField) + "' is column-only (not indexed); string facets "
               "require an indexed field");
         }
+        std::optional<FacetTermFilterSpec> termFilter;
+        if (facetReq.term_filter.has_value()) {
+          termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);
+        }
         auto ordMap = req.reader->getOrdMap(facetField);
         facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing,
-            std::move(ordMap), selectedStrings);
+            std::move(ordMap), selectedStrings, std::move(termFilter));
         break;
       }
       case FieldType::Type::TEXT:
@@ -1043,7 +1133,7 @@ public:
       if (dataBounds) {
         auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
             facetField, facetName, std::move(grid), encodedStart, encodedEnd,
-            fieldType->type(), minCount, facetReq.missing);
+            minCount, facetReq.missing);
         configureMeasure(*facet, measure);
         return facet;
       }
@@ -1056,7 +1146,7 @@ public:
       });
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
-          parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+          parsed.affine, parsed.affineGap, minCount,
           facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
       return facet;
@@ -1104,7 +1194,7 @@ public:
     if (dataBounds) {
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
           facetField, facetName, std::move(grid), givenStart, givenEnd,
-          fieldType->type(), minCount, facetReq.missing);
+          minCount, facetReq.missing);
       configureMeasure(*facet, measure);
       return facet;
     }
@@ -1116,7 +1206,7 @@ public:
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
-        parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+        parsed.affine, parsed.affineGap, minCount,
         facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
     return facet;
@@ -1354,7 +1444,8 @@ public:
       try {
         plan.bucketQueries[i] = parser.parse(*bucket.query);
       } catch (const std::runtime_error& error) {
-        throw std::runtime_error("facet '" + std::string(facetName)
+        auto info = classifyException(error, ErrorKind::INVALID_REQUEST);
+        throw ApiError(info.kind, info.code, "facet '" + std::string(facetName)
             + "': query_facet bucket '" + std::string(bucket.name)
             + "': " + error.what());
       }
@@ -1405,12 +1496,7 @@ public:
   }
 
   void validateQueryFacetQueries(FacetParsePlan& plan) {
-    plan.planning = luxir::arenaCreate<Query::PlanningContext>(
-        req.arena, req.requestPool, *req.reader,
-        Query::PlanningContext::Limits{}, &req.warnings,
-        FilterKeyContext{.schemaGen = req.schema->gen_,
-                         .timeZone = req.proto.time_zone},
-        req.filterUses);
+    plan.planning = createPlanningContext();
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1680,11 +1766,7 @@ public:
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
     }
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -1798,12 +1880,7 @@ public:
     if (topDocsReq.collapse && !topDocsReq.collapse->head_sort.empty()) {
       headSort = parseSorts(topDocsReq.collapse->head_sort);
     }
-    auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
-      req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
-      &req.warnings,
-      FilterKeyContext{.schemaGen = req.schema->gen_,
-                       .timeZone = req.proto.time_zone},
-      req.filterUses);
+    auto* planningContext = createPlanningContext();
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2316,6 +2393,98 @@ public:
     return out;
   }
 
+  // The parser side of a plugin op: query parsing, a planning context of its
+  // own, TopDocs sources and nested ops, all bound to this request.
+  class PluginOpContextImpl final : public PluginOpContext {
+    SearchParserImpl& parser;
+    int depth;
+    ParseContext context;
+    Query::PlanningContext* planningContext = nullptr;
+    Query::Context* executionContext = nullptr;
+
+  public:
+    PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
+      : PluginOpContext(parser.req, name, proto,
+                        ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
+        parser(parser), depth(depth),
+        context(parser.createParseContext(name)) {
+    }
+
+    ParseContext& parseContext() override { return context; }
+
+    Query::PlanningContext& planning() override {
+      if (planningContext == nullptr) {
+        planningContext = parser.createPlanningContext();
+      }
+      return *planningContext;
+    }
+
+    Query::Context& weightContext() override {
+      if (executionContext == nullptr) executionContext = Query::Context::create(&req.arena, planning());
+      return *executionContext;
+    }
+
+    Query* parseQuery(const luxir::api::Query& query) override {
+      ProtobufQueryParser queryParser(context);
+      Query* parsed = queryParser.parse(query);
+      parsed->validateLogical(planning());
+      return parsed;
+    }
+
+    Query* parseQuery(const luxir::api::Val& value) override {
+      return parseQuery(*readMessage<luxir::api::Query>(value, "query"));
+    }
+
+    TopDocsReq* parseSource(std::string_view sourceName, const luxir::api::Val& topDocs) override {
+      auto* proto = readMessage<luxir::api::TopDocs>(topDocs, "top_docs source");
+      auto* oldCollapse = parser.enclosingCollapse;
+      auto* oldMeasure = parser.inheritedFacetMeasure;
+      auto restore = scope_guard([&]() noexcept {
+        parser.enclosingCollapse = oldCollapse;
+        parser.inheritedFacetMeasure = oldMeasure;
+      });
+      auto* source = parser.parseTopDocs(sourceName, *proto, TopDocsPlacement::FUSION_SOURCE);
+      source->flags = parser.options.flags;
+      return source;
+    }
+
+    void addSubs(SearchOp& op) override {
+      parser.addSubs(op, proto.ops, depth, OpsPlacement::PLUGIN);
+    }
+
+  private:
+    // A param value read as a request message: the same JSON the message's
+    // own field accepts. The text and the views it yields live in the arena.
+    template <typename M>
+    M* readMessage(const luxir::api::Val& value, std::string_view what) {
+      std::string json;
+      if (!luxir::api::write_json(value, json)) {
+        throw RequestError(params.owner + ": cannot serialize a " + std::string(what) + " param");
+      }
+      ArenaResource mr(&req.arena);
+      std::string_view text = luxir::api::build::arenaStr(mr, json);
+      auto* message = new (mr.allocate(sizeof(M), alignof(M))) M();
+      std::string error;
+      if (!luxir::api::read_json(*message, text, mr, &error)) {
+        throw RequestError(params.owner + ": invalid " + std::string(what) + ": " + error);
+      }
+      return message;
+    }
+  };
+
+  SearchOp* parsePluginOp(std::string_view name, const luxir::api::PluginOp& pluginOp, int depth) {
+    const auto& maker = SearchOpRegistry::global().require(pluginOp.name);
+    PluginOpContextImpl context(*this, name, pluginOp, depth);
+    SearchOp* op;
+    try {
+      op = maker(context);
+    } catch (const ParamError& e) {
+      throw RequestError(e.what());
+    }
+    if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
+    return op;
+  }
+
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
     int64_t countLimit = fusionProto.count_limit.value_or(0);
     if (countLimit < -1) {
@@ -2408,11 +2577,7 @@ public:
       sourceWeights.push_back(weights[i]);
     }
 
-    ParseContext parseContext{
-      req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
-    parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    auto parseContext = createParseContext(name);
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");
