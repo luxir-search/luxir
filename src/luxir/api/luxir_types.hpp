@@ -900,6 +900,7 @@ struct TopDocs {                                                 // all indirect
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -915,6 +916,7 @@ struct Fusion {                                                  // needs TopDoc
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
   ::hpp_proto::optional_indirect_view<Query> query;

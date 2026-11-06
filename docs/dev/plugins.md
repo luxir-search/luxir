@@ -848,3 +848,31 @@ must read through `rangeStream`, and code that wants the whole file through `rea
 directory opens and creates per collection) and a `counting` layer (counting file
 opens and creates). `StorageExampleTest` runs a node on both and asserts the counters
 (`CountingStorage::count`).
+
+
+## Result decorators
+
+`Registries::hitDecorators` registers a maker receiving a `DecoratorContext`
+(request, query parse/planning context, and original ranking queries) and a
+`ParamReader`. Return a shared `HitDecorator` with a unique output column name.
+Register during startup; the registry is frozen with the other registries.
+
+TopDocs and Fusion accept `decorate: {"registered_name": {params...}}` on the
+wire. JSON also accepts a registered name directly as a list key. Unknown names,
+non-object params, duplicate decorators and unknown params are request errors.
+Candidate Fusion sources cannot decorate; configure decoration on the Fusion.
+
+`HitDecorator::decorate(docs, rows, out, mr)` runs only over emitted rows, after
+paging. Each call receives a sorted segment run within a response batch, with
+`rows` mapping into the emission-order `docs` and `out` arrays. Calls for different
+runs may execute concurrently. Leave `out[row]` null when there is no value.
+Allocate response-owned strings and arrays using `mr`; do not retain stored-reader
+views past their callbacks. Columns flow through the ordinary ROWS, COLUMNS and
+ADAPTIVE placement and streaming paths.
+
+Keep mutable readers and forward-only iterators call-local: sorting is per batch,
+and a later ranked batch can contain lower document IDs. Immutable per-request
+plans may be shared with synchronization during initialization. Decorators cannot
+change membership, order or scores. The output name must not collide with another
+extra column. Decorators are also invoked for nested top-doc lists, collapsed
+heads, and diversified lists.

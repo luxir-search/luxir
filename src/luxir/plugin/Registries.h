@@ -8,6 +8,7 @@
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
+#include "luxir/search/HitDecorator.h"
 #include "luxir/search/SortKindRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/store/StorageRegistry.h"
@@ -32,6 +33,7 @@ struct Registries {
   SortKindRegistry& sortKinds;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
+  HitDecoratorRegistry& hitDecorators;
 
   static Registries global();
   // Freezes every registry.

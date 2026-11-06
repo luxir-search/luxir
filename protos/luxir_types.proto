@@ -168,6 +168,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
 
@@ -231,6 +233,8 @@ message TopDocs {
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 27;
   // Named source queries. At least one source is required.
   map<string, TopDocs> sources = 1;
 

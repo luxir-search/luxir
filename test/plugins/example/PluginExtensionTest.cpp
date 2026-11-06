@@ -289,6 +289,20 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
 }
 
+TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {
+  for (std::string_view decorate : {R"("decorate":{"label":{"text":"hi"}})", R"("label":{"text":"hi"})"}) {
+    SCOPED_TRACE(decorate);
+    auto res = search(R"({"ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],)" + std::string(decorate) + "}}}}");
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_NE(std::string::npos, res.body().find(R"({"id":"d1","label":"hi"})")) << res.body();
+  }
+  auto unknownParam = search(R"({"ops":{"q":{"top_docs":{"decorate":{"label":{"text":"hi","x":1}}}}}})");
+  EXPECT_EQ(400, unknownParam.result_int()) << unknownParam.body();
+  auto unknownName = search(R"({"ops":{"q":{"top_docs":{"decorate":{"nope":{}}}}}})");
+  EXPECT_EQ(400, unknownName.result_int()) << unknownName.body();
+  EXPECT_NE(std::string::npos, unknownName.body().find("unknown hit decorator 'nope'")) << unknownName.body();
+}
+
 TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
                               UpdateMessage::COMMIT, true).success);

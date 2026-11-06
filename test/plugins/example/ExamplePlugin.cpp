@@ -460,6 +460,24 @@ public:
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
     r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
+    // Adds a "label" column holding the configured text to every emitted hit.
+    r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
+      struct Label : HitDecorator {
+        std::string text;
+        std::string_view columnName() const override { return "label"; }
+        void decorate(std::span<const segdoc>, std::span<const uint32_t> rows,
+                      std::span<api::Val> out, std::pmr::memory_resource& mr) const override {
+          for (uint32_t row : rows) {
+            char* copy = (char*)mr.allocate(text.size(), alignof(char));
+            std::memcpy(copy, text.data(), text.size());
+            out[row].kind = std::string_view(copy, text.size());
+          }
+        }
+      };
+      auto label = std::make_shared<Label>();
+      label->text = std::string(params.requireString("text"));
+      return label;
+    });
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");

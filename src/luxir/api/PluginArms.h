@@ -14,6 +14,7 @@ namespace luxir::api {
 struct PluginArmNames {
   bool (*isQuery)(std::string_view name) = nullptr;
   bool (*isOp)(std::string_view name) = nullptr;
+  bool (*isDecorator)(std::string_view name) = nullptr;
 };
 
 inline PluginArmNames pluginArmNames;
@@ -24,6 +25,10 @@ inline bool isPluginQueryArm(std::string_view name) {
 
 inline bool isPluginOpArm(std::string_view name) {
   return pluginArmNames.isOp != nullptr && pluginArmNames.isOp(name);
+}
+
+inline bool isPluginDecoratorArm(std::string_view name) {
+  return pluginArmNames.isDecorator && pluginArmNames.isDecorator(name);
 }
 
 } // namespace luxir::api
