@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "luxir/util/automaton/ByteDfa.h"
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/Utf32ToUtf8.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "luxir/util/automaton/RegExpParser.h"
@@ -362,6 +363,74 @@ TEST(RegExpTest, literalAtomFolding) {
   EXPECT_FALSE(sharpS.matches("sssss"));
   Budget escapedBudget(10000000);
   EXPECT_TRUE(compileRegex("\\A", escapedBudget, &folder).matches("a"));
+}
+
+TEST(CaseAlternatesTest, simpleFoldClasses) {
+  auto alternates = [](int32_t cp) {
+    auto span = caseAlternates(cp);
+    return std::vector<int32_t>(span.begin(), span.end());
+  };
+  EXPECT_EQ((std::vector<int32_t>{'K', 'k', 0x212a}), alternates('k'));
+  EXPECT_EQ(alternates('k'), alternates(0x212a));
+  EXPECT_EQ((std::vector<int32_t>{0x3a3, 0x3c2, 0x3c3}), alternates(0x3c2));
+  EXPECT_EQ((std::vector<int32_t>{0x1c4, 0x1c5, 0x1c6}), alternates(0x1c5));
+  EXPECT_TRUE(alternates('1').empty());
+  std::vector<std::pair<int32_t, int32_t>> ranges{{'a', 'c'}};
+  Budget budget;
+  appendCaseAlternates(ranges, budget);
+  EXPECT_EQ((std::vector<std::pair<int32_t, int32_t>>{{'a', 'c'}, {'A', 'A'}, {'B', 'B'}, {'C', 'C'}}), ranges);
+}
+
+TEST(CaseAlternatesTest, expansionConsumesBudget) {
+  std::vector<std::pair<int32_t, int32_t>> ranges{{0, 0x10ffff}};
+  Budget budget(1);
+  EXPECT_THROW(appendCaseAlternates(ranges, budget), std::runtime_error);
+}
+
+TEST(RegExpTest, overlappingCaseRangesShareBudget) {
+  std::string pattern = "[";
+  for (int i = 0; i < 200; i++) pattern += "a-z";
+  pattern += "]";
+  Budget budget(5000);
+  auto compiled = compileRegex(pattern, budget, nullptr, true);
+  EXPECT_TRUE(compiled.matches("B"));
+  EXPECT_TRUE(compiled.matches(utf8(0x212a)));
+  EXPECT_FALSE(compiled.matches("0"));
+}
+
+TEST(RegExpTest, negatedFullRangeMatchesNothing) {
+  auto pattern = "[^" + utf8(0) + "-" + utf8(0x10ffff) + "]";
+  for (bool caseInsensitive : {false, true}) {
+    Budget budget;
+    auto compiled = compileRegex(pattern, budget, nullptr, caseInsensitive);
+    EXPECT_FALSE(compiled.matches(""));
+    EXPECT_FALSE(compiled.matches("a"));
+    EXPECT_FALSE(compiled.matches(utf8(0x10ffff)));
+  }
+}
+
+TEST(CaseAlternatesTest, compilersExpandLiteralsAndClasses) {
+  auto wildcard = [](std::string_view pattern, const CodepointFolder* folder = nullptr) {
+    Budget budget(10000000);
+    return compileWildcard(pattern, budget, folder, true);
+  };
+  auto regex = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileRegex(pattern, budget, nullptr, true);
+  };
+  EXPECT_TRUE(wildcard("fo*").matches("FOOBAR"));
+  EXPECT_TRUE(wildcard("\\F?").matches("fx"));
+  EXPECT_FALSE(wildcard("fo").matches("fp"));
+  EXPECT_TRUE(regex("[a-c]x").matches("BX"));
+  EXPECT_FALSE(regex("[a-c]x").matches("dx"));
+  EXPECT_FALSE(regex("[^a]").matches("A"));
+  EXPECT_TRUE(regex("[^a]").matches("b"));
+  EXPECT_TRUE(regex("\\k").matches(utf8(0x212a)));
+  // Case alternation applies after field folding.
+  TestCodepointFolder folder;
+  ByteDfa sharpS = wildcard(utf8(0xdf), &folder);
+  EXPECT_TRUE(sharpS.matches("sS"));
+  EXPECT_FALSE(sharpS.matches(utf8(0xdf)));
 }
 
 TEST(RegExpTest, errorsHavePositions) {

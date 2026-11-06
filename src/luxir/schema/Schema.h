@@ -13,6 +13,8 @@
 #include "luxir/util/StrRef.h"
 #include "FieldType.h"
 #include "FieldSignature.h"
+#include "SchemaBinding.h"
+#include "luxir/store/OutputStream.h"
 
 namespace luxir {
 
@@ -62,10 +64,12 @@ public:
   using map_type = PhysicalFieldMap;
 
   map_type fieldTypeMap;
+  SchemaBinding binding;
+  FileDescriptor file;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
   // Introduction generations for declared concrete and template representations.
-  std::map<std::string, uint64_t, std::less<>> introducedGen;
+  std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,
@@ -78,10 +82,12 @@ private:
 
   RootField findRoot(std::string_view root) const;
   const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
+  static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base,
+                                         InvalidStopWords invalidStopWords);
 
 public:
   Schema() = default;
-  std::shared_ptr<Schema> withHistory(uint64_t gen, const Schema* previous) const;
+  std::shared_ptr<Schema> withHistory(SchemaBinding binding, const Schema* previous) const;
 
   // Ingest accepts logical document keys only. The returned primary handle
   // exposes the owner and its variants for the later ingest dispatcher.
@@ -97,9 +103,11 @@ public:
 
   FieldSignatures signatures(bool includeTemplates = false) const;
   void inheritIntroductions(const Schema* previous);
-  uint64_t introduction(std::string_view physicalName) const;
+  api::SchemaVersion introductionVersion(std::string_view physicalName) const;
+  uint64_t introduction(std::string_view physicalName) const { return introductionVersion(physicalName).generation(); }
+  size_t estimatedBytes() const;
   api::SchemaInfo storedInfo(std::pmr::memory_resource& arena) const;
-  static std::shared_ptr<Schema> fromStored(const api::SchemaInfo& info, uint64_t gen);
+  static std::shared_ptr<Schema> fromStored(const api::SchemaInfo& info, SchemaBinding binding);
 
   // Physical lookup includes suffix-template prototypes, never bindings or
   // __self aliases. Copy a shared_ptr before the Schema's lifetime ends.

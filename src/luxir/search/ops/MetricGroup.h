@@ -40,6 +40,8 @@ public:
   const CollapseKey& key(size_t slot) const;
   int64_t totalHits() const;
   int64_t totalGroups() const;
+  void renderRanks(std::span<const api::ArrVal> ranks, uint64_t flags,
+                   std::pmr::memory_resource& mr) const;
   void emitRank(api::ArrVal& out, size_t slot, std::pmr::memory_resource& mr) const;
   static MetricGroupData* merge(MetricGroupData* a, MetricGroupData* b);
 };

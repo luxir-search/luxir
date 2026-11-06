@@ -171,6 +171,7 @@ public:
     ASSERT_EQ(luxir::api::UpdateResponse_::Status::OK, response.msg.status);
     ASSERT_EQ(std::to_string(docnum), idString(response.msg.request_id));
     ASSERT_GT(response.msg.update_version, 0u);
+    EXPECT_GT(response.msg.took_us, 0u);
     ASSERT_EQ(commit, !response.msg.commit.empty());
     if (commit) {
       auto snapshot = test::readDurableIndexInfo(*LuxirTest::luxirNode->getCollection("main")->getShard()->getDirectory());
@@ -828,7 +829,7 @@ TEST_F(GrpcIndexTest, geoPointFormatsOverProtobuf) {
   auto& field = schema.field("loc");
   field.type = api::FieldDef::FieldClass::GEO_POINT;
   field.index = api::FieldDef::IndexMode::RANGE;
-  field.multi = true;
+  field.multi = api::FieldDef::MultiMode::DEFAULT;
   schema.set(helper.collection());
 
   std::pmr::monotonic_buffer_resource mr;

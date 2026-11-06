@@ -5,24 +5,37 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory_resource>
+#include <numbers>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "luxir/api/build.h"
 #include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
+#include "luxir/query/PointsMaterialize.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
+#include "luxir/server/HttpServer.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/HttpReq.h"
+#include "test/LinearPolygon.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -112,6 +125,41 @@ std::vector<int32_t> run(IndexReader& reader, std::string_view field,
                  twoPhase);
 }
 
+// Runs any geo query on the first segment, through the planned arm or the
+// column scan.
+template <class Q>
+std::vector<int32_t> runQuery(IndexReader& reader, Q& query, bool scan,
+                              bool twoPhase) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto* weight = (typename Q::Weight*)query.createWeight(context, 0);
+  auto& segment = reader.segments()[0];
+  return collect(scan ? weight->createScanScorerForTests(pool, segment)
+                      : weight->createScorer(pool, segment),
+                 twoPhase);
+}
+
+using EncodedPoints = std::vector<std::vector<std::pair<int32_t, int32_t>>>;
+
+// Docs with any point the relation's per-point check accepts.
+template <class Relation>
+std::vector<int32_t> relationOracle(const EncodedPoints& points,
+                                    const Relation& relation) {
+  std::vector<int32_t> docs;
+  for (int32_t doc = 0; doc < (int32_t)points.size(); doc++) {
+    if (std::ranges::any_of(points[(size_t)doc], [&](const auto& point) {
+          return relation.matches(point.first, point.second);
+        })) {
+      docs.push_back(doc);
+    }
+  }
+  return docs;
+}
+
+void addEncoded(EncodedPoints& points, int32_t doc, double lat, double lon) {
+  points[(size_t)doc].push_back({geo::encodeLatitude(lat), geo::encodeLongitude(lon)});
+}
+
 void setGeoSchema(CollectionHelper& helper, bool range = true) {
   SchemaBuilder b;
   api::FieldDef::IndexMode index = range ? api::FieldDef::IndexMode::RANGE
@@ -122,7 +170,7 @@ void setGeoSchema(CollectionHelper& helper, bool range = true) {
   auto& multi = b.field("geo_multi");
   multi.type = api::FieldDef::FieldClass::GEO_POINT;
   multi.index = index;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   b.set(helper.collection());
 }
 
@@ -171,6 +219,28 @@ void setValues(api::Val& val, std::pmr::memory_resource& mr, size_t size,
   auto& arr = val.kind.emplace<api::ArrVal>();
   api::Val* out = api::build::allocArray(arr.v, size, mr);
   for (size_t i = 0; i < size; i++) fill(out[i], i, mr);
+}
+
+using Ring = std::vector<geo::LatLon>;
+
+// Polygons as vertex lists, kept alive with the pool for the GeoPolygonQuery
+// that borrows them.
+struct PolygonSet {
+  MemPool pool;
+  std::deque<Ring> rings;
+  std::deque<std::vector<std::span<const geo::LatLon>>> holes;
+  std::vector<geo::PolygonRings> polygons;
+
+  PolygonSet& add(Ring outer, std::vector<Ring> holeRings = {}) {
+    auto& spans = holes.emplace_back();
+    for (auto& ring : holeRings) spans.push_back(rings.emplace_back(std::move(ring)));
+    polygons.push_back({rings.emplace_back(std::move(outer)), spans});
+    return *this;
+  }
+};
+
+Ring square(double minLat, double maxLat, double minLon, double maxLon) {
+  return {{minLat, minLon}, {maxLat, minLon}, {maxLat, maxLon}, {minLat, maxLon}};
 }
 
 } // namespace
@@ -336,7 +406,7 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
     setDoubles(val, mr, {1.0});
   });
   addWireDoc(update, "long", "geo_single", [](api::Val& val, auto& mr) {
-    setInts(val, mr, {1, 2, 3});
+    setInts(val, mr, {1, 2, 3, 4});
   });
   addWireDoc(update, "text", "geo_single", [](api::Val& val, auto& mr) {
     setValues(val, mr, 2, [](api::Val& elem, size_t i, auto&) {
@@ -359,7 +429,7 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
     EXPECT_NE(std::string::npos, error.error_message.find("'geo_single'"));
   }
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("needs 2 coordinates"));
-  EXPECT_NE(std::string::npos, result.errors[1].error_message.find("ignore_z_value"));
+  EXPECT_NE(std::string::npos, result.errors[1].error_message.find("needs 2 coordinates"));
   EXPECT_NE(std::string::npos, result.errors[2].error_message.find("geohash"));
   EXPECT_NE(std::string::npos, result.errors[3].error_message.find("single-valued"));
 
@@ -552,6 +622,127 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   EXPECT_EQ(1, SkipStats::geoScanArms);
 }
 
+// A 64 x 64 grid of single points, latitude -80 + 2.5 * (doc % 64), with a
+// body of terms t3, t5 and t7 on every third, fifth and seventh doc. Calls
+// `check` with the index reader.
+template <typename Check>
+void withGrid(bool range, Check&& check) {
+  CollectionHelper helper;
+  setGeoSchema(helper, range);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  auto& body = inverter.getIndexHandler("body_w");
+  for (int32_t doc = 0; doc < 4096; doc++) {
+    inverter.startDoc();
+    handler.index(inverter, -80.0 + 2.5 * (doc % 64), -170.0 + 5.0 * (doc / 64));
+    std::string text = "pad";
+    for (int32_t k : {3, 5, 7}) if (doc % k == 0) text += " t" + std::to_string(k);
+    body.index(inverter, std::string_view(text));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+  check(*reader);
+}
+
+// The southern half of the grid (2,112 docs): its supplier and a probe that
+// resolves it for a pull consumer's expected candidates and spared work,
+// returning whether the plan verifies (two-phase).
+template <typename Check>
+void withGridBox(bool range, Check&& check) {
+  withGrid(range, [&](IndexReader& reader) {
+    constexpr int32_t N = 4096;
+    MemPool pool;
+    QueryState state(pool, reader, "geo_single", Box{-80.0, 0.0, -180.0, 180.0});
+    auto* supplier = state.weight->scorerSupplier(pool, reader.segments()[0]);
+    ASSERT_NE(nullptr, supplier);
+    auto verifies = [&](double candidates, double spared) {
+      Query::Demand demand = Query::Demand::fromLeadCost(N);
+      demand.expectedCandidates = candidates;
+      demand.sparedWork = spared;
+      auto* plan = supplier->resolve(pool, supplier->makePlanContext(demand));
+      return plan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
+    };
+    check(*supplier, verifies, pool, N);
+  });
+}
+
+// With the candidates a pull consumer expects to reach it, or an exposure's
+// candidates, the box verifies or produces its BKD by point emissions:
+// candidates times the verify price plus the consumer's spared work, against
+// materializing about 2,100 matches into a bitset. Otherwise it verifies for
+// a lead sparser than its matches.
+TEST_F(GeoBoxQueryTest, armChoicePricesVerificationAgainstBKDProduction) {
+  withGridBox(true, [](Query::ScorerSupplier& supplier, auto& verifies, MemPool& pool,
+                       int32_t n) {
+    EXPECT_TRUE(verifies(10, 0));
+    EXPECT_FALSE(verifies(1000, 0));
+    EXPECT_FALSE(verifies(10, 10000));
+    auto verifiesFor = [&](int64_t lead, bool exposure) {
+      auto context = supplier.makePlanContext(Query::Demand::fromCandidatesAndSpan(
+          lead, n, exposure ? Query::ExecutionUse::MATCH_WINDOWS : Query::ExecutionUse::PULL));
+      if (exposure) context.expectedSpan = n;
+      auto* plan = supplier.resolve(pool, context);
+      return plan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
+    };
+    EXPECT_TRUE(verifiesFor(1000, false));
+    EXPECT_FALSE(verifiesFor(3000, false));
+    // Filling windows over an exposure, the box prices that exposure's
+    // candidates: verifying 1,000 costs more than producing.
+    EXPECT_FALSE(verifiesFor(1000, true));
+  });
+}
+
+// Without a BKD both arms verify; the scan iterates the column once the
+// consumer reaches every document with a value.
+TEST_F(GeoBoxQueryTest, armChoiceWithoutPointsScansAFullReach) {
+  withGridBox(false, [](Query::ScorerSupplier& supplier, auto& verifies, MemPool& pool,
+                        int32_t n) {
+    EXPECT_TRUE(verifies(10, 0));
+    SkipStats::reset();
+    SkipStats::enabled = true;
+    supplier.resolve(pool, supplier.makePlanContext(Query::Demand::fromLeadCost(n)))
+        ->build(pool);
+    SkipStats::enabled = false;
+    EXPECT_EQ(1, SkipStats::geoScanArms);
+  });
+}
+
+// A box holding 3,392 docs under a 3-term union of about 2,800 candidates: the
+// union's cost is below the box's matches, but verifying every union candidate
+// costs far more than producing the box, so the conjunction builds the BKD,
+// and describing the Boolean reports the same (no verification).
+TEST_F(GeoBoxQueryTest, boxUnderAUnionProducesItsBKD) {
+  withGrid(true, [](IndexReader& reader) {
+    constexpr int32_t N = 4096;
+    MemPool pool;
+    Query::Context context(pool, reader);
+    GeoBoxQuery box("geo_single", -90.0, 51.0, -180.0, 180.0);
+    TermQuery t3("body_w", "t3"), t5("body_w", "t5"), t7("body_w", "t7");
+    std::array<Query*, 3> optional{&t3, &t5, &t7};
+    std::array<Query*, 1> filters{&box};
+    BooleanQuery query({}, optional, {}, filters, 1);
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader.segments()[0]);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(Query::VerificationWork::ABSENT,
+              supplier->verificationWork(supplier->makePlanContext(Query::Demand::fromLeadCost(N))));
+    SkipStats::reset();
+    SkipStats::enabled = true;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+    SkipStats::enabled = false;
+    EXPECT_EQ(1, SkipStats::geoBKDArms);
+    EXPECT_EQ(0, SkipStats::geoSparseVerifyArms);
+    std::vector<int32_t> docs, expected;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (doc % 64 <= 52 && (doc % 3 == 0 || doc % 5 == 0 || doc % 7 == 0)) expected.push_back(doc);
+    }
+    EXPECT_EQ(expected, docs);
+  });
+}
+
 TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   CollectionHelper helper;
   setGeoSchema(helper);
@@ -647,4 +838,610 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   EXPECT_EQ(39, countForTests(singleCountState.weight, merged));
   QueryState multiCountState(countPool, *afterMerge, "geo_multi", all);
   EXPECT_EQ(-1, countForTests(multiCountState.weight, merged));
+}
+
+// The column scan arm agrees with the per-point check for every geo relation
+// over clustered points.
+TEST_F(GeoBoxQueryTest, scanAgreesWithPointChecks) {
+  constexpr int32_t N = 4 * 512 + 100;
+  CollectionHelper helper;
+  setGeoSchema(helper, false);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  const std::array<GeoPoint, 5> clusters = {{{40.7, -74.0}, {51.5, -0.1},
+                                             {35.7, 139.7}, {-33.9, 151.2},
+                                             {0.0, 179.9}}};
+  EncodedPoints points(N);
+  SplitMix64 rng(0x2b0e5a17);
+  for (int32_t doc = 0; doc < N; doc++) {
+    const auto& center = clusters[(size_t)(doc / 512)];
+    double lat = center.latitude + (unitDouble(rng) - 0.5) * 0.2;
+    double lon = std::min(180.0, center.longitude + (unitDouble(rng) - 0.5) * 0.2);
+    inverter.startDoc();
+    handler.index(inverter, lat, lon);
+    addEncoded(points, doc, lat, lon);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+
+  auto check = [&](auto& query) {
+    auto expected = relationOracle(points, query.makeRelation());
+    EXPECT_EQ(expected, runQuery(*reader, query, true, false));
+    EXPECT_EQ(expected, runQuery(*reader, query, true, true));
+    return expected.size();
+  };
+  for (const Box& box : {Box{40.0, 41.0, -75.0, -73.0}, Box{40.7, 51.5, -74.0, 0.0},
+                         Box{-1.0, 1.0, 179.85, -179.0}, Box{-90.0, 90.0, -180.0, 180.0}}) {
+    GeoBoxQuery query("geo_single", box.minLat, box.maxLat, box.minLon, box.maxLon);
+    EXPECT_GT(check(query), 0u);
+  }
+  for (double radius : {3000.0, 8000.0, 6000000.0}) {
+    GeoDistanceQuery query("geo_single", 40.7, -74.0, radius);
+    EXPECT_GT(check(query), 0u);
+  }
+  PolygonSet set;
+  set.add(square(35.0, 36.0, 139.0, 140.0),
+          {{{35.65, 139.65}, {35.75, 139.65}, {35.7, 139.75}}});
+  set.add(square(51.45, 51.5, -0.15, -0.1));
+  GeoPolygonQuery polygon(set.pool, "geo_single", set.polygons);
+  EXPECT_GT(check(polygon), 0u);
+  EXPECT_LT(check(polygon), 1024u);
+}
+
+class GeoPolygonQueryTest : public LuxirTest {};
+
+TEST_F(GeoPolygonQueryTest, containmentHolesAndValidation) {
+  // A concave "C" around New York with a triangular hole in its top bar;
+  // the ring repeats its first vertex, which the query drops.
+  PolygonSet set;
+  set.add({{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0}, {41.0, -73.0}, {41.0, -74.5},
+           {40.5, -74.5}, {40.5, -73.0}, {40.0, -73.0}, {40.0, -75.0}},
+          {{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}});
+  GeoPolygonQuery query(set.pool, "geo", set.polygons);
+  EXPECT_EQ(8u, query.getPolygons()[0].outer.size());
+  const BKDPolygonRelation& relation = query.makeRelation();
+  auto matches = [](const BKDPolygonRelation& r, double lat, double lon) {
+    return r.matches(geo::encodeLatitude(lat), geo::encodeLongitude(lon));
+  };
+  EXPECT_TRUE(matches(relation, 40.25, -74.0));   // bottom bar
+  EXPECT_TRUE(matches(relation, 41.25, -73.5));   // top bar
+  EXPECT_TRUE(matches(relation, 40.75, -74.75));  // left bar
+  EXPECT_FALSE(matches(relation, 40.75, -73.5));  // the notch
+  EXPECT_FALSE(matches(relation, 41.35, -74.85)); // the hole
+  EXPECT_FALSE(matches(relation, 42.0, -74.0));
+
+  auto compare = [](const BKDPolygonRelation& r, double minLat, double maxLat,
+                    double minLon, double maxLon) {
+    return r.compare(geo::encodeLatitude(minLat), geo::encodeLatitude(maxLat),
+                     geo::encodeLongitude(minLon), geo::encodeLongitude(maxLon));
+  };
+  EXPECT_EQ(BKDRelation::INSIDE, compare(relation, 40.1, 40.4, -74.9, -73.1));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(relation, 40.6, 40.9, -74.4, -73.1));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(relation, 10.0, 20.0, 10.0, 20.0));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(relation, 40.4, 40.6, -74.0, -73.5));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(relation, 41.2, 41.3, -74.85, -74.7));
+
+  // A union: the second square covers part of the first one's hole, which
+  // applies to its own polygon only.
+  PolygonSet two;
+  two.add(square(0.0, 10.0, 0.0, 10.0), {square(4.0, 6.0, 4.0, 6.0)});
+  two.add(square(5.0, 7.0, 5.0, 7.0));
+  GeoPolygonQuery both(two.pool, "geo", two.polygons);
+  const BKDPolygonRelation& unionRelation = both.makeRelation();
+  EXPECT_TRUE(matches(unionRelation, 8.0, 8.0));
+  EXPECT_TRUE(matches(unionRelation, 5.5, 5.5));
+  EXPECT_FALSE(matches(unionRelation, 4.5, 4.5));
+  EXPECT_FALSE(matches(unionRelation, 20.0, 20.0));
+  EXPECT_EQ(BKDRelation::INSIDE, compare(unionRelation, 5.2, 5.8, 5.2, 5.8));
+  EXPECT_EQ(BKDRelation::OUTSIDE, compare(unionRelation, 4.2, 4.8, 4.2, 4.8));
+  EXPECT_EQ(BKDRelation::CROSSES, compare(unionRelation, 4.5, 5.5, 4.5, 5.5));
+
+  PolygonSet same;
+  same.add(square(0.0, 10.0, 0.0, 10.0), {square(4.0, 6.0, 4.0, 6.0)});
+  same.add(square(5.0, 7.0, 5.0, 7.0));
+  GeoPolygonQuery equal(same.pool, "geo", same.polygons);
+  EXPECT_TRUE(both.equals(equal));
+  EXPECT_EQ(both.hash(), equal.hash());
+  EXPECT_FALSE(both.equals(query));
+
+  auto rejects = [](Ring outer, std::vector<Ring> holes = {}) {
+    PolygonSet bad;
+    bad.add(std::move(outer), std::move(holes));
+    EXPECT_THROW(GeoPolygonQuery(bad.pool, "geo", bad.polygons), std::invalid_argument);
+  };
+  rejects({{0.0, 0.0}, {1.0, 0.0}});
+  rejects({{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}});
+  rejects({{0.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}});
+  rejects({{0.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}});
+  rejects({{0.0, 0.0}, {91.0, 0.0}, {0.0, 1.0}});
+  rejects({{0.0, 0.0}, {std::numeric_limits<double>::quiet_NaN(), 0.0}, {0.0, 1.0}});
+  rejects(square(0.0, 1.0, 0.0, 1.0), {{{0.5, 0.5}, {0.5, 0.5}, {0.6, 0.6}}});
+  MemPool pool;
+  EXPECT_THROW(GeoPolygonQuery(pool, "geo", {}), std::invalid_argument);
+}
+
+TEST_F(GeoPolygonQueryTest, bkdAndScanAgreeWithPointChecks) {
+  constexpr int32_t N = 1500;
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& singleHandler = inverter.getIndexHandler("geo_single");
+  auto& multiHandler = inverter.getIndexHandler("geo_multi");
+  EncodedPoints single(N), multi(N);
+  SplitMix64 rng(0x70f1a6b3);
+  auto makePoint = [&](int32_t salt) {
+    if (salt % 2 == 0) {
+      return GeoPoint{40.7 + (unitDouble(rng) - 0.5) * 2.0,
+                      -74.0 + (unitDouble(rng) - 0.5) * 2.0};
+    }
+    return GeoPoint{-90.0 + unitDouble(rng) * 180.0, -180.0 + unitDouble(rng) * 360.0};
+  };
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    GeoPoint point = makePoint(doc);
+    singleHandler.index(inverter, point.latitude, point.longitude);
+    addEncoded(single, doc, point.latitude, point.longitude);
+    std::array<GeoPoint, 2> values{{makePoint(doc + 1), makePoint(doc)}};
+    multiHandler.index(inverter, std::span<const GeoPoint>(values));
+    for (const auto& value : values) addEncoded(multi, doc, value.latitude, value.longitude);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+
+  PolygonSet withHole;
+  withHole.add({{40.0, -75.0}, {41.5, -75.0}, {41.5, -73.0}, {41.0, -73.0},
+                {41.0, -74.5}, {40.5, -74.5}, {40.5, -73.0}, {40.0, -73.0}},
+               {{{41.1, -74.9}, {41.4, -74.9}, {41.4, -74.6}}});
+  PolygonSet world;
+  world.add({{-60.0, -170.0}, {70.0, -150.0}, {80.0, 20.0}, {10.0, 175.0}, {-70.0, 60.0}});
+  PolygonSet several;
+  several.add(square(40.2, 40.9, -74.6, -73.3), {square(40.4, 40.7, -74.2, -73.8)});
+  several.add(square(40.5, 41.2, -74.0, -73.0));
+  several.add(square(-10.0, 30.0, 100.0, 140.0));
+  for (std::string_view field : {"geo_single", "geo_multi"}) {
+    const EncodedPoints& points = field == "geo_single" ? single : multi;
+    GeoPolygonQuery concave(withHole.pool, field, withHole.polygons);
+    GeoPolygonQuery large(world.pool, field, world.polygons);
+    GeoPolygonQuery parts(several.pool, field, several.polygons);
+    for (GeoPolygonQuery* query : {&concave, &large, &parts}) {
+      auto expected = relationOracle(points, LinearPolygonRelation(query->getPolygons()));
+      EXPECT_FALSE(expected.empty()) << field;
+      EXPECT_EQ(expected, runQuery(*reader, *query, false, false)) << field;
+      EXPECT_EQ(expected, runQuery(*reader, *query, true, true)) << field;
+    }
+  }
+}
+// The edge trees and the grid answer exactly as a scan of every edge does,
+// for cells and for points, on random polygons that often self-intersect:
+// scattered vertices, noisy circles, vertices snapped onto a coarse grid
+// (collinear and axis-parallel edges), holes that may leave their polygon,
+// and unions of overlapping parts.
+TEST_F(GeoPolygonQueryTest, indexedRelationMatchesLinearScan) {
+  SplitMix64 rng(0x5e1f1a7e);
+  auto uniform = [&](double lo, double hi) { return lo + unitDouble(rng) * (hi - lo); };
+  auto vertex = [](double lat, double lon) {
+    return geo::LatLon{std::clamp(lat, -90.0, 90.0), std::clamp(lon, -180.0, 180.0)};
+  };
+  auto ring = [&](double lat, double lon, double radius) {
+    int32_t n = 3 + (int32_t)(rng() % 40);
+    uint64_t shape = rng() % 3;
+    Ring out;
+    for (int32_t i = 0; i < n; i++) {
+      if (shape == 0) {
+        out.push_back(vertex(lat + uniform(-radius, radius), lon + uniform(-radius, radius)));
+        continue;
+      }
+      double angle = 2.0 * std::numbers::pi * i / n;
+      double r = radius * uniform(0.4, 1.0);
+      geo::LatLon point = vertex(lat + r * std::sin(angle), lon + r * std::cos(angle));
+      if (shape == 2) {
+        double step = radius / 4.0;
+        point = vertex(std::round(point.lat / step) * step, std::round(point.lon / step) * step);
+      }
+      out.push_back(point);
+    }
+    return out;
+  };
+  auto encodedPoint = [&](double lat, double lon, int32_t jitter) {
+    auto shift = [&](int32_t value) {
+      int64_t moved = (int64_t)value + (int64_t)(rng() % (2 * (uint64_t)jitter + 1)) - jitter;
+      return (int32_t)std::clamp<int64_t>(moved, INT32_MIN, INT32_MAX);
+    };
+    return std::pair{shift(geo::encodeLatitude(std::clamp(lat, -90.0, 90.0))),
+                     shift(geo::encodeLongitude(std::clamp(lon, -180.0, 180.0)))};
+  };
+
+  int32_t built = 0;
+  std::array<int32_t, 3> relations{};
+  std::array<int32_t, 2> matched{};
+  for (int32_t trial = 0; trial < 120; trial++) {
+    SCOPED_TRACE(trial);
+    double lat = uniform(-80.0, 80.0), lon = uniform(-170.0, 170.0);
+    double radius = std::exp(uniform(std::log(1e-4), std::log(15.0)));
+    PolygonSet set;
+    int32_t parts = 1 + (int32_t)(rng() % 3);
+    for (int32_t p = 0; p < parts; p++) {
+      double partLat = lat + uniform(-radius, radius), partLon = lon + uniform(-radius, radius);
+      std::vector<Ring> holes;
+      for (uint64_t h = rng() % 3; h > 0; h--) {
+        holes.push_back(ring(partLat + uniform(-radius, radius) / 2,
+                             partLon + uniform(-radius, radius) / 2, radius / 2));
+      }
+      set.add(ring(partLat, partLon, radius), std::move(holes));
+    }
+    std::optional<GeoPolygonQuery> query;
+    try {
+      query.emplace(set.pool, "geo", set.polygons);
+    } catch (const std::invalid_argument&) {
+      continue;  // a snapped ring collapsed below three distinct vertices
+    }
+    built++;
+    const BKDPolygonRelation& relation = query->makeRelation();
+    LinearPolygonRelation linear(query->getPolygons());
+    // The subdivided grid holds each cell's own compare().
+    const BKDRelationGrid& grid = relation.grid;
+    ASSERT_EQ((size_t)grid.latCells * grid.lonCells, grid.cells.size());
+    for (uint32_t row = 0; row < grid.latCells; row++) {
+      for (uint32_t column = 0; column < grid.lonCells; column++) {
+        auto [latMin, latMax, lonMin, lonMax] = grid.blockBox(row, column, 1, 1);
+        ASSERT_EQ(relation.compare(latMin, latMax, lonMin, lonMax),
+                  grid.cells[(size_t)row * grid.lonCells + column])
+            << row << "," << column;
+      }
+    }
+    std::vector<geo::LatLon> vertices;
+    for (const auto& polygon : query->getPolygons()) {
+      vertices.insert(vertices.end(), polygon.outer.begin(), polygon.outer.end());
+      for (auto hole : polygon.holes) vertices.insert(vertices.end(), hole.begin(), hole.end());
+    }
+    double reach = 2.5 * radius;
+    for (int32_t i = 0; i < 300; i++) {
+      const geo::LatLon& near = vertices[rng() % vertices.size()];
+      auto [cellLat, cellLon] = i % 2 == 0
+          ? encodedPoint(near.lat, near.lon, 64)
+          : encodedPoint(lat + uniform(-reach, reach), lon + uniform(-reach, reach), 0);
+      int64_t half = (int64_t)std::exp(uniform(0.0, std::log(geo::LAT_SCALE * reach)));
+      auto clampInt = [](int64_t v) { return (int32_t)std::clamp<int64_t>(v, INT32_MIN, INT32_MAX); };
+      int32_t latMin = clampInt(cellLat - half), latMax = clampInt(cellLat + half);
+      int32_t lonMin = clampInt(cellLon - 2 * half), lonMax = clampInt(cellLon + 2 * half);
+      BKDRelation expected = linear.compare(latMin, latMax, lonMin, lonMax);
+      ASSERT_EQ(expected, relation.compare(latMin, latMax, lonMin, lonMax))
+          << latMin << ".." << latMax << " x " << lonMin << ".." << lonMax;
+      relations[(size_t)expected]++;
+    }
+    for (int32_t i = 0; i < 600; i++) {
+      std::pair<int32_t, int32_t> point;
+      if (i % 3 == 0) {
+        point = encodedPoint(lat + uniform(-reach, reach), lon + uniform(-reach, reach), 0);
+      } else {
+        // Near an edge: a point along the segment from a vertex to the next.
+        size_t at = rng() % vertices.size();
+        const geo::LatLon& a = vertices[at];
+        const geo::LatLon& b = vertices[(at + 1) % vertices.size()];
+        double t = unitDouble(rng);
+        point = encodedPoint(a.lat + t * (b.lat - a.lat), a.lon + t * (b.lon - a.lon), 4);
+      }
+      bool expected = linear.matches(point.first, point.second);
+      ASSERT_EQ(expected, relation.matches(point.first, point.second))
+          << point.first << "," << point.second;
+      matched[expected]++;
+    }
+  }
+  EXPECT_GT(built, 100);
+  for (int32_t count : relations) EXPECT_GT(count, 3000);
+  for (int32_t count : matched) EXPECT_GT(count, 10000);
+}
+
+// Every geo price comes from the relation's point cost. A box quotes the
+// fitted column verification and a match cost of 2, distance keeps those
+// prices without quoting, multivalued fields do not quote, and a polygon
+// adds its modeled extra to both.
+TEST_F(GeoPolygonQueryTest, relationPointCostPricesEveryConsumer) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& singleHandler = inverter.getIndexHandler("geo_single");
+  auto& multiHandler = inverter.getIndexHandler("geo_multi");
+  SplitMix64 rng(0x1c0571e5);
+  for (int32_t doc = 0; doc < 300; doc++) {
+    inverter.startDoc();
+    singleHandler.index(inverter, 40.0 + unitDouble(rng), -75.0 + unitDouble(rng));
+    std::array<GeoPoint, 2> values{{{40.0 + unitDouble(rng), -75.0 + unitDouble(rng)},
+                                    {40.0 + unitDouble(rng), -75.0 + unitDouble(rng)}}};
+    multiHandler.index(inverter, std::span<const GeoPoint>(values));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  // The sparse verifier's quote and its scorer's match cost.
+  auto prices = [&]<class Q>(Q& query) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = (typename Q::Weight*)query.createWeight(context, 0);
+    auto* plan = resolveScorerPlanForTests(pool, *weight->scorerSupplier(pool, segment), 0);
+    EXPECT_EQ(Query::ReportedTwoPhase::YES, plan->shape().reportedTwoPhase);
+    return std::pair{plan->shape().verificationPoints, plan->build(pool)->matchCost()};
+  };
+  GeoBoxQuery box("geo_single", 40.2, 40.8, -74.8, -74.2);
+  EXPECT_EQ(std::pair(std::optional(PointsMaterialize::VERIFY_POINTS), 2.0f), prices(box));
+  GeoBoxQuery boxes("geo_multi", 40.2, 40.8, -74.8, -74.2);
+  EXPECT_EQ(std::pair(std::optional<double>(), 4.0f), prices(boxes));
+  GeoDistanceQuery circle("geo_single", 40.5, -74.5, 20000.0);
+  EXPECT_EQ(std::pair(std::optional<double>(), 2.0f), prices(circle));
+
+  PolygonSet set;
+  set.add({{40.2, -74.8}, {40.8, -74.8}, {40.5, -74.5}, {40.8, -74.2}, {40.2, -74.2}});
+  GeoPolygonQuery polygon(set.pool, "geo_single", set.polygons);
+  BKDPointCost cost = polygon.makeRelation().pointCost();
+  EXPECT_GT(cost.exact, cost.average);
+  EXPECT_GT(cost.average, 0.0);
+  auto [quote, matchCost] = prices(polygon);
+  EXPECT_EQ(PointsMaterialize::VERIFY_POINTS + cost.average, quote);
+  EXPECT_FLOAT_EQ((float)(2.0 * (1.0 + cost.average / BOX_TEST_POINTS)), matchCost);
+}
+
+// A multipolygon walks only the parts whose box holds the point: four
+// disjoint districts price about like one, four copies of one like four.
+TEST_F(GeoPolygonQueryTest, partWalksWeighByBoxShare) {
+  auto circle = [](double lat, double lon) {
+    Ring ring;
+    for (int32_t i = 0; i < 200; i++) {
+      double angle = 2.0 * std::numbers::pi * i / 200;
+      ring.push_back({lat + std::sin(angle), lon + std::cos(angle)});
+    }
+    return ring;
+  };
+  auto exact = [](PolygonSet& set) {
+    GeoPolygonQuery query(set.pool, "geo", set.polygons);
+    return query.makeRelation().pointCost().exact;
+  };
+  PolygonSet one, districts, copies;
+  one.add(circle(0.0, 0.0));
+  for (auto [lat, lon] : {std::pair{0.0, 0.0}, {0.0, 3.0}, {3.0, 0.0}, {3.0, 3.0}}) {
+    districts.add(circle(lat, lon));
+    copies.add(circle(0.0, 0.0));
+  }
+  EXPECT_LT(exact(districts), 1.2 * exact(one));
+  EXPECT_GT(exact(copies), 3.0 * exact(one));
+}
+
+// The public request path: a geo_polygon query over each cardinality.
+TEST_F(GeoPolygonQueryTest, protoQuerySelectsDocsInside) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  CollectionHelper::UpdateBuilder update;
+  addWireDoc(update, "ny", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {-74.0060, 40.7128});
+  });
+  addWireDoc(update, "london", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {-0.1278, 51.5074});
+  });
+  addWireDoc(update, "tour", "geo_multi", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 2, [](api::Val& point, size_t i, auto& innerMr) {
+      if (i == 0) setDoubles(point, innerMr, {-74.0, 40.7});
+      else setDoubles(point, innerMr, {151.2093, -33.8688});
+    });
+  });
+  update.commit();
+  ASSERT_EQ(IndexResult::Status::OK, helper.submit(update).status);
+
+  auto search = [&](std::string_view field) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    qb::GeoPolygonRings box{{{40.0, -75.0}, {41.0, -75.0}, {41.0, -73.0}, {40.0, -73.0}}};
+    cur.rawQuery() = qb::geoPolygon(cur.mr(), field, {box});
+    cur.fields({"id"}).limit(10);
+    req->execute();
+    EXPECT_OK(req);
+    return req->getDocs();
+  };
+  auto single = search("geo_single");
+  ASSERT_EQ(1u, single.size());
+  EXPECT_EQ("ny", std::get<std::string>(*find(single[0], "id")));
+  auto multi = search("geo_multi");
+  ASSERT_EQ(1u, multi.size());
+  EXPECT_EQ("tour", std::get<std::string>(*find(multi[0], "id")));
+}
+
+// The HTTP JSON form: named vertices, a union of polygons whose holes cut
+// only their own polygon, and malformed polygons rejected as bad requests.
+TEST_F(GeoPolygonQueryTest, jsonQueryMatchesUnion) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  HttpServer server(*luxirNode, 1, 0);
+  server.start();
+  auto post = [&](std::string_view path, const std::string& body) {
+    return httpRequest(server.getPort(), http::verb::post, path, body);
+  };
+  auto update = post("/collections/main/_update", R"({"docs":[
+      {"id":"ny","geo_single":[-74.006,40.7128]},
+      {"id":"london","geo_single":[-0.1278,51.5074]},
+      {"id":"sydney","geo_single":[151.2093,-33.8688]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto search = [&](const std::string& polygons) {
+    return post("/collections/main/_search",
+                R"({"query":{"geo_polygon":{"field":"geo_single","polygons":)" + polygons
+                    + R"(}},"fields":["id"],"sort":"id asc"})");
+  };
+  auto ids = [&](const std::string& polygons) {
+    auto res = search(polygons);
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    glz::generic_i64 root;
+    EXPECT_FALSE(glz::read_json(root, res.body())) << res.body();
+    std::vector<std::string> out;
+    for (const auto& doc : root["docs"].get_array()) out.push_back(doc["id"].get_string());
+    return out;
+  };
+  const std::string ny =
+      R"({"points":[{"lat":40,"lon":-75},{"lat":41,"lon":-75},{"lat":41,"lon":-73},{"lat":40,"lon":-73}]})";
+  const std::string london =
+      R"("points":[{"lat":51,"lon":-1},{"lat":52,"lon":-1},{"lat":52,"lon":1},{"lat":51,"lon":1}])";
+  const std::string aroundLondon =
+      R"("holes":[{"points":[{"lat":51.4,"lon":-0.2},{"lat":51.6,"lon":-0.2},{"lat":51.6,"lon":0},{"lat":51.4,"lon":0}]}])";
+  EXPECT_EQ((std::vector<std::string>{"london", "ny"}), ids("[" + ny + ",{" + london + "}]"));
+  EXPECT_EQ((std::vector<std::string>{"ny"}),
+            ids("[" + ny + ",{" + london + "," + aroundLondon + "}]"));
+
+  auto repeated = search(R"([{"points":[{"lat":1,"lon":1},{"lat":1,"lon":1},{"lat":1,"lon":1}]}])");
+  EXPECT_EQ(400, repeated.result_int()) << repeated.body();
+  EXPECT_NE(std::string::npos, repeated.body().find("3 distinct vertices")) << repeated.body();
+  auto none = search("[]");
+  EXPECT_EQ(400, none.result_int()) << none.body();
+  EXPECT_NE(std::string::npos, none.body().find("at least one polygon")) << none.body();
+  server.shutdown();
+}
+
+class GeoProjectionTest : public LuxirTest {};
+
+// A projected geo field has the ingest shape its cardinality reads: [lon, lat]
+// for a single-valued field, [[lon, lat], ...] for a multi-valued one even
+// with one point, and no value when missing. Indexing what a search returns,
+// as gRPC Vals in either document format or as HTTP JSON, gives back the same
+// quantized points.
+TEST_F(GeoProjectionTest, projectedPointsIndexBackUnchanged) {
+  struct Input {
+    std::string id;
+    std::string field;
+    std::vector<GeoPoint> points;
+  };
+  const std::vector<Input> inputs = {
+      {"single", "geo_single", {{40.712776123456, -74.005974321987}}},
+      {"corner", "geo_single", {{-90.0, 180.0}}},
+      {"one", "geo_multi", {{-33.8688197, 151.2092955}}},
+      {"many", "geo_multi",
+       {{51.5072178, -0.1275862}, {35.6764225, 139.6500231}, {51.5072178, -0.1275862}}},
+  };
+  auto otherField = [](const Input& input) {
+    return input.field == "geo_single" ? "geo_multi" : "geo_single";
+  };
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  CollectionHelper::UpdateBuilder originals;
+  for (const auto& input : inputs) {
+    addWireDoc(originals, input.id, input.field, [&input](api::Val& val, auto& mr) {
+      auto lonLat = [](api::Val& out, auto& outMr, const GeoPoint& p) {
+        setDoubles(out, outMr, {p.longitude, p.latitude});
+      };
+      if (input.field == "geo_single") return lonLat(val, mr, input.points[0]);
+      setValues(val, mr, input.points.size(), [&](api::Val& point, size_t i, auto& innerMr) {
+        lonLat(point, innerMr, input.points[i]);
+      });
+    });
+  }
+  originals.commit();
+  ASSERT_EQ(IndexResult::Status::OK, helper.submit(originals).status);
+  auto original = [&](std::string_view id) {
+    return std::ranges::find(inputs, id, &Input::id) != inputs.end();
+  };
+
+  // gRPC: the returned Val of each original, from row maps and from columns.
+  for (auto [format, suffix] : {std::pair{api::DocFormat::ROWS, "-rows"},
+                                std::pair{api::DocFormat::COLUMNS, "-cols"}}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main").topDocs("q").allQuery()
+        .fields({"id", "geo_single", "geo_multi"}).documentFormat(format).limit(100);
+    req->execute();
+    ASSERT_OK(req);
+    const api::DocList& list = *req->docList();
+    auto docs = req->getDocs();
+    auto rowVal = [&](size_t row, std::string_view field) -> const api::Val* {
+      for (const auto& [name, column] : list.columns) {
+        if (name != field) continue;
+        const auto& slot = std::get<api::ColVal>(column.kind).v[row];
+        return slot.isNull() ? nullptr : &slot;
+      }
+      if (row >= list.docs.size()) return nullptr;
+      for (const auto& [name, val] : list.docs[row].fields) {
+        if (name == field) return &*val;
+      }
+      return nullptr;
+    };
+    CollectionHelper::UpdateBuilder copies;
+    for (size_t row = 0; row < docs.size(); row++) {
+      auto id = std::get<std::string>(*find(docs[row], "id"));
+      if (!original(id)) continue;
+      const Input& input = *std::ranges::find(inputs, id, &Input::id);
+      const api::Val* val = rowVal(row, input.field);
+      ASSERT_NE(nullptr, val) << id;
+      EXPECT_EQ(nullptr, rowVal(row, otherField(input))) << id;
+      EXPECT_EQ(input.field == "geo_multi", std::holds_alternative<api::ArrVal>(val->kind)) << id;
+      addWireDoc(copies, id + suffix, input.field, [val](api::Val& out, auto&) { out = *val; });
+    }
+    copies.commit();
+    ASSERT_EQ(IndexResult::Status::OK, helper.submit(copies).status);
+  }
+
+  // HTTP JSON: wildcard selection includes geo fields; post each value back.
+  HttpServer server(*luxirNode, 1, 0);
+  server.start();
+  auto found = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                           R"({"query":"*:*","fields":["*"],"limit":100})");
+  ASSERT_EQ(200, found.result_int()) << found.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, found.body())) << found.body();
+  std::string body = R"({"docs":[)";
+  for (const auto& doc : root["docs"].get_array()) {
+    const auto& id = doc["id"].get_string();
+    if (!original(id)) continue;
+    const Input& input = *std::ranges::find(inputs, id, &Input::id);
+    ASSERT_TRUE(doc.contains(input.field)) << id;
+    EXPECT_TRUE(!doc.contains(otherField(input)) || doc[otherField(input)].is_null()) << id;
+    const auto& value = doc[input.field];
+    EXPECT_EQ(input.field == "geo_multi", value[0].is_array()) << id;
+    if (body.back() != '[') body += ',';
+    body += R"({"id":")" + id + R"(-json",")" + input.field + R"(":)"
+        + glz::write_json(value).value() + "}";
+  }
+  body += R"(],"commit":{}})";
+  auto posted = httpRequest(server.getPort(), http::verb::post, "/collections/main/_update", body);
+  ASSERT_EQ(200, posted.result_int()) << posted.body();
+  server.shutdown();
+
+  auto quantized = [](const FieldVal& val) {
+    std::vector<std::vector<double>> points;
+    if (const auto* one = std::get_if<std::vector<double>>(&val)) points.push_back(*one);
+    else points = std::get<std::vector<std::vector<double>>>(val);
+    std::vector<std::pair<int32_t, int32_t>> out;
+    for (const auto& point : points) {
+      EXPECT_EQ(2u, point.size());
+      out.push_back({geo::encodeLatitude(point[1]), geo::encodeLongitude(point[0])});
+    }
+    return out;
+  };
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery()
+      .fields({"id", "geo_single", "geo_multi"}).limit(100);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  EXPECT_EQ(4 * inputs.size(), docs.size());
+  for (const auto& input : inputs) {
+    std::vector<std::pair<int32_t, int32_t>> expected;
+    for (const auto& p : input.points) {
+      expected.push_back({geo::encodeLatitude(p.latitude), geo::encodeLongitude(p.longitude)});
+    }
+    for (std::string suffix : {"", "-rows", "-cols", "-json"}) {
+      std::string id = input.id + suffix;
+      auto doc = std::ranges::find_if(docs, [&](const Doc& d) {
+        return std::get<std::string>(*find(d, "id")) == id;
+      });
+      ASSERT_NE(docs.end(), doc) << id;
+      const FieldVal* val = find(*doc, input.field);
+      ASSERT_NE(nullptr, val) << id;
+      EXPECT_EQ(input.field == "geo_multi",
+                std::holds_alternative<std::vector<std::vector<double>>>(*val)) << id;
+      EXPECT_EQ(expected, quantized(*val)) << id;
+      EXPECT_EQ(nullptr, find(*doc, otherField(input))) << id;
+    }
+  }
 }

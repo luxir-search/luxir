@@ -14,7 +14,9 @@
 
 #include <google/protobuf/arena.h>
 
+#include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/IntColReader.h"
+#include "luxir/reader/OrdColReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/MemPool.h"
@@ -97,15 +99,45 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
+  ValueBounds constantBounds(uint32_t index) const;
   bool structurallyEqual(const ValueProgram& other) const;
+  std::string describeDateSources(uint32_t node) const;
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
                           ValueFieldInfos fields) const;
+};
+
+// A STRING or ID column node. count() reads only its shape; a consumer that
+// needs the stored ords (cardinality) attaches them.
+struct BoundStringColumn {
+  const SegFieldInfo& fieldInfo;
+  ColumnShape shape;
+  ColumnShape::Cursor cursor;
+  OrdColReader* ords = nullptr;
+  OrdColReader::BulkOrds* ordValues = nullptr;
+
+  BoundStringColumn(PostingsReader& postings, const SegFieldInfo& fieldInfo)
+      : fieldInfo(fieldInfo), shape(postings, fieldInfo), cursor(shape) {}
+
+  // Only indexed STRING and ID columns store ords.
+  void attachOrds(MemPool& pool, PostingsReader& postings) {
+    ords = pool.make<OrdColReader>(postings, fieldInfo);
+    ordValues = pool.make<OrdColReader::BulkOrds>(*ords);
+  }
+
+  // The stored ord (segment ord + 1) at value rank `rank` of `docid`, after
+  // cursor.seek(docid) found it.
+  int32_t storedOrd(int32_t docid, int64_t rank) {
+    assert(ords != nullptr && rank >= cursor.begin() && rank < cursor.end());
+    int64_t index = !ords->multiValued() && ords->docIdIndexed() ? docid : rank;
+    return ordValues->valueAt(index);
+  }
 };
 
 struct BoundValueNode {
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
+  BoundStringColumn* stringColumn = nullptr;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;

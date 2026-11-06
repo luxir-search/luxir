@@ -74,11 +74,12 @@ void ReplicationSource::pruneLocked(const CollectionId& name) {
   }
 }
 
-void ReplicationSource::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept {
+void ReplicationSource::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection, uint64_t catalogRevision) noexcept {
   try {
     std::map<uint64_t, std::function<void()>> ready;
     {
       std::lock_guard lock(mutex);
+      catalogRevisions[name.tenant] = catalogRevision;
       auto& state = collections[name];
       if (state.collection.lock() != collection) state = {collection, {}, 0, {}};
       state.refresh();
@@ -87,6 +88,27 @@ void ReplicationSource::registered(const CollectionId& name, const std::shared_p
     }
     notify(ready);
   } catch (...) { LOG_ERROR("Replication registration notification failed"); }
+}
+
+void ReplicationSource::remapped(std::string_view tenant, uint64_t catalogRevision, std::span<const Binding> changes) noexcept {
+  try {
+    std::map<uint64_t, std::function<void()>> ready;
+    {
+      std::lock_guard lock(mutex);
+      catalogRevisions[std::string(tenant)] = catalogRevision;
+      for (const auto& change : changes) {
+        if (change.collection) {
+          auto& state = collections[change.id];
+          state = {change.collection, {}, 0, {}};
+          state.refresh();
+        } else collections.erase(change.id);
+      }
+      for (const auto& change : changes) pruneLocked(change.id);
+      ready = changedLocked(std::string(tenant));
+    }
+    notify(ready);
+    if (acknowledgmentsChanged) acknowledgmentsChanged(nullptr);
+  } catch (...) { LOG_ERROR("Replication mapping notification failed"); }
 }
 
 void ReplicationSource::updated(const CollectionId& name, const Collection& collection) noexcept {
@@ -104,11 +126,12 @@ void ReplicationSource::updated(const CollectionId& name, const Collection& coll
   } catch (...) { LOG_ERROR("Replication publication notification failed"); }
 }
 
-void ReplicationSource::removed(const CollectionId& name) noexcept {
+void ReplicationSource::removed(const CollectionId& name, uint64_t catalogRevision) noexcept {
   try {
     std::map<uint64_t, std::function<void()>> ready;
     {
       std::lock_guard lock(mutex);
+      catalogRevisions[name.tenant] = catalogRevision;
       collections.erase(name);
       pruneLocked(name);
       ready = changedLocked(name.tenant);
@@ -210,6 +233,13 @@ api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& ar
       entry.commit = api::build::arenaStr(arena, state.commit->token());
       entry.manifest_xxh3 = api::build::arenaStr(arena, CommitSnapshot::digestText(state.digest));
     }
+  }
+  auto* revisions = api::build::allocArray(response.tenants,
+      (size_t)std::ranges::count_if(catalogRevisions, [&](const auto& e) { return tenants.empty() || std::ranges::find(tenants, e.first) != tenants.end(); }), arena);
+  i = 0;
+  for (const auto& [tenant, rev] : catalogRevisions) {
+    if (!tenants.empty() && std::ranges::find(tenants, tenant) == tenants.end()) continue;
+    revisions[i++] = {api::build::arenaStr(arena, tenant), rev};
   }
   return response;
 }

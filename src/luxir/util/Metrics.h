@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "luxir/util/ApiError.h"
+#include "luxir/util/Clock.h"
 #include "luxir/util/Striped.h"
 
 namespace luxir {
@@ -25,7 +26,7 @@ enum class MetricTransport { HTTP, GRPC, COUNT };
 enum class MetricOutcome { OK, ERROR, CANCELLED, COUNT };
 // Timed engine work. Searches, their execution and index batches are
 // request-sized; the rest runs in the background.
-enum class MetricStage { SEARCH, SEARCH_EXECUTION, INDEX_BATCH, FLUSH, COMMIT, MERGE, VECTOR_BUILD, READER_REFRESH, COUNT };
+enum class MetricStage { SEARCH, SEARCH_EXECUTION, INDEX_BATCH, FLUSH, COMMIT, DELETE_PASS, MERGE, VECTOR_BUILD, READER_REFRESH, COUNT };
 enum class MetricCounter {
   SEARCH_RESOURCE_EXHAUSTED, SEARCH_WARNINGS, DOCUMENTS_ACCEPTED, DOCUMENTS_REJECTED, DELETE_IDS_ACCEPTED, COUNT
 };
@@ -103,11 +104,6 @@ inline void addCells(MetricCounts& dst, const MetricCells& src) {
   addCells(dst.transport, src.transport);
   addCells(dst.requestErrors, src.requestErrors);
   addCells(dst.documentErrors, src.documentErrors);
-}
-
-inline uint64_t nanosSince(std::chrono::steady_clock::time_point start) {
-  auto elapsed = std::chrono::steady_clock::now() - start;
-  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
 }
 
 // Error kinds index counters; an unknown wire value counts as UNKNOWN.

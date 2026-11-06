@@ -652,7 +652,7 @@ TEST_F(MinScoreTest, bulkPlansAndScoreScalingMatchPull) {
         ASSERT_EQ(Answer::YES, plan.available);
         EXPECT_EQ(Answer::YES, plan.supportsMatchWindows);
         EXPECT_EQ(Answer::NO, plan.supportsExactCandidateScoring);
-        EXPECT_EQ(childPlan.acceptsWindowFilter, plan.acceptsWindowFilter);
+        EXPECT_EQ(childPlan.windowFilterConsumption, plan.windowFilterConsumption);
         EXPECT_EQ(Answer::NO, plan.supportsReposition());
         EXPECT_EQ(-1, plan.constantCount);
         auto* bulk = supplier->buildBulk(pool, plan);

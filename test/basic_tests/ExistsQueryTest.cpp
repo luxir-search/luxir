@@ -35,7 +35,7 @@ void installExistsSchema(CollectionHelper& helper, SchemaBuilder& b) {
   auto& multi = b.field("multi_w");
   multi.type = FieldClass::TEXT;
   multi.index = IndexMode::MATCH;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   multi.column = false;
   b.analyzer(multi, "whitespace");
 

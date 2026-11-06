@@ -60,6 +60,7 @@ private:
   uint8_t bits = 0;
   uint32_t mask = 0;
   bool multi = false;
+  bool array = false;
 
   PredictedBlockInfo blockInfo(uint64_t block) const {
     PredictedBlockInfo info;
@@ -136,6 +137,7 @@ public:
     bits = (uint8_t)fieldInfo.ordBits;
     mask = LinearPack::mask32(bits);
     multi = fieldInfo.monoLoc.offset() > 0;
+    array = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
     assert(format == SegFieldInfo::ORD_DIRECT || format == SegFieldInfo::ORD_PREDICTED);
     assert(indexing == SegFieldInfo::ORD_DOCID || indexing == SegFieldInfo::ORD_RANK);
     assert(!multi || indexing == SegFieldInfo::ORD_RANK);
@@ -163,6 +165,8 @@ public:
   int64_t encodedValues() const noexcept {
     return indexing == SegFieldInfo::ORD_DOCID ? maxdoc : nvalues;
   }
+
+  bool multiArray() const noexcept { return array; }
 
   bool multiValued() const noexcept {
     return multi;
@@ -198,6 +202,13 @@ public:
     return (int32_t)ord;
   }
 
+  // Minimum term ordinal, independent of the stored sequence order.
+  int32_t minOrdAt(int32_t doc) const {
+    if (multi && array) return selectedArrayOrdAt(doc, false);
+    return firstOrdAt(doc);
+  }
+
+  // First stored ordinal: the minimum for single-valued and set columns.
   int32_t firstOrdAt(int32_t doc) const {
     if (!multi) return ordAt(doc);
     assert(doc >= 0 && doc < maxdoc);
@@ -331,6 +342,24 @@ public:
   // block is shorter) decode cheaper with one bulk unpack than by point.
   static bool bulkBlock(int32_t hits, int32_t span, int32_t bulkMinHits) {
     return (int64_t)hits * BULK_SIZE >= (int64_t)bulkMinHits * span;
+  }
+
+  int32_t LUXIR_NOINLINE selectedArrayOrdAt(int32_t doc, bool descending) const {
+    assert(multi && array);
+    int32_t rank = doc;
+    if (docs.hasBitset()) {
+      screaming::BitSet::Iterator iter(docs.bitset());
+      if (iter.advance(doc) != doc) return 0;
+      rank = iter.rank();
+    }
+    auto [start, end] = getStartEndValueRank(rank);
+    BulkOrds ords(*this);
+    int32_t selected = ords.valueAt(start);
+    for (int64_t i = start + 1; i < end; i++) {
+      int32_t ord = ords.valueAt(i);
+      selected = descending ? std::max(selected, ord) : std::min(selected, ord);
+    }
+    return selected;
   }
 
   class Iterator {

@@ -35,7 +35,7 @@ struct ColdFile {
     fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     std::vector<char> bytes(size, 'x');
     EXPECT_EQ((ssize_t)size, ::write(fd, bytes.data(), size));
-    fdatasync(fd);
+    fsync(fd);
     file = MMapInputFile::map(fd, path);
     drop();
   }
@@ -159,10 +159,15 @@ TEST(ReadAheadTest, faultsTurnSparseAdviceOnAndResidentBatchesOff) {
     ahead.sparseAt(0, (int64_t)ranks.size(), queue);
     EXPECT_FALSE(ahead.active());
     // Four major faults in the first 256 units: 1/64, above the 1/128 bar.
+    // Without read-around, each fault reads only its page: a read_ahead_kb
+    // window (2 MiB on some cloud volumes) would cover the later pages.
+    void* base = (void*)cold.file->read().data();
+    ASSERT_EQ(0, madvise(base, cold.file->size(), MADV_RANDOM));
     for (size_t at : {1u << 20, 2u << 20, 3u << 20, 7u << 19}) {
       volatile char sink = cold.file->read()[at];
       unused(sink);
     }
+    ASSERT_EQ(0, madvise(base, cold.file->size(), MADV_NORMAL));
     ahead.sparseAt(256, (int64_t)ranks.size(), queue);
     EXPECT_TRUE(ahead.active());
     for (int64_t k : {256, 500, 1000, 1279}) {

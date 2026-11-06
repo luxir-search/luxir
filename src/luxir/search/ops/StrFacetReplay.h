@@ -157,7 +157,8 @@ public:
     Selected selected;
     selected.reserve(buckets.size());
     for (const auto& bucket : buckets) {
-      assert(bucket.id.has_value());
+      // A pinned value absent from the index has no ord: nothing routes to it.
+      if (!bucket.id.has_value()) continue;
       selected.emplace_back(bucket.id->value, bucket.owner.value);
     }
     std::sort(selected.begin(), selected.end());
@@ -231,7 +232,8 @@ public:
 template <typename SelectedMap, typename Callback>
 void forEachSelectedBucketDoc(
     DocSet* domain, OrdColReader& parentColumn, int32_t maxDoc,
-    const SelectedMap& selectedMap, Callback&& callback) {
+    const SelectedMap& selectedMap, RequestMemTracker& tracker,
+    std::string_view label, Callback&& callback) {
   int64_t parentMissing = 0;
   if (!parentColumn.multiValued()) {
     forEachOrdValue(
@@ -254,9 +256,9 @@ void forEachSelectedBucketDoc(
     if (!owners.empty()) callback(currentDoc, std::span<const int32_t>(owners));
     owners.clear();
   };
-  forEachOrdValue(
+  forEachOrdDocument(
       domain, parentColumn, OrdMap::SegToGlobal::identity(), maxDoc,
-      parentMissing,
+      parentMissing, tracker, label,
       [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
         if (docid != currentDoc) {
           flush();

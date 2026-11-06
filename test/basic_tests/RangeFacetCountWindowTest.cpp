@@ -370,3 +370,17 @@ TEST(RangeFacetCountWindowTest, piecewiseGrowthAndMergeMatchMap) {
     }
   }
 }
+
+TEST(RangeFacetCountWindowTest, nanosecondCellsAtReservedExtrema) {
+  for (bool calendar : {false, true}) {
+    auto grid = calendar ? Grid::calendar(CalendarUnit::DAY, 1, TimeZone::utc(), std::nullopt, DateUnit::NANOS)
+        : Grid::fixed(FieldType::DATE, 5, 0, TimeZone::utc(), DateUnit::NANOS);
+    for (int64_t base : {INT64_MIN + 1, INT64_MAX - 8}) {
+      std::vector<int64_t> values;
+      for (int i = 0; i < 8; i++) values.push_back(base + i);
+      randomized(grid, values);
+    }
+  }
+  auto full = Grid::fixed(FieldType::DATE, INT64_MAX, 1, TimeZone::utc(), DateUnit::NANOS);
+  randomized(full, {INT64_MIN + 1, 0, INT64_MAX - 1});
+}

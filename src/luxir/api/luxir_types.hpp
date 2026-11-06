@@ -68,11 +68,11 @@ struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struc
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
-struct DisMaxQuery; struct GeoNearestQuery;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct GeoLatLon; struct GeoRing; struct GeoPolygon; struct GeoPolygonQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
+struct DisMaxQuery; struct PluginQuery; struct PluginOp; struct GeoNearestQuery;
 struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
-struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
+struct TermFilter; struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
@@ -127,12 +127,15 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
+enum class DateUnit { MS = 0, NS = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
@@ -157,9 +160,22 @@ struct SortSpec {
   SortDir dir = SortDir::UNKNOWN;
 };
 struct ExistsQuery { std::string_view field; };
-struct PrefixQuery { std::string_view field; std::string_view prefix; };
-struct WildcardQuery { std::string_view field; std::string_view pattern; };
-struct RegexQuery { std::string_view field; std::string_view pattern; };
+struct PrefixQuery {
+  std::string_view field;
+  std::string_view prefix;
+  bool case_insensitive = false;
+  int32_t max_expansions = 0;
+};
+struct WildcardQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
+struct RegexQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
 struct FuzzyQuery {
   std::string_view field;
   std::string_view term;
@@ -223,6 +239,7 @@ struct UpdateResponse {
   std::span<const std::string_view> ids;
   std::span<const DocError> errors;
   int64_t total_errors = 0;
+  uint64_t took_us = 0;
   std::optional<Error> error;
   Status status = Status::UNKNOWN;                              // align 4 (enum)
 };
@@ -244,6 +261,8 @@ struct AnalyzerComponent {
 struct AnalyzerDef {                                              // needs AnalyzerComponent
   std::optional<AnalyzerComponent> tokenizer;
   std::span<const AnalyzerComponent> filters;
+  std::span<const AnalyzerComponent> char_filters;
+  std::string_view name;
 };
 struct FieldVariants {
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> entries;
@@ -270,8 +289,10 @@ struct VectorAnnDef {
 };
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
+  using MultiMode = luxir::api::FieldDef_::MultiMode;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
+  using DateUnit = luxir::api::FieldDef_::DateUnit;
   using Metric = luxir::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
@@ -283,11 +304,12 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<DateUnit> unit;                                // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
+  std::optional<MultiMode> multi;
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
-  std::optional<bool> multi;
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
@@ -369,6 +391,7 @@ struct MemoryStats {
   FieldMetadataStats field_metadata;
   uint64_t node_budget_bytes = 0;
   uint64_t search_request_limit_bytes = 0;
+  uint64_t schema_cache_bytes = 0;
 };
 struct StatsTotals {
   uint64_t collections = 0;
@@ -469,10 +492,12 @@ struct ReplicationCatalogEntry {
   std::string_view collection;
   bool available = false;
 };
+struct ReplicationTenant { std::string_view tenant; uint64_t revision = 0; };
 struct ReplicationCatalog {
   std::string_view boot;
   std::string_view cursor;
   std::span<const ReplicationCatalogEntry> collections;
+  std::span<const ReplicationTenant> tenants;
 };
 struct ReplicationInstalled {
   std::string_view follower;
@@ -525,6 +550,7 @@ struct TransportStats {
 struct ServiceStats {
   std::string_view version;
   std::string_view cpu_target;
+  std::string_view source_commit;
   std::span<const double> request_duration_bounds;
   std::span<const double> background_duration_bounds;
   TransportStats http;
@@ -540,6 +566,7 @@ struct ServiceStats {
   uint64_t delete_ids_accepted = 0;
   ActivityStats flush;
   ActivityStats commit;
+  ActivityStats delete_pass;
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
@@ -741,6 +768,7 @@ struct StatsResponse {
 struct CacheControlRequest {
   std::string_view collection;
   std::string_view tenant;
+  std::optional<uint64_t> max_bytes;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;
@@ -824,6 +852,10 @@ struct CreateCollectionRequest {
   std::optional<ReplicaRequirement> wait_for_replicas; std::optional<uint64_t> wait_for_replicas_timeout_ms; };
 struct CreateCollectionResponse {
   std::string_view commit; std::string_view name; std::optional<ReplicaResult> replicas; };
+struct RenameCollectionRequest { std::string_view from; std::string_view to; std::string_view tenant; };
+struct RenameCollectionResponse { std::string_view from; std::string_view to; };
+struct SwapCollectionsRequest { std::string_view a; std::string_view b; std::string_view tenant; };
+struct SwapCollectionsResponse { std::string_view a; std::string_view b; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
@@ -901,6 +933,15 @@ struct ExprOp {
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
+struct TermFilter {
+  std::string_view prefix;
+  std::string_view regex;
+  std::string_view exclude_regex;
+  std::span<const std::string_view> include;
+  std::span<const std::string_view> exclude;
+  uint32_t partition = 0;
+  uint32_t num_partitions = 0;
+};
 struct FieldFacet {
   std::optional<FieldFacet_::CountUnit> count_unit;
   ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
@@ -910,6 +951,7 @@ struct FieldFacet {
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
+  std::optional<TermFilter> term_filter;
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
@@ -936,6 +978,8 @@ struct SearchRequest {
   std::int32_t max_parallel = 0;
   std::string_view min_commit;
   std::optional<uint64_t> min_commit_timeout_ms;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -1013,9 +1057,16 @@ struct RangeFacet {                                             // needs Val,Cal
   RangeFacet_::Bounds bounds = RangeFacet_::Bounds::EXPLICIT;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
+struct PluginOp {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+};
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,PluginOp,Domain
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp, PluginOp> kind;
   std::optional<Domain> domain;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct ExecutionProfilePiece {
@@ -1041,6 +1092,7 @@ struct SearchResponse {
   std::optional<Error> error;
   std::span<const Warning> warnings;
   std::optional<ExecutionProfile> profile;
+  std::uint64_t took_us = 0;
   bool more = false;
 };
 struct Match {
@@ -1049,10 +1101,15 @@ struct Match {
   ::hpp_proto::optional_indirect_view<Val> val;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  bool case_insensitive = false;
 };
 struct AnyOfQuery {
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> values;
+};
+struct PluginQuery {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
 };
 struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -1125,15 +1182,28 @@ struct DisMaxQuery {                                             // span<incompl
   std::span<const Query> queries;
   std::optional<float> tie;
 };
+struct GeoLatLon {
+  double lat = 0.0;
+  double lon = 0.0;
+};
+struct GeoRing { std::span<const GeoLatLon> points; };          // needs GeoLatLon
+struct GeoPolygon {                                            // needs GeoLatLon,GeoRing
+  std::span<const GeoLatLon> points;
+  std::span<const GeoRing> holes;
+};
+struct GeoPolygonQuery {                                       // needs GeoPolygon
+  std::string_view field;
+  std::span<const GeoPolygon> polygons;
+};
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
-struct Query {                                                 // needs Match,AnyOfQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost,Rescore
+struct Query {                                                 // needs Match,AnyOfQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,GeoPolygon,Boost,Rescore
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, DisMaxQuery, GeoNearestQuery>
+               AnyOfQuery, MultiMatchQuery, GeoNearestQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1158,10 +1228,10 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
-LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery)
+LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(GeoLatLon) LUXIR_TD(GeoRing) LUXIR_TD(GeoPolygon) LUXIR_TD(GeoPolygonQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery) LUXIR_TD(PluginQuery) LUXIR_TD(PluginOp)
 LUXIR_TD(GeoNearestQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
-LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
+LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(TermFilter) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
 LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
@@ -1176,6 +1246,7 @@ LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::P
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
+LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
@@ -1184,7 +1255,7 @@ LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
-LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
+LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationTenant) LUXIR_TD(ReplicationInstalled)
 #undef LUXIR_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -1205,11 +1276,11 @@ LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(Line
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
-LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
-LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery)
+LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(GeoPolygonQuery) LUXIR_ENTRY(ExprQuery)
+LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery) LUXIR_ENTRY(PluginQuery) LUXIR_ENTRY(PluginOp)
 LUXIR_ENTRY(GeoNearestQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
-LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
+LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(TermFilter) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
 LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
@@ -1224,6 +1295,7 @@ LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef)
 LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
+LUXIR_ENTRY(RenameCollectionRequest) LUXIR_ENTRY(RenameCollectionResponse) LUXIR_ENTRY(SwapCollectionsRequest) LUXIR_ENTRY(SwapCollectionsResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
@@ -1235,7 +1307,7 @@ LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemorySta
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
-LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
+LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationTenant) LUXIR_ENTRY(ReplicationInstalled)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

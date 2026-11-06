@@ -20,9 +20,11 @@ binary caches are shared; completed build trees are cleaned.
 Triplets
 --------
 
-triplets/x64-linux-luxir-native*.cmake use -march=native -mtune=native for C and
-C++. The setup script records the compilers' effective CPU options in the
-binary-cache ABI, preventing reuse across incompatible native CPU settings.
+triplets/x64-linux-luxir-native*.cmake and arm64-linux-luxir-native*.cmake share
+common/native.cmake: -march=native -mtune=native for C and C++. The setup script
+selects them by host architecture and records the compilers' effective CPU
+options in the binary-cache ABI, preventing reuse across incompatible native CPU
+settings.
 triplets/x64-linux-luxir-v2*.cmake provide the container's x86-64-v2 baseline.
 triplets/arm64-osx-luxir-m1*.cmake serve macOS: a fixed apple-m1 and macOS 14
 baseline rather than the host CPU, so no fingerprint is needed and one install

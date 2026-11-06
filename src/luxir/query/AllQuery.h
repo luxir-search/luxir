@@ -148,7 +148,7 @@ public:
     MembershipWork membershipWork(int32_t maxDoc) override {
       unused(maxDoc);
       double matches = (double)cost();
-      return {matches, 4 * matches, 0, 32, 64};
+      return {matches, 4 * matches, 0, 32, 64, 0, true};
     }
 
     Query::ScorerShape describeScorer(

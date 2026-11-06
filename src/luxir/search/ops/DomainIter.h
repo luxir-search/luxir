@@ -11,6 +11,8 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
 #include <optional>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include "FacetCountResource.h"
 
 namespace luxir {
 
@@ -534,6 +536,32 @@ private:
   template <Source S> int32_t nextRankDoc();
 };
 
+// A bucket-membership view of a lossless ord walk. ARRAY-only callers opt in;
+// the SET batch decoder and its consumers retain their original loops.
+class DistinctOrdValueBatches {
+  OrdValueBatches& values;
+  FacetCountResource resource;
+  boost::unordered_flat_set<int64_t, boost::hash<int64_t>, std::equal_to<int64_t>,
+      std::pmr::polymorphic_allocator<int64_t>> seen;
+  int32_t lastDoc = -1;
+public:
+  DistinctOrdValueBatches(OrdValueBatches& values, RequestMemTracker& tracker, std::string_view label)
+      : values(values), resource(tracker, label, "facet document dedup"), seen(&resource) {}
+  bool next(OrdValueBatches::Batch& batch);
+};
+
+template <class F>
+void LUXIR_NOINLINE consumeArrayOrdDocuments(OrdValueBatches& values,
+                                            int64_t& missing_num, RequestMemTracker& tracker,
+                                            std::string_view label, F& callback) {
+  DistinctOrdValueBatches distinct(values, tracker, label);
+  OrdValueBatches::Batch batch;
+  while (distinct.next(batch)) {
+    for (int32_t i = 0; i < batch.size; i++) callback(batch.docs[i], batch.ords[i]);
+  }
+  missing_num += values.missing();
+}
+
 // The consuming half of a walk: the caller's callback, once per decoded
 // value, in a loop over each batch.
 template <class F>
@@ -562,6 +590,29 @@ void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
   consumeOrdValues(values, missing_num, callback);
 }
 
+template <class F>
+void LUXIR_NOINLINE forEachArrayOrdDocument(
+    DocSet* domain, OrdColReader& column, const OrdMap::SegToGlobal& ordSpace,
+    int32_t maxDoc, int64_t& missing_num, RequestMemTracker& tracker,
+    std::string_view label, F&& callback) {
+  OrdValueBatches values(domain, column, ordSpace, maxDoc, false, nullptr);
+  consumeArrayOrdDocuments(values, missing_num, tracker, label, callback);
+}
+
+// Document membership per term. Pass the original callback straight through on
+// the existing SET/single-valued path (the hot walk's inlining is sensitive).
+template <class F>
+void forEachOrdDocument(DocSet* domain, OrdColReader& column,
+                        const OrdMap::SegToGlobal& ordSpace, int32_t maxDoc,
+                        int64_t& missing_num, RequestMemTracker& tracker,
+                        std::string_view label, F&& callback) {
+  if (!column.multiArray() || !column.multiValued()) {
+    forEachOrdValue(domain, column, ordSpace, maxDoc, missing_num, std::forward<F>(callback));
+  } else {
+    forEachArrayOrdDocument(domain, column, ordSpace, maxDoc, missing_num, tracker, label, std::forward<F>(callback));
+  }
+}
+
 // Walk the complement of a resolved facet domain over the ord column. Bitset
 // domains drive the shared adaptive machinery through inverted word reads, so
 // no second bitset is materialized. Array domains (reachable only when a
@@ -572,7 +623,8 @@ void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
 template <class F>
 void forEachComplementOrdValue(DomainView& view, MemPool& pool,
                                OrdColReader& ordColReader,
-                               int64_t& missing_num, F&& callback) {
+                               int64_t& missing_num, RequestMemTracker& tracker,
+                               std::string_view label, F&& callback) {
   assert(view.domain != nullptr && view.compCard > 0);
   if (view.bits == nullptr) {
     size_t numWords = FixedBitSet::sizeInWords(view.maxDoc);
@@ -588,8 +640,8 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
     }
     FixedBitSet complementBits(words, view.maxDoc);
     BitDocSet complement(complementBits, view.compCard);
-    forEachOrdValue(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
-                    view.maxDoc, missing_num, std::forward<F>(callback));
+    forEachOrdDocument(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
+                    view.maxDoc, missing_num, tracker, label, std::forward<F>(callback));
     return;
   }
   // Word-wise inversion reads the domain's whole word array, so it must cover
@@ -599,7 +651,11 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
   OrdValueBatches values(view.domain, ordColReader,
                          OrdMap::SegToGlobal::identity(), view.maxDoc, true,
                          nullptr);
-  consumeOrdValues(values, missing_num, callback);
+  if (ordColReader.multiArray() && ordColReader.multiValued()) {
+    consumeArrayOrdDocuments(values, missing_num, tracker, label, callback);
+  } else {
+    consumeOrdValues(values, missing_num, callback);
+  }
 }
 
 }

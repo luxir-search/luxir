@@ -6,11 +6,42 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
 
+#include <omp.h>
+
 namespace luxir {
+
+void PluginNodeStates::create(LuxirNode& node, const PluginRegistry& plugins) {
+  if (!states.empty()) throw std::logic_error("plugin node states have already been created");
+  states.reserve(plugins.plugins().size());
+  try {
+    for (const auto& plugin : plugins.plugins()) {
+      states.emplace_back(plugin->info().name, nullptr);
+      states.back().second = plugin->createNodeState(node);
+    }
+  } catch (...) {
+    clear();
+    throw;
+  }
+}
+
+void PluginNodeStates::clear() noexcept {
+  while (!states.empty()) {
+    states.back().second.reset();
+    states.pop_back();
+  }
+}
+
+PluginNodeState* PluginNodeStates::find(std::string_view name) const {
+  for (const auto& [key, state] : states) {
+    if (key == name) return state.get();
+  }
+  return nullptr;
+}
 
 // One arena slot per thread that enters the task arena from outside: each
 // HTTP shard the configured server runs, plus the embedding (main or test)
@@ -55,8 +86,17 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   }
 }
 
+void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
+  omp_set_num_threads(1);
+  if (!worker) return;
+  char name[16];
+  snprintf(name, sizeof(name), "%s%d", prefix,
+           oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
+  nameThisThread(name);
+}
+
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
-  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+  : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
@@ -81,14 +121,17 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   public:
     Events(std::shared_ptr<ReplicationSource> source, std::shared_ptr<CommitWaits> waits)
         : source(std::move(source)), waits(std::move(waits)) {}
-    void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) noexcept override {
-      waits->registered(id, collection); source->registered(id, collection);
+    void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection, uint64_t revision) noexcept override {
+      waits->registered(id, collection, revision); source->registered(id, collection, revision);
+    }
+    void remapped(std::string_view tenant, uint64_t revision, std::span<const Binding> changes) noexcept override {
+      source->remapped(tenant, revision, changes); waits->remapped(tenant, revision, changes);
     }
     void updated(const CollectionId& id, const Collection& collection) noexcept override {
       waits->updated(id, collection); source->updated(id, collection);
     }
-    void removed(const CollectionId& id) noexcept override {
-      waits->removed(id); source->removed(id);
+    void removed(const CollectionId& id, uint64_t revision) noexcept override {
+      waits->removed(id, revision); source->removed(id, revision);
     }
   };
   events = std::make_shared<Events>(replication, commitWaits);
@@ -103,9 +146,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   } else {
     // A follower directory becomes a writer only through offline promotion,
     // which completes for every collection before any writer opens one.
-    if (!this->config.read_only && this->config.store.backend == "fs"
-        && std::filesystem::exists(std::filesystem::path(this->config.store.data_dir) / "replication.json")) {
-      throw std::runtime_error("Follower data directory: run 'luxir promote " + this->config.store.data_dir + "' to make it a writer");
+    // Only durable node metadata can outlive a follower process.
+    auto nodeDir = collections_->storage().directory(StorageRoot::NODE_PRIVATE, "");
+    if (!this->config.read_only && nodeDir->openFile("replication.json")) {
+      throw std::runtime_error("Follower data directory (" + collections_->storage().describe()
+                               + "): run 'luxir promote' on it to make it a writer");
     }
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
@@ -113,9 +158,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
+  pluginStates.create(*this, PluginRegistry::global());
 }
 
 LuxirNode::~LuxirNode() {
+  pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
@@ -153,6 +200,15 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(const CollectionId&
 std::shared_ptr<Collection> LuxirNode::createCollection(const CollectionId& id, const api::SchemaDef* schema) {
   if (following()) throw ReadOnlyError("cannot create collections on a follower");
   return collections_->create(id, schema);
+}
+
+void LuxirNode::renameCollection(const CollectionId& from, const CollectionId& to) {
+  if (following() || config.read_only) throw ReadOnlyError("cannot rename collections on a read-only node or follower");
+  collections_->rename(from, to);
+}
+void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
+  if (following() || config.read_only) throw ReadOnlyError("cannot swap collections on a read-only node or follower");
+  collections_->swap(a, b);
 }
 
 void LuxirNode::deleteCollection(const CollectionId& id) {

@@ -11,6 +11,14 @@ option objc_class_prefix = "Luxir";
 
 package luxir;
 
+// Bit positions in the packed request option word, not masks. The two date
+// bits form one field: native=0, iso=1, ms=2, ns=3.
+enum RequestFlagBit {
+  DATE_MODE_LOW_BIT = 0;
+  DATE_MODE_HIGH_BIT = 1;
+  INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
+}
+
 // Top-level search request that can contain multiple search operations.
 message SearchRequest {
   // Optional opaque identifier, echoed in every response to this request.
@@ -55,6 +63,18 @@ message SearchRequest {
   string min_commit = 9;
   // Search floor deadline. Absent defaults to 30000; zero checks immediately.
   optional uint64 min_commit_timeout_ms = 10;
+
+  // Packed request options. Effective = (inherited & ~flags_set) |
+  // (flags & flags_set); the request inherits 0. JSON uses lowercase names,
+  // e.g. "flags": ["date_ms"], rather than numeric flags/flags_set.
+  // Date modes control numeric date literal units: ms or ns overrides the
+  // field unit; native and iso use the field unit. Value arithmetic is unchanged.
+  uint64 flags = 11;
+  // Override mask. Set both date-mode bits (3), or neither. Request-only
+  // int64_str (bit 2) quotes JSON int64/uint64 values outside the safe integer
+  // range, +/- (2^53 - 1). Unknown bits are rejected in either word.
+  // Binary gRPC responses retain their integer types.
+  uint64 flags_set = 12;
 }
 
 enum ResponseFormat {
@@ -71,8 +91,31 @@ message SearchOp {
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
+    PluginOp plugin = 16;           // an operation registered by a compiled-in plugin
   }
   Domain domain = 20; // optional override of the incoming document domain
+  // Overrides the parent's packed options, including for this op's domain,
+  // queries and facet literals. Subops inherit this op's effective options.
+  // JSON uses the same lowercase flags name array as SearchRequest.
+  uint64 flags = 21;
+  // Override mask. int64_str is request-only: bit 2 is rejected in both
+  // flags and flags_set, including an attempted clear. Other validation is
+  // the same as SearchRequest.flags_set.
+  // Naming date_native in JSON explicitly replaces an inherited date mode.
+  uint64 flags_set = 22;
+}
+
+// An operation registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_op": {"a": 1, "ops": {...}}} reads as
+// {"plugin": {"name": "my_op", "params": {"a": 1}, "ops": {...}}}.  An
+// unregistered name is a request error that lists the registered operations.
+// The plugin validates params and defines the result shape; nested ops run
+// over the domain the plugin gives them and may not override it.
+message PluginOp {
+  string name = 1;
+  map<string, Val> params = 2;
+  map<string, SearchOp> ops = 3;
 }
 
 // An expression aggregate over the operation's incoming document domain.
@@ -300,8 +343,10 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
-    DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     GeoNearestQuery geo_nearest = 21; // the k documents nearest a point of a GEO_POINT field
+    GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
+    DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
   }
 }
 
@@ -398,6 +443,16 @@ message Match {
   // ground).  When set it overrides `operator`; clamped to the term count.
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
+
+  // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
+  // after query analysis/normalization. Indexed case variants score as one word,
+  // with the query's exact case preferred slightly: frequency weight 1.0 for
+  // the analyzed/normalized query token, 0.9 for other variants. Frequencies sum
+  // before BM25 saturation, with shared statistics. Slower than a folding
+  // variant (_t, _un, _wl), recommended for frequent use. Alternates come from
+  // analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems
+  // lowercase only). Numeric and DATE fields ignore it.
+  bool case_insensitive = 10;
 
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
@@ -502,6 +557,19 @@ message AnyOfQuery {
   Val values = 2;
 }
 
+// A query type registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_query": {"a": 1}} reads as
+// {"plugin": {"name": "my_query", "params": {"a": 1}}}, and the expression
+// language calls it as my_query(...) with the arguments the plugin declares.
+// An unregistered name is a request error that lists the registered query
+// types. params are typed JSON values; a nested query is a Query-shaped
+// value the plugin parses.
+message PluginQuery {
+  string name = 1;
+  map<string, Val> params = 2;
+}
+
 // Matches documents whose field value falls in the given range.  All bounds
 // are optional; omit a side for an open-ended range.  Set at most one of
 // gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is
@@ -511,7 +579,7 @@ message AnyOfQuery {
 // Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go
 // through the same value-coercion contract as ingest, so querying a literal
 // finds the documents ingested with it.  DATE accepts ISO-8601 strings or
-// epoch millis, and a partial date names its whole window: bounds include the
+// epoch values in the field's unit, and a partial date names its whole window: bounds include the
 // granule they name ([2024-01 TO 2024-06] covers January through June;
 // exclusive bounds exclude the granule whole).  FLOAT/DOUBLE compare by
 // IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.
@@ -553,6 +621,38 @@ message GeoDistanceQuery {
   double lat = 2;           // center latitude, degrees in [-90, 90]
   double lon = 3;           // center longitude, degrees in [-180, 180]
   double radius_meters = 4; // inclusive radius, finite and non-negative
+}
+
+// A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the
+// VALUE array contract [x, y] = [lon, lat] does not apply.
+message GeoLatLon {
+  double lat = 1; // degrees in [-90, 90], finite
+  double lon = 2; // degrees in [-180, 180], finite
+}
+
+// A ring lists its vertices in order; the last connects back to the first,
+// and repeating the first vertex at the end is optional. It needs at least 3
+// distinct vertices.
+message GeoRing {
+  repeated GeoLatLon points = 1;
+}
+
+// One polygon: an outer ring and optional holes. A point is inside it when it
+// is inside the outer ring and inside none of its holes, each ring by the
+// even-odd rule, so a self-intersecting ring still has an interior. Holes
+// apply to this polygon only.
+message GeoPolygon {
+  repeated GeoLatLon points = 1; // the outer ring, as in GeoRing
+  repeated GeoRing holes = 2;
+}
+
+// Matches when at least one GEO_POINT value is inside any of the polygons,
+// their union. Edges are straight lines in latitude/longitude and do not
+// cross the dateline: split such a polygon into two polygons of the same
+// query. A point exactly on an edge may match either way.
+message GeoPolygonQuery {
+  string field = 1;
+  repeated GeoPolygon polygons = 2; // at least one
 }
 
 // The k documents nearest a point of a GEO_POINT field, by the great-circle
@@ -607,6 +707,19 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+
+  // After whole-prefix normalization, also match simple Unicode case
+  // alternates. TEXT fields are supported. Uses a constant-score automaton.
+  bool case_insensitive = 3;
+
+  // Max term expansions per segment. Unset/0 = every term with the prefix.
+  // A positive value keeps only the terms with the highest document frequency
+  // in each segment (ties go to the lower term), so a short prefix over a
+  // large dictionary costs at most this many postings lists per segment.
+  // Any positive value is valid; negative values are rejected. Selection also
+  // supports case_insensitive. Operator expansion and request memory limits
+  // still apply.
+  int32 max_expansions = 4;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
@@ -617,6 +730,10 @@ message PrefixQuery {
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, also match their simple Unicode
+  // case alternates (lower, upper and title forms).
+  bool case_insensitive = 3;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
@@ -627,6 +744,11 @@ message WildcardQuery {
 message RegexQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, and every member of character
+  // classes and ranges also match their simple Unicode case alternates.
+  // Negated classes exclude all case forms of their members.
+  bool case_insensitive = 3;
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
@@ -645,8 +767,8 @@ message FuzzyQuery {
   optional int32 prefix_length = 4;
 
   // Max term expansions, closest terms first. Unset/0 = default 50. A
-  // positive value requests that cap; the operator/clause budget may lower it
-  // with a warning. Negative values are rejected.
+  // positive value is honored as given, with no upper bound. Negative values
+  // are rejected.
   int32 max_expansions = 5;
 }
 
@@ -736,9 +858,42 @@ enum SelectionMode {
   ALL = 1;
 }
 
+// Restricts which terms of a STRING or ID field can become ordinary buckets of
+// a FieldFacet. Every set condition must hold (AND). Counts are exact: the
+// filter chooses buckets after counting and never narrows the query domain, so
+// it is not the same as adding a filter to the search. Terms are tested as
+// indexed: prefix, regex, include, and exclude values are normalized the way
+// the field normalizes query text, and ID fields use them verbatim.
+message TermFilter {
+  // Keeps terms starting with this prefix. Empty = unset.
+  string prefix = 1;
+
+  // Keeps terms matching this regular expression in full, with RegexQuery
+  // syntax. Empty = unset.
+  string regex = 2;
+
+  // Drops terms matching this regular expression in full. Empty = unset.
+  string exclude_regex = 3;
+
+  // Keeps only these exact terms. An empty list is unset, so it cannot be used
+  // to match nothing.
+  repeated string include = 4;
+
+  // Drops these exact terms.
+  repeated string exclude = 5;
+
+  // Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes)
+  // modulo num_partitions equals partition, so num_partitions requests with
+  // partition 0..num_partitions-1 together return every term once. Unset when
+  // num_partitions is 0; otherwise partition must be below num_partitions.
+  uint32 partition = 6;
+  uint32 num_partitions = 7;
+}
+
 // Buckets of distinct field values, using the field's value binding.
-// STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
-// counts, limits, mincount, missing, and selections.
+// STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount,
+// missing, selections, sub-operations, and metric sorts. Distinct counts are
+// supported except on TEXT; metric sorts with distinct counts are unsupported.
 message FieldFacet {
   enum CountUnit {
     DOCS = 0; // Count documents.
@@ -752,7 +907,7 @@ message FieldFacet {
 
   // Minimum bucket count. Unset includes only buckets with matches.
   // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
-  // INT/DATE require a positive value when set.
+  // INT/DATE/FLOAT/DOUBLE require a positive value when set.
   optional int64 mincount = 3;
   bool missing = 4; // Return the count without a value, in the chosen count unit.
 
@@ -775,6 +930,12 @@ message FieldFacet {
   // Exact distinct keys per bucket, also usable without collapse. Same key
   // types and missing policies as Collapse. Conflicting measures are errors.
   Collapse count_distinct = 10;
+  // STRING/ID only. Restricts which terms can be ordinary buckets while counts
+  // stay exact; see TermFilter. It applies to the ordinary page and to
+  // mincount=0 padding. `missing` still counts every document in the domain
+  // without a value, and selected buckets are returned whether or not they
+  // pass the filter.
+  TermFilter term_filter = 11;
 }
 
 message CalendarGap {
@@ -806,7 +967,7 @@ message RangeFacet {
   // bound; include intersecting cells below it without excluding larger values.
   Val end = 3;
   oneof gap_kind {
-    Val gap = 4; // positive fixed width in field units; integer milliseconds for DATE
+    Val gap = 4; // positive fixed width in field units; integer field units for DATE
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
   }
   optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
@@ -847,7 +1008,7 @@ message RangeFacet {
   // For DATE, origin is a wall-clock phase in the facet zone: 21600000 with
   // gap 86400000 starts days at 06:00 local across DST. This differs from
   // Elasticsearch's UTC-translated offset near transitions. Must be integer
-  // milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE.
+  // field units for DATE, an integer for INT, or a number for FLOAT/DOUBLE.
   Val origin = 16;
 }
 
@@ -955,6 +1116,12 @@ message SearchResponse {
   Error error = 3;
   repeated Warning warnings = 4; // final response only, on success or failure
   ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its final response is ready to serialize. Includes parsing,
+  // any min_commit wait, execution, and earlier streamed batches, including any
+  // pause while the client reads them. Excludes serializing, queueing, and
+  // sending the final response. Final response only.
+  uint64 took_us = 8;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
@@ -1019,6 +1186,7 @@ message DocList {
 
 
 message FacetResult {
+  // Always-present bucket labels; Column.missing_val sentinels do not apply.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
   optional int64 missing = 4; // the number of documents that do not have this field
@@ -1204,6 +1372,12 @@ message UpdateResponse {
   // Any collection error sets the response status to ERROR and a top-level error;
   // every admitted collection outcome is retained. HTTP status remains 200.
   map<string, CollectionCommit> commits = 10;
+
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its response is ready to serialize, including parsing and any
+  // commit and replica wait. Excludes serializing, queueing, and sending the
+  // response. HTTP NDJSON stream acknowledgments do not carry this field.
+  uint64 took_us = 11;
 }
 
 
@@ -1305,6 +1479,7 @@ message ColStr {
 // Vector and value columns use the missing-value rules described on their
 // fields.  Every returned field type has a column form: a type with no typed
 // arm uses col_val.
+// In FacetResult.bucket_ids, every value is present and missing_val is ignored.
 message Column {
   oneof kind {
     ColStr col_s = 1;
@@ -1329,8 +1504,9 @@ message ColVector {
 }
 
 // Column of a field type that has no typed arm (an object, an interval, a
-// boolean): v[i] holds what document i's row entry would.  An unset kind
-// means missing.
+// boolean, a geo point): v[i] holds what document i's row entry would.  An
+// unset kind means missing.  A geo point is an arr_d [lon, lat], and a
+// multi-valued geo field an arr of such pairs, the shapes ingest reads.
 message ColVal {
   repeated Val v = 1;
 }
@@ -1390,6 +1566,19 @@ message DeleteCollectionRequest {
 message DeleteCollectionResponse {
   string name = 1;
 }
+
+message RenameCollectionRequest {
+  string from = 1;
+  string to = 2;
+  string tenant = 3;
+}
+message RenameCollectionResponse { string from = 1; string to = 2; }
+message SwapCollectionsRequest {
+  string a = 1;
+  string b = 2;
+  string tenant = 3;
+}
+message SwapCollectionsResponse { string a = 1; string b = 2; }
 
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
@@ -1496,12 +1685,14 @@ message ServiceStats {
   string version = 1;
   // The CPU target the binary was built for.
   string cpu_target = 20;
+  // The full Git commit the binary was built from, or "unknown".
+  string source_commit = 23;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
   repeated double request_duration_bounds = 3;
-  // Upper bounds, in seconds, of the flush, commit, merge, vector build and
-  // reader refresh histograms.
+  // Upper bounds, in seconds, of the flush, commit, delete pass, merge,
+  // vector build and reader refresh histograms.
   repeated double background_duration_bounds = 4;
   TransportStats http = 5;
   TransportStats grpc = 6;
@@ -1522,6 +1713,9 @@ message ServiceStats {
   map<string, uint64> document_errors = 19;
   ActivityStats flush = 14;
   ActivityStats commit = 15;
+  // Delete passes, which apply deletes between commits without flushing,
+  // syncing or publishing.
+  ActivityStats delete_pass = 22;
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
@@ -1769,6 +1963,8 @@ message MemoryStats {
   uint64 node_budget_bytes = 5;
   // Per-request tracked search memory ceiling; zero disables rejection.
   uint64 search_request_limit_bytes = 6;
+  // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
+  uint64 schema_cache_bytes = 7;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1776,6 +1972,11 @@ message ReplicationCatalog {
   string boot = 1;
   string cursor = 2;
   repeated ReplicationCatalogEntry collections = 3;
+  repeated ReplicationTenant tenants = 4;
+}
+message ReplicationTenant {
+  string tenant = 1;
+  uint64 revision = 2;
 }
 message ReplicationCatalogEntry {
   string commit = 1;
@@ -1927,9 +2128,9 @@ message IndexStats {
 
 // Ids and generations that appear in filenames are reported in their
 // filesystem spelling so stats output correlates directly with directory
-// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// listings and logs: "seg" includes the creator epoch (e.g. "s0a.2"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// in filenames (e.g. live_gen "01" written in epoch 3 -> file "s0a.2__L01.3").
 // Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,
@@ -2029,7 +2230,7 @@ message ArenaStats {
 }
 
 // Admin control over the per-collection query cache. Actions compose and
-// apply in this order: flush, reset_admission, reset_counters, then dump.
+// apply in this order: max_bytes, flush, reset_admission, reset_counters, then dump.
 // flush drops resident values and entry metadata; sighting history survives,
 // so a known query can be readmitted and rebuilt immediately.
 // flush + reset_admission also forgets sightings, restarting admission
@@ -2046,6 +2247,12 @@ message CacheControlRequest {
   bool reset_counters = 4;
   bool dump = 5;
   uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+  // Administration only. Sets the selected caches' byte budget before the
+  // other actions; 0 disables caching and drops entries. With collection and
+  // tenant both empty it is also the budget for collections created later.
+  // Lasts for the node session: kept when a collection is replaced, dropped
+  // when it is deleted, back to --query-cache-bytes on restart.
+  optional uint64 max_bytes = 8;
 }
 
 // One resident cache entry. key_text is the printable-byte extraction from
@@ -2087,7 +2294,7 @@ message CacheControlResponse {
 // Schema
 //
 
-// One analysis-chain component - a tokenizer or a token filter - named by its
+// One analysis-chain component - a tokenizer, character filter, or token filter - named by its
 // registry name, plus its parameters.  params values are typed JSON values
 // (string, number, bool, string list), e.g. {"possessive": false} for kstem.
 // A component that takes no parameters rejects any. The JSON dialect accepts a
@@ -2097,9 +2304,17 @@ message AnalyzerComponent {
   map<string, Val> params = 2;
 }
 
+// A text analysis chain: char filters, then one tokenizer, then token filters.
+// Alternatively `name` selects a registered analyzer (a built-in preset such as
+// "english", or one a plugin provides); it excludes tokenizer and filters, and
+// char_filters alongside it replace the preset's char filters.
+// The JSON dialect accepts a bare string for the named form:
+// "english" == {"name": "english"}.
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
-  repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
+  repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
+  repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
+  string name = 4;                         // a registered analyzer name; combines only with char_filters
 }
 
 // Alternate representations of the same input value, keyed by local label.
@@ -2159,14 +2374,15 @@ message VectorAnnDef {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
   }
-  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
+  optional Codec codec = 1;  // absent: rabitq; pq requires explicit selection
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.
   optional int32 nlist = 2;
 
   message RaBitQ {
-    // Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a
+    // Bits per dimension, 0..9. Absent or 0: 2 below 384 stored dims,
+    // 1 at or above. Above 1 (extended RaBitQ) a
     // 1-bit pass prunes with the error bound and survivors are re-estimated
     // with the extra bits.
     optional int32 bits = 1;
@@ -2175,18 +2391,18 @@ message VectorAnnDef {
     // overlays.
     optional int32 query_bits = 2;
   }
-  RaBitQ rabitq = 3;  // requires explicit codec rabitq
+  RaBitQ rabitq = 3;  // codec rabitq (the default) only
 
   message Pq {
     // Sub-quantizers. Positive m requires positive effective (inherited)
     // dims and must divide it. Absent or 0: automatic, including inferred
     // dims. Choose the largest divisor leaving at least 4 dimensions per
-    // sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2.
+    // sub-quantizer, capped at max(32, dims / 8) for every metric.
     // If none does, choose the largest divisor under the same cap.
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }
-  Pq pq = 4;  // codec pq only
+  Pq pq = 4;  // requires explicit codec pq
 }
 
 // A field, template, or variant definition, named by its enclosing map key.
@@ -2203,7 +2419,7 @@ message FieldDef {
     DOUBLE = 4;
     ID = 6;        // document identifier used for replacement and deletion
     VECTOR = 7;    // dense float vector
-    DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
+    DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
   }
   optional FieldClass type = 2; // required unless inherited from parent
@@ -2222,7 +2438,23 @@ message FieldDef {
   optional IndexMode index = 3;
 
   optional bool column = 4;      // store values in a per-field column
-  optional bool multi = 5;       // multi-valued
+  // SINGLE is one value; DEFAULT enables the type's default multi mode.
+  // SET sorts and deduplicates column values; ARRAY keeps their source order and repeats.
+  // Stored source keeps order and repeats independently of the column mode.
+  // DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING
+  // use SET, TEXT/VECTOR/GEO_POINT use ARRAY. Explicit SET is rejected on
+  // an array-only primary and resolves to ARRAY on an array-only variant.
+  // Explicit ARRAY applies to every representation. ID is reserved for the
+  // single-valued id field. Variants inherit the declared mode and
+  // cannot override it. Schema JSON views echo the declaration.
+  // HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+  enum MultiMode {
+    SINGLE = 0;
+    DEFAULT = 1;
+    SET = 2;
+    ARRAY = 3;
+  }
+  optional MultiMode multi = 5; // unset inherits, falling back to SINGLE
 
   // TEXT only. Unset or empty inherits; a nonempty definition replaces the
   // entire analyzer. Without an inherited analyzer, defaults to whitespace.
@@ -2287,14 +2519,25 @@ message FieldDef {
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
 
+  // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
+  // text is converted to this precision, truncating toward earlier time.
+  // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.
+  // The unit is part of the field signature and cannot change on an existing
+  // date definition. Absent inherits from the parent, falling back to ms.
+  enum DateUnit {
+    MS = 0; // milliseconds
+    NS = 1; // nanoseconds
+  }
+  optional DateUnit unit = 24;
+
   // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
-  // range, or a z coordinate without ignore_z_value) and index the rest of the
-  // document; in a multi-valued field only the bad points are skipped. Unset
-  // inherits, else false: a malformed point fails the document.
+  // range, or a z coordinate when ignore_z_value is false) and index the rest
+  // of the document; in a multi-valued field only the bad points are skipped.
+  // Unset inherits, else false: a malformed point fails the document.
   optional bool ignore_malformed = 28;
 
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
-  // inherits, else false: a point with a z coordinate is malformed.
+  // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
 }
 

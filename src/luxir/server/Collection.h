@@ -102,6 +102,7 @@ namespace api::SchemaRequest_ { enum class Mode; }
 // consist of multiple shards.
 class Collection {
   CollectionId id;
+  mutable std::mutex idMutex;
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   // Set once, by placeholder() or fail(): resolution then rejects the
@@ -112,7 +113,8 @@ class Collection {
   // Shared with the writer, whose work can outlive this object.
   std::shared_ptr<CollectionMetrics> metrics = std::make_shared<CollectionMetrics>();
 public:
-  const CollectionId& getId() const { return id; }
+  CollectionId getId() const { std::lock_guard lock(idMutex); return id; }
+  void setId(CollectionId next) { std::lock_guard lock(idMutex); id = std::move(next); }
   CollectionMetrics& getMetrics() const { return *metrics; }
   const std::shared_ptr<CollectionMetrics>& sharedMetrics() const { return metrics; }
   std::string getUnavailableReason() const;

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "luxir/index/Inverter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/geo.h"
@@ -14,7 +13,22 @@
 #include <optional>
 #include <string_view>
 
-namespace luxir::handler {
+namespace luxir::coerce {
+
+// Shared by ingest coercion and typed input. Keep document errors out of the
+// low-level geographic encoding utilities.
+inline void checkGeoPoint(const GeoPoint& point, std::string_view fieldName,
+                          std::string_view form) {
+  const char* problem = !geo::validLatitude(point.latitude)
+      ? "latitude must be finite and in [-90, 90]"
+      : !geo::validLongitude(point.longitude) ? "longitude must be finite and in [-180, 180]"
+      : nullptr;
+  if (problem != nullptr) {
+    throw DocumentError(fmt::format(
+        "field '{}': cannot read GEO_POINT value: {} lon={} lat={}: {}",
+        fieldName, form, point.longitude, point.latitude, problem));
+  }
+}
 
 // Reads GEO_POINT document values. One point may be written as
 //   [lon, lat]                          numeric array, GeoJSON order
@@ -24,17 +38,20 @@ namespace luxir::handler {
 //   "POINT (-74.0 40.7)"                WKT, case-insensitive
 //   "dr5regw3p"                         geohash, decoded to its cell centre
 // The array, GeoJSON, "lat,lon" and WKT forms take an optional third (z)
-// coordinate, which is rejected unless ignoreZValue is set; then it is
-// dropped. Objects take no z key and geohashes have none.
+// coordinate, which is dropped, or rejected when ignoreZValue is false.
+// Objects take no z key and geohashes have none.
 //
 // A field value is one point or an array of points. An array whose elements
 // are all numbers is one point; any other array lists points, one per
 // element. So [-74.0, 40.7] is one point, [[-74.0, 40.7], [-0.1, 51.5]] and
 // ["40.7,-74.0", "gcpvj0"] are two.
-struct GeoPointWire {
+//
+// This is the lenient document form; a strict form for query point literals
+// belongs beside it.
+struct GeoPointInput {
   std::string_view fieldName;
   bool ignoreMalformed = false;
-  bool ignoreZValue = false;
+  bool ignoreZValue = true;
 
   [[noreturn]] void fail(std::string_view detail) const {
     throw DocumentError(fmt::format(
@@ -46,7 +63,7 @@ struct GeoPointWire {
   // document. Otherwise a malformed point throws, possibly after fn has seen
   // earlier points, so callers buffer the points and index them afterwards.
   template <typename F>
-  void forEachPoint(const IndexVal& val, F&& fn) const {
+  void forEachPoint(const api::Val& val, F&& fn) const {
     if (coerce::isNull(val)) return;
     if (const auto* strs = std::get_if<api::ArrStr>(&val.kind)) {
       for (std::string_view s : strs->v) visit(coerce::scalarVal(s), fn);
@@ -54,7 +71,7 @@ struct GeoPointWire {
     }
     const auto* arr = std::get_if<api::ArrVal>(&val.kind);
     if (arr != nullptr && !allNumeric(*arr)) {
-      for (const IndexVal& elem : arr->v) {
+      for (const api::Val& elem : arr->v) {
         if (!coerce::isNull(elem)) visit(elem, fn);
       }
       return;
@@ -63,20 +80,20 @@ struct GeoPointWire {
     visit(val, fn);
   }
 
+private:
   // Parses one point in any accepted form.
-  GeoPoint parse(const IndexVal& val) const {
+  GeoPoint parse(const api::Val& val) const {
     if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
       return parseString(*s);
     }
     if (const auto* m = std::get_if<api::Map>(&val.kind)) return parseObject(*m);
-    if (coerce::isArray(val)) return parseCoordinates(val, "[lon, lat]");
+    if (coerce::isArray(val)) return parseCoordinates(val, "[lon, lat] array");
     fail(fmt::format("expected [lon, lat], an object, or a string, got {}",
                      coerce::describe(val)));
   }
 
-private:
   template <typename F>
-  void visit(const IndexVal& val, F& fn) const {
+  void visit(const api::Val& val, F& fn) const {
     if (!ignoreMalformed) {
       fn(parse(val));
       return;
@@ -90,7 +107,7 @@ private:
     fn(*point);
   }
 
-  static std::optional<double> number(const IndexVal& val) {
+  static std::optional<double> number(const api::Val& val) {
     if (const auto* d = std::get_if<double>(&val.kind)) return *d;
     if (const auto* f = std::get_if<float>(&val.kind)) return (double)*f;
     if (const auto* i = std::get_if<int64_t>(&val.kind)) return (double)*i;
@@ -98,15 +115,15 @@ private:
   }
 
   static bool allNumeric(const api::ArrVal& arr) {
-    for (const IndexVal& elem : arr.v) {
+    for (const api::Val& elem : arr.v) {
       if (!number(elem)) return false;
     }
     return true;
   }
 
-  static size_t arraySize(const IndexVal& val) {
+  static size_t arraySize(const api::Val& val) {
     size_t n = 0;
-    coerce::forEachElement(val, [&](const IndexVal&) { n++; });
+    coerce::forEachElement(val, [&](const api::Val&) { n++; });
     return n;
   }
 
@@ -136,25 +153,23 @@ private:
   }
 
   // Validates and orders coordinates; `count` is 2 or 3 (z last).
-  GeoPoint point(double longitude, double latitude, size_t count) const {
+  GeoPoint point(double longitude, double latitude, size_t count,
+                 std::string_view form) const {
     if (count == 3 && !ignoreZValue) {
-      fail("found a z (altitude) coordinate; set ignore_z_value: true on the "
-           "field to accept and drop it");
+      fail(fmt::format("{} lon={} lat={}: found a z (altitude) coordinate; "
+                       "set ignore_z_value: true on the field to accept and drop it",
+                       form, longitude, latitude));
     }
-    if (!std::isfinite(latitude) || latitude < -90.0 || latitude > 90.0) {
-      fail(fmt::format("latitude {} is not in [-90, 90]", latitude));
-    }
-    if (!std::isfinite(longitude) || longitude < -180.0 || longitude > 180.0) {
-      fail(fmt::format("longitude {} is not in [-180, 180]", longitude));
-    }
-    return {latitude, longitude};
+    GeoPoint result{latitude, longitude};
+    checkGeoPoint(result, fieldName, form);
+    return result;
   }
 
   // A numeric coordinate array: [lon, lat] or [lon, lat, z].
-  GeoPoint parseCoordinates(const IndexVal& val, std::string_view form) const {
+  GeoPoint parseCoordinates(const api::Val& val, std::string_view form) const {
     std::array<double, 3> c{};
     size_t n = 0;
-    coerce::forEachElement(val, [&](const IndexVal& elem) {
+    coerce::forEachElement(val, [&](const api::Val& elem) {
       std::optional<double> v = number(elem);
       if (!v) {
         fail(fmt::format("{} element {} ({}) is not a number", form, n,
@@ -164,12 +179,14 @@ private:
       n++;
     });
     if (n != 2 && n != 3) {
-      fail(fmt::format("{} needs 2 coordinates (3 with z), got {}", form, n));
+      std::string detail = fmt::format("{} needs 2 coordinates (3 with z), got {}", form, n);
+      if (n >= 2) detail += fmt::format("; interpreted lon={} lat={}", c[0], c[1]);
+      fail(detail);
     }
-    return point(c[0], c[1], n);
+    return point(c[0], c[1], n, form);
   }
 
-  double objectNumber(const IndexVal& val, std::string_view key) const {
+  double objectNumber(const api::Val& val, std::string_view key) const {
     if (std::optional<double> v = number(val)) return *v;
     if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
       if (std::optional<double> v = parseNumber(trim(*s))) return *v;
@@ -179,10 +196,10 @@ private:
 
   // {"lat": .., "lon": ..} or GeoJSON {"type": "Point", "coordinates": [..]}.
   GeoPoint parseObject(const api::Map& map) const {
-    const IndexVal* lat = nullptr;
-    const IndexVal* lon = nullptr;
-    const IndexVal* type = nullptr;
-    const IndexVal* coordinates = nullptr;
+    const api::Val* lat = nullptr;
+    const api::Val* lon = nullptr;
+    const api::Val* type = nullptr;
+    const api::Val* coordinates = nullptr;
     // Duplicate keys resolve last-wins, as map_view::find does.
     for (const auto& [key, value] : map.fields) {
       if (key == "lat") lat = &*value;
@@ -203,10 +220,10 @@ private:
       if (coordinates == nullptr || !coerce::isArray(*coordinates)) {
         fail("a GeoJSON Point needs a \"coordinates\" array");
       }
-      return parseCoordinates(*coordinates, "coordinates");
+      return parseCoordinates(*coordinates, "GeoJSON");
     }
     if (lat == nullptr || lon == nullptr) fail("a point object needs both lat and lon");
-    return point(objectNumber(*lon, "lon"), objectNumber(*lat, "lat"), 2);
+    return point(objectNumber(*lon, "lon"), objectNumber(*lat, "lat"), 2, "lat/lon object");
   }
 
   GeoPoint parseString(std::string_view raw) const {
@@ -229,20 +246,26 @@ private:
       std::string_view part = trim(s.substr(0, comma));
       std::optional<double> v = parseNumber(part);
       if (!v || n == c.size()) {
-        fail(fmt::format("'{}' is not \"lat,lon\" (2 numbers, 3 with z)", raw));
+        std::string detail = fmt::format("lat,lon string '{}' is not \"lat,lon\" (2 numbers, 3 with z)", raw);
+        if (n >= 2) detail += fmt::format("; interpreted lon={} lat={}", c[1], c[0]);
+        fail(detail);
       }
       c[n++] = *v;
       if (comma == std::string_view::npos) break;
       s.remove_prefix(comma + 1);
     }
     if (n < 2) fail(fmt::format("'{}' is not \"lat,lon\" (2 numbers, 3 with z)", raw));
-    return point(c[1], c[0], n);
+    return point(c[1], c[0], n, "lat,lon string");
   }
 
   // The text after "POINT": [Z] "(" lon lat [z] ")".
   GeoPoint parseWkt(std::string_view s, std::string_view raw) const {
+    std::array<double, 3> c{};
+    size_t n = 0;
     auto bad = [&]() {
-      fail(fmt::format("'{}' is not WKT POINT (lon lat) or POINT Z (lon lat z)", raw));
+      std::string detail = fmt::format("'{}' is not WKT POINT (lon lat) or POINT Z (lon lat z)", raw);
+      if (n >= 2) detail += fmt::format("; interpreted lon={} lat={}", c[0], c[1]);
+      fail(detail);
     };
     s = trim(s);
     if (startsWithNoCase(s, "empty") && trim(s.substr(5)).empty()) {
@@ -255,8 +278,6 @@ private:
     }
     if (s.size() < 2 || s.front() != '(' || s.back() != ')') bad();
     s = s.substr(1, s.size() - 2);
-    std::array<double, 3> c{};
-    size_t n = 0;
     while (true) {
       while (!s.empty() && space(s.front())) s.remove_prefix(1);
       if (s.empty()) break;
@@ -268,7 +289,7 @@ private:
       s.remove_prefix(end);
     }
     if (n < 2 || (zTag && n != 3)) bad();
-    return point(c[0], c[1], n);
+    return point(c[0], c[1], n, "WKT");
   }
 
 public:
@@ -296,4 +317,4 @@ public:
   }
 };
 
-} // namespace luxir::handler
+} // namespace luxir::coerce

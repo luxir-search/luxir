@@ -66,6 +66,7 @@ class ProtobufQueryParser {
   Query* parseRange(const luxir::api::RangeQuery& rangeQuery);
   Query* parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery);
   Query* parseGeoDistance(const luxir::api::GeoDistanceQuery& geoDistanceQuery);
+  Query* parseGeoPolygon(const luxir::api::GeoPolygonQuery& geoPolygonQuery);
   Query* parseGeoNearest(const luxir::api::GeoNearestQuery& geoNearestQuery);
   Query* parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery);
   Query* parseKnn(const luxir::api::KnnQuery& knnQuery);
@@ -78,6 +79,7 @@ class ProtobufQueryParser {
   Query* parseRescore(const luxir::api::RescoreQuery& rescoreQuery);
   Query* parseMultiMatch(const luxir::api::MultiMatchQuery& query);
   Query* parseDisMax(const luxir::api::DisMaxQuery& query);
+  Query* parsePlugin(const luxir::api::PluginQuery& query);
 
   static std::optional<float> constantOutput(const ValueProgram& program);
   static bool exactlyRepresented(const ValueResult& result, float value);

@@ -44,11 +44,18 @@ protected:
 
 namespace {
 
+using Counts = std::vector<int64_t>;
+
+Counts countsOf(const api::FacetResult& result) {
+  return {result.counts.begin(), result.counts.end()};
+}
+
 struct RangeSchemaField {
   std::string_view name;
   bool points;
   bool multi;
   api::FieldDef::FieldClass fieldClass = api::FieldDef::FieldClass::INT;
+  bool array = false;
 };
 
 void setRangeFacetSchema(CollectionHelper& helper,
@@ -59,7 +66,8 @@ void setRangeFacetSchema(CollectionHelper& helper,
     f.type = fs.fieldClass;
     f.index = fs.points ? api::FieldDef::IndexMode::RANGE
                         : api::FieldDef::IndexMode::NONE;
-    f.multi = fs.multi;
+    f.multi = !fs.multi ? api::FieldDef::MultiMode::SINGLE
+        : fs.array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
   }
   b.set(helper.collection());
 }
@@ -1150,7 +1158,7 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
     auto& all = req->rangeFacet("all", "range_is").range(-1500, 9100, 2700);
     std::get<api::RangeFacet>(all.rawOp().kind).missing = true;
     auto& filtered = req->rangeFacet("filtered", "range_is")
-                         .range(-1500, 9100, 2700).mincount(3);
+                         .range(-1500, 9100, 2700).mincount(2);
     std::get<api::RangeFacet>(filtered.rawOp().kind).missing = true;
     auto& extreme = req->rangeFacet("extreme", "extreme_is")
                         .range(i64min + 10, i64max - 10, i64max);
@@ -1164,12 +1172,13 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
       std::pair<int64_t, int64_t>{3900, 6600},
       std::pair<int64_t, int64_t>{6600, 9100}
     };
-    const std::array<int64_t, 4> allCounts = {3, 2, 0, 2};
+    const std::array<int64_t, 4> allCounts = {2, 2, 0, 1};
     expectRangeResult(rootFacetResult(*req, "all"), allBounds, allCounts, 1);
     const std::array filteredBounds = {
-      std::pair<int64_t, int64_t>{-1500, 1200}
+      std::pair<int64_t, int64_t>{-1500, 1200},
+      std::pair<int64_t, int64_t>{1200, 3900}
     };
-    const std::array<int64_t, 1> filteredCounts = {3};
+    const std::array<int64_t, 2> filteredCounts = {2, 2};
     expectRangeResult(rootFacetResult(*req, "filtered"), filteredBounds,
                       filteredCounts, 1);
     const std::array extremeBounds = {
@@ -1189,7 +1198,7 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
 
   auto [pointsResults, pointsArms] = run(false);
   auto [walkResults, walkArms] = run(true);
-  EXPECT_EQ(3, pointsArms);
+  EXPECT_EQ(0, pointsArms); // Multi-valued point ordinals count values, not docs.
   EXPECT_EQ(0, walkArms);
   EXPECT_EQ(pointsResults, walkResults);
   // Later tests (TermScorerTest) index into "main" without clearing first.
@@ -3139,12 +3148,12 @@ TEST_F(FacetTest, rangeFacetSubOpsMultiValueAndMincount) {
   ASSERT_OK(req);
 
   const auto& result = rootFacetResult(*req, "f");
-  // Counts are value occurrences; [10,20) is empty and mincount(1) drops it.
+  // Counts are documents; [10,20) is empty and mincount(1) drops it.
   const std::array bounds = {
     std::pair<int64_t, int64_t>{0, 10},
     std::pair<int64_t, int64_t>{20, 30}
   };
-  const std::array<int64_t, 2> counts = {3, 2};
+  const std::array<int64_t, 2> counts = {2, 2};
   expectRangeResult(result, bounds, counts, -1);
   // Sums are per-document: doc1 contributes 10 once to [0,10) despite two
   // in-bucket values, and doc3 contributes 7 to both returned buckets.
@@ -3470,26 +3479,155 @@ TEST_F(FacetTest, nestedNumericFacetBindingsRespectResidentBudget) {
 TEST_F(FacetTest, numericFacetDuplicateOccurrencesAndUniqueFeedDomains) {
   SearchOverridesGuard guard(forcedInlineFacetEntryMode);
   CollectionHelper helper;
-  helper.indexAll(std::array{
-      flatdoc("n_is", vec_i(20, 20, 10, 20), "score_i", 10),
-      flatdoc("n_is", vec_i(20), "score_i", 20),
-  }, UpdateMessage::COMMIT);
-  helper.index(flatdoc("n_is", vec_i(20, 10, 20), "score_i", 30), UpdateMessage::COMMIT);
-  for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
-    forcedInlineFacetEntryMode = mode;
-    for (int64_t limit : {1, -1}) {
+  for (bool array : {false, true}) for (bool wide : {false, true}) {
+    helper.clear();
+    int64_t other = wide ? -1000000 : 10;
+    SchemaBuilder schema;
+    auto& field = schema.field("n_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.indexAll(std::array{
+        flatdoc("n_is", vec_i(20, 20, other, 20), "score_i", 10),
+        flatdoc("n_is", vec_i(20), "score_i", 20),
+    }, UpdateMessage::COMMIT);
+    helper.index(flatdoc("n_is", vec_i(20, other, 20), "score_i", 30), UpdateMessage::COMMIT);
+    for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
+      forcedInlineFacetEntryMode = mode;
+      for (int64_t limit : {1, -1}) for (bool metrics : {false, true}) {
+        auto req = localReq(helper.getSearchEngine());
+        auto& facet = req->collection("main").facet("f", "n_is").limit(limit);
+        if (metrics) facet.sum("total", "score_i").avg("mean", "score_i");
+        facet.facet("scores", "score_i").limit(-1);
+        req->execute();
+        ASSERT_OK(req);
+        const auto& result = rootFacetResult(*req, "f");
+        ASSERT_FALSE(result.counts.empty());
+        EXPECT_EQ(20, std::get<api::ColInt>(result.bucket_ids->kind).v[0]);
+        EXPECT_EQ(3, result.counts[0]);
+        if (metrics) {
+          EXPECT_EQ(60, metricValues(result, "total")[0].asInt());
+          EXPECT_DOUBLE_EQ(20, metricValues(result, "mean")[0].asDouble());
+        }
+        EXPECT_EQ((Counts{1, 1, 1}), countsOf(*metricValues(result, "scores")[0].facetResult()));
+        EXPECT_EQ(0u, req->memoryTracker.bytes());
+      }
+    }
+  }
+}
+
+// Bucket counts and metric feeds agree even when distinct values share a
+// range or an array revisits a bucket after visiting another one.
+TEST_F(FacetTest, numericRangeDocumentCountsInBothModes) {
+  using FC = api::FieldDef::FieldClass;
+  for (auto type : {FC::INT, FC::DATE, FC::FLOAT, FC::DOUBLE}) {
+    for (bool array : {false, true}) for (bool points : {false, true}) {
+      CollectionHelper helper;
+      helper.clear();
+      setRangeFacetSchema(helper, std::array{RangeSchemaField{"value", points, true, type, array}});
+      bool fp = type == FC::FLOAT || type == FC::DOUBLE;
+      auto first = flatdoc("score_i", 10);
+      auto second = flatdoc("score_i", 20);
+      if (fp) {
+        first.emplace_back("value", vec(11.0, 1.0, 12.0, 2.0, 1.0));
+        second.emplace_back("value", vec(2.0, 1.0));
+      } else {
+        first.emplace_back("value", vec_i(11, 1, 12, 2, 1));
+        second.emplace_back("value", vec_i(2, 1));
+      }
+      ASSERT_TRUE(helper.index(first, UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.index(second, UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("score_i", 30), UpdateMessage::COMMIT).success);
+      for (int merge = 0; merge < 2; merge++) {
+        for (bool data : {false, true}) for (bool metrics : {false, true}) {
+          auto req = localReq(helper.getSearchEngine());
+          auto& facet = req->collection("main").rangeFacet("r", "value");
+          if (fp) facet.rangeFp(0, 20, 10);
+          else facet.range(0, 20, 10);
+          auto& spec = std::get<api::RangeFacet>(facet.rawOp().kind);
+          spec.missing = true;
+          if (data) spec.bounds = api::RangeFacet_::Bounds::DATA;
+          if (metrics) {
+            facet.sum("total", "score_i").expr("values", "sum(count(value))");
+            facet.facet("scores", "score_i").limit(-1);
+          }
+          req->execute(false);
+          ASSERT_OK(req);
+          const auto& result = rootFacetResult(*req, "r");
+          EXPECT_EQ((Counts{2, 1}), countsOf(result));
+          EXPECT_EQ(1, result.missing.value_or(-1));
+          if (metrics) {
+            auto totals = metricValues(result, "total");
+            ASSERT_EQ(2u, totals.size());
+            EXPECT_EQ(30, totals[0].asInt());
+            EXPECT_EQ(10, totals[1].asInt());
+            auto values = metricValues(result, "values");
+            EXPECT_EQ(array ? 7 : 6, values[0].asInt());
+            EXPECT_EQ(array ? 5 : 4, values[1].asInt());
+            EXPECT_EQ((Counts{1, 1}), countsOf(*metricValues(result, "scores")[0].facetResult()));
+          }
+        }
+        if (!merge) {
+          CollectionHelper::UpdateBuilder update;
+          update.commit(true, 1);
+          ASSERT_TRUE(helper.submit(update).success);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, singleValueMultiSegmentsUseRangeFastPaths) {
+  SearchOverridesGuard guard(IntFacetRangeReq::disablePointsRangeFacetForTests,
+      IntFacetRangeReq::disableZoneRangeFacetForTests, SkipStats::enabled);
+  IntFacetRangeReq::disablePointsRangeFacetForTests = false;
+  IntFacetRangeReq::disableZoneRangeFacetForTests = false;
+  SkipStats::enabled = true;
+  for (bool array : {false, true}) for (bool points : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_is", points, true,
+        api::FieldDef::FieldClass::INT, array}});
+    ASSERT_TRUE(helper.indexAll(std::array{
+        flatdoc("n_is", vec_i(3)), flatdoc("n_is", vec_i(4)),
+        flatdoc("id", "missing")}, UpdateMessage::COMMIT).success);
+    for (bool data : {false, true}) {
       auto req = localReq(helper.getSearchEngine());
-      auto& facet = req->collection("main").facet("f", "n_is").limit(limit);
-      facet.sum("total", "score_i").avg("mean", "score_i");
-      req->execute();
+      auto& facet = req->collection("main").rangeFacet("r", "n_is").range(0, 10, 10);
+      auto& spec = std::get<api::RangeFacet>(facet.rawOp().kind);
+      spec.missing = true;
+      if (data) spec.bounds = api::RangeFacet_::Bounds::DATA;
+      SkipStats::reset();
+      req->execute(false);
       ASSERT_OK(req);
-      const auto& result = rootFacetResult(*req, "f");
-      ASSERT_FALSE(result.counts.empty());
-      EXPECT_EQ(20, std::get<api::ColInt>(result.bucket_ids->kind).v[0]);
-      EXPECT_EQ(6, result.counts[0]);
-      EXPECT_EQ(60, metricValues(result, "total")[0].asInt());
-      EXPECT_DOUBLE_EQ(20, metricValues(result, "mean")[0].asDouble());
-      EXPECT_EQ(0u, req->memoryTracker.bytes());
+      EXPECT_EQ((Counts{2}), countsOf(rootFacetResult(*req, "r")));
+      EXPECT_EQ(1, rootFacetResult(*req, "r").missing.value_or(-1));
+      EXPECT_EQ(points ? 1 : 0, SkipStats::rangeFacetPointsArms);
+      EXPECT_EQ(!points, SkipStats::rangeFacetZoneRuns > 0);
+    }
+  }
+}
+
+TEST_F(FacetTest, calendarRangeDocumentCountsAcrossTransitions) {
+  using Unit = api::CalendarGap_::Unit;
+  struct Case { const char* zone; Unit unit; const char* a; const char* b; };
+  for (auto c : std::array{
+      Case{"America/New_York", Unit::DAY, "2024-03-10T06:30Z", "2024-03-10T08:30Z"},
+      Case{"America/New_York", Unit::DAY, "2024-11-03T05:30Z", "2024-11-03T06:30Z"},
+      Case{"America/Havana", Unit::DAY, "2015-11-01T04:30Z", "2015-11-01T05:30Z"},
+      Case{"Pacific/Apia", Unit::DAY, "2011-12-30T12:00Z", "2011-12-30T13:00Z"},
+      Case{"America/New_York", Unit::MONTH, "2024-03-10T06:30Z", "2024-03-20T08:30Z"}}) {
+    for (bool array : {false, true}) {
+      CollectionHelper helper;
+      helper.clear();
+      setRangeFacetSchema(helper, std::array{RangeSchemaField{"date", true, true,
+          api::FieldDef::FieldClass::DATE, array}});
+      ASSERT_TRUE(helper.index(flatdoc("date", vec_i(epoch(c.b), epoch(c.a), epoch(c.b))), UpdateMessage::COMMIT).success);
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").rangeFacet("r", "date").rangeDataCalendar(1, c.unit, c.zone);
+      req->execute(false);
+      ASSERT_OK(req);
+      EXPECT_EQ((Counts{1}), countsOf(rootFacetResult(*req, "r"))) << c.zone;
     }
   }
 }
@@ -4016,7 +4154,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     }, "cannot sort by a subop without inline support: nested"},
     {"int_mincount_zero", [](LocalReq& req) {
       req.facet("f", "foo_i").mincount(0);
-    }, "not supported for int field facets"},
+    }, "not supported for numeric field facets"},
     {"text_unknown_sort", [](LocalReq& req) {
       qb::sort(req.facet("f", "body_w"), "unknown", qb::ASC);
     }, "unknown sort field 'unknown'"},
@@ -5236,6 +5374,8 @@ protected:
         if constexpr (std::is_same_v<Key, int64_t>) {
           if (facetOp.selected) {
             for (int64_t pin : std::get<api::ArrInt>(facetOp.selected->kind).v) {
+              if (fieldName.ends_with("_dt")
+                  && (pin < datetime_detail::kMinEpochMs || pin > datetime_detail::kMaxEpochMs)) continue;
               if (std::ranges::find(ids, pin) == ids.end()) ids.push_back(pin);
             }
           }
@@ -5284,15 +5424,17 @@ protected:
       int64_t missingCount = 0;
       for (auto docIdx : domainDocs) {
         bool hasField = false;
+        std::set<size_t> buckets;
         for (const auto& nv : values(docIdx, fieldOrd)) {
           if (auto* iv = std::get_if<int64_t>(&nv.val)) {
             hasField = true;
             int64_t v = *iv;
             if (v < start || v >= end) continue;  // out of range -> dropped
-            bucketCounts[(size_t)((v - start) / gap)]++;
+            buckets.insert((size_t)((v - start) / gap));
           }
         }
         if (!hasField) missingCount++;
+        for (size_t bucket : buckets) bucketCounts[bucket]++;
       }
       for (int64_t k = 0; k < bucketCount; k++) {
         int64_t count = bucketCounts[(size_t)k];
@@ -5318,7 +5460,7 @@ protected:
       def.type = field.name.ends_with("_dt") ? api::FieldDef::FieldClass::DATE
                                              : api::FieldDef::FieldClass::INT;
       def.index = api::FieldDef::IndexMode::RANGE;
-      def.multi = field.multiValued;
+      def.multi = (field.multiValued) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
     }
     b.set(helper.collection());
     
@@ -6436,7 +6578,7 @@ TEST_F(FacetTest, resetIdentityPostingsPointsAndColumnFallbackAgree) {
       // column fallback when their points index is absent.
       field.index = name.ends_with("_s") ? api::FieldDef::IndexMode::MATCH
           : indexed ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
-      field.multi = true;
+      field.multi = api::FieldDef::MultiMode::DEFAULT;
     }
     schema.set(helper.collection());
     for (int segment = 0; segment < 3; segment++) {
@@ -6588,7 +6730,6 @@ void indexInts(CollectionHelper& helper, std::initializer_list<int64_t> values,
 }
 
 using Bounds = std::vector<std::pair<int64_t, int64_t>>;
-using Counts = std::vector<int64_t>;
 
 Bounds boundsOf(const api::FacetResult& result) {
   Bounds out;
@@ -6599,9 +6740,6 @@ Bounds boundsOf(const api::FacetResult& result) {
   return out;
 }
 
-Counts countsOf(const api::FacetResult& result) {
-  return {result.counts.begin(), result.counts.end()};
-}
 
 } // namespace
 
@@ -7239,11 +7377,11 @@ TEST_F(FacetTest, dataStreamingMatchesLiveDomainOracle) {
   using FC = api::FieldDef::FieldClass;
   std::mt19937 random(12937);
   for (auto type : {FC::INT, FC::DATE, FC::FLOAT, FC::DOUBLE}) {
-    for (bool points : {false, true}) for (int segments : {1, 5}) {
-      SCOPED_TRACE(std::format("type={} points={} segments={}", (int)type, points, segments));
+    for (bool points : {false, true}) for (bool array : {false, true}) for (int segments : {1, 5}) {
+      SCOPED_TRACE(std::format("type={} points={} array={} segments={}", (int)type, points, array, segments));
       CollectionHelper helper;
       helper.clear();
-      setRangeFacetSchema(helper, std::array{RangeSchemaField{"value", points, true, type}});
+      setRangeFacetSchema(helper, std::array{RangeSchemaField{"value", points, true, type, array}});
       bool floating = type == FC::FLOAT || type == FC::DOUBLE;
       struct Doc { std::vector<int64_t> values; int group; bool keep, live; };
       std::vector<Doc> docs;
@@ -7273,6 +7411,10 @@ TEST_F(FacetTest, dataStreamingMatchesLiveDomainOracle) {
             ? helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", fp), commit)
             : helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", doc.values), commit);
         ASSERT_TRUE(result.success) << result.error_message;
+        if (!array) {
+          std::ranges::sort(doc.values);
+          doc.values.erase(std::unique(doc.values.begin(), doc.values.end()), doc.values.end());
+        }
         docs.push_back(std::move(doc));
       }
       if (segments > 1) {
@@ -7289,19 +7431,21 @@ TEST_F(FacetTest, dataStreamingMatchesLiveDomainOracle) {
                 type == FC::DATE ? 2700000 : 10, type == FC::DATE ? 1020000 : 3, zone);
         for (int scenario = 0; scenario < 6; scenario++) for (int parallel : {1, -1}) {
           bool filtered = scenario % 2 != 0;
-          int measure = scenario / 2; // values, DOCS distinct, GROUPS distinct
+          int measure = scenario / 2; // documents, DOCS distinct, GROUPS distinct
           std::map<int64_t, int64_t> counts;
           std::map<int64_t, std::set<int>> groups;
           int64_t missing = 0;
           std::set<int> missingGroups;
           for (const auto& doc : docs) if (doc.live && (!filtered || doc.keep)) {
             if (doc.values.empty()) { missing++; missingGroups.insert(doc.group); }
+            std::set<int64_t> buckets;
             for (int64_t value : doc.values) {
               if (floating && !std::isfinite(type == FC::FLOAT ? (double)sortableInt32ToFloat((int32_t)value) : sortableInt64ToDouble(value))) continue;
               int64_t key = grid.floor(value).key;
-              counts[key]++;
+              buckets.insert(key);
               groups[key].insert(doc.group);
             }
+            for (int64_t key : buckets) counts[key]++;
           }
           ASSERT_FALSE(counts.empty());
           int64_t lo = counts.begin()->first, hi = counts.rbegin()->first;
@@ -7493,7 +7637,10 @@ TEST_F(FacetTest, dataNestingMatchesPerInstanceOracle) {
     int missing = 0;
     for (size_t i = 0; i < rows.size(); i++) if (includes(rows[i])) {
       if (rows[i].values.empty()) missing++;
-      for (int64_t value : rows[i].values) { counts[value / 10 * 10]++; docs[value / 10 * 10].insert(i); }
+      for (int64_t value : rows[i].values) docs[value / 10 * 10].insert(i);
+    }
+    for (const auto& [key, members] : docs) {
+      counts[key] = (int64_t)members.size();
     }
     Bounds bounds;
     Counts expected;
@@ -7749,4 +7896,260 @@ TEST_F(FacetTest, piecewiseLayoutsFeedBucketDomains) {
       }
     }
   }
+}
+
+TEST_F(FacetTest, absentStringPinWithChildrenOnEveryDomainSource) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "x", "score_i", 1, "sel_s", "yes"),
+      flatdoc("id", "b", "cat_s", "y", "score_i", 2, "sel_s", "yes"),
+      flatdoc("id", "c", "cat_s", "x", "score_i", 4, "sel_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource);
+  for (auto source : {FacetBucketDomainSource::AUTO, FacetBucketDomainSource::POSTINGS,
+                      FacetBucketDomainSource::ORD_COLUMN}) {
+    forcedFacetBucketDomainSource = source;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").topDocs("q").matchQuery("sel_s", "yes").limit(0)
+        .facet("f", "cat_s").limit(-1);
+    std::array<std::string, 2> pins{"x", "absent"};
+    setSelected(facet, pins);
+    facet.sum("total", "score_i");
+    facet.topDocs("hits").allQuery().limit(0).countLimit();
+    req->execute();
+    ASSERT_OK(req);
+    const auto& result = topFacetResult(*req, "q", "f");
+    const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+    auto totals = metricValues(result, "total");
+    auto hits = metricValues(result, "hits");
+    ASSERT_EQ(3u, ids.size()) << (int)source;
+    for (size_t i = 0; i < ids.size(); i++) {
+      std::string_view id = ids[i];
+      int64_t expected = id == "absent" ? 0 : 1;
+      EXPECT_EQ(expected, result.counts[i]) << id << " source=" << (int)source;
+      EXPECT_EQ(expected, hits[i].docList()->found.value_or(-1)) << id << " source=" << (int)source;
+      if (id == "absent") EXPECT_TRUE(totals[i].isNull()) << "source=" << (int)source;
+      else EXPECT_EQ(id == "x" ? 1 : 2, totals[i].asInt()) << id << " source=" << (int)source;
+    }
+  }
+}
+
+TEST_F(FacetTest, facetLimitBelowMinusOneMeansAll) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "x"), flatdoc("id", "b", "cat_s", "x"),
+      flatdoc("id", "c", "cat_s", "y"),
+  }, UpdateMessage::COMMIT).success);
+  for (int64_t mincount : {0, 1}) {
+    std::vector<std::vector<std::pair<std::string, int64_t>>> rows;
+    for (int64_t limit : {(int64_t)-1, (int64_t)-2, std::numeric_limits<int64_t>::min()}) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").facet("f", "cat_s").limit(limit).mincount(mincount);
+      req->execute();
+      ASSERT_OK(req);
+      rows.push_back(stringFacetRows(rootFacetResult(*req, "f")));
+    }
+    std::vector<std::pair<std::string, int64_t>> expected{{"x", 2}, {"y", 1}};
+    for (const auto& r : rows) EXPECT_EQ(expected, r) << "mincount=" << mincount;
+  }
+}
+
+TEST_F(FacetTest, multiColumnOnlyStringFacetIsRejected) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("tags_ssc", vecs("z", "a", "z")), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("f", "tags_ssc");
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("column-only (not indexed)"));
+}
+
+TEST_F(FacetTest, indexedStringArrayBucketsCountDocumentsAcrossPlans) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"parent", "child"}) for (bool array : {false, true}) {
+    auto& f = schema.field(std::string(name) + (array ? "_array" : "_set"));
+    f.type = api::FieldDef::FieldClass::STRING;
+    f.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+  }
+  schema.set(helper.collection());
+  // One doc spans multiple decoded batches; its repeats must dedup across them.
+  std::vector<std::string> repeats(600, "a");
+  repeats[1] = "z";
+  for (int i = 0; i < 6; i++) {
+    auto p = i == 0 ? repeats : i == 1 ? vecs("b", "a", "b") : vecs("b", "z", "b");
+    auto c = i == 0 ? vecs("y", "x", "y") : vecs("x", "y", "x");
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i),
+        "parent_array", p, "parent_set", p, "child_array", c, "child_set", c,
+        "metric_i", i + 1, "selected_s", i < 4 ? "yes" : "no"),
+        i % 2 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("5", UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedStrFacetStrategy, forcedFacetSubOpInline, forcedFacetFeedStrategy);
+  // Compare complete responses below, using the same operation names in each.
+  auto result = [&](bool array, bool metrics, bool nested, bool filtered, bool parallel) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").countLimit();
+    if (filtered) top.matchQuery("selected_s", "yes"); else top.allQuery();
+    auto& parent = top.facet("f", array ? "parent_array" : "parent_set").limit(-1);
+    if (metrics) parent.avg("avg", "metric_i");
+    if (nested) parent.facet("child", array ? "child_array" : "child_set").limit(-1);
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(topFacetResult(*req, "q", "f"), encoded));
+    return encoded;
+  };
+  for (int merge = 0; merge < 2; merge++) {
+    for (bool parallel : {false, true}) for (bool filtered : {false, true}) {
+      forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
+      for (auto strategy : {StrFacetStrategy::COLUMN_DOMAIN, StrFacetStrategy::COLUMN_COMPLEMENT,
+                            StrFacetStrategy::TERM_DRIVEN, StrFacetStrategy::TOP_TERMS}) {
+        forcedStrFacetStrategy = strategy;
+        EXPECT_EQ(result(false, false, false, filtered, parallel), result(true, false, false, filtered, parallel));
+      }
+      forcedStrFacetStrategy = StrFacetStrategy::COLUMN_DOMAIN;
+      forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+      EXPECT_EQ(result(false, true, false, filtered, parallel), result(true, true, false, filtered, parallel));
+      forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
+      for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+        forcedFacetFeedStrategy = feed;
+        EXPECT_EQ(result(false, true, true, filtered, parallel), result(true, true, true, filtered, parallel));
+      }
+    }
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}
+
+TEST_F(FacetTest, arrayChildReplayDedupUsesRequestBreaker) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("child");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  std::vector<std::string> values;
+  for (int i = 0; i < 64; i++) values.push_back(std::to_string(i));
+  ASSERT_TRUE(helper.indexAll({flatdoc("parent_s", "p", "child", values),
+      flatdoc("parent_s", "p", "child", values)}, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetFeedStrategy, forcedRequestMemoryMaxBytes);
+  forcedFacetFeedStrategy = FacetFeedStrategy::STRING_COLUMN_REPLAY;
+  for (size_t ceiling : {size_t{1 << 20}, size_t{1}}) {
+    forcedRequestMemoryMaxBytes = ceiling;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").facet("p", "parent_s").limit(-1).facet("c", "child").limit(-1);
+    req->execute(false);
+    if (ceiling == 1) {
+      EXPECT_FALSE(req->ok());
+      EXPECT_NE(std::string::npos, req->errorMsg().find("facet document dedup"));
+    } else {
+      ASSERT_OK(req);
+      const auto& child = *metricValues(rootFacetResult(*req, "p"), "c")[0].facetResult();
+      EXPECT_EQ(Counts(64, 2), countsOf(child));
+      EXPECT_GT(req->memoryTracker.peak(), 0u);
+    }
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
+namespace {
+void setNanosecondFacetSchema(CollectionHelper& helper, bool points = false) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  field.index = points ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
+  schema.set(helper.collection());
+}
+}
+
+TEST_F(FacetTest, nanosecondFixedDataExplicitAndSelections) {
+  for (bool points : {false, true}) {
+    auto collection = points ? "points" : "columns";
+    CollectionHelper helper(collection);
+    setNanosecondFacetSchema(helper, points);
+    std::vector<Doc> docs;
+    for (int64_t value : {-2, -1, 1, 2}) docs.push_back(flatdoc("id", std::to_string(value), "stamp", value));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    req->rangeFacet("ticks", "stamp").rangeData(1, std::nullopt, -3, 4);
+    req->rangeFacet("explicit", "stamp").range("1969-12-31T23:59:59.999999997Z", "1970-01-01T00:00:00.000000004Z", 1);
+    req->rangeFacet("phase", "stamp").rangeData(2, 1);
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(boundsOf(rootFacetResult(*req, "ticks")), boundsOf(rootFacetResult(*req, "explicit")));
+    EXPECT_EQ((Counts{0, 1, 1, 0, 1, 1, 0}), countsOf(rootFacetResult(*req, "ticks")));
+    EXPECT_EQ((Bounds{{-3, -1}, {-1, 1}, {1, 3}}), boundsOf(rootFacetResult(*req, "phase")));
+    EXPECT_EQ((Counts{1, 1, 2}), countsOf(rootFacetResult(*req, "phase")));
+    for (bool fieldFacet : {false, true}) {
+      auto selected = localReq(helper.getSearchEngine());
+      auto& top = selected->collection(collection).topDocs("q").allQuery().withStats();
+      if (fieldFacet) {
+        auto& facet = top.facet("f", "stamp");
+        setSelected(facet, std::vector<int64_t>{1});
+      } else {
+        auto& facet = top.rangeFacet("f", "stamp").range(-3, 3, 2);
+        auto* values = api::build::allocMessage<api::Val>(facet.mr());
+        values->kind = (int64_t)-1;
+        std::get<api::RangeFacet>(facet.rawOp().kind).selected = values;
+      }
+      selected->execute();
+      ASSERT_OK(selected);
+      EXPECT_EQ(1, selected->getMatchCount());
+    }
+  }
+}
+
+TEST_F(FacetTest, nanosecondCalendarDataAndExplicitShareFences) {
+  using Unit = api::CalendarGap_::Unit;
+  for (auto [name, start, end] : {
+      std::tuple{"America/Denver", "2024-03-09T07:00Z", "2024-03-12T06:00Z"},
+      std::tuple{"Pacific/Apia", "2011-12-29T10:00Z", "2012-01-01T10:00Z"}}) {
+    auto collection = name == std::string_view("Pacific/Apia") ? "apia" : "denver";
+    CollectionHelper helper(collection);
+    setNanosecondFacetSchema(helper, true);
+    int64_t lo = epoch(start), hi = epoch(end), day = 86400000;
+    std::vector<Doc> docs;
+    for (int64_t value = lo + day / 2; value < hi; value += day) {
+      docs.push_back(flatdoc("id", std::to_string(value), "stamp", value * 1000000 + 7));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection).timeZone(name);
+    req->rangeFacet("data", "stamp").rangeDataCalendar(1, Unit::DAY);
+    req->rangeFacet("explicit", "stamp").calendarRange(start, end, 1, Unit::DAY);
+    req->rangeFacet("fixed", "stamp").rangeData(day * 1000000);
+    req->execute(false);
+    ASSERT_OK(req);
+    auto expected = oldCalendarFences(lo, hi, CalendarUnit::DAY, zone(name));
+    Bounds bounds;
+    for (size_t i = 1; i < expected.size(); i++) bounds.emplace_back(expected[i - 1] * 1000000, expected[i] * 1000000);
+    for (auto facet : {"data", "explicit", "fixed"}) {
+      EXPECT_EQ(bounds, boundsOf(rootFacetResult(*req, facet))) << name << " " << facet;
+      EXPECT_EQ((Counts(bounds.size(), 1)), countsOf(rootFacetResult(*req, facet)));
+    }
+    EXPECT_EQ(name == std::string_view("Pacific/Apia"), req->hasWarning("calendar_bucket_skipped"));
+  }
+}
+
+TEST_F(FacetTest, nanosecondMaximumIsAnExclusiveFence) {
+  CollectionHelper helper;
+  setNanosecondFacetSchema(helper, true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "last", "stamp", INT64_MAX - 1), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("data", "stamp").rangeData(1);
+  req->rangeFacet("explicit", "stamp").range(INT64_MAX - 3, INT64_MAX, 1);
+  req->rangeFacet("calendar", "stamp").rangeDataCalendar(1, api::CalendarGap_::Unit::MONTH);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{INT64_MAX - 1, INT64_MAX}}), boundsOf(rootFacetResult(*req, "data")));
+  EXPECT_EQ((Counts{0, 0, 1}), countsOf(rootFacetResult(*req, "explicit")));
+  EXPECT_EQ((Bounds{{epoch("2262-04-01") * 1000000, INT64_MAX}}), boundsOf(rootFacetResult(*req, "calendar")));
+  EXPECT_EQ((Counts{1}), countsOf(rootFacetResult(*req, "calendar")));
 }

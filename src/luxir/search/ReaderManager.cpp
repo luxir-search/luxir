@@ -110,7 +110,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
   out.indexGen = info.index_gen;
   out.coreGen = info.core_gen;
   out.updateVersion = info.update_version;
-  out.schemaGen = info.schema_gen;
+  out.schemaGen = info.schema->version.generation();
   out.segments = out.committedSegments = info.segments.size();
   if (includeFiles) out.totalBytes = dir.totalBytes();
   auto copyAux = [](const api::AuxIndexInfo& aux) {
@@ -134,11 +134,12 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
     if (!includeSegments) continue;
     SegmentStats result;
     result.segId = seg.seg_id;
+    result.creatorEpoch = seg.creator_epoch;
     result.liveGen = seg.live_gen;
     result.minUpdateVersion = seg.min_version;
     result.maxUpdateVersion = seg.max_version;
     result.firstCommitTime = seg.commit_time;
-    result.schemaGen = seg.schema_gen;
+    result.schemaGen = seg.schema.version.generation();
     result.maxDoc = seg.max_doc;
     result.liveDocs = seg.live_docs;
     result.committed = true;
@@ -156,8 +157,9 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
 void ReaderManager::cacheStats(CacheStats& out) const {
   auto cache = filterCache;
   if (!cache) return;
-  out.filterCacheEnabled = cache->enabled();
-  out.filterCacheMaxBytes = cache->configuration().maxBytes;
+  auto config = cache->configuration();
+  out.filterCacheEnabled = config.maxBytes != 0;
+  out.filterCacheMaxBytes = config.maxBytes;
   out.filterCacheResidentBytes = cache->bytesUsed();
   out.filterCacheMetadataBytes = cache->metadataBytesUsed();
   out.filterCacheCounters = cache->counters();

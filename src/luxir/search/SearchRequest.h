@@ -22,6 +22,8 @@
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
 #include "luxir/query/ExecutionWarnings.h"
+#include "luxir/query/MultiTermBudget.h"
+#include "luxir/query/ExecutionProfile.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -53,37 +55,11 @@ using RespProto = luxir::api::SearchResponse;
 // Short alias for the response build-by-backing helpers (luxir/api/build.h).
 namespace build = luxir::api::build;
 
-// Runtime backing for request profiling. Each calculator owns one run with a
-// fixed slot per segment; the response wire objects are built only after all
-// segment work has drained.
-struct ExecutionProfilePieceState {
-  luxir::api::ExecutionProfilePiece wire;
-  // Human-readable execution notes, one clause per entry; profiling is off
-  // the hot path by definition, so ops just push composed strings here and
-  // fillExecutionProfile builds the wire span over them.
-  std::vector<std::string> details;
-  bool complete = false;
-};
-
-struct ExecutionProfileRun {
-  std::vector<ExecutionProfilePieceState> pieces;
-
-  explicit ExecutionProfileRun(std::size_t numPieces) : pieces(numPieces) {}
-};
-
-struct ExecutionProfileOpState {
-  std::string_view name;
-  std::mutex mutex;
-  std::vector<std::unique_ptr<ExecutionProfileRun>> runs;
-
-  explicit ExecutionProfileOpState(std::string_view name) : name(name) {}
-};
-
 // The top-level request for the SearchEngine.
 class Collection;
-class SearchRequest : public ExecutionWarnings {
+class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   friend class SearchEngine;
-  void count(MetricOutcome outcome);
+  void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
@@ -103,6 +79,10 @@ public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
+  uint64_t flags = 0;             // effective packed options, resolved during parsing
+  // Shared by every query tree of the request: one allowance for all of its
+  // prefix/wildcard/regex/range/fuzzy dictionary work.
+  MultiTermBudget multiTermBudget;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -119,6 +99,9 @@ public:
   // One clock snapshot for every query tree/op in this request. Parsers are
   // short-lived and numerous, so NOW belongs here rather than in a parser.
   const int64_t dateMathNowEpochMillis;
+  // When the transport received the request; the final response's took_us is
+  // measured from here (stamped in maybeSendFinal, just before reply()).
+  const std::chrono::steady_clock::time_point startTime;
   // Resolved eagerly from proto.time_zone. Invalid IANA/fixed specifications
   // retain an error for submitBody to surface as a whole-request failure.
   std::optional<TimeZone> timeZone;
@@ -143,6 +126,7 @@ public:
   // Empty, with no backing allocation, unless an instrumented op observes
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
+  std::mutex executionProfileMutex;
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
@@ -156,7 +140,8 @@ public:
   bool testForcePrepare = false;
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                google::protobuf::Arena& arena);
+                google::protobuf::Arena& arena,
+                std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());
 
   virtual ~SearchRequest();
 
@@ -164,6 +149,7 @@ public:
     if (!proto.profile) return nullptr;
     auto state = std::make_unique<ExecutionProfileOpState>(name);
     auto* result = state.get();
+    std::lock_guard<std::mutex> lock(executionProfileMutex);
     executionProfileOps.push_back(std::move(state));
     return result;
   }
@@ -175,6 +161,10 @@ public:
     std::lock_guard<std::mutex> lock(opState->mutex);
     opState->runs.push_back(std::move(run));
     return result;
+  }
+
+  ExecutionProfileRun* addQueryProfile(std::string_view name) override {
+    return addExecutionProfileRun(addExecutionProfileOp(name));
   }
 
   void fillExecutionProfile(SearchResponse& response);
