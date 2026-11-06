@@ -1403,7 +1403,7 @@ TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
   EXPECT_EQ(api::SchemaDef::IndexSort::Order::DESC, desc->indexSortOrder);
   EXPECT_NE(std::string::npos, authoredJson(*desc).find(R"("order":"desc")")) << authoredJson(*desc);
   EXPECT_EQ(api::SchemaDef::IndexSort::Order::DESC,
-            Schema::fromStored(desc->storedInfo(arena), 1)->indexSortOrder);
+            Schema::fromStored(desc->storedInfo(arena), desc->binding)->indexSortOrder);
 
   // A SET without index_sort keeps it, a template instance is accepted, and
   // an empty field clears it.
