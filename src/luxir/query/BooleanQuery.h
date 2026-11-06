@@ -37,6 +37,11 @@ class BooleanQuery final : public luxir::Query {
   int minShouldMatch;
 
 public:
+  std::span<Query* const> getMandatory() const { return mandatory; }
+  std::span<Query* const> getOptional() const { return optional; }
+  std::span<Query* const> getFilter() const { return filter; }
+  std::span<Query* const> getProhibited() const { return prohibited; }
+
   // Test hook: keep score-only optional clauses in unscored plans.
   static inline bool disableUnscoredOptionalDropForTests = false;
 

@@ -179,6 +179,13 @@ r.query.add("doc_ids", luxir::PluginQueryDef{
   the one positional value. Without expression arguments the type is JSON only.
 - Names are `[a-z0-9_]+` and may not be a built-in arm name.
 
+Code that inspects a parsed query tree can walk `BooleanQuery` through its
+read-only clause spans (`getMandatory`, `getOptional`, `getFilter`,
+`getProhibited`). `FuzzyQuery::rewrittenQuery(Context&)` returns the logical
+rewrite execution uses, with its expansion cap, ordering and term boosts.
+Call it with the request's context so the inspector shares the cached rewrite
+instead of scanning the dictionary again.
+
 ## Search ops
 
 `Registries::searchOps` (`src/luxir/search/SearchOpRegistry.h`) adds operations next

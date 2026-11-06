@@ -203,9 +203,20 @@ Query::Weight* CombinedFieldQuery::createWeight(
   return rewritten->createWeight(context, flags, multiplier);
 }
 
-Query::Weight* FuzzyQuery::createWeight(
-    Context& context, int32_t flags, float multiplier) {
-  Query* rewritten = rewriteToDisjunction(context);
+Query* FuzzyQuery::rewrittenQuery(Context& context) {
+  // The kept terms do not depend on flags, so every weight the request builds
+  // for this query (ranking, count, domain) and any inspector reuse one
+  // dictionary scan.
+  struct Rewrite {
+    Query* query;
+  };
+  return context.getOrCreateLogicalPlan<Rewrite>(*this, [&]() {
+    return context.pool.make<Rewrite>(rewriteToDisjunction(context));
+  }).query;
+}
+
+Query::Weight* FuzzyQuery::createWeight(Context& context, int32_t flags, float multiplier) {
+  Query* rewritten = rewrittenQuery(context);
 #ifndef NDEBUG
   if (context.logicalValidationActive()) {
     rewritten->validateLogical(context.planningContext(), multiplier);
