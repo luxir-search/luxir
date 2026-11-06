@@ -1068,6 +1068,15 @@ message ExecutionProfilePiece {
   optional sint64 domain_size = 6;
   int64 thread_id = 7;
   uint64 elapsed_us = 8;
+  // Storage reads that blocked this piece's thread on bytes not in memory, as
+  // the storage implementation reports them (see ReadWaitStats), and their
+  // summed wait.
+  uint64 blocking_reads = 10;
+  uint64 read_wait_us = 11;
+  // Major page faults on this piece's thread: mapped file pages read from
+  // disk, which a cold local index takes too. Zero where the platform does not
+  // count them per thread.
+  uint64 major_faults = 12;
 
   // Human-readable execution notes. Contents and formatting may change;
   // do not parse these entries.
@@ -1686,6 +1695,31 @@ message ServiceStats {
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
+  RemoteSearchStats remote_search = 28;
+  ReadWaitStats read_wait = 29;
+}
+
+// Searches of collections on remote storage, admitted through
+// server.remote_search_slots: at most `slots` run at once, the rest wait in
+// FIFO order without holding a thread.
+message RemoteSearchStats {
+  uint64 slots = 1;
+  uint64 running = 2;    // holding a slot now
+  uint64 queued = 3;     // waiting for a slot now
+  uint64 admitted = 4;   // started since the node opened, with or without waiting
+  uint64 waited = 5;     // of those, the ones that waited for a slot
+  uint64 cancelled = 6;  // cancelled by their transport while waiting
+  // Summed wait for a slot of the searches started.
+  double wait_seconds = 7;
+}
+
+// Storage reads that blocked a thread on bytes not in memory (a fetch from an
+// object store, a lazily loaded file), as the storage implementations report
+// them. Built-in storage reports none; mapped file reads show as major page
+// faults in ProcessStats instead.
+message ReadWaitStats {
+  uint64 blocking_reads = 1;
+  double wait_seconds = 2;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their

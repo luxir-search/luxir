@@ -673,6 +673,15 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
                       std::chrono::steady_clock::time_point startTime)
       : SearchRequest(engine, proto, arena, startTime) {}
 
+    // Only searches that may queue pay for the call's cancellation hook.  Runs
+    // on the call's cq thread (dispatch), or after a min_commit wait that
+    // already enabled it.
+    std::stop_token admissionStop() override {
+      parent->enableWaitCancellation();
+      waitCancellation = parent->waitCancellation;
+      return waitCancellation.get_token();
+    }
+
     ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
       response.proto.more = !response.last;

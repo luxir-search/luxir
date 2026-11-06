@@ -460,6 +460,16 @@ void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile
       appendInt<Int64Str>(out, piece.thread_id);
       out += R"(,"elapsed_us":)";
       appendInt<Int64Str>(out, piece.elapsed_us);
+      if (piece.blocking_reads) {
+        out += R"(,"blocking_reads":)";
+        appendInt<Int64Str>(out, piece.blocking_reads);
+        out += R"(,"read_wait_us":)";
+        appendInt<Int64Str>(out, piece.read_wait_us);
+      }
+      if (piece.major_faults) {
+        out += R"(,"major_faults":)";
+        appendInt<Int64Str>(out, piece.major_faults);
+      }
       if (!piece.details.empty()) {
         out += R"(,"details":[)";
         for (std::size_t d = 0; d < piece.details.size(); d++) {

@@ -27,6 +27,7 @@
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/proto.h"
+#include "RemoteSearchGate.h"
 
 namespace luxir {
 
@@ -61,7 +62,12 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
 public:
+  // Requested when the transport gives up on the request: cancels a min_commit
+  // wait and a wait for a remote search slot.
   std::stop_source waitCancellation{std::nostopstate};
+  // The token a wait for a remote search slot honors.  A transport that wires
+  // waitCancellation only on demand overrides this to wire it here.
+  virtual std::stop_token admissionStop() { return waitCancellation.get_token(); }
   // The request's tenant, owned for asynchronous resolution; empty is the
   // default tenant.
   std::string tenant;
@@ -110,6 +116,9 @@ public:
   // (SearchEngine::enqueueSubmit), in any max_parallel lane.  Its resumed
   // production stays off that thread too.
   bool offloaded = false;
+  // The admission slot of a search of a remote collection, held while its
+  // body runs (see SearchEngine::submitBody).
+  RemoteSearchGate::Slot remoteSlot;
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);

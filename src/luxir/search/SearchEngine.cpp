@@ -11,6 +11,9 @@
 
 namespace luxir {
 
+SearchEngine::SearchEngine(LuxirNode& node)
+    : node(node), remoteGate((uint64_t)node.getConfig().server.resolveRemoteSearchSlots(node.getWorkers())) {}
+
 const SearchConfig& SearchEngine::searchConfig() const {
   return node.getConfig().search;
 }
@@ -116,6 +119,11 @@ void SearchEngine::submitBody(SearchRequest& req) {
     }
   }
 
+  // A remote search's admission slot goes to the next waiting search now,
+  // before the final response: the body's reads are done, and a paused
+  // stream's resumed production runs without a slot (see dispatch()).
+  req.remoteSlot.reset();
+
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
@@ -123,8 +131,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
   req.bodyDone();
 }
 
-void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
-  req.offloaded = true;
+void SearchEngine::enqueueRun(SearchRequest& req, int32_t maxParallel) {
   try {
     // Isolated: a -1 request waiting on its task group helps only with its own
     // tasks, never stealing another request's.
@@ -134,15 +141,56 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
   } catch (const std::exception& e) {
     // Nothing was queued: complete the request here so its transport still
     // sees exactly one final reply.
+    req.remoteSlot.reset();
     req.setError(classifyException(e, ErrorKind::INTERNAL));
     req.bodyDone();
   }
 }
 
+void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel, bool remote) {
+  req.offloaded = true;
+  if (!remote) {
+    enqueueRun(req, maxParallel);
+    return;
+  }
+  try {
+    // A queued search holds no thread. It starts on the thread that frees a
+    // slot, which only enqueues it.
+    remoteGate.admit(req.admissionStop(),
+        [this, &req, maxParallel](RemoteSearchGate::Slot slot) {
+          req.remoteSlot = std::move(slot);
+          enqueueRun(req, maxParallel);
+        },
+        [this, &req] {
+          failOnArena(req, {ErrorKind::UNAVAILABLE, "cancelled",
+                            "search cancelled while waiting for a remote search slot"});
+        });
+  } catch (const std::exception& e) {
+    req.setError(classifyException(e, ErrorKind::INTERNAL));
+    req.bodyDone();
+  }
+}
+
+void SearchEngine::failOnArena(SearchRequest& req, ErrorInfo error) {
+  auto fail = [&req, error = std::move(error)] { req.setError(error); req.bodyDone(); };
+  try {
+    node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
+  } catch (...) {
+    fail();
+  }
+}
+
+bool SearchEngine::readsRemotely(const Collection& collection) noexcept {
+  try {
+    return collection.getShard()->getDirectory()->capabilities() & Directory::REMOTE;
+  } catch (const std::exception&) {
+    return false;  // getResources reports the unavailable collection
+  }
+}
+
 bool SearchEngine::readsRemotely(const SearchRequest& req) {
   try {
-    auto collection = node.getCollection(LuxirNode::target(req.tenant, req.proto.collection));
-    return collection->getShard()->getDirectory()->capabilities() & Directory::REMOTE;
+    return readsRemotely(*node.getCollection(LuxirNode::target(req.tenant, req.proto.collection)));
   } catch (const std::exception&) {
     return false;  // getResources reports the failed lookup, as for any collection
   }
@@ -162,17 +210,12 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
             if (!result.error) {
               req.floorCollection = result.collection;
-              enqueueSubmit(req, maxParallel);
+              enqueueSubmit(req, maxParallel, readsRemotely(*result.collection));
               return;
             }
             // CommitWaits swallows a throw from here, which would strand the
             // request: if the enqueue fails, fail the request on this thread.
-            auto fail = [&req, error = *result.error] { req.setError(error); req.bodyDone(); };
-            try {
-              node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
-            } catch (...) {
-              fail();
-            }
+            failOnArena(req, *result.error);
           });
       return;
 
@@ -184,14 +227,14 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
   }
   // 0 and -1 start on the receiving thread when its transport allows it and
   // the collection's reads cannot wait on the network.
-  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1)
-      && !readsRemotely(req);
+  bool remote = readsRemotely(req);
+  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1) && !remote;
   if (!runOnReceiver) {
     // Off the receiving thread: always for an offloading transport or a remote
     // collection, and for 1 (serial on the arena, the escape hatch for a query
     // expected to be expensive).  Other values are rejected in prepare(), on
     // the arena like 1.
-    enqueueSubmit(req, maxParallel);
+    enqueueSubmit(req, maxParallel, remote);
   } else if (maxParallel == 0) {
     // Default lane: the whole query runs serially right here on the receiving
     // transport thread.  No scheduler hop, and the arena's parked width never

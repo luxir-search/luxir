@@ -7,6 +7,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <thread>
 
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
@@ -14,6 +15,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/store/ReadWait.h"
 #include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
@@ -48,21 +50,42 @@ public:
     });
   }
 
+  bool awaitStall() { return reached.get_future().wait_for(std::chrono::seconds(60)) == std::future_status::ready; }
+  void release() { released.set_value(); }
+
   // While a thread is stalled, the server's only shard must still answer.
   void expectShardAnswers(int port) {
-    ASSERT_EQ(std::future_status::ready, reached.get_future().wait_for(std::chrono::seconds(60)));
+    ASSERT_TRUE(awaitStall());
     auto health = std::async(std::launch::async, [port] { return httpRequest(port, http::verb::get, "/health"); });
     bool answered = health.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    released.set_value();
+    release();
     EXPECT_TRUE(answered);
     EXPECT_EQ(200, health.get().result_int());
   }
 };
 
-LuxirConfig remoteConfig() {
+LuxirConfig remoteConfig(int slots = 0) {
   LuxirConfig config;
   config.store.layers = {"remote"};
+  config.server.remote_search_slots = slots;
   return config;
+}
+
+std::future<http::response<http::string_body>> searchAsync(int port, std::string body) {
+  return std::async(std::launch::async, [port, body = std::move(body)] {
+    return httpRequest(port, http::verb::post, "/collections/main/_search", body);
+  });
+}
+
+// The JSON body without whitespace, as _stats pretty-prints.
+std::string compact(std::string body) {
+  std::erase_if(body, [](char c) { return c == ' ' || c == '\n'; });
+  return body;
+}
+
+bool eventually(const std::function<bool()>& condition) {
+  for (int i = 0; i < 6000 && !condition(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  return condition();
 }
 
 }  // namespace
@@ -114,6 +137,84 @@ TEST_F(StorageExampleTest, remoteCollectionResumesProductionOffTheShard) {
   size_t count = 0;
   for (size_t pos = 0; (pos = response.body().find(R"("id":"d)", pos)) != std::string::npos; pos++) count++;
   EXPECT_EQ(2000u, count);
+  server.shutdown();
+}
+
+// With one slot, a second search of a remote collection waits without
+// starting until the first finishes, and both succeed.
+TEST_F(StorageExampleTest, remoteSearchesQueueForASlot) {
+  LuxirNode node(remoteConfig(1));
+  HttpServer server(node, 1, 0);
+  server.start();
+  int port = server.getPort();
+  auto update = httpRequest(port, http::verb::post, "/collections/main/_update", R"({"docs":[{"id":"a"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto& engine = node.getSearchEngine();
+  {
+    StalledSignal stalled("searchRootChildStart");
+    auto first = searchAsync(port, R"({"query":{"all":true}})");
+    ASSERT_TRUE(stalled.awaitStall());
+    auto second = searchAsync(port, R"({"query":{"all":true},"max_parallel":-1})");
+    EXPECT_TRUE(eventually([&] { return engine.remoteSearchStats().queued == 1; }));
+    auto stats = engine.remoteSearchStats();
+    EXPECT_EQ(1u, stats.running);
+    EXPECT_EQ(1u, stats.admitted);
+    auto nodeStats = compact(httpRequest(port, http::verb::get, "/_stats").body());
+    EXPECT_NE(std::string::npos, nodeStats.find(R"("queued":1)")) << nodeStats;
+    stalled.release();
+    EXPECT_EQ(200, first.get().result_int());
+    EXPECT_EQ(200, second.get().result_int());
+  }
+  auto stats = engine.remoteSearchStats();
+  EXPECT_EQ(0u, stats.running);
+  EXPECT_EQ(0u, stats.queued);
+  EXPECT_EQ(2u, stats.admitted);
+  EXPECT_EQ(1u, stats.waited);
+  EXPECT_GT(stats.waitNanos, 0u);
+  server.shutdown();
+}
+
+TEST_F(StorageExampleTest, failedRemoteSearchFreesItsSlot) {
+  LuxirNode node(remoteConfig(1));
+  CollectionHelper helper(node, "main");
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a")}, UpdateMessage::COMMIT).success);
+  HttpServer server(node, 1, 0);
+  server.start();
+  // Rejected while preparing, on the worker that holds the slot.
+  auto failed = searchAsync(server.getPort(), R"({"query":{"all":true},"max_parallel":2})").get();
+  EXPECT_EQ(400, failed.result_int()) << failed.body();
+  EXPECT_EQ(0u, node.getSearchEngine().remoteSearchStats().running);
+  auto next = searchAsync(server.getPort(), R"({"query":{"all":true}})").get();
+  EXPECT_EQ(200, next.result_int()) << next.body();
+  server.shutdown();
+}
+
+// A storage layer that blocks on reads records them in ReadWait: _stats sums
+// them, and a profiled search reports those taken during each piece.
+TEST_F(StorageExampleTest, blockingReadsShowInStatsAndProfile) {
+  auto config = remoteConfig();
+  config.store.options = {{"remote", {{"read_delay_us", "100"}}}};
+  auto readsBefore = ReadWait::totalReads.load();
+  LuxirNode node(config);
+  EXPECT_GT(ReadWait::totalReads.load(), readsBefore);  // startup read its files through the layer
+  CollectionHelper helper(node, "main");
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "cat_s", "x")}, UpdateMessage::COMMIT).success);
+  HttpServer server(node, 1, 0);
+  server.start();
+  auto nodeStats = compact(httpRequest(server.getPort(), http::verb::get, "/_stats").body());
+  EXPECT_NE(std::string::npos, nodeStats.find(R"("read_wait":{)")) << nodeStats;
+
+  // Segments are opened eagerly, so a read during the piece stands in for the
+  // lazy fetch of a remote store.
+  Signal::listen("searchProfilePieceStart", [](void*, void*, void*) -> void* {
+    ReadWait::record(2000000);
+    return nullptr;
+  });
+  auto response = searchAsync(server.getPort(),
+      R"({"profile":true,"ops":{"f":{"field_facet":{"field":"cat_s"}}}})").get();
+  Signal::unlisten("searchProfilePieceStart");
+  EXPECT_EQ(200, response.result_int());
+  EXPECT_NE(std::string::npos, response.body().find(R"("blocking_reads":1,"read_wait_us":2000)")) << response.body();
   server.shutdown();
 }
 

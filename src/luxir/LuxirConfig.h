@@ -32,6 +32,17 @@ struct ServerConfig {
   int workers = 0;
   static constexpr int kSmallNodeCores = 4;
 
+  // Searches of collections on remote storage (Directory::REMOTE) running at
+  // once; the rest wait in FIFO order for a slot without holding a thread.
+  // Such a search holds a worker while its reads wait on the network.  0 =
+  // auto: half the workers, at least one.
+  int remote_search_slots = 0;
+
+  int resolveRemoteSearchSlots(int resolvedWorkers) const {
+    if (remote_search_slots > 0) return remote_search_slots;
+    return std::max(1, resolvedWorkers / 2);
+  }
+
   int resolveWorkers() const {
     if (workers > 0) return workers;
     int cores = std::max(1, oneapi::tbb::info::default_concurrency());

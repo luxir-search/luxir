@@ -87,6 +87,16 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
+  const auto& remote = s.remote_search;
+  r.gauge("luxir_remote_search_slots", "Searches of remote collections allowed to run at once.", (double)remote.slots);
+  r.gauge("luxir_remote_searches_running", "Searches of remote collections holding a slot.", (double)remote.running);
+  r.gauge("luxir_remote_searches_queued", "Searches of remote collections waiting for a slot.", (double)remote.queued);
+  r.counter("luxir_remote_searches_admitted_total", "Searches of remote collections started, with or without waiting.", (double)remote.admitted);
+  r.counter("luxir_remote_searches_waited_total", "Searches of remote collections that waited for a slot before starting.", (double)remote.waited);
+  r.counter("luxir_remote_searches_cancelled_total", "Searches of remote collections cancelled while waiting for a slot.", (double)remote.cancelled);
+  r.counter("luxir_remote_search_wait_seconds_total", "Summed wait for a slot of the searches of remote collections started.", remote.wait_seconds);
+  r.counter("luxir_storage_blocking_reads_total", "Storage reads that blocked a thread on bytes not in memory, as storage reports them.", (double)s.read_wait.blocking_reads);
+  r.counter("luxir_storage_read_wait_seconds_total", "Summed wait of storage reads that blocked a thread.", s.read_wait.wait_seconds);
 }
 
 void memory(Renderer& r, const api::MemoryStats& m) {

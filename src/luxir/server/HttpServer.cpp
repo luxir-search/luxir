@@ -1916,9 +1916,8 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena, requestStart_);
-    if (!sreq->proto.min_commit.empty()) {
-      sreq->waitCancellation = waitCancellation;
-    }
+    // Cancels a min_commit wait, or a wait for a remote search slot.
+    sreq->waitCancellation = waitCancellation;
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
