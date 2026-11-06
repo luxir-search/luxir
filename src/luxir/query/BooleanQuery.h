@@ -591,6 +591,13 @@ public:
   // Test hook: use the pull DisjunctionScorer for sparse filtered term unions
   // instead of head/tail WAND candidate formation.
   static inline bool disableFilteredUnionWandForTests = false;
+  // Test hook: keep every required verifier beside a constraining optional
+  // group instead of confirming the one the plan selects inside the leading
+  // exact group (sourceGroupVerifier).
+  static inline bool disableSourceGroupingForTests = false;
+  // Test hook: group the one verifier a source group's scope admits whatever
+  // its price, to compare the grouped schedule with the flat one.
+  static inline bool forceSourceGroupingForTests = false;
   // Test hook: use pull MandNot for prohibited scored disjunctions.
   static inline bool disableBulkExclusionForTests = false;
   // Test hook: bypass prohibited membership whose benefit comes from removing

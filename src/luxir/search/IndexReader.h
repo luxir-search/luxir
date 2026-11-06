@@ -54,7 +54,7 @@ public:
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
   // find the delete file (this is not necessarily an error, the index could have changed already).
   // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
-  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
+  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
   
   // Get the underlying FixedBitSet for direct access
   const screaming::FixedBitSet& bitset() const {
@@ -132,12 +132,14 @@ public:
 class SegmentBase : public SegmentPart<PostingsReader> {
 public:
   const uint64_t segId;
+  const uint64_t creatorEpoch;
   const int32_t maxDoc;
-  SegmentBase(uint64_t segId, int32_t maxDoc, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
-              std::shared_ptr<const UnreadableHook> onUnreadable)
-      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), maxDoc(maxDoc) {}
-  SegmentBase(uint64_t segId, int32_t maxDoc, std::shared_ptr<PostingsReader> opened)
-      : SegmentPart(std::move(opened)), segId(segId), maxDoc(maxDoc) {}
+  SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, std::unique_ptr<HeldFiles> files,
+              std::shared_ptr<Metrics> metrics, std::shared_ptr<const UnreadableHook> onUnreadable)
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId),
+        creatorEpoch(creatorEpoch), maxDoc(maxDoc) {}
+  SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, std::shared_ptr<PostingsReader> opened)
+      : SegmentPart(std::move(opened)), segId(segId), creatorEpoch(creatorEpoch), maxDoc(maxDoc) {}
   std::shared_ptr<PostingsReader> get();
 };
 
@@ -145,15 +147,16 @@ public:
 class SegmentLive : public SegmentPart<LiveDocs> {
 public:
   const uint64_t segId;
+  const uint64_t creatorEpoch;
   const uint64_t liveGen;
+  const uint64_t liveEpoch;
   const int32_t maxDoc;
   const int32_t numLive;
-  SegmentLive(uint64_t segId, uint64_t liveGen, int32_t maxDoc, int32_t numLive,
-              std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+  SegmentLive(uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc,
+              int32_t numLive, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
               std::shared_ptr<const UnreadableHook> onUnreadable)
-      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), liveGen(liveGen),
-        maxDoc(maxDoc),
-        numLive(numLive) {}
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId),
+        creatorEpoch(creatorEpoch), liveGen(liveGen), liveEpoch(liveEpoch), maxDoc(maxDoc), numLive(numLive) {}
   std::shared_ptr<LiveDocs> get();
 };
 

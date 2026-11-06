@@ -9,7 +9,15 @@ if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
   if(CMAKE_HOST_APPLE)
     set(_luxir_triplet arm64-osx-luxir-m1)
   else()
-    set(_luxir_triplet x64-linux-luxir-native)
+    # CMAKE_HOST_SYSTEM_PROCESSOR is not set until project().
+    cmake_host_system_information(RESULT _luxir_host_arch QUERY OS_PLATFORM)
+    if(_luxir_host_arch STREQUAL "x86_64")
+      set(_luxir_triplet x64-linux-luxir-native)
+    elseif(_luxir_host_arch STREQUAL "aarch64")
+      set(_luxir_triplet arm64-linux-luxir-native)
+    else()
+      message(FATAL_ERROR "No native dependency triplet for ${_luxir_host_arch}")
+    endif()
   endif()
   if(LUXIR_NATIVE_DEPS STREQUAL "native")
     set(_luxir_host_triplet ${_luxir_triplet})
@@ -411,7 +419,8 @@ include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 file(GLOB_RECURSE Proj_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
-add_library(luxir_lib STATIC ${Proj_SOURCES})
+include(cmake/BuildInfo.cmake)
+add_library(luxir_lib STATIC ${Proj_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/BuildInfo.cpp")
 target_compile_definitions(luxir_lib PUBLIC
   # oneTBB preview API for task_arena::leave_policy (LuxirNode). Global so
   # every translation unit, and the precompiled headers that include
@@ -427,9 +436,7 @@ target_compile_definitions(luxir_lib PUBLIC
   LUXIR_PROBE_WRAPPER_TRIMS=$<BOOL:${LUXIR_PROBE_WRAPPER_TRIMS}>)
 
 add_executable(luxir src/luxir/main.cpp)
-target_link_libraries(luxir luxir_lib)
-set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
-  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${_luxir_cpu_name}\"")
+target_link_libraries(luxir PRIVATE luxir_lib)
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -469,6 +476,21 @@ include(cmake/hpp_proto.cmake)
 
 add_subdirectory(protos)
 add_subdirectory(test)
+
+# Compiled-in plugins (docs/dev/plugins.md). LUXIR_PLUGIN_DIRS lists directories whose
+# CMakeLists.txt call luxir_add_plugin; the in-tree test-only example is always added.
+set(LUXIR_PLUGIN_DIRS "" CACHE STRING "Semicolon-separated plugin directories compiled into the engine")
+include(cmake/LuxirPlugins.cmake)
+# Binary dirs carry the list index so two plugin dirs with one basename do not collide.
+set(_plugin_index 0)
+foreach(_plugin_dir IN LISTS LUXIR_PLUGIN_DIRS)
+  cmake_path(ABSOLUTE_PATH _plugin_dir BASE_DIRECTORY "${CMAKE_SOURCE_DIR}" NORMALIZE)
+  cmake_path(GET _plugin_dir FILENAME _plugin_base)
+  math(EXPR _plugin_index "${_plugin_index} + 1")
+  add_subdirectory("${_plugin_dir}" "${CMAKE_BINARY_DIR}/plugins/${_plugin_index}_${_plugin_base}")
+endforeach()
+add_subdirectory(test/plugins/example "${CMAKE_BINARY_DIR}/plugins/example")
+luxir_finalize_plugins()
 
 # luxir_descriptors.cpp #include "luxir_fds_data.h" (generated descriptor set); order its
 # compile after generation. The PCH no longer force-includes any generated proto header.

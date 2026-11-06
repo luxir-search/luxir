@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -844,7 +845,7 @@ TEST(FilterCacheTest, resizeZeroRacingInsertCleansWithoutAnotherRequest) {
 
 TEST(FilterCacheTest, resizeZeroRacingReaderInsertCleansWithoutAnotherRequest) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter writer(snapshots);
   addTermDoc(writer, "body");
   writer.commit();
@@ -885,7 +886,7 @@ TEST(FilterCacheTest, resizeZeroRacingReaderInsertCleansWithoutAnotherRequest) {
 
 TEST(FilterCacheTest, resizeZeroDetachesValuePublishedBeforeInsertCheck) {
   RAMDir dir;
-  CommitSnapshotRegistry snapshots(dir);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter writer(snapshots);
   // Two docs: a segment value matching every doc is never populated.
   addTermDoc(writer, "body");
@@ -1092,7 +1093,7 @@ TEST(FilterCacheTest, existingAcceptanceRevalidatesEverySegment) {
 
 TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   addTermDoc(writer, "second");
@@ -1147,7 +1148,7 @@ TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
 
 TEST(FilterCacheTest, existingReaderAcceptanceRejectsPublishedReader) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   writer.commit();
@@ -2376,7 +2377,7 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
   FilterCacheConfig config = testConfig();
   config.minSegmentDocs = 0;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
@@ -2430,7 +2431,7 @@ TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   for (int32_t doc = 0; doc < 1024; doc++) {
     addTermDoc(writer, doc == 7 ? "selected body" : "body");
@@ -2489,7 +2490,7 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 2 * DocsEnumMeta::L1_DOCS;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -2684,7 +2685,7 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
 
 TEST(FilterCacheTest, ownedAndBorrowedValuesComposeDeletesIdentically) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   for (int32_t doc = 0; doc < 8; doc++) {
     addIdTermDoc(writer, std::to_string(doc), "selected");
@@ -2777,7 +2778,7 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "selected");
   addTermDoc(writer, "other");
@@ -2829,7 +2830,7 @@ TEST(FilterCacheTest, requestStableFilterOwnsAndDeduplicatesWithoutSharedTraffic
 
 TEST(FilterCacheTest, weightCountShortcutsAreNarrowAndTransparent) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
@@ -2920,7 +2921,7 @@ TEST(FilterCacheTest,
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
@@ -3009,7 +3010,7 @@ TEST(FilterCacheTest, wholeAdmissionDiscriminatesSchemaGeneration) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
@@ -3042,7 +3043,7 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 1024;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -3123,7 +3124,7 @@ TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 1024;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -3867,7 +3868,7 @@ TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
   config.minSegmentDocs = 0;
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
@@ -3897,7 +3898,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   config.minSegmentDocs = 0;
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "a keep");
   addTermDoc(writer, "a");
@@ -3959,7 +3960,7 @@ TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
@@ -3990,7 +3991,7 @@ TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache");
   addTermDoc(writer, "cache");
@@ -4052,7 +4053,7 @@ TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
 
 TEST(FilterCacheTest, rawMaterializationEnforcesExhaustiveFlags) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "cache me");
   writer.commit();
@@ -4073,7 +4074,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected alpha");
   addIdTermDoc(writer, "1", "body selected beta");
@@ -4139,7 +4140,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected");
   addIdTermDoc(writer, "1", "body selected");
@@ -4199,7 +4200,7 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "body selected");
   addTermDoc(writer, "body");
@@ -4208,16 +4209,19 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   auto reader = writer.snapshots.readers.getReader(0);
   auto& segment = reader->segments()[0];
 
-  auto run = [&]() {
+  auto run = [&](bool prepareMandatory) {
     MemPool pool;
     Query::Context context(pool, *reader);
     TermQuery body("text_w", "body");
     TermQuery selected("text_w", "selected");
     ForcePrepareQuery preparedSelected(&selected);
-    std::array<Query*, 1> mandatory{&body};
+    ForcePrepareQuery preparedBody(&body);
+    std::array<Query*, 1> mandatory{prepareMandatory ? (Query*)&preparedBody : &body};
     std::array<Query*, 1> prohibited{&preparedSelected};
     BooleanQuery query(mandatory, {}, prohibited, {});
     auto* weight = query.createWeight(context, 0);
+    EXPECT_TRUE(weight->needsPrepare());
+    EXPECT_FALSE(weight->consumesDomain());
     Query::Weight::PrepareContext prepareContext{
         *reader, std::span<DocSet* const>{}, false, nullptr};
     auto prepared = weight->prepare(prepareContext);
@@ -4229,14 +4233,18 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   };
 
   SkipStatsScope stats;
-  auto built = run();
+  auto built = run(false);
   ASSERT_NE(nullptr, built);
   EXPECT_EQ(1, built->card());
+  EXPECT_TRUE(built->get(1));
   EXPECT_EQ(1, SkipStats::prohibitedCachePullBuilds);
   SkipStats::reset();
-  auto hit = run();
+  // A mandatory wrapper that only needs prepare must retain lazy exclusion.
+  // Folding would bypass the prohibited supplier and its existing counter.
+  auto hit = run(true);
   ASSERT_NE(nullptr, hit);
   EXPECT_EQ(1, hit->card());
+  EXPECT_TRUE(hit->get(1));
   EXPECT_EQ(1, SkipStats::prohibitedCachePullHits);
 }
 
@@ -4244,7 +4252,7 @@ TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected");
   addIdTermDoc(writer, "1", "body selected");
@@ -4313,7 +4321,7 @@ TEST(FilterCacheTest, recursiveRawBuildExceptionReleasesBothClaims) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir, config);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "body selected");
   addTermDoc(writer, "body");
@@ -4399,7 +4407,7 @@ TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
 
 TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   addTermDoc(writer, "second");
@@ -4688,7 +4696,7 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
 
 TEST(FilterCacheTest, routedAccountingOwnsRejectedReaderValue) {
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(dir);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "body");
   writer.commit();
@@ -6164,18 +6172,17 @@ TEST(FilterKeyTest, preservesNonFiniteFloatBitPatterns) {
 }
 
 TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
+  luxir::test::SearchOverridesGuard routing(KnnQuery::tuning.routing, KnnQuery::tuning.plannerCosts);
   struct PolicyRestore {
     int64_t candidates = KnnQuery::maxKnnCandidates;
-    int32_t breadth = KnnQuery::maxKnnBreadth;
-    int32_t refineCount = KnnQuery::defaultAnnRefineCount;
-    int32_t refineRatio = KnnQuery::defaultAnnRefineRatio;
+    double alpha = KnnQuery::tuning.filteredCoverageAlpha, headroom = KnnQuery::tuning.breadthHeadroom, growth = KnnQuery::tuning.breadthGrowth;
     decltype(KnnQuery::engineWrapperForTests) wrapper =
         KnnQuery::engineWrapperForTests;
     ~PolicyRestore() {
       KnnQuery::maxKnnCandidates = candidates;
-      KnnQuery::maxKnnBreadth = breadth;
-      KnnQuery::defaultAnnRefineCount = refineCount;
-      KnnQuery::defaultAnnRefineRatio = refineRatio;
+      KnnQuery::tuning.filteredCoverageAlpha = alpha;
+      KnnQuery::tuning.breadthHeadroom = headroom;
+      KnnQuery::tuning.breadthGrowth = growth;
       KnnQuery::engineWrapperForTests = std::move(wrapper);
     }
   } restore;
@@ -6209,20 +6216,27 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   EXPECT_NE(baseKey, keyFor(KnnQuery(
       "vec", vectorType, vector, 7, 3, 11, 0.25f, true)));
 
+  KnnQuery::tuning.routing = KnnQuery::Routing::FORCE_IVF;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::tuning.routing = KnnQuery::Routing::AUTO;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM]++;
+  EXPECT_NE(baseKey, keyFor(base));
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM]--;
+  EXPECT_EQ(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates++;
   EXPECT_NE(baseKey, keyFor(base));
   KnnQuery::maxKnnCandidates = restore.candidates;
-  KnnQuery::maxKnnBreadth++;
+  KnnQuery::tuning.filteredCoverageAlpha += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::maxKnnBreadth = restore.breadth;
-  KnnQuery::defaultAnnRefineCount++;
+  KnnQuery::tuning.filteredCoverageAlpha = restore.alpha;
+  KnnQuery::tuning.breadthHeadroom += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::defaultAnnRefineCount = restore.refineCount;
-  KnnQuery::defaultAnnRefineRatio++;
+  KnnQuery::tuning.breadthHeadroom = restore.headroom;
+  KnnQuery::tuning.breadthGrowth += 0.1;
   EXPECT_NE(baseKey, keyFor(base));
-  KnnQuery::defaultAnnRefineRatio = restore.refineRatio;
+  KnnQuery::tuning.breadthGrowth = restore.growth;
 
-  KnnQuery::engineWrapperForTests = [](VectorEngine&, int64_t) {
+  KnnQuery::engineWrapperForTests = [](VectorEngine&) {
     return std::unique_ptr<VectorEngine>();
   };
   EXPECT_FALSE(optionalKeyFor(base).has_value());
@@ -6232,15 +6246,16 @@ TEST(FilterKeyTest, fuzzyIsCoreStableAndIncludesEffectiveLimit) {
   FuzzyQuery fuzzy("title", "luxir", 2, 1, 0);
   FuzzyQuery boostedFuzzy("title", "luxir", 2, 1, 0, 3.0f);
   BoostQuery wrappedFuzzy(&fuzzy, 3.0f);
-  FilterKeyContext first{.schemaGen = 5, .coreGen = 10,
-                         .fuzzyMaxExpansions = 40, .timeZone = "UTC"};
+  FuzzyQuery explicitDefault("title", "luxir", 2, 1, FuzzyQuery::DEFAULT_MAX_EXPANSIONS);
+  FuzzyQuery wide("title", "luxir", 2, 1, 1000);
+  FuzzyQuery wider("title", "luxir", 2, 1, 1001);
+  FilterKeyContext first{.schemaGen = 5, .coreGen = 10, .timeZone = "UTC"};
   FilterKeyContext otherCore = first;
   otherCore.coreGen = 11;
-  FilterKeyContext otherLimit = first;
-  otherLimit.fuzzyMaxExpansions = 30;
 
   EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherCore));
-  EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherLimit));
+  EXPECT_EQ(keyFor(fuzzy, first), keyFor(explicitDefault, first));
+  EXPECT_NE(keyFor(wide, first), keyFor(wider, first));
   EXPECT_EQ(keyFor(fuzzy, first), keyFor(boostedFuzzy, first));
   EXPECT_EQ(keyFor(fuzzy, first), keyFor(wrappedFuzzy, first));
 }

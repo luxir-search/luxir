@@ -95,7 +95,7 @@ public:
     fingerprint = 0;
 
     highestDoc = -1;
-    postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
+    postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 1, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
     // writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
 
     // save the RNG state
@@ -108,7 +108,7 @@ public:
     luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
-    reader = std::make_unique<PostingsReader>(dir, 0);
+    reader = std::make_unique<PostingsReader>(dir, 0, 1);
     fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state

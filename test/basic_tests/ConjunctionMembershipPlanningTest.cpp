@@ -183,8 +183,11 @@ TEST_F(ConjunctionMembershipPlanningTest, SelectiveVerifierKeepsTermLead) {
       clauses.push_back(&selective);
       if (reverse) std::swap(clauses[1], clauses.back());
       BooleanQuery query{std::span(clauses).first(clauses.size() - 1), {}, {}, std::span(clauses).last(1)};
+      // The ranges verify behind the term; the planner orders that split.
+      std::vector<Consumption> consumption(clauses.size(), Consumption::CANDIDATES);
+      consumption[0] = Consumption::WINDOWS;
       for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
-        auto result = run(query, use, {}, {}, true, 7, N - 11, 1531);
+        auto result = run(query, use, {}, consumption, true, 7, N - 11, 1531);
         EXPECT_EQ(ids(matches, 7, N - 11), result.docs);
         EXPECT_EQ((std::vector<size_t>{0}), result.stages[0]);
         ASSERT_FALSE(result.stages[1].empty());
@@ -192,10 +195,8 @@ TEST_F(ConjunctionMembershipPlanningTest, SelectiveVerifierKeepsTermLead) {
       }
       if (!reverse) {
         std::vector<size_t> order = many ? std::vector<size_t>{0, 2, 1, 3} : std::vector<size_t>{0, 1, 2};
-        std::vector<Consumption> consumption(clauses.size(), Consumption::CANDIDATES);
-        consumption[0] = Consumption::WINDOWS;
         auto incumbent = run(query, Use::COUNT_WINDOWS, order, consumption);
-        auto selected = run(query, Use::COUNT_WINDOWS);
+        auto selected = run(query, Use::COUNT_WINDOWS, {}, consumption);
         EXPECT_EQ(incumbent.docs, selected.docs);
 #ifndef NDEBUG
         EXPECT_EQ(ids([&](int32_t doc) { return term(doc, 40) && narrow(doc) && (!many || doc < 3 * N / 4); }).size(),
@@ -290,8 +291,9 @@ TEST_F(ConjunctionMembershipPlanningTest, UnderestimatedYieldDoesNotClearLeadMar
   auto quote = supplier->quoteMembership(Query::PlanContext::fromLeadCost(N, Use::COUNT_WINDOWS));
   ASSERT_TRUE(quote);
   EXPECT_LT(quote->matches, (double)ids(matches).size() / 2);
+  std::array<Consumption, 2> split{Consumption::WINDOWS, Consumption::CANDIDATES};
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
-    auto result = run(query, use);
+    auto result = run(query, use, {}, split);
     EXPECT_EQ((std::vector<size_t>{0}), result.stages[0]);
     EXPECT_EQ(ids([&](int32_t doc) { return term(doc, 45) && matches(doc); }), result.docs);
   }
@@ -317,8 +319,9 @@ TEST_F(ConjunctionMembershipPlanningTest, AdverseYieldRejectsAnOtherwiseCheaperL
   demand.demand.candidates = (int64_t)std::ceil(newProduction->matches);
   auto newPlan = newProduction->work + oldLead->quoteMembership(demand)->work;
   ASSERT_LE(newPlan, 0.75 * oldPlan);
+  std::array<Consumption, 2> split{Consumption::WINDOWS, Consumption::CANDIDATES};
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
-    auto result = run(query, use);
+    auto result = run(query, use, {}, split);
     EXPECT_EQ((std::vector<size_t>{0}), result.stages[0]);
     EXPECT_EQ(ids([](int32_t doc) { return b(doc) >= 10000 && b(doc) < 90000 && a(doc) >= 25000 && a(doc) < 75000; }), result.docs);
   }
@@ -432,6 +435,36 @@ TEST_F(ConjunctionMembershipPlanningTest, OpaqueDomainsScoredAndPullDoNotUseTheP
       }
     }
   }
+}
+
+
+TEST_F(ConjunctionMembershipPlanningTest, VerifyingRangeLeadCostIsItsApproximation) {
+  // A verifying column range estimates its matches but iterates every
+  // document with a value; its plan costs the latter, which conjunctions
+  // order their clauses by.
+  NumericPredicateQuery range("a_i", 0, 9999);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto* plan = resolveScorerPlanForTests(pool, *supplier, 1);
+  ASSERT_EQ(Query::ReportedTwoPhase::YES, plan->shape().reportedTwoPhase);
+  EXPECT_LT(supplier->cost(), N);
+  EXPECT_EQ(N, plan->cost());
+
+  // A Boolean costs what it iterates: its term lead, ahead of the range.
+  TermQuery t10("body_w", "t10");
+  std::array<Query*, 1> terms{&t10};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query(terms, {}, {}, filters);
+  auto* boolean = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, boolean);
+  auto* booleanPlan = resolveScorerPlanForTests(pool, *boolean, N);
+  EXPECT_EQ((int64_t)ids([](int32_t doc) { return term(doc, 10); }).size(), booleanPlan->cost());
+  auto* scorer = booleanPlan->build(pool);
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  EXPECT_EQ(ids([](int32_t doc) { return term(doc, 10) && a(doc) < 10000; }), docs);
 }
 
 } // namespace

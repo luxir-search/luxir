@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <format>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -44,6 +46,13 @@ public:
       if (summary::termMatch(view, field, term) != MatchState::EMPTY) return MatchState::UNKNOWN;
     }
     return MatchState::EMPTY;
+  }
+
+  bool capsExpansions() const override { return false; }
+
+  std::string describe() const override {
+    return std::format("terms query of {} terms on field '{}'",
+                       terms.size(), field);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

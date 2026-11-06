@@ -168,6 +168,39 @@ protected:
   }
 };
 
+TEST_F(EmitDocsTest, invalidExtraNamesFailBeforeEmission) {
+  CollectionHelper helper;
+  auto req = localReq(helper.getSearchEngine());
+  api::DocList list;
+  bool started = false;
+  std::span<const std::string_view> fields;
+  auto emit = [&](std::span<const ExtraColumn> extras) {
+    emitDocsResponse(*req.get(), 0, [&](SearchResponse*) -> api::DocList& {
+      started = true;
+      return list;
+    }, 1, [](int64_t) { return segdoc(0, 0); }, [](int64_t) { return 0.0f; },
+    1, fields, 0, 0, false, false, api::DocFormat::COLUMNS, DocEmission::FINAL_RESPONSE, {}, false, extras);
+  };
+  ExtraColumn extra{"_rank", [](int64_t, api::Val& out, std::pmr::memory_resource&) { out.kind = (int64_t)1; }};
+  ExtraColumn duplicates[] = {extra, extra};
+  EXPECT_THROW(emit(duplicates), std::logic_error);
+  for (auto name : {"_score_", "_version_"}) {
+    extra.name = name;
+    EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  }
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "price_i", 17)}, UpdateMessage::COMMIT).success);
+  req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  req->schema = req->reader->schema();
+  extra.name = "price_i";
+  EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  std::string_view wildcard = "*";
+  fields = std::span<const std::string_view>(&wildcard, 1);
+  EXPECT_THROW(emit(std::span<const ExtraColumn>(&extra, 1)), RequestError);
+  EXPECT_FALSE(started);
+  EXPECT_TRUE(list.columns.empty());
+  EXPECT_TRUE(req->responses.empty());
+}
+
 TEST_F(EmitDocsTest, siblingFailureDuringColumnLoads) {
   for (bool onCaller : {false, true}) {
     for (bool finalBatch : {false, true}) siblingFailure(onCaller, finalBatch, false);
