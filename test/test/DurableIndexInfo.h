@@ -42,6 +42,7 @@ inline std::vector<api::FileDescriptor> manifestFiles(const api::IndexInfo& info
     for (const auto& overlay : segment.overlays) append(overlay.files);
   }
   for (const auto& aux : info.aux_indexes) append(aux.files);
+  files.push_back(info.schema_file);
   return files;
 }
 
@@ -61,7 +62,7 @@ inline std::vector<std::string> fileNames(std::span<const api::FileDescriptor> f
 inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
   for (const auto& seg : info.segments) {
     std::set<std::string> expected;
-    auto id = Postings::getSortableString(seg.seg_id);
+    auto id = Postings::segmentKey(seg.seg_id, seg.creator_epoch);
     auto first = dir.openFile(Postings::getIndexFileName(id, 0));
     ASSERT_NE(nullptr, first);
     auto input = first->getInputStream();
@@ -71,7 +72,7 @@ inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
     input.readVint(); // maxDoc
     auto count = input.readVint();
     for (uint32_t i = 0; i < count; i++) expected.insert(Postings::getIndexFileName(id, input.readVint()));
-    if (seg.live_gen) expected.insert(Postings::getLiveDocsFileName(id, seg.live_gen));
+    if (seg.live_gen) expected.insert(Postings::getLiveDocsFileName(id, seg.live_gen, seg.live_epoch));
     auto names = fileNames(seg.files);
     EXPECT_EQ(expected, std::set<std::string>(names.begin(), names.end()));
   }

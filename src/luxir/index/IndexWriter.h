@@ -22,6 +22,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
+#include "luxir/store/IncarnationState.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -51,6 +52,10 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
+    uint64_t creatorEpoch;
+    uint64_t initialLiveGen = 0;
+    uint64_t initialLiveEpoch;
+    uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
@@ -82,8 +87,8 @@ public:
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
     std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
-    // Schema generation this segment was indexed under.
-    uint64_t schemaGen = 0;
+    // Oldest input schema binding; merging does not backfill fields.
+    SchemaBinding schema;
 
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
@@ -106,22 +111,22 @@ public:
     std::vector<AuxInfo> auxOverlays;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
+    uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
-    // firendly name for logs that match the segment filenames for easier debugging.
-    static std::string name(uint64_t segId) {
-      return Postings::getIndexFileNamePrefix(segId);
-    }
+    SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
+      : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
+        maxDoc(nDocs), liveDocs(nDocs) {}
 
+    // Friendly name for logs that matches the segment filenames.
     std::string name() const {
-      return name(segId);
+      return "s" + Postings::segmentKey(segId, creatorEpoch);
     }
   };
 
 
 inline std::string format_as(const SegInfo& seg) {
   return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schemaGen, seg.personalDeletes.size());
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schema.generation(), seg.personalDeletes.size());
 }
 
 
@@ -139,6 +144,8 @@ class IndexWriter {
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t completedUpdateVersion = 0; // indexMutex
+  IncarnationState writerState;
+  uint64_t writerEpoch = 0;
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 
@@ -418,6 +425,7 @@ public:
   // Schema generation read from IndexInfo on startup and advanced only after
   // a new commit is durable. Protected by indexMutex.
   uint64_t schemaGen_ = 0;
+  uint64_t nextSchemaVersion = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // manifest. Both commit and schema publication update these under

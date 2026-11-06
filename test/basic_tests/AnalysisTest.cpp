@@ -335,21 +335,27 @@ TEST_F(AnalysisTest, chainKeyword) {
 }
 
 // The registry is the only path from a name to a stage: an unknown name (the
-// old "nocopy_whitespace" alias is gone) is a teaching error naming the valid set.
+// old "nocopy_whitespace" alias is gone) is a teaching error naming the valid set,
+// sorted (the example plugin's "example_reverse" is registered in this binary).
 TEST_F(AnalysisTest, unknownComponentIsRejected) {
   try {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "nocopy_whitespace");
     FAIL() << "unknown tokenizer accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_EQ("unknown tokenizer 'nocopy_whitespace'; valid tokenizers: whitespace, keyword, unicode_word",
-              std::string(e.what()));
+    // compiled-in plugins add their own components to the valid list
+    std::string msg = e.what();
+    EXPECT_TRUE(msg.starts_with("unknown tokenizer 'nocopy_whitespace'; valid tokenizers: ")) << msg;
+    for (const char* name : {"keyword", "unicode_word", "whitespace"})
+      EXPECT_NE(std::string::npos, msg.find(name)) << msg;
   }
   try {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"stemmer"});
     FAIL() << "unknown filter accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold, english_possessive, kstem, stop",
-              std::string(e.what()));
+    std::string msg = e.what();
+    EXPECT_TRUE(msg.starts_with("unknown filter 'stemmer'; valid filters: ")) << msg;
+    for (const char* name : {"english_possessive", "example_reverse", "fold", "kstem", "lowercase", "nfkc_cf", "stop"})
+      EXPECT_NE(std::string::npos, msg.find(name)) << msg;
   }
 }
 
@@ -1053,4 +1059,40 @@ TEST_F(AnalysisTest, wordSegmentationIsAllocationFree) {
   EXPECT_EQ(0, uniAllocs);
   EXPECT_GT(asciiBytes, 0u);  // the loops really produced segments
   EXPECT_GT(uniBytes, 0u);
+}
+
+namespace {
+
+std::unique_ptr<TokenChain> chainOf(std::string_view json) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::AnalyzerDef def;
+  std::string err;
+  if (!api::read_json(def, json, arena, &err)) throw std::runtime_error(err);
+  return Analyzer::compile(def)->createChain();
+}
+
+}  // namespace
+
+TEST_F(AnalysisTest, builtinPresetsAnalyze) {
+  auto english = chainOf(R"({"name":"english"})");
+  EXPECT_EQ((std::vector<std::string>{"winter", "tale", "pony"}), analyze(*english, "Winter's TALE Ponies").terms);
+  auto standard = chainOf(R"("standard")");
+  EXPECT_EQ((std::vector<std::string>{"winter's", "tale", "ponies"}), analyze(*standard, "Winter's TALE Ponies").terms);
+}
+
+// The example plugin's strip_x char filter runs before the tokenizer, maps
+// offsets back to the source and takes part in multiterm normalization.
+TEST_F(AnalysisTest, pluginCharFilterOffsetsAndNormalization) {
+  auto chain = chainOf(R"({"name":"example"})");  // char filter strip_x, then lowercase + reverse
+  auto out = analyze(*chain, "Hxello wxorld");
+  EXPECT_EQ((std::vector<std::string>{"olleh", "dlrow"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 7}), (std::vector<int>{chain->sourceOffset(out.starts[0], false),
+                                                         chain->sourceOffset(out.starts[1], false)}));
+  EXPECT_EQ((std::vector<int>{6, 13}), (std::vector<int>{chain->sourceOffset(out.ends[0], true),
+                                                          chain->sourceOffset(out.ends[1], true)}));
+  EXPECT_EQ((std::vector<std::string>{"ba"}), analyze(*chain, "xx ab").terms);
+  EXPECT_TRUE(analyze(*chain, "xxx").terms.empty());
+  std::string term = "HxELLO";
+  chain->normalizeTerm(term);  // strip_x (normalizing), then lowercase, then reverse
+  EXPECT_EQ("olleh", term);
 }

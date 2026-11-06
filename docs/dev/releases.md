@@ -12,8 +12,10 @@ runtime-selected kernels. Debug and ASan downloads target v2.
 
 ## Build and validate
 
-Run builds sequentially. Save configure/build/test output to logs and inspect
-compiler warnings and any test failures.
+Commit the release changes first. Executables embed the source commit, so a
+later commit leaves every build stale. Run builds sequentially. Save
+configure/build/test output to logs and inspect compiler warnings and any test
+failures.
 
 ```bash
 for preset in container-release container-release-v3 container-release-v4 \
@@ -46,8 +48,8 @@ families. First verify the checker rejects deliberate forbidden instructions.
 
 ## Package
 
-Commit the release changes after validation. `tools/package-release` requires a
-clean checkout and an up-to-date build. It packages the tested executable, checking its version,
+`tools/package-release` requires a clean checkout and an up-to-date build. It
+packages the tested executable, checking its version, embedded source commit,
 required-ISA note, dynamic libraries, and glibc symbol requirements. It does not
 replace the test and CPU validation above. Record the immutable builder image:
 

@@ -678,6 +678,22 @@ public:
         return minCost < 0 ? 0 : minCost;
       }
 
+      // A two-phase conjunction flattens the phrase into its estimate's
+      // conjunction terms.
+      void approximationCosts(
+          MemPool& planPool, const Query::PlanContext& context,
+          boost::container::small_vector_base<int64_t>& out) override {
+        const EstimateMemo& estimate = estimateMemo(planPool, context);
+        if (!estimate.nonempty || context.disableBooleanTwoPhaseForTests) {
+          out.push_back(cost());
+          return;
+        }
+        for (int32_t ordinal : estimate.conjunctionOrder) {
+          int32_t source = estimate.querySlotSources[(size_t)ordinal];
+          out.push_back(weight.cachedTermInfos[(size_t)source]->docFreq(segment.ord));
+        }
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.phraseDisableShapesForTests) return {};

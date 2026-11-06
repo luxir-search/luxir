@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/query/BooleanWeight.h"
+#include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
@@ -347,29 +349,150 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   }
 }
 
+TEST_F(RangeFilterTest, MultivaluedZonesPriceTheirDocumentVisits) {
+  // Two values per document: zones combine every document's values, far
+  // below verifying them all and far above verifying a few.
+  NumericPredicateQuery range("cluster_is", 4096, 28671);
+  for (auto [candidates, verifies] : {std::pair{int64_t{64}, true}, {int64_t{N}, false}}) {
+    SCOPED_TRACE(candidates);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(
+        candidates, N, Use::COUNT_WINDOWS));
+    build.membershipConsumption = Consumption::EITHER;
+    auto* scorer = supplier->resolve(pool, build)->build(pool);
+    if (verifies) {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
+          IntColReader::SparseIterator>*>(scorer));
+    } else {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
+    }
+  }
+}
+
+struct PullRun {
+  std::vector<int32_t> docs;
+  int64_t zoneArms;
+  int64_t verifyArms;
+  // Verified candidates per range, keyed by its upper bound.
+  std::map<int64_t, int64_t> verified;
+};
+
+static PullRun pullRun(IndexReader& reader, Query& query) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader.segments()[0]);
+  EXPECT_NE(nullptr, supplier);
+  if (supplier == nullptr) return {};
+  PullRun run;
+  NumericVerificationObserver observe([&](const NumericPredicateQuery& leaf, int32_t) {
+    run.verified[leaf.getHi()]++;
+  });
+  SkipStatsScope stats;
+  auto* scorer = buildScorerForTests(pool, *supplier, reader.maxDoc());
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    run.docs.push_back(doc);
+  }
+  run.zoneArms = SkipStats::numericPredicateZoneArms;
+  run.verifyArms = SkipStats::numericPredicateSparseVerifyArms;
+  return run;
+}
+
+TEST_F(RangeFilterTest, PullConjunctionKeepsAProducingRange) {
+  // Two point-less multivalued ranges, each cheap to verify against the
+  // other's matches and dear to produce. Each prices the other as producing;
+  // if both verified, the conjunction would lead on every document with a
+  // value. The narrower one produces and leads, so the other verifies only
+  // its matches.
+  NumericPredicateQuery narrow("cluster_is", 4096, 4607), wide("cluster_is", 4096, 5119);
+  std::array<Query*, 2> filters{&narrow, &wide};
+  BooleanQuery query({}, {}, {}, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) expected.push_back(doc);
+  PullRun run = pullRun(*reader, query);
+  EXPECT_EQ(expected, run.docs);
+  EXPECT_EQ(1, run.zoneArms);
+  EXPECT_EQ(1, run.verifyArms);
+#ifndef NDEBUG
+  EXPECT_LE(run.verified[5119], (int64_t)expected.size());
+#endif
+}
+
+TEST_F(RangeFilterTest, VerifyingRangeFollowsACostlierTermLead) {
+  // The range estimates fewer matches than the term has postings, but a
+  // verifier iterates every document with a value: the plan costs the term,
+  // which leads the conjunction.
+  NumericPredicateQuery range("cluster_is", 4096, 4607);
+  TermQuery term("body_w", "dense_a");
+  std::array<Query*, 1> mandatory{&term};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query(mandatory, {}, {}, filters);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto* plan = resolveScorerPlanForTests(pool, *supplier, N);
+  EXPECT_EQ(N / 16, plan->cost());
+  auto* scorer = plan->build(pool);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  using Verifier = NumericPredicateQuery::PredicateScorer<IntColReader::SparseIterator>;
+  EXPECT_EQ(nullptr, dynamic_cast<Verifier*>(clauses[0]));
+  EXPECT_NE(nullptr, dynamic_cast<Verifier*>(clauses[1]));
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) if (doc % 16 == 0) expected.push_back(doc);
+  EXPECT_EQ(expected, docs);
+}
+
+TEST_F(RangeFilterTest, LoneRangeVerifiesAgainstItsOwnApproximation) {
+  // With no other approximation a verifying range leads on every document
+  // with a value, not on its own match estimate, so it produces.
+  NumericPredicateQuery range("cluster_is", 4096, 4607);
+  TermQuery b("body_w", "b");
+  std::array<Query*, 1> prohibited{&b};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query({}, {}, prohibited, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) if (doc % 3 != 0) expected.push_back(doc);
+  PullRun run = pullRun(*reader, query);
+  EXPECT_EQ(expected, run.docs);
+  EXPECT_EQ(1, run.zoneArms);
+  EXPECT_EQ(0, run.verifyArms);
+  // Describing prices the same demand, so it reports no verification.
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  EXPECT_EQ(Query::VerificationWork::ABSENT,
+            supplier->verificationWork(supplier->makePlanContext(Query::Demand::fromLeadCost(N))));
+}
+
 TEST_F(RangeFilterTest, EitherPricesPointProductionAgainstSurvivorVerification) {
-  // Half the docs: 16,384 points into a 512-word bitset, 16,896 point
-  // emissions against 24 per verified survivor and 4 per spared alignment.
-  // Unknown survivors keep 8 per raw candidate.
+  // Half the docs: 16,384 points into a 512-word bitset, about 16,461 point
+  // emissions against a price per verified survivor plus the consumer's
+  // spared work. Unknown survivors verify every candidate.
   struct Case {
     int64_t candidates;
     double survivors;
-    double alignments;
+    double spared;
     bool verifies;
   };
   NumericPredicateQuery range("points_i", 0, N - 1);
-  for (auto [candidates, survivors, alignments, verifies] : {
-           Case{1000, 1000, 0, false}, Case{1000, 100, 0, true},
-           Case{600, 600, 0, true}, Case{600, 600, 1800, false},
-           Case{1000, -1, 0, true}, Case{3000, -1, 0, false}}) {
-    SCOPED_TRACE(::testing::Message() << candidates << " " << survivors << " " << alignments);
+  for (auto [candidates, survivors, spared, verifies] : {
+           Case{4000, 4000, 0, false}, Case{4000, 200, 0, true},
+           Case{200, 200, 0, true}, Case{200, 200, 30000, false},
+           Case{200, -1, 0, true}, Case{4000, -1, 0, false}}) {
+    SCOPED_TRACE(::testing::Message() << candidates << " " << survivors << " " << spared);
     MemPool pool;
     Query::Context context(pool, *reader);
     auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
     ASSERT_EQ(N / 2, supplier->cost());
     auto demand = Query::Demand::fromCandidatesAndSpan(candidates, N, Use::COUNT_WINDOWS);
     demand.expectedCandidates = survivors;
-    demand.precedingAlignments = alignments;
+    demand.sparedWork = spared;
     auto build = supplier->makePlanContext(demand);
     build.membershipConsumption = Consumption::EITHER;
     EXPECT_EQ(verifies ? Consumption::CANDIDATES : Consumption::WINDOWS,
@@ -404,6 +527,423 @@ TEST_F(RangeFilterTest, EitherProducesBroadUnionsAndVerifiesRareOnes) {
     EXPECT_EQ(verifies ? 1 : 0, SkipStats::numericPredicateSparseVerifyArms);
     EXPECT_EQ(verifies ? 0 : 1, SkipStats::numericPredicatePointsArms);
   }
+}
+
+TEST_F(RangeFilterTest, ProducedFiltersFaceAUnionAsTheirIntersection) {
+  // Two produced ranges intersect to about 512 docs (estimated 1,024), fewer
+  // than the union's 1,280 candidates, although each alone has more: they
+  // lead as one nested conjunction instead of each facing the union.
+  NumericPredicateQuery spread("points_i", 0, 4095);          // 2,048 docs
+  NumericPredicateQuery run("proof_points_i", 4096, 12287);   // 8,192 docs
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> optional{&a, &c};
+  std::array<Query*, 2> filters{&spread, &run};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  EXPECT_NE(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]));
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4096; doc < 12288; doc++) {
+    bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
+    if (body && 2 * ((doc * 1543) % N) <= 4095) expected.push_back(doc);
+  }
+  EXPECT_EQ(expected, docs);
+}
+
+TEST_F(RangeFilterTest, CachedFiltersUnderTopKFaceAUnionAsTheirIntersection) {
+  // The filter cache admits both ranges on their second sighting and serves
+  // them as prepared doc sets from the third. Under top-k pruning they nest
+  // as one unpruned conjunction ahead of the union (their ~512-doc
+  // intersection, estimated 1,024, is below the union's 1,280 candidates),
+  // and rank exactly as the uncached plan does.
+  NumericPredicateQuery spread("points_i", 0, 4095), run("proof_points_i", 4096, 12287);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> optional{&a, &c};
+  std::array<Query*, 2> filters{&spread, &run};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  auto cached = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto collect = [&](IndexReader& source, bool expectNested) {
+    MemPool pool;
+    Query::Context context(pool, source);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, source.segments()[0]);
+    EXPECT_NE(nullptr, supplier);
+    std::vector<std::pair<int32_t, float>> out;
+    if (supplier == nullptr) return out;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+    if (expectNested) {
+      auto clauses = scorer->flatConjunctionScorers();
+      EXPECT_EQ(2u, clauses.size());
+      auto* nested = clauses.empty() ? nullptr
+          : dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]);
+      EXPECT_NE(nullptr, nested);
+      if (nested != nullptr) {
+        for (auto* clause : nested->flatConjunctionScorers()) {
+          EXPECT_NE(nullptr, dynamic_cast<QueryPrep::DocSetScorer*>(clause));
+        }
+      }
+    }
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      out.emplace_back(doc, scorer->score());
+    }
+    return out;
+  };
+  auto expected = collect(*reader, false);
+  EXPECT_FALSE(expected.empty());
+  collect(*cached, false);
+  collect(*cached, false);
+  EXPECT_EQ(expected, collect(*cached, true));
+}
+
+TEST_F(RangeFilterTest, LonePreparedFilterUnderTopKStaysFlat) {
+  // One prepared filter beside a union under pruning keeps its flat place in
+  // the group's conjunction.
+  NumericPredicateQuery spread("points_i", 0, 4095);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  ForcePrepareQuery prepareA(&a);
+  std::array<Query*, 2> optional{&prepareA, &c};
+  std::array<Query*, 1> filters{&spread};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  Query::Weight::PrepareContext prepareContext{*reader, std::span<DocSet* const>{}, false, nullptr};
+  auto preparedWeight = weight->prepare(prepareContext);
+  auto* supplier = preparedWeight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto clauses = resolveScorerPlanForTests(pool, *supplier, N)->build(pool)->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  for (auto* clause : clauses) {
+    EXPECT_EQ(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clause));
+  }
+}
+
+namespace {
+
+// The selector's own schedule, the flat one, or the grouped one wherever a
+// source group's scope admits a verifier.
+enum class Schedule { RULE, FLAT, GROUPED };
+
+struct ScheduleGuard {
+  bool disable = BooleanQuery::disableSourceGroupingForTests;
+  bool force = BooleanQuery::forceSourceGroupingForTests;
+  explicit ScheduleGuard(Schedule schedule) {
+    BooleanQuery::disableSourceGroupingForTests = schedule == Schedule::FLAT;
+    BooleanQuery::forceSourceGroupingForTests = schedule == Schedule::GROUPED;
+  }
+  ~ScheduleGuard() {
+    BooleanQuery::disableSourceGroupingForTests = disable;
+    BooleanQuery::forceSourceGroupingForTests = force;
+  }
+};
+
+// Every live pull hit per segment with its score, and the verifiers grouped
+// and posting blocks decoded on the way.
+struct ScheduleRun {
+  std::vector<std::tuple<int32_t, int32_t, float>> hits;
+  int64_t grouped = 0;
+  int64_t blocks = 0;
+};
+
+ScheduleRun scheduleRun(IndexReader& source, Query& query, Schedule schedule,
+                int flags = Query::NEED_SCORES, bool prepare = false) {
+  ScheduleGuard guard(schedule);
+  SkipStatsScope stats;
+  ScheduleRun run;
+  MemPool pool;
+  Query::Context context(pool, source);
+  auto* weight = query.createWeight(context, flags);
+  std::unique_ptr<Query::Weight::PreparedWeight> prepared;
+  if (prepare) {
+    Query::Weight::PrepareContext prepareContext{source, std::span<DocSet* const>{}, false, nullptr};
+    prepared = weight->prepare(prepareContext);
+  }
+  for (auto& segment : source.segments()) {
+    auto* supplier = prepared ? prepared->scorerSupplier(pool, segment)
+                              : weight->scorerSupplier(pool, segment);
+    if (supplier == nullptr) continue;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, segment.maxDoc())->build(pool);
+    if (scorer == nullptr) continue;
+    auto* live = segment.liveDocs();
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      if (live != nullptr && !live->docset().get(doc)) continue;
+      float score = (flags & Query::NEED_SCORES) ? scorer->score() : 0.0f;
+      run.hits.emplace_back((int32_t)segment.ord, doc, score);
+    }
+  }
+  run.grouped = SkipStats::conjSourceGroupedVerifiers;
+  run.blocks = SkipStats::docBlocksDecoded;
+  return run;
+}
+
+// The grouped schedule returns the flat one's hits, scores and order; and
+// groups only where expected.
+void expectGroupedMatchesFlat(IndexReader& source, Query& query, bool groups,
+                              int flags = Query::NEED_SCORES) {
+  ScheduleRun flat = scheduleRun(source, query, Schedule::FLAT, flags);
+  ScheduleRun grouped = scheduleRun(source, query, Schedule::GROUPED, flags);
+  EXPECT_EQ(0, flat.grouped);
+  EXPECT_EQ(groups, grouped.grouped > 0);
+  EXPECT_FALSE(flat.hits.empty());
+  EXPECT_EQ(flat.hits, grouped.hits);
+}
+
+} // namespace
+
+TEST_F(RangeFilterTest, LeadingFiltersConfirmRejectingVerifiersBeforeTheUnion) {
+  // Grouped: a sparse produced range (128 docs across the segment) leads a
+  // dense union (341 posting blocks); a verifier estimated to reject most of
+  // its documents (it rejects half) joins it, and the union decodes fewer
+  // blocks reaching only confirmed ones. Beside: two produced ranges whose
+  // intersection lies in one docid window lead a sparse union, whose few
+  // blocks there decode either way; the verifier stays beside.
+  NumericPredicateQuery sparse("points_i", 0, 255), spread("points_i", 0, 4095);
+  NumericPredicateQuery run("proof_points_i", 4096, 12287);
+  NumericPredicateQuery rejecting("column_i", 0, 127), window("column_i", 2048, 6000);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> dense{&pad, &b}, rare{&a, &c};
+  std::array<Query*, 2> groupedFilters{&sparse, &rejecting};
+  std::array<Query*, 3> besideFilters{&spread, &run, &window};
+  BooleanQuery groupedQuery({}, dense, {}, groupedFilters, 1);
+  BooleanQuery besideQuery({}, rare, {}, besideFilters, 1);
+  for (bool grouped : {true, false}) {
+    SCOPED_TRACE(grouped);
+    BooleanQuery& query = grouped ? groupedQuery : besideQuery;
+    ScheduleRun flat = scheduleRun(*reader, query, Schedule::FLAT);
+    ScheduleRun rule = scheduleRun(*reader, query, Schedule::RULE);
+    EXPECT_EQ(grouped, rule.grouped > 0);
+    EXPECT_EQ(flat.hits, rule.hits);
+    if (grouped) {
+      EXPECT_LT(rule.blocks, flat.blocks);
+    }
+    std::vector<int32_t> docs, expected;
+    for (auto [segment, doc, score] : rule.hits) docs.push_back(doc);
+    for (int32_t doc = 0; doc < N; doc++) {
+      int64_t value = 2 * ((doc * 1543) % N);
+      bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
+      if (grouped ? value <= 127
+                  : body && doc >= 4096 && doc < 12288 && value >= 2048 && value <= 4095) {
+        expected.push_back(doc);
+      }
+    }
+    EXPECT_EQ(expected, docs);
+  }
+}
+
+TEST_F(RangeFilterTest, NonrejectingVerifierStaysBesideADenseUnion) {
+  // A verifier expected to pass every document spares the union nothing, and
+  // a union holding every source document costs it no checks beside: the
+  // flat schedule stays, though the shape admits grouping.
+  NumericPredicateQuery sparse("points_i", 0, 255), everything("column_i", 1, 2 * N);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &everything};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  ScheduleRun rule = scheduleRun(*reader, query, Schedule::RULE);
+  EXPECT_EQ(0, rule.grouped);
+  EXPECT_EQ(scheduleRun(*reader, query, Schedule::FLAT).hits, rule.hits);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, CachedSourceWithUncachedVerifierStaysFlat) {
+  // A prepared doc set knows its count but not where its documents lie, so
+  // it cannot lead a source group; the uncached verifier stays beside.
+  NumericPredicateQuery sparse("points_i", 0, 255), rejecting("column_i", 0, 127);
+  ForcePrepareQuery prepared(&sparse);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&prepared, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  for (Schedule schedule : {Schedule::RULE, Schedule::GROUPED}) {
+    ScheduleRun run = scheduleRun(*reader, query, schedule, Query::NEED_SCORES, true);
+    EXPECT_EQ(0, run.grouped);
+    EXPECT_EQ(scheduleRun(*reader, query, Schedule::FLAT, Query::NEED_SCORES, true).hits, run.hits);
+  }
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatWithExclusions) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), excluded("body_w", "excluded");
+  std::array<std::string_view, 2> terms{"dense_a", "dense_b"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  std::array<Query*, 2> dense{&pad, &b}, prohibited{&excluded, &phrase};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, prohibited, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatBesideAScoredRequiredTerm) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery b("body_w", "b"), pad("body_w", "pad"), denseA("body_w", "dense_a");
+  std::array<Query*, 1> mandatory{&b};
+  std::array<Query*, 2> optional{&pad, &denseA};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query(mandatory, optional, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatUnderAnActiveThreshold) {
+  // Top 10 with pruning: the grouped schedule keeps the flat one's results.
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), a("body_w", "a");
+  std::array<Query*, 3> optional{&pad, &b, &a};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  int64_t grouped = 0;
+  auto topK = [&](Schedule schedule) {
+    ScheduleGuard guard(schedule);
+    SkipStatsScope stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    TopDocsCollector collector(10);
+    auto& segment = reader->segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(nullptr, supplier);
+    if (supplier != nullptr) {
+      auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+      collectTopK(segment.ord, scorer, nullptr, nullptr, collector, true);
+    }
+    std::vector<std::pair<int32_t, float>> out;
+    for (const auto& hit : collector.scoreDocs()) out.emplace_back(hit.doc.docId(), (float)hit.score);
+    grouped = SkipStats::conjSourceGroupedVerifiers;
+    return out;
+  };
+  auto flat = topK(Schedule::FLAT);
+  EXPECT_EQ(0, grouped);
+  EXPECT_EQ(10u, flat.size());
+  EXPECT_EQ(flat, topK(Schedule::GROUPED));
+  EXPECT_LT(0, grouped);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceResetsLikeFlat) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  int64_t grouped = 0;
+  auto replay = [&](Schedule schedule) {
+    ScheduleGuard guard(schedule);
+    SkipStatsScope stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    std::vector<int32_t> docs;
+    EXPECT_NE(nullptr, supplier);
+    if (supplier == nullptr) return docs;
+    auto* plan = resolveScorerPlanForTests(pool, *supplier, N);
+    EXPECT_TRUE(plan->supportsReset());
+    auto* scorer = plan->build(pool);
+    for (int i = 0; i < 3 && scorer->next() != PostingsReader::END; i++) {}
+    scorer->reset();
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+    grouped = SkipStats::conjSourceGroupedVerifiers;
+    return docs;
+  };
+  auto flat = replay(Schedule::FLAT);
+  EXPECT_EQ(0, grouped);
+  EXPECT_FALSE(flat.empty());
+  EXPECT_EQ(flat, replay(Schedule::GROUPED));
+  EXPECT_LT(0, grouped);
+  std::vector<int32_t> fresh;
+  for (auto [segment, doc, score] : scheduleRun(*reader, query, Schedule::FLAT, 0).hits) fresh.push_back(doc);
+  EXPECT_EQ(fresh, flat);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceIntersectionMatchesFlat) {
+  // Two produced ranges intersect as the group's source and a verifier
+  // confirms behind them; a sparse union leaps the group forward, so its
+  // inner conjunction serves advances, not just next().
+  NumericPredicateQuery spread("points_i", 0, 4095), run("proof_points_i", 4096, 12287);
+  NumericPredicateQuery window("column_i", 2048, 6000);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> rare{&a, &c};
+  std::array<Query*, 3> filters{&spread, &run, &window};
+  BooleanQuery query({}, rare, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+  expectGroupedMatchesFlat(*reader, query, true, 0);
+}
+
+TEST_F(RangeFilterTest, VerifiersAloneNeverFormASourceGroup) {
+  // Without a single-phase source a nested verifier would produce: no group.
+  NumericPredicateQuery low("column_i", 0, 4095), high("column_i", 1024, 30000);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> rare{&a, &c};
+  std::array<Query*, 2> filters{&low, &high};
+  BooleanQuery query({}, rare, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, false);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatAcrossSegmentsWithDeletes) {
+  // Three segments: the second lacks the union's second term, every seventh
+  // document lacks the verifier's field, and a few documents are deleted.
+  CollectionHelper multi;
+  SchemaBuilder schema;
+  auto& field = schema.field("points_i");
+  field.type = api::FieldDef::FieldClass::INT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(multi.collection());
+  for (int32_t seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < 4096; i++) {
+      int32_t id = seg * 4096 + i;
+      int64_t value = 2 * ((id * 1543) % N);
+      std::string body = "pad";
+      if (seg != 1 && id % 3 == 0) body += " b";
+      docs.push_back(flatdoc("id", std::to_string(id), "body_w", body, "points_i", value));
+      if (id % 7 != 0) docs.back().push_back({"column_i", value});
+    }
+    ASSERT_TRUE(multi.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(multi.deleteByIds({"5", "4100", "8200", "8201"}, UpdateMessage::COMMIT).success);
+  // Read the committed index directly: no filter cache serves the filters
+  // as prepared doc sets.
+  auto source = std::make_shared<IndexReader>(multi.getIndexWriter()->dir);
+  ASSERT_LE(3u, source->segments().size());
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  expectGroupedMatchesFlat(*source, query, true);
+}
+
+TEST_F(RangeFilterTest, SparseBodyKeepsRejectingVerifiersBesideIt) {
+  // The union (144 docs) is sparser than the produced range (2,048) and
+  // supplies the candidates; the verifier that would join a leading range
+  // stays beside it, checking only the union's candidates.
+  NumericPredicateQuery spread("points_i", 0, 4095), verifier("column_i", 0, 6000);
+  TermQuery rare("body_w", "rare"), threshold("body_w", "threshold");
+  std::array<Query*, 2> optional{&rare, &threshold};
+  std::array<Query*, 2> filters{&spread, &verifier};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  SkipStatsScope stats;
+  auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+  EXPECT_EQ(1, SkipStats::numericPredicateSparseVerifyArms);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(3u, clauses.size());
+  for (auto* clause : clauses) {
+    EXPECT_EQ(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clause));
+  }
+  std::vector<int32_t> docs, expected;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  for (int32_t doc = 0; doc < N; doc += 256) {
+    if (2 * ((doc * 1543) % N) <= 4095) expected.push_back(doc);
+  }
+  EXPECT_EQ(expected, docs);
 }
 
 TEST_F(RangeFilterTest, MembershipYieldIsKnownOnlyWhereEstimated) {
@@ -469,7 +1009,9 @@ TEST_F(RangeFilterTest, ProofsSkipProductionInDenseAndSparseMembership) {
 }
 
 TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
-  TermQuery a("body_w", "threshold"), b("body_w", "b"), excluded("body_w", "excluded");
+  // A rare conjunction (threshold docs are a subset of a's) verifies the
+  // striped range; its proof rejects the odd stripes first.
+  TermQuery a("body_w", "threshold"), b("body_w", "a"), excluded("body_w", "excluded");
   NumericPredicateQuery range("striped_i", 0, 0);
   std::array<Query*, 2> required{&a, &b};
   std::array<Query*, 1> filters{&range}, prohibited{&excluded};
@@ -477,14 +1019,14 @@ TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
   RAMBitDocSet domain(N);
   domain.mutableBits().set(768);
   std::vector<int32_t> expected;
-  for (int32_t doc = 0; doc < N; doc += 768) {
+  for (int32_t doc = 0; doc < N; doc += 256) {
     if ((doc / 512) % 2 == 0) expected.push_back(doc);
   }
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
     int64_t verified = 0;
     NumericVerificationObserver observe([&](int32_t doc) {
       EXPECT_EQ(0, (doc / 512) % 2);
-      EXPECT_EQ(0, doc % 768);
+      EXPECT_EQ(0, doc % 256);
       verified++;
     });
     EXPECT_EQ(expected, membership(query, use));
@@ -1027,24 +1569,36 @@ TEST_F(RangeFilterTest, CandidateExposurePricesOnlyTheIncomingFilterStream) {
   }
 }
 
-TEST_F(RangeFilterTest, ExplicitWindowExposureComparesZonesBelowLegacyVerifierFence) {
+TEST_F(RangeFilterTest, ZonesArePricedByTheWindowsTheirConsumerReaches) {
+  // An explicit exposure refines its windows' blocks; pull candidates each
+  // reach a zone iteration window, so a thousand of them span the column,
+  // which is classified whole, and one verifies.
   NumericPredicateQuery range("proof_points_i", 0, N - 1);
-  for (auto [use, explicitSpan] : {
-           std::pair{Use::MATCH_WINDOWS, true}, {Use::MATCH_WINDOWS, false}, {Use::PULL, true}}) {
+  struct Case {
+    Use use;
+    int64_t candidates;
+    bool explicitSpan;
+    bool zones;
+    int64_t classified;
+  };
+  for (auto [use, candidates, explicitSpan, zones, classified] : {
+           Case{Use::MATCH_WINDOWS, 1024, true, true, 1}, Case{Use::MATCH_WINDOWS, 1, false, false, 0},
+           Case{Use::PULL, 1, true, false, 0}, Case{Use::PULL, 1024, false, true, 8}}) {
+    SCOPED_TRACE(::testing::Message() << (int)use << " " << candidates << " " << explicitSpan);
     MemPool pool;
     Query::Context context(pool, *reader);
     SkipStatsScope stats;
     auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
-    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(1024, 1024, use));
-    if (explicitSpan) build.expectedSpan = 1024;
+    auto build = supplier->makePlanContext(
+        Query::Demand::fromCandidatesAndSpan(candidates, candidates, use));
+    if (explicitSpan) build.expectedSpan = candidates;
     auto* scorer = supplier->resolve(pool, build)->build(pool);
-    bool zones = explicitSpan && use == Use::MATCH_WINDOWS;
     EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateZoneArms);
     EXPECT_EQ(zones ? 0 : 1, SkipStats::numericPredicateSparseVerifyArms);
     std::array<uint64_t, 1> bits{};
     scorer->fillWindowBits(bits, 4096, 4160);
     EXPECT_EQ(~0ULL, bits[0]);
-    EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateClassifiedBlocks);
+    EXPECT_EQ(classified, SkipStats::numericPredicateClassifiedBlocks);
   }
 }
 

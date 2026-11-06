@@ -13,6 +13,7 @@
 #include "FacetEmit.h"
 #include "FacetExecution.h"
 #include "DistinctFacetCounts.h"
+#include "FacetTermFilter.h"
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
@@ -81,13 +82,32 @@ public:
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
   ValueNature outputNature = ValueNature::NUMBER;
+  FieldType::Type valueType = FieldType::NONE;
+
+  // Hands `emit` the decoder from an encoded column value to its output:
+  // sortable bits back to float/double, date ticks in the request's date
+  // mode, integers as stored.
+  template <typename Emit>
+  void withValueOutput(std::pmr::memory_resource& mr, Emit emit) const {
+    switch (valueType) {
+      case FieldType::FLOAT:
+        emit([](int64_t value) { return sortableInt32ToFloat((int32_t)value); });
+        break;
+      case FieldType::DOUBLE:
+        emit([](int64_t value) { return sortableInt64ToDouble(value); });
+        break;
+      default:
+        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        break;
+    }
+  }
 
   template <typename Label>
   void emitFieldBuckets(api::FacetResult& result,
                         const std::vector<std::pair<Label, int64_t>>& buckets,
                         std::pmr::memory_resource& mr) const {
     if constexpr (std::is_same_v<Label, int64_t>) {
-      withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+      withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
     } else emitBuckets(result, buckets, mr);
@@ -103,6 +123,7 @@ public:
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
+      valueType = type.type();
       if (type.type() == FieldType::DATE) {
         outputNature = dateValueNature(DateFieldType::unitOf(type));
       }
@@ -304,11 +325,19 @@ public:
   }
 };
 
+// inlineResult's default key filter: every key may be an ordinary bucket.
+struct AcceptAnyFacetKey {
+  constexpr bool operator()(int64_t) const { return true; }
+};
+
 class FieldFacetReq : public FacetReq {
 public:
   const ReqFieldFacet& fieldFacet;
   std::span<const int64_t> selectedInts;
   std::span<const std::string_view> selectedStrings;
+  // Which global ords may be ordinary buckets: a string facet's term_filter,
+  // owned by StrFacetOp. Null keeps every key.
+  const FacetOrdFilter* termFilter = nullptr;
 
 protected:
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -593,12 +622,14 @@ public:
       return data.release();
     }
 
+    // `accept` picks which keys may join the ordinary page; selected values
+    // are captured regardless.
     template <typename Label, typename Data, typename ResolveLabel, typename ExecuteChildren,
-              typename KeyLess = std::less<int64_t>>
+              typename KeyLess = std::less<int64_t>, typename Accept = AcceptAnyFacetKey>
     void inlineResult(std::unique_ptr<Data> mergedData,
                       std::span<const std::optional<int64_t>> pinKeys,
                       ResolveLabel&& resolveLabel, ExecuteChildren&& executeChildren,
-                      KeyLess keyLess = {}) {
+                      KeyLess keyLess = {}, Accept accept = {}) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = fieldOp().minCount;
@@ -662,7 +693,7 @@ public:
       if (finalizer.needsCandidates() || capturePins) {
         counts.forEachEntry([&](int64_t key, char* entry) {
           int64_t count = loadUnaligned<int64_t>(entry);
-          finalizer.add({key, count, {entry, finalizedSlot}});
+          if (accept(key)) finalizer.add({key, count, {entry, finalizedSlot}});
           if (capturePins) {
             auto pin = pinByKey.find(key);
             if (pin != pinByKey.end()) {
@@ -784,6 +815,30 @@ public:
       }
     }
 
+    // term_filter selection: the distinct counter has no page floor, so the
+    // term tier runs once over the counted ords; zero-count padding walks
+    // the accepted ords only.
+    template <typename Finalizer>
+    LUXIR_NOINLINE void selectFiltered(const DistinctFacetCounts& data, const FacetOrdFilter& filter,
+                                       OrdMapStr& labels, Finalizer& finalizer) {
+      auto& facet = this->fieldOp();
+      auto accept = filter.select([&](auto&& visit) {
+        for (auto [value, count] : data.counts) if (count > 0) visit(value);
+      }, labels);
+      for (auto [value, count] : data.counts) {
+        if (count > 0 && accept(value)) finalizer.add({value, count, {}});
+      }
+      if (facet.minCount != 0) return;
+      FacetOrdFilter::Terms terms(filter, filter.hasTermTier() ? &labels : nullptr);
+      int64_t padded = 0;
+      terms.forEachAccepted([&](int64_t ord) {
+        if (data.count(ord) != 0) return true;
+        finalizer.add({ord, 0, {}});
+        // Zero counts tie, and the smaller ord wins a tie, so later ones lose.
+        return facet.limit < 0 || ++padded < facet.limit;
+      });
+    }
+
     void result(std::unique_ptr<DistinctFacetCounts> data) {
       auto& facet = this->fieldOp();
       data->finish();
@@ -797,6 +852,10 @@ public:
         }
       } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
       auto finalized = this->finishCountBuckets([&](auto& finalizer) {
+        if constexpr (Ordinal) if (facet.termFilter != nullptr) {
+          selectFiltered(*data, *facet.termFilter, *labels, finalizer);
+          return;
+        }
         for (auto [value, count] : data->counts) if (count > 0) finalizer.add({value, count, {}});
         if constexpr (Ordinal) if (facet.minCount == 0) {
           for (uint64_t value = 0; value < valueDimension.size; value++) {
@@ -1821,7 +1880,6 @@ public:
 class IntFacetRangeReq : public FixedBucketFacetReq {
   std::span<const int64_t> fences;
   int64_t affineGap;
-  FieldType::Type valueType;
   bool affine;
   std::optional<RangeFacetGrid> grid;
   std::optional<int64_t> wideningStart, wideningEnd;
@@ -2027,20 +2085,20 @@ public:
   IntFacetRangeReq(SearchRequest& req,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
-    FieldType::Type valueType, int64_t minCount, bool missing,
+    int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
         req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
-    fences(fences), affineGap(affineGap), valueType(valueType),
+    fences(fences), affineGap(affineGap),
     affine(affine), runs(runs) {}
 
   IntFacetRangeReq(SearchRequest& req,
       std::string_view fieldName, std::string_view facetName,
       RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
-      FieldType::Type valueType, int64_t minCount, bool missing)
+      int64_t minCount, bool missing)
     : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
-      affineGap(0), valueType(valueType), affine(false), grid(std::move(grid)),
+      affineGap(0), affine(false), grid(std::move(grid)),
       wideningStart(start), wideningEnd(end) {}
 
   size_t facetBucketResidentBytes() const override;
@@ -2092,7 +2150,8 @@ public:
       std::span<const size_t> emitted, std::pmr::memory_resource& mr,
       std::span<const int64_t> layout) const {
     size_t n = emitted.size();
-    auto emitBounds = [&]<typename Outer>(auto decode) {
+    withValueOutput(mr, [&](auto decode) {
+      using Outer = typename FacetOutputTypes<decltype(decode(int64_t{}))>::ArrayColumn;
       auto& bucketIds = result.bucket_ids.emplace().kind.emplace<Outer>();
       auto* pairs = build::allocArray(bucketIds.v, n, mr);
       int64_t* counts = build::allocArray(result.counts, n, mr);
@@ -2103,30 +2162,7 @@ public:
         bounds[1] = decode(layout[bucket + 1]);
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
-    };
-    switch (valueType) {
-      case FieldType::Type::DATE:
-        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
-          using Outer = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
-                                            luxir::api::ArrArrStr, luxir::api::ArrArrInt>;
-          emitBounds.template operator()<Outer>(output);
-        });
-        break;
-      case FieldType::Type::FLOAT:
-        emitBounds.template operator()<luxir::api::ArrArrFloat>(
-            [](int64_t encoded) {
-              return sortableInt32ToFloat((int32_t)encoded);
-            });
-        break;
-      case FieldType::Type::DOUBLE:
-        emitBounds.template operator()<luxir::api::ArrArrDouble>(
-            [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
-        break;
-      default:
-        emitBounds.template operator()<luxir::api::ArrArrInt>(
-            [](int64_t value) { return value; });
-        break;
-    }
+    });
     if (missing) result.missing = merged.missing_num;
   }
 

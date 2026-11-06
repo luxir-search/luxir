@@ -6,6 +6,7 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "luxir/BuildInfo.h"
 #include "Prometheus.h"
 
 #include <cassert>
@@ -46,6 +47,7 @@
 #include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
+#include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/util/log.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchEngine.h"
@@ -432,8 +434,9 @@ public:
   bool outputCommitted = false;
 
   HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
-                    std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
-    : SearchRequest(engine, requestState->proto, arena),
+                    std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena,
+                    std::chrono::steady_clock::time_point startTime)
+    : SearchRequest(engine, requestState->proto, arena, startTime),
       requestState(std::move(requestState)),
       session(std::move(s)),
       jsonOptions{.int64Str = (proto.flags & proto.flags_set & RequestFlags::INT64_STR) != 0} {
@@ -649,8 +652,9 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
+    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
+    PLUGIN
   };
 
   struct RouteMatch {
@@ -668,6 +672,8 @@ private:
     // omitted body field), so dispatch rejects it before any handler resolves it.
     bool emptyCollection = false;
     bool prettyDefault = false;
+    // Route::PLUGIN: the registered routes for the path and its captures.
+    std::optional<HttpRouteRegistry::Match> plugin;
   };
 
   struct PrettyOpts : glz::opts {
@@ -741,7 +747,7 @@ private:
       case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
       case Route::HEALTH: operation = MetricOperation::HEALTH; break;
       case Route::TENANT_LIST: case Route::COLLECTION_LIST:
-      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE:
+      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE: case Route::COLLECTION_RENAME: case Route::COLLECTION_SWAP:
         operation = MetricOperation::COLLECTIONS; break;
       case Route::REPLICATION_STATUS: case Route::REPLICATION_WATCH:
       case Route::REPLICATION_SNAPSHOT: case Route::REPLICATION_FILE:
@@ -763,6 +769,8 @@ private:
 
   UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
+  // When the buffered request's body finished arriving: the start of its took_us.
+  std::chrono::steady_clock::time_point requestStart_;
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
   // producers but not yet written to the socket (earlyLines_ + pendingQ_ +
@@ -1048,6 +1056,7 @@ private:
   }
 
   void dispatchBufferedRequest() {
+    requestStart_ = std::chrono::steady_clock::now();
     http::request<http::string_body> req;
     req.base() = parser_->get().base();
     req.body() = std::move(bufferedBody_);
@@ -1063,7 +1072,7 @@ private:
       auto slash = target.find('/', 9);
       target = slash == std::string_view::npos ? std::string_view{} : target.substr(slash);
     }
-    if (target == "/collections/_create" || target == "/collections/_delete") return true;
+    if (target == "/collections/_create" || target == "/collections/_delete" || target == "/collections/_rename" || target == "/collections/_swap") return true;
     if (method != http::verb::post) return false;
     std::string coll;
     return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
@@ -1437,7 +1446,7 @@ private:
   // Routes that may name a tenant: administration and replication. Search,
   // update and replica waits always act in the caller's own tenant.
   static bool tenantRoute(Route route) {
-    return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE ||
+    return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE || route == Route::COLLECTION_RENAME || route == Route::COLLECTION_SWAP ||
            route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
            route == Route::REPLICATION_FILE;
   }
@@ -1463,7 +1472,9 @@ private:
 
   static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
-    if (target == "/health") {
+    if (target == "/") {
+      m.route = Route::BUILD_INFO; m.allow = "GET"; m.prettyDefault = true;
+    } else if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
     } else if (target == "/metrics") {
       m.route = Route::METRICS; m.allow = "GET";
@@ -1475,6 +1486,10 @@ private:
       m.route = Route::COLLECTION_LIST; m.allow = "GET"; m.prettyDefault = true;  // synonym for _list
     } else if (target == "/collections/_create") {
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
+    } else if (target == "/collections/_rename") {
+      m.route = Route::COLLECTION_RENAME; m.allow = "POST";
+    } else if (target == "/collections/_swap") {
+      m.route = Route::COLLECTION_SWAP; m.allow = "POST";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
@@ -1497,6 +1512,19 @@ private:
       else if (path == "watch") { m.route = Route::REPLICATION_WATCH; m.allow = "GET"; }
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
       return m;
+    }
+    if (m.route == Route::NONE) {
+      // Built-in routes win; a plugin route answers only paths they do not.
+      if (auto plugin = HttpRouteRegistry::global().match(target)) {
+        m.route = Route::PLUGIN;
+        m.allow = plugin->allow;
+        for (const auto& [key, value] : plugin->params) {
+          if (key == "collection") m.coll = value;
+        }
+        m.emptyCollection = target.starts_with("/collections/") && m.coll.empty();
+        m.plugin = std::move(plugin);
+        return m;
+      }
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
@@ -1542,6 +1570,17 @@ private:
       respondError(readOnlyError(target));
       return;
     }
+    const HttpRoute* pluginRoute = nullptr;
+    if (match.route == Route::PLUGIN) {
+      for (const auto* candidate : match.plugin->routes) {
+        if (candidate->method == http::to_string(req.method())) pluginRoute = candidate;
+      }
+      assert(pluginRoute != nullptr);  // methodAllowed checked the same list
+      if (node_.readOnly() && pluginRoute->mutating) {
+        respondError(readOnlyError(target));
+        return;
+      }
+    }
 
     if (match.tenantRoute) {
       try { Collections::validateName(match.tenant, "tenant"); }
@@ -1550,6 +1589,15 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::BUILD_INFO: {
+        const auto& build = buildInfo();
+        OverlayJsonBuilder json;
+        json.string("version", build.version);
+        json.string("source_commit", build.sourceCommit);
+        json.string("cpu_target", build.cpuTarget);
+        respondJson(http::status::ok, json.finish());
+        break;
+      }
       case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
@@ -1583,6 +1631,8 @@ private:
       case Route::COLLECTION_CREATE:
         handleCollectionCreate(std::move(req.body()));
         break;
+      case Route::COLLECTION_RENAME: handleCollectionNames<false>(std::move(req.body())); break;
+      case Route::COLLECTION_SWAP: handleCollectionNames<true>(std::move(req.body())); break;
       case Route::COLLECTION_DELETE:
         handleCollectionDelete(req.body());
         break;
@@ -1682,9 +1732,56 @@ private:
         handleSchemaSet(std::move(req.body()), coll, mode);
         break;
       }
+      case Route::PLUGIN:
+        handlePluginRoute(*pluginRoute, req, target);
+        break;
       case Route::NONE:
         break;
     }
+  }
+
+  // A plugin route runs its handler on the task arena, then answers on the
+  // connection's executor: the handler's body, or the search it asked for.
+  void handlePluginRoute(const HttpRoute& route, http::request<http::string_body>& req, std::string_view target) {
+    struct Call {
+      std::string method;
+      std::string path;
+      std::string body;
+      std::vector<std::pair<std::string, std::string>> pathParams;
+      std::vector<std::pair<std::string, std::string>> queryParams;
+    };
+    auto call = std::make_shared<Call>();
+    call->method = std::string(http::to_string(req.method()));
+    call->path = std::string(target);
+    call->body = std::move(req.body());
+    call->pathParams = route_.plugin->params;
+    for (const auto& param : urlParams_) call->queryParams.emplace_back(param.key, param.value);
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
+      HttpPluginResponse response;
+      std::optional<ErrorInfo> failure;
+      try {
+        HttpPluginRequest request{self->node_, call->method, call->path, tenant, call->body,
+                                  call->pathParams, call->queryParams};
+        route.handler(request, response);
+      } catch (const std::exception& e) {
+        failure = classifyException(e, ErrorKind::INTERNAL);
+      }
+      net::post(self->stream_.get_executor(),
+                [self, shardPin, failure = std::move(failure), response = std::move(response)]() mutable {
+                  if (failure) {
+                    self->respondError(*failure);
+                  } else if (response.searchBody) {
+                    // A search with default URL options: the request's own URL
+                    // parameters belong to the plugin, not to the search.
+                    self->handleSearch(*response.searchBody, response.searchCollection,
+                                       HttpSearchFormat::ENVELOPE, SearchUrlOverlay{});
+                  } else {
+                    self->respondSimple((http::status)response.status, response.contentType,
+                                        std::move(response.body));
+                  }
+                });
+    });
   }
 
   static void setCollectionTarget(std::string_view& collection,
@@ -1830,7 +1927,7 @@ private:
 
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
-        *arena, engine, std::move(requestState), shared_from_this(), *arena);
+        *arena, engine, std::move(requestState), shared_from_this(), *arena, requestStart_);
     if (!sreq->proto.min_commit.empty()) {
       sreq->waitCancellation = waitCancellation;
     }
@@ -1884,24 +1981,29 @@ private:
     std::shared_ptr<HttpSession> session;
     std::shared_ptr<HttpUpdateState> state;
     std::shared_ptr<ShardPin> pin;
+    const std::chrono::steady_clock::time_point startTime;
   public:
-    BufferedUpdate(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
-        : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+    BufferedUpdate(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin,
+                   std::chrono::steady_clock::time_point startTime)
+        : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)),
+          startTime(startTime) {}
     void done(IndexWriter&) override {
       auto completed = takeCompletion(session->node_);
       auto target = session;
       auto guard = pin;
+      auto start = startTime;
       delete this;
       // A replica wait watches the socket for a client disconnect, which is
       // shard work, so the wait starts there (as for a streaming batch).
-      net::post(target->stream_.get_executor(), [target, guard, completed] {
+      net::post(target->stream_.get_executor(), [target, guard, completed, start] {
         if (completed->wait) target->watchWaitDisconnect();
-        completed->await(target->node_, [target, guard](auto result) {
-          net::post(target->stream_.get_executor(), [target, guard, result] {
+        completed->await(target->node_, [target, guard, start](auto result) {
+          net::post(target->stream_.get_executor(), [target, guard, result, start] {
             try {
               std::string out;
               if (result->response.status == api::UpdateResponse_::Status::ERROR)
                 target->metricError(ProtoUpdateMessage::failureKind(result->response));
+              result->response.took_us = microsSince(start);
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
             } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
@@ -1913,11 +2015,12 @@ private:
 
   // Task arena: hands a decoded buffered update to its collection's writer.
   static void submitBufferedUpdate(const std::shared_ptr<HttpSession>& self, std::shared_ptr<HttpUpdateState> state,
-                                   const std::string& tenant, const std::shared_ptr<ShardPin>& shardPin) {
+                                   const std::string& tenant, const std::shared_ptr<ShardPin>& shardPin,
+                                   std::chrono::steady_clock::time_point startTime) {
     BufferedUpdate* msg = nullptr;
     ErrorKind fallback = ErrorKind::INVALID_REQUEST;  // the message validates its commit params
     try {
-      auto admission = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin);
+      auto admission = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin, startTime);
       fallback = ErrorKind::INTERNAL;
       auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, admission->req->collection));
       admission->target = collection->getId();
@@ -1944,7 +2047,7 @@ private:
     auto shardPin = makeShardPin();
     try {
       node_.getTaskArena().enqueue([self = shared_from_this(), slot = UpdateStateSlot{std::move(state)}, coll, url,
-                                    tenant = tenant_, shardPin] {
+                                    tenant = tenant_, shardPin, startTime = requestStart_] {
         auto state = std::move(slot.state);
         std::optional<ErrorInfo> failure;
         try {
@@ -1964,7 +2067,7 @@ private:
         net::post(self->stream_.get_executor(), [self, shardPin, id = std::string(state->proto.request_id)]() mutable {
           self->requestId_ = std::move(id);
         });
-        submitBufferedUpdate(self, std::move(state), tenant, shardPin);
+        submitBufferedUpdate(self, std::move(state), tenant, shardPin, startTime);
       });
     } catch (const std::exception& e) {
       respondException(e, ErrorKind::INTERNAL);
@@ -2143,6 +2246,42 @@ private:
             if (failure) self->respondError(*failure);
             else self->respondJson(http::status::ok, std::move(body));
           });
+    });
+  }
+
+  template <bool Swap>
+  void handleCollectionNames(std::string body) {
+    using Request = std::conditional_t<Swap, api::SwapCollectionsRequest, api::RenameCollectionRequest>;
+    using Response = std::conditional_t<Swap, api::SwapCollectionsResponse, api::RenameCollectionResponse>;
+    struct State {
+      std::string body;
+      std::pmr::monotonic_buffer_resource resource;
+      Request request;
+    };
+    auto state = std::make_shared<State>();
+    state->body = std::move(body);
+    CollectionId first, second;
+    try {
+      std::string error;
+      if (!api::read_json(state->request, state->body, state->resource, &error)) throw RequestError(error, "invalid_json");
+      auto& req = state->request;
+      if constexpr (Swap) { first = adminTarget(req.tenant, req.a); second = adminTarget(req.tenant, req.b); }
+      else { first = adminTarget(req.tenant, req.from); second = adminTarget(req.tenant, req.to); }
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    auto pin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, first, second, pin] {
+      std::string out;
+      std::optional<ErrorInfo> failure;
+      try {
+        if constexpr (Swap) self->node_.swapCollections(first, second);
+        else self->node_.renameCollection(first, second);
+        Response response{first.name, second.name};
+        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize collection mapping response");
+      } catch (const std::exception& e) { failure = classifyException(e, ErrorKind::INTERNAL); }
+      net::post(self->stream_.get_executor(), [self, pin, failure = std::move(failure), body = std::move(out)]() mutable {
+        if (failure) self->respondError(*failure);
+        else self->respondJson(http::status::ok, std::move(body));
+      });
     });
   }
 
@@ -4058,7 +4197,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       status = ReplyStatus::CANCEL;  // connection failed; skip the render
     } else if (response.proto.error && !outputCommitted) {
       auto info = api::build::errorInfo(*response.proto.error);
-      session->respondErrorFromEngine(httpStatusFor(info), renderErrorBody(info, response.proto.request_id));
+      session->respondErrorFromEngine(httpStatusFor(info),
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
     } else {
       int64_t queued = session->enqueueJson(
           renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions), last);
@@ -4094,7 +4234,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       } else {
         ErrorInfo info = luxir::api::build::errorInfo(*response.proto.error);
         session->respondErrorFromEngine(httpStatusFor(info),
-                                        renderErrorBody(info, response.proto.request_id));
+            renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
       }
     } else {
       // Document bodies are a pure function of the batch: render them OUTSIDE
