@@ -10,6 +10,7 @@
 
 #include "luxir/reader/Hotcache.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/util/IoContext.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/util/log.h"
 
@@ -52,6 +53,7 @@ public:
     for (uint64_t offset = 0; offset < size_;) {
       size_t length = (size_t)std::min<uint64_t>(buffer.size(), size_ - offset);
       store->readRange(key, offset, std::span<char>(buffer.data(), length));
+      if (const auto* io = IoContext::current()) io->countFetch(length);
       XXH3_64bits_update(&state, buffer.data(), length);
       offset += length;
       if (progress) progress(length);
@@ -146,6 +148,7 @@ std::shared_ptr<const Hotcache> ObjectStoreDirectory::hotcacheOf(std::string_vie
     if (auto size = sizeOf(fileName)) {
       std::string bytes((size_t)*size, '\0');
       store->readRange(key(fileName), 0, std::span<char>(bytes.data(), bytes.size()));
+      if (const auto* io = IoContext::current()) io->countFetch(bytes.size());
       slot->cache = std::make_shared<const Hotcache>(Hotcache::decode(bytes));
     }
   } catch (const std::exception& e) {

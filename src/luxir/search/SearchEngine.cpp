@@ -59,6 +59,11 @@ Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
 void SearchEngine::submitBody(SearchRequest& req) {
   MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
+  // Reads done for the request see its context, here and in every task it
+  // fans out (task_group_fanout carries it). The scope only touches this
+  // thread's slot, so it may end after bodyDone() has released the request.
+  req.io.requestId = req.proto.request_id;
+  IoScope io(&req.io);
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know

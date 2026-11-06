@@ -508,6 +508,42 @@ An `InputFile` that reads lazily also overrides `rangeStream` and `prefetchRange
 and returns `true` from `lazy()`; see `LazyInputFile`. Code that opens a segment
 must read through `rangeStream`, and code that wants the whole file through `read()`.
 
+### The request I/O context
+
+A read done for a search can see that search through `luxir::IoContext`
+(`src/luxir/util/IoContext.h`): `IoContext::current()` returns it, or null
+when the read is not done for a request (merges, startup, verification,
+replication). It is visible in `ObjectStore::readRange` and in every
+`DelegatingDirectory` / `InputFile` method called on a query thread, including
+segment-parallel tasks, since core carries it into the tasks it spawns.
+
+```cpp
+void S3Store::readRange(std::string_view name, uint64_t offset, std::span<char> out) {
+  const luxir::IoContext* io = luxir::IoContext::current();
+  bool hedge = io && io->remaining() < hedgeBudget;  // deadline: hedge a slow GET early
+  bool admit = !io || io->fillCache;                 // a scan: do not admit into a cache
+  ...
+}
+```
+
+The fields are the query id and `request_id` (for correlating a layer's logs),
+the deadline (`hasDeadline()`, `remaining()`), the `fillCache` hint and the
+request's `IoCounters`. The deadline and the hint are advice: a read must return
+the same bytes, and core never fails a read on them. `LazyInputFile` already
+counts every `readRange` it issues (one request and one round each) and the
+bytes it touches; a layer that issues requests of its own (a hedge, a split
+read, a cache miss behind a cache hit) adds them with `io->countFetch(bytes,
+requests, rounds)`, counting a wave of concurrent requests as one round. Counts
+appear in the search profile (`io_*`) and in the node's `search_io_*` totals.
+
+Work handed to a thread or pool of the plugin's own runs without a context
+unless it is wrapped: `pool.submit(luxir::bindIoContext(task))` copies the
+current context into the task and restores the pool thread's own afterwards.
+`IoScope` is the underlying guard; `IoScope scope(nullptr)` detaches work from
+the enclosing request. The counters belong to the request and outlive its
+tasks, but not the request: work still running after the request ends must
+not count.
+
 ### The example plugin
 
 `test/plugins/example` registers a `counting_ram` backend (RAM storage counting

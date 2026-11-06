@@ -12,6 +12,7 @@
 #include <system_error>
 
 #include "luxir/store/FileIOException.h"
+#include "luxir/util/IoContext.h"
 #include "luxir/util/log.h"
 
 namespace luxir {
@@ -74,6 +75,7 @@ void LazyInputFile::ensureChunks(size_t first, size_t last) {
     }
     fetchRequests_.fetch_add(1, std::memory_order_relaxed);
     fetchedBytes_.fetch_add(end - begin, std::memory_order_relaxed);
+    if (const auto* io = IoContext::current()) io->countFetch(end - begin);
     for (size_t i = c; i <= runEnd; i++) resident[i].store(true, std::memory_order_release);
     residentChunks_.fetch_add(runEnd - c + 1, std::memory_order_relaxed);
     c = runEnd + 1;
@@ -83,15 +85,18 @@ void LazyInputFile::ensureChunks(size_t first, size_t last) {
 void LazyInputFile::ensure(uint64_t offset, uint64_t length) {
   checkRange(offset, length, size_);
   if (length == 0) return;
+  if (const auto* io = IoContext::current()) io->countTouch(length);
   ensureChunks((size_t)(offset / chunkBytes), (size_t)((offset + length - 1) / chunkBytes));
 }
 
 std::string_view LazyInputFile::read() {
+  if (const auto* io = IoContext::current()) io->countWholeFileRead();
   ensure(0, size_);
   return {base, (size_t)size_};
 }
 
 InputStream LazyInputFile::getInputStream() {
+  if (const auto* io = IoContext::current()) io->countWholeFileRead();
   ensure(0, size_);
   return InputStream(base, base + size_);
 }
