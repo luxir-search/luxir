@@ -31,6 +31,8 @@
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
+#include <faiss/impl/RaBitQuantizer.h>
+#include <faiss/utils/distances.h>
 
 #include <cstring>
 #include <atomic>
@@ -39,6 +41,8 @@
 #include <latch>
 #include <memory>
 #include <memory_resource>
+#include <random>
+#include <set>
 #include <span>
 #include <thread>
 #include <vector>
@@ -1388,6 +1392,122 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     EXPECT_EQ(approx, (std::vector<std::string>{"doc79"}));
     EXPECT_EQ(approx, runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1, true));
   }
+}
+
+namespace {
+std::vector<float> randomUnit(std::mt19937& rng, int32_t dims) {
+  std::normal_distribution<float> normal;
+  std::vector<float> v((size_t)dims);
+  for (auto& x : v) x = normal(rng);
+  faiss::fvec_renorm_L2((size_t)dims, 1, v.data());
+  return v;
+}
+}
+
+// FAISS scores a residual below sqrt(FLT_EPSILON) as if it had unit length.
+TEST_F(VectorIndexBuilderTest, nearCentroidRaBitQEstimatesTrackTrueDistance) {
+  constexpr int32_t dims = 128;
+  std::mt19937 rng(7);
+  auto centroid = randomUnit(rng, dims), query = randomUnit(rng, dims), direction = randomUnit(rng, dims);
+  float toCentroid = std::sqrt(faiss::fvec_L2sqr(query.data(), centroid.data(), dims));
+  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
+    for (int32_t bits : {1, 4}) {
+      for (double scale = 1e-7; scale < 1e-2; scale *= 2) {
+        SCOPED_TRACE(fmt::format("metric={} bits={} scale={}", (int)metric, bits, scale));
+        std::vector<float> x = centroid;
+        for (int32_t i = 0; i < dims; i++) x[(size_t)i] += (float)scale * direction[(size_t)i];
+        faiss::RaBitQuantizer quantizer((size_t)dims, metric, (size_t)bits);
+        std::vector<uint8_t> code(quantizer.code_size);
+        quantizer.compute_codes_core(x.data(), code.data(), 1, centroid.data());
+        VectorIndexBuilder::finishRaBitQCode(x.data(), centroid.data(), code.data(), dims, bits, metric);
+        std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
+            quantizer.get_distance_computer(4, centroid.data()));
+        computer->set_query(query.data());
+        auto* rabitq = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
+        ASSERT_NE(rabitq, nullptr);
+        float truth = metric == faiss::METRIC_L2 ? faiss::fvec_L2sqr(query.data(), x.data(), dims)
+                                                 : faiss::fvec_inner_product(query.data(), x.data(), dims);
+        // Hard bound for any sane sign code: cos(angle) >= 1/2 here.
+        double bound = (metric == faiss::METRIC_L2 ? 2 : 1) * 2 * toCentroid * scale + 1e-5;
+        EXPECT_NEAR(rabitq->distance_to_code_1bit(code.data()), truth, bound);
+        if (bits > 1) {
+          EXPECT_NEAR(rabitq->distance_to_code_full(code.data()), truth, bound);
+        }
+      }
+    }
+  }
+}
+
+// A list holding only copies of one vector has a centroid within rounding of
+// it, and small-magnitude data has small residuals in every list. Neither may
+// outrank true neighbors at full scan.
+TEST_F(VectorIndexBuilderTest, nearCentroidCodesKeepFullScanRecall) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  constexpr int32_t dims = 64, rows = 300, k = 9;
+  struct Case { api::VectorMetric metric; float scale; int32_t copies, nlist; };
+  for (auto [metric, scale, copies, nlist] : {Case{api::VectorMetric::COSINE, 1, 3, 256},
+                                              Case{api::VectorMetric::L2, 1e-5f, 1, 16}}) {
+    SCOPED_TRACE(fmt::format("metric={} scale={}", (int)metric, scale));
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = metric;
+    f.dims = dims;
+    f.ann = rabitqAnn(nlist, 1);
+    b.set(h.collection());
+    std::mt19937 rng(11);
+    auto next = [&] {
+      auto v = randomUnit(rng, dims);
+      for (auto& x : v) x *= scale;
+      return v;
+    };
+    for (int32_t i = 0; i < rows; i++) {
+      auto v = next();
+      for (int32_t c = 0; c < copies; c++) {
+        h.index(flatdoc("id", std::to_string(i) + "_" + std::to_string(c), "v_v", v));
+      }
+    }
+    h.commit({"*"});
+    // Copies tie, so compare the distinct rows reached rather than ids.
+    auto rowsOf = [](const std::vector<std::string>& ids) {
+      std::set<std::string> out;
+      for (const auto& id : ids) out.insert(id.substr(0, id.find('_')));
+      return out;
+    };
+    int32_t hits = 0, total = 0;
+    for (int32_t q = 0; q < 20; q++) {
+      auto query = next();
+      auto approx = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, nlist, 0));
+      auto exact = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, nlist, 0, true));
+      total += (int32_t)exact.size();
+      for (const auto& row : exact) hits += approx.count(row) ? 1 : 0;
+    }
+    EXPECT_GE((double)hits / total, 0.9);
+  }
+}
+
+TEST_F(VectorIndexBuilderTest, trainingSampleScalesWithCentroids) {
+  IvfTestGuard guard;
+  SearchOverridesGuard<size_t> maxBytes{VectorIndexBuilder::ivfTrainingSampleMaxBytes};
+  auto trained = [](api::VectorAnnDef ann) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), ann, 4);
+    std::mt19937 rng(3);
+    for (int32_t i = 0; i < 1000; i++) h.index(flatdoc("id", std::to_string(i), "embedding_v", randomUnit(rng, 4)));
+    h.commit({"*"});
+    return VectorIndexBuilder::ivfLastTrainingVectorsForTests.load();
+  };
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 400);       // lists * 100
+  EXPECT_EQ(trained(rabitqAnn(32, 1)), 1000);     // capped by the segment
+  EXPECT_EQ(trained(pqAnn(2, 2, 3)), 800);        // 2^bits codebook entries bind
+  EXPECT_EQ(trained(pqAnn(8, 2, 2)), 800);        // lists bind
+  VectorIndexBuilder::ivfTrainingSampleMaxBytes = 100 * 4 * sizeof(float);
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 100);       // memory ceiling
+  EXPECT_EQ(trained(rabitqAnn(200, 1)), 200);     // floor (one per list) beats the ceiling
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
