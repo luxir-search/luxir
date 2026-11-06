@@ -6,6 +6,7 @@
 #include "luxir/query/PostingsUnion.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SortField.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/util/heap.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/value/ValueExpr.h"
@@ -94,6 +95,12 @@ public:
       : descriptor(descriptor) {
       if (descriptor.getKind() == SortClause::COLUMN) {
         comparator = descriptor.getSortField().createComparator(*reader);
+      } else if (descriptor.getKind() == SortClause::PLUGIN) {
+        comparator = descriptor.getSortKind().createComparator(*reader);
+        if (comparator == nullptr) {
+          throw RequestError("sort kind " + std::string(descriptor.getSortKindName()) +
+                             "() made no comparator");
+        }
       } else if (descriptor.getKind() == SortClause::EXPR) {
         expr = std::make_unique<ExprState>();
         expr->fields.resize(descriptor.getValueProgram().nodes.size());
@@ -244,6 +251,16 @@ public:
   LeafDescent leafDescent = LeafDescent::UNDECIDED;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
+  // The primary comparator offers no competitiveDocs source in this segment.
+  bool competitiveDocsUnsupported = false;
+  // The current segment, to rebind the comparators after a seed pass.
+  const IndexReader::Segment* currentSegment = nullptr;
+  // The runs of the current segment the seed windows of every round so far
+  // visited, sorted, disjoint and inside it (takeSeedWindows), and the last
+  // round's new runs.
+  std::vector<SeedWindow> seedRuns;
+  std::vector<SeedWindow> seedRoundRuns;
+  std::vector<SeedWindow> seedScratch;
 
   class ExpressionBindings {
   public:
@@ -334,12 +351,16 @@ public:
     candidateReach = 0;
     nextProbeDoc = 0;
     candidatesDisabled = false;
+    competitiveDocsUnsupported = false;
     if (segmentSourceCost > 0) {
       priorSourceDocs += std::min<int64_t>(segmentSourceCost, segmentMaxDoc);
     }
     segmentSourceCost = sourceCost;
     segmentWalkCard = 0;
     segmentMaxDoc = segment.maxDoc();
+    currentSegment = &segment;
+    seedRuns.clear();
+    seedRoundRuns.clear();
     for (auto& clause : clauses) {
       clause.resetCache();
       if (clause.comparator != nullptr) {
@@ -549,6 +570,7 @@ public:
       int cmp = 0;
       switch (clause.descriptor.getKind()) {
         case SortClause::COLUMN:
+        case SortClause::PLUGIN:
           if (source == CompareSource::CURRENT_DOC) {
             if constexpr (Member) {
               cmp = clause.comparator->compareCurrent(docA.slot, docA.doc, docB.doc);
@@ -679,6 +701,103 @@ public:
     ensureSlotCapacity((int64_t)slot + 1);
     copy(slot, other, candidate.slot, candidate.doc);
     head = SortDoc(candidate.doc, candidate.score, slot);
+  }
+
+  // Whether the primary comparator offers seed windows (seedWindows) the
+  // seed-window driver can run: a ranking heap and no EXPR clause (the
+  // caller binds value programs once per segment, and rebindAfterSeeding
+  // does not rewind them).
+  bool offersSeedWindows() const {
+    return topCount > 0 && !hasExpr && clauses[0].comparator != nullptr
+        && clauses[0].comparator->offersSeedWindows();
+  }
+
+  // Seed rounds after the first one, asked while the heap is not full.
+  static constexpr int32_t kMaxSeedWindowRounds = 4;
+
+  // The primary comparator's seed windows of `round` for the current segment
+  // (round 0 starts over), sorted, merged where they overlap or touch,
+  // clamped to the segment, without empty ones and without the runs earlier
+  // rounds visited: whatever the comparator answers, each doc is in at most
+  // one window of all rounds and a round's windows ascend, as window
+  // production needs. The answer joins the visited runs (seededRuns).
+  std::span<const SeedWindow> takeSeedWindows(int32_t round) {
+    if (round == 0) seedRuns.clear();
+    seedRoundRuns.clear();
+    if (!offersSeedWindows()) return {};
+    FieldComparator::SeedRequest request;
+    request.matches = topCount;
+    request.sourceDocs = segmentSourceCost > 0
+        ? std::min<int64_t>(segmentSourceCost, segmentMaxDoc) : segmentMaxDoc;
+    request.bottomSlot = heapFull() ? pq.top().slot : -1;
+    request.round = round;
+    request.collected = (int64_t)pq.size();
+    clauses[0].comparator->seedWindows(request, seedRoundRuns);
+    normalizeSeedRuns(seedRoundRuns);
+    if (!seedRuns.empty() && !seedRoundRuns.empty()) {
+      // Both lists are sorted and disjoint: cut the visited runs out.
+      seedScratch.clear();
+      size_t run = 0;
+      for (SeedWindow window : seedRoundRuns) {
+        while (run < seedRuns.size() && seedRuns[run].end <= window.begin) run++;
+        for (size_t i = run; i < seedRuns.size() && seedRuns[i].begin < window.end; i++) {
+          if (seedRuns[i].begin > window.begin) {
+            seedScratch.push_back({window.begin, seedRuns[i].begin});
+          }
+          window.begin = std::max(window.begin, seedRuns[i].end);
+        }
+        if (window.begin < window.end) seedScratch.push_back(window);
+      }
+      seedRoundRuns.swap(seedScratch);
+    }
+    seedRuns.insert(seedRuns.end(), seedRoundRuns.begin(), seedRoundRuns.end());
+    normalizeSeedRuns(seedRuns);
+    return seedRoundRuns;
+  }
+
+  // Whether to ask the comparator for seed round `round` (> 0): the earlier
+  // rounds left the heap short, so pruning could not start.
+  bool wantsSeedRound(int32_t round) const {
+    return round <= kMaxSeedWindowRounds && !heapFull();
+  }
+
+  // Every run the seed rounds of the current segment visited, for the sweep
+  // to jump.
+  std::span<const SeedWindow> seededRuns() const { return seedRuns; }
+
+  void normalizeSeedRuns(std::vector<SeedWindow>& runs) const {
+    for (SeedWindow& window : runs) {
+      window.begin = std::clamp(window.begin, 0, segmentMaxDoc);
+      window.end = std::clamp(window.end, 0, segmentMaxDoc);
+    }
+    std::erase_if(runs, [](const SeedWindow& w) { return w.begin >= w.end; });
+    std::sort(runs.begin(), runs.end(),
+              [](const SeedWindow& a, const SeedWindow& b) { return a.begin < b.begin; });
+    size_t kept = 0;
+    for (const SeedWindow& window : runs) {
+      if (kept > 0 && window.begin <= runs[kept - 1].end) {
+        runs[kept - 1].end = std::max(runs[kept - 1].end, window.end);
+      } else {
+        runs[kept++] = window;
+      }
+    }
+    runs.resize(kept);
+  }
+
+  // After a seed round, before the next round or the sweep rewinds to the
+  // segment start: the later clauses' comparators may read through
+  // forward-only cursors, so they are bound to the segment again (slot
+  // values survive) and given the bottom. The primary comparator offered the windows and reads in any
+  // order; collapse identity reads reset on a backward read themselves.
+  void rebindAfterSeeding() {
+    assert(currentSegment != nullptr);
+    for (size_t i = 1; i < clauses.size(); i++) {
+      clauses[i].resetCache();
+      if (clauses[i].comparator != nullptr) {
+        clauses[i].comparator->setSegment(*currentSegment);
+      }
+    }
+    if (heapFull()) setBottom();
   }
 
   struct CompetitiveRange {
@@ -1057,6 +1176,50 @@ private:
   // narrow and cheap enough, the postings union activates and each consult
   // surfaces the next candidate doc as a one-doc range.
   CompetitiveRange candidateRange(int32_t segment, int32_t from) {
+    if (!competitiveDocsUnsupported && topCount > 0
+        && clauses[0].comparator != nullptr
+        && clauses[0].comparator->offersCompetitiveDocs()) {
+      // Until the heap fills, consult again about topCount docs on: the
+      // source has no bound to offer before that.
+      if (pq.size() < (size_t)topCount) {
+        nextProbeDoc = (int32_t)std::min<int64_t>((int64_t)from + std::max<int64_t>(topCount, 16),
+                                                  (int64_t)PostingsReader::END);
+        return {from, nextProbeDoc};
+      }
+      if (from < nextProbeDoc) return {from, nextProbeDoc};
+      int32_t begin = from;
+      int32_t end = from;
+      // The source's docs left, assuming they spread evenly over the
+      // segment; the docs left when its cost is unknown.
+      int64_t left = std::max<int64_t>(0, (int64_t)segmentMaxDoc - from);
+      if (segmentSourceCost > 0 && segmentMaxDoc > 0) {
+        left = std::min<int64_t>(segmentSourceCost, segmentMaxDoc) * left / segmentMaxDoc;
+      }
+      auto status = clauses[0].comparator->competitiveDocs(
+          pq.top().slot, from, left, begin, end);
+      if (status == FieldComparator::CompetitiveDocStatus::READY) {
+        nextProbeDoc = 0;
+        if (begin == PostingsReader::END) {
+          skipCount(SkipStats::fieldSortCandidateTerminations);
+          return {begin, begin};
+        }
+        // A run must start at or after from and hold a doc: an answer before
+        // from would revisit collected docs, an empty one would stall the
+        // query on the same doc.
+        begin = std::max(begin, from);
+        end = std::max(end, begin + 1);
+        return {begin, end};
+      }
+      if (status == FieldComparator::CompetitiveDocStatus::PENDING) {
+        if (end > from) {
+          nextProbeDoc = end;
+          return {from, end};
+        }
+        return {from, probeDeferral(from)};
+      }
+      competitiveDocsUnsupported = true;
+      nextProbeDoc = 0;
+    }
     if (candidatesDisabled || segmentPool == nullptr || topCount == 0
         || clauses[0].comparator == nullptr) {
       candidatesDisabled = true;

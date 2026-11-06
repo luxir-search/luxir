@@ -17,6 +17,7 @@
 namespace luxir {
 
 class ValueProgram;
+class SortKindSource;
 
 enum class StringSortMode : uint8_t {
     DEFAULT,
@@ -155,7 +156,10 @@ public:
         COLUMN,
         SCORE,
         DOC,
-        EXPR
+        EXPR,
+        // A plugin sort kind (SortKindRegistry): its source makes the
+        // comparator.
+        PLUGIN
     };
 
 private:
@@ -163,6 +167,8 @@ private:
     SortField::SortOrder order;
     std::optional<SortField> sortField;
     const ValueProgram* valueProgram = nullptr;
+    std::shared_ptr<const SortKindSource> sortKind;
+    std::string_view sortKindName;
 
 public:
     explicit SortClause(SortField field)
@@ -176,6 +182,11 @@ public:
     SortClause(const ValueProgram& valueProgram, SortField::SortOrder order)
         : kind(EXPR), order(order), valueProgram(&valueProgram) {}
 
+    // `name` is the claimed name, a view into the request like the plan.
+    SortClause(std::shared_ptr<const SortKindSource> source, std::string_view name,
+               SortField::SortOrder order)
+        : kind(PLUGIN), order(order), sortKind(std::move(source)), sortKindName(name) {}
+
     Kind getKind() const { return kind; }
     SortField::SortOrder getOrder() const { return order; }
     const SortField& getSortField() const {
@@ -185,6 +196,14 @@ public:
     const ValueProgram& getValueProgram() const {
         assert(kind == EXPR);
         return *valueProgram;
+    }
+    const SortKindSource& getSortKind() const {
+        assert(kind == PLUGIN);
+        return *sortKind;
+    }
+    std::string_view getSortKindName() const {
+        assert(kind == PLUGIN);
+        return sortKindName;
     }
 };
 
