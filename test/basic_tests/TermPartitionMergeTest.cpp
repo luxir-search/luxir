@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "luxir/index/SegmentMerger.h"
@@ -118,6 +119,7 @@ int32_t recomputePackedBlockCount(const std::vector<PostingSnapshot>& postings) 
 void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
                   bool partitioned, int32_t termBase = 0,
                   IndexRamBudget* budget = nullptr, int32_t maxRanges = 4) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema, budget);
   index.iw->mergePolicy->setMergeFactor(1000);
@@ -153,6 +155,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
 
 void buildWideDictionarySources(TestIndex& index,
                                 const std::shared_ptr<Schema>& schema) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
@@ -184,7 +187,7 @@ SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
 size_t baseFileCount(Directory& directory, uint64_t segId) {
   std::vector<Directory::FileInfo> files;
   directory.listFiles(files);
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = "s" + Postings::segmentKey(segId, 1);
   return (size_t) std::count_if(files.begin(), files.end(), [&](const auto& file) {
     return file.name.starts_with(prefix + "_")
         && !file.name.starts_with(prefix + "__");
@@ -311,7 +314,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
       &right.reader->segments()[0].postingsReader()};
   std::array<LiveDocs*, 2> liveDocs = {nullptr, nullptr};
   RAMDir outputDir;
-  PostingsWriter writer(outputDir, 900, -1);
+  PostingsWriter writer(outputDir, 900, 1, -1);
   IndexRamBudget budget;
   Schema schema;
   StoredDictionaryRegistry dictionaries;
@@ -321,7 +324,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   merger.merge();
   writer.finish();
 
-  PostingsReader outputReader(outputDir, 900);
+  PostingsReader outputReader(outputDir, 900, 1);
   VersionRuns::Cursor outputBirths(outputReader.versionRuns());
   int32_t base = 0;
   for (auto* reader : readers) {
@@ -375,6 +378,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
 
 SegFieldInfo buildSparseRanges(TestIndex& index, const std::shared_ptr<Schema>& schema,
                                bool keepOneRange) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
   index.iw->termPartitionMinBytes = 1;
@@ -596,7 +600,7 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   [[maybe_unused]] auto blocker = budget.forceAcquire(cap);
   ASSERT_EQ(cap, budget.reservedBytes());
   RAMDir outputDir;
-  PostingsWriter writer(outputDir, 901, -1);
+  PostingsWriter writer(outputDir, 901, 1, -1);
   StoredDictionaryRegistry dictionaries;
   dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*schema));
   std::atomic<int64_t> maxCharged = 0;
@@ -614,7 +618,7 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   writer.finish();
   EXPECT_EQ(cap, budget.reservedBytes());
 
-  PostingsReader outputReader(outputDir, 901);
+  PostingsReader outputReader(outputDir, 901, 1);
   auto* fields = outputReader.fieldInfo("body");
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;

@@ -103,6 +103,14 @@ bool LuxirTest::isDefaultSchema(const std::shared_ptr<Schema>& schema) {
     auto it = schema->fieldTypeMap.find(name);
     if (it == schema->fieldTypeMap.end() || !fieldTypesEqual(*it->second, *defaultField)) return false;
   }
+  // Signatures carry the remaining per-field properties, such as long_terms.
+  static const FieldSignatures defaultSignatures = defaultSchema->signatures(true);
+  auto signatures = schema->signatures(true);
+  if (signatures.size() != defaultSignatures.size()) return false;
+  for (const auto& [name, signature] : defaultSignatures) {
+    auto it = signatures.find(name);
+    if (it == signatures.end() || it->second.properties != signature.properties) return false;
+  }
   return true;
 }
 

@@ -23,7 +23,7 @@ public:
 // Reads record which keys were consumed, so rejectUnknown() can refuse the
 // rest with the list of valid names.
 class ParamReader {
-  mutable std::vector<std::string_view> seen;
+  mutable std::vector<std::string> seen;
 
 public:
   using Entries = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
@@ -44,6 +44,8 @@ public:
   std::optional<int64_t> getInt(std::string_view name) const;
   int64_t getInt(std::string_view name, int64_t fallback) const;
   int64_t requireInt(std::string_view name) const;
+  // A non-negative integer or a size string using the CLI's binary size units.
+  uint64_t getBytes(std::string_view name, uint64_t fallback) const;
   std::optional<double> getDouble(std::string_view name) const;
   double getDouble(std::string_view name, double fallback) const;
   bool getBool(std::string_view name, bool fallback) const;

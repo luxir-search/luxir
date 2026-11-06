@@ -531,10 +531,10 @@ public:
       childWeight = query.child->createWeight(
           context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
           1.0f);
-      // Only the prepare requirement carries over: match-all, constant
+      // Only preparation traits carry over: match-all, constant
       // counts, and count/top-k composition all describe the child's
       // unfiltered membership.
-      traits = childWeight->getFlags() & NEEDS_PREPARE;
+      traits = childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 

@@ -277,8 +277,8 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
       dims = segDims;
     } else if (dims != segDims) {
       throw std::runtime_error(fmt::format(
-        "VectorIndexBuilder: dims mismatch in field {} (expected {}, segment {} has {})",
-        fieldName, dims, seg.segId, segDims));
+        "VectorIndexBuilder: dims mismatch in field {} (expected {}, segment s{} has {})",
+        fieldName, dims, Postings::segmentKey(seg.segId, seg.creatorEpoch), segDims));
     }
 
     if (!fn(seg, vr)) return false;
@@ -612,7 +612,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // (n:m segment:index) would use index-level aux naming instead.
   assert(segments_.size() == 1);
   std::string faissFile = Postings::getSegmentOverlayFileName(
-      segments_.front().segId, auxName, overlayGen_, 0);
+      segments_.front().segId, auxName, overlayGen_, 0, segments_.front().creatorEpoch, writerEpoch_);
   outFilesToSync.push_back(faissFile);
 
   FileDescriptor descriptor;

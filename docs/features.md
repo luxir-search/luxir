@@ -234,12 +234,16 @@ Anywhere a query goes, it can be a structured object or an expression string.
   TEXT matching, prefer a folding variant (`_t`, `_un`, `_wl`); it is faster.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
-  cut-off (the `function_score` / `script_score` counterpart).
+  (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
+  `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
+  and Elasticsearch-style `gauss_decay`, `exp_decay`, and `linear_decay`
+  decay functions over numeric, date, and geo values. `rescore` takes an
+  optional `min_score` cut-off (the `function_score` / `script_score`
+  counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
-- `knn` vector search, `geo_box`, and `geo_distance`.
+- `knn` vector search, `geo_box`, `geo_distance`, and `geo_polygon`.
 - `multi_match`: search one text across weighted fields. `combined`
   (default) scores TEXT fields sharing an analyzer and long-term policy as
   one field with BM25F; weights scale term frequency and length at every
@@ -339,8 +343,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   candidates are rescored at full precision straight from the column, so the
   recall recovery costs no extra storage.
 - Filtered kNN applies filters inside the vector search and adaptively deepens
-  ANN breadth instead of post-filtering. `exact: true` gives the exact
-  filtered top-k, which also serves as the ground truth for measuring recall.
+  ANN breadth instead of post-filtering. Each segment chooses between its index
+  and an exact scan of the filtered vectors by modeled cost, and switches to
+  exact mid-query when the index turns out more expensive. `exact: true` gives
+  the exact filtered top-k, which also serves as the ground truth for
+  measuring recall.
 - Multi-valued vector fields collapse to one hit per document at its best
   similarity, with adaptive over-fetch so `k` documents still come back.
 - ANN indexes are segment overlays: built at commit from the vector column and
@@ -361,8 +368,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `Point` objects, `"lat,lon"` strings, WKT `POINT` strings, or geohashes.
   `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
   `ignore_z_value`.
-- Bounding-box queries (dateline-aware) and great-circle distance queries,
-  usable as the main query, as a non-scoring filter, or as a boolean clause.
+- Bounding-box queries (dateline-aware), great-circle distance queries, and
+  polygon queries over a union of polygons with holes, usable as the main
+  query, as a non-scoring filter, or as a boolean clause.
+- Requested geo fields come back in their ingest shape, `[lon, lat]`, or
+  `[[lon, lat], ...]` for a multi-valued field, so results index back
+  unchanged.
 
 ## API surfaces
 

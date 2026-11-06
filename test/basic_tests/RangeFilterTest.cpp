@@ -625,14 +625,306 @@ TEST_F(RangeFilterTest, LonePreparedFilterUnderTopKStaysFlat) {
   }
 }
 
-TEST_F(RangeFilterTest, TwoPhaseFilterStaysBesideTheNestedFilters) {
-  // The two produced ranges nest by their intersection; a third range that
-  // verifies stays its own clause beside them.
+namespace {
+
+// The selector's own schedule, the flat one, or the grouped one wherever a
+// source group's scope admits a verifier.
+enum class Schedule { RULE, FLAT, GROUPED };
+
+struct ScheduleGuard {
+  bool disable = BooleanQuery::disableSourceGroupingForTests;
+  bool force = BooleanQuery::forceSourceGroupingForTests;
+  explicit ScheduleGuard(Schedule schedule) {
+    BooleanQuery::disableSourceGroupingForTests = schedule == Schedule::FLAT;
+    BooleanQuery::forceSourceGroupingForTests = schedule == Schedule::GROUPED;
+  }
+  ~ScheduleGuard() {
+    BooleanQuery::disableSourceGroupingForTests = disable;
+    BooleanQuery::forceSourceGroupingForTests = force;
+  }
+};
+
+// Every live pull hit per segment with its score, and the verifiers grouped
+// and posting blocks decoded on the way.
+struct ScheduleRun {
+  std::vector<std::tuple<int32_t, int32_t, float>> hits;
+  int64_t grouped = 0;
+  int64_t blocks = 0;
+};
+
+ScheduleRun scheduleRun(IndexReader& source, Query& query, Schedule schedule,
+                int flags = Query::NEED_SCORES, bool prepare = false) {
+  ScheduleGuard guard(schedule);
+  SkipStatsScope stats;
+  ScheduleRun run;
+  MemPool pool;
+  Query::Context context(pool, source);
+  auto* weight = query.createWeight(context, flags);
+  std::unique_ptr<Query::Weight::PreparedWeight> prepared;
+  if (prepare) {
+    Query::Weight::PrepareContext prepareContext{source, std::span<DocSet* const>{}, false, nullptr};
+    prepared = weight->prepare(prepareContext);
+  }
+  for (auto& segment : source.segments()) {
+    auto* supplier = prepared ? prepared->scorerSupplier(pool, segment)
+                              : weight->scorerSupplier(pool, segment);
+    if (supplier == nullptr) continue;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, segment.maxDoc())->build(pool);
+    if (scorer == nullptr) continue;
+    auto* live = segment.liveDocs();
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      if (live != nullptr && !live->docset().get(doc)) continue;
+      float score = (flags & Query::NEED_SCORES) ? scorer->score() : 0.0f;
+      run.hits.emplace_back((int32_t)segment.ord, doc, score);
+    }
+  }
+  run.grouped = SkipStats::conjSourceGroupedVerifiers;
+  run.blocks = SkipStats::docBlocksDecoded;
+  return run;
+}
+
+// The grouped schedule returns the flat one's hits, scores and order; and
+// groups only where expected.
+void expectGroupedMatchesFlat(IndexReader& source, Query& query, bool groups,
+                              int flags = Query::NEED_SCORES) {
+  ScheduleRun flat = scheduleRun(source, query, Schedule::FLAT, flags);
+  ScheduleRun grouped = scheduleRun(source, query, Schedule::GROUPED, flags);
+  EXPECT_EQ(0, flat.grouped);
+  EXPECT_EQ(groups, grouped.grouped > 0);
+  EXPECT_FALSE(flat.hits.empty());
+  EXPECT_EQ(flat.hits, grouped.hits);
+}
+
+} // namespace
+
+TEST_F(RangeFilterTest, LeadingFiltersConfirmRejectingVerifiersBeforeTheUnion) {
+  // Grouped: a sparse produced range (128 docs across the segment) leads a
+  // dense union (341 posting blocks); a verifier estimated to reject most of
+  // its documents (it rejects half) joins it, and the union decodes fewer
+  // blocks reaching only confirmed ones. Beside: two produced ranges whose
+  // intersection lies in one docid window lead a sparse union, whose few
+  // blocks there decode either way; the verifier stays beside.
+  NumericPredicateQuery sparse("points_i", 0, 255), spread("points_i", 0, 4095);
+  NumericPredicateQuery run("proof_points_i", 4096, 12287);
+  NumericPredicateQuery rejecting("column_i", 0, 127), window("column_i", 2048, 6000);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> dense{&pad, &b}, rare{&a, &c};
+  std::array<Query*, 2> groupedFilters{&sparse, &rejecting};
+  std::array<Query*, 3> besideFilters{&spread, &run, &window};
+  BooleanQuery groupedQuery({}, dense, {}, groupedFilters, 1);
+  BooleanQuery besideQuery({}, rare, {}, besideFilters, 1);
+  for (bool grouped : {true, false}) {
+    SCOPED_TRACE(grouped);
+    BooleanQuery& query = grouped ? groupedQuery : besideQuery;
+    ScheduleRun flat = scheduleRun(*reader, query, Schedule::FLAT);
+    ScheduleRun rule = scheduleRun(*reader, query, Schedule::RULE);
+    EXPECT_EQ(grouped, rule.grouped > 0);
+    EXPECT_EQ(flat.hits, rule.hits);
+    if (grouped) {
+      EXPECT_LT(rule.blocks, flat.blocks);
+    }
+    std::vector<int32_t> docs, expected;
+    for (auto [segment, doc, score] : rule.hits) docs.push_back(doc);
+    for (int32_t doc = 0; doc < N; doc++) {
+      int64_t value = 2 * ((doc * 1543) % N);
+      bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
+      if (grouped ? value <= 127
+                  : body && doc >= 4096 && doc < 12288 && value >= 2048 && value <= 4095) {
+        expected.push_back(doc);
+      }
+    }
+    EXPECT_EQ(expected, docs);
+  }
+}
+
+TEST_F(RangeFilterTest, NonrejectingVerifierStaysBesideADenseUnion) {
+  // A verifier expected to pass every document spares the union nothing, and
+  // a union holding every source document costs it no checks beside: the
+  // flat schedule stays, though the shape admits grouping.
+  NumericPredicateQuery sparse("points_i", 0, 255), everything("column_i", 1, 2 * N);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &everything};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  ScheduleRun rule = scheduleRun(*reader, query, Schedule::RULE);
+  EXPECT_EQ(0, rule.grouped);
+  EXPECT_EQ(scheduleRun(*reader, query, Schedule::FLAT).hits, rule.hits);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, CachedSourceWithUncachedVerifierStaysFlat) {
+  // A prepared doc set knows its count but not where its documents lie, so
+  // it cannot lead a source group; the uncached verifier stays beside.
+  NumericPredicateQuery sparse("points_i", 0, 255), rejecting("column_i", 0, 127);
+  ForcePrepareQuery prepared(&sparse);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&prepared, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  for (Schedule schedule : {Schedule::RULE, Schedule::GROUPED}) {
+    ScheduleRun run = scheduleRun(*reader, query, schedule, Query::NEED_SCORES, true);
+    EXPECT_EQ(0, run.grouped);
+    EXPECT_EQ(scheduleRun(*reader, query, Schedule::FLAT, Query::NEED_SCORES, true).hits, run.hits);
+  }
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatWithExclusions) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), excluded("body_w", "excluded");
+  std::array<std::string_view, 2> terms{"dense_a", "dense_b"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  std::array<Query*, 2> dense{&pad, &b}, prohibited{&excluded, &phrase};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, prohibited, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatBesideAScoredRequiredTerm) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery b("body_w", "b"), pad("body_w", "pad"), denseA("body_w", "dense_a");
+  std::array<Query*, 1> mandatory{&b};
+  std::array<Query*, 2> optional{&pad, &denseA};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query(mandatory, optional, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatUnderAnActiveThreshold) {
+  // Top 10 with pruning: the grouped schedule keeps the flat one's results.
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b"), a("body_w", "a");
+  std::array<Query*, 3> optional{&pad, &b, &a};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  int64_t grouped = 0;
+  auto topK = [&](Schedule schedule) {
+    ScheduleGuard guard(schedule);
+    SkipStatsScope stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    TopDocsCollector collector(10);
+    auto& segment = reader->segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(nullptr, supplier);
+    if (supplier != nullptr) {
+      auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+      collectTopK(segment.ord, scorer, nullptr, nullptr, collector, true);
+    }
+    std::vector<std::pair<int32_t, float>> out;
+    for (const auto& hit : collector.scoreDocs()) out.emplace_back(hit.doc.docId(), (float)hit.score);
+    grouped = SkipStats::conjSourceGroupedVerifiers;
+    return out;
+  };
+  auto flat = topK(Schedule::FLAT);
+  EXPECT_EQ(0, grouped);
+  EXPECT_EQ(10u, flat.size());
+  EXPECT_EQ(flat, topK(Schedule::GROUPED));
+  EXPECT_LT(0, grouped);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceResetsLikeFlat) {
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  int64_t grouped = 0;
+  auto replay = [&](Schedule schedule) {
+    ScheduleGuard guard(schedule);
+    SkipStatsScope stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    std::vector<int32_t> docs;
+    EXPECT_NE(nullptr, supplier);
+    if (supplier == nullptr) return docs;
+    auto* plan = resolveScorerPlanForTests(pool, *supplier, N);
+    EXPECT_TRUE(plan->supportsReset());
+    auto* scorer = plan->build(pool);
+    for (int i = 0; i < 3 && scorer->next() != PostingsReader::END; i++) {}
+    scorer->reset();
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+    grouped = SkipStats::conjSourceGroupedVerifiers;
+    return docs;
+  };
+  auto flat = replay(Schedule::FLAT);
+  EXPECT_EQ(0, grouped);
+  EXPECT_FALSE(flat.empty());
+  EXPECT_EQ(flat, replay(Schedule::GROUPED));
+  EXPECT_LT(0, grouped);
+  std::vector<int32_t> fresh;
+  for (auto [segment, doc, score] : scheduleRun(*reader, query, Schedule::FLAT, 0).hits) fresh.push_back(doc);
+  EXPECT_EQ(fresh, flat);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceIntersectionMatchesFlat) {
+  // Two produced ranges intersect as the group's source and a verifier
+  // confirms behind them; a sparse union leaps the group forward, so its
+  // inner conjunction serves advances, not just next().
   NumericPredicateQuery spread("points_i", 0, 4095), run("proof_points_i", 4096, 12287);
-  NumericPredicateQuery broad("column_i", 0, 59000);
+  NumericPredicateQuery window("column_i", 2048, 6000);
   TermQuery a("body_w", "a"), c("body_w", "c");
-  std::array<Query*, 2> optional{&a, &c};
-  std::array<Query*, 3> filters{&spread, &run, &broad};
+  std::array<Query*, 2> rare{&a, &c};
+  std::array<Query*, 3> filters{&spread, &run, &window};
+  BooleanQuery query({}, rare, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, true);
+  expectGroupedMatchesFlat(*reader, query, true, 0);
+}
+
+TEST_F(RangeFilterTest, VerifiersAloneNeverFormASourceGroup) {
+  // Without a single-phase source a nested verifier would produce: no group.
+  NumericPredicateQuery low("column_i", 0, 4095), high("column_i", 1024, 30000);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> rare{&a, &c};
+  std::array<Query*, 2> filters{&low, &high};
+  BooleanQuery query({}, rare, {}, filters, 1);
+  expectGroupedMatchesFlat(*reader, query, false);
+}
+
+TEST_F(RangeFilterTest, GroupedSourceMatchesFlatAcrossSegmentsWithDeletes) {
+  // Three segments: the second lacks the union's second term, every seventh
+  // document lacks the verifier's field, and a few documents are deleted.
+  CollectionHelper multi;
+  SchemaBuilder schema;
+  auto& field = schema.field("points_i");
+  field.type = api::FieldDef::FieldClass::INT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(multi.collection());
+  for (int32_t seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < 4096; i++) {
+      int32_t id = seg * 4096 + i;
+      int64_t value = 2 * ((id * 1543) % N);
+      std::string body = "pad";
+      if (seg != 1 && id % 3 == 0) body += " b";
+      docs.push_back(flatdoc("id", std::to_string(id), "body_w", body, "points_i", value));
+      if (id % 7 != 0) docs.back().push_back({"column_i", value});
+    }
+    ASSERT_TRUE(multi.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(multi.deleteByIds({"5", "4100", "8200", "8201"}, UpdateMessage::COMMIT).success);
+  // Read the committed index directly: no filter cache serves the filters
+  // as prepared doc sets.
+  auto source = std::make_shared<IndexReader>(multi.getIndexWriter()->dir);
+  ASSERT_LE(3u, source->segments().size());
+  NumericPredicateQuery sparse("points_i", 0, 1023), rejecting("column_i", 0, 511);
+  TermQuery pad("body_w", "pad"), b("body_w", "b");
+  std::array<Query*, 2> dense{&pad, &b};
+  std::array<Query*, 2> filters{&sparse, &rejecting};
+  BooleanQuery query({}, dense, {}, filters, 1);
+  expectGroupedMatchesFlat(*source, query, true);
+}
+
+TEST_F(RangeFilterTest, SparseBodyKeepsRejectingVerifiersBesideIt) {
+  // The union (144 docs) is sparser than the produced range (2,048) and
+  // supplies the candidates; the verifier that would join a leading range
+  // stays beside it, checking only the union's candidates.
+  NumericPredicateQuery spread("points_i", 0, 4095), verifier("column_i", 0, 6000);
+  TermQuery rare("body_w", "rare"), threshold("body_w", "threshold");
+  std::array<Query*, 2> optional{&rare, &threshold};
+  std::array<Query*, 2> filters{&spread, &verifier};
   BooleanQuery query({}, optional, {}, filters, 1);
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -643,13 +935,13 @@ TEST_F(RangeFilterTest, TwoPhaseFilterStaysBesideTheNestedFilters) {
   EXPECT_EQ(1, SkipStats::numericPredicateSparseVerifyArms);
   auto clauses = scorer->flatConjunctionScorers();
   ASSERT_EQ(3u, clauses.size());
-  EXPECT_NE(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]));
+  for (auto* clause : clauses) {
+    EXPECT_EQ(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clause));
+  }
   std::vector<int32_t> docs, expected;
   for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
-  for (int32_t doc = 4096; doc < 12288; doc++) {
-    int64_t value = 2 * ((doc * 1543) % N);
-    bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
-    if (body && value <= 4095 && value <= 59000) expected.push_back(doc);
+  for (int32_t doc = 0; doc < N; doc += 256) {
+    if (2 * ((doc * 1543) % N) <= 4095) expected.push_back(doc);
   }
   EXPECT_EQ(expected, docs);
 }

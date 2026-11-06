@@ -176,6 +176,8 @@ def variant(args, queries, stream, metric, meta):
         sockets.append(s)
     port, grpc = [s.getsockname()[1] for s in sockets]
     cmd = [str(Path(args.binary).resolve()), '--store.backend=fs', f'--store.data-dir={data}', f'--server.http.port={port}', f'--server.grpc.port={grpc}', f'--server.workers={args.workers}', '--max-ram-mb=4096']
+    if args.max_inflight_batches:
+        cmd.append(f'--indexing.max-inflight-batches={args.max_inflight_batches}')
     session = requests.Session()
     base = f'http://127.0.0.1:{port}'
 
@@ -190,7 +192,7 @@ def variant(args, queries, stream, metric, meta):
 
     cpu = Path('/proc/cpuinfo').read_text()
     (args.output / 'cpuinfo.txt').write_text(cpu)
-    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': meta['index_count'], 'query_count': meta['query_count'], 'k': 10, 'workers': args.workers, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
+    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': meta['index_count'], 'query_count': meta['query_count'], 'k': 10, 'workers': args.workers, 'max_inflight_batches': args.max_inflight_batches, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
     log = (args.output / 'server.log').open('w')
     shim_source = args.output.resolve() / 'loopback-bind.c'
     shim = args.output.resolve() / 'loopback-bind.so'
@@ -268,19 +270,21 @@ def variant(args, queries, stream, metric, meta):
             payloads = [json.dumps(search(v, nprobe), separators=(',', ':')).encode() for v in vectors]
             passes = all_passes[nprobe]
             for pass_no in range(4):
-                times, recalls = [], []
+                times, recalls, result_ids = [], [], []
                 for payload, expected in zip(payloads, truth):
                     start = time.perf_counter_ns()
                     r = session.post(base + f'/collections/{name}/_search', data=payload, headers={'Content-Type': 'application/json'}, timeout=120)
                     elapsed = (time.perf_counter_ns() - start) / 1e6
                     r.raise_for_status()
-                    ids = {d['id'] for d in checked(r.json())['docs']}
+                    ordered_ids = [d['id'] for d in checked(r.json())['docs']]
+                    result_ids.append(ordered_ids)
+                    ids = set(ordered_ids)
                     if len(ids) != 10:
                         raise RuntimeError('ANN top ten underfilled')
                     times.append(elapsed)
                     recalls.append(len(ids & expected) / 10)
                 if pass_no:
-                    passes.append({'p50_ms': float(np.percentile(times, 50)), 'p99_ms': float(np.percentile(times, 99)), 'recall_at_10': statistics.mean(recalls), 'latencies_ms': times})
+                    passes.append({'p50_ms': float(np.percentile(times, 50)), 'p99_ms': float(np.percentile(times, 99)), 'recall_at_10': statistics.mean(recalls), 'latencies_ms': times, 'query_result_ids_sha256': hashlib.sha256(json.dumps(result_ids, separators=(',', ':')).encode()).hexdigest()})
                 print(f'{name} nprobe={nprobe} pass={pass_no} done', flush=True)
                 if pass_no == 3:
                     row = {'variant': name, 'field_settings': args.settings, 'nprobe': 'adaptive' if nprobe == 0 else nprobe, 'ingest_s': ingest, 'ann_build_s': build_s, 'index_bytes': size, 'committed_bytes': committed_bytes, 'allocated_bytes': allocated, **{k: statistics.median(x[k] for x in passes) for k in ['p50_ms', 'p99_ms', 'recall_at_10']}, 'passes': passes}
@@ -320,7 +324,10 @@ def main():
     p.add_argument('--output', type=Path, default=Path('vector-results'))
     p.add_argument('--label', default='local')
     p.add_argument('--workers', type=int, default=2)
+    p.add_argument('--max-inflight-batches', type=int, default=1, help='Internal ingest batches in flight; 1 preserves input order, 0 uses the server default')
     args = p.parse_args()
+    if args.max_inflight_batches < 0:
+        p.error('max-inflight-batches must be nonnegative')
     settings = json.loads(args.candidate_field_settings)
     if not isinstance(settings, dict) or any(k in settings for k in ['type', 'dims', 'metric']):
         p.error('Candidate settings must be an object without type/dims/metric overrides')
@@ -352,7 +359,7 @@ def main():
             row['delta_percent_vs_base'] = {k: 100 * (row[k] / base[k] - 1) for k in ['ingest_s', 'ann_build_s', 'index_bytes', 'p50_ms', 'p99_ms']}
             row['recall_delta_points_vs_base'] = 100 * (row['recall_at_10'] - base['recall_at_10'])
             rows.append(row)
-    output = {'label': args.label, 'variants': results, 'rows': rows, 'pass_schedule': schedule, 'exact_truth_equal': True}
+    output = {'label': args.label, 'max_inflight_batches': args.max_inflight_batches, 'variants': results, 'rows': rows, 'pass_schedule': schedule, 'exact_truth_equal': True}
     (args.output / 'results.json').write_text(json.dumps(output, indent=2))
     lines = [f'## {args.label}: base vs candidate', '', f'Base `{args.base_revision}`; candidate `{args.candidate_revision}`.', f'{results[0]["cpu_model"]}; SIMD `{results[0]["simd"]}`; {meta["index_count"]} indexed / {meta["query_count"]} queries, {meta["dims"]}d, {metric}; dataset `{args.dataset}`.', '', 'Single measurements in base, feature, default order; percent change vs base.', '', '| Variant | Ingest s | Merge + ANN build s | Index MiB |', '|---|---:|---:|---:|']
     for result in results:
