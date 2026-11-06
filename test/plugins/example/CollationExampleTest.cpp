@@ -16,6 +16,7 @@
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "test/CollectionHelper.h"
+#include "test/StorageTestUtils.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -198,9 +199,10 @@ TEST_F(CollationExampleTest, signatureCarriesTheCollation) {
   };
   EXPECT_EQ(R"("example_ci")", signature(tertiary));
   EXPECT_EQ(R"({"name":"example_ci","params":{"strength":"primary"}})", signature(primary));
-  auto first = tertiary->withHistory(1, nullptr);
-  EXPECT_EQ(2u, primary->withHistory(2, first.get())->introduction("title__sort"));  // new keys, new introduction
-  EXPECT_EQ(1u, build(R"("example_ci")")->withHistory(2, first.get())->introduction("title__sort"));  // unchanged
+  auto at = [](uint64_t gen) { return SchemaBinding(api::SchemaReference{"t0", "", {0, 0, gen, 1}}); };
+  auto first = tertiary->withHistory(at(1), nullptr);
+  EXPECT_EQ(2u, primary->withHistory(at(2), first.get())->introduction("title__sort"));  // new keys, new introduction
+  EXPECT_EQ(1u, build(R"("example_ci")")->withHistory(at(2), first.get())->introduction("title__sort"));  // unchanged
 }
 
 // The authored schema reads back with the collation, and a stored primary that
@@ -244,8 +246,7 @@ TEST_F(CollationExampleTest, persistedAndMissingCollationFailsTheCollectionOnly)
     EXPECT_EQ((std::vector<std::string>{"d3", "d2", "d1", "d4", "d5"}), sorted(good, "title", qb::ASC, "good"));
   }
   // Rewrite the committed schema of "bad" as if the plugin were absent.
-  FSDirectory container(path / "t" / "t0" / "bad");
-  FSDirectory dir(path / "t" / "t0" / "bad" / *CollectionStorage::current(container));
+  FSDirectory dir(test::incarnationPath(path, "bad"));
   auto loaded = readDurableIndexInfo(dir);
   api::SchemaDef missing;
   std::string error;
@@ -253,9 +254,18 @@ TEST_F(CollationExampleTest, persistedAndMissingCollationFailsTheCollectionOnly)
   ASSERT_TRUE(api::read_json(missing, missingJson, *loaded.arena, &error)) << error;
   std::vector<std::byte> schemaBytes, manifest;
   ASSERT_TRUE(api::encode(missing, schemaBytes));
-  loaded.info.schema->source_def = std::span<const std::byte>(schemaBytes);
+  api::SchemaInfo stored;
+  stored.source_def = schemaBytes;
+  std::vector<std::byte> storedBytes;
+  ASSERT_TRUE(api::encode(stored, storedBytes));
+  auto contents = Manifest::withFooter(storedBytes);
+  auto& file = loaded.info.schema_file;
+  file.size = contents.size();
+  file.xxh3 = XXH3_64bits(contents.data(), contents.size());
+  dir.publishFile(file.name, contents, Directory::PublishMode::REPLACE);
   ASSERT_TRUE(api::encode(loaded.info, manifest));
-  Manifest::write(dir, loaded.info.index_gen, manifest);
+  dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+      Manifest::withFooter(manifest), Directory::PublishMode::REPLACE);
 
   LuxirNode node(config);
   CollectionHelper good(node, "good");
