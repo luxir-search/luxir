@@ -1992,6 +1992,19 @@ public:
 
       bool usesIntervals() const { return intervals != nullptr; }
       int32_t getNList() const noexcept { return (int32_t)ivf.nlist; }
+
+      /// True when the lists are read by range from a lazy overlay.
+      bool lazyLists() const { return listLayout.file != nullptr && listLayout.file->lazy(); }
+
+      /// Declares the lists a round will scan, so a lazy overlay fetches
+      /// them together (adjacent runs coalesce) before the scan touches them
+      /// one by one.
+      void declareLists(std::span<const faiss::idx_t> listIds) const {
+        std::vector<ByteRange> ranges;
+        ranges.reserve(listIds.size() * 3);
+        listLayout.appendRanges(listIds, intervals != nullptr, ranges);
+        if (!ranges.empty()) listLayout.file->prefetchRanges(ranges);
+      }
       int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)ivf.invlists->list_size((size_t)id); }
 
       void coarseRun(int32_t dims,
@@ -2079,7 +2092,8 @@ public:
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         // Cold lists fault page by page, each a blocking device read, so a
         // round reads its lists ahead.  A round is shorter than the gate's
-        // fault checks, so a sampled page of the codes turns advice on.
+        // fault checks, so a sampled page of the codes turns advice on.  A
+        // lazy overlay has none of this: search() declared the round's lists.
         RowReadAhead::Gate gate;
         RowReadAhead ahead(gate, listLayout.file, 0, 1, (int64_t)listLayout.fileSize);
         auto queueList = [&](int64_t k) {
@@ -2772,6 +2786,7 @@ public:
         // previous chunk rather than becoming a trivial task.  Boundaries do
         // not depend on the execution mode.
         std::vector<ScanUnit> units;
+        std::vector<ScanUnit> declared;
         for (size_t i = 0; i < slots.size(); i++) {
           auto& slot = slots[i];
           if (slot.ivfEngine != nullptr) {
@@ -2780,6 +2795,7 @@ public:
             size_t start = depthGrew && !slot.ivfEngine->usesIntervals() ? 0 : scannedListCount[i];
             scannedListCount[i] = total;
             if (start >= total) continue;
+            if (slot.ivfEngine->lazyLists()) declared.push_back({(int32_t)i, start, total, 0});
             int64_t grain = std::max<int64_t>(1, scanTaskGrainVectors);
             size_t firstUnit = units.size();
             size_t chunkBegin = start;
@@ -2804,6 +2820,24 @@ public:
             slot.flatPending = false;
             units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount});
           }
+        }
+
+        // A lazy overlay fetches the round's lists in one call per segment
+        // before the scan, instead of one request per list as the scan first
+        // touches it.  The fetch still blocks this round; rounds after the
+        // first block again, each on its own fetch, and so do live-size
+        // lookups under deletes, which read a list's ids while allocating.
+        if (!declared.empty()) {
+          bool spawnTasks = parallel && declared.size() > 1;
+          TaskGroupRunner runner;
+          task_group_fanout(spawnTasks ? runner.group() : nullptr, declared.size(), [&](size_t i) {
+            return [&, i]() {
+              const auto& unit = declared[i];
+              slots[(size_t)unit.slotOrd].ivfEngine->declareLists(std::span<const faiss::idx_t>(
+                selectedListIds[(size_t)unit.slotOrd].data() + unit.listBegin, unit.listEnd - unit.listBegin));
+            };
+          });
+          runner.join();
         }
 
         if (!units.empty()) {

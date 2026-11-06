@@ -177,13 +177,30 @@ struct VectorAuxListsFooter {
   /// Decode + validate the footer at the tail of a fileBytes-long file.
   static VectorAuxListsFooter fromFileTail(const char* base, size_t fileBytes,
                                            std::string_view auxName) {
+    checkFileBytes(fileBytes, auxName);
+    return decode(base + fileBytes - sizeof(VectorAuxListsFooter), fileBytes, auxName);
+  }
+
+  /// The same, reading only the footer's bytes of the file.
+  static VectorAuxListsFooter fromFile(InputFile& file, std::string_view auxName) {
+    size_t fileBytes = file.size();
+    checkFileBytes(fileBytes, auxName);
+    InputStream tail = file.rangeStream(fileBytes - sizeof(VectorAuxListsFooter), sizeof(VectorAuxListsFooter));
+    return decode(tail.ptr(), fileBytes, auxName);
+  }
+
+private:
+  static void checkFileBytes(size_t fileBytes, std::string_view auxName) {
     if (fileBytes < sizeof(VectorAuxListsFooter)) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' file is {} bytes, smaller than the lists footer",
         auxName, fileBytes));
     }
+  }
+
+  static VectorAuxListsFooter decode(const char* bytes, size_t fileBytes, std::string_view auxName) {
     VectorAuxListsFooter f;
-    std::memcpy(&f, base + fileBytes - sizeof(VectorAuxListsFooter), sizeof(f));
+    std::memcpy(&f, bytes, sizeof(f));
     if (f.magic != MAGIC) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' is not in the header+lists layout (bad magic)", auxName));
@@ -222,12 +239,17 @@ static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 4 * sizeof(i
               "VectorAuxListsFooter layout is an on-disk contract");
 
 struct RaBitQAmplitudes {
-  const float* values = nullptr;
+  const float* values = nullptr;  // all lists' amplitudes; null when read by range
   std::span<const size_t> offsets;
   std::atomic<uint8_t>* checked = nullptr;  // per list; the reader owns it
+  InputFile* lazyFile = nullptr;  // set when read by range: the amplitudes start at valuesAt
+  size_t valuesAt = 0;
 
-  std::span<const float> list(size_t listNo) const noexcept {
-    return {values + offsets[listNo], offsets[listNo + 1] - offsets[listNo]};
+  std::span<const float> list(size_t listNo) const {
+    size_t count = offsets[listNo + 1] - offsets[listNo];
+    if (lazyFile == nullptr) return {values + offsets[listNo], count};
+    InputStream is = lazyFile->rangeStream(valuesAt + offsets[listNo] * sizeof(float), count * sizeof(float));
+    return {(const float*)is.ptr(), count};
   }
 
   /// The list's amplitudes, validated on the list's first use.  A scan reads
@@ -257,18 +279,39 @@ struct IvfListLayout {
   size_t amplitudes = 0;
   size_t codeSize = 0;
   std::span<const size_t> offsets;
+
+  /// Appends the byte ranges of the lists' runs (ids, codes, and amplitudes
+  /// when withAmplitudes), for InputFile::prefetchRanges.  Negative ids are
+  /// skipped.
+  void appendRanges(std::span<const int64_t> lists, bool withAmplitudes, std::vector<ByteRange>& out) const {
+    for (int64_t list : lists) {
+      if (list < 0) continue;
+      size_t first = offsets[(size_t)list], end = offsets[(size_t)list + 1];
+      if (first == end) continue;
+      out.push_back({ids + first * sizeof(int64_t), (end - first) * sizeof(int64_t)});
+      out.push_back({codes + first * codeSize, (end - first) * codeSize});
+      if (withAmplitudes && amplitudes != 0) {
+        out.push_back({amplitudes + first * sizeof(float), (end - first) * sizeof(float)});
+      }
+    }
+  }
 };
 
 /// Read-only faiss::InvertedLists serving codes + ids directly out of the aux
 /// file's memory view (mmap for FSDirectory, owned buffer for RAMDir): FAISS
 /// list scans read zero-copy through Directory instead of from a deserialized
-/// RAM copy.  The owning VectorAuxReader keeps the backing InputFile alive
+/// RAM copy.  On a lazy file (object storage) each list is a range of the
+/// file instead, fetched on its first use: the whole-file view would fetch
+/// every list.  The owning VectorAuxReader keeps the backing InputFile alive
 /// for the lifetime of the index.  ReadOnlyInvertedLists supplies throwing
 /// add/update/resize.
 class MmapInvertedLists final : public faiss::ReadOnlyInvertedLists {
-  const faiss::idx_t* ids;      // all lists' ids, concatenated in list order
-  const uint8_t* codes;         // all lists' codes, same order
+  const faiss::idx_t* ids;      // all lists' ids, concatenated in list order; null when lazy
+  const uint8_t* codes;         // all lists' codes, same order; null when lazy
   std::vector<size_t> offsets;  // prefix sums of list sizes, nlist+1 entries
+  InputFile* lazyFile = nullptr;  // set when lists are read by range
+  size_t idsAt = 0;               // lazy: file offsets of the ids and codes sections
+  size_t codesAt = 0;
 
 public:
   MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
@@ -281,6 +324,16 @@ public:
     }
   }
 
+  /// Lists read by range from `file`, whose ids and codes sections start at
+  /// idsAt and codesAt.
+  MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
+                    InputFile& file, size_t idsAt, size_t codesAt)
+    : MmapInvertedLists(nlist, codeSize, listSizes, nullptr, nullptr) {
+    lazyFile = &file;
+    this->idsAt = idsAt;
+    this->codesAt = codesAt;
+  }
+
   size_t totalSize() const noexcept { return offsets.back(); }
   std::span<const size_t> listOffsets() const noexcept { return offsets; }
 
@@ -288,9 +341,17 @@ public:
     return offsets[listNo + 1] - offsets[listNo];
   }
   const uint8_t* get_codes(size_t listNo) const override {
+    if (lazyFile) {
+      return (const uint8_t*)lazyFile->rangeStream(codesAt + offsets[listNo] * code_size,
+                                                   list_size(listNo) * code_size).ptr();
+    }
     return codes + offsets[listNo] * code_size;
   }
   const faiss::idx_t* get_ids(size_t listNo) const override {
+    if (lazyFile) {
+      return (const faiss::idx_t*)lazyFile->rangeStream(idsAt + offsets[listNo] * sizeof(faiss::idx_t),
+                                                        list_size(listNo) * sizeof(faiss::idx_t)).ptr();
+    }
     return ids + offsets[listNo];
   }
 };
@@ -367,14 +428,14 @@ public:
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
       file(std::move(file)), meta(meta) {
-    InputStream is = this->file->getInputStream();
-    const char* base = is.ptr();
-    footer = VectorAuxListsFooter::fromFileTail(base, (size_t)is.left(), this->name);
+    // Ranges, not the whole file: on object storage the whole file would
+    // fetch every list at open.
+    footer = VectorAuxListsFooter::fromFile(*this->file, this->name);
     if (footer.amplitudeCount != (isRaBitQ() ? 1 : 0)) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' amplitude layout does not match codec", this->name));
     }
-    const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
+    const int64_t* sizes = listSizes();
     int64_t remaining = footer.ntotal;
     for (int64_t i = 0; i < footer.nlist; i++) {
       if (sizes[i] < 0 || sizes[i] > remaining) {
@@ -418,13 +479,12 @@ public:
   // construction.  Only the FAISS header (params + coarse quantizer + PQ
   // codebooks) is deserialized into RAM; the inverted-list
   // payloads are served zero-copy from the file's memory view via
-  // MmapInvertedLists (see VectorAuxListsFooter).
+  // MmapInvertedLists (see VectorAuxListsFooter).  A lazy file reads the
+  // header here and each list by range when a scan first uses it.
   faiss::Index* getFaissIndex() const {
     callOnce(loadOnce, [this]() {
-      InputStream is = file->getInputStream();
-      const char* base = is.ptr();
-
-      BufferIOReader io(base, (size_t)footer.faissHeaderBytes);
+      InputStream header = file->rangeStream(0, (uint64_t)footer.faissHeaderBytes);
+      BufferIOReader io(header.ptr(), (size_t)footer.faissHeaderBytes);
       std::unique_ptr<faiss::Index> idx(faiss::read_index(&io, faiss::IO_FLAG_SKIP_PRECOMPUTE_TABLE));
       if (!idx) {
         throw std::runtime_error(std::format(
@@ -483,12 +543,20 @@ public:
         }
       }
 
-      const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
-      const faiss::idx_t* listIds = (const faiss::idx_t*)(base + footer.idsOffset());
-      const uint8_t* listCodes = (const uint8_t*)(base + footer.codesOffset());
-      assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0);
-      auto lists = std::make_unique<MmapInvertedLists>(
-        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
+      const int64_t* sizes = listSizes();
+      bool lazy = file->lazy();
+      const char* base = lazy ? nullptr : file->getInputStream().ptr();
+      std::unique_ptr<MmapInvertedLists> lists;
+      if (lazy) {
+        lists = std::make_unique<MmapInvertedLists>((size_t)footer.nlist, (size_t)footer.codeSize, sizes,
+                                                    *file, footer.idsOffset(), footer.codesOffset());
+      } else {
+        const faiss::idx_t* listIds = (const faiss::idx_t*)(base + footer.idsOffset());
+        const uint8_t* listCodes = (const uint8_t*)(base + footer.codesOffset());
+        assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0);
+        lists = std::make_unique<MmapInvertedLists>(
+          (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
+      }
       if ((int64_t)lists->totalSize() != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' list sizes sum to {}, expected ntotal {}",
@@ -502,8 +570,9 @@ public:
       faissIndex = std::move(idx);
       rotation = std::move(rot);
       if (isRaBitQ()) amplitudesChecked = std::make_unique<std::atomic<uint8_t>[]>((size_t)footer.nlist);
-      amplitudes = {(const float*)(base + footer.amplitudesOffset()),
-                    mmapLists->listOffsets(), amplitudesChecked.get()};
+      amplitudes = {lazy ? nullptr : (const float*)(base + footer.amplitudesOffset()),
+                    mmapLists->listOffsets(), amplitudesChecked.get(),
+                    lazy ? file.get() : nullptr, footer.amplitudesOffset()};
     });
     return faissIndex.get();
   }
@@ -578,6 +647,11 @@ public:
   }
 
 private:
+  // Per-list sizes, int64[nlist]: a range of the file, valid while it lives.
+  const int64_t* listSizes() const {
+    return (const int64_t*)file->rangeStream(footer.sizesOffset(), (uint64_t)footer.nlist * 8).ptr();
+  }
+
   /// faiss::IOReader backed by a contiguous in-memory buffer.  Our Directory
   /// implementations expose the whole file as a memory view (mmap for FSDir,
   /// owned buffer for RAMDir), so we can hand FAISS a sequential reader

@@ -163,6 +163,11 @@ public:
     due = NEVER;
 #endif
     if (!enabled || file == nullptr || stride == 0 || rows <= 0) due = NEVER;
+    // A lazy file fetches outside the fault counters, so the gate cannot see
+    // it cold, and its prefetch may fetch in this thread: advice would become
+    // serial requests.  Readers of lazy files declare their ranges in one
+    // prefetchRanges call instead.
+    if (file != nullptr && file->lazy()) due = NEVER;
   }
 
   /// A fixed-size column's values.
