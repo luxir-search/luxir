@@ -32,6 +32,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
+#include "test/StorageTestUtils.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -276,9 +277,9 @@ TEST_F(FieldTypeExampleTest, signaturesAndEcho) {
             signatures.at("pt$key").properties.at("plugin_type"));
   EXPECT_EQ("$key", signatures.at("pt$key").label);
   EXPECT_EQ(R"("plugin")", signatures.at("pt").properties.at("type"));
-  auto first = slash->withHistory(1, nullptr);
-  EXPECT_EQ(1u, schemaOf(PAIR_SCHEMA)->withHistory(2, first.get())->introduction("pt$a"));
-  EXPECT_EQ(2u, schemaOf(R"({"fields":{"pt":"pair"}})")->withHistory(2, first.get())->introduction("pt$a"));
+  auto first = slash->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 1, 1}}), nullptr);
+  EXPECT_EQ(1u, schemaOf(PAIR_SCHEMA)->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 2, 1}}), first.get())->introduction("pt$a"));
+  EXPECT_EQ(2u, schemaOf(R"({"fields":{"pt":"pair"}})")->withHistory(SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 2, 1}}), first.get())->introduction("pt$a"));
   // canonicalParams(): the defaults spelled out are the same definition, and
   // "params" may come before "type".
   auto plain = schemaOf(R"({"fields":{"pt":"pair"}})")->signatures().at("pt$a").properties.at("plugin_type");
@@ -534,17 +535,25 @@ TEST_F(FieldTypePersistenceTest, reopensAndAMissingTypeFailsTheCollectionOnly) {
     LuxirNode node(config);
     EXPECT_EQ((Strings{"q", "p"}), sortedIds(node, "good"));
   }
-  FSDirectory container(path / "t" / "t0" / "bad");
-  FSDirectory dir(path / "t" / "t0" / "bad" / *CollectionStorage::current(container));
+  FSDirectory dir(test::incarnationPath(path, "bad"));
   auto loaded = readDurableIndexInfo(dir);
   api::SchemaDef missing;
   std::string missingJson = R"({"fields":{"pt":"from_a_missing_plugin"}})";  // the views point into it
   ASSERT_TRUE(api::read_json(missing, missingJson, *loaded.arena));
   std::vector<std::byte> schemaBytes, manifest;
   ASSERT_TRUE(api::encode(missing, schemaBytes));
-  loaded.info.schema->source_def = std::span<const std::byte>(schemaBytes);
+  api::SchemaInfo stored;
+  stored.source_def = schemaBytes;
+  std::vector<std::byte> storedBytes;
+  ASSERT_TRUE(api::encode(stored, storedBytes));
+  auto contents = Manifest::withFooter(storedBytes);
+  auto& file = loaded.info.schema_file;
+  file.size = contents.size();
+  file.xxh3 = XXH3_64bits(contents.data(), contents.size());
+  dir.publishFile(file.name, contents, Directory::PublishMode::REPLACE);
   ASSERT_TRUE(api::encode(loaded.info, manifest));
-  Manifest::write(dir, loaded.info.index_gen, manifest);
+  dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+      Manifest::withFooter(manifest), Directory::PublishMode::REPLACE);
 
   LuxirNode node(config);
   EXPECT_EQ((Strings{"q", "p"}), sortedIds(node, "good"));
