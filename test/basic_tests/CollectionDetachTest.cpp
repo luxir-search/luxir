@@ -3,13 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include "luxir/server/TenantCatalog.h"
 #include "luxir/store/ObjectStore.h"
 #include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 
 // Detaching a collection leaves its storage for another node; attaching opens
-// one that storage lists and the node has not opened.
+// one that the catalog in storage selects and the node has not opened.
 
 using namespace luxir;
 using namespace luxir::test;
@@ -24,7 +25,7 @@ protected:
 
   void SetUp() override {
     config.store.backend = "ram_object";
-    config.store.options = {{"store_name", name}};
+    config.store.options = {{"ram_object", {{"store_name", name}}}};
   }
   void TearDown() override { RamObjectStore::drop(name); }
 
@@ -49,7 +50,7 @@ TEST_F(CollectionDetachTest, aDetachedCollectionMovesWithEveryDocument) {
     node.detachCollection(id);
     EXPECT_THROW(node.getCollection(id), CollectionNotFoundError);
     EXPECT_THROW(node.detachCollection(id), CollectionNotFoundError);
-    EXPECT_EQ(1u, node.collections().storage().collections().size()) << "storage keeps it";
+    EXPECT_EQ(1u, TenantCatalog::collections(node.collections().storage()).size()) << "storage keeps it";
     node.attachCollection(id);
     EXPECT_EQ(2u, liveDocs(node));
     EXPECT_THROW(node.attachCollection(id), CollectionExistsError);

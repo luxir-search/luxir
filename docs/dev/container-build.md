@@ -78,7 +78,8 @@ is unavailable, configure reports it and the affected tests/benchmarks skip.
 The image also includes the word list used by the dictionary benchmarks.
 
 With no arguments, `tools/dev-container` opens a shell. It mounts the checkout
-at `/workspace/luxir`, runs as your UID/GID, and puts its home under
+at `/workspace/luxir` (and, for a linked worktree, its repository's Git
+directory at the same absolute path), runs as your UID/GID, and puts its home under
 `build/container-cache/`. It also mounts the shared Luxir cache
 (`LUXIR_CACHE_DIR`, default `~/.cache/luxir`) at `/luxir-cache`, which holds
 the container's ccache (shared by all worktrees) and the build slots.
@@ -86,8 +87,9 @@ Native build directories and presets remain usable.
 The wrapper grants `SYS_PTRACE` for debugging within the container. It honors
 Docker's `DOCKER_CONTEXT`, `CONTAINER_ENGINE` (default `docker`), and
 `LUXIR_DEV_IMAGE` (default `luxir-dev:jammy-gcc16`).
-With a remote Docker context, the checkout and the shared cache must exist at
-the same absolute paths on the daemon host so the bind mounts resolve.
+With a remote Docker context, the checkout, its Git directory, and the shared
+cache must exist at the same absolute paths on the daemon host so the bind
+mounts resolve.
 
 ## CPU targets and runtime libraries
 

@@ -75,6 +75,72 @@ class ValueExprGrammar {
     return actions.makeFunction(operatorFunction(op), pos, args);
   }
 
+  // cond ? then : else, right-associative, below every binary operator.
+  Node parseConditional() {
+    Node condition = parseLogical(false);
+    cur.skipWs();
+    if (cur.peek() != '?') return condition;
+    size_t pos = cur.position();
+    DepthGuard depth(*this, pos);
+    cur.advance();
+    Node then = parseConditional();
+    cur.skipWs();
+    if (!cur.consume(':')) actions.fail(cur.position(), "expected ':' in a ? b : c");
+    Node otherwise = parseConditional();
+    std::array<Node, 3> args{condition, then, otherwise};
+    return actions.makeFunction("if", pos, args);
+  }
+
+  // || binds more loosely than &&; both are left-associative.
+  Node parseLogical(bool conjunction) {
+    ChainDepthGuard depth(*this);
+    Node left = conjunction ? parseComparison() : parseLogical(true);
+    char op = conjunction ? '&' : '|';
+    for (;;) {
+      cur.skipWs();
+      if (cur.peek() != op || cur.peekAt(1) != op) return left;
+      size_t pos = cur.position();
+      depth.charge(pos);
+      cur.advance(2);
+      Node right = conjunction ? parseComparison() : parseLogical(true);
+      std::array<Node, 2> args{left, right};
+      left = actions.makeFunction(conjunction ? "and" : "or", pos, args);
+    }
+  }
+
+  // The comparison operator at the cursor, or empty. Comparisons do not chain.
+  std::string_view comparisonFunction(size_t& length) const {
+    char c = cur.peek();
+    bool equals = cur.peekAt(1) == '=';
+    length = equals ? 2 : 1;
+    switch (c) {
+      case '<': return equals ? "lte" : "lt";
+      case '>': return equals ? "gte" : "gt";
+      case '=': if (equals) return "eq"; break;
+      case '!': if (equals) return "ne"; break;
+    }
+    return {};
+  }
+
+  Node parseComparison() {
+    Node left = parseAdditive();
+    cur.skipWs();
+    size_t length = 0;
+    std::string_view name = comparisonFunction(length);
+    if (name.empty()) return left;
+    size_t pos = cur.position();
+    DepthGuard depth(*this, pos);
+    cur.advance(length);
+    Node right = parseAdditive();
+    cur.skipWs();
+    if (!comparisonFunction(length).empty()) {
+      actions.fail(cur.position(),
+                   "comparisons do not chain; combine them with && or ||");
+    }
+    std::array<Node, 2> args{left, right};
+    return actions.makeFunction(name, pos, args);
+  }
+
   Node parseAdditive() {
     ChainDepthGuard depth(*this);
     Node left = parseMultiplicative();
@@ -109,6 +175,12 @@ class ValueExprGrammar {
     cur.skipWs();
     size_t pos = cur.position();
     char op = cur.peek();
+    if (op == '!' && cur.peekAt(1) != '=') {
+      cur.advance();
+      DepthGuard depth(*this, pos);
+      std::array<Node, 1> args{parseUnary()};
+      return actions.makeFunction("not", pos, args);
+    }
     if (op != '+' && op != '-') return parsePrimary();
 
     char next = cur.peekAt(1);
@@ -149,7 +221,7 @@ public:
   ValueExprGrammar(Actions& actions, Cursor& cur, int& budget)
       : actions(actions), cur(cur), budget(budget) {}
 
-  Node parseExpression() { return parseAdditive(); }
+  Node parseExpression() { return parseConditional(); }
 
   // Used only to resolve names that exist as both a one-argument aggregate
   // and a multi-argument bucket-scalar function (currently min/max). The

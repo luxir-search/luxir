@@ -146,6 +146,16 @@ pooled latency distribution. All three servers stay alive during these passes.
 Requests are serial, with two server workers by default; this is not concurrent
 throughput or a codec kernel timing.
 
+Ingest is serial by default: every server receives
+`--indexing.max-inflight-batches=1`. A single HTTP stream otherwise pipelines
+internal batches, which can change physical document order and the strided ANN
+training sample. Serial ingest makes identical arms build identical indexes in
+the same environment. Use `vector-compare.py --max-inflight-batches=0` to omit
+the server flag and use its default, or choose a positive batch limit. The
+selected limit and each measured pass's ordered query-result ID hash are
+recorded in `results.json`. This does not promise identical bytes across CPUs
+or numerical libraries.
+
 Ingest time, merge plus ANN build time, and index size are single
 measurements, prepared in base, candidate-feature, candidate-default order, and
 have their own table. Index size includes all collection files, not just
@@ -164,8 +174,10 @@ does not establish a statistically significant speedup. In three hosted runs
 of the same two refs, absolute base p50 moved by up to 37% between runs, the
 feature arm's single-shot ingest change ranged from -4% to +40%, and base
 recall@10 at nprobe 16 ranged from 0.897 to 0.906. Compare only within a run,
-and treat latency differences under about 10% and recall differences under
-about one point as noise. The full development
+and treat latency differences under about 10% as noise. Those earlier runs
+used parallel ingest; serial ingest removes the observed document-order source
+of recall variation. Other environments and numerical implementations still
+need their own repeatability checks. The full development
 image, two source builds, and dataset need substantial disk space;
 hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent

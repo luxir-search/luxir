@@ -27,6 +27,11 @@ if [[ $(uname -s) == Darwin ]]; then
   triplet=arm64-osx-luxir-m1
   jemalloc=()
 else
+  case $(uname -m) in
+    x86_64) triplet=x64-linux-luxir-native ;;
+    aarch64) triplet=arm64-linux-luxir-native ;;
+    *) echo "No native dependency triplet for $(uname -m)" >&2; exit 1 ;;
+  esac
   # Track the effective CPU options in vcpkg's binary cache, including tuning and
   # features masked by a VM. Keep the compiler selection consistent with this probe.
   native_cpu=$({
@@ -34,7 +39,6 @@ else
     LC_ALL=C "$CXX" -march=native -mtune=native -Q --help=target --help=params
   } | sha256sum)
   export LUXIR_NATIVE_CPU=${native_cpu%% *}
-  triplet=x64-linux-luxir-native
   jemalloc=(--x-feature=jemalloc)
 fi
 

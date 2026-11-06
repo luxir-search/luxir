@@ -729,7 +729,8 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   {
     std::vector<std::byte> serialized;
     ASSERT_TRUE(luxir::api::encode(loaded.info, serialized));
-    Manifest::write(dir, loaded.info.index_gen, serialized);
+    dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+                    Manifest::withFooter(serialized), Directory::PublishMode::REPLACE);
   }
 
   // Open should succeed: the unknown entry is skipped silently.
