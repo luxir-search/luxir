@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <limits>
+#include <optional>
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
@@ -19,7 +22,8 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
   if (req.maxParallel > 1 || req.maxParallel < -1) {
     throw RequestError(
-      "max_parallel must be 0 (engine default, serial today), 1 (serial "
+      "max_parallel must be 0 (engine default: parallel only for heavy "
+      "requests), 1 (serial "
       "on the shared executor), or -1 (unlimited parallelism); values "
       "above 1 are reserved for a parallelism budget and not implemented");
   }
@@ -65,9 +69,21 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
+  // The default lane fans a heavy request out across segments once parsing
+  // shows enough work; light requests stay serial and pay no handoff.
+  std::optional<oneapi::tbb::task_group> autoTg;
   try {
     root = prepare(req);
     root->init();
+    // SkipStats counters are single-threaded; instrumented runs stay serial.
+    if (req.maxParallel == 0 && req.tg == nullptr && !SkipStats::enabled
+        && req.reader->segments().size() > 1
+        && root->workEstimate() >= autoParallelMinWork) {
+      req.tg = &autoTg.emplace();
+      // From here on the request is on the parallel lane: transports resume
+      // paused emitters inside the arena, as for -1.
+      req.maxParallel = -1;
+    }
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and
@@ -75,9 +91,17 @@ void SearchEngine::submitBody(SearchRequest& req) {
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
     fallback = ErrorKind::INTERNAL;
-    rootCalc->start(req.tg);
+    if (autoTg.has_value()) {
+      // The receiving thread may be outside the arena; tasks must spawn in it.
+      node.executeIsolated([&] {
+        rootCalc->start(req.tg);
+        req.tg->wait();
+      });
+    } else {
+      rootCalc->start(req.tg);
+    }
 
-    if (req.tg) {
+    if (req.tg && !autoTg.has_value()) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
       req.tg->wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
@@ -87,7 +111,13 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
       req.tg->cancel();
-      try { req.tg->wait(); } catch (...) {}
+      if (autoTg.has_value()) {
+        node.executeIsolated([&] {
+          try { req.tg->wait(); } catch (...) {}
+        });
+      } else {
+        try { req.tg->wait(); } catch (...) {}
+      }
     }
     ErrorInfo info = classifyException(e, fallback);
     if (info.kind == ErrorKind::INTERNAL) {
@@ -119,6 +149,8 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  // autoTg dies with this frame; later emitter resumptions must not see it.
+  if (autoTg.has_value()) req.tg = nullptr;
   execution.finish();
   req.bodyDone();
 }

@@ -5850,8 +5850,175 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   EXPECT_EQ(1, equalCosts.wholeBypasses);
 }
 
+// Text queries leave minShouldMatch unset; an exact count must still
+// compose with a pruned ranking instead of scoring every match.
+TEST_F(SearchEngineTest, exactCountComposesForUnfilteredTextQueries) {
+  constexpr std::string_view collection = "exact_composition_text";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3000; doc++) {
+    std::string body = "filler";
+    if ((doc % 2) == 0) body += " alpha";
+    if ((doc % 3) == 0) body += " beta";
+    if ((doc % 5) == 0) body += " alpha beta";
+    if ((doc % 11) == 0) body += " beta beta gamma";
+    std::string title = (doc % 7) == 0 ? "alpha title" : "title";
+    docs.push_back(flatdoc("id", "text_" + std::to_string(doc),
+                           "body_w", body, "title_w", title));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    int64_t count;
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t compositions;
+  };
+  auto run = [&](auto makeQuery, bool disableComposition) {
+    TopKCountCompositionGuard compositionGuard(
+        disableComposition,
+        TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").countLimit().getScores()
+        .fields({"id"}).limit(10);
+    cur.rawQuery() = makeQuery(cur.mr());
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{req->getMatchCount("q"), resultIds(*req, "q"),
+                  resultScoreMap(*req, "q"),
+                  SkipStats::exactCountTopKCompositions};
+  };
+  auto check = [&](std::string_view name, auto makeQuery) {
+    SCOPED_TRACE(name);
+    Result composed = run(makeQuery, false);
+    Result exhaustive = run(makeQuery, true);
+    EXPECT_GT(composed.compositions, 0);
+    EXPECT_EQ(0, exhaustive.compositions);
+    EXPECT_EQ(exhaustive.count, composed.count);
+    EXPECT_EQ(exhaustive.ids, composed.ids);
+    expectSameScoreMap(exhaustive.scores, composed.scores);
+  };
+
+  check("match", [](auto& mr) {
+    return qb::match(mr, "body_w", "alpha beta gamma");
+  });
+  check("boolean", [](auto& mr) {
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")});
+  });
+  check("multi_match", [](auto& mr) {
+    return qb::multiMatch(mr, "alpha beta gamma alpha",
+                          {{"body_w", {}}, {"title_w", 2.0f}});
+  });
+  check("phrase", [](auto& mr) {
+    return qb::phraseText(mr, "body_w", "alpha beta");
+  });
+}
+
+TEST_F(SearchEngineTest, unsetCountLimitEstimatesFound) {
+  constexpr std::string_view collection = "estimated_count";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 40000; doc++) {
+    std::string body = "filler";
+    if ((doc % 2) == 0) body += " common";
+    if ((doc % 3) == 0) body += " other";
+    if (doc < 5) body += " rare";
+    docs.push_back(flatdoc("id", "estimate_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  int32_t savedMinSampled = TopDocsReq::estimateMinSampledDocsForTests;
+  TopDocsReq::estimateMinSampledDocsForTests = 1024;
+  auto restore = scope_guard([&]() noexcept {
+    TopDocsReq::estimateMinSampledDocsForTests = savedMinSampled;
+  });
+
+  struct Result {
+    std::optional<int64_t> found;
+    bool estimated;
+  };
+  auto run = [&](std::string_view text, std::optional<int64_t> countLimit) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").fields({"id"}).limit(10);
+    if (countLimit) cur.countLimit(*countLimit);
+    cur.rawQuery() = qb::match(cur.mr(), "body_w", text);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* list = req->docList("q");
+    EXPECT_NE(list, nullptr);
+    return list == nullptr ? Result{}
+                           : Result{list->found, list->found_estimated};
+  };
+
+  // A sampled union estimate lands near the exact count.
+  Result exact = run("common other", -1);
+  Result estimate = run("common other", std::nullopt);
+  ASSERT_TRUE(exact.found.has_value());
+  ASSERT_TRUE(estimate.found.has_value());
+  EXPECT_FALSE(exact.estimated);
+  EXPECT_TRUE(estimate.estimated);
+  EXPECT_NEAR((double) *exact.found, (double) *estimate.found,
+              0.1 * (double) *exact.found);
+
+  // A single term counts from metadata; a sparse query counts everything.
+  Result term = run("common", std::nullopt);
+  EXPECT_EQ(std::optional<int64_t>(20000), term.found);
+  EXPECT_FALSE(term.estimated);
+  Result rare = run("rare filler", std::nullopt);
+  EXPECT_EQ(std::optional<int64_t>(40000), rare.found);
+  EXPECT_TRUE(rare.estimated);
+  Result sparse = run("rare", std::nullopt);
+  EXPECT_EQ(std::optional<int64_t>(5), sparse.found);
+  EXPECT_FALSE(sparse.estimated);
+
+  EXPECT_FALSE(run("common other", 0).found.has_value());
+}
+
+TEST_F(SearchEngineTest, defaultLaneParallelizesHeavyRequests) {
+  constexpr std::string_view collection = "auto_parallel";
+  CollectionHelper helper(collection);
+  for (int32_t batch = 0; batch < 3; batch++) {
+    std::vector<Doc> docs;
+    for (int32_t doc = 0; doc < 500; doc++) {
+      std::string body = (doc % 3) == 0 ? "alpha beta" : "alpha";
+      docs.push_back(flatdoc(
+          "id", "parallel_" + std::to_string(batch) + "_" + std::to_string(doc),
+          "body_w", body));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_GT(helper.getIndexWriter()->snapshots.readers.getReader()
+                ->segments().size(), 1u);
+  auto run = [&](size_t minWork, bool expectParallel) {
+    size_t saved = autoParallelMinWork;
+    autoParallelMinWork = minWork;
+    auto restore = scope_guard([&]() noexcept { autoParallelMinWork = saved; });
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").countLimit().getScores()
+        .fields({"id"}).limit(20);
+    cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha beta");
+    req->execute(0);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    // The auto lane records itself as -1 for transports that resume later.
+    EXPECT_EQ(expectParallel ? -1 : 0, req->maxParallel);
+    return std::tuple(req->getMatchCount("q"), resultIds(*req, "q"),
+                      resultScoreMap(*req, "q"));
+  };
+  auto parallel = run(0, true);
+  auto serial = run(std::numeric_limits<size_t>::max(), false);
+  EXPECT_EQ(1500, std::get<0>(parallel));
+  EXPECT_EQ(std::get<0>(serial), std::get<0>(parallel));
+  EXPECT_EQ(std::get<1>(serial), std::get<1>(parallel));
+  expectSameScoreMap(std::get<2>(serial), std::get<2>(parallel));
+}
+
 TEST_F(SearchEngineTest,
-       exactCompositionIneligibleConstantRankingDeclinesBeforeBuild) {
+       exactCompositionFilteredUnionWithTiedScoresMatchesExhaustive) {
   constexpr std::string_view collection =
       "exact_composition_constant_ranking";
   constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
@@ -5921,9 +6088,9 @@ TEST_F(SearchEngineTest,
     unused(id);
     EXPECT_EQ(score, candidateScore);
   }
-  EXPECT_GT(planned.fallbacks, 0)
-      << planned.profitabilityRejects << " " << planned.sparseRejects
-      << " " << planned.compositions;
+  EXPECT_GT(planned.compositions, 0)
+      << planned.fallbacks << " " << planned.profitabilityRejects
+      << " " << planned.sparseRejects;
   EXPECT_EQ(0, planned.exactCompositionRejects);
 }
 
@@ -6080,7 +6247,8 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
         EXPECT_EQ(bulk.ids, pull.ids);
         EXPECT_EQ(bulk.found, pull.found);
         EXPECT_EQ(bulk.facets, pull.facets);
-        EXPECT_EQ(bulk.found.has_value(), getNumber);
+        // A ranked list without a count request carries an estimate.
+        EXPECT_EQ(bulk.found.has_value(), getNumber || limit > 0);
         if (limit == 0) {
           EXPECT_TRUE(bulk.ids.empty());
         } else {

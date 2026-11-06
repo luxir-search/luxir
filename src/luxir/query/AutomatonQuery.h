@@ -105,6 +105,9 @@ public:
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
 protected:
+  // A scored case_insensitive match: the union of indexed case variants.
+  Query* rewriteCaseVariants(Context& context);
+
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     checkedBoostProduct(multiplier, 1.0f);
     if (!fittedPolicy) return;

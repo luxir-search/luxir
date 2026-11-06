@@ -284,7 +284,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       docListProto.offset = qr.topDocsProto.offset;
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
-      if (qr.requirements.needsCount()) {
+      if (qr.requirements.needsCount() || qr.requirements.estimateCount) {
         docListProto.found = 0;
         if (qr.collapse != nullptr) docListProto.found_docs = 0;
         if (qr.diversify != nullptr) docListProto.found_groups = 0;
@@ -329,6 +329,12 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       int64_t found = collector.totalHits();
       bool foundGte = qr.boundedCount && collector.countIncomplete;
       if (foundGte) found = qr.requirements.countLimit;
+      // Ranked hits are real matches, so they also floor an estimate.
+      bool foundEstimated = false;
+      if (qr.requirements.estimateCount) {
+        found = std::max(found, collector.estimatedHits);
+        foundEstimated = collector.countEstimated;
+      }
       emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
@@ -337,10 +343,10 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
-        qr.requirements.needsCount(),
+        qr.requirements.needsCount() || qr.requirements.estimateCount,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte);
+        emission, {}, foundGte, foundEstimated);
     }
   }
 

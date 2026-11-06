@@ -20,6 +20,7 @@
 #include "luxir/server/JsonRequest.h"
 #include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/reader/FuzzySeekEnum.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 
 using namespace luxir;
@@ -235,6 +236,35 @@ TEST_F(MultiTermLimitsTest, minLiteralPrefixChecksOnlyThePattern) {
     EXPECT_EQ(minimum == 0, facet->ok()) << facet->errorMsg();
     if (!facet->ok()) { EXPECT_EQ("pattern_prefix_too_short", facet->errorCode()); }
   }
+}
+
+TEST_F(MultiTermLimitsTest, weightsOfOneQueryShareItsExpansion) {
+  // The estimate behind an unset count_limit, and the count and ranking
+  // passes behind count_limit -1, build their own weights but reuse one scan.
+  LuxirNode node(config(1000, 1'000'000, 0));
+  CollectionHelper helper(node);
+  indexTerms(helper);
+
+  SkipStatsScope stats;
+  auto estimated = localReq(helper.getSearchEngine());
+  estimated->collection("main").topDocs("q").wildcardQuery("tag_s", "t0*9").limit(5);
+  estimated->execute();
+  ASSERT_TRUE(estimated->ok()) << estimated->errorMsg();
+  EXPECT_EQ(10, estimated->getMatchCount());
+  EXPECT_EQ(1, SkipStats::multitermExpansions);
+  EXPECT_EQ(100, estimated->multiTermBudget.termsExamined());
+
+  auto fuzzy = [&](int64_t countLimit) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").fuzzyQuery("tag_s", "t050", 2, 0)
+        .countLimit(countLimit).limit(5);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->multiTermBudget.termsExamined();
+  };
+  int64_t uncounted = fuzzy(0);
+  EXPECT_GT(uncounted, 0);
+  EXPECT_EQ(uncounted, fuzzy(-1));
 }
 
 TEST_F(MultiTermLimitsTest, facetTermFilterIsExemptFromMinLiteralPrefix) {
