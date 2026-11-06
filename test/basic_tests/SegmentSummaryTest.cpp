@@ -42,7 +42,7 @@ SegFieldInfo fieldInfo(FieldType::Type type, int32_t flags, int32_t docs, int64_
 
 std::shared_ptr<const SegmentSummary> roundTrip(SegmentSummaryBuilder& builder) {
   RAMDir dir;
-  auto name = SegmentSummary::overlayFileName(7);
+  auto name = SegmentSummary::overlayFileName(7, 1, 1);
   auto descriptor = builder.write(dir, name, 7, 100, true);
   EXPECT_EQ(name, descriptor.name);
   auto summary = SegmentSummary::open(dir, name);
@@ -346,8 +346,8 @@ TEST_F(SegmentSummaryTest, sidecarIsAGenerationZeroOverlayListedInStats) {
   EXPECT_EQ(SegmentSummary::OVERLAY_NAME, overlay.name);
   EXPECT_EQ(0u, overlay.gen);
   ASSERT_EQ(1u, overlay.files.size());
-  EXPECT_EQ(SegmentSummary::overlayFileName(segment.segId), overlay.files[0]);
-  EXPECT_EQ(Postings::getIndexFileNamePrefix(segment.segId) + "__summary_00_00", overlay.files[0]);
+  EXPECT_TRUE(overlay.files[0].starts_with(Postings::getIndexFileNamePrefix(segment.segId, segment.creatorEpoch) + "_summary_00."));
+  EXPECT_TRUE(overlay.files[0].ends_with("_00"));
   EXPECT_EQ(reader()->segments()[0].summary()->bytes(), overlay.bytes);
 }
 

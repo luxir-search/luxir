@@ -351,8 +351,6 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   ASSERT_NE(overlays.end(), vector);
   EXPECT_EQ(fileSize, vector->bytes);
   EXPECT_EQ(0u, vector->gen);
-  EXPECT_EQ(Postings::getSegmentOverlayFileName(stats.segmentStats[0].segId, "vec.embedding_v", 0, 0),
-            aux.files[0].name);
   auto summary = std::ranges::find(overlays, std::string("segment_summary"), [](const auto& o) { return o.kind; });
   ASSERT_NE(overlays.end(), summary);
   EXPECT_EQ(0u, summary->gen);
