@@ -8437,6 +8437,9 @@ class BooleanQuery::Weight final : public Query::Weight {
     bool needsScores;
     bool allowsPruning;
     bool uniformConstantCandidate;
+    // Set only while the pruning top-k planner asks for a filter-led
+    // candidate route: filters behind the lead are then probed.
+    bool probeTailFilters = false;
     ScorePolicy scorePolicy;
     Query::SupplierExecutionMode executionMode;
 
@@ -10417,6 +10420,47 @@ class BooleanQuery::Weight final : public Query::Weight {
 
       if (mode == ConjunctionMode::CANDIDATE) {
         if (plan.entries[0].filter) {
+          // Filters behind the lead filter become candidate probes: a DocSet
+          // or postings membership check per competitive lead candidate. The
+          // scored tail then starts at the first scored entry.
+          size_t tailFilters = 0;
+          for (size_t i = 1; i < plan.entries.size(); i++) {
+            if (plan.entries[i].filter) tailFilters++;
+          }
+          if (tailFilters > 0 && probeTailFilters) {
+            if (disableCandidateTailFiltersForTests
+                || !plan.candidateFilters.empty()
+                || tailFilters + 1 >= plan.entries.size()) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+            auto kept = targetPool.make_span<PlannedEntry>(
+                plan.entries.size() - tailFilters);
+            auto probes =
+                targetPool.make_span<PlannedSupplier>(tailFilters);
+            size_t keptCount = 0;
+            size_t probeCount = 0;
+            for (size_t i = 0; i < plan.entries.size(); i++) {
+              const PlannedEntry& entry = plan.entries[i];
+              if (i == 0 || !entry.filter) {
+                kept[keptCount++] = entry;
+                continue;
+              }
+              std::optional<bool> docSet = directDocSet(entry.shape);
+              std::optional<bool> term = directTerm(entry.shape);
+              if (!docSet.has_value() || !term.has_value()
+                  || (!*docSet && !*term)) {
+                return {ConjunctionPlanStatus::DECLINED, plan};
+              }
+              probes[probeCount++] = {
+                  entry.supplier, entry.shape, entry.buildContext};
+            }
+            plan.entries = kept;
+            plan.candidateFilters = probes;
+            plan.nonLeadCost = 0;
+            for (size_t i = 1; i < plan.entries.size(); i++) {
+              plan.nonLeadCost += plan.entries[i].cost;
+            }
+          }
           for (size_t i = 1; i < plan.entries.size(); i++) {
             std::optional<bool> term = directTerm(plan.entries[i].shape);
             if (!term.has_value()) {
@@ -10435,6 +10479,11 @@ class BooleanQuery::Weight final : public Query::Weight {
           int64_t minRatio = *leadDocSet
               ? multiTermBatchMinRatioDocSet
               : multiTermBatchMinRatioPostings;
+          // Probed filters add work per candidate, and a body that prunes
+          // well can beat a lead that is only a few times cheaper.
+          if (!plan.candidateFilters.empty()) minRatio *= 2;
+          // entries[1] is the cheapest scored clause once probed filters
+          // have left the entry list.
           if (plan.entries[1].cost
               < minRatio * plan.entries[0].cost) {
             return {ConjunctionPlanStatus::DECLINED, plan};
@@ -10510,7 +10559,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               ConjunctionRoute::CANDIDATE_SCORING_TERM, true);
         }
         if (plan.entries[0].docSetFilter) {
-          plan.docSetSparseEligible = true;
+          plan.docSetSparseEligible = plan.candidateFilters.empty();
           return finishRoute(
               ConjunctionRoute::CANDIDATE_DOC_SET_FILTER, true);
         }
@@ -11188,7 +11237,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           builtRoute = ConjunctionRoute::CANDIDATE_SCORING_TERM;
         } else if (candidatePostingsLead != nullptr) {
           builtRoute = ConjunctionRoute::CANDIDATE_POSTINGS_FILTER;
-        } else if (runtimeDocSetSparseEligible) {
+        } else if (plan.entries[0].docSetFilter) {
           builtRoute = ConjunctionRoute::CANDIDATE_DOC_SET_FILTER;
         }
       } else if (plan.mode == ConjunctionMode::EXHAUSTIVE) {
@@ -11801,15 +11850,22 @@ class BooleanQuery::Weight final : public Query::Weight {
       // scored required terms. The cheapest required clause owns a docs-only
       // candidate feed, while the scored clauses define the competitive
       // window bound and score only survivors. If admission declines, retain
-      // the existing scored-body plus WindowFilter plan below.
+      // the existing scored-body plus WindowFilter plan below. With several
+      // filters only a filter-led feed is taken: the cheapest filter leads
+      // and the others are probed per candidate. A scored term feed over
+      // several filters measured slower than the fallback for rare terms.
       if (allowsPruning && !disableFilteredConjunctionBatchForTests
-          && filterSuppliers.size() == 1
           && !mandatorySources.empty() && optionalSources.empty()
           && minShouldMatch == 0) {
+        probeTailFilters = true;
         ConjunctionPlanningResult candidate = planConjunction(
             pool, ConjunctionMode::CANDIDATE,
             candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
-        if (candidate.status == ConjunctionPlanStatus::READY) {
+        probeTailFilters = false;
+        if (candidate.status == ConjunctionPlanStatus::READY
+            && (filterSuppliers.size() == 1
+                || candidate.plan.route
+                    != ConjunctionRoute::CANDIDATE_SCORING_TERM)) {
           resolveConjunctionChildren(pool, candidate.plan);
           auto* state = pool.make<ConjunctionPlan>(candidate.plan);
           state->owner = this;
