@@ -149,7 +149,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
-TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnFirstListUse) {
   IvfTestGuard guard;
   for (int bits : {1, 4}) {
     CollectionHelper h("main");
@@ -181,7 +181,15 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.write(payload.data(), payload.size());
       os.close();
       dir.finishFile(*out);
-      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      std::string synced[] = {"invalid-amplitude"};
+      dir.sync(synced);
+      // Opening reads no amplitudes; the first scan of the list rejects them.
+      auto aux = VectorAuxReader::open(dir, info, false);
+      const auto& amplitudes = aux->getAmplitudes();
+      size_t list = 0;
+      while (amplitudes.list(list).empty()) list++;
+      EXPECT_THROW(amplitudes.checkedList(list), std::runtime_error);
+      aux.reset();
       dir.deleteFile("invalid-amplitude");
     }
   }
