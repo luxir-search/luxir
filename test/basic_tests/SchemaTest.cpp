@@ -1437,7 +1437,7 @@ TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
     std::vector<std::byte> bytes;
     ASSERT_TRUE(api::encode(stored, bytes));
     info.source_def = bytes;
-    auto loaded = Schema::fromStored(info, 2);
+    auto loaded = Schema::fromStored(info, s->binding);
     EXPECT_EQ("", loaded->indexSortField);
     EXPECT_EQ(std::string::npos, authoredJson(*loaded).find("index_sort"));
   }
