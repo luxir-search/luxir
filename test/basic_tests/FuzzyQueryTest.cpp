@@ -265,6 +265,30 @@ TEST_F(FuzzyQueryTest, scoredDisjunctionSums) {
   EXPECT_GT(summed, single);
 }
 
+TEST_F(FuzzyQueryTest, rewrittenQueryIsSharedWithExecution) {
+  TestIndex ti;
+  TestField f(ti, "foo_w");
+  f.startIndexing();
+  f.add(0, "apple zzzzz");
+  f.add(1, "apply ample");
+  ti.flush();
+  f.startReading();
+
+  auto g = ti.pool.rewindScopeGuard();
+  FuzzyQuery fq("foo_w", "apple", 1, 0);
+  Query::Context ctx(ti.pool, *ti.reader);
+  Query* rewritten = fq.rewrittenQuery(ctx);
+  fq.createWeight(ctx, Query::NEED_SCORES);
+  fq.createWeight(ctx, 0);
+  EXPECT_EQ(rewritten, fq.rewrittenQuery(ctx));
+  auto* disjunction = dynamic_cast<BooleanQuery*>(rewritten);
+  ASSERT_NE(nullptr, disjunction);
+  EXPECT_EQ(3u, disjunction->getOptional().size());  // apple, apply, ample
+  EXPECT_TRUE(disjunction->getMandatory().empty());
+  EXPECT_TRUE(disjunction->getFilter().empty());
+  EXPECT_TRUE(disjunction->getProhibited().empty());
+}
+
 TEST_F(FuzzyQueryTest, multiVariantDocScoreIsSumOfVariantScores) {
   TestIndex ti;
   TestField f(ti, "foo_w");

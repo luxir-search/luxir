@@ -189,6 +189,9 @@ private:
 public:
   // The expansion set is selected here, independent of `flags`: NEED_SCORES
   // decides only whether the kept clauses score, never which docs match.
+  // The same cached logical rewrite used by execution; useful to query inspectors.
+  Query* rewrittenQuery(Context& context);
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 };
