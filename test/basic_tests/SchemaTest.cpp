@@ -1396,7 +1396,7 @@ TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
   EXPECT_NE(std::string::npos, json.find(R"("index_sort":{"field":"ts"})"));
   EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
   std::pmr::monotonic_buffer_resource arena;
-  EXPECT_EQ("ts", Schema::fromStored(s->storedInfo(arena), 1)->indexSortField);
+  EXPECT_EQ("ts", Schema::fromStored(s->storedInfo(arena), s->binding)->indexSortField);
 
   // A SET without index_sort keeps it, a template instance is accepted, and
   // an empty field clears it.
