@@ -56,6 +56,8 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::KNN:
+    case QueryKind::GEO_NEAREST:
+    case QueryKind::DISTANCE_FEATURE:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
     case QueryKind::DIS_MAX:
@@ -90,6 +92,8 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
+    case QueryKind::GEO_NEAREST:
+    case QueryKind::DISTANCE_FEATURE:
     case QueryKind::AUTOMATON:
     case QueryKind::PREFIX:
     case QueryKind::TERM_RANGE:
@@ -135,6 +139,8 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
+    case QueryKind::GEO_NEAREST:
+    case QueryKind::DISTANCE_FEATURE:
     case QueryKind::AUTOMATON:
     case QueryKind::PREFIX:
     case QueryKind::TERM_RANGE:
@@ -185,6 +191,8 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
+    case QueryKind::GEO_NEAREST:
+    case QueryKind::DISTANCE_FEATURE:
     case QueryKind::AUTOMATON:
     case QueryKind::PREFIX:
     case QueryKind::TERM_RANGE:
@@ -244,6 +252,8 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
+    case QueryKind::GEO_NEAREST:
+    case QueryKind::DISTANCE_FEATURE:
     case QueryKind::AUTOMATON:
     case QueryKind::PREFIX:
     case QueryKind::TERM_RANGE:
