@@ -522,7 +522,7 @@ TEST_F(FieldTypeExampleTest, storedIndexSortWithoutProxyLoadsCleared) {
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(stored, bytes));
   info.source_def = bytes;
-  auto loaded = Schema::fromStored(info, 3);
+  auto loaded = Schema::fromStored(info, valid->binding);
   EXPECT_EQ("", loaded->indexSortField);
   api::SchemaDef echoed;
   loaded->toProto(&echoed, arena);
