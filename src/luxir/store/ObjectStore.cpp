@@ -66,6 +66,14 @@ std::optional<uint64_t> RamObjectStore::size(std::string_view name) {
   return (uint64_t)it->second.bytes.size();
 }
 
+std::optional<ObjectStore::Head> RamObjectStore::head(std::string_view name) {
+  std::lock_guard lock(mutex);
+  record("size", name, 0, 0);
+  auto it = objects.find(name);
+  if (it == objects.end()) return std::nullopt;
+  return Head{(uint64_t)it->second.bytes.size(), std::to_string(it->second.version)};
+}
+
 void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span<char> out) {
   std::lock_guard lock(mutex);
   record("read", name, offset, out.size());

@@ -45,6 +45,12 @@ public:
     std::string bytes;
     std::string version;
   };
+  /// What a HEAD reports: the size and the object's version (an S3 ETag, as
+  /// get() and put() report it); empty when the backend has none.
+  struct Head {
+    uint64_t size = 0;
+    std::string etag;
+  };
   using PutCondition = ObjectPutCondition;
 
   virtual ~ObjectStore() = default;
@@ -69,6 +75,21 @@ public:
   /// nothing changed.
   virtual std::optional<std::string> put(std::string_view name, std::string_view bytes,
                                          const PutCondition& condition = {}) = 0;
+  /// The object's size and version, or nullopt when it does not exist. The
+  /// default asks size() and reports no version.
+  virtual std::optional<Head> head(std::string_view name) {
+    auto s = size(name);
+    if (!s) return std::nullopt;
+    return Head{*s, {}};
+  }
+  /// Replaces the object only while its version is still `etag` (compare and
+  /// swap through put's ifMatch). Throws std::runtime_error whose message
+  /// contains "precondition failed" when the object changed or is gone.
+  void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) {
+    if (!put(name, bytes, {.ifAbsent = false, .ifMatch = std::string(etag)})) {
+      throw std::runtime_error("precondition failed: object " + std::string(name) + " changed");
+    }
+  }
   /// True when the object existed.
   virtual bool remove(std::string_view name) = 0;
   /// Server-side copy; replaces `to`. Throws when `from` does not exist.
@@ -122,6 +143,7 @@ public:
 
   std::vector<ObjectInfo> list(std::string_view prefix) override;
   std::optional<uint64_t> size(std::string_view name) override;
+  std::optional<Head> head(std::string_view name) override;
   void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;
   std::optional<Object> get(std::string_view name) override;
   std::optional<std::string> put(std::string_view name, std::string_view bytes,
