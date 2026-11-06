@@ -41,7 +41,7 @@ public:
     Scorer(luxir::IndexReader::Segment& segment,
            float constantScore = 0.0f)
       : Query::ConstantScorer(constantScore), segment(segment),
-        lastDoc(segment.postingsReader().maxDoc() - 1) {
+        lastDoc(segment.maxDoc() - 1) {
     }
 
     [[gnu::cold]] void reset() override {
@@ -179,7 +179,7 @@ public:
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (bulkContext.requireConstantCount) {
-        if (segment.liveDocs() != nullptr) {
+        if (segment.hasDeletes()) {
           return {
             BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO,
@@ -238,7 +238,7 @@ public:
     CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
       if (domain && domain->cachedCard() >= 0
-          && (!segment.liveDocs() || domain == &segment.liveDocs()->docset())) {
+          && (!segment.hasDeletes() || domain == &segment.liveDocs()->docset())) {
         return {domain->cachedCard(), CountHow::METADATA};
       }
       return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);
