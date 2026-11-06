@@ -128,6 +128,9 @@ struct AggregateStateOps {
   bool inlineCapable = true;
   bool replayCapable = true;
   bool orderSensitive = false;
+  // Adding a value the state has already seen leaves it unchanged
+  // (cardinality), so a scan may add each distinct value once.
+  bool duplicateInsensitive = false;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
