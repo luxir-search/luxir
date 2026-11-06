@@ -22,8 +22,8 @@ std::string_view viewOf(::hpp_proto::bytes_view bytes) {
 
 } // namespace
 
-std::string SegmentSummary::overlayFileName(uint64_t segId) {
-  return Postings::getSegmentOverlayFileName(segId, OVERLAY_NAME, OVERLAY_GEN, 0);
+std::string SegmentSummary::overlayFileName(uint64_t segId, uint64_t creatorEpoch, uint64_t writerEpoch) {
+  return Postings::getSegmentOverlayFileName(segId, OVERLAY_NAME, OVERLAY_GEN, 0, creatorEpoch, writerEpoch);
 }
 
 std::shared_ptr<const SegmentSummary> SegmentSummary::open(Directory& dir, std::string_view fileName,
