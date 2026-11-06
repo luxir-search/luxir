@@ -597,7 +597,10 @@ public:
       std::unreachable();
     }
 
-    int32_t advance(int32_t target) {
+    // Out of line: inlined into a caller's per-candidate loop, the bucket
+    // advance and gallop crowd out the loop's registers, and whether GCC
+    // inlines it there flips with unrelated code in the translation unit.
+    [[gnu::noinline]] int32_t advance(int32_t target) {
       // If it would make it faster, we could also implement skipping-only iterators where we don't mix next() and advance()
       // We could also build a bucket index if the set will be used many times for skipping.
       // We could also try using interpolation to estimate where the value may lie.
