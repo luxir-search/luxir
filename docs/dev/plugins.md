@@ -353,7 +353,7 @@ always run.
 ## Storage backends and layers
 
 `Registries::storage` (`src/luxir/store/StorageRegistry.h`) holds named storage
-backends and layers. `ram` and `fs` are built in and registered before plugins.
+backends and layers. `ram`, `fs` and `ram_object` are built in and registered before plugins.
 
 - A **backend** builds the root `DirectoryFactory` from the node configuration. It
   is selected by `--store.backend NAME`.
@@ -448,6 +448,65 @@ replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
 selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
+
+### Object stores
+
+A plugin that keeps segments in a remote object store implements `ObjectStore`
+(`src/luxir/store/ObjectStore.h`) and lets `ObjectStoreDirFactory` do the rest: the
+key layout, lazy range reads, staging of writes, the per-segment hotcache and
+deletes that wait for readers (see [storage tiers](../design/storage-tiers.md)).
+
+```cpp
+class S3Store : public luxir::ObjectStore {
+public:
+  std::vector<ObjectInfo> list(std::string_view prefix) override;          // sorted; full keys
+  std::optional<uint64_t> size(std::string_view name) override;            // HEAD; nullopt when absent
+  void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;  // GET with Range
+  std::optional<Object> get(std::string_view name) override;               // GET; bytes and ETag
+  std::optional<std::string> put(std::string_view name, std::string_view bytes,
+                                 const PutCondition& condition) override;  // PUT, If-None-Match / If-Match
+  bool remove(std::string_view name) override;
+  void copy(std::string_view from, std::string_view to) override;           // CopyObject
+  std::vector<std::string> listDirectories(std::string_view prefix) override;  // optional: a delimiter listing
+};
+
+void registerComponents(luxir::Registries& r) override {
+  r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
+    auto store = std::make_shared<S3Store>(std::string(ctx.params.requireString("bucket")));
+    return std::make_unique<luxir::ObjectStoreDirFactory>(std::move(store), ctx);
+  });
+}
+```
+
+The contract the directory relies on:
+
+- Every method is thread safe and throws `std::runtime_error` on failure.
+- `readRange` throws when the object is missing or shorter than the range. It is
+  called from query threads, in chunks of `chunk_bytes`, so it should be cheap to
+  issue concurrently.
+- `put` replaces the object atomically: a reader sees the old or the new bytes.
+  It returns the new version (an ETag, fresh on every put), or nullopt when its
+  condition fails: `ifAbsent` (If-None-Match: *) or `ifMatch` (If-Match on a
+  version from `get` or an earlier `put`). `publishFile`, and so the fencing of a
+  superseded writer, rests on these. `put` receives a whole object; split large
+  ones (multipart) inside the plugin.
+- `list` returns full keys relative to the store, sorted. A plugin with a key prefix
+  option strips it again.
+- `ObjectStoreDirFactory` reads `chunk_bytes`, `staging_dir` and `spill_bytes` from
+  `ctx.params`; the plugin's own options (bucket, region, ...) are read by its
+  maker from the same reader (`--store.option s3.bucket=...`).
+
+`ram_object` is the built-in backend over `RamObjectStore`, whose request counters
+and request log (`requests("read", prefix)`, `bytesRead(prefix)`, `requestLog()`)
+let a test assert what a read cost; `RamObjectStore::named(name)` is the store a
+`ram_object` node with `--store.option ram_object.store_name=<name>` uses.
+`ObjectStoreDirectoryTest.aReopenedCollectionOpensItsFilesWithoutSizeRequests`
+is a small end-to-end example: a node on `ram_object`, reopened, with its
+requests asserted through the counters.
+
+An `InputFile` that reads lazily also overrides `rangeStream` and `prefetchRanges`
+and returns `true` from `lazy()`; see `LazyInputFile`. Code that opens a segment
+must read through `rangeStream`, and code that wants the whole file through `read()`.
 
 ### The example plugin
 

@@ -174,7 +174,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.retry_ms);
 
   // Names are validated against the registries when storage opens: options are added before plugins register.
-  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs; plugins may add more)")
+  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs, ram_object; plugins may add more)")
       ->default_val(store.backend);
   app.add_option("--store.layer", store.layers,
                  "Storage layer wrapped around the backend (repeatable, innermost first; provided by plugins)")
