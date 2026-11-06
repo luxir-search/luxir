@@ -4,6 +4,7 @@
 #pragma once
 
 #include "SearchRequest.h"
+#include "RemoteSearchGate.h"
 #include "luxir/server/LuxirNode.h"
 
 namespace luxir {
@@ -16,22 +17,32 @@ struct SearchConfig;
 //
 class SearchEngine {
   LuxirNode& node;
+  // Admits searches of collections on remote storage (server.remote_search_slots).
+  RemoteSearchGate remoteGate;
 
   void submitBody(SearchRequest& req);
-  // Runs submit() on an arena worker; -1's waits stay within the request.
-  void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
+  // Runs submit() on an arena worker; -1's waits stay within the request.  A
+  // search of a remote collection first takes a slot of remoteGate, waiting
+  // in its queue if none is free.
+  void enqueueSubmit(SearchRequest& req, int32_t maxParallel, bool remote);
+  void enqueueRun(SearchRequest& req, int32_t maxParallel);
+  // Completes a request that never ran, from a thread that must not deliver.
+  void failOnArena(SearchRequest& req, ErrorInfo error);
+  // Whether the request's collection may fetch bytes over a network.
+  bool readsRemotely(const SearchRequest& req);
+  static bool readsRemotely(const Collection& collection) noexcept;
   RootOp* prepare(SearchRequest& req);
 
   /// get needed resources such as the index reader and schema
   void getResources(SearchRequest& req);
 
 public:
-  SearchEngine(LuxirNode& node): node(node) {
-  }
+  explicit SearchEngine(LuxirNode& node);
 
   const SearchConfig& searchConfig() const;
   LuxirNode& getNode() const { return node; }
   Metrics& metrics() const;
+  RemoteSearchGate::Snapshot remoteSearchStats() { return remoteGate.snapshot(); }
 
   // Prepare through the ordinary parser/planner, without running calculators.
   // As a search in `tenant` would resolve it.
@@ -52,7 +63,13 @@ public:
   // shared TBB task arena so arena workers parallelize it; 1 enqueues on the
   // arena and runs serially there, off the calling thread.  With
   // Receiver::OFFLOAD every request is enqueued on the arena: 0 and 1 run
-  // serially on a worker, -1 starts on a worker and fans out from there.
+  // serially on a worker, -1 starts on a worker and fans out from there.  A
+  // search of a collection on remote storage is routed like Receiver::OFFLOAD
+  // whatever the receiver: its reads can wait on the network, and an HTTP
+  // shard waiting on them stalls every connection assigned to it.  It is also
+  // admitted through server.remote_search_slots, so cold searches cannot hold
+  // every arena worker; its slot is freed when the search body finishes, and
+  // production resumed after backpressure runs without one.
   void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver);
 
   // Synchronous execution on the calling thread (dispatch() routes here).

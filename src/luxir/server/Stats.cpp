@@ -21,6 +21,8 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/SearchEngine.h"
+#include "luxir/store/ReadWait.h"
 
 namespace luxir {
 namespace {
@@ -165,6 +167,16 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  auto remote = node.getSearchEngine().remoteSearchStats();
+  dst.remote_search.slots = remote.slots;
+  dst.remote_search.running = remote.running;
+  dst.remote_search.queued = remote.queued;
+  dst.remote_search.admitted = remote.admitted;
+  dst.remote_search.waited = remote.waited;
+  dst.remote_search.cancelled = remote.cancelled;
+  dst.remote_search.wait_seconds = (double)remote.waitNanos / 1e9;
+  dst.read_wait.blocking_reads = ReadWait::totalReads.load(std::memory_order_relaxed);
+  dst.read_wait.wait_seconds = (double)ReadWait::totalNanos.load(std::memory_order_relaxed) / 1e9;
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
