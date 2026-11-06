@@ -1670,6 +1670,7 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    Query* resultQuery = topDocsReq.query ? query : nullptr;
     // A minimum score turns the query's score into part of its membership,
     // so the cut-off wraps the query before filters fold in beside it: every
     // ranking, count, and ops-domain route below then sees the same matches.
@@ -2209,6 +2210,14 @@ public:
       qr->countLimitProven = minMatches >= requirements.countLimit;
     }
     qr->headSort = std::move(headSort);
+    qr->resultQuery = resultQuery;
+    if (placement != TopDocsPlacement::FUSION_SOURCE) {
+      DecoratorContext::QuerySource source{qr->resultQuery, qr->planning};
+      DecoratorContext dc{req, parseContext, qr->planning, {&source, 1}};
+      qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc);
+    } else if (!topDocsReq.decorate.empty()) {
+      throw RequestError("fusion sources cannot decorate; put decorate on fusion");
+    }
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }
@@ -2477,6 +2486,10 @@ public:
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
+    std::vector<DecoratorContext::QuerySource> resultQueries;
+    for (auto* source : fusion->sources) resultQueries.push_back({source->resultQuery, source->planning});
+    DecoratorContext dc{req, parseContext, fusion->sources.front()->planning, resultQueries};
+    fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc);
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
         [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });
 

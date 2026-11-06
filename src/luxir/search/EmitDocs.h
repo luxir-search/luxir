@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/search/HitDecorator.h"
 
 // Field loading + streaming response emission for an already-ranked list of
 // (segdoc, score) pairs.  Used by TopDocsReq (after collector sort) and by
@@ -770,6 +771,8 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 struct ExtraColumn {
   std::string_view name;
   std::function<void(int64_t i, luxir::api::Val& out, std::pmr::memory_resource& mr)> value;
+  std::function<void(std::span<const segdoc>, std::span<const uint32_t>,
+                     std::span<api::Val>, std::pmr::memory_resource&)> batchValue = {};
 };
 
 struct ReturnField {
@@ -1288,7 +1291,14 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         case ReturnField::Kind::EXTRA: {
           auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
           luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
-          for (int i = 0; i < columnSize; i++) rf.extra->value(batchStart + i, values[i], mr);
+          if (rf.extra->batchValue) {
+            auto fn = rf.extra->batchValue;
+            addFieldLoader(pendingLoaders, runs, [fn, segDocs, values, columnSize, &mr](std::span<RowIndex> rows) {
+              fn(segDocs, rows, std::span<api::Val>(values, (size_t)columnSize), mr);
+            });
+          } else {
+            for (int i = 0; i < columnSize; i++) rf.extra->value(batchStart + i, values[i], mr);
+          }
           registerColumn();
           continue;
         }
@@ -1662,7 +1672,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       DocBatchMetadata metadata = {},
                       bool foundGte = false,
                       std::span<const ExtraColumn> extraColumns = {},
-                      DocSortValues sortValues = {})
+                      DocSortValues sortValues = {},
+                      std::span<const std::shared_ptr<HitDecorator>> decorators = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1683,7 +1694,14 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   // every field in docs, COLUMNS leaves out all-missing discovered columns,
   // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
   // get_scores) is a column except under ROWS.
-  std::span<ReturnField> rfields = resolveReturnFields(req, fields, extraColumns);
+  std::vector<ExtraColumn> decoratedColumns(extraColumns.begin(), extraColumns.end());
+  for (const auto& decorator : decorators) {
+    decoratedColumns.push_back({decorator->columnName(), {},
+        [decorator](auto docs, auto rows, auto values, auto& mr) {
+          decorator->decorate(docs, rows, values, mr);
+        }});
+  }
+  std::span<ReturnField> rfields = resolveReturnFields(req, fields, decoratedColumns);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
