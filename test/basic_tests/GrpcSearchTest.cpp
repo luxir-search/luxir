@@ -132,6 +132,8 @@ TEST_F(GrpcSearchTest, multiBatchStreaming) {
     responses++;
     EXPECT_FALSE(sawLast);  // nothing after the first response without more
     sawLast = !response.msg.more;
+    // took_us rides on the final response only.
+    EXPECT_EQ(sawLast, response.msg.took_us > 0);
     auto& rsp = *response.msg.ops.at("q");
     auto& docList = std::get<luxir::api::DocList>(rsp.kind);
     EXPECT_EQ(response.msg.more, docList.more);
@@ -434,4 +436,27 @@ TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
   server.shutdown();
   serverThread.join();
   Signal::unlisten("searchRootChildStart");
+}
+
+TEST_F(GrpcSearchTest, collectionRenameSwapUnary) {
+  auto a = luxirNode->createCollection("grpc_rename_a"), b = luxirNode->createCollection("grpc_rename_b");
+  api::RenameCollectionRequest rename{"grpc_rename_a", "grpc_renamed", {}};
+  Reply<api::RenameCollectionResponse> renamed;
+  grpc::ClientContext renameContext;
+  auto result = hppUnaryCall(channel.get(), rpc::RenameCollection, &renameContext, rename, &renamed);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ("grpc_renamed", renamed.msg.to);
+  api::SwapCollectionsRequest swap{"grpc_renamed", "grpc_rename_b", {}};
+  Reply<api::SwapCollectionsResponse> swapped;
+  grpc::ClientContext swapContext;
+  result = hppUnaryCall(channel.get(), rpc::SwapCollections, &swapContext, swap, &swapped);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ(a, luxirNode->getCollection("grpc_rename_b")); EXPECT_EQ(b, luxirNode->getCollection("grpc_renamed"));
+  rename = {"grpc_rename_b", "grpc_renamed", {}};
+  grpc::ClientContext duplicate;
+  EXPECT_EQ(grpc::StatusCode::ALREADY_EXISTS, hppUnaryCall(channel.get(), rpc::RenameCollection, &duplicate, rename, &renamed).error_code());
+  swap.b = "grpc_missing";
+  grpc::ClientContext missing;
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, hppUnaryCall(channel.get(), rpc::SwapCollections, &missing, swap, &swapped).error_code());
+  luxirNode->deleteCollection("grpc_rename_b"); luxirNode->deleteCollection("grpc_renamed");
 }

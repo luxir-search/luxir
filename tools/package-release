@@ -96,8 +96,9 @@ def main():
     if not pending.strip().endswith("ninja: no work to do."):
         parser.error("the build is stale; rebuild and test before packaging")
     binary = directory / "bin/luxir"
-    if run(str(binary), "--version") != f"Luxir {version} ({tier})":
-        parser.error("the executable version does not match its build configuration")
+    revision = run("git", "rev-parse", "HEAD")
+    if run(str(binary), "--version") != f"Luxir {version} ({tier}) commit {revision}":
+        parser.error("the executable version or source commit does not match its build configuration")
     notes = run("readelf", "-n", str(binary))
     needed_tiers = re.findall(r"x86-64-v[234]", notes)
     if not needed_tiers or max(needed_tiers) != tier:
@@ -125,7 +126,6 @@ def main():
 
     install = pathlib.Path(cache["VCPKG_INSTALLED_DIR"])
     triplet = cache["VCPKG_TARGET_TRIPLET"]
-    revision = run("git", "rev-parse", "HEAD")
     epoch = run("git", "show", "-s", "--format=%ct", "HEAD")
     manifest = {
         "version": version, "source_commit": revision,

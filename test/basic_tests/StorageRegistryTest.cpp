@@ -13,7 +13,8 @@ using namespace luxir;
 namespace {
 
 LuxirConfig config;
-StorageContext context() { return {config, config.store.options, {}}; }
+const ParamReader noParams("store backend 'ram'", ParamReader::Entries{});
+StorageContext context() { return {config, noParams, {}}; }
 
 std::unique_ptr<DirectoryFactory> ramMaker(const StorageContext&) { return std::make_unique<RAMDirFactory>(); }
 
@@ -29,9 +30,9 @@ TEST(StorageRegistryTest, repeatedLayerAndOptionFlagsParse) {
   LuxirConfig parsed;
   CLI::App app;
   parsed.addOptions(app);
-  app.parse("--store.layer a --store.layer b --store.option k=v --store.option j=w");
+  app.parse("--store.layer a --store.layer b --store.option a.k=v --store.option b.j=w --store.option a.k=last");
   EXPECT_EQ(parsed.store.layers, (std::vector<std::string>{"a", "b"}));
-  EXPECT_EQ(parsed.store.options, (std::map<std::string, std::string>{{"j", "w"}, {"k", "v"}}));
+  EXPECT_EQ(parsed.store.options, (decltype(parsed.store.options){{"a", {{"k", "last"}}}, {"b", {{"j", "w"}}}}));
 }
 
 TEST(StorageRegistryTest, builtinsAreRegistered) {
@@ -79,7 +80,7 @@ TEST(StorageRegistryTest, frozenRegistryRejectsRegistration) {
                std::logic_error);
 }
 
-TEST(StorageRegistryTest, layersWrapInOrderAndOptionsParse) {
+TEST(StorageRegistryTest, layersWrapInOrder) {
   StorageRegistry registry;
   registry.addBackend("base", ramMaker);
   struct Tagged : DelegatingDirFactory {
@@ -96,16 +97,84 @@ TEST(StorageRegistryTest, layersWrapInOrderAndOptionsParse) {
   auto factory = registry.makeLayer("two", registry.makeLayer("one", registry.makeBackend("base", ctx), ctx), ctx);
   EXPECT_EQ("two(one(ram))", factory->describe());
 
-  LuxirConfig withOptions;
-  withOptions.store.options = {{"size", "64K"}, {"big", "2G"}, {"plain", "10"}, {"bad", "x"}, {"unit", "3Q"}};
-  StorageContext ctx2{withOptions, withOptions.store.options, {}};
-  EXPECT_EQ(64u * 1024, ctx2.optionBytes("size", 0));
-  EXPECT_EQ(2ULL << 30, ctx2.optionBytes("big", 0));
-  EXPECT_EQ(10u, ctx2.optionBytes("plain", 0));
-  EXPECT_EQ(7u, ctx2.optionBytes("missing", 7));
-  EXPECT_THROW(ctx2.optionBytes("bad", 0), std::invalid_argument);
-  EXPECT_THROW(ctx2.optionBytes("unit", 0), std::invalid_argument);
-  EXPECT_EQ("64K", ctx2.option("size"));
-  EXPECT_FALSE(ctx2.option("missing"));
-  EXPECT_EQ("d", ctx2.optionOr("missing", "d"));
+}
+
+TEST(StorageRegistryTest, malformedOptionsFailAtParseTime) {
+  for (auto option : {"key=value", ".key=value", "ram.=value", "ram.key", "Ram.key=value", "a-b.key=value"}) {
+    LuxirConfig parsed;
+    CLI::App app;
+    parsed.addOptions(app);
+    EXPECT_THROW(app.parse("--store.option " + std::string(option)), CLI::ValidationError) << option;
+  }
+}
+
+TEST(StorageRegistryTest, optionsAreTypedAndScoped) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  const char* argv[] = {"luxir", "--store.option=s3.bucket=logs", "--store.option=s3.numeric=\"123\"",
+                        "--store.option=s3.count=123", "--store.option=s3.ratio=1.5", "--store.option=s3.enabled=true",
+                        "--store.option=s3.disabled=false", "--store.option=s3.bytes=10G", "--store.option=cache.bytes=1048576"};
+  app.parse((int)std::size(argv), argv);
+  StorageOptions options(config.store);
+  auto params = options.reader("s3", "store backend 's3'");
+  EXPECT_EQ("logs", params.getString("bucket"));
+  EXPECT_EQ("123", params.getString("numeric"));
+  EXPECT_EQ(123, params.requireInt("count"));
+  EXPECT_EQ(1.5, params.getDouble("ratio", 0));
+  EXPECT_TRUE(params.getBool("enabled", false));
+  EXPECT_FALSE(params.getBool("disabled", true));
+  EXPECT_EQ("10G", params.getString("bytes"));
+  EXPECT_NO_THROW(params.rejectUnknown());
+  auto cache = options.reader("cache", "store layer 'cache'");
+  EXPECT_EQ(1048576, cache.requireInt("bytes"));
+  EXPECT_NO_THROW(cache.rejectUnknown());
+}
+
+TEST(StorageRegistryTest, nonScalarAndMalformedValuesStayStrings) {
+  for (std::string text : {"null", "[]", "{}", "", "1x", "truex", "01", "\"unclosed"}) {
+    StoreConfig config;
+    config.options = {{"s3", {{"bucket", text}}}};
+    StorageOptions options(config);
+    auto params = options.reader("s3", "store backend 's3'");
+    EXPECT_EQ(text, params.getString("bucket"));
+  }
+}
+
+TEST(StorageRegistryTest, unknownKeyListsAcceptedNames) {
+  StoreConfig config;
+  config.options = {{"cache", {{"byets", "1G"}}}};
+  StorageOptions options(config);
+  auto params = options.reader("cache", "store layer 'cache'");
+  EXPECT_EQ(1024u, params.getBytes("bytes", 1024));
+  std::string key = "path";
+  EXPECT_EQ("", params.getString(key));
+  key.assign("gone"); // validation runs after the maker's temporary key is gone
+  EXPECT_EQ("store layer 'cache': unknown parameter 'byets'; valid: bytes, path",
+            messageOf([&] { params.rejectUnknown(); }));
+}
+
+TEST(StorageRegistryTest, byteSizesUseCliUnits) {
+  StoreConfig config;
+  config.options = {{"cache", {{"integer", "1048576"}, {"size", "2 kb"}, {"large", "1TiB"},
+                               {"negative", "-1"}, {"string_negative", R"("-1")"}, {"fraction", "1.5"},
+                               {"bad", "3Q"}, {"overflow", "18446744073709551616"}}}};
+  StorageOptions options(config);
+  auto params = options.reader("cache", "store layer 'cache'");
+  EXPECT_EQ(1048576u, params.getBytes("integer", 0));
+  EXPECT_EQ(2048u, params.getBytes("size", 0));
+  EXPECT_EQ(1ULL << 40, params.getBytes("large", 0));
+  for (auto key : {"negative", "string_negative", "fraction", "bad", "overflow"}) {
+    auto error = messageOf([&] { params.getBytes(key, 0); });
+    EXPECT_TRUE(error.starts_with("store layer 'cache': '" + std::string(key) + "'")) << error;
+  }
+}
+
+TEST(StorageRegistryTest, ramMakerRejectsReadOnly) {
+  LuxirConfig config;
+  config.read_only = true;
+  EXPECT_NO_THROW(config.normalize());
+  StorageContext ctx{config, noParams, {}};
+  EXPECT_EQ("--read-only requires a persistent --store.backend such as fs; there is no existing data to serve with backend=ram",
+            messageOf([&] { StorageRegistry::global().makeBackend("ram", ctx); }));
 }

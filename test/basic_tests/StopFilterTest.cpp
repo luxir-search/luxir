@@ -124,7 +124,7 @@ TEST_F(StopFilterTest, invalidTokenCountsOnSetAndStoredLoad) {
     api::SchemaInfo info;
     info.source_def = bytes;
     ExpectLog warning("Dropping stored stop word: filter 'stop': " + message);
-    auto loaded = Schema::fromStored(info, 7);
+    auto loaded = Schema::fromStored(info, SchemaBinding(api::SchemaReference{"t0", "", {0, 0, 7, 1}}));
     EXPECT_EQ(1u, warning.suppressed());
     EXPECT_EQ(7u, loaded->gen_);
     auto plan = ((TextFieldType*) loaded->physical("body"))->analyzer_;

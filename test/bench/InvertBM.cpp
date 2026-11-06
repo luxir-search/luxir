@@ -32,7 +32,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
   RAMDir dir;
   for (auto _ : state) {
     dir = RAMDir(); // clear dir
-    Inverter inverter(dir, 0);
+    Inverter inverter(dir, 0, 1);
     Inverter::InputHandler& fieldHandler = inverter.getIndexHandler(field);
 
     for (int i=0; i<iter;i++) {
@@ -80,7 +80,7 @@ static void BM_InvertSci(benchmark::State& state, std::string field, bool stored
   for (int i = 0; i < ndocs; i++) totalBytes += bodies[(size_t) i % bodies.size()].size();
   for (auto _ : state) {
     RAMDir dir;
-    Inverter inverter(dir, 0, schema);
+    Inverter inverter(dir, 0, 1, schema);
     auto& handler = inverter.getIndexHandler(field);
     for (int i = 0; i < ndocs; i++) {
       inverter.startDoc();
