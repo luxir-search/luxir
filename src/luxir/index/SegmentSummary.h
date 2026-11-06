@@ -54,7 +54,7 @@ public:
   static constexpr std::string_view OVERLAY_KIND = "segment_summary";
   static constexpr std::string_view OVERLAY_NAME = "summary";
   static constexpr uint64_t OVERLAY_GEN = 0;
-  static std::string overlayFileName(uint64_t segId);
+  static std::string overlayFileName(uint64_t segId, uint64_t creatorEpoch, uint64_t writerEpoch);
 
   static constexpr std::string_view MAGIC = "LUXIRSUM";
   static constexpr uint32_t FORMAT_VERSION = 1;
