@@ -4,6 +4,7 @@
 #include "Inverter.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/GeoPointCoerce.h"
@@ -366,7 +367,58 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     liveDocs = getMaxDoc();
   }
 
-  return getPostingsWriter().finish(filenames, descriptors);
+  bool written = getPostingsWriter().finish(filenames, descriptors);
+  if (written && sourceWriter_) flushSource(filenames, descriptors);
+  return written;
+}
+
+void Inverter::addSource(std::string_view id, std::string_view body, uint64_t version, uint8_t flags) {
+  if (!schema->source.enabled) return;
+  if (!sourceWriter_) {
+    sourceWriter_ = std::make_unique<SourceWriter>(
+        schema->source, Postings::getIndexFileNamePrefix(getSegId(), postingsWriter.creatorEpoch));
+  }
+  // Record i is doc i: docs started without a source before this one get placeholders.
+  // A second call for one doc, or a call before startDoc(), would shift every later
+  // record onto the wrong document, so it fails instead.
+  if (currDoc < 0) throw std::logic_error("Inverter::addSource called before startDoc");
+  sourceWriter_->padTo((uint32_t)currDoc);
+  if (sourceWriter_->docCount() != (uint32_t)currDoc) {
+    throw std::logic_error("Inverter::addSource: source record " + std::to_string(sourceWriter_->docCount()) +
+                           " would not be doc " + std::to_string(currDoc));
+  }
+  sourceWriter_->add(id, body, version, flags);
+  size_t ram = sourceWriter_->ramBytes();
+  addExtraRam((int64_t)ram - (int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = ram;
+}
+
+// Writes the source file holding this segment's documents and the map that
+// points the segment's doc IDs at it. Both are listed with the segment's files.
+void Inverter::flushSource(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
+  if (!sourceSeq) throw std::logic_error("Inverter::sourceSeq must be set before a segment with sources is flushed");
+  auto& dir = postingsWriter.getDirectory();
+  int32_t docs = getMaxDoc();
+  sourceWriter_->padTo((uint32_t)docs);
+  std::string name = Postings::getSourceFileName(sourceSeq->fetch_add(1), postingsWriter.creatorEpoch);
+  std::string mapName = Postings::getSourceMapFileName(Postings::segmentKey(getSegId(), postingsWriter.creatorEpoch), 1);
+  FileDescriptor file;
+  try {
+    sourceWriter_->flush(dir, name, file);
+    SourceMap map;
+    map.addRun(0, docs, map.fileIndex({name, (uint32_t)docs, file.size}), 0);
+    map.write(dir, mapName, filenames, descriptors);
+  } catch (...) {
+    dir.deleteFile(name);
+    dir.deleteFile(mapName);
+    throw;
+  }
+  if (filenames) filenames->push_back(name);
+  if (descriptors) descriptors->push_back(file);
+  sourceGen = 1;
+  addExtraRam(-(int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = 0;
+  sourceWriter_.reset();
 }
 
 

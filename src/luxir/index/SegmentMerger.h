@@ -580,6 +580,12 @@ public:
     return deleted ? -1 : docId;
   }
 
+  // The mapping mapDocId applies to input `sourceOrd`: its remap table (empty
+  // when every doc survives in order) and its base in the merged segment.
+  std::pair<std::span<const int32_t>, int32_t> docMapping(size_t sourceOrd) const {
+    return {segs[sourceOrd].remap, segs[sourceOrd].base};
+  }
+
 
 
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,

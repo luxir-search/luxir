@@ -27,6 +27,11 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+
+  // Allocation high-water mark for source file names ("v<seq>.<epoch>"), including files
+  // that are no longer referenced. Durable only at commit: the writer epoch in
+  // the name keeps a sequence number reused after a crash from naming the same file.
+  uint64 next_source_seq = 30;
 }
 
 // Shared minor and collection-local versions occupy separate components. The
@@ -85,4 +90,8 @@ message SegmentInfo {
   uint64 creator_epoch = 12; // Writer lifetime that created the core files
   uint64 live_epoch = 13; // Writer lifetime that wrote live_gen
   uint64 next_overlay_gen = 11; // Persistent high-water mark, including dropped overlays
+
+  // Generation of the segment's source map ("s<seg>.<epoch>__S<gen>"), 0 = no source
+  // store for this segment. The map lists the source files holding its documents.
+  uint64 source_gen = 30;
 }

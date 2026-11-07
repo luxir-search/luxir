@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Scrubber.h"
+#include "luxir/store/SourceFiles.h"
 #include "Collections.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
@@ -100,6 +101,7 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
       auto snapshot = registry.snapshot();
       if (!snapshot) continue;
       for (const auto& file : snapshot->files) {
+        if (isSourceFile(file.name)) continue;
         std::string problem;
         try {
           auto reader = registry.openChecksum(file, true);
