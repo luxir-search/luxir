@@ -458,6 +458,10 @@ public:
         opt.scorer->setMinCompetitiveScore(minScore);
       }
     }
+    if (reqMaxScore > 0.0f && opt.scorer->prunesOnMinCompetitiveScore()) {
+      float floor = clauseFloor(minScore, (double)reqMaxScore, 2);
+      if (floor > 0.0f) opt.scorer->setMinCompetitiveScore(floor);
+    }
   }
 
   float getMaxScore(int32_t upTo) override {
@@ -627,6 +631,10 @@ class BooleanQuery::MandOptBulkScorer final : public BulkScorer {
   double scoreBoundFactor = 1.0;
   float mandWindowMax = std::numeric_limits<float>::infinity();
   double optWindowMaxSum = 0.0;
+  // Global maxima for forwardClauseFloors; empty unless an optional clause
+  // prunes on its own floor.
+  std::span<float> optGlobalMax;
+  float mandGlobalMax = std::numeric_limits<float>::infinity();
 
   static bool lessMaxScore(float a, float b) {
     bool finiteA = std::isfinite(a);
@@ -1017,8 +1025,18 @@ public:
     assert(mand != nullptr);
     assert(!opts.empty());
     scoreBoundFactor = 1.0 + (double) (opts.size() + 1) * 0x1p-24;
+    bool anyPrunes = false;
     for (auto* opt : opts) {
       assert(opt != nullptr);
+      anyPrunes |= opt->prunesOnMinCompetitiveScore();
+    }
+    if (anyPrunes) {
+      optGlobalMax = pool.make_span<float>(opts.size());
+      for (size_t i = 0; i < opts.size(); i++) {
+        optGlobalMax[i] = optionalUpperBound(
+            opts[i]->getMaxScoreForSetup(PostingsReader::END));
+      }
+      mandGlobalMax = mand->getMaxScoreForSetup(PostingsReader::END);
     }
   }
 
@@ -1047,6 +1065,10 @@ public:
     }
     if (minCompetitiveScore > this->minCompetitiveScore) {
       this->minCompetitiveScore = minCompetitiveScore;
+      if (!optGlobalMax.empty()) {
+        forwardClauseFloors(opts, optGlobalMax, (double)mandGlobalMax,
+                            minCompetitiveScore);
+      }
     }
 
     int32_t start = min;
@@ -4756,6 +4778,8 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   int32_t windowSize;
   bool globalMode;
   bool windowReady = false;
+  // Some clause prunes on its own floor (forwardClauseFloors).
+  bool forwardsClauseFloors = false;
   int32_t nextWindowStart = 0;
   int32_t windowStart = 0;
   int32_t windowEnd = 0;
@@ -5128,6 +5152,7 @@ public:
     for (size_t i = 0; i < scorers.size(); i++) {
       clauseMax[i] = optionalUpperBound(
           scorers[i]->getMaxScoreForSetup(PostingsReader::END));
+      forwardsClauseFloors |= !DISMAX && scorers[i]->prunesOnMinCompetitiveScore();
     }
     sortByClauseMax();
     for (size_t i = 0; i < scorers.size(); i++) {
@@ -5152,6 +5177,11 @@ public:
   void setMinCompetitiveScore(float minScore) override {
     if (minScore > minCompetitiveScore) {
       minCompetitiveScore = minScore;
+      if constexpr (!DISMAX) {
+        if (forwardsClauseFloors) {
+          forwardClauseFloors(scorers, clauseMax, 0.0, minScore);
+        }
+      }
       if (globalMode) {
         updateGlobalSplit();
       } else if (windowReady) {
@@ -5635,6 +5665,8 @@ private:
   float uniformConstant = 0.0f;
   bool exactUniformConstant = false;
   bool disjConjCountPath = false;
+  // Some clause prunes on its own floor (forwardClauseFloors).
+  bool forwardsClauseFloors = false;
 
   void configureDisjunctionCountIdentity(luxir::MemPool& pool,
                                          bool enabled,
@@ -6937,6 +6969,7 @@ public:
     for (size_t i = 0; i < scorers.size(); i++) {
       clauseMax[i] = optionalUpperBound(
           scorers[i]->getMaxScoreForSetup(PostingsReader::END));
+      forwardsClauseFloors |= scorers[i]->prunesOnMinCompetitiveScore();
     }
     sortByClauseMax();
     for (size_t i = 0; i < scorers.size(); i++) {
@@ -6978,6 +7011,9 @@ public:
     }
     if (minCompetitiveScore > this->minCompetitiveScore) {
       this->minCompetitiveScore = minCompetitiveScore;
+      if (forwardsClauseFloors) {
+        forwardClauseFloors(scorers, clauseMax, 0.0, minCompetitiveScore);
+      }
       bool insideOuterWindow = outerWindowReady && min >= outerWindowStart && min < outerWindowEnd;
       if (!insideOuterWindow || disablePartitionLatchForTests
           || minCompetitiveScore >= nextPartitionMcs) {

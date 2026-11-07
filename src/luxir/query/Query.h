@@ -1962,6 +1962,15 @@ public:
     virtual void setMinCompetitiveScore(float minScore) {
       unused(minScore);
     }
+    /// True for a clause scorer that skips its own docs from a floor on its
+    /// own score. MandOptScorer, MandOptBulkScorer and the summing MaxScore
+    /// disjunctions, which do not pass theta on to their clauses, forward
+    /// such a clause the floor it must reach for a doc to make theta when
+    /// every other clause scores its maximum (forwardClauseFloors); the floor
+    /// never removes a doc that could compete.
+    virtual bool prunesOnMinCompetitiveScore() const {
+      return false;
+    }
     virtual float getMaxScore(int32_t upTo) {
       unused(upTo);
       return std::numeric_limits<float>::infinity();
@@ -2259,6 +2268,44 @@ public:
     }
   };
 };
+
+// The floor a clause must reach for a doc to make `theta` when the rest of
+// the doc's score is at most `othersMax`, out of `clauses` summed scores; -inf
+// when no floor is proven. A float sum of n terms can exceed the exact sum by
+// about n float ulps of the total, so theta is lowered by that much, as the
+// compound scorers' scoreBoundFactor does, and by a margin on top. A positive
+// floor implies othersMax < theta, so a doc missing the clause cannot compete
+// and dropping the clause's low-scoring matches only drops docs below theta.
+inline float clauseFloor(float theta, double othersMax, size_t clauses) {
+  if (!std::isfinite(othersMax) || !std::isfinite(theta)) {
+    return -std::numeric_limits<float>::infinity();
+  }
+  double factor = 1.0 + (double)(clauses + 1) * 0x1p-24;
+  double floor = (double)theta / factor - othersMax
+      - ((double)std::abs(theta) + std::abs(othersMax)) * 1e-6;
+  return floor > 0.0 ? (float)floor : -std::numeric_limits<float>::infinity();
+}
+
+// Forwards clause floors to the clauses that prune on them. `clauseMax`
+// holds each clause's global maximum (never below its score), aligned with
+// `clauses`; `extraMax` bounds any other score the doc can receive. Each
+// clause's own maximum is left out of the others' sum by summing the rest
+// directly, not by subtracting from a total, which would lose small terms
+// beside a huge one.
+inline void forwardClauseFloors(std::span<Query::Scorer* const> clauses,
+                                std::span<const float> clauseMax,
+                                double extraMax, float theta) {
+  assert(clauses.size() == clauseMax.size());
+  for (size_t i = 0; i < clauses.size(); i++) {
+    if (!clauses[i]->prunesOnMinCompetitiveScore()) continue;
+    double others = extraMax;
+    for (size_t j = 0; j < clauseMax.size(); j++) {
+      if (j != i) others += (double)clauseMax[j];
+    }
+    float floor = clauseFloor(theta, others, clauses.size() + 1);
+    if (floor > 0.0f) clauses[i]->setMinCompetitiveScore(floor);
+  }
+}
 
 const Query* peelBoost(const Query* query, float& boost);
 Query* peelBoost(Query* query, float& boost);
