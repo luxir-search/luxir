@@ -1160,6 +1160,13 @@ engine, so do not build tooling on it. Serial execution (the default, or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
 
+A piece whose thread waited on storage also reports it, so a slow piece can be
+told apart from a cold one. `blocking_reads` and `read_wait_us` count the reads
+that blocked on bytes not in memory, as the storage implementation reports
+them (built-in storage reports none), and `major_faults` counts mapped file
+pages read from disk, which a cold local index takes too. They cover the
+piece's own thread and are omitted when zero.
+
 ## Streaming HTTP responses
 
 The normal HTTP response is chunked NDJSON. Each line is a complete response

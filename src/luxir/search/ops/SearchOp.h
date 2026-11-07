@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <vector>
 #if !defined(__APPLE__)
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -22,7 +23,9 @@
 #include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/store/ReadWait.h"
 #include "luxir/util/BigBuffer.h"
+#include "luxir/util/Signal.h"
 #include "luxir/util/thread.h"
 
 
@@ -292,6 +295,17 @@ public:
     class ExecutionProfileScope {
       ExecutionProfilePieceState* state;
       std::chrono::steady_clock::time_point started;
+      ReadWait::Counts readsBefore;
+      uint64_t majorFaultsBefore = 0;
+
+      // This thread's major page faults: cold mmap reads on local disk.
+      static uint64_t majorFaults() {
+#ifdef RUSAGE_THREAD
+        struct rusage usage;
+        if (::getrusage(RUSAGE_THREAD, &usage) == 0) return (uint64_t)usage.ru_majflt;
+#endif
+        return 0;
+      }
 
     public:
       ExecutionProfileScope(ExecutionProfilePieceState* state, int32_t segnum) : state(state) {
@@ -305,7 +319,10 @@ public:
 #else
         state->wire.thread_id = (int64_t)::syscall(SYS_gettid);
 #endif
+        readsBefore = ReadWait::thread();
+        majorFaultsBefore = majorFaults();
         started = std::chrono::steady_clock::now();
+        Signal::emit("searchProfilePieceStart", state);
       }
       ExecutionProfileScope(const ExecutionProfileScope&) = delete;
       ExecutionProfileScope& operator=(const ExecutionProfileScope&) = delete;
@@ -313,6 +330,12 @@ public:
         if (state == nullptr) return;
         state->wire.elapsed_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - started).count();
+        // Waits on this thread only: work the piece hands to other threads
+        // reports in their own pieces.
+        const auto& reads = ReadWait::thread();
+        state->wire.blocking_reads = reads.reads - readsBefore.reads;
+        state->wire.read_wait_us = (reads.nanos - readsBefore.nanos) / 1000;
+        state->wire.major_faults = majorFaults() - majorFaultsBefore;
         state->complete = true;
       }
 

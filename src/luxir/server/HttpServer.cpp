@@ -1928,9 +1928,8 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena, requestStart_);
-    if (!sreq->proto.min_commit.empty()) {
-      sreq->waitCancellation = waitCancellation;
-    }
+    // Cancels a min_commit wait, or a wait for a remote search slot.
+    sreq->waitCancellation = waitCancellation;
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
@@ -1945,7 +1944,7 @@ private:
     // the task arena so its workers parallelize the query.  1 moves the
     // synchronous engine.submit() onto the task arena so this io thread is
     // not occupied for the query's duration; reply() then posts results back
-    // here.
+    // here.  A collection on remote storage takes the arena in every lane.
     engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
@@ -4039,7 +4038,8 @@ private:
   // to this connection's shard, not invoked: an already-drained park must not
   // recurse into produce(), and running production here keeps a default-lane
   // request on the thread that owns it (max_parallel=-1 re-enters the arena
-  // here and 1 re-enqueues - see HttpSearchRequest::resumeWhenDrained).
+  // here and an offloaded request re-enqueues - see
+  // HttpSearchRequest::resumeWhenDrained).
   // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
   // a lost waiter strands its request forever - so a post allocation failure
   // falls back to running the resume inline.
@@ -4298,25 +4298,28 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel == -1) {
+  if (offloaded) {
+    // The query work left the io plane (max_parallel=1, a commit wait, or a
+    // collection on remote storage), so resumed production belongs on the
+    // arena too, isolated like the search itself.  The wrapper runs on the
+    // shard (see maybeFireDrainWaiters) and must not throw: fall back to
+    // producing inline rather than stranding the stream.
+    resume = [&node = session->node(), resume = std::move(resume)] {
+      try {
+        node.getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+          oneapi::tbb::this_task_arena::isolate(resume);
+        });
+      } catch (...) {
+        if (resume) resume();
+      }
+    };
+  } else if (maxParallel == -1) {
     // The parallel lane runs on this shard inside the arena (see
     // SearchEngine::dispatch), and so does resumed production: its per-batch
     // task groups must spawn into the node arena, not this thread's implicit
     // one.
     resume = [&node = session->node(), resume = std::move(resume)] {
       node.executeIsolated(resume);
-    };
-  } else if (maxParallel != 0) {
-    // The request opted its query work off the io plane (max_parallel=1),
-    // so resumed production belongs on the arena too.  The wrapper runs on
-    // the shard (see maybeFireDrainWaiters) and must not throw: fall back to
-    // producing inline rather than stranding the stream.
-    resume = [&node = session->node(), resume = std::move(resume)] {
-      try {
-        node.getTaskArena().enqueue(resume);
-      } catch (...) {
-        if (resume) resume();
-      }
     };
   }
   session->whenDrained(std::move(resume));

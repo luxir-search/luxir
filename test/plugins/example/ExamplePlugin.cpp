@@ -101,6 +101,11 @@ public:
                                        -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingLayer>(std::move(inner));
     });
+    r.storage.addLayer("remote", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext& ctx)
+                                     -> std::unique_ptr<DirectoryFactory> {
+      auto delay = std::chrono::microseconds(ctx.params.getInt("read_delay_us", 0));
+      return std::make_unique<RemoteLayer>(std::move(inner), delay);
+    });
 
     r.query.add("doc_ids", ::example::docIdsDef());
     r.query.add("field_value", ::example::fieldValueDef());

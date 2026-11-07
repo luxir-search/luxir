@@ -467,6 +467,9 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
+| `luxir_remote_search_slots`, `luxir_remote_searches_running`, `luxir_remote_searches_queued` | Searches of collections on remote storage: the configured slots (`--server.remote_search_slots`), those holding one, and those waiting for one. JSON: `service.remote_search`. |
+| `luxir_remote_searches_admitted_total`, `luxir_remote_searches_waited_total`, `luxir_remote_searches_cancelled_total`, `luxir_remote_search_wait_seconds_total` | Remote-collection searches started, those that waited for a slot first, those cancelled while waiting, and the summed wait of the ones started. |
+| `luxir_storage_blocking_reads_total`, `luxir_storage_read_wait_seconds_total` | Storage reads that blocked a thread on bytes not in memory, and their summed wait, as storage implementations report them (`service.read_wait`). Built-in storage reports none; cold reads of mapped local files show as major page faults in the process metrics. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
@@ -609,6 +612,23 @@ scheduler's workers join in with unlimited intra-request parallelism; values
 above `1` are reserved for a bounded parallelism budget and not implemented
 yet. A request with `min_commit` continues on a shared worker once its commit
 wait ends, whatever the setting.
+
+A search of a collection on a remote storage backend (one whose directory
+reports `Directory::REMOTE`) leaves the shard in every lane, because its reads
+can wait on the network: `0` and `1` run serially on a worker, and `-1` fans out
+from one. The search holds that worker while it waits, so such searches are
+admitted through `--server.remote_search_slots`: at most that many run at once
+on the node (default `0`, meaning half the workers, at least one), and the rest
+wait in arrival order without holding a thread. Without the cap, enough cold
+searches would occupy every worker, stalling gRPC searches, `max_parallel=1`,
+`min_commit` continuations and fan-out work along with them. A waiting search
+is never rejected; it is cancelled only when its client goes away (the gRPC
+call is cancelled, or the HTTP connection closes). A search frees its slot when
+its body finishes, on success or failure and before its final response is sent.
+A streamed response paused by backpressure does not keep the slot: each
+resumed batch is a bounded unit of work, and holding a slot through a pause
+would let one slow reader block every other remote search. Resumed batches
+still run on the workers, not on the shard.
 
 gRPC searches always run on the shared workers, never on the completion-queue
 thread: a client such as a gateway multiplexes many calls over one HTTP/2

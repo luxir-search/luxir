@@ -44,6 +44,8 @@ locations, browse `src/luxir/<area>/`.
      - Implements parallel segment searching using TBB
      - Ordinary preparation is shared with HTTP `?explain=resolved`;
        `?explain=request` only parses and serializes
+     - `RemoteSearchGate`: FIFO admission of searches of remote-storage
+       collections (`server.remote_search_slots`)
    - `EmitDocs`: `ReturnField` separates the requested output key from the physical
      read source; wildcard discovery returns logical primaries only
 
