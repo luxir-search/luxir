@@ -600,6 +600,11 @@ public:
   bool boundedCount = false;
   bool countLimitProven = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
+  // The segments where the op's key query alone (the one the whole-membership
+  // cache is keyed by) may match, deletes ignored. `viable` also prunes by
+  // filters, fusion shared filters and segments without live documents; only
+  // a segment outside this mask may record an empty cached membership.
+  SegmentMask membershipViable;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
   // Every field-sort collector's primaryValues (see sortValueEnvelope).
@@ -643,6 +648,14 @@ public:
 
   bool bucketVariantsNeedCompleteInput(bool selectionInPath = false) const {
     return !domainVariants.segmentLocal(selectionInPath);
+  }
+
+  bool needsWholePreparation() const override {
+    return (weight && weight->needsPrepare())
+        || std::ranges::any_of(filterWeights, [](auto* source) { return source->needsPrepare(); })
+        || domainVariants.sourcesNeedPrepare()
+        || SearchOp::needsWholePreparation()
+        || std::ranges::any_of(groupOps, [](const auto& entry) { return entry.second->needsWholePreparation(); });
   }
 
   bool needsCompleteBucketInput() const override {
@@ -1632,9 +1645,46 @@ public:
       op.releaseSegmentState(segment);
     }
 
+    // A segment the op's root mask pruned contributes exactly an empty
+    // match: no supplier, scorer, filter or count is built for it, every
+    // child receives the empty domain, and the collector still counts the
+    // segment as visited. The whole-membership cache records the empty
+    // membership only where the key query itself is proven empty; a segment
+    // pruned by filters or fusion shared filters publishes nothing.
+    template <bool MetricGroups>
+    void collectPrunedSegment(oneapi::tbb::task_group* tg, int32_t segnum) {
+      auto& op = thisOp();
+      auto& seg = op.req.reader->segments()[(size_t)segnum];
+      Signal::emit("searchTopDocsSegmentPruned", this);
+      {
+        // Released before the children run and the collector completes, as
+        // doCollectPolicy releases before its merge.
+        auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
+        if (!op.membershipViable.test((size_t)segnum)) op.wholeMembershipPlan.recordProvenEmpty(seg);
+      }
+      DomainHandle empty = DomainHandle::empty();
+      if (memberReplay) memberReplay->domains[(size_t)segnum] = empty;
+      if (!output.empty()) output[(size_t)segnum] = empty;
+      task_group_fanout(tg, subCalcs.size(), [&](size_t i) {
+        auto* subCalc = subCalcs[subCalcs.size() - 1 - i].get();
+        return [subCalc, tg, segnum, empty]() {
+          Signal::emit("searchTopDocsChildStart", subCalc);
+          subCalc->calc(tg, segnum, empty);
+        };
+      });
+      int64_t count;
+      if constexpr (MetricGroups) count = metricGroups->merger.release(metricGroups->merger.obtain());
+      else count = collectorMerger.release(collectorMerger.obtain());
+      if (count == (int64_t)op.req.reader->segments().size()) doneCollecting<MetricGroups>();
+    }
+
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void doCollect(oneapi::tbb::task_group* tg, int32_t segnum,
                    DomainHandle domainHandle) {
+      if (thisOp().segmentPruned(segnum)) {
+        collectPrunedSegment<MetricGroups>(tg, segnum);
+        return;
+      }
       if constexpr (Admission::isDiversified) {
         doCollectPolicy<Structural, true, false, Admission>(tg, segnum, std::move(domainHandle));
       } else if constexpr (MetricGroups) {
@@ -2659,6 +2709,8 @@ public:
       }
 
       assert(segnum < (int32_t)inputDomains.size());
+      // Whole-index preparation keeps every segment's domain, pruned or not:
+      // a prepared weight (kNN's global top k) chooses across all segments.
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =

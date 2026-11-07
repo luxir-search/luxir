@@ -25,6 +25,7 @@
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -174,6 +175,14 @@ public:
       std::string_view target) const override {
     if (target != field) return std::nullopt;
     return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (envelope.lo > envelope.hi) {
+      view.prove("empty numeric range");
+      return MatchState::EMPTY;
+    }
+    return summary::numericMatch(view, field, [this](int64_t min, int64_t max) { return intersects(min, max); });
   }
 
   float valueMatchCost() const {
