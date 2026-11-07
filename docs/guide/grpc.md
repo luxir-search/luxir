@@ -191,7 +191,10 @@ Subops inherit their parent's effective word. The date mode occupies bits 0-1:
 `flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
 Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
 or clear it in either word. It affects HTTP JSON rendering only, and binary
-gRPC responses retain their integer types. Unknown bits are rejected in either
+gRPC responses retain their integer types. Bit 3 is `estimate_count`: lists in
+its scope with an unset or positive `count_limit` may estimate `found` (see
+[counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded)). Clearing
+it on an op stops its subops inheriting it. Unknown bits are rejected in either
 word. Bits absent from `flags_set` have no effect on inheritance.
 
 `RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the

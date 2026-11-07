@@ -150,6 +150,9 @@ errors. Canonical echo and both explain modes emit names, including an explicit
 in the named unit. This applies to documents, facets, groups, sort values and
 DATE metrics; the same output types are used over gRPC.
 
+`estimate_count` lets every list in its scope that leaves `count_limit` unset
+estimate `found`; see [counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded).
+
 `int64_str` is request-level only. For example, `"flags": ["date_ns",
 "int64_str"]` renders JSON int64 and uint64 values as decimal strings only
 when they fall outside JavaScript's safe integer range, -9007199254740991

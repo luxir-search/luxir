@@ -256,6 +256,17 @@ TEST_F(MultiTermLimitsTest, weightsOfOneQueryShareItsExpansion) {
   EXPECT_EQ(1, SkipStats::multitermExpansions);
   EXPECT_EQ(100, wildcard->multiTermBudget.termsExamined());
 
+  // The estimator's sampling pass adds nothing to the budget either.
+  SkipStats::reset();
+  auto estimated = localReq(helper.getSearchEngine());
+  estimated->collection("main").topDocs("q").wildcardQuery("tag_s", "t0*9")
+      .countLimit(-2).limit(5);
+  estimated->execute();
+  ASSERT_TRUE(estimated->ok()) << estimated->errorMsg();
+  EXPECT_EQ(10, estimated->getMatchCount());
+  EXPECT_EQ(1, SkipStats::multitermExpansions);
+  EXPECT_EQ(100, estimated->multiTermBudget.termsExamined());
+
   auto fuzzy = [&](int64_t countLimit, bool facet) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
@@ -269,6 +280,7 @@ TEST_F(MultiTermLimitsTest, weightsOfOneQueryShareItsExpansion) {
   EXPECT_GT(uncounted, 0);
   EXPECT_EQ(uncounted, fuzzy(-1, false));
   EXPECT_EQ(uncounted, fuzzy(-1, true));
+  EXPECT_EQ(uncounted, fuzzy(-2, false));
 }
 
 TEST_F(MultiTermLimitsTest, facetTermFilterIsExemptFromMinLiteralPrefix) {
