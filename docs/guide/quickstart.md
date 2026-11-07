@@ -135,7 +135,7 @@ The rest of this page uses them.
 > `curl -X POST 'http://localhost:9400<path>?pretty' -H 'Content-Type: application/json' -d '<body>'`.
 
 The same search as JSON, choosing which fields come back and asking for the
-exact match count:
+match count:
 
 ```http
 POST /collections/books/_search
@@ -143,7 +143,7 @@ POST /collections/books/_search
 {
   "query": "title_t:kings",
   "fields": ["id", "title_t", "author_name", "year_i"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 
@@ -174,10 +174,11 @@ explicit `null` where the document has no value, which is convenient when
 feeding rows into a table. (Over gRPC, responses are natively columnar; this
 setting picks the placement there too.)
 
-### Counts are exact
+### Counting matches
 
-Add `count_limit: -1` and `found` is the total number of matching documents,
-regardless of `limit`:
+Add `count_limit: -2` and `found` is the number of matching documents,
+regardless of `limit`. It is exact whenever that is cheap, as it always is on an
+index this small:
 
 ```http
 POST /collections/books/_search
@@ -185,7 +186,7 @@ POST /collections/books/_search
 {
   "query": {"match": {"author_name": "sanderson"}},
   "fields": ["id", "title_t"],
-  "count_limit": -1,
+  "count_limit": -2,
   "limit": 2
 }
 ```
@@ -206,7 +207,9 @@ POST /collections/books/_search
 }
 ```
 
-`found` is 3 even though `limit` was 2.
+`found` is 3 even though `limit` was 2. On a large index, `-2` may return an
+estimate instead, marked `"found_estimated": true`, which stays fast even for
+common terms. Use `count_limit: -1` when you need the exact count every time.
 
 ### Forgiving end-user search
 
@@ -222,7 +225,7 @@ POST /collections/books/_search
     "simple_query": {"q": "kings | radiance", "fields": ["title_t"]}
   },
   "fields": ["id", "title_t"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 
@@ -255,7 +258,7 @@ POST /collections/books/_search
 {
   "query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2013]",
   "fields": ["id", "title_t"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 
@@ -433,7 +436,7 @@ POST /collections/movies/_search
 {
   "query": {"match": {"title_t": "ugly"}},
   "fields": ["id", "title_t"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 

@@ -16,7 +16,7 @@ results, and links the protobuf definitions shared by JSON and gRPC.
 ```http
 POST /collections/books/_search
 
-{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -1}
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -2}
 ```
 
 ```json
@@ -422,7 +422,9 @@ nothing.
 
 A prefix query with `max_expansions` keeps at most that many terms per segment.
 The selected count is subject to any configured `too_many_expansions` cap, and
-its scan counts toward any configured terms-examined budget. `any_of` term
+its scan counts toward any configured terms-examined budget. The sampling pass
+behind an estimated `found` reuses the search's expansions, so it adds nothing
+to the budget. `any_of` term
 lists are not capped by term count because the request already lists every
 term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
 prefix rule. Case-insensitive matching does not shorten the measured literal.

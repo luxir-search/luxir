@@ -55,7 +55,7 @@ POST /collections/books/_search
   "query": "title_t:(dune OR messiah) AND year_i:>=1965",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "count_limit": -1,
+  "count_limit": -2,
   "get_scores": true,
   "fields": ["id", "title_t", "year_i", "price_f"]
 }
@@ -95,7 +95,7 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
+| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; `-2` permits an estimate; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
@@ -104,11 +104,37 @@ one.
 | `document_format` | `rows`, `columns`, or `adaptive`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
-### Counts are opt-in, exact or bounded
+### Counts are opt-in: exact, estimated or bounded
 
 `found` is opt-in. Unset or `count_limit: 0` omits the count and permits
 competitive-score skipping. `count_limit: -1` requests an exact count, even
-when only a few documents are returned.
+when only a few documents are returned. An exact count visits every match,
+which costs far more than finding the top documents for common terms.
+
+`count_limit: -2` asks for a count that may be estimated, and costs little at
+any scale. `found` is still exact when that is cheap: from index statistics,
+when ranking visited every match, or when the matches are few enough to count.
+Otherwise each segment that ranking pruned counts a sample spread across its
+documents and scales it up, within the bounds index statistics prove, and
+`found_estimated: true` marks the result, which can be above or below the exact
+count. Where a sample is too thin to scale, `found` counts the matches seen and
+`found_gte: true` marks it as a lower bound.
+
+```http
+POST /collections/books/_search
+
+{"query": "title_t:the", "count_limit": -2}
+```
+
+```json
+{"found": 1830000, "found_estimated": true, "docs": [...]}
+```
+
+The packed `estimate_count` [request flag](http-api.md#packed-request-flags)
+asks the same of every list in its scope that leaves `count_limit` unset. On a
+positive `count_limit: N` it permits an estimate of at least N where the count
+would otherwise stop at N. An explicit `0` or `-1` overrides it, and `-2`
+applies only to its own list.
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
 list holds competitive-score skipping until N matches have been counted, or
@@ -131,7 +157,7 @@ POST /collections/books/_search
 Lists with `ops`, `collapse`, or `diversify`, field sorts, nested lists, and
 `limit: 0` count-only requests retain exact counting for any nonzero
 `count_limit`. Fusion also always supplies an exact count when requested.
-Values below -1 are rejected.
+Values below -2 are rejected.
 
 For a count plus analytics with no documents at all, set `limit: 0`. No
 document fields are loaded:
@@ -1046,7 +1072,7 @@ The recognized top-document parameters are:
 | `batch_size` | Signed 32-bit decimal integer. |
 | `document_format` | Exactly `default`, `rows`, `columns`, or `adaptive`. |
 | `get_scores` | Exactly `true` or `false`. |
-| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, positive values permit a lower bound. |
+| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, `-2` permits an estimate, positive values permit a lower bound. |
 
 URL form decoding happens before these grammars are applied, so `+` in a
 `sort` value is a space. `sort=` clears the body sort list; empty and non-empty

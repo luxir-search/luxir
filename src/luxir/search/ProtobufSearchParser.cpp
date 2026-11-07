@@ -1621,6 +1621,19 @@ public:
                            const luxir::api::TopDocs& topDocsReq,
                            TopDocsPlacement placement) {
     int64_t countLimit = topDocsReq.count_limit.value_or(0);
+    if (countLimit < -2) {
+      throw std::runtime_error(
+          "top_docs '" + std::string(name) + "': count_limit must be >= -2");
+    }
+    // An estimate is a bounded count with an estimator behind it. N = 1 holds
+    // pruning only until the first hit, and the bounded routes bring the rest:
+    // exact when free or when ranking never pruned, and exact on any list that
+    // cannot bound its count. Fusion sources report no count of their own.
+    bool estimateCount = placement != TopDocsPlacement::FUSION_SOURCE
+        && (countLimit == -2
+            || ((options.flags & RequestFlags::ESTIMATE_COUNT) != 0
+                && (!topDocsReq.count_limit.has_value() || countLimit > 0)));
+    if (countLimit == -2 || (estimateCount && countLimit == 0)) countLimit = 1;
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
     DiversifyPlan* diversify = nullptr;
@@ -1671,10 +1684,6 @@ public:
     if (offset < 0) {
       throw std::runtime_error(
           "top_docs '" + std::string(name) + "': offset must be >= 0");
-    }
-    if (countLimit < -1) {
-      throw std::runtime_error(
-          "top_docs '" + std::string(name) + "': count_limit must be >= -1");
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
@@ -2193,6 +2202,7 @@ public:
       }
       qr->countLimitProven = minMatches >= requirements.countLimit;
     }
+    qr->estimateCount = estimateCount && qr->boundedCount;
     qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
       firstQuery = qr;
@@ -2334,8 +2344,13 @@ public:
 
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
     int64_t countLimit = fusionProto.count_limit.value_or(0);
-    if (countLimit < -1) {
-      throw std::runtime_error(fusionPrefix(name) + "count_limit must be >= -1");
+    if (countLimit < -2) {
+      throw std::runtime_error(fusionPrefix(name) + "count_limit must be >= -2");
+    }
+    // Fusion cannot estimate, so a request for one counts exactly.
+    if (!fusionProto.count_limit.has_value()
+        && (options.flags & RequestFlags::ESTIMATE_COUNT) != 0) {
+      countLimit = -1;
     }
     auto* oldCollapse = enclosingCollapse;
     auto* oldMeasure = inheritedFacetMeasure;

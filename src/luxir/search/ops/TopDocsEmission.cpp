@@ -328,7 +328,16 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       // Opening the threshold alone does not invalidate an exhaustive count.
       int64_t found = collector.totalHits();
       bool foundGte = qr.boundedCount && collector.countIncomplete;
-      if (foundGte) found = qr.requirements.countLimit;
+      bool foundEstimated = false;
+      if (foundGte && qr.estimateCount) {
+        // Ranking pruned somewhere, so the segments' shares are the answer. All
+        // of them can still be exact, from metadata or a full count.
+        found = std::max(collector.estimatedHits, qr.requirements.countLimit);
+        foundEstimated = collector.countEstimated;
+        foundGte = !foundEstimated && collector.countFloored;
+      } else if (foundGte) {
+        found = qr.requirements.countLimit;
+      }
       emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
@@ -340,7 +349,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte);
+        emission, {}, foundGte, foundEstimated);
     }
   }
 

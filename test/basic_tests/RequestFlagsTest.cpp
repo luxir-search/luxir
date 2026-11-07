@@ -158,7 +158,7 @@ TEST_F(RequestFlagsTest, explicitAndDataFacetGridsConvertGapAndOriginAtTheEdge) 
 TEST_F(RequestFlagsTest, binaryValidationRejectsUnknownPartialAndOpOnlyOverrides) {
   CollectionHelper helper;
   for (bool opLevel : {false, true}) for (auto [flags, set] : {
-      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {8, 0}, {0, 8},
+      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {16, 0}, {0, 16},
       {uint64_t{1} << 63, 0}, {4, 0}, {0, 4}}) {
     if (!opLevel && ((flags | set) & RequestFlags::INT64_STR)) continue;
     auto req = localReq(helper.getSearchEngine());

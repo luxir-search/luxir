@@ -895,8 +895,9 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
-| <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound; false means the count is exact. |
+| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero or the estimate\_count flag applies. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
+| <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound. Neither this nor found\_estimated means the count is exact. |
+| <a id="field-luxir.doclist.found_estimated"></a>[`found_estimated`](#field-luxir.doclist.found_estimated) | 16 | `bool` | singular | True when found was extrapolated from a sample of the index; it may be above or below the exact count, within what index statistics allow. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when count\_limit is nonzero, after missing=drop. |
 | <a id="field-luxir.doclist.found_groups"></a>[`found_groups`](#field-luxir.doclist.found_groups) | 8 | `sint64` | optional | Diversify only, with nonzero count\_limit: distinct eligible keys. |
 | <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
@@ -1191,7 +1192,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused row; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
-| <a id="field-luxir.fusion.count_limit"></a>[`count_limit`](#field-luxir.fusion.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 requests exact; positive N permits a lower bound. Fusion always supplies an exact count, also valid for N. Counts eligible groups with collapse, otherwise source-union documents. Must be &gt;= -1. |
+| <a id="field-luxir.fusion.count_limit"></a>[`count_limit`](#field-luxir.fusion.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 requests exact; -2 permits an estimate; positive N permits a lower bound. Fusion always supplies an exact count, which is valid for -2, N and an unset count\_limit under the estimate\_count flag. Counts eligible groups with collapse, otherwise source-union documents. Must be &gt;= -2. |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
@@ -2541,7 +2542,7 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
 | <a id="field-luxir.topdocs.offset"></a>[`offset`](#field-luxir.topdocs.offset) | 3 | `int64` | singular | Zero-based rank of the first returned document; must be &gt;= 0. Skip this many ranked matches, then return up to limit (-1: all remaining; 0: none). Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. Ignored as a Fusion source. |
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
-| <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte. An exact count is also valid for N. Must be &gt;= -1. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
+| <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte; -2 asks for an estimate, like the estimate\_count flag but for this list alone. The flag applies to an unset or positive count\_limit, never to an explicit 0 or -1. An exact count is valid for every nonzero value. Must be &gt;= -2. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
 | <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
@@ -3021,6 +3022,7 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 | <a id="value-luxir.requestflagbit.date_mode_low_bit"></a>[`DATE_MODE_LOW_BIT`](#value-luxir.requestflagbit.date_mode_low_bit) | 0 |  |
 | <a id="value-luxir.requestflagbit.date_mode_high_bit"></a>[`DATE_MODE_HIGH_BIT`](#value-luxir.requestflagbit.date_mode_high_bit) | 1 |  |
 | <a id="value-luxir.requestflagbit.int64_str_bit"></a>[`INT64_STR_BIT`](#value-luxir.requestflagbit.int64_str_bit) | 2 | request-only: quote JSON integers outside the safe range |
+| <a id="value-luxir.requestflagbit.estimate_count_bit"></a>[`ESTIMATE_COUNT_BIT`](#value-luxir.requestflagbit.estimate_count_bit) | 3 | lists with an unset or positive count\_limit may estimate found |
 
 <a id="enum-luxir.responseformat"></a>
 

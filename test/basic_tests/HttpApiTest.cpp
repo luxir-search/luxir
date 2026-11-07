@@ -1545,7 +1545,7 @@ TEST_F(HttpApiTest, countLimit) {
     EXPECT_EQ(200, res.result_int()) << res.body();
     return res.body();
   };
-  for (auto limit : {"-1", "5", "100"}) {
+  for (auto limit : {"-1", "-2", "5", "100"}) {
     auto exact = search(limit);
     EXPECT_NE(std::string::npos, exact.find(R"("found":30,"docs")")) << exact;
     EXPECT_EQ(std::string::npos, exact.find("found_gte")) << exact;
@@ -1557,7 +1557,7 @@ TEST_F(HttpApiTest, countLimit) {
       R"({"query":"*:*","fields":["id"],"filter":["title_w:counttoken AND title_w:keep"]})");
   ASSERT_EQ(200, bounded.result_int()) << bounded.body();
   EXPECT_NE(std::string::npos, bounded.body().find(R"("found":5,"found_gte":true)")) << bounded.body();
-  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-2");
+  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-3");
   EXPECT_EQ(400, invalid.result_int()) << invalid.body();
 }
 
