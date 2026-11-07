@@ -262,10 +262,9 @@ public:
   }
 
   // Whether this subtree runs a weight that prepares over the whole index
-  // (Weight::needsPrepare, such as kNN's global top k). Preparation reads
-  // every segment's domain, so no op substitutes the empty domain for a
-  // pruned segment where a preparing weight could see it. Ops holding
-  // weights override this.
+  // (Weight::needsPrepare, such as kNN's global top k): preparation reads
+  // every segment's domain, pruned by a root mask or not, so the search
+  // materializes every segment for it. Ops holding weights override this.
   virtual bool needsWholePreparation() const {
     if (bucketDomain && bucketDomain->variants.sourcesNeedPrepare()) return true;
     return std::ranges::any_of(subOps, [](const auto& entry) {
