@@ -3341,6 +3341,13 @@ bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOr
     return info.name == name;
   });
   if (overlays.size() == oldSize) return false;
+  if (name == SegmentSummary::OVERLAY_NAME) {
+    // As if the segment was written before summaries existed: no cached
+    // copy, and the next commit recomputes the collection summary.
+    ordered[segmentOrd]->summary.store(nullptr);
+    std::lock_guard summaryLock(collectionSummaryMutex);
+    collectionSummaryCache.valid = false;
+  }
   return true;
 }
 
