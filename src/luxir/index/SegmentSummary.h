@@ -67,6 +67,10 @@ public:
                                                     bool expectSynced = false);
   // Decodes a complete sidecar image; the summary keeps its own copy.
   static std::shared_ptr<const SegmentSummary> fromBytes(std::span<const std::byte> image);
+  // A summary over a collection's aggregate (IndexInfo.field_summaries),
+  // with its own copy of the records; seg_id and max_doc are 0.
+  static std::shared_ptr<const SegmentSummary> fromAggregate(std::span<const api::FieldSummary> fields,
+                                                             bool complete);
 
   bool complete() const noexcept { return info.complete; }
   uint64_t segId() const noexcept { return info.seg_id; }
@@ -105,6 +109,7 @@ public:
 
 private:
   void decode(std::span<const std::byte> image);
+  void decodeBody(std::span<const std::byte> body);
 };
 
 } // namespace luxir

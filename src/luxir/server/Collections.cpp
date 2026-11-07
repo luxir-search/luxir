@@ -364,6 +364,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  col->shard->iw->collectionSummaryMaxBytes = (size_t)config.index.collection_summary_max_bytes;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
   if (creating) storage.activate(name.name, *selected);
   retire(name, *selected);

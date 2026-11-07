@@ -13,9 +13,9 @@ namespace luxir {
 
 enum class FieldPresence : uint8_t { ABSENT, PRESENT, UNKNOWN };
 
-// Read-only adapter over one segment's summary for Query::mayMatch. A null
-// or incomplete summary proves no absence; the records of an incomplete one
-// may still carry bounds.
+// Read-only adapter over one segment's summary, or the collection summary
+// standing in for one, for Query::mayMatch. A null or incomplete summary
+// proves no absence; the records of an incomplete one may still carry bounds.
 class SummaryView {
   const SegmentSummary* summary;
   std::string* reason;
