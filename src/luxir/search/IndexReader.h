@@ -86,7 +86,7 @@ public:
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index
-      int32_t  max_doc;         // Number of live documents in this segment
+      int32_t  max_doc;         // Number of documents in this segment, deleted ones included
       int32_t  live_docs;       // Number of live documents in this segment
     };
 
@@ -111,6 +111,12 @@ public:
     std::shared_ptr<PostingsReader> postingsReaderShared() const noexcept {
       return sharedPostingsReader;
     }
+
+    // Whether the segment carries a live-docs generation (live_gen > 0), so
+    // liveDocs() is non-null and must be consulted. It does not guarantee a
+    // deleted document exists (compare numLive() with maxDoc() for that).
+    // Never opens the segment's files.
+    bool hasDeletes() const noexcept { return sharedLiveDocs != nullptr; }
 
     // returns null if all docs are live (no deletes)
     LiveDocs* liveDocs() const noexcept {

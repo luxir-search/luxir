@@ -2078,7 +2078,7 @@ public:
           everySegmentConstant = true;
           bool everySegmentEmpty = !req.reader->segments().empty();
           for (auto& segment : req.reader->segments()) {
-            DocSet* rootDomain = segment.liveDocs() == nullptr
+            DocSet* rootDomain = !segment.hasDeletes()
                 ? nullptr : &segment.liveDocs()->docset();
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA

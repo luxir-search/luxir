@@ -95,7 +95,7 @@ void DomainVariantPlan::SegmentSources::init(size_t source, Query::Weight* weigh
     return;
   }
   auto& seg = reader.segments()[(size_t)segment];
-  value.stable = materialize(source, seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, std::move(probe));
+  value.stable = materialize(source, seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr, std::move(probe));
 }
 
 DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHandle base,
@@ -115,7 +115,7 @@ DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHan
   } else {
     auto& domain = *value.stable;
     auto& seg = reader.segments()[(size_t)segment];
-    DocSet* live = seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
+    DocSet* live = seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
     if (!domain.get())
       result = base;
     else if (!base.get() || base.get() == live || base.get() == domain.get())

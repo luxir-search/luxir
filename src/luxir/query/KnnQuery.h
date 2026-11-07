@@ -1002,7 +1002,7 @@ public:
             input.domainSize = domain ? domain->card() : seg.maxDoc(); input.maxDoc = seg.maxDoc();
             input.dims = dims; input.l2 = metric == (int32_t)api::VectorMetric::L2; input.domain = domain != nullptr;
             input.arrayDomain = domain && domain->type == DocSet::ARRAY;
-            input.unfiltered = eligible.unfiltered; input.deletes = seg.liveDocs() != nullptr;
+            input.unfiltered = eligible.unfiltered; input.deletes = seg.hasDeletes();
             input.sparse = vr.strColReader().docsReader().hasBitset(); input.multi = vr.isMultiValued();
             if (auto* vaux = vauxPerSeg[i]) {
               if (vaux->getDims() != dims) throw std::runtime_error(std::format(
@@ -1118,7 +1118,7 @@ public:
         // is the complete eligibility predicate; null means no deletes and
         // no filters.  The engines rely on it - they never re-check
         // liveDocs.
-        assert(domain != nullptr || seg.liveDocs() == nullptr);
+        assert(domain != nullptr || !seg.hasDeletes());
         VectorAuxReader* vaux = vauxPerSeg[i];
         faiss::IndexIVF* ivf = nullptr;
         if (plan.ivf[i]) {
@@ -1130,7 +1130,7 @@ public:
                 idx->ntotal, segCount, query.getField()));
             ivf = dynamic_cast<faiss::IndexIVF*>(idx);
             if (ivf == nullptr) throw std::runtime_error("KnnQuery: vector aux is not an IVF index");
-            if (seg.liveDocs() != nullptr) {
+            if (seg.hasDeletes()) {
               rankLivePerSeg[i] = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
                 VectorReader vr(seg.postingsReader(), *segInfos.at(i));
                 return buildRankLiveBitmap(seg, vr, segCount);

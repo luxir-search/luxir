@@ -480,7 +480,7 @@ public:
       routes[s] = 0;
       if (supplier != nullptr) {
         int64_t estimatedCard = supplier->cost();
-        if (segment.liveDocs() != nullptr) {
+        if (segment.hasDeletes()) {
           estimatedCard = std::min(
               estimatedCard,
               (int64_t)segment.liveDocs()->docset().card());
@@ -795,7 +795,7 @@ public:
     DomainHandle resetBaseHandle(int32_t segment) {
       auto& seg = thisOp().req.reader->segments()[(size_t)segment];
       DomainHandle live = DomainHandle::pinned(
-          seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, thisOp().req.reader);
+          seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr, thisOp().req.reader);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -810,7 +810,7 @@ public:
       if constexpr (Structural) return resetBaseHandle(segment).get();
       else {
         auto& seg = op.req.reader->segments()[(size_t)segment];
-        return seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
+        return seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
       }
     }
 
