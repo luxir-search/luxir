@@ -277,7 +277,7 @@ TEST_F(NestedIngestTest, rowBoundArithmeticCannotOverflow) {
 TEST_F(NestedIngestTest, mergesCompactNestedAndRootOnlyBundles) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(2);
+  writer->setMergeFactor(2);
   ASSERT_TRUE(ingest(helper, {R"({"id":"nested","items_nested":[{},{}]})"}).success);
   ASSERT_TRUE(ingest(helper, {R"({"id":"a"})"}).success);
   ASSERT_TRUE(ingest(helper, {R"({"id":"b"})"}).success);

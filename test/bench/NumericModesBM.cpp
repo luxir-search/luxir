@@ -141,7 +141,7 @@ struct NumericIndex {
     if (date) field.unit = api::FieldDef::DateUnit::MS;
     schema.set(helper->collection());
     auto writer = helper->getIndexWriter();
-    writer->mergePolicy->setMergeFactor(1000);
+    writer->setMergeFactor(1000);
     writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
         FilterCacheConfig{.maxBytes = 0});
   }

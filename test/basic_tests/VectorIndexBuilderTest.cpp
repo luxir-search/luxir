@@ -820,7 +820,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
 
   for (int i = 0; i < 400; i++) {
     h.index(flatdoc("id", "active" + std::to_string(i),
@@ -1169,7 +1169,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "a" + std::to_string(i),
@@ -1323,7 +1323,7 @@ TEST_F(VectorIndexBuilderTest, mergeFinishingDuringAuxCommitPublishesWithOverlay
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
   mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/false);
 
   auto info = readIndexInfo(iw->dir);
@@ -1337,7 +1337,7 @@ TEST_F(VectorIndexBuilderTest, failedAuxCommitKeepsConcurrentMergeOverlay) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
   ExpectLog quiet("injected commit build failure");
   mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/true);
 
@@ -1373,7 +1373,7 @@ TEST_F(VectorIndexBuilderTest, failedAuxCommitMergeOverlaySeedsActiveNameOnResta
     CollectionHelper h(node, "main");
     enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
     auto iw = h.getIndexWriter();
-    iw->mergePolicy->setMergeFactor(2);
+    iw->setMergeFactor(2);
     ExpectLog quiet("injected commit build failure");
     mergeFinishesDuringAuxBuild(h, *iw, true);
   }
@@ -1389,7 +1389,7 @@ TEST_F(VectorIndexBuilderTest, mergeMatchesWildcardDuringAuxCommit) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
   mergeFinishesDuringAuxBuild(h, *iw, false, "*");
   auto info = readIndexInfo(iw->dir);
   ASSERT_EQ(info->segments.size(), 1);
@@ -1406,7 +1406,7 @@ void mergeRechecksVectorRequirements(bool reselectActive) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
   std::latch atDiff(1), releaseMerge(1), finished(1);
   std::atomic_int passes{0};
   luxir::Signal::listen("mergeVectorOverlayPrepare", [&](void*, void*, void*) -> void* {
