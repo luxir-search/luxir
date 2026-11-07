@@ -235,6 +235,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
       }
       commitTimeUs = indexInfo.commit_time;
       core->coreGeneration = indexInfo.core_gen;
+      core->commitTime = commitTimeUs;
       bool missingFileOK = !manifest; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time,
                     indexInfo.segments.size(), indexInfo.index_gen);

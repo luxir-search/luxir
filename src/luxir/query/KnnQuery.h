@@ -1131,7 +1131,7 @@ public:
             ivf = dynamic_cast<faiss::IndexIVF*>(idx);
             if (ivf == nullptr) throw std::runtime_error("KnnQuery: vector aux is not an IVF index");
             if (seg.liveDocs() != nullptr) {
-              rankLivePerSeg[i] = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
+              rankLivePerSeg[i] = seg.liveDocsView<RankLiveBitmap>(vaux, [&]() {
                 VectorReader vr(seg.postingsReader(), *segInfos.at(i));
                 return buildRankLiveBitmap(seg, vr, segCount);
               });

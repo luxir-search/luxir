@@ -407,10 +407,20 @@ public:
       return -1;
     }
     server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
-    queuedBytes += (int64_t)buf.Length();
     if (writeOutstanding) {
-      pending.emplace_back(std::move(buf));
+      try {
+        pending.emplace_back(std::move(buf));
+      } catch (...) {
+        // Out of memory while queueing: the response is dropped like it is
+        // on a dead stream, so the caller still releases what it owns.  A
+        // write is outstanding, so its completion sends the finish.
+        errored = true;
+        readsDone = true;
+        return -1;
+      }
+      queuedBytes += (int64_t)buf.Length();
     } else {
+      queuedBytes += (int64_t)buf.Length();
       doWrite(std::move(buf));
     }
     return queuedBytes;
@@ -681,8 +691,12 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
         buf = serializeToByteBuffer(response.proto);
       } catch (const std::exception& e) {
         // The response cannot be delivered: the call ends with the failure
-        // instead of a silently empty message.
-        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
+        // instead of a silently empty message.  Reporting it allocates too;
+        // whatever happens, the response's arena must still be released.
+        try {
+          parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
+        } catch (...) {
+        }
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
