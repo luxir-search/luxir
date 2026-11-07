@@ -943,6 +943,20 @@ inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
   return count;
 }
 
+// Count an unscored pull scorer's matches in [min, max) that filter accepts.
+// Verification stays inside the range, so later calls may count later ranges.
+inline int64_t countMatchesInRange(Query::Scorer* scorer, DocSet* filter,
+                                   int32_t min, int32_t max) {
+  assert(scorer != nullptr);
+  DocSetProbe accepted(filter);
+  int64_t count = 0;
+  for (int32_t doc = scorer->advanceWindow(min, max); doc < max;
+       doc = scorer->advanceWindow(doc + 1, max)) {
+    if (accepted.get(doc)) count++;
+  }
+  return count;
+}
+
 inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
                                  DocSetBuilder* builder,
                                  auto& collector, int32_t maxDoc) {

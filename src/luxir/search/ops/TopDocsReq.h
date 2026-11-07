@@ -1001,6 +1001,37 @@ public:
           collector, maxDoc, allowPruning, exactScorer);
     }
 
+    // A single scorer ranks canonically by itself: count with the unscored
+    // weight (windowed when it can, else pulled), then rank with pruning.
+    void countThenRankWithoutRescoring(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto countPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      BulkScorer* countBulk = nullptr;
+      if (countPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+        countBulk = countSupplier.buildBulk(pool, countPlan);
+      } else {
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+      }
+      int64_t count = 0;
+      if (countBulk != nullptr) {
+        count = countMatchesWindowed(
+            countBulk, collectorFilter, nullptr, maxDoc);
+      } else if (auto* scorer = buildPullScorer(pool, countSupplier)) {
+        count = countMatchesInRange(scorer, collectorFilter, 0, maxDoc);
+      }
+      auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+          pool, thisOp().planning.topReader.segments()[segnum]);
+      collectKnownCountTopK(
+          pool, segnum, count, rankingSupplier, collectorFilter,
+          collector, maxDoc, true);
+    }
+
     bool composeVariableScoreExactCountTopK(
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& scoringSupplier,
@@ -1015,6 +1046,15 @@ public:
               != Query::ScorerSupplier::BulkAnswer::YES
           || scoringPlan.supportsExactCandidateScoring
               != Query::ScorerSupplier::BulkAnswer::YES;
+      if (scoringDeclined && scoringPlan.rankingScoresExact
+              == Query::ScorerSupplier::BulkAnswer::YES) {
+        scoringSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+            bulkContext, scoringPlan);
+        countThenRankWithoutRescoring(
+            pool, segnum, countSupplier, collectorFilter, collector, maxDoc);
+        return true;
+      }
       if (scoringDeclined) {
         auto countPlan = countSupplier.planBulk(
             Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
