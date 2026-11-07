@@ -271,6 +271,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.auto-parallel-min-work",
+                 search.auto_parallel_min_work,
+                 "Operator opt-in: run a max_parallel 0 request in parallel when its "
+                 "lists visit at least this many documents by index metadata (0 = off, default)")
+      ->default_val(search.auto_parallel_min_work)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
                  "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "

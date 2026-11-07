@@ -631,6 +631,31 @@ public:
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
 
+  bool ownsMatchDomain() const override { return true; }
+
+  // Counting and ranking are priced apart, each at the matches it may visit.
+  // A count that metadata answers costs nothing, and score-ordered
+  // constant-score ranking stops at the first K. Sub-ops need every match. A
+  // prepared query's work is not a document count; it adds none.
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    if (weight == nullptr || weight->needsPrepare()) return total;
+    bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
+    for (auto& segment : req.reader->segments()) {
+      auto shortcut = weight->countShortcut(segment, nullptr);
+      auto matches = (size_t) shortcut.maxMatches;
+      size_t counting = !requirements.needsCount()
+              || shortcut.how == Query::CountHow::METADATA
+          ? 0 : matches;
+      size_t ranking = !requirements.needRankedDocs ? 0
+          : firstK ? std::min(matches, (size_t) std::max<int64_t>(topCount, 0))
+          : matches;
+      size_t work = subOps.empty() ? std::max(counting, ranking) : matches;
+      total = saturatingAdd(total, work);
+    }
+    return total;
+  }
+
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,

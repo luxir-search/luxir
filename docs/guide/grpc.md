@@ -84,12 +84,14 @@ One request contains:
   response; string field facets are currently instrumented.
 - `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
   for unlimited (shared workers join in across segments and operations).
-  `0` (the default) lets the engine decide; today that is serial. Over gRPC
+  `0` (the default) lets the engine decide: serial, unless the operator has set
+  `search.auto-parallel-min-work` and the request visits at least that many
+  documents, in which case it runs like `-1`. Over gRPC
   every search runs on the shared worker pool, never on the completion-queue
   thread that received it: gRPC offers a connection's new calls to its
   preferred completion queue first, so running queries there would
-  serialize the calls multiplexed on that connection. `0` and `1` therefore
-  behave alike,
+  serialize the calls multiplexed on that connection. A serial `0` and `1`
+  therefore behave alike,
   and `-1` fans out from a worker. Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the

@@ -4298,7 +4298,7 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel == -1) {
+  if (parallelLane()) {
     // The parallel lane runs on this shard inside the arena (see
     // SearchEngine::dispatch), and so does resumed production: its per-batch
     // task groups must spawn into the node arena, not this thread's implicit
