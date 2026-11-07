@@ -166,11 +166,31 @@ public:
 
     // Segment tasks use distinct slots; preparation precedes dispatch and
     // facet bucket bindings sharing a weight run serially. Concurrent use of
-    // the same (weight, segment), including fill and release, is unsupported.
+    // the same (query, segment), including fill and release, is unsupported.
     // Populated facts are immutable until the executor releases the segment.
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
     };
+
+    // The facts depend on the query and segment only, so every weight a
+    // request builds for one query (ranking, count, domain) shares one memo:
+    // each segment's dictionary is walked and charged once.
+    struct SharedExpansions {
+      std::span<ExpansionMemo> memos;
+      // A subclass's own rewrite of the query, when it has one (for example a
+      // scored case_insensitive match), shared the same way.
+      Query* rewrite = nullptr;
+    };
+
+    static SharedExpansions& sharedExpansions(
+        Context& context, const MultiTermQuery& query) {
+      return context.getOrCreateLogicalPlan<SharedExpansions>(query, [&]() {
+        auto* shared = context.pool.make<SharedExpansions>();
+        shared->memos =
+            context.pool.make_span<ExpansionMemo>(context.numSegments());
+        return shared;
+      });
+    }
 
     MultiTermQuery& query;
     CachedFieldInfo* cachedFieldInfo = nullptr;
@@ -183,6 +203,13 @@ public:
     int32_t expansionCap;
 
   public:
+    // The query's shared rewrite slot (see SharedExpansions::rewrite). The
+    // logical plan cache is keyed by query alone, so a subclass keeps its
+    // rewrite here rather than under its own plan type.
+    static Query*& sharedRewrite(Context& context, const MultiTermQuery& query) {
+      return sharedExpansions(context, query).rewrite;
+    }
+
     // Test/bench force switch over the constant-score union scorers. AUTO is
     // the production policy. FORCE_EAGER always selects the eager scorer;
     // forced lazy modes require the lazy preconditions and retained-state
@@ -236,8 +263,7 @@ public:
                      == (NEED_SCORES | ALLOW_PRUNING)
                    && scorerModeForTests != ScorerMode::FORCE_EAGER),
         memoArena(context.arena()),
-        expansionMemos(
-            context.pool.make_span<ExpansionMemo>(context.numSegments())),
+        expansionMemos(sharedExpansions(context, query).memos),
         budget(context.multiTermBudget()),
         memoryTracker(context.planningContext().memoryTracker),
         expansionCap(query.capsExpansions()

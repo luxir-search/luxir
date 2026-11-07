@@ -56,10 +56,32 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
 
 Query::Weight* AutomatonQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  if (automatonKind != Kind::MATCH || !caseInsensitive || (flags & NEED_SCORES) == 0) {
+  if (automatonKind != Kind::MATCH || !caseInsensitive) {
     return MultiTermQuery::createWeight(context, flags, multiplier);
   }
+  // A scored weight rewrites to the union of indexed case variants. Unscored
+  // weights of the same query match that union as a constant-score filter once
+  // it exists, so the variant scan is charged to the request's budget once;
+  // before it, they take the multi-term filter form. The parser builds a
+  // query's scored weight before its count weight, so in a ranked request the
+  // rewrite exists by then.
+  Query*& rewritten = MultiTermQuery::Weight::sharedRewrite(context, *this);
+  if ((flags & NEED_SCORES) == 0) {
+    if (rewritten == nullptr) return MultiTermQuery::createWeight(context, flags, multiplier);
+    auto* filter = context.pool.make<ConstantScoreQuery>(rewritten);
+    filter->markPlannerGenerated();
+    return filter->createWeight(context, flags, multiplier);
+  }
+  if (rewritten == nullptr) rewritten = rewriteCaseVariants(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
 
+Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
   // Discover the union across segments before computing shared synonym stats.
   // Unlike fuzzy, case matching promises every alternate, so an operator limit
   // rejects rather than truncates, as this query's filter form does.
@@ -116,12 +138,7 @@ Query::Weight* AutomatonQuery::createWeight(
     weights[0] = 1.0f;
     rewritten = context.pool.make<CombinedFieldQuery>(fields, weights, terms);
   }
-#ifndef NDEBUG
-  if (context.logicalValidationActive()) {
-    rewritten->validateLogical(context.planningContext(), multiplier);
-  }
-#endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten;
 }
 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
@@ -205,7 +222,14 @@ Query::Weight* CombinedFieldQuery::createWeight(
 
 Query::Weight* FuzzyQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  Query* rewritten = rewriteToDisjunction(context);
+  // The kept terms do not depend on flags, so every weight the request builds
+  // for this query (ranking, count, domain) reuses one dictionary scan.
+  struct Rewrite {
+    Query* query;
+  };
+  Query* rewritten = context.getOrCreateLogicalPlan<Rewrite>(*this, [&]() {
+    return context.pool.make<Rewrite>(rewriteToDisjunction(context));
+  }).query;
 #ifndef NDEBUG
   if (context.logicalValidationActive()) {
     rewritten->validateLogical(context.planningContext(), multiplier);
