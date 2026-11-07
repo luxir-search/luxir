@@ -3,6 +3,7 @@
 
 #include "luxir/store/FileVerifier.h"
 #include "luxir/store/CorruptionMarker.h"
+#include "luxir/store/SourceFiles.h"
 #include <format>
 #include <oneapi/tbb/parallel_for.h>
 
@@ -20,6 +21,9 @@ void FileVerification::open(Directory& dir, std::span<const FileDescriptor> file
   for (const auto& file : files) {
     bool direct = std::ranges::binary_search(suspects, file.name);
     if (!full && !direct) continue;
+    // Source files are never read at open: a damaged one costs only the documents
+    // in it, so it must not delay or fail startup.
+    if (!direct && isSourceFile(file.name)) continue;
     std::shared_ptr<ChecksumReader> reader;
     try { reader = dir.openChecksum(file.name, direct); }
     catch (const FileEIOError& e) { throw ChecksumMismatchError("unreadable file: " + file.name + ": " + e.what()); }

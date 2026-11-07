@@ -14,6 +14,7 @@
 #include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
@@ -77,12 +78,14 @@ public:
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::shared_ptr<SourceReader> sharedSource;
   public:
     friend class IndexReader;
 
     struct SegmentInfo {
       uint64_t seg_id;          // Unique identifier for the segment
       uint64_t live_gen;        // What deletes version to use for the segment (0 if no deletes)
+      uint64_t source_gen = 0;  // Generation of the segment's source map (0 if its docs keep no source)
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index
@@ -96,10 +99,19 @@ public:
 
     Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
               std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
-              SegmentInfo segInfo, int64_t base, int ord)
+              SegmentInfo segInfo, int64_t base, int ord,
+              std::shared_ptr<SourceReader> source = {})
             :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
-                sharedAuxReaders(std::move(auxReaders)),
+                sharedAuxReaders(std::move(auxReaders)), sharedSource(std::move(source)),
                 segInfo(segInfo), base(base), ord(ord) {
+    }
+
+    // The segment's stored documents, or null if none of its docs keep a source.
+    SourceReader* source() const noexcept {
+      return sharedSource.get();
+    }
+    std::shared_ptr<SourceReader> sourceShared() const noexcept {
+      return sharedSource;
     }
 
     PostingsReader& postingsReader() const noexcept {

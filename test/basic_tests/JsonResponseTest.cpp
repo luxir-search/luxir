@@ -486,7 +486,7 @@ TEST_F(JsonResponseTest, integerStringOptionCoversDocsHeadersAndScalarCounts) {
   auto& docs = api::build::opsSlot(response.ops, 1, "q", mr)->kind.emplace<api::DocList>();
   docs.found = INT64_MAX;
   docs.found_docs = 1;
-  auto runs = renderDocRuns(response, {.int64Str = true});
+  auto runs = renderDocRuns(response, false, {.int64Str = true});
   ASSERT_EQ(1u, runs.size());
   DocLinesState state;
   std::string marker;
@@ -515,7 +515,7 @@ TEST_F(JsonResponseTest, integerStringOptionCoversFacetBoundsGroupKeysAndRanks) 
                     R"("metric":"9007199254740992")"}) {
     EXPECT_NE(std::string::npos, text.find(part)) << text;
   }
-  auto runs = renderDocRuns(response, {.int64Str = true});
+  auto runs = renderDocRuns(response, false, {.int64Str = true});
   ASSERT_EQ(1u, runs.size());
   EXPECT_NE(std::string::npos, runs[0].body.find(R"("rank":["9007199254740992"])"));
 }

@@ -51,6 +51,10 @@ public:
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
+  // The bytes each of req->docs arrived as (JSON), when the transport kept them
+  // for a collection that stores its source; empty otherwise, or when the count
+  // does not match. They must outlive handle().
+  std::span<const std::string_view> rawDocs;
   // The collection the transport resolved and submitted to; replica waits
   // target it rather than re-resolving req->collection.
   CollectionId target;
