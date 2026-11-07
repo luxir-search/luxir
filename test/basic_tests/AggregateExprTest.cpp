@@ -757,6 +757,282 @@ TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
   EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
+TEST_F(AggregateExprTest, ordinalAggregateBatchesMatchPerValueInputs) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  std::mt19937_64 random(11);
+  std::set<std::string> all, tagged;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 5000; i++) {
+      std::string user = "u" + std::to_string(random() % (segment == 2 ? 300 : 9000));
+      std::string tag = "t" + std::to_string(random() % 50);
+      all.insert(user);
+      if (i % 4 == 0) tagged.insert(user);
+      docs.push_back(flatdoc("id", std::to_string(segment * 5000 + i), "user_s", user,
+          "tags_ss", vecs(tag, tag + "x", user), "quarter_i", i % 4, "cat_s", i % 3 ? "a" : "b"));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  auto guard = facetAggregateOverrides();
+  SearchOverridesGuard ordGuard(disableOrdinalAggregateBatchesForTests, disableCardinalityOrdSetsForTests);
+  disableCardinalityOrdSetsForTests = true;
+  std::array<std::string, 4> cases{
+    R"json({"ops":{"users":"cardinality(user_s)","exact":"cardinality(user_s,40000)",
+      "tags":"cardinality(tags_ss)","ids":"cardinality(id,40000)"}})json",
+    R"json({"ops":{"q":{"top_docs":{"limit":0,"query":"quarter_i:0","ops":{
+      "users":"cardinality(user_s)","exact":"cardinality(user_s,40000)"}}}}})json",
+    R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":{
+      "users":"cardinality(user_s)","tags":"cardinality(tags_ss,40000)"}}}}})json",
+    R"json({"ops":{"f":{"field_facet":{"field":"quarter_i","limit":2,"ops":{
+      "users":"cardinality(user_s)"}}}}})json"};
+  for (const std::string& json : cases) {
+    SCOPED_TRACE(json);
+    AggregateExecutionStats baselineStats, batchStats;
+    disableOrdinalAggregateBatchesForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableOrdinalAggregateBatchesForTests = false;
+    auto batched = runSharedSketchRequest(helper, json, batchStats, -1);
+    EXPECT_FALSE(batched.values.empty());
+    EXPECT_EQ(baseline.values, batched.values);
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(cases[1], req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((int64_t)tagged.size(), req->docList("q")->ops.at("exact")->asInt());
+  auto root = localReq(helper.getSearchEngine());
+  parseQueryRequest(cases[0], root->rawRequest(), root->mr);
+  root->collection("main");
+  root->execute(false);
+  ASSERT_TRUE(root->ok()) << root->errorMsg();
+  EXPECT_EQ((int64_t)all.size(), root->scalar<int64_t>("exact"));
+  EXPECT_EQ(15000, root->scalar<int64_t>("ids"));
+}
+
+TEST_F(AggregateExprTest, cardinalityOrdSetsCountLiveValuesAcrossDomains) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  using Values = std::array<std::set<std::string>, 3>;
+  Values all, selected;
+  std::array<Values, 3> buckets;
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 1400; i++) {
+      int doc = segment * 1400 + i;
+      std::string id = std::to_string(doc), user = "u" + id;
+      auto tags = vecs(user, "shared", "tag" + std::to_string(i % 300));
+      bool missing = i % 7 == 0, deleted = i == 10;
+      docs.push_back(missing
+          ? flatdoc("id", id, "bucket_i", i % 3, "cat_s", std::to_string(i % 3))
+          : flatdoc("id", id, "user_s", user, "tags_ss", tags,
+                    "bucket_i", i % 3, "cat_s", std::to_string(i % 3)));
+      if (deleted) continue;
+      auto record = [&](Values& values) {
+        values[2].insert(id);
+        if (!missing) {
+          values[0].insert(user);
+          values[1].insert(tags.begin(), tags.end());
+        }
+      };
+      record(all);
+      record(buckets[(size_t)(i % 3)]);
+      if (i % 3 == 0) record(selected);
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  for (int segment = 0; segment < 3; segment++) {
+    ASSERT_TRUE(helper.deleteById(std::to_string(segment * 1400 + 10), UpdateMessage::COMMIT).success);
+  }
+  auto guard = facetAggregateOverrides();
+  SearchOverridesGuard ordGuard(disableCardinalityOrdSetsForTests);
+  disableCardinalityOrdSetsForTests = false;
+  auto metrics = [](auto& cursor) {
+    cursor.expr("users", "cardinality(user_s,0)");
+    cursor.expr("tags", "cardinality(tags_ss,0)");
+    cursor.expr("ids", "cardinality(id,0)");
+  };
+  for (int parallel : {0, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& root = req->collection("main");
+    metrics(root);
+    auto& q = root.topDocs("q").exprQuery("bucket_i:0").limit(0);
+    metrics(q);
+    auto& strings = root.facet("strings", "cat_s").limit(-1);
+    metrics(strings);
+    auto& numbers = root.facet("numbers", "bucket_i").limit(-1);
+    metrics(numbers);
+    // One-doc ID buckets stay buffered while the root and larger buckets promote.
+    root.facet("tiny", "id").limit(2).expr("ids", "cardinality(id,0)");
+    req->execute(parallel);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    std::array<const char*, 3> names{"users", "tags", "ids"};
+    for (size_t metric = 0; metric < names.size(); metric++) {
+      EXPECT_EQ((int64_t)all[metric].size(), req->scalar<int64_t>(names[metric]));
+      EXPECT_EQ((int64_t)selected[metric].size(), req->docList("q")->ops.at(names[metric])->asInt());
+      for (const char* name : {"strings", "numbers"}) {
+        const auto& facet = *req->responses[0]->proto.ops.at(name)->facetResult();
+        auto values = std::get<api::ArrVal>(facet.ops.at(names[metric])->kind).v;
+        ASSERT_EQ(3u, values.size());
+        for (size_t bucket = 0; bucket < values.size(); bucket++) {
+          int64_t key = std::string_view(name) == "strings"
+              ? std::stoll(std::string(std::get<api::ColStr>(facet.bucket_ids->kind).v[bucket]))
+              : std::get<api::ColInt>(facet.bucket_ids->kind).v[bucket];
+          EXPECT_EQ((int64_t)buckets[(size_t)key][metric].size(), values[bucket].asInt());
+        }
+      }
+    }
+    const auto& tiny = *req->responses[0]->proto.ops.at("tiny")->facetResult();
+    const auto& counts = std::get<api::ArrVal>(tiny.ops.at("ids")->kind).v;
+    ASSERT_EQ(2u, counts.size());
+    for (const auto& count : counts) EXPECT_EQ(1, count.asInt());
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
+TEST_F(AggregateExprTest, cardinalityOrdSetsMergeWithSetsAndSketches) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "cardinality(s_s,0)");
+  auto* plain = parseAggregate(memory, *schema, "cardinality(x_i,0)");
+  constexpr size_t SET_BYTES = 256 * 1024;
+  constexpr int64_t NUM_ORDS = 65536;
+  auto sequence = [](int64_t start, size_t size) {
+    std::vector<int64_t> values(size);
+    for (size_t i = 0; i < size; i++) values[i] = start + (int64_t)i;
+    return values;
+  };
+  const std::array<int64_t, 3> small{2000, 2001, 2001}, small2{2001, 2002, 2002};
+  auto full = sequence(0, 1024), full2 = sequence(512, 1024);
+  struct Case {
+    const char* name;
+    std::span<const int64_t> left, right;
+    size_t leftCap = SET_BYTES, rightCap = SET_BYTES;
+    bool hll = false;
+  };
+  const std::array<Case, 8> cases{{
+      {"buffer+buffer", small, small2},
+      {"buffer+set", small, full}, {"set+buffer", full, small},
+      {"set+set", full, full2},
+      {"set+HLL", full, full2, SET_BYTES, 0, true},
+      {"HLL+set", full, full2, 0, SET_BYTES, true},
+      {"buffer+HLL", small, full2, SET_BYTES, 0, true},
+      {"HLL+buffer", full, small, 0, SET_BYTES, true}}};
+  for (const auto& entry : cases) {
+    SCOPED_TRACE(entry.name);
+    RequestMemTracker tracker(0);
+    RequestMemResource resource(tracker, "ordinal merges");
+    {
+      AggregateAccumulator left(*program, &resource), right(*program, &resource), baseline(*plain, &resource);
+      left.addOrdBatch(0, entry.left, NUM_ORDS, entry.leftCap);
+      right.addOrdBatch(0, entry.right, NUM_ORDS, entry.rightCap);
+      if (std::string_view(entry.name) == "buffer+buffer") {
+        EXPECT_LT(resource.bytes(), (size_t)NUM_ORDS / 8);
+      }
+      AggregateAccumulator::merge(&left, &right);
+      if (entry.hll) {
+        baseline.addRawBatch(0, entry.left, FieldType::INT);
+        baseline.addRawBatch(0, entry.right, FieldType::INT);
+        EXPECT_EQ(baseline.finish().intValue, left.finish().intValue);
+      } else {
+        std::set<int64_t> exact(entry.left.begin(), entry.left.end());
+        exact.insert(entry.right.begin(), entry.right.end());
+        EXPECT_EQ((int64_t)exact.size(), (int64_t)left.finish().intValue);
+      }
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+  for (auto values : {std::span<const int64_t>(small), std::span<const int64_t>(full)}) {
+    RequestMemTracker tracker(0);
+    RequestMemResource resource(tracker, "ordinal point transition");
+    {
+      AggregateAccumulator actual(*program, &resource), baseline(*plain, &resource);
+      actual.addOrdBatch(0, values, NUM_ORDS, SET_BYTES);
+      baseline.addRawBatch(0, values, FieldType::INT);
+      actual.add(0, ValueResult::integer(5000));
+      baseline.add(0, ValueResult::integer(5000));
+      EXPECT_EQ(baseline.finish().intValue, actual.finish().intValue);
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+}
+
+TEST_F(AggregateExprTest, cardinalityOrdBuffersPromoteOnMerge) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "cardinality(s_s,0)");
+  bool promoted = false;
+  for (size_t count = 1; count < 1024 && !promoted; count *= 2) {
+    RequestMemTracker tracker(0);
+    RequestMemResource resource(tracker, "ordinal buffer promotion");
+    {
+      std::vector<int64_t> first(count), second(count);
+      for (size_t i = 0; i < count; i++) { first[i] = (int64_t)i; second[i] = (int64_t)(count + i); }
+      AggregateAccumulator left(*program, &resource), right(*program, &resource);
+      left.addOrdBatch(0, first, 65536, 256 * 1024);
+      right.addOrdBatch(0, second, 65536, 256 * 1024);
+      size_t before = resource.bytes();
+      AggregateAccumulator::merge(&left, &right);
+      promoted = before < 65536u / 8 && resource.bytes() >= 65536u / 8;
+      EXPECT_EQ((int64_t)(count * 2), (int64_t)left.finish().intValue);
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+  EXPECT_TRUE(promoted);
+}
+
+TEST_F(AggregateExprTest, cardinalityOrdSetChargeFallsBackWithoutRetrying) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "cardinality(s_s,0)");
+  auto* plain = parseAggregate(memory, *schema, "cardinality(x_i,0)");
+  RequestMemTracker tracker(1024), baselineTracker(0);
+  RequestMemResource resource(tracker, "ordinal fallback"), baselineResource(baselineTracker, "baseline");
+  {
+    AggregateAccumulator actual(*program, &resource), baseline(*plain, &baselineResource);
+    std::array<int64_t, 1024> ords;
+    for (size_t i = 0; i < ords.size(); i++) ords[i] = (int64_t)i;
+    actual.addOrdBatch(0, ords, 65536, 256 * 1024);
+    baseline.addRawBatch(0, ords, FieldType::INT);
+    size_t peak = tracker.peak(), bytes = resource.bytes();
+    EXPECT_LT(peak, 65536u / 8);
+    actual.addOrdBatch(0, ords, 65536, 256 * 1024);
+    EXPECT_EQ(peak, tracker.peak());
+    EXPECT_EQ(bytes, resource.bytes());
+    EXPECT_EQ(baseline.finish().intValue, actual.finish().intValue);
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+  EXPECT_EQ(0u, baselineTracker.bytes());
+}
+
+TEST_F(AggregateExprTest, cardinalityLargeOrdSpacesBoundTheBuffer) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "cardinality(s_s,40000)");
+  auto* plain = parseAggregate(memory, *schema, "cardinality(x_i,40000)");
+  RequestMemTracker tracker(4096);
+  RequestMemResource resource(tracker, "large ordinal space");
+  {
+    AggregateAccumulator actual(*program, &resource), baseline(*plain, &resource);
+    constexpr int64_t NUM_ORDS = int64_t{1} << 40;
+    std::array<int64_t, 2> high{(int64_t{1} << 32) + 1, (int64_t{1} << 32) + 2};
+    actual.addOrdBatch(0, high, NUM_ORDS, 256 * 1024);
+    EXPECT_LT(resource.bytes(), 256u);
+    EXPECT_EQ(2, (int64_t)actual.finish().intValue);
+    std::array<int64_t, 64> low;
+    for (size_t i = 0; i < low.size(); i++) low[i] = (int64_t)i;
+    actual.addOrdBatch(0, low, NUM_ORDS, 256 * 1024);
+    baseline.addRawBatch(0, high, FieldType::INT);
+    baseline.addRawBatch(0, low, FieldType::INT);
+    EXPECT_EQ(66, (int64_t)actual.finish().intValue);
+    EXPECT_EQ(baseline.finish().intValue, actual.finish().intValue);
+    EXPECT_LT(tracker.peak(), 4096u);
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
 TEST_F(AggregateExprTest, sketchRowsSkipNonFiniteValuesAndCanonicalizeZero) {
   CollectionHelper helper;
   double nan = std::numeric_limits<double>::quiet_NaN();
@@ -1086,7 +1362,8 @@ TEST_F(AggregateExprTest, indirectReplayAndDomainFailuresReleaseAllState) {
   forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
     forcedFacetFeedStrategy = feed;
-    for (size_t ceiling : {32u, 256u, 512u}) {
+    // Exact ID storage can fit at 512 bytes; keep the required numeric sketch over budget.
+    for (size_t ceiling : {32u, 128u, 256u}) {
       forcedRequestMemoryMaxBytes = ceiling;
       auto req = localReq(helper.getSearchEngine());
       req->collection("main").facet("f", "cat_s").limit(-1)

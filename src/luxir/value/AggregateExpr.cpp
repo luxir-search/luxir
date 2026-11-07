@@ -132,6 +132,19 @@ void AggregateStateView::addRawBatch(
       producerState(producer), values, columnType, producer.arguments);
 }
 
+void AggregateStateView::addOrdBatch(
+    uint32_t producerIndex, std::span<const int64_t> ords,
+    int64_t numOrds, size_t maxSetBytes) {
+  if (failed() || ords.empty()) return;
+  const AggregateProducer& producer = program->producers[producerIndex];
+  if (auto add = producer.resolved.state.accumulateOrdBatch) {
+    add(producerState(producer), ords, numOrds, maxSetBytes, producer.arguments);
+  } else {
+    producer.resolved.state.accumulateRawBatch(
+        producerState(producer), ords, FieldType::INT, producer.arguments);
+  }
+}
+
 void AggregateStateView::fail(AggregateFailure reason) {
   if (!failed()) setFailure(reason);
 }
@@ -243,6 +256,13 @@ void AggregateAccumulator::addRawBatch(
       producerIndex, values, columnType);
 }
 
+void AggregateAccumulator::addOrdBatch(
+    uint32_t producerIndex, std::span<const int64_t> ords,
+    int64_t numOrds, size_t maxSetBytes) {
+  AggregateStateView(*program, states.data()).addOrdBatch(
+      producerIndex, ords, numOrds, maxSetBytes);
+}
+
 void AggregateAccumulator::fail(AggregateFailure reason) {
   AggregateStateView(*program, states.data()).fail(reason);
 }
@@ -317,8 +337,8 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     const ValueNode& root = producer.input->root();
     BoundValueProgram* values = producer.input->bind(pool, segment, fields[index].values);
     BoundValueNode& rootBinding = values->nodes[producer.input->rootNode];
-    // A string column root yields its global ords (cardinality); only int
-    // columns scan raw values.
+    // A string column root yields its global ords (cardinality). Raw point
+    // reads remain numeric-only.
     bool strings = root.type == ValueType::COLUMN_ONLY;
     OrdMap::SegToGlobal ordMapping;
     if (strings && rootBinding.stringColumn != nullptr && fields[index].ords != nullptr) {
@@ -326,8 +346,8 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
       rootBinding.stringColumn->attachOrds(pool, segment.postingsReader());
       ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
     }
-    bool columnScan = root.kind == ValueNodeKind::COLUMN && !strings;
-    bool bareColumn = columnScan && !valueArray(root.type);
+    bool columnScan = root.kind == ValueNodeKind::COLUMN && (!strings || root.columnIndexed);
+    bool bareColumn = columnScan && !strings && !valueArray(root.type);
     bindings.push_back({
         .values = values,
         .producer = &producer,
