@@ -15,6 +15,7 @@
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
 #include "test/TestIndex.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/query/MultiTermBudget.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/server/JsonRequest.h"
@@ -235,6 +236,39 @@ TEST_F(MultiTermLimitsTest, minLiteralPrefixChecksOnlyThePattern) {
     EXPECT_EQ(minimum == 0, facet->ok()) << facet->errorMsg();
     if (!facet->ok()) { EXPECT_EQ("pattern_prefix_too_short", facet->errorCode()); }
   }
+}
+
+TEST_F(MultiTermLimitsTest, weightsOfOneQueryShareItsExpansion) {
+  // A count, a ranking pass and a sub-op domain each build their own weight
+  // of one query, but they reuse one dictionary scan and one budget charge.
+  LuxirNode node(config(1000, 1'000'000, 0));
+  CollectionHelper helper(node);
+  indexTerms(helper);
+
+  SkipStatsScope stats;
+  auto wildcard = localReq(helper.getSearchEngine());
+  auto& list = wildcard->collection("main").topDocs("q");
+  list.wildcardQuery("tag_s", "t0*9").countLimit(-1).limit(5).getScores();
+  list.facet("tags", "tag_s");
+  wildcard->execute();
+  ASSERT_TRUE(wildcard->ok()) << wildcard->errorMsg();
+  EXPECT_EQ(10, wildcard->getMatchCount());
+  EXPECT_EQ(1, SkipStats::multitermExpansions);
+  EXPECT_EQ(100, wildcard->multiTermBudget.termsExamined());
+
+  auto fuzzy = [&](int64_t countLimit, bool facet) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.fuzzyQuery("tag_s", "t050", 2, 0).countLimit(countLimit).limit(5);
+    if (facet) cur.facet("tags", "tag_s");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->multiTermBudget.termsExamined();
+  };
+  int64_t uncounted = fuzzy(0, false);
+  EXPECT_GT(uncounted, 0);
+  EXPECT_EQ(uncounted, fuzzy(-1, false));
+  EXPECT_EQ(uncounted, fuzzy(-1, true));
 }
 
 TEST_F(MultiTermLimitsTest, facetTermFilterIsExemptFromMinLiteralPrefix) {
