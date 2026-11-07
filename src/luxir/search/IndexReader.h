@@ -12,6 +12,7 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
@@ -77,6 +78,7 @@ public:
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::shared_ptr<const SegmentSummary> sharedSummary;
   public:
     friend class IndexReader;
 
@@ -96,11 +98,16 @@ public:
 
     Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
               std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
+              std::shared_ptr<const SegmentSummary>&& summary,
               SegmentInfo segInfo, int64_t base, int ord)
             :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
-                sharedAuxReaders(std::move(auxReaders)),
+                sharedAuxReaders(std::move(auxReaders)), sharedSummary(std::move(summary)),
                 segInfo(segInfo), base(base), ord(ord) {
     }
+
+    // The segment's summary sidecar, loaded when the snapshot opened; null
+    // when the segment has none readable, which proves nothing about it.
+    const SegmentSummary* summary() const noexcept { return sharedSummary.get(); }
 
     PostingsReader& postingsReader() const noexcept {
       return *sharedPostingsReader;

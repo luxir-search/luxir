@@ -83,6 +83,9 @@ state, and commits are crash-safe on immutable segments.
 - [Storage and object stores](design/storage.md) lays out the storage
   roadmap: object-store durability, nodes reading from the store through a
   local cache, and the publication contract both use.
+- [Segment summaries](design/segment-summaries.md) describes the per-segment
+  summary sidecar: the metadata that will let a query skip a segment without
+  opening its data.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
