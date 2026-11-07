@@ -2244,6 +2244,49 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
 }
 
+TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  h.deleteByIds({"d40"}, UpdateMessage::COMMIT);
+
+  // Build and cache the rank-live bitmap, which borrows the live docs bits.
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  req->done();
+
+  std::weak_ptr<LiveDocs> superseded;
+  std::shared_ptr<AuxReader> aux;
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    superseded = reader->segments()[0].liveDocsShared();
+    aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+    ASSERT_NE(aux, nullptr);
+  }
+  ASSERT_FALSE(superseded.expired());
+
+  // A delete commit replaces the live docs but reuses the vector aux reader.
+  h.deleteByIds({"d41"}, UpdateMessage::COMMIT);
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    EXPECT_EQ(aux.get(), reader->segments()[0].getAuxReader("vec.embedding_v").get());
+    EXPECT_NE(reader->segments()[0].liveDocsShared(), superseded.lock());
+  }
+  EXPECT_TRUE(superseded.expired())
+      << "the cached rank-live bitmap pins the previous live docs";
+}
+
 // Filtered query on an IVF segment with deletes: the domain is filter
 // intersect liveDocs (NOT the liveDocs docset itself), so eligibility goes
 // through the resolve-based selector while the allocator's live accounting

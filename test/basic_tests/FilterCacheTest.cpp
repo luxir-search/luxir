@@ -5390,6 +5390,58 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   ASSERT_NO_THROW(cache->validateForTest());
 }
 
+TEST(FilterCacheIntegrationTest, schemaOnlyPublishKeepsWholeReaderCaching) {
+  LuxirConfig config;
+  config.queryCacheBytes = 0;
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_schema_only");
+  installVectorSchema(helper.collection());
+  auto cache = std::make_shared<FilterCache>(testConfig());
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+
+  std::vector<luxir::test::Doc> input;
+  for (int32_t i = 0; i < 24; i++) {
+    input.push_back(luxir::test::flatdoc(
+        "id", std::to_string(i),
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+  auto firstReader = helper.getIndexWriter()->snapshots.readers.getReader();
+  std::array<float, 2> queryVector{0.0f, 0.0f};
+  CachedSearchResult expected = runKnnFilter(
+      node, "filter_cache_schema_only", queryVector, 4);
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(expected, runKnnFilter(
+        node, "filter_cache_schema_only", queryVector, 4));
+  }
+  auto warm = cache->counters();
+  ASSERT_EQ(1u, warm.readerStableHits);
+
+  // A schema-only publication keeps the segment files, so the reader reuses
+  // the previous core and its cache version, under a new commit time.
+  SchemaBuilder schema;
+  auto& vector = schema.templ("_v");
+  vector.type = api::FieldDef_::FieldClass::VECTOR;
+  vector.column = true;
+  vector.metric = api::VectorMetric::L2;
+  schema.templ("_s").type = api::FieldDef_::FieldClass::STRING;
+  schema.set(helper.collection());
+  auto secondReader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_GT(secondReader->commitTime(), firstReader->commitTime());
+  ASSERT_EQ(firstReader->segments().data(), secondReader->segments().data());
+  EXPECT_EQ(firstReader->coreCommitTime(), secondReader->coreCommitTime());
+  EXPECT_EQ(warm.readerStableRetires, cache->counters().readerStableRetires);
+
+  // The schema change keys new entries, so admission, build and hit take
+  // the same three requests as the warm-up did.
+  for (int i = 0; i < 3; i++) {
+    EXPECT_EQ(expected, runKnnFilter(
+        node, "filter_cache_schema_only", queryVector, 4));
+  }
+  EXPECT_EQ(warm.readerStableHits + 1, cache->counters().readerStableHits);
+  ASSERT_NO_THROW(cache->validateForTest());
+}
+
 TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
   LuxirConfig config;
   config.queryCacheBytes = 0;

@@ -181,7 +181,11 @@ public:
   };
 
   /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
-  /// replyComplete will be called when the response has actually been written and is no longer needed.
+  /// reply() takes ownership of `response` on every path and must not throw:
+  /// once it has run, the transport has called replyCallback(response), which
+  /// releases a non-final response's own arena and completes the request on
+  /// the last one.  A producer cannot recover from an exception here because
+  /// it cannot tell whether that release already happened.
   virtual ReplyStatus reply(SearchResponse& response) = 0;
 
   /// Called by a streaming producer after reply() returned PAUSE.  The

@@ -817,6 +817,9 @@ private:
   void _resumePolicyMergesLocked();
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
+  // Builds the SegInfo for an inverter whose flush just succeeded.
+  std::unique_ptr<SegInfo> describeFlushedSegment(Inverter& inverter, std::vector<std::string>&& flushedFiles,
+                                                  std::vector<FileDescriptor>&& descriptors);
   bool finishCommitBody(UpdateMessage& msg);
   void deletePassBody();
   template <class Visit> bool forEachPassPacketLocked(uint64_t frontier, Visit&& visit);

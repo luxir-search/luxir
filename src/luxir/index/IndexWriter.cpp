@@ -325,8 +325,20 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     [this](Inverter* inverter,
     InverterMultiFunc::output_ports_type& op) {
       unused(op);
-      // TODO: handle exceptions
-      this->segmentFlushBody(*inverter);
+      // An exception leaving a graph node body cancels the whole graph:
+      // every message buffered in it is dropped without completion, and
+      // nothing ever drains it again.  segmentFlushBody handles its own
+      // failures; this backstop only keeps an unexpected one from taking
+      // the graph down with it.
+      try {
+        this->segmentFlushBody(*inverter);
+      } catch (const std::exception& e) {
+        LOG_ERROR("Segment flush failed outside recovery: {}", e.what());
+        this->fail(std::string("segment flush failed: ") + e.what());
+      } catch (...) {
+        LOG_ERROR("Segment flush failed outside recovery: unknown exception");
+        this->fail("segment flush failed: unknown exception");
+      }
     }, FLUSH_PRIORITY);
 
   // Budget callbacks never take indexMutex or flush inline.  They coalesce on
@@ -1131,74 +1143,86 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
-    // Register with one hold for every merge already submitted but not tailed.
-    // A later merge submission adds its own hold before entering the graph.
-    if (msg.waitForMerges) {
-      waitingForMerges.push_back(&msg);
-      commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
-    }
-
-    // first look at any flushing inverters that are not marked for a commit yet
-    // and mark them if necessary.
-    for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+    // Everything below hands pointers into msg to inverters and to the merge
+    // waiter list.  The caller completes msg when this throws, which frees
+    // commitInfo, so a failure must take those pointers back first: an
+    // inverter already flushing then finishes as a plain flush, and the
+    // waiter list no longer names a freed message.
+    try {
+      // Register with one hold for every merge already submitted but not tailed.
+      // A later merge submission adds its own hold before entering the graph.
+      if (msg.waitForMerges) {
+        waitingForMerges.push_back(&msg);
+        commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
       }
-    }
 
-    // now look at all idle inverters and initiate a flush if necessary.
-    for (auto it = idleInverters.begin(); it != idleInverters.end();) {
-      auto current = it++;
-      if (current->second->minVersion <= msg.updateVersion) {
-        if (current->second->commitInfo == nullptr) {
-          INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      *current->second.get());
-          current->second->commitInfo = &commitInfo;
+      // first look at any flushing inverters that are not marked for a commit yet
+      // and mark them if necessary.
+      for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
-        else {
-          // this would be a bug since we should never have an idle inverter that is part of a commit.
-          LOG_ERROR("Idle inverter is part of another commit.");
-        }
+      }
 
-        if (!startIdleFlushLocked(*current->second, false)) {
-          throw std::runtime_error("Segment flush node rejected a commit inverter");
+      // now look at all idle inverters and initiate a flush if necessary.
+      for (auto it = idleInverters.begin(); it != idleInverters.end();) {
+        auto current = it++;
+        if (current->second->minVersion <= msg.updateVersion) {
+          if (current->second->commitInfo == nullptr) {
+            INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
+                        *current->second.get());
+            current->second->commitInfo = &commitInfo;
+            commitInfo.leftToFlush++;
+          }
+          else {
+            // this would be a bug since we should never have an idle inverter that is part of a commit.
+            LOG_ERROR("Idle inverter is part of another commit.");
+          }
+
+          if (!startIdleFlushLocked(*current->second, false)) {
+            throw std::runtime_error("Segment flush node rejected a commit inverter");
+          }
         }
       }
-    }
 
-    // Any inverters that are busy should be marked so that when they are released they can be flushed.
-    for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+      // Any inverters that are busy should be marked so that when they are released they can be flushed.
+      for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
+        }
       }
-    }
 
-    INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
-    // updateFinishNode is serial and segment-flush completion needs indexMutex,
-    // so this is the commit's single admission point.  No ordinal is consumed
-    // until all state above is installed.  An immediate commit increments the
-    // counter only after the sequencer accepts it.
-    msg.commitNum = commitNumber;
-    if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
-    // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
-    // we need to kick it off here.
-    if (commitInfo.leftToFlush == 0) {
-      try {
+      // updateFinishNode is serial and segment-flush completion needs indexMutex,
+      // so this is the commit's single admission point.  No ordinal is consumed
+      // until all state above is installed.  An immediate commit increments the
+      // counter only after the sequencer accepts it.
+      msg.commitNum = commitNumber;
+      if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
+      // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
+      // we need to kick it off here.
+      if (commitInfo.leftToFlush == 0) {
         _releaseToCommitSequencer(&msg);
-      } catch (...) {
-        if (msg.waitForMerges) {
-          std::erase(waitingForMerges, &msg);
-        }
-        throw;
       }
+    } catch (...) {
+      auto disown = [&](auto& inverters) {
+        for (auto& entry : inverters) {
+          if (entry.second->commitInfo == &commitInfo) entry.second->commitInfo = nullptr;
+        }
+      };
+      disown(flushingInverters);
+      disown(idleInverters);
+      disown(busyInverters);
+      std::erase(waitingForMerges, &msg);
+      msg.commitInfo.reset();
+      throw;
     }
     commitNumber++;
     // Flushes this commit started complete under indexMutex, so none can
@@ -1388,6 +1412,32 @@ void IndexWriter::deletePassRetryFired() {
   requestDeletePassLocked();
 }
 
+std::unique_ptr<SegInfo> IndexWriter::describeFlushedSegment(
+    Inverter& inverter, std::vector<std::string>&& flushedFiles, std::vector<FileDescriptor>&& descriptors) {
+  auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
+                                           inverter.getPostingsWriter().creatorEpoch,
+                                           inverter.getPostingsWriter().getMaxDoc());
+  segInfo->unsyncedFiles = std::move(flushedFiles);
+  segInfo->files = std::move(descriptors);
+  segInfo->minVersion = inverter.minVersion;
+  segInfo->maxVersion = inverter.maxVersion;
+  segInfo->schema = inverter.schema->binding;
+  auto& postings = inverter.getPostingsWriter();
+  if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
+  segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
+  // Set liveDocs + liveGen for deleted docs from errors during indexing
+  if (inverter.liveGen > 0) {
+    liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
+    segInfo->liveGen = inverter.liveGen;
+    segInfo->liveDocs = inverter.liveDocs;
+    assert(segInfo->liveDocs <= segInfo->maxDoc);
+    // We still need to carry over deletes-by-string-id even if liveDocs == 0.
+  } else {
+    segInfo->liveDocs = segInfo->maxDoc;
+  }
+  return segInfo;
+}
+
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
@@ -1395,19 +1445,20 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
-  // Test seam; emitted before any lock so a blocking listener can hold flushes
-  // in flight without stalling releaseInverter.
-  Signal::emit("segmentFlushBody", &inverter);
-
   std::vector<std::string> flushedFiles;
   std::vector<FileDescriptor> descriptors;
+  std::unique_ptr<SegInfo> segInfo;
   bool success = false;
   bool aborted = inverter.failed();
   if (!aborted) {
     try {
+      // Test seam; emitted before any lock so a blocking listener can hold
+      // flushes in flight without stalling releaseInverter.
+      Signal::emit("segmentFlushBody", &inverter);
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       success = inverter.flush(&flushedFiles, &descriptors);
+      if (success) segInfo = describeFlushedSegment(inverter, std::move(flushedFiles), std::move(descriptors));
     } catch (const std::exception& e) {
       LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
       inverter.fail(std::current_exception());
@@ -1422,30 +1473,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   }
 
   metric.failed = aborted;
-  std::unique_ptr<SegInfo> segInfo;
-  if (!aborted) {
-    segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
-                                        inverter.getPostingsWriter().creatorEpoch,
-                                        inverter.getPostingsWriter().getMaxDoc());
-    segInfo->unsyncedFiles = std::move(flushedFiles);
-    segInfo->files = std::move(descriptors);
-    segInfo->minVersion = inverter.minVersion;
-    segInfo->maxVersion = inverter.maxVersion;
-    segInfo->schema = inverter.schema->binding;
-    auto& postings = inverter.getPostingsWriter();
-    if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
-    segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
-    // Set liveDocs + liveGen for deleted docs from errors during indexing
-    if (inverter.liveGen > 0) {
-      liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
-      segInfo->liveGen = inverter.liveGen;
-      segInfo->liveDocs = inverter.liveDocs;
-      assert(segInfo->liveDocs <= segInfo->maxDoc);
-      // We still need to carry over deletes-by-string-id even if liveDocs == 0.
-    } else {
-      segInfo->liveDocs = segInfo->maxDoc;
-    }
-  }
 
   // A segment born with no live docs (every doc failed and was marked deleted)
   // never becomes visible: don't register it as a live segment.  Registering it
@@ -1463,6 +1490,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
 
   std::unique_ptr<Inverter> inverterPtr;
   std::shared_ptr<SortedDeletes> deletes;
+  bool lostDeletes = false;
+  UpdateMessage* unsequencedCommit = nullptr;
   if (!aborted && inverter.hasDeletions()) {
     auto& batch = *inverter.sortedDeletes;
     int64_t actual = (int64_t)batch.memSize();
@@ -1480,27 +1509,40 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // Reserve the segment map, then register deletes before exposing the segment.
     // The delete-set insertion may allocate. Holding indexMutex across both
     // registrations keeps segment snapshots consistent with their deletes.
-    if (success) segInfos.reserve(segInfos.size() + 1);
-    if (deletes) {
-      if (segInfo) deletes->sourceSegId = segInfo->segId;
-      // An adopting commit retires the packet unless it holds a newer request,
-      // and must not race a pass for it. No commit adopts the inverter once it
-      // leaves flushingInverters below. If initiateCommit throws after adopting
-      // inverters, nothing completes that commit, so their packets keep the
-      // claim until a later commit completes: a delay only.
-      if (auto* commit = inverter.commitInfo) {
-        uint64_t version = commit->updateMessage->updateVersion;
-        if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
-      }
-      if (deletes->getLargestVersion() <= retirableThrough && deletes->ramGuard) deletes->ramGuard.markRetirable();
-      pendingDeletes.deletes.insert(std::move(deletes));
-    }
-
-    // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
+    // A registration that fails turns the flush into an aborted one so the
+    // bookkeeping below still runs; its commit then fails instead of waiting
+    // forever, and lost deletes fail the writer.
     std::pair<SegMap::iterator, bool> iter;
-    if (success) {
-      iter = segInfos.emplace(segInfo->segId, std::move(segInfo));
-      assert(iter.second); // should never already exist
+    const bool hadDeletes = deletes != nullptr;
+    try {
+      if (success) segInfos.reserve(segInfos.size() + 1);
+      if (deletes) {
+        deletes->sourceSegId = inverter.getPostingsWriter().segId;
+        // An adopting commit retires the packet unless it holds a newer request,
+        // and must not race a pass for it. No commit adopts the inverter once it
+        // leaves flushingInverters below, and a commit that fails to start
+        // disowns its inverters before it completes.
+        if (auto* commit = inverter.commitInfo) {
+          uint64_t version = commit->updateMessage->updateVersion;
+          if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
+        }
+        if (deletes->getLargestVersion() <= retirableThrough && deletes->ramGuard) deletes->ramGuard.markRetirable();
+        pendingDeletes.deletes.insert(std::move(deletes));
+      }
+
+      // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
+      if (success) {
+        iter = segInfos.emplace(segInfo->segId, std::move(segInfo));
+        assert(iter.second); // should never already exist
+      }
+    } catch (...) {
+      LOG_ERROR("Failed to register flushed segment s{}",
+                Postings::segmentKey(inverter.getPostingsWriter().segId, writerEpoch));
+      inverter.fail(std::current_exception());
+      aborted = true;
+      success = false;
+      segInfo.reset();
+      lostDeletes = hadDeletes;
     }
 
     // remove the inverter from the flushingInverters set, but remember it until the end of this function.
@@ -1525,8 +1567,14 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // doesn't prematurely fire triggerCommit (and release the message into
     // commitSequencerNode while a merge still holds it as a waiter).
     // We do this with the lock held since segInfo could go away otherwise.
+    // Merging is advisory: a submission that fails has rolled back its own
+    // holds, and the segment stays eligible for the next flush to pick up.
     if (success) {
-      mergePolicy->_maybeMergeSegments(iter.first->second.get());
+      try {
+        mergePolicy->_maybeMergeSegments(iter.first->second.get());
+      } catch (const std::exception& e) {
+        LOG_ERROR("Merge scheduling after flush failed: {}", e.what());
+      }
     }
 
     // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
@@ -1539,7 +1587,17 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
         setException(inverter.commitInfo->updateMessage->result, inverter.failure());
       }
       if (--inverter.commitInfo->leftToFlush == 0) {
-        _releaseToCommitSequencer(inverter.commitInfo->updateMessage);
+        UpdateMessage* commit = inverter.commitInfo->updateMessage;
+        try {
+          _releaseToCommitSequencer(commit);
+        } catch (...) {
+          // The sequencer has a hole it cannot fill: the commit completes
+          // with the failure below, and the writer stops taking work rather
+          // than stall every later commit behind the missing ordinal.
+          setException(commit->result, std::current_exception());
+          std::erase(waitingForMerges, commit);
+          unsequencedCommit = commit;
+        }
       }
     }
   }
@@ -1547,6 +1605,15 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   // Destroy before removing an aborted segment's files.
   uint64_t segId = inverterPtr->getPostingsWriter().segId;
   inverterPtr.reset();
+  if (lostDeletes) fail("segment flush could not register its deletes");
+  if (unsequencedCommit != nullptr) {
+    fail("commit sequencer rejected a flushed commit");
+    try {
+      unsequencedCommit->done(*this);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Commit completion threw after sequencer rejection: {}", e.what());
+    }
+  }
   if (aborted) {
     try {
       dir.deletePrefix(Postings::getIndexFileNamePrefix(segId, writerEpoch));

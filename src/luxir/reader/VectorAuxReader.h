@@ -274,6 +274,13 @@ public:
 /// segment's liveDocs words (dense single-valued fields: valueRank == docId,
 /// and the little-endian byte view of the words IS this layout); either way
 /// `backing` pins the storage for as long as a query holds the bitmap.
+/// KnnQuery builds one per (segment, field) - in time proportional to the
+/// segment's DELETED docs, not its vectors - and caches it on the snapshot's
+/// Segment (IndexReader::Segment::liveDocsView) so every query against that
+/// segment shares it: the FAISS eligibility selector for unfiltered queries
+/// and the allocator's live-list accounting both read the bits instead of
+/// resolving rank -> doc -> liveDocs per scanned vector, and its cardinality
+/// is the segment's exact live vector count.
 struct RankLiveBitmap {
   const uint8_t* bits;
   size_t numBytes;
@@ -308,17 +315,6 @@ class VectorAuxReader : public AuxReader {
   mutable RaBitQAmplitudes amplitudes;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
-  // Cached RankLiveBitmap (built by KnnQuery).  Built once per liveDocs
-  // generation - in time proportional to the segment's DELETED docs, not its
-  // vectors - and shared by every query against this (segment, field): the
-  // FAISS eligibility selector for unfiltered queries and the allocator's
-  // live-list accounting both read the bits instead of resolving rank ->
-  // doc -> liveDocs per scanned vector, and its cardinality is the
-  // segment's exact live vector count.  Keyed by liveGen, so a reader
-  // version with newer deletes rebuilds.
-  mutable std::mutex rankLiveMutex;
-  mutable uint64_t rankLiveGen = 0;
-  mutable std::shared_ptr<const RankLiveBitmap> rankLive;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -477,22 +473,6 @@ public:
                     mmapLists->listOffsets()};
     });
     return faissIndex.get();
-  }
-
-  /// Get-or-build the RankLiveBitmap for the given liveDocs generation.
-  /// build() runs at most once per generation (under the lock; concurrent
-  /// first callers wait rather than duplicate the walk) and returns a
-  /// RankLiveBitmap whose backing keeps the bits valid for as long as any
-  /// query holds the shared_ptr.
-  template <typename Build>
-  std::shared_ptr<const RankLiveBitmap> rankLiveBitmap(uint64_t liveGen,
-                                                       Build&& build) const {
-    std::lock_guard<std::mutex> lock(rankLiveMutex);
-    if (rankLive == nullptr || rankLiveGen != liveGen) {
-      rankLive = std::make_shared<const RankLiveBitmap>(build());
-      rankLiveGen = liveGen;
-    }
-    return rankLive;
   }
 
   /// Open the FAISS index referenced by `info`.  Returns nullptr when the

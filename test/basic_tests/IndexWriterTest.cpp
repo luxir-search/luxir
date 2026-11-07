@@ -3227,6 +3227,72 @@ TEST_F(IndexWriterTest, failedSchemaChangeLeavesPublicationUntouched) {
   EXPECT_NE(schema, writer.getSchema());
 }
 
+TEST_F(IndexWriterTest, commitFailingAfterAdoptionDisownsInverters) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(writerSnapshots);
+  addDoc(writer);  // idle inverter the commit adopts and starts flushing
+  std::latch flushStarted(1), releaseFlush(1);
+  Signal::listen("segmentFlushBody", [&](void*, void*, void*) -> void* {
+    flushStarted.count_down();
+    releaseFlush.wait();
+    return nullptr;
+  });
+  Signal::listen("commitWaitingForMerges", [&](void*, void*, void*) -> void* {
+    throw std::runtime_error("commit admission failed for the test");
+  });
+  // Completes like a transport message: deletes itself, and with it the
+  // commit state the adopted inverter must no longer point at.
+  class SelfDeletingCommit final : public UpdateMessage {
+  public:
+    std::promise<bool> errored;
+    SelfDeletingCommit() {
+      commit = COMMIT;
+      waitForMerges = true;
+    }
+    void handle(IndexWriter& iw) override { unused(iw); }
+    void done(IndexWriter& iw) override {
+      unused(iw);
+      std::unique_ptr<SelfDeletingCommit> self(this);
+      errored.set_value(result.errored());
+    }
+  };
+  auto* commit = new SelfDeletingCommit();
+  auto errored = commit->errored.get_future();
+  ASSERT_TRUE(writer.submitUpdate(commit));
+  ASSERT_EQ(std::future_status::ready, errored.wait_for(std::chrono::seconds(10)));
+  EXPECT_TRUE(errored.get());
+  flushStarted.wait();
+  releaseFlush.count_down();
+  writer.testDrain();
+  Signal::unlisten("segmentFlushBody");
+  Signal::unlisten("commitWaitingForMerges");
+  // The flush finished on its own; a later commit publishes it normally.
+  auto later = writer.commit();
+  ASSERT_TRUE(later.has_value());
+  EXPECT_EQ(1u, writer.snapshots.readers.getReader()->segments().size());
+  writer.close();
+}
+
+TEST_F(IndexWriterTest, flushFailingAtEntryCompletesItsCommit) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(writerSnapshots);
+  addDoc(writer);
+  std::atomic<bool> thrown{false};
+  Signal::listen("segmentFlushBody", [&](void*, void*, void*) -> void* {
+    if (!thrown.exchange(true)) throw std::runtime_error("flush failed for the test");
+    return nullptr;
+  });
+  auto commit = std::async(std::launch::async, [&] { writer.commit(); });
+  ASSERT_EQ(std::future_status::ready, commit.wait_for(std::chrono::seconds(10)))
+      << "the failed flush never completed its commit";
+  EXPECT_THROW(commit.get(), std::runtime_error);
+  addDoc(writer);
+  EXPECT_TRUE(writer.commit().has_value());
+  writer.close();
+}
+
 TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForPendingMergeCommit) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));

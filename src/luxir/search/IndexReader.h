@@ -74,9 +74,21 @@ public:
 
 
   class Segment {
+    // Views consumers derive from sharedLiveDocs (the rank-space live bitmap
+    // kNN builds), keyed by the consuming reader component.  They are cached
+    // on the segment, not on the component: components such as
+    // VectorAuxReader are shared with later snapshots whose live docs differ,
+    // and a view cached there outlived its generation and pinned the
+    // superseded LiveDocs mapping until a later query replaced it.
+    struct LiveDocsViews {
+      std::mutex mutex;
+      std::vector<std::pair<const void*, std::shared_ptr<const void>>> views;
+    };
+
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::shared_ptr<LiveDocsViews> liveDocsViews = std::make_shared<LiveDocsViews>();
   public:
     friend class IndexReader;
 
@@ -124,6 +136,21 @@ public:
 
     std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
       return sharedAuxReaders;
+    }
+
+    // Get-or-build the view of this segment's live docs that `key` consumes.
+    // build() runs at most once per (segment, key); concurrent first callers
+    // wait rather than duplicate the walk.  The view lives as long as this
+    // segment's LiveDocs, so it may borrow their bits.
+    template <typename T, typename Build>
+    std::shared_ptr<const T> liveDocsView(const void* key, Build&& build) const {
+      std::lock_guard<std::mutex> lock(liveDocsViews->mutex);
+      for (const auto& [viewKey, view] : liveDocsViews->views) {
+        if (viewKey == key) return std::static_pointer_cast<const T>(view);
+      }
+      std::shared_ptr<const T> made = std::make_shared<const T>(build());
+      liveDocsViews->views.emplace_back(key, made);
+      return made;
     }
 
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
@@ -271,6 +298,9 @@ private:
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
     uint64_t coreGeneration = 0;
+    // Commit time of the publication that produced this physical state. A
+    // later publication that reuses the core (a schema-only one) keeps it.
+    uint64_t commitTime = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
     // A segment's physical identity, which decides what a reopen reuses: the
@@ -349,6 +379,15 @@ public:
   }
 
   uint64_t commitId() const noexcept { return snapshotGen; }
+
+  // The commit time of the publication that produced this reader's physical
+  // state (segments, live docs, overlays).  A reader that reuses the previous
+  // core, as a schema-only publication does, reports the previous value, so
+  // caches that version whole-reader values by it keep them across that
+  // publication instead of stranding them under a version no request asks for.
+  uint64_t coreCommitTime() const noexcept {
+    return core->commitTime;
+  }
   std::string_view incarnation() const noexcept { return core->incarnation; }
 
   std::span<Segment> segments() noexcept {
