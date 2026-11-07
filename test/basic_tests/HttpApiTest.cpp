@@ -4064,15 +4064,64 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 // server-side buffering.  A private server with a tiny stream buffer forces
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the response resumes it and every doc arrives.
-TEST_F(HttpApiTest, backpressurePausesEmitter) {
-  LuxirTest::clearCollection("http_bp");
-  CollectionHelper ch("http_bp");
+static void expectBackpressureDrains(HttpServer& server, const std::string& body,
+                                     size_t expectedDocs) {
+  SCOPED_TRACE(body);
+  net::io_context cioc;
+  tcp::socket sock(cioc);
+  sock.open(tcp::v4());
+  // Small receive buffer (set before connect) so the kernel absorbs little
+  // and the server's write queue backs up quickly.
+  sock.set_option(net::socket_base::receive_buffer_size(8192));
+  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                             (unsigned short)server.getPort()));
+
+  int64_t pausesBefore = streamPauseCount.load();
+
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
+  req.set(http::field::host, "127.0.0.1");
+  req.set(http::field::content_type, "application/json");
+  req.body() = body;
+  req.prepare_payload();
+  http::write(sock, req);
+
+  // Withhold reads until the connection backs up and the emitter parks.
+  bool paused = false;
+  for (int i = 0; i < 400 && !paused; i++) {
+    paused = streamPauseCount.load() > pausesBefore;
+    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_TRUE(paused);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  http::read(sock, buffer, res);
+  EXPECT_EQ(200, res.result_int());
+
+  // Every doc arrived once the client drained the stream.
+  size_t count = 0;
+  std::string_view text = res.body();
+  for (size_t pos = 0; (pos = text.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
+  EXPECT_EQ(expectedDocs, count);
+
+  beast::error_code ec;
+  sock.shutdown(tcp::socket::shutdown_both, ec);
+}
+
+static std::vector<Doc> backpressureDocs() {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad,
+                           "k_s", i % 2 ? "odd" : "even"));
   }
-  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
+  return docs;
+}
+
+TEST_F(HttpApiTest, backpressurePausesEmitter) {
+  LuxirTest::clearCollection("http_bp");
+  CollectionHelper ch("http_bp");
+  ASSERT_TRUE(ch.indexAll(backpressureDocs(), UpdateMessage::COMMIT).success);
 
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
@@ -4081,47 +4130,29 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   // resumes on the connection shard; 1 and -1 re-enqueue their resumes onto
   // the arena (HttpSearchRequest::resumeWhenDrained's arena-lane wrapper).
   for (std::string mp : {"0", "1", "-1"}) {
-    net::io_context cioc;
-    tcp::socket sock(cioc);
-    sock.open(tcp::v4());
-    // Small receive buffer (set before connect) so the kernel absorbs little
-    // and the server's write queue backs up quickly.
-    sock.set_option(net::socket_base::receive_buffer_size(8192));
-    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
-                               (unsigned short)bpServer.getPort()));
-
-    int64_t pausesBefore = streamPauseCount.load();
-
-    http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
-    req.set(http::field::host, "127.0.0.1");
-    req.set(http::field::content_type, "application/json");
-    req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" +
-        mp + R"(,"fields":["id","pad_s"]})";
-    req.prepare_payload();
-    http::write(sock, req);
-
-    // Withhold reads until the connection backs up and the emitter parks.
-    bool paused = false;
-    for (int i = 0; i < 400 && !paused; i++) {
-      paused = streamPauseCount.load() > pausesBefore;
-      if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    EXPECT_TRUE(paused) << "max_parallel=" << mp;
-
-    beast::flat_buffer buffer;
-    http::response<http::string_body> res;
-    http::read(sock, buffer, res);
-    EXPECT_EQ(200, res.result_int()) << "max_parallel=" << mp;
-
-    // Every doc arrived once the client drained the stream.
-    size_t count = 0;
-    std::string_view body = res.body();
-    for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
-    EXPECT_EQ(2000u, count) << "max_parallel=" << mp;
-
-    beast::error_code ec;
-    sock.shutdown(tcp::socket::shutdown_both, ec);
+    expectBackpressureDrains(bpServer,
+        R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" + mp
+            + R"(,"fields":["id","pad_s"]})",
+        2000);
   }
+  bpServer.shutdown();
+}
+
+// The engine's own parallel lane resumes inside the arena too.
+TEST_F(HttpApiTest, backpressurePausesAutoParallelEmitter) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_work = 1;
+  LuxirNode node(config);
+  CollectionHelper ch(node, "http_bp");
+  auto docs = backpressureDocs();
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).first(1000), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(1000), UpdateMessage::COMMIT).success);
+
+  HttpServer bpServer(node, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer.start();
+  expectBackpressureDrains(bpServer,
+      R"({"query":"k_s:odd k_s:even","limit":-1,"batch_size":100,"fields":["id","pad_s"]})",
+      2000);
   bpServer.shutdown();
 }
 

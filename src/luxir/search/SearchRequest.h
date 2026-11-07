@@ -110,6 +110,10 @@ public:
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
+  // The engine chose the parallel lane for a max_parallel 0 request, so
+  // transports resume paused production inside the arena, as for -1.
+  bool autoParallel = false;
+  bool parallelLane() const noexcept { return maxParallel == -1 || autoParallel; }
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);

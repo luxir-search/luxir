@@ -25,6 +25,17 @@ public:
     SearchOp::releaseSegmentState(segment);
   }
 
+  // Lists price their own matches. Any other top-level op works over the
+  // whole collection.
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto& [name, subOp] : subOps) {
+      if (subOp->ownsMatchDomain()) continue;
+      total = saturatingAdd(total, (size_t) req.reader->maxDoc());
+    }
+    return total;
+  }
+
   class Calc final : public SearchOp::Calculator {
     std::vector<std::unique_ptr<Calculator>> subCalcs;
     std::vector<size_t> subCalcVariants;

@@ -1127,8 +1127,10 @@ beside `ops` in the full form:
   native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
   output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
-  executes serially on the HTTP io thread that received it, with no
-  scheduler handoff. `1` moves the request onto the
+  lets the engine decide: it executes serially on the HTTP io thread that
+  received it, with no scheduler handoff, unless the operator has set
+  [`search.auto-parallel-min-work`](operations.md#indexing-memory-and-request-limits) and the request visits at
+  least that many documents, in which case it runs like `-1`. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
   not occupy its connection thread. `-1` removes the cap: the request starts
   on the receiving thread and shared workers join in, parallelizing across

@@ -103,6 +103,14 @@ public:
     }
   }
 
+  bool ownsMatchDomain() const override { return true; }
+
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
+    return total;
+  }
+
   bool needsCount() const {
     return fusionProto.count_limit.has_value()
         ? *fusionProto.count_limit != 0

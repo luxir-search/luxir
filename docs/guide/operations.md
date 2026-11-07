@@ -721,6 +721,12 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
+  request across segments in parallel, like `-1`, when its lists and
+  operations visit at least that many documents by index metadata. Counts that
+  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
+  serial. Parallel runs cost more CPU in exchange for latency, so set it only
+  where large requests are common.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

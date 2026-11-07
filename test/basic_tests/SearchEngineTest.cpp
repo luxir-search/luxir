@@ -5937,6 +5937,60 @@ TEST_F(SearchEngineTest, exactCountComposesForUnfilteredTextQueries) {
   }
 }
 
+TEST_F(SearchEngineTest, autoParallelIsAnOperatorOptIn) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_work = 100;
+  LuxirNode node(config);
+  for (LuxirNode* target : {&node, luxirNode}) {
+    CollectionHelper helper(*target, "auto_parallel");
+    for (int32_t batch = 0; batch < 3; batch++) {
+      std::vector<Doc> docs;
+      for (int32_t doc = 0; doc < 500; doc++) {
+        docs.push_back(flatdoc(
+            "id", "parallel_" + std::to_string(batch) + "_" + std::to_string(doc),
+            "body_w", (doc % 3) == 0 ? "alpha beta" : "alpha",
+            "cat_s", (doc % 2) == 0 ? "even" : "odd"));
+      }
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+    ASSERT_GT(helper.getIndexWriter()->snapshots.readers.getReader()
+                  ->segments().size(), 1u);
+  }
+  auto run = [&](LuxirNode& target, std::string_view body, int maxParallel) {
+    auto req = localReq(target.getSearchEngine());
+    parseQueryRequest(body, req->rawRequest(), req->mr);
+    req->collection("auto_parallel");
+    req->execute(maxParallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  constexpr std::string_view ranked = R"({"ops":{"q":{"top_docs":{
+      "query":"body_w:alpha body_w:beta","count_limit":-1,"get_scores":true,
+      "fields":["id"],"limit":20}}}})";
+
+  // Past the threshold, max_parallel 0 runs in parallel with the same results.
+  auto parallel = run(node, ranked, 0);
+  auto serial = run(node, ranked, 1);
+  EXPECT_TRUE(parallel->autoParallel);
+  EXPECT_FALSE(serial->autoParallel);
+  EXPECT_EQ(1500, parallel->getMatchCount("q"));
+  EXPECT_EQ(serial->getMatchCount("q"), parallel->getMatchCount("q"));
+  EXPECT_EQ(resultIds(*serial, "q"), resultIds(*parallel, "q"));
+  expectSameScoreMap(resultScoreMap(*serial, "q"), resultScoreMap(*parallel, "q"));
+
+  // A count that metadata answers is no work, nor is a first-K ranking.
+  EXPECT_FALSE(run(node, R"({"ops":{"q":{"top_docs":{"query":"*:*","count_limit":-1,
+      "limit":1}}}})", 0)->autoParallel);
+  // Ranking a term's matches is work, though metadata knows their count.
+  EXPECT_TRUE(run(node, R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha","count_limit":-1,
+      "limit":10}}}})", 0)->autoParallel);
+  // A top-level facet reads the whole collection.
+  EXPECT_TRUE(run(node, R"({"ops":{"f":{"field_facet":{"field":"cat_s"}}}})", 0)->autoParallel);
+
+  // Without the opt-in, max_parallel 0 stays serial.
+  EXPECT_FALSE(run(*luxirNode, ranked, 0)->autoParallel);
+}
+
 TEST_F(SearchEngineTest,
        exactCompositionFilteredUnionWithTiedScoresMatchesExhaustive) {
   constexpr std::string_view collection =
