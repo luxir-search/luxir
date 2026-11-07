@@ -20,6 +20,8 @@ class SearchEngine {
   void submitBody(SearchRequest& req);
   // Runs submit() on an arena worker; -1's waits stay within the request.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
+  // Whether the request's collection may fetch bytes over a network.
+  bool readsRemotely(const SearchRequest& req);
   RootOp* prepare(SearchRequest& req);
 
   /// get needed resources such as the index reader and schema
@@ -52,7 +54,10 @@ public:
   // shared TBB task arena so arena workers parallelize it; 1 enqueues on the
   // arena and runs serially there, off the calling thread.  With
   // Receiver::OFFLOAD every request is enqueued on the arena: 0 and 1 run
-  // serially on a worker, -1 starts on a worker and fans out from there.
+  // serially on a worker, -1 starts on a worker and fans out from there.  A
+  // search of a collection on remote storage is routed like Receiver::OFFLOAD
+  // whatever the receiver: its reads can wait on the network, and an HTTP
+  // shard waiting on them stalls every connection assigned to it.
   void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver);
 
   // Synchronous execution on the calling thread (dispatch() routes here).
