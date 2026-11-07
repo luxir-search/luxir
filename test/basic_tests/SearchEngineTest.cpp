@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -460,6 +461,18 @@ void expectSameScoreMap(const std::map<std::string, float>& expected,
     ASSERT_NE(found, actual.end()) << id;
     float scale = std::max({std::fabs(expectedScore), std::fabs(found->second), 1.0f});
     EXPECT_NEAR(expectedScore, found->second, 1e-6f * scale) << id;
+  }
+}
+
+// Composition promises the exhaustive scores themselves, not just close ones.
+void expectBitIdenticalScoreMap(const std::map<std::string, float>& expected,
+                                const std::map<std::string, float>& actual) {
+  ASSERT_EQ(expected.size(), actual.size());
+  for (const auto& [id, expectedScore] : expected) {
+    auto found = actual.find(id);
+    ASSERT_NE(found, actual.end()) << id;
+    EXPECT_EQ(std::bit_cast<uint32_t>(expectedScore),
+              std::bit_cast<uint32_t>(found->second)) << id;
   }
 }
 
@@ -5850,8 +5863,82 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   EXPECT_EQ(1, equalCosts.wholeBypasses);
 }
 
+// Text queries leave minShouldMatch unset; an exact count must still
+// compose with a pruned ranking instead of scoring every match.
+TEST_F(SearchEngineTest, exactCountComposesForUnfilteredTextQueries) {
+  constexpr std::string_view collection = "exact_composition_text";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3000; doc++) {
+    std::string body = "filler";
+    if ((doc % 2) == 0) body += " alpha";
+    if ((doc % 3) == 0) body += " beta";
+    if ((doc % 5) == 0) body += " alpha beta";
+    if ((doc % 11) == 0) body += " beta beta gamma";
+    std::string title = (doc % 7) == 0 ? "alpha title" : "title";
+    docs.push_back(flatdoc("id", "text_" + std::to_string(doc),
+                           "body_w", body, "title_w", title));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    int64_t count;
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t compositions;
+  };
+  auto run = [&](auto makeQuery, bool disableComposition) {
+    // A resident membership from an earlier run would answer the count.
+    WholeMembershipPlanGuard wholeGuard(true);
+    TopKCountCompositionGuard compositionGuard(
+        disableComposition,
+        TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").countLimit().getScores()
+        .fields({"id"}).limit(10);
+    cur.rawQuery() = makeQuery(cur.mr());
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{req->getMatchCount("q"), resultIds(*req, "q"),
+                  resultScoreMap(*req, "q"),
+                  SkipStats::exactCountTopKCompositions};
+  };
+  auto check = [&](std::string_view name, auto makeQuery) {
+    SCOPED_TRACE(name);
+    Result composed = run(makeQuery, false);
+    Result exhaustive = run(makeQuery, true);
+    EXPECT_GT(composed.compositions, 0);
+    EXPECT_EQ(0, exhaustive.compositions);
+    EXPECT_EQ(exhaustive.count, composed.count);
+    EXPECT_EQ(exhaustive.ids, composed.ids);
+    expectBitIdenticalScoreMap(exhaustive.scores, composed.scores);
+  };
+
+  check("match", [](auto& mr) {
+    return qb::match(mr, "body_w", "alpha beta gamma");
+  });
+  check("boolean", [](auto& mr) {
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")});
+  });
+  check("multi_match", [](auto& mr) {
+    return qb::multiMatch(mr, "alpha beta gamma alpha",
+                          {{"body_w", {}}, {"title_w", 2.0f}});
+  });
+  check("phrase", [](auto& mr) {
+    return qb::phraseText(mr, "body_w", "alpha beta");
+  });
+  for (std::string_view program : {"add(score,1)", "sub(100,score)", "mul(score,score)"}) {
+    check(program, [program](auto& mr) {
+      return qb::rescore(mr, qb::phraseWords(mr, "body_w", {"alpha", "beta"}), program);
+    });
+  }
+}
+
 TEST_F(SearchEngineTest,
-       exactCompositionIneligibleConstantRankingDeclinesBeforeBuild) {
+       exactCompositionFilteredUnionWithTiedScoresMatchesExhaustive) {
   constexpr std::string_view collection =
       "exact_composition_constant_ranking";
   constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
@@ -5921,9 +6008,9 @@ TEST_F(SearchEngineTest,
     unused(id);
     EXPECT_EQ(score, candidateScore);
   }
-  EXPECT_GT(planned.fallbacks, 0)
-      << planned.profitabilityRejects << " " << planned.sparseRejects
-      << " " << planned.compositions;
+  EXPECT_GT(planned.compositions, 0)
+      << planned.fallbacks << " " << planned.profitabilityRejects
+      << " " << planned.sparseRejects;
   EXPECT_EQ(0, planned.exactCompositionRejects);
 }
 

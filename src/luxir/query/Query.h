@@ -884,6 +884,9 @@ public:
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
       BulkAnswer statelessReposition = BulkAnswer::NO;
+      // For EXACT_CANDIDATE_SCORING, with no bulk: one scorer produces every
+      // score, so a pruned ranking pass needs no rescoring of its survivors.
+      BulkAnswer rankingScoresExact = BulkAnswer::NO;
 
       [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
         if (buildState == nullptr) return statelessReposition;
