@@ -64,7 +64,7 @@ void sortById(std::vector<Doc>& docs) {
 void buildMergedIndex(CollectionHelper& helper) {
   helper.clear();
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   auto docs = mergeCorpus();
   for (const auto& doc : docs) {
     auto result = helper.index(doc, UpdateMessage::COMMIT, true);

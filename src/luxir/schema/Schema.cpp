@@ -7,6 +7,7 @@
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/index/TieredMergePolicy.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -873,6 +874,20 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   }
   std::ranges::sort(resources, {}, &ResourcePair::first);
 
+  // The merge policy is replaced only when the def names one. Building it
+  // once checks the name and params, so a bad one fails the schema request
+  // instead of a later merge decision.
+  std::optional<api::MergePolicyDef> mergePolicy = def.merge_policy ? def.merge_policy : baseSrc.merge_policy;
+  if (mergePolicy) {
+    try {
+      MergePolicyRegistry::global().make(mergePolicy->name, mergePolicy->params,
+                                         TieredMergePolicy::DEFAULT_MERGE_FACTOR);
+    } catch (const std::invalid_argument& e) {
+      throw SchemaError(std::string("merge_policy: ") + e.what());
+    }
+    schema->mergePolicy = std::make_shared<const MergePolicySpec>(*mergePolicy);
+  }
+
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
   auto hasEntry = [&](std::string_view name) {
@@ -930,6 +945,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
+    src.merge_policy = mergePolicy;
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

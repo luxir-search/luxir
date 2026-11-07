@@ -31,7 +31,7 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   LuxirNode node(config);
   CollectionHelper h(node, "main");
   auto w = h.getIndexWriter();
-  w->mergePolicy->setMergeFactor(100);
+  w->setMergeFactor(100);
   ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b"), flatdoc("id", "c")},
                         UpdateMessage::COMMIT).success);
   ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
@@ -297,7 +297,7 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
   LuxirNode node;
   CollectionHelper h(node, "main");
   auto writer = h.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto previous = writer->snapshots.snapshot();
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
