@@ -255,7 +255,7 @@ public:
   CollectionHelper(LuxirNode& node, const CollectionId& id)
     : node_(&node) {
     collection_ = node.getOrCreateCollection(id);
-    getIndexWriter()->mergePolicy->setMergeFactor(node.getConfig().index.merge_factor);
+    getIndexWriter()->setMergeFactor(node.getConfig().index.merge_factor);
   }
 
   Collection& collection() { return *collection_; }

@@ -41,7 +41,7 @@ PluginRegistry& PluginRegistry::global() {
 
 Registries Registries::global() {
   return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), QueryRegistry::global(),
-          SearchOpRegistry::global(), HttpRouteRegistry::global()};
+          SearchOpRegistry::global(), HttpRouteRegistry::global(), MergePolicyRegistry::global()};
 }
 
 void Registries::freeze() {
@@ -51,6 +51,7 @@ void Registries::freeze() {
   query.freeze();
   searchOps.freeze();
   http.freeze();
+  mergePolicies.freeze();
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {

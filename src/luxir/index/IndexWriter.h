@@ -21,6 +21,9 @@
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
+#include "luxir/index/MergePolicy.h"
+#include "luxir/index/MergePolicyRegistry.h"
+#include "luxir/index/TieredMergePolicy.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/IncarnationState.h"
 #include "luxir/search/IndexReader.h"
@@ -58,7 +61,6 @@ public:
     uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
-    int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
@@ -125,7 +127,7 @@ public:
 
 
 inline std::string format_as(const SegInfo& seg) {
-  return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
+  return fmt::format("(seg={} max={} live={} lgen={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.merging,
                      seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schema.generation(), seg.personalDeletes.size());
 }
 
@@ -192,150 +194,6 @@ public:
     uint64_t deleteOnlyFlushCap = 0;
   };
 
-  // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
-  // if we add a method to IndexWriter to get/set the merge factor or other configurable things.
-  class MergePolicy {
-    std::vector<SegInfo*> segsCopy;
-    std::vector<int32_t> levelCounts;
-    int32_t segCount = 0;  // a sanity check that we are in-sync with segments in the IndexWriter.
-  public:
-    static constexpr int32_t DEFAULT_MERGE_FACTOR = 10;
-    IndexWriter& iw;
-    int32_t outstandingMerges = 0;
-    int32_t mergeFactor = DEFAULT_MERGE_FACTOR;
-    // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
-    // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
-    // when a merge happens at tier 3, sweep up all the smaller segments as well.  I'm not sure this
-    // really makes sense though since it would only occasionally fix the "many small segments" problem, and
-    // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
-    // through an API that requests a more aggressive merge to sweep up small segments.
-
-    // Methods with _ prefix should be called with the indexMutex already locked.
-    MergePolicy(IndexWriter& iw) : iw(iw) {}
-
-    void setMergeFactor(int32_t mergeFactor) {
-      this->mergeFactor = std::max(2,mergeFactor);
-    }
-
-    // re-calculate the merges from scratch (i.e. not incrementally)
-    // does not kick off any merges.
-    void refresh() {
-      std::lock_guard<std::mutex> lock(iw.indexMutex);
-      _refresh();
-    }
-
-    void _refresh() {
-      segCount = 0;
-      levelCounts.clear();
-      for (auto& [segId, seg] : iw.segInfos) {
-        _update(seg.get());
-      }
-    }
-
-    void _sanityCheck() {
-      if ((size_t)segCount != iw.segInfos.size()) {
-        LOG_ERROR(
-                "Internal Error, please report. MergePolicy segCount {} does not match live segment count of {}.",
-                segCount, iw.segInfos.size());
-        _refresh();  // Fix the bug.  This currently no longer triggers, but is left here for defensive reasons.
-      }
-    }
-
-    // TODO: deletes are not considered.  The level comes from maxDoc and a merge
-    // needs mergeFactor segments at one level, so a mostly-deleted segment keeps
-    // its level and its dead docs are reclaimed only once that level fills;
-    // overwrite-heavy loads grow the index until then.
-    //
-    // Integer arithmetic: a floating-point log ratio rounds exact powers of the
-    // merge factor (e.g. 100 docs for factor 10) down a level.
-    int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
-      int32_t level = 0;
-      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
-        level++;
-      }
-      return level;
-    }
-
-    // Reserve any merge-policy storage needed by _update(seg) before the
-    // caller mutates segment ownership.  Call with indexMutex locked.
-    void _prepareUpdate(SegInfo* seg) {
-      int32_t mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
-      if (mergeLevel >= (int)levelCounts.size()) {
-        levelCounts.resize(mergeLevel + 1);
-      }
-    }
-
-    // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
-    // If seg is nullptr, then we check all segment levels for a merge.
-    // Call with indexMutex locked.
-    int32_t _update(SegInfo* seg) {
-      // assert that the index mutex is locked
-      int32_t mergeLevel = -1;
-
-      if (seg != nullptr) {
-        segCount++;
-
-        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
-        seg->mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
-        if (seg->mergeLevel >= (int) levelCounts.size()) {
-          levelCounts.resize(seg->mergeLevel + 1);
-        }
-        if (++levelCounts[seg->mergeLevel] >= mergeFactor) {
-          mergeLevel = seg->mergeLevel;
-        }
-        INDEX_DEBUG("merge level update: seg={} segLevel={} segLevelCount={} mergeLevel={}", *seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
-      } else {
-        // check all levels
-        for (auto i = 0u; i < levelCounts.size(); i++) {
-          if (levelCounts[i] >= mergeFactor) {
-            mergeLevel = i;
-            break;
-          }
-        }
-        INDEX_DEBUG("merge level update: seg=ALL mergeLevel={}", mergeLevel);
-      }
-
-
-      return mergeLevel;
-    }
-
-    // Call with indexMutex locked.
-    void _remove(SegInfo* seg) {
-      segCount--;
-      if (seg->mergeLevel >= 0) {
-        levelCounts[seg->mergeLevel]--;
-      }
-    }
-
-    // Call with indexMutex locked, returns true if new merge message was sent.
-    bool _maybeMergeSegments(SegInfo* seg) {
-      int mergeLevel = -1;
-      {
-        // const std::lock_guard<std::mutex> lock(iw.indexMutex);
-        mergeLevel = _update(seg);
-        if (mergeLevel < 0 || outstandingMerges > 0 || iw._forceMergePendingLocked()) {
-          return false;
-        }
-      }
-
-      class MyMergeMessage : public MergeMessage {
-      public:
-        void handle(IndexWriter& iw) override { unused(iw); }
-        void done(IndexWriter& iw) override {
-          unused(iw);
-          delete this;
-        }
-      };
-
-      auto msg = std::make_unique<MyMergeMessage>();
-      msg->mergeLevel = mergeLevel;
-      if (!iw._submitMergeLocked(msg.get())) {
-        return false;
-      }
-      msg.release();
-      return true;
-    }
-  };  // end MergePolicy
 
   Directory& dir;
   std::unique_ptr<IndexRamBudget> privateIndexRamBudget;
@@ -349,7 +207,13 @@ public:
   CommitId openingCommit; // Captured before this writer becomes externally visible.
   std::atomic<std::shared_ptr<const CommitSnapshot>> lastSnapshot;
 
-  std::unique_ptr<MergePolicy> mergePolicy;
+  // Merges submitted and not yet finished, policy and forced alike. The
+  // merge node runs one at a time, and the policy is asked only when none is
+  // outstanding. Protected by indexMutex.
+  int32_t outstandingMerges = 0;
+  // The node's --indexing.merge-factor, the default for the schema's merge
+  // policy (MergePolicyContext::nodeMergeFactor). Protected by indexMutex.
+  int32_t mergeFactor = TieredMergePolicy::DEFAULT_MERGE_FACTOR;
 
   // Tracks current segments in the index.  Keyed by uint64_t segId.
   // There needs to be higher level protection for transactions like replacing N segments with a new merged segment.
@@ -589,10 +453,15 @@ public:
   // arena, for a collection); null means the arena of the constructing thread.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
+                       int mergeFactor = TieredMergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
                        oneapi::tbb::task_arena* arena = nullptr);
   ~IndexWriter();
   void close();
+
+  // Sets the node default merge factor (as --indexing.merge-factor does);
+  // the next merge decision uses it unless the schema's merge_policy sets
+  // its own. Tests use it to force or hold off merges.
+  void setMergeFactor(int32_t factor);
 
   // Per-inverter auto-flush caps, evaluated once at the end of each update batch
   // (ProtoUpdateMessage::handle): an inverter past either cap is flushed to a
@@ -832,6 +701,34 @@ private:
   void enqueueForceMerge(UpdateMessage& origin);
   void completeForceMerge(MergeMessage& msg);
   void _resumePolicyMergesLocked();
+
+  // The policy in force: built from the published schema's merge_policy and
+  // mergeFactor, rebuilt when either changes. Protected by indexMutex.
+  struct ActiveMergePolicy {
+    std::shared_ptr<const MergePolicySpec> spec;
+    int32_t nodeMergeFactor = 0;
+    std::unique_ptr<MergePolicy> policy;
+  } activeMergePolicy;
+  // Answers MergeSegmentSummary from the segment's PostingsReader.
+  class PolicySegmentSummary;
+  // Caller must hold indexMutex. Never throws: a policy that cannot be built
+  // from the schema (a plugin's maker failing at reopen) falls back to the
+  // default policy.
+  MergePolicy& _mergePolicyLocked();
+  // Asks the policy over the live segments (segId order) and maps its merge
+  // back to segments that can merge (live, not empty, not merging): the first
+  // spec naming `triggerSegId`, or the first spec when that is 0. A flush
+  // starts only merges its segment takes part in, so a due merge that failed
+  // (say, over incompatible field types) is not retried on every flush.
+  // Caller must hold indexMutex.
+  std::vector<SegInfo*> _selectPolicyMergeLocked(uint64_t triggerSegId);
+  // Submits a merge when the policy has one due (see above) and none is
+  // outstanding; true when a merge message was submitted. Caller must hold
+  // indexMutex. Policy failures are logged, never thrown.
+  bool _maybeMergeSegmentsLocked(uint64_t triggerSegId = 0);
+  // The policy's level for `seg` (stats, the mergeStart signal). Caller must
+  // hold indexMutex.
+  int32_t _mergeLevelLocked(SegInfo& seg);
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
