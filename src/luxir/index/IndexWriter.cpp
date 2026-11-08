@@ -2258,6 +2258,50 @@ void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noe
   }
 }
 
+std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema& schema,
+                                                      std::vector<std::string>& outFiles) noexcept {
+  std::vector<AuxInfo> built;
+  for (const auto& spec : schema.segmentOverlays) {
+    std::string overlayName = spec->overlayName();
+    std::vector<std::string> staged;
+    try {
+      if (seg.maxDoc < spec->def.min_docs) continue;
+      if (!seg.attemptedPluginOverlays.insert(overlayName).second) continue;
+      if (std::ranges::any_of(seg.auxOverlays, [&](const AuxInfo& info) { return info.name == overlayName; })) continue;
+      auto reader = getSegmentPostingsReader(seg);
+      uint64_t gen = nextSegmentOverlayGen(seg);
+      SegmentOverlayBuild request{seg.segId, seg.maxDoc, *reader, spec->resolveFields(*reader), dir,
+                                  [&](uint32_t fnum) {
+                                    std::string name = Postings::getSegmentOverlayFileName(seg.segId, overlayName, gen, fnum,
+                                                                                           seg.creatorEpoch, writerEpoch);
+                                    staged.push_back(name);
+                                    return name;
+                                  }};
+      if (request.fields.empty()) continue;
+      auto output = SegmentOverlayRegistry::global().make(*spec)->build(request);
+      if (!output) {
+        deleteStagedOverlayFiles(staged, "empty plugin overlay build");
+        continue;
+      }
+      AuxInfo info;
+      info.kind = std::string(spec->def.kind);
+      info.name = std::move(overlayName);
+      info.gen = gen;
+      info.files = std::move(output->files);
+      info.opaque_meta = std::move(output->meta);
+      built.push_back(std::move(info));
+      outFiles.insert(outFiles.end(), staged.begin(), staged.end());
+    } catch (const std::exception& e) {
+      deleteStagedOverlayFiles(staged, "plugin overlay build failure");
+      LOG_WARN("Overlay '{}' not built for seg={}: {}", spec->overlayName(), seg.segId, e.what());
+    } catch (...) {
+      deleteStagedOverlayFiles(staged, "plugin overlay build failure");
+      LOG_WARN("Overlay '{}' not built for seg={}: unknown exception", spec->overlayName(), seg.segId);
+    }
+  }
+  return built;
+}
+
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
   std::lock_guard lock(indexMutex);
   return seg.nextOverlayGen++;
@@ -2387,6 +2431,18 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
         info.opaque_meta.assign((const std::byte*)testMeta.data(),
                                 (const std::byte*)testMeta.data() + testMeta.size());
         stagedOverlays.push_back({seg, std::move(info)});
+      }
+    }
+
+    if (auto current = getSchema(); !current->segmentOverlays.empty()) {
+      // Bounded per commit: a collection that just enabled an overlay reaches
+      // its older segments over several commits.
+      size_t budget = PLUGIN_OVERLAY_BUILDS_PER_COMMIT;
+      for (size_t i = segsToKeep.size(); i > 0 && budget > 0; i--) {
+        auto* seg = segsToKeep[i - 1];
+        size_t attempted = seg->attemptedPluginOverlays.size();
+        for (auto& info : buildPluginOverlays(*seg, *current, stagedFiles)) stagedOverlays.push_back({seg, std::move(info)});
+        if (seg->attemptedPluginOverlays.size() != attempted) budget--;
       }
     }
 
@@ -2980,6 +3036,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
       phase = "segment_summary";
       writeSegmentSummary(*newSegInfo, pwriter);
+      phase = "plugin_overlays";
+      {
+        std::vector<std::string> pluginOverlayFiles;
+        for (auto& info : buildPluginOverlays(*newSegInfo, *mergeSchema, pluginOverlayFiles)) newSegInfo->auxOverlays.push_back(std::move(info));
+        newSegInfo->unsyncedFiles.insert(newSegInfo->unsyncedFiles.end(), pluginOverlayFiles.begin(), pluginOverlayFiles.end());
+      }
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();

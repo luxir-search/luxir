@@ -16,6 +16,7 @@
 #include "SchemaBinding.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/index/MergePolicyRegistry.h"
+#include "luxir/index/SegmentOverlayRegistry.h"
 
 namespace luxir {
 
@@ -74,6 +75,8 @@ public:
   // The authored merge_policy, validated against MergePolicyRegistry; null
   // selects the default policy. The writer builds its policy from it.
   std::shared_ptr<const MergePolicySpec> mergePolicy;
+  // The authored segment_overlays, validated against SegmentOverlayRegistry.
+  std::vector<std::shared_ptr<const SegmentOverlaySpec>> segmentOverlays;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,

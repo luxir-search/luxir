@@ -888,6 +888,23 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     schema->mergePolicy = std::make_shared<const MergePolicySpec>(*mergePolicy);
   }
 
+  // The overlay list is replaced only when the def names one.
+  std::span<const api::SegmentOverlayDef> segmentOverlays = !def.segment_overlays.empty() ? def.segment_overlays : baseSrc.segment_overlays;
+  {
+    std::set<std::string_view> overlayNames;
+    for (const auto& overlay : segmentOverlays) {
+      if (!overlayNames.insert(overlay.name).second) {
+        throw SchemaError("segment_overlays: duplicate overlay '" + std::string(overlay.name) + "'");
+      }
+      try {
+        SegmentOverlayRegistry::global().validate(overlay);
+      } catch (const std::invalid_argument& e) {
+        throw SchemaError(std::string("segment_overlays: ") + e.what());
+      }
+      schema->segmentOverlays.push_back(std::make_shared<const SegmentOverlaySpec>(overlay));
+    }
+  }
+
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
   auto hasEntry = [&](std::string_view name) {
@@ -946,6 +963,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
     src.merge_policy = mergePolicy;
+    src.segment_overlays = segmentOverlays;
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

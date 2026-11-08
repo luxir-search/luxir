@@ -111,6 +111,9 @@ public:
     // ANN entries are carried by segment liveness; coreGen does not
     // participate.
     std::vector<AuxInfo> auxOverlays;
+    // Plugin overlays this writer already tried to build for the segment, so
+    // one that built nothing or failed is not rebuilt at every commit.
+    boost::unordered_flat_set<std::string> attemptedPluginOverlays;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
     uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
@@ -772,7 +775,12 @@ private:
   // as the segment's "segment_summary" overlay. A failure leaves the segment
   // without a summary, which proves nothing, and never fails the flush or
   // merge.
+  static constexpr size_t PLUGIN_OVERLAY_BUILDS_PER_COMMIT = 8;
   void writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept;
+  // Builds the schema's plugin overlays `seg` lacks. Never throws: an overlay
+  // that fails is logged and the segment goes on without it. Returns the
+  // built overlays and adds their files to `outFiles`.
+  std::vector<AuxInfo> buildPluginOverlays(SegInfo& seg, const Schema& schema, std::vector<std::string>& outFiles) noexcept;
   // The segment's summary, opened from its overlay file on first need; null
   // when it has none or it cannot be read.
   std::shared_ptr<const SegmentSummary> segmentSummary(SegInfo& seg) noexcept;

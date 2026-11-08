@@ -439,6 +439,20 @@ next one on and does not rewrite existing segments. A collection whose stored
 schema names a policy the binary no longer has fails to load, like one naming
 an unknown analyzer.
 
+### Segment overlays
+
+Plugins can attach extra per-segment structures to a collection, for example
+filters that let a search skip segments. The top-level `segment_overlays`
+lists them: `name` is unique in the schema, `kind` is registered by a plugin,
+`fields` names the physical fields covered (exact names or globs with one
+`*`), `params` configures the kind, and segments with fewer than `min_docs`
+documents get no overlay.
+
+An overlay never affects indexing or results if it fails to build or read: the
+segment simply goes without it. Segments written before the overlay was added
+gain it over later commits. An unknown kind or an invalid param fails the
+schema request. `mode=set` replaces the list only when the request names one.
+
 ## Text analysis
 
 A text analyzer applies an ordered list of `char_filters` to the whole value,

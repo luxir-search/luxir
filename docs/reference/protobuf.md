@@ -152,6 +152,7 @@ defaults and constraints are described in the comments and guides.
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MergePolicyDef`](#message-luxir.mergepolicydef)
+- [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
@@ -1608,6 +1609,22 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
 | <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
 
+<a id="message-luxir.segmentoverlaydef"></a>
+
+### luxir.SegmentOverlayDef
+
+One plugin overlay of a collection's segments (SchemaDef.segment\_overlays).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.segmentoverlaydef.name"></a>[`name`](#field-luxir.segmentoverlaydef.name) | 1 | `string` | singular | \[a-z0-9\_\]+, unique in the schema |
+| <a id="field-luxir.segmentoverlaydef.kind"></a>[`kind`](#field-luxir.segmentoverlaydef.kind) | 2 | `string` | singular | a kind registered by a plugin |
+| <a id="field-luxir.segmentoverlaydef.fields"></a>[`fields`](#field-luxir.segmentoverlaydef.fields) | 3 | `string` | repeated | The physical fields the overlay covers: exact names, or globs with one '\*'. |
+| <a id="field-luxir.segmentoverlaydef.params"></a>[`params`](#field-luxir.segmentoverlaydef.params) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | read by the kind's maker |
+| <a id="field-luxir.segmentoverlaydef.min_docs"></a>[`min_docs`](#field-luxir.segmentoverlaydef.min_docs) | 5 | `int32` | singular | segments with fewer documents get no overlay |
+
 <a id="message-luxir.mergepolicydef"></a>
 
 ### luxir.MergePolicyDef
@@ -2163,6 +2180,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
 | <a id="field-luxir.schemadef.merge_policy"></a>[`merge_policy`](#field-luxir.schemadef.merge_policy) | 6 | [`MergePolicyDef`](#message-luxir.mergepolicydef) | singular | How the collection's segments merge: a policy registered under \`name\` (built in: "tiered"; plugins add others) and its params. Absent selects "tiered" with the node's --indexing.merge-factor. An unknown name or a bad param fails the schema request. mode=set replaces it only when the request names one; it applies to merge decisions from the next one on. |
+| <a id="field-luxir.schemadef.segment_overlays"></a>[`segment_overlays`](#field-luxir.schemadef.segment_overlays) | 7 | [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef) | repeated | Per-segment overlays registered by plugins (for example term filters), built for the segments of this collection. mode=set replaces the list only when the request names one. An unknown kind or a bad param fails the schema request. Segments written earlier gain an overlay at later commits. |
 
 <a id="message-luxir.schemarequest"></a>
 
