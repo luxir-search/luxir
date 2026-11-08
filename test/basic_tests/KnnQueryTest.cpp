@@ -1324,6 +1324,42 @@ TEST_F(KnnQueryTest, booleanProhibitedMatchAllOrNothingWithKnn) {
   }
 }
 
+// A constant-scoring required sibling is a pure constraint, so it narrows the
+// kNN domain like a filter: k neighbors that match it. A scoring sibling keeps
+// post-filtering the kNN's top k.
+TEST_F(KnnQueryTest, booleanConstantRequiredSiblingConstrainsKnn) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+
+  // Nearest to the query are the "orange" docs; only "apple" ones match.
+  h.index(flatdoc("id", std::string("n0"), "foo_w", "orange",
+                  "body_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("n1"), "foo_w", "orange",
+                  "body_v", std::vector<float>{0.9f, 0.1f}));
+  h.index(flatdoc("id", std::string("a0"), "foo_w", "apple",
+                  "body_v", std::vector<float>{0.0f, 1.0f}));
+  h.index(flatdoc("id", std::string("a1"), "foo_w", "apple",
+                  "body_v", std::vector<float>{0.1f, 0.9f}));
+  h.commit({"*"});
+
+  auto run = [&](bool constant) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(10).countLimit().fields({"id"});
+    auto term = qb::match(cur.mr(), "foo_w", "apple");
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::knn(cur.mr(), "body_v", {1.0f, 0.0f}, 2),
+                      constant ? qb::constantScore(cur.mr(), term) : term});
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  EXPECT_EQ(run(true), (std::vector<std::string>{"a0", "a1"}));
+  EXPECT_TRUE(run(false).empty());
+}
+
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
