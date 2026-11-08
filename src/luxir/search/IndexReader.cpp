@@ -294,7 +294,9 @@ void SegmentPart<Value>::declareReads(ReadSet& reads) {
 void Segment::declareReads(ReadSet& reads) const {
   sharedBase->declareReads(reads);
   if (sharedLive) sharedLive->declareReads(reads);
-  for (const auto& overlay : sharedOverlays) overlay->declareReads(reads);
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->policy.onDemand) overlay->declareReads(reads);
+  }
 }
 
 void Segment::materialize() const {
