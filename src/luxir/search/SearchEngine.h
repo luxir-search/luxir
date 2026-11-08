@@ -26,6 +26,7 @@ class SearchEngine {
   // group run() made on its stack, which a deferred request leaves behind.
   void submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg);
   // Parses and plans, then (after the materialize round) executes.
+  void fetchTermReads(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg, std::shared_ptr<MetricScope> execution);
   void plan(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg, std::shared_ptr<MetricScope> execution);
   // Fetches `reads` ahead of the work that needs them. False when they
   // completed inline (local files): the caller goes on. True when the request

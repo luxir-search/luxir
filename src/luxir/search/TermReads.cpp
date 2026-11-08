@@ -3,11 +3,14 @@
 
 #include "TermReads.h"
 
+#include <algorithm>
 #include <optional>
 #include <string_view>
 #include <vector>
 
+#include "luxir/analysis/Analyzer.h"
 #include "luxir/query/QueryPruning.h"
+#include "luxir/query/SummaryView.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 
@@ -15,27 +18,53 @@ namespace luxir {
 
 namespace {
 
-// Collects the segments whose base a term lookup of the request opens.
+// Walks the term-level queries of a request. With `segments` it collects the
+// segments whose base a term lookup opens; with `probes` the term membership
+// ranges the lookups will read.
 class TermFields {
   const Schema& schema;
   IndexReader& reader;
-  SegmentMask& segments;
+  SegmentMask* segments;
+  ReadSet* probes;
 
-  // `term` is the exact value when the query seeks one, else empty.
-  void field(std::string_view name, std::optional<std::string_view> term) {
+  // The dictionary terms a value seeks, or nullopt when they are not known here.
+  static std::optional<std::vector<std::string>> termsOf(FieldType& type, std::optional<std::string_view> value) {
+    if (!value) return std::nullopt;
+    if (type.type() != FieldType::TEXT) return std::vector<std::string>{std::string(*value)};
+    auto& text = static_cast<TextFieldType&>(type);
+    if (!text.analyzer_) return std::nullopt;
+    auto chain = text.analyzer_->createChain();
+    Token& token = chain->getToken();
+    std::vector<std::string> terms;
+    PackedTerm::TermBuffer scratch;
+    chain->setValue(*value);
+    chain->reset();
+    while (chain->tail->incrementToken()) {
+      if (auto fitted = PackedTerm::fitTerm(type.longTerms, token.text, scratch)) terms.emplace_back(*fitted);
+    }
+    return terms;
+  }
+
+  void field(std::string_view name, std::optional<std::string_view> value) {
     auto* type = schema.getFieldTypePtr(name);
     if (!type) return;
     auto kind = type->type();
     if (kind != FieldType::TEXT && kind != FieldType::STRING && kind != FieldType::ID) return;
-    // An analyzed field seeks the analyzed tokens, not the raw text.
-    if (kind == FieldType::TEXT) term.reset();
     auto present = reader.field(name);
     if (!present.exists()) return;
+    auto terms = termsOf(*type, value);
     const auto& segs = reader.segments();
     for (size_t i = 0; i < segs.size(); i++) {
-      if (segments.test(i) || !present.presentIn(i) || segs[i].isOpen()) continue;
-      if (term && QueryPruning::termAbsent(segs[i], name, *term)) continue;
-      segments.set(i);
+      if (!present.presentIn(i) || segs[i].isOpen()) continue;
+      if (probes != nullptr) {
+        if (!terms || !segs[i].hasTermMembership()) continue;
+        for (const auto& term : *terms) {
+          if (!SummaryView::provesTermAbsent(segs[i].summary(), name, term)) segs[i].declareMembershipProbes(name, term, *probes);
+        }
+      } else if (!segments->test(i)
+                 && !(terms && std::ranges::all_of(*terms, [&](const auto& term) { return QueryPruning::termAbsent(segs[i], name, term); }))) {
+        segments->set(i);
+      }
     }
   }
 
@@ -50,8 +79,8 @@ class TermFields {
   }
 
 public:
-  TermFields(const Schema& schema, IndexReader& reader, SegmentMask& segments)
-      : schema(schema), reader(reader), segments(segments) {}
+  TermFields(const Schema& schema, IndexReader& reader, SegmentMask* segments, ReadSet* probes)
+      : schema(schema), reader(reader), segments(segments), probes(probes) {}
 
   template <class View>
   void query(const View& view) {
@@ -116,8 +145,13 @@ void declareTermReads(const api::SearchRequest& request, const Schema& schema, I
                       ReadSet& reads) {
   if (reader.segments().empty()) return;
   SegmentMask segments(reader.segments().size(), false);
-  TermFields(schema, reader, segments).ops(request.ops);
+  TermFields(schema, reader, &segments, nullptr).ops(request.ops);
   if (segments.popcount() > 0) reader.declareBases(segments, reads);
+}
+
+void declareTermProbes(const api::SearchRequest& request, const Schema& schema, IndexReader& reader, ReadSet& reads) {
+  if (reader.segments().empty()) return;
+  TermFields(schema, reader, nullptr, &reads).ops(request.ops);
 }
 
 }  // namespace luxir

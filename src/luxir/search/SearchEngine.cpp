@@ -96,6 +96,24 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::ta
     return;
   }
   if (mayDefer) {
+    // Term membership overlays decide which dictionaries need fetching, so
+    // their ranges come first.
+    ReadSet probes;
+    try {
+      declareTermProbes(req.proto, *req.schema, *req.reader, probes);
+    } catch (const std::exception& e) {
+      LOG_DEBUG("declaring term probes failed: {}", e.what());  // they are read as they are used
+      probes.clear();
+    }
+    auto resume = [this, &req, execution](oneapi::tbb::task_group* tg) { fetchTermReads(req, true, tg, execution); };
+    if (fetchAhead(req, std::move(probes), ownTg, std::move(resume))) return;
+  }
+  fetchTermReads(req, mayDefer, ownTg, execution);
+}
+
+void SearchEngine::fetchTermReads(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg,
+                                  std::shared_ptr<MetricScope> execution) {
+  if (mayDefer) {
     // Parsing seeks terms in the segments it may match: fetch the term
     // dictionaries first, so those seeks read resident bytes.
     ReadSet reads;

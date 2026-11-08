@@ -507,12 +507,10 @@ over every segment.
   sources plan (today its sources plan normally and their root masks prune
   every segment), and facets below a proven-empty op that build global
   ordinal maps over every segment.
-- Membership structures (exact term sets, term and prefix filters). They help
-  most on cold segments, where they are much smaller than the dictionary and
-  can stay cached, but they cost build memory and space. They will come as a
-  later, opt-in overlay kind per field, built for segments that have stopped
-  merging, not bundled with this mandatory metadata. An exact set is not
-  needed by default: a field small enough for one has a dictionary about as
-  small.
+- Prefix membership filters. Exact term membership is an opt-in overlay
+  (`TermMembership`, registered by a plugin), consulted after the term bounds:
+  it proves a term absent from a segment without opening its dictionary. It
+  is not bundled with this mandatory metadata, and it applies per segment
+  only: filters cannot be unioned into the collection summary.
 - Vector statistics (centroids, boxes), to be designed together with the kNN
   segment ordering that would use them.

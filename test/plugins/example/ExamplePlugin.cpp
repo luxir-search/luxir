@@ -129,6 +129,42 @@ public:
   std::string_view getName() const override { return name; }
 };
 
+// A term membership overlay that claims every term with its prefix is absent,
+// true or not: the tests use it to show what pruning does with a proof.
+class AbsentPrefixOverlay final : public SegmentOverlayKind {
+  std::string prefix;
+
+public:
+  explicit AbsentPrefixOverlay(std::string prefix) : prefix(std::move(prefix)) {}
+  std::optional<SegmentOverlayOutput> build(const SegmentOverlayBuild& request) const override {
+    auto file = request.dir.createFile(request.fileName(0));
+    OutputStream os;
+    os.setFile(&*file);
+    os.write("-", 1);
+    os.close();
+    request.dir.finishFile(*file);
+    SegmentOverlayOutput output;
+    output.files.push_back(file->descriptor());
+    output.meta.assign((const std::byte*)prefix.data(), (const std::byte*)prefix.data() + prefix.size());
+    return output;
+  }
+};
+
+class AbsentPrefixReader final : public AuxReader, public TermMembership {
+  std::string name;
+  std::string prefix;
+
+public:
+  explicit AbsentPrefixReader(const api::AuxIndexInfo& info)
+      : AuxReader(info.gen, info.built_core_gen), name(info.name),
+        prefix((const char*)info.opaque_meta.data(), info.opaque_meta.size()) {}
+  std::string_view getKind() const override { return "example_absent_prefix"; }
+  std::string_view getName() const override { return name; }
+  const TermMembership* termMembership() const noexcept override { return this; }
+  bool provesAbsent(std::string_view, std::string_view term) const noexcept override { return term.starts_with(prefix); }
+  std::string_view label() const noexcept override { return "example absent prefix"; }
+};
+
 class ExamplePlugin : public Plugin {
 public:
   static inline std::atomic<bool> throwOnNodeStateCreation{false};
@@ -197,6 +233,16 @@ public:
         std::string_view text = file->read();
         return std::make_shared<FieldListReader>(info, std::string(text));
       },
+    });
+
+    r.segmentOverlays.add("example_absent_prefix", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<AbsentPrefixOverlay>(std::string(ctx.params.requireString("prefix")));
+      },
+      .open = [](Directory&, const api::AuxIndexInfo& info) -> std::shared_ptr<AuxReader> {
+        return std::make_shared<AbsentPrefixReader>(info);
+      },
+      .policy = {.onDemand = true, .advisory = true, .termMembership = true},
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());

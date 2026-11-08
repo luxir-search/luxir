@@ -3,9 +3,9 @@
 
 #pragma once
 // Shared Query::mayMatch evaluations over a SummaryView, one per predicate
-// shape. EMPTY is a proof; UNKNOWN is the fallback. Term and prefix proofs
-// use field presence and term bounds only: the summary carries no
-// membership structures.
+// shape. EMPTY is a proof; UNKNOWN is the fallback. Term proofs use field
+// presence, term bounds and any term membership overlay of the segment.
+// Prefix proofs use presence and bounds only.
 
 #include <optional>
 #include <string_view>
@@ -39,11 +39,12 @@ inline const api::FieldSummary* requireField(const SummaryView& view, std::strin
 inline MatchState termMatch(const SummaryView& view, std::string_view field, std::string_view term) {
   MatchState state;
   const auto* record = requireField(view, field, state);
-  if (record == nullptr) return state;
-  if (SegmentSummary::boundsExcludeTerm(*record, term)) {
+  if (record == nullptr && state == MatchState::EMPTY) return state;
+  if (record != nullptr && SegmentSummary::boundsExcludeTerm(*record, term)) {
     view.prove("term outside term bounds");
     return MatchState::EMPTY;
   }
+  if (view.membershipExcludes(field, term)) return MatchState::EMPTY;
   return MatchState::UNKNOWN;
 }
 

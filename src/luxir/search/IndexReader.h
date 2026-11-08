@@ -18,6 +18,7 @@
 #include "luxir/index/SegmentSummary.h"
 #include "luxir/query/SegmentMask.h"
 #include "luxir/reader/AuxReader.h"
+#include "luxir/reader/TermMembership.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/store/HeldFiles.h"
 #include "luxir/util/Metrics.h"
@@ -258,6 +259,15 @@ public:
 
     // Every overlay of a known kind opened with the segment, materialized.
     std::vector<std::shared_ptr<AuxReader>> auxReaders() const;
+
+    // Whether an overlay of this segment can prove terms absent.
+    bool hasTermMembership() const noexcept;
+    // Whether an overlay proves `term` (dictionary form) absent from `field`.
+    // Fills `why` with the proof's label when it does. Never throws: any
+    // failure proves nothing.
+    bool membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why = nullptr) const noexcept;
+    // Adds the byte ranges those probes will read.
+    void declareMembershipProbes(std::string_view field, std::string_view term, ReadSet& reads) const noexcept;
 
     // The overlay `name`, materialized on first use; null when absent.
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const;
