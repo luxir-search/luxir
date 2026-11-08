@@ -54,6 +54,11 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   return nullptr;
 }
 
+SegmentOverlayPolicy overlayPolicyOf(std::string_view kind) {
+  if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  return {};
+}
+
 } // namespace
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
@@ -251,16 +256,30 @@ std::shared_ptr<LiveDocs> SegmentLive::get() {
 
 std::shared_ptr<AuxReader> SegmentOverlay::get() {
   if (auto value = cell.peek()) return value;  // the warm path builds no message
-  return getOrOpen("overlay " + info.name, [this](HeldFiles& held) {
+  return getOrOpen("overlay " + info.name, [this](HeldFiles& held) -> std::shared_ptr<AuxReader> {
     std::pmr::monotonic_buffer_resource arena;
-    return openKnownAux(held, toWire(info, arena), false);
+    if (!policy.advisory) return openKnownAux(held, toWire(info, arena), false);
+    std::shared_ptr<AuxReader> reader;
+    try {
+      reader = openKnownAux(held, toWire(info, arena), false);
+    } catch (const ApiError&) {
+      throw;
+    } catch (const std::system_error&) {
+      throw;
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (const std::exception& e) {
+      LOG_WARN("Advisory overlay '{}' is unusable and will answer nothing: {}", info.name, e.what());
+    }
+    if (reader) return reader;
+    return std::make_shared<UnavailableAuxReader>(info.kind, info.name, info.gen, info.built_core_gen);
   });
 }
 
 bool Segment::isMaterialized() const noexcept {
   if (!sharedBase->peek() || (sharedLive && !sharedLive->peek())) return false;
   for (const auto& overlay : sharedOverlays) {
-    if (!overlay->peek()) return false;
+    if (!overlay->policy.onDemand && !overlay->peek()) return false;
   }
   return true;
 }
@@ -281,13 +300,17 @@ void Segment::declareReads(ReadSet& reads) const {
 void Segment::materialize() const {
   sharedBase->get();
   if (sharedLive) sharedLive->get();
-  for (const auto& overlay : sharedOverlays) overlay->get();
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->policy.onDemand) overlay->get();
+  }
 }
 
 std::vector<std::shared_ptr<AuxReader>> Segment::auxReaders() const {
   std::vector<std::shared_ptr<AuxReader>> readers;
   readers.reserve(sharedOverlays.size());
-  for (const auto& overlay : sharedOverlays) readers.push_back(overlay->get());
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->policy.onDemand) readers.push_back(overlay->get());
+  }
   return readers;
 }
 
@@ -591,7 +614,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           }
           auto descriptors = fromWire(info.files);
           dir.expectSynced(descriptors);
-          segmentOverlays.push_back(std::make_shared<SegmentOverlay>(fromWire(info), std::move(held), metrics,
+          segmentOverlays.push_back(std::make_shared<SegmentOverlay>(fromWire(info), overlayPolicyOf(info.kind), std::move(held), metrics,
                                                                     onUnreadable));
         }
         if (retry) break;
