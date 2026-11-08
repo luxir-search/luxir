@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
@@ -2008,8 +2010,11 @@ private:
   // Vector columns: values are self-describing in their segment's encoding, so
   // when every input shares one encoding the bytes are copied verbatim (never
   // re-quantized).  Inputs with different encodings (a schema change between
-  // them) are written in the most precise of their encodings, transcoding only
-  // the less precise inputs, so a merge never loses precision.
+  // them) are written in the schema's current encoding, transcoding the
+  // others, so a field converges to its declared encoding.  Transcoding clamps
+  // to the F16 range and renormalizes unit-length cosine rows written as F32.
+  // Columns without a vector field type (the keep_original companion) keep
+  // the first input's encoding.
   void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     assert(sortedFields.size() == segs.size());
@@ -2063,12 +2068,22 @@ private:
 
     bool isVector = outputFieldInfo.type == FieldType::Type::VECTOR;
     VectorEncoding outEncoding = VectorEncoding::F32;
-    bool firstEncoding = true;
-    for (auto* f : sortedFields) {
-      if (f == nullptr || !isVector) continue;
-      auto e = (VectorEncoding)f->segFieldInfo.vectorEncoding;
-      if (firstEncoding || vcodec::precision(e) > vcodec::precision(outEncoding)) outEncoding = e;
-      firstEncoding = false;
+    bool renormalize = false;
+    if (isVector) {
+      auto* vtype = dynamic_cast<const VectorFieldType*>(
+          schema.getFieldTypePtr(std::string_view(outputFieldInfo.fieldname)));
+      if (vtype != nullptr) {
+        outEncoding = vtype->encoding();
+        renormalize = outEncoding == VectorEncoding::F32
+            && vtype->metric() == VectorFieldType::METRIC_COSINE
+            && (vtype->normalizeOnWrite() || vtype->normalized());
+      } else {
+        for (auto* f : sortedFields) {
+          if (f == nullptr) continue;
+          outEncoding = (VectorEncoding)f->segFieldInfo.vectorEncoding;
+          break;
+        }
+      }
     }
     outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
     std::vector<float> transcodeFloats;
@@ -2148,6 +2163,16 @@ private:
       auto convert = [&](std::string_view value) {
         if (!transcode) return value;
         vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
+        if (outEncoding == VectorEncoding::F16) {
+          for (auto& x : transcodeFloats) x = std::clamp(x, -vcodec::F16_MAX, vcodec::F16_MAX);
+        } else if (renormalize) {
+          double normSq = 0.0;
+          for (float x : transcodeFloats) normSq += (double)x * (double)x;
+          if (normSq > VectorFieldType::MIN_COSINE_NORM_SQ) {
+            float inv = (float)(1.0 / std::sqrt(normSq));
+            for (auto& x : transcodeFloats) x *= inv;
+          }
+        }
         vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
         return std::string_view(transcodeBytes.data(), transcodeBytes.size());
       };

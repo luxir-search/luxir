@@ -49,9 +49,10 @@ parameters:
   `(max - min) / 510`, per element.
 
 A merge of inputs with different encodings (a schema change between them)
-writes the most precise input encoding and transcodes only the less precise
-inputs, so a merge never loses precision; same-encoding merges are pure byte
-copies.
+writes the schema's current encoding and transcodes the other inputs, so a
+field converges to its declared encoding. Transcoding is lossy when it goes to
+a narrower encoding; it clamps to the f16 range and renormalizes unit-length
+cosine rows written as f32. Same-encoding merges are pure byte copies.
 
 Exact scoring means exact over the stored encoding. `VectorScorer` is the
 single place a float query is scored against a stored row, used by the flat

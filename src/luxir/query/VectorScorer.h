@@ -131,12 +131,13 @@ private:
       std::memcpy(&h, row + 2 * i, 2);
       x[i] = (float)h;
     }
+    // One kernel pass per metric.
+    if (metric == (int32_t)luxir::api::VectorMetric::L2) {
+      return fromParts(0, (double)faiss::fvec_L2sqr(query, x, (size_t)dims), 0, fallbackScore);
+    }
     double dot = (double)faiss::fvec_inner_product(query, x, (size_t)dims);
-    if (metric == (int32_t)luxir::api::VectorMetric::IP) return fromParts(dot, 0, 0, fallbackScore);
-    double normSq = (double)faiss::fvec_norm_L2sqr(x, (size_t)dims);
-    double distSq = metric == (int32_t)luxir::api::VectorMetric::L2
-        ? (double)faiss::fvec_L2sqr(query, x, (size_t)dims) : 0.0;
-    return fromParts(dot, distSq, normSq, fallbackScore);
+    if (metric != (int32_t)luxir::api::VectorMetric::COSINE) return fromParts(dot, 0, 0, fallbackScore);
+    return fromParts(dot, 0, (double)faiss::fvec_norm_L2sqr(x, (size_t)dims), fallbackScore);
   }
 
   // INT8: the codes (not the decoded values) are widened to float for
@@ -146,6 +147,12 @@ private:
     vcodec::Int8Header h = vcodec::readInt8Header(row);
     auto* codes = (const uint8_t*)(row + vcodec::INT8_HEADER_BYTES);
     float* c = scratch.data();
+    if (metric == (int32_t)luxir::api::VectorMetric::L2) {
+      // Decode and take the difference directly: the |q|^2 - 2 q.x + |x|^2
+      // decomposition cancels catastrophically for large offsets.
+      for (int32_t i = 0; i < dims; i++) c[i] = h.offset + h.scale * (float)codes[i];
+      return fromParts(0, (double)faiss::fvec_L2sqr(query, c, (size_t)dims), 0, fallbackScore);
+    }
     int64_t sumC = 0;
     int64_t sumCC = 0;
     for (int32_t i = 0; i < dims; i++) {

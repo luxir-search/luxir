@@ -211,8 +211,11 @@ the exact input.
 
 `encoding` and `keep_original` apply to segments written after the change.
 Existing segments keep the encoding they were written with, and a merge of
-segments with different encodings writes the most precise of them, so a merge
-never loses precision. To re-encode existing data, reindex it.
+segments with different encodings rewrites them in the field's current
+encoding, so a field converges to its declared encoding over time. Moving to a
+narrower encoding is lossy and cannot be undone without the original input
+(see `keep_original`). Under f16 or int8 storage, `exact` and `similarity`
+cut-offs compare scores computed over the quantized values.
 
 With
 [`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table

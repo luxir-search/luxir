@@ -2451,7 +2451,7 @@ public:
           unused(doc);
           heap.offer(makeHit());
         });
-        result.work.scoreBytes = result.work.exactVectors * dims * (int64_t)sizeof(float);
+        result.work.scoreBytes = result.work.exactVectors * (int64_t)vr.valueBytes();
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         result.boundedSelection = VectorSelection::COMPLETE;
@@ -3138,7 +3138,7 @@ private:
         buckets.emplace_back(b, e);
         b = e;
       }
-      std::vector<int64_t> readsByBucket(buckets.size());
+      std::vector<int64_t> readsByBucket(buckets.size()), bytesByBucket(buckets.size());
       auto readBucket = [&](size_t bucket) {
         return [&, bucket]() {
           auto [b, e] = buckets[bucket];
@@ -3168,6 +3168,7 @@ private:
             reads++;
           }
           readsByBucket[bucket] = reads;
+          bytesByBucket[bucket] = reads * (int64_t)column.valueBytes();
         };
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
@@ -3185,7 +3186,7 @@ private:
         int32_t segOrd = records[selected[buckets[i].first]].hit.segOrd;
         auto& work = workBySeg[(size_t)segOrd];
         (seed ? work.seedReads : work.remainingReads) += readsByBucket[i];
-        work.scoreBytes += readsByBucket[i] * dims * (int64_t)sizeof(float);
+        work.scoreBytes += bytesByBucket[i];
       }
     };
     readStage(true, KnnIntervalCollector<Groups>::NO_FLOOR);

@@ -68,17 +68,6 @@ inline int32_t dimsFromBytes(VectorEncoding e, int32_t bytes) {
   }
 }
 
-/// Merge order: a merge of segments with different encodings writes the most
-/// precise one, so a merge never loses precision.
-inline int32_t precision(VectorEncoding e) {
-  switch (e) {
-    case VectorEncoding::INT8: return 0;
-    case VectorEncoding::F16: return 1;
-    case VectorEncoding::F32:
-    default: return 2;
-  }
-}
-
 struct Int8Header {
   float offset;
   float scale;
