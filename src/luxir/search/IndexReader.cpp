@@ -329,6 +329,12 @@ void IndexReader::declareMaterialize(const SegmentMask& mask, ReadSet& reads) co
   }
 }
 
+void IndexReader::declareBases(const SegmentMask& mask, ReadSet& reads) const {
+  for (const auto& segment : core->segs) {
+    if (mask.test((size_t)segment.ord) && !segment.isOpen()) segment.sharedBase->declareReads(reads);
+  }
+}
+
 void IndexReader::materialize(const SegmentMask& mask) {
   std::vector<const Segment*> pending;
   for (const auto& segment : core->segs) {
