@@ -1,8 +1,12 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <climits>
 #include <csignal>
 #include <filesystem>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <poll.h>
 #include <spawn.h>
 #include <string>
@@ -17,11 +21,22 @@ namespace fs = std::filesystem;
 
 namespace {
 
+fs::path executablePath() {
+#if defined(__APPLE__)
+  char path[PATH_MAX];
+  uint32_t size = sizeof(path);
+  if (_NSGetExecutablePath(path, &size) != 0) return {};
+  return fs::canonical(path);
+#else
+  return fs::read_symlink("/proc/self/exe");
+#endif
+}
+
 // Signals are process-wide, so this drives the real `luxir` binary built next
 // to luxir_test rather than luxir_main in-process.
 class ServerShutdownTest : public ::testing::Test {
 protected:
-  fs::path binary = fs::read_symlink("/proc/self/exe").parent_path() / "luxir";
+  fs::path binary = executablePath().parent_path() / "luxir";
   fs::path dataDir = fs::temp_directory_path() / ("luxir_shutdown_" + std::to_string(getpid()));
 
   void SetUp() override {

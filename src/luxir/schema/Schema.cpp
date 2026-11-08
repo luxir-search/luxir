@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <cstddef>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +24,7 @@ using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
 using LongTerms = luxir::api::FieldDef_::LongTerms;
 using IndexOptions = luxir::api::FieldDef_::IndexOptions;
+using ApiDateUnit = luxir::api::FieldDef_::DateUnit;
 using StoredCodec = luxir::api::StoredResourceDef_::Codec;
 using VectorMetric = luxir::api::VectorMetric;
 
@@ -45,10 +47,11 @@ struct ResolvedField {
   std::optional<LongTerms> longTerms;
   std::optional<IndexOptions> indexOptions;
   std::optional<bool> norms;
+  std::optional<ApiDateUnit> dateUnit;
   bool hasColumn = false;
   bool column = false;
-  // The authored analyzer in force: the first non-empty AnalyzerDef in the
-  // parent chain (a view into the source entries); null = the type default.
+  // The effective analyzer, backed by source entries or AnalyzerDefinitions;
+  // null = the type default. Char-filter-only definitions keep the parent chain.
   const luxir::api::AnalyzerDef* analyzer = nullptr;
   const luxir::api::NormalizerDef* normalizer = nullptr;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
@@ -62,13 +65,15 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
-  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
+  std::optional<bool> geoIgnoreMalformed;
+  std::optional<bool> geoIgnoreZValue;
 };
 
 struct ResolvedOwnership {
   bool hasMulti = false;
-  bool multi = false;
+  api::FieldDef::MultiMode multi = api::FieldDef::MultiMode::SINGLE;
   bool hasStored = false;
   bool stored = false;
   // storedResource: empty string means "inherit from parent or use the
@@ -149,17 +154,35 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
 
 // An authored analyzer that says something: a tokenizer component (which must
 // then name a tokenizer - params-only input is an error, not a silent default)
-// or any filter.  {} inherits; filters-only replaces the whole parent analyzer
-// and gets the whitespace tokenizer.
+// or any filter, or a named analyzer. {} inherits; token filters alone replace
+// the whole parent analyzer and get the whitespace tokenizer; char filters alone
+// keep its chain.
 static bool analyzerSet(const luxir::api::FieldDef& def) {
   return def.analyzer.has_value() &&
-         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty());
+         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty() ||
+          !def.analyzer->char_filters.empty() || !def.analyzer->name.empty());
 }
+
+// Intern merged views until all physical fields have been compiled. Their
+// component arrays/strings remain backed by the request or decoded base source.
+// Inherited variant definitions can request the same merge more than once.
+struct AnalyzerDefinitions {
+  std::map<std::pair<const api::AnalyzerDef*, const api::AnalyzerDef*>, api::AnalyzerDef> merged;
+
+  const api::AnalyzerDef* resolve(const api::FieldDef& def, const api::AnalyzerDef* parent) {
+    if (!analyzerSet(def)) return parent;
+    const auto& own = *def.analyzer;
+    if (own.tokenizer || !own.filters.empty() || !own.name.empty() || !parent) return &own;
+    auto [it, inserted] = merged.try_emplace({parent, &own}, *parent);
+    if (inserted) it->second.char_filters = own.char_filters;
+    return &it->second;
+  }
+};
 
 // Pass 1: physical settings only. Variant parent edges consult this completed
 // graph, never the logical graph, so borrowing one's owner's settings is safe.
 static ResolvedField physicalSettings(std::string_view name, const api::FieldDef& def,
-                                      const ResolvedField& parentResolved) {
+                                      const ResolvedField& parentResolved, AnalyzerDefinitions& analyzers) {
   ResolvedField r;
 
   // type: use this field's if set, else parent's
@@ -200,6 +223,11 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                       " (field: " + std::string(name) + "); valid: docs, freqs, positions");
   }
   r.norms = def.norms ? def.norms : parentResolved.norms;
+  r.dateUnit = def.unit ? def.unit : parentResolved.dateUnit;
+  if (r.dateUnit && *r.dateUnit != ApiDateUnit::MS && *r.dateUnit != ApiDateUnit::NS) {
+    throw SchemaError("unknown unit value " + std::to_string((int)*r.dateUnit) +
+                      " (field: " + std::string(name) + "); valid: ms, ns");
+  }
 
   // column
   if (def.column.has_value()) {
@@ -210,8 +238,9 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.column = parentResolved.column;
   }
 
-  // analyzer: atomic - first non-empty AnalyzerDef in chain wins
-  r.analyzer = analyzerSet(def) ? &*def.analyzer : parentResolved.analyzer;
+  // A tokenizer or token filter replaces the chain; char filters alone replace
+  // just the inherited char filters, retaining the tokenizer and token filters.
+  r.analyzer = analyzers.resolve(def, parentResolved.analyzer);
   r.normalizer = def.normalizer ? &*def.normalizer : parentResolved.normalizer;
 
   // dims: explicit set on this field overrides (0 = infer from first value);
@@ -272,6 +301,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
+  r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
+                                              : parentResolved.geoIgnoreMalformed;
+  r.geoIgnoreZValue = def.ignore_z_value ? def.ignore_z_value
+                                         : parentResolved.geoIgnoreZValue;
   return r;
 }
 
@@ -300,12 +333,12 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
     cfg.nlist = *def->nlist;
   }
   if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
-    fail("rabitq settings require explicit codec \"rabitq\"");
+    fail("rabitq settings require codec \"rabitq\"");
   }
   if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
   if (def->rabitq) {
     if (def->rabitq->bits) {
-      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      if (*def->rabitq->bits < 0 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [0, 9]");
       cfg.rabitqBits = *def->rabitq->bits;
     }
     if (def->rabitq->query_bits) {
@@ -336,7 +369,7 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
-                         sv_resolved_map& resolved, sv_flat_set& visiting) {
+                         sv_resolved_map& resolved, sv_flat_set& visiting, AnalyzerDefinitions& analyzers) {
   if (resolved.contains(name)) return;
   if (!visiting.insert(name).second) {
     throw SchemaError("Circular schema inheritance detected involving field: " + std::string(name));
@@ -348,10 +381,10 @@ static void resolveField(std::string_view name, const sv_entry_map& defMap,
   const auto& entry = *it->second;
   ResolvedField parent;
   if (!entry.def.parent.empty()) {
-    resolveField(entry.def.parent, defMap, resolved, visiting);
+    resolveField(entry.def.parent, defMap, resolved, visiting, analyzers);
     parent = resolved.at(entry.def.parent);
   }
-  auto r = physicalSettings(name, entry.def, parent);
+  auto r = physicalSettings(name, entry.def, parent, analyzers);
   r.isTemplate = entry.isTemplate;
   resolved.emplace(name, std::move(r));
   visiting.erase(name);
@@ -413,6 +446,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
+  if (def.unit && r.type != FieldClass::DATE) {
+    throw SchemaError("unit is only valid for date fields (field: " + name + ")");
+  }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
                     def.ann.has_value();
@@ -420,6 +456,10 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError(
       "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
       name + ")");
+  }
+  if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
+    throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
+                      name + ")");
   }
 }
 
@@ -437,7 +477,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       if (!r.hasType || r.type != FieldClass::ID) {
         throw SchemaError("reserved field 'id' must have type 'id'");
       }
-      if (logical.hasMulti && logical.multi) throw SchemaError("reserved field 'id' cannot be multi-valued");
+      if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field 'id' cannot be multi-valued");
       if (r.hasIndex && r.index != IndexMode::MATCH) {
         throw SchemaError("reserved field 'id' must be match-indexed (overwrite and delete-by-id use it)");
       }
@@ -449,9 +489,11 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       if (!r.hasType || r.type != FieldClass::INT) {
         throw SchemaError("reserved field '_version_' must have type 'int'");
       }
-      if (logical.hasMulti && logical.multi) throw SchemaError("reserved field '_version_' cannot be multi-valued");
-      if (r.hasColumn && !r.column) {
-        throw SchemaError("reserved field '_version_' requires column=true");
+      if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field '_version_' cannot be multi-valued");
+      if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
+          || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
+          || r.longTerms || logical.defaults) {
+        throw SchemaError("reserved field '_version_' is retrieval-only and cannot be configured");
       }
     } else if (r.hasType && r.type == FieldClass::ID) {
       throw SchemaError("type 'id' is reserved for the 'id' field (field: " + std::string(name) +
@@ -460,9 +502,27 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
   }
 }
 
-// Pass 3 compiles each authored analysis definition once and creates physical
+// Pass 3 compiles each effective analysis definition once and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
+static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declared,
+    FieldClass type, bool isPrimary, std::string_view name) {
+  using Mode = api::FieldDef::MultiMode;
+  bool arrayOnly = type == FieldClass::TEXT || type == FieldClass::VECTOR
+      || type == FieldClass::GEO_POINT;
+  switch (declared) {
+    case Mode::SINGLE: return Mode::SINGLE;
+    case Mode::DEFAULT: return arrayOnly ? Mode::ARRAY : Mode::SET;
+    case Mode::ARRAY: return Mode::ARRAY;
+    case Mode::SET:
+      if (!arrayOnly) return Mode::SET;
+      if (!isPrimary) return Mode::ARRAY;
+      throw SchemaError("multi=set is not supported for array-only field: " + std::string(name));
+    default: throw SchemaError("invalid multi mode for field: " + std::string(name));
+  }
+}
+
 struct FieldCompiler {
+  InvalidStopWords invalidStopWords;
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
 
@@ -474,8 +534,10 @@ struct FieldCompiler {
 
     // Apply defaults based on type if properties were not explicitly set
     IndexMode index = r.index;
+    if (name == "_version_") return std::make_shared<IntFieldType>(name, 0);
     bool column = r.column;
-    bool multi = logical.multi;
+    using MultiMode = api::FieldDef::MultiMode;
+    MultiMode mode = resolveMultiMode(logical.multi, r.type, !derived, name);
     bool stored = logical.stored;
 
     if (!r.hasIndex) {
@@ -542,22 +604,23 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
+      if (numericClass && !column) {
+        throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (r.type == FieldClass::VECTOR) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
-    }
-    if (!logical.hasMulti) {
-      multi = false;
     }
     if (!logical.hasStored) {
       // TEXT fields are stored by default so the raw (pre-analysis) value can
       // be returned in search results.  Other types default to false;
       // STRING/ID already expose their value via the column store.
       stored = (r.type == FieldClass::TEXT);
+    }
+
+    if (geoClass && stored) {
+      throw SchemaError("stored=true is not supported for geo_point fields (field: " +
+                        std::string(name) + ")");
     }
 
     // Build flags
@@ -576,7 +639,8 @@ struct FieldCompiler {
     }
     if (index == IndexMode::RANGE) flags |= FieldType::INDEX_RANGE;
     if (column) flags |= FieldType::COLUMN_STORED;
-    if (multi) flags |= FieldType::MULTI_VALUED;
+    if (mode != MultiMode::SINGLE) flags |= FieldType::MULTI_VALUED;
+    if (mode == MultiMode::ARRAY) flags |= FieldType::MULTI_ARRAY;
     if (stored && !derived) flags |= FieldType::STORED;
     if (derived) flags |= FieldType::DERIVED;
 
@@ -612,7 +676,7 @@ struct FieldCompiler {
           // The registry's teaching error (unknown component, unexpected
           // parameter) plus the field it was found on.
           try {
-            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{});
+            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{}, invalidStopWords);
           } catch (const std::invalid_argument& e) {
             throw SchemaError(std::string(e.what()) + " (field: " + std::string(name) + ")");
           }
@@ -630,10 +694,12 @@ struct FieldCompiler {
         ft = std::make_shared<DoubleFieldType>(name, flags);
         break;
       case FieldClass::DATE:
-        ft = std::make_shared<DateFieldType>(name, flags);
+        ft = std::make_shared<DateFieldType>(name, flags,
+            r.dateUnit.value_or(ApiDateUnit::MS) == ApiDateUnit::NS ? DateUnit::NANOS : DateUnit::MILLIS);
         break;
       case FieldClass::GEO_POINT:
-        ft = std::make_shared<GeoPointFieldType>(name, flags);
+        ft = std::make_shared<GeoPointFieldType>(name, flags, r.geoIgnoreMalformed.value_or(false),
+                                                 r.geoIgnoreZValue.value_or(true));
         break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
@@ -698,7 +764,7 @@ static LogicalField::Shape shapeFamily(FieldClass type) {
   return LogicalField::Shape::SCALAR;
 }
 
-static std::string binding(std::optional<std::string_view> label,
+static std::string resolveBinding(std::optional<std::string_view> label,
                            const LogicalField& logical, OpClass op) {
   if (label) {
     if (foldName(*label) == "self") return "self";
@@ -767,10 +833,25 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
     }
     format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
   }
+  if (def.zstd_dictionary.value_or(false)) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
+    format.dictionaryBytes = StoredChunkFormat::DEFAULT_DICTIONARY_BYTES;
+  }
+  if (def.zstd_dictionary_bytes) {
+    if (!format.dictionaryBytes) fail("zstd_dictionary_bytes requires zstd_dictionary: true");
+    if (*def.zstd_dictionary_bytes < 1024 || *def.zstd_dictionary_bytes > 262144) {
+      fail("zstd_dictionary_bytes must be 1024 to 262144");
+    }
+    format.dictionaryBytes = (uint32_t)*def.zstd_dictionary_bytes;
+  }
   return std::make_shared<StoredFieldType>(name, format);
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
+  return compile(def, base, InvalidStopWords::REJECT);
+}
+
+std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords) {
   auto schema = std::make_shared<Schema>();
 
   // ---- assemble the authored source entries (merge or replace) ----
@@ -904,10 +985,11 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
+  AnalyzerDefinitions analyzers;
   sv_resolved_map resolved;
   sv_flat_set visiting;
   for (const auto& e : entries) {
-    resolveField(e.name, defMap, resolved, visiting);
+    resolveField(e.name, defMap, resolved, visiting, analyzers);
     validateDirectProps(e, resolved.find(e.name)->second);
   }
   ownership_map ownership;
@@ -924,7 +1006,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
-  FieldCompiler compiler;
+  FieldCompiler compiler{invalidStopWords, {}, {}};
   for (const auto& e : entries) {
     const auto& r = resolved.at(e.name);
     const auto& owned = ownership.at(e.name);
@@ -949,8 +1031,9 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
           throw SchemaError("generated physical field name exceeds 127 bytes: " + name);
         }
         const auto& def = *view;
-        if (def.multi || def.stored || def.stored_resource) {
-          throw SchemaError("multi/stored/stored_resource belong to the logical field, not variant: " + name);
+        if (def.multi || def.stored || def.stored_resource || def.ignore_malformed || def.ignore_z_value) {
+          throw SchemaError("multi/stored/stored_resource/ignore_malformed/ignore_z_value belong to the "
+                            "logical field, not variant: " + name);
         }
         if (def.variants || def.defaults) {
           throw SchemaError("variant cannot declare variants or defaults: " + name);
@@ -963,7 +1046,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
           }
           parent = it->second;
         }
-        auto branch = physicalSettings(name, def, parent);
+        auto branch = physicalSettings(name, def, parent, analyzers);
         validateDirectProps({name, def, false}, branch);
         if (branch.type == FieldClass::ID) throw SchemaError("variant cannot have type id: " + name);
         if (shapeFamily(branch.type) != logical->shape) {
@@ -978,9 +1061,9 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
         logical->variants.emplace(label, std::move(ft));
       }
     }
-    logical->search = binding(owned.defaults ? owned.defaults->search : std::nullopt,
+    logical->search = resolveBinding(owned.defaults ? owned.defaults->search : std::nullopt,
                               *logical, OpClass::SEARCH);
-    logical->value = binding(owned.defaults ? owned.defaults->value : std::nullopt,
+    logical->value = resolveBinding(owned.defaults ? owned.defaults->value : std::nullopt,
                              *logical, OpClass::VALUE);
     // Abstract variant prototypes are kept only in their logical template.
     // Concrete physical entries are also exposed through the legacy registry.
@@ -1072,6 +1155,9 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   if (!validFieldName(rootName)) {
     throw RequestError("Invalid field or selector root: " + std::string(name), "invalid_field_name");
   }
+  if (rootName == "_version_" && op != OpClass::RETRIEVE) {
+    throw RequestError("Field '_version_' is retrieval-only", "retrieval_only");
+  }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
   std::string_view label = "self";
@@ -1101,6 +1187,40 @@ FieldType* Schema::physical(std::string_view name) const {
   auto* type = findPhysical(name);
   if (!type) throw RequestError("Physical field not found: " + std::string(name), "unknown_field");
   return type->get();
+}
+
+std::vector<std::string> Schema::searchableFields(
+    std::span<const std::string_view> physicalNames) const {
+  std::set<std::string_view> roots;
+  auto addRoot = [&](std::string_view name) {
+    if (name.empty() || name[0] == '_') return;
+    roots.insert(name.substr(0, name.rfind("__")));
+  };
+  for (const auto& [name, type] : fieldTypeMap) addRoot(name);
+  for (auto name : physicalNames) addRoot(name);
+  auto termTarget = [](FieldType& type) {
+    return type.indexed() && (type.type() == FieldType::TEXT
+        || type.type() == FieldType::STRING || type.type() == FieldType::ID);
+  };
+  std::vector<std::string> names;
+  for (auto root : roots) {
+    ResolvedFieldHandle target;
+    try {
+      if (!getFieldTypePtr(root)) continue;
+      target = resolveFor(root, OpClass::SEARCH);
+    } catch (const RequestError&) {
+      // A schema edit can retire an old dynamic root or make it too long.
+      continue;
+    }
+    if (termTarget(*target.fieldType)) names.emplace_back(root);
+    if (target.owner) {
+      for (const auto& [label, type] : target.owner->variants) {
+        if (termTarget(*type)) names.push_back(std::string(root) + "__" + label);
+      }
+    }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 void Schema::toProto(luxir::api::SchemaDef* def, std::pmr::memory_resource& arena) const {
@@ -1136,7 +1256,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     for (size_t i = 0; i < filters.size(); i++) fl[i].name = filters[i];
   };
 
-  // Concrete fields (id defaults to MATCH+column, _version_ to NONE+column).
+  // Concrete fields (id defaults to MATCH+column, _version_ is virtual retrieval).
   add(fields, "id", FieldClass::ID);
   add(fields, "_version_", FieldClass::INT);
 
@@ -1144,20 +1264,28 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   // deviations are spelled out.  Multi-valued variants use the trailing "s".
   add(templates, "_s", FieldClass::STRING);
   add(templates, "_sc", FieldClass::STRING).index = IndexMode::NONE;
-  add(templates, "_ss", FieldClass::STRING).multi = true;
+  add(templates, "_ss", FieldClass::STRING).multi = api::FieldDef::MultiMode::DEFAULT;
   {
     auto& f = add(templates, "_ssc", FieldClass::STRING);
     f.index = IndexMode::NONE;
-    f.multi = true;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
   }
   add(templates, "_i", FieldClass::INT);
-  add(templates, "_is", FieldClass::INT).multi = true;
+  add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_f", FieldClass::FLOAT);
-  add(templates, "_fs", FieldClass::FLOAT).multi = true;
+  add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);
-  add(templates, "_ds", FieldClass::DOUBLE).multi = true;
+  add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
-  add(templates, "_dts", FieldClass::DATE).multi = true;
+  add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
+  // Geo points: unlike the numeric suffixes these build the points index,
+  // since geo queries are their only use.
+  add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
+  {
+    auto& f = add(templates, "_ps", FieldClass::GEO_POINT);
+    f.index = IndexMode::RANGE;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
+  }
   // Text suffixes, from raw to folded and stemmed. In the whitespace
   // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
   // for NFKC_CF ("normalize": casefold + compatibility forms + canonical
@@ -1189,12 +1317,12 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   name.defaults.emplace().value = "s";
   auto& names = add(templates, "_names");
   names.parent = "_name";
-  names.multi = true;
+  names.multi = api::FieldDef::MultiMode::DEFAULT;
 
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the template; concrete fields may pin it.
   add(templates, "_v", FieldClass::VECTOR);
-  add(templates, "_vs", FieldClass::VECTOR).multi = true;
+  add(templates, "_vs", FieldClass::VECTOR).multi = api::FieldDef::MultiMode::DEFAULT;
 
   luxir::api::SchemaDef def;
   def.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(

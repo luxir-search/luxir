@@ -37,9 +37,15 @@ Content-Type: application/json
   "request_id": "load-42",
   "update_version": 1,
   "status": "ok",
-  "ids": ["b1", "b2"]
+  "ids": ["b1", "b2"],
+  "took_us": 2140
 }
 ```
+
+`took_us` is the server-side wall time, in microseconds, from receipt of the
+complete request message until its response is ready to serialize, including
+parsing and any commit and replica wait. It excludes serializing, queueing,
+and sending the response.
 
 One request can add documents, delete by id, and commit. The request fields
 are:
@@ -130,8 +136,9 @@ Content-Type: application/x-ndjson
 {"request_id":"nonfiction","update_version":4,"status":"ok"}
 ```
 
-The response is NDJSON too, one update response per completed group. The URL
-collection is the default; a control object can set
+The response is NDJSON too, one update response per completed group. NDJSON
+stream acknowledgments do not carry `took_us`. The URL collection is the
+default; a control object can set
 `"collection":"archive"` for the following group, so one connection can feed
 several collections.
 
@@ -146,9 +153,8 @@ A malformed document record also ends the stream, with error code
 they are read, so the failure is reported when the internal batch carrying the
 record is processed: earlier batches stay indexed, the batch holding the bad
 record indexes nothing and runs no commit it carried (an `_end_` commit, for
-example), and batches the connection had already submitted behind it (at most
-`--indexing.max-inflight-batches`) are still processed, so they are normally
-indexed. The error line's `docs_indexed_so_far` counts what was. Inside an
+example), and batches the connection had already submitted behind it are
+still processed, so they are normally indexed. The error line's `docs_indexed_so_far` counts what was. Inside an
 `all_or_none` group the whole group fails. Control records are decoded in stream order as
 they arrive, so a malformed control record fails before anything after it is
 submitted.
@@ -171,8 +177,8 @@ An empty commit object commits immediately and the response waits for
 publication. A request that fails as a whole (`status: "error"`) runs no
 immediate commit, though a positive `commit_within_ms` it set may still
 publish other updates. The response's optional `commit` field identifies the resulting
-snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
-incarnation is 16 hex digits). The
+snapshot as the token `"19a38a9f000:42"` (`incarnation:index_gen`, where the
+incarnation is an 11-digit hexadecimal millisecond timestamp). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
 snapshot's id. An NDJSON URL EOF commit always returns
@@ -214,7 +220,9 @@ field omitted by the new version is absent from the new document.
 
 When you know the incoming IDs are unique and do not already exist in the
 collection, set `allow_dups: true` to improve indexing performance by skipping
-ID overwrite/deduplication. This disables overwrites for that request.
+ID overwrite/deduplication. This disables overwrites for that request. If
+the IDs are not in fact unique, the outcome is unspecified: some duplicates
+remain as separate documents, and others replace each other.
 
 Delete by ID with no document body:
 
@@ -366,8 +374,8 @@ The relevant server controls are:
 - `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for
   internal non-atomic handoff granularity.
 - `--indexing.max-inflight-batches` for the number of internal batches a
-  connection can submit concurrently (`0` selects the worker count plus two;
-  `1` makes batch submission serial).
+  connection can have decoding or indexing at once (`0` selects the worker
+  count plus two; `1` indexes one batch at a time).
 
 ## Limits
 

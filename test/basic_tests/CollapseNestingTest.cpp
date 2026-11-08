@@ -111,7 +111,7 @@ TEST_F(CollapseNestingTest, collapsedListsUnderFacetBuckets) {
   for (size_t kind = 0; kind < facets.size(); kind++) {
     auto json = R"({"query":"body_w:keep","collapse":"owner_s","limit":0,"ops":{"f":{)"
         + facets[kind] + R"("ops":{"lists":{"top_docs":{"collapse":"key_s","sort":"id asc",
-          "get_number":true,"limit":1,"batch_size":1,"fields":["id"],"document_format":"rows",
+          "count_limit":-1,"limit":1,"batch_size":1,"fields":["id"],"document_format":"rows",
           "ops":{
             "default":{"field_facet":{"field":"cat_s"}},
             "groups":{"field_facet":{"field":"cat_s","count_unit":"groups"}},
@@ -119,7 +119,7 @@ TEST_F(CollapseNestingTest, collapsedListsUnderFacetBuckets) {
             "nested":{"top_docs":{"collapse":"id","limit":0,"ops":{
               "counts":{"field_facet":{"field":"cat_s"}}}}},
             "after":{"field_facet":{"field":"cat_s"}},
-            "reset":{"top_docs":{"sort":"id asc","limit":-1,"get_number":true,
+            "reset":{"top_docs":{"sort":"id asc","limit":-1,"count_limit":-1,
               "fields":["id"],"document_format":"rows"},
               "domain":{"query":"*:*","filter":["stock_i:>0"]}}
           }}}}}}}})";
@@ -183,9 +183,9 @@ TEST_F(CollapseNestingTest, collapsedListUnderFusionUsesAllEvidence) {
     auto req = execute(R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{
       "forward":{"query":"body_w:keep","sort":"id asc","limit":3},
       "reverse":{"query":"body_w:keep","sort":"id desc","limit":2}},
-      "limit":1,"offset":1,"get_number":true,"fields":["id"],"document_format":"rows",
+      "limit":1,"offset":1,"count_limit":-1,"fields":["id"],"document_format":"rows",
       "ops":{"products":{"top_docs":{"collapse":"key_s","sort":"id asc","limit":-1,
-        "get_number":true,"batch_size":1,"fields":["id"],"document_format":"rows"}}}
+        "count_limit":-1,"batch_size":1,"fields":["id"],"document_format":"rows"}}}
     }}}})", parallel);
     ASSERT_OK(req);
     std::vector<std::string> fusedIds, childIds;
@@ -222,9 +222,9 @@ TEST_F(CollapseNestingTest, fusionUnderCollapsedListRanksMatchingDocuments) {
   for (auto* row : ranking) expected.push_back(row->id);
   for (int parallel : {1, -1}) {
     auto req = execute(R"({"query":"body_w:keep","collapse":"key_s","sort":"id asc","limit":1,
-      "get_number":true,"fields":["id"],"document_format":"rows","ops":{"f":{"fusion":{
+      "count_limit":-1,"fields":["id"],"document_format":"rows","ops":{"f":{"fusion":{
         "rrf":{},"sources":{"forward":{"sort":"id asc","limit":3},
-          "reverse":{"sort":"id desc","limit":2}},"limit":-1,"get_number":true,
+          "reverse":{"sort":"id desc","limit":2}},"limit":-1,"count_limit":-1,
         "fields":["id"],"document_format":"rows"
       }}}})", parallel);
     ASSERT_OK(req);

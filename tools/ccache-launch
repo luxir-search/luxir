@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs COMMAND (ccache and the compiler) with the NAME=VALUE assignments added to
+# its environment, like env, after deleting the output of a precompiled header
+# compile. CMake builds a PCH with -include of the header being precompiled, so
+# ccache takes the previous build's .gch for an input: the stale file is hashed
+# into the key, and the result is not cached because the compile overwrites it.
+# GCC's PCH output is not deterministic, so every TU using a PCH that came from
+# the compiler rather than the cache then misses too. GCC itself does not read
+# the stale .gch.
+# Usage: tools/ccache-launch [NAME=VALUE...] COMMAND [ARGS...]
+set -u
+while [[ $1 == *=* ]]; do
+  export "$1"
+  shift
+done
+prev=
+for arg; do
+  if [[ $prev == -o && $arg == *.gch ]]; then
+    rm -f "$arg"
+  fi
+  prev=$arg
+done
+exec "$@"

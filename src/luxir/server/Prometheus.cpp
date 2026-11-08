@@ -53,8 +53,9 @@ public:
 };
 
 void service(Renderer& r, const api::ServiceStats& s) {
-  r.gauge("luxir_build_info", "Luxir build version and CPU target.", 1,
-          PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target));
+  r.gauge("luxir_build_info", "Luxir build version, CPU target and source commit.", 1,
+          PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target) + "," +
+          PrometheusText::label("source_commit", s.source_commit));
   r.gauge("luxir_node_read_only", "Node is configured read only.", s.read_only);
   for (auto [transportName, transport] : {std::pair{"http", &s.http}, {"grpc", &s.grpc}}) {
     auto t = PrometheusText::label("transport", transportName);
@@ -83,7 +84,7 @@ void service(Renderer& r, const api::ServiceStats& s) {
     r.counter("luxir_ingest_document_errors_total", "Documents rejected with an error of their own, by error kind.",
               (double)count, PrometheusText::label("kind", kind));
   r.counter("luxir_ingest_delete_ids_total", "Accepted delete IDs, not the number of matching documents removed.", (double)s.delete_ids_accepted);
-  for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"merge", &s.merge},
+  for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"delete_pass", &s.delete_pass}, {"merge", &s.merge},
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
@@ -97,8 +98,10 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_index_ram_budget_bytes", "Shared indexing RAM cap; zero means unlimited.", (double)ram.limit_bytes);
   r.gauge("luxir_index_ram_draining_bytes", "Reserved indexing RAM currently draining through flushes.", (double)ram.draining_bytes);
   r.gauge("luxir_index_ram_pending_merge_bytes", "Pending merge demand, capped at the indexing RAM budget when limited.", (double)ram.pending_merge_bytes);
+  r.gauge("luxir_index_ram_retained_delete_bytes", "Resident delete packets across all owners; part of the reservations and not freed by flushing.", (double)ram.retained_delete_bytes);
   r.gauge("luxir_storage_ram_bytes", "RAM storage bytes owned by the node; not disk usage.", (double)m.storage_ram.used_bytes);
   r.gauge("luxir_storage_ram_limit_bytes", "RAM storage cap; zero means unlimited or not applicable.", (double)m.storage_ram.limit_bytes);
+  r.gauge("luxir_schema_cache_bytes", "Estimated parsed schema payload held by snapshots and readers.", (double)m.schema_cache_bytes);
   const auto& f = m.field_metadata;
   for (auto [part, count, bytes] : {std::tuple{"directory", f.directories, f.directory_bytes}, {"page", f.pages, f.page_bytes},
                                     {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes}}) {
@@ -195,6 +198,7 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_idle, labels + ",state=\"idle\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
     r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
+    r.gauge("luxir_index_retained_delete_bytes", "Delete packets retained by the writer, counted once per packet.", (double)index.retained_delete_bytes, labels);
     if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);
   }

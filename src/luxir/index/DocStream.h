@@ -31,7 +31,7 @@ public:
     return lastDoc;
   }
 
-  void addDoc(MemPool &pool, int docid) {
+  LUXIR_INLINE void addDoc(MemPool &pool, int docid) {
     int delta = docid - lastDoc;
     assert(delta > 0);
     if (delta != 1) {

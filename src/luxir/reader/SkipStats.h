@@ -164,6 +164,9 @@ struct SkipStats {
   static inline int64_t conjDenseScoredFilterRejects = 0;
   static inline int64_t conjExactScoredBoundsBypasses = 0;
   static inline int64_t conjExactDirectApproxEngagements = 0;
+  // Verifiers a pull conjunction confirms inside its leading exact group
+  // (BooleanWeight sourceGroupVerifier), one per verifier per build.
+  static inline int64_t conjSourceGroupedVerifiers = 0;
   static inline int64_t conjDirectDenseEngagements = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
@@ -234,6 +237,7 @@ struct SkipStats {
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
   static inline int64_t constantWindowCaptures = 0;
+  static inline int64_t constantLimitOnlyCollections = 0;
   static inline int64_t fieldSortBlocksSkipped = 0;
   static inline int64_t fieldSortCandidateActivations = 0;
   static inline int64_t fieldSortCandidateTerminations = 0;
@@ -332,9 +336,18 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  static inline int64_t numericPredicateClassifiedBlocks = 0;
+  static inline int64_t numericPredicateProofIndexes = 0;
   static inline int64_t rangeFacetPointsArms = 0;
+  // Range facet zones (blocks or leaves) counted whole, without a decode.
+  static inline int64_t rangeFacetZoneRuns = 0;
+  // Range facet zones added whole to sub-op bucket domains.
+  static inline int64_t rangeFacetZoneDomainRuns = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
@@ -491,6 +504,7 @@ struct SkipStats {
     conjDenseScoredFilterRejects = 0;
     conjExactScoredBoundsBypasses = 0;
     conjExactDirectApproxEngagements = 0;
+    conjSourceGroupedVerifiers = 0;
     conjDirectDenseEngagements = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
@@ -560,6 +574,7 @@ struct SkipStats {
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
     constantWindowCaptures = 0;
+    constantLimitOnlyCollections = 0;
     fieldSortBlocksSkipped = 0;
     fieldSortCandidateActivations = 0;
     fieldSortCandidateTerminations = 0;
@@ -626,9 +641,15 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateClassifiedBlocks = 0;
+    numericPredicateProofIndexes = 0;
     rangeFacetPointsArms = 0;
+    rangeFacetZoneRuns = 0;
+    rangeFacetZoneDomainRuns = 0;
     geoBKDArms = 0;
     geoScanArms = 0;
     geoSparseVerifyArms = 0;

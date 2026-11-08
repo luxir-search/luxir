@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/analysis/AsciiScan.h"
 #include "luxir/analysis/KStemmer.h"
 #include "luxir/analysis/NfkcCfData.h"
+#include "luxir/util/log.h"
 
 #include <algorithm>
+#include <array>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <functional>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -34,12 +40,13 @@ namespace {
 static_assert(UNI_ALGO_UNICODE_VERSION == nfkc_cf_data::unicodeVersion,
               "Regenerate NFKC_CF tables when upgrading uni-algo's Unicode data");
 
-// UAX#29 word-boundary tokenizer. Emits word-like segments only (letters,
-// numbers, ideographs, ...); punctuation and whitespace runs are dropped, like
-// Lucene's StandardTokenizer. Each token is a string_view into the source (no
-// copy), honoring the borrow contract. Stateful: it holds a segmentation cursor
-// over the current value and rebuilds it in reset().
-class UnicodeWordTokenizer : public Tokenizer {
+// UAX#29 word-boundary tokenizer straight over uni-algo, codepoint by
+// codepoint. Emits word-like segments only (letters, numbers, ideographs, ...);
+// punctuation and whitespace runs are dropped, like Lucene's StandardTokenizer.
+// Each token is a string_view into the source (no copy). Chains use the
+// region-dispatching StandardTokenizer below; this is the conformance oracle
+// its fast paths are tested against.
+class ReferenceWordTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
   std::optional<View> view;  // word_only view over the current value
@@ -196,17 +203,20 @@ inline bool isAsciiWs(unsigned char c) {
   return c == ' ' || (c >= '\t' && c <= '\r');  // \t \n \v \f \r
 }
 
-// The fused default tokenizer: UAX#29 word segmentation with per-token NFKC_CF
-// applied in the same stage. Equivalent to unicode_word + nfkc_cf (asserted in
-// AnalysisTest) but without the extra filter hop / redundant ASCII scan. When
-// the chain continues with `fold` (the _t chain), that is fused in too, but
-// only as an equivalent shortcut: fold stays a separate, optional component
-// (lossy, language-dependent; it is what distinguishes _t from _un).
+// The unicode_word tokenizer: UAX#29 word segmentation, optionally with the
+// chain's leading case filter applied in the same stage. WordFold::NONE is
+// plain unicode_word; LOWERCASE fuses unicode_word + lowercase; NFKC_CF fuses
+// unicode_word + nfkc_cf, and NFKC_CF_ACCENTS also a following `fold` (the _t
+// chain), only as an equivalent shortcut: fold stays a separate, optional
+// component (lossy, language-dependent; it is what distinguishes _t from _un).
+// Each fused mode is equivalent to the composed chain (asserted in
+// AnalysisTest) without the extra filter hop / redundant ASCII scan.
 //
-// Hot-path structure: reset() copies the value into `lowered`, ASCII-lowercasing
-// in one bulk SIMD pass (ASCII byte ops cannot corrupt multibyte UTF-8
-// sequences, and pre-lowercasing ASCII never changes NFKC_CF output since
-// casefold subsumes it). The scan then carves the value into regions delimited
+// Hot-path structure: with a case filter, reset() copies the value into
+// `lowered`, ASCII-lowercasing in one bulk SIMD pass (ASCII byte ops cannot
+// corrupt multibyte UTF-8 sequences, and pre-lowercasing ASCII changes neither
+// word-break classes nor NFKC_CF or lowercase output, which subsume it).
+// Without one, the scan runs over the value itself. The scan then carves the value into regions delimited
 // at *safe splits*: an ASCII whitespace byte followed by an ASCII byte (or end).
 // ASCII whitespace always hard-breaks words (WSegSpace/CR/LF/Newline classes;
 // TAB is Other, which also breaks both sides), and the only UAX#29 rule that
@@ -221,49 +231,55 @@ inline bool isAsciiWs(unsigned char c) {
 // after it, goes through uni-algo word_only + per-token NFKC_CF (+ fold), the
 // fully conformant path.
 //
-// Tokens point into `lowered` (or the NFKC / fold scratch buffers): the
-// producer's private reusable buffers, per the borrow contract.
+// Tokens point into the value or `lowered` (or the case / fold scratch
+// buffers): the producer's private reusable buffers, per the borrow contract.
 class StandardTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
-  std::string lowered;           // ASCII-lowercased copy of the current value
-  const char* loweredBase = nullptr;  // = lowered.data(), cached so offset math avoids reloading it
-  const char* cur = nullptr;     // region scan cursor into `lowered`
+  std::string lowered;           // ASCII-lowercased copy of the value, with a case filter
+  const char* textBase = nullptr;  // the scanned text: the value or lowered.data()
+  const char* cur = nullptr;     // region scan cursor into the scanned text
   const char* valEnd = nullptr;
   const char* nextHigh = nullptr;  // first non-ASCII byte at or after cur once refreshed; valEnd if none
   const char* dfaCur = nullptr;  // active pure-ASCII region: [dfaCur, dfaEnd)
   const char* dfaEnd = nullptr;
   std::optional<View> view;      // active non-ASCII region: word_only over it
   Iter it{};
-  std::string buf;               // NFKC_CF scratch for the current token
+  std::string buf;               // case-filter scratch for the current token
   std::string foldBuf;           // accent-fold scratch for the current token
-  const bool foldAccents;        // fused `fold` filter (see Analyzer::fusedFold)
+  const WordFold fold;
 
 public:
-  explicit StandardTokenizer(bool foldAccents) : foldAccents(foldAccents) {}
+  explicit StandardTokenizer(WordFold fold) : fold(fold) {}
 
   void reset() override {
     size_t n = (size_t) (end_ - start_);
-    const char* src = start_;
-    lowered.resize_and_overwrite(n, [src](char* dst, size_t len) {
-      ascii::lowerCopy(dst, src, len);
-      return len;
-    });
-    loweredBase = lowered.data();
-    cur = loweredBase;
-    valEnd = cur + lowered.size();
+    if (fold == WordFold::NONE) {
+      textBase = start_;
+    } else {
+      const char* src = start_;
+      lowered.resize_and_overwrite(n, [src](char* dst, size_t len) {
+        ascii::lowerCopy(dst, src, len);
+        return len;
+      });
+      textBase = lowered.data();
+    }
+    cur = textBase;
+    valEnd = cur + n;
     nextHigh = cur + ascii::findNonAscii(cur, n);
     dfaCur = dfaEnd = nullptr;
     view.reset();
   }
 
-  // The fused nfkc_cf half applies to a bare term; the segmentation half does
+  // The fused filter half applies to a bare term; the segmentation half does
   // not (see TokenStream::normalizeTerm).
   void normalizeTerm(std::string& term) override {
+    if (fold == WordFold::NONE) return;
     std::string scratch;
-    std::string_view folded = applyNfkcCf(term, scratch);
+    std::string_view folded = fold == WordFold::LOWERCASE ? applyLowercase(term, scratch)
+                                                          : applyNfkcCf(term, scratch);
     if (folded.data() != term.data()) term.assign(folded);
-    if (foldAccents && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
+    if (fold == WordFold::NFKC_CF_ACCENTS && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
   }
 
   bool incrementToken() override {
@@ -286,19 +302,27 @@ private:
   // released) when it is exhausted.
   [[gnu::noinline]] bool viewNext() {
     while (it != view->end()) {
-      // Capture the source span before NFKC_CF repoints token.text at `buf`.
-      // `lowered` is a length-preserving ASCII-lowercased copy, so byte
-      // offsets into it equal byte offsets into the original value.
+      // Capture the source span before the case filter repoints token.text
+      // at `buf`. `lowered` is a length-preserving ASCII-lowercased copy, so
+      // byte offsets into it equal byte offsets into the original value.
       std::string_view w = *it;
-      token.setOffset((int) (w.data() - loweredBase),
-                      (int) (w.data() + w.size() - loweredBase));
-      token.text = applyNfkcCf(w, buf);
+      token.setOffset((int) (w.data() - textBase),
+                      (int) (w.data() + w.size() - textBase));
       ++it;
+      if (fold == WordFold::NONE) {
+        token.text = w;
+        return true;
+      }
+      if (fold == WordFold::LOWERCASE) {
+        token.text = applyLowercase(w, buf);
+        return true;
+      }
+      token.text = applyNfkcCf(w, buf);
       if (token.text.empty()) continue;  // invisible words consume no position
       // Fused `fold`, exactly as AccentFoldFilter applies it after nfkc_cf
       // (including keeping a token that folds to empty). DFA tokens are
       // ASCII, which fold leaves alone, so only this path pays for it.
-      if (foldAccents && !isAscii(token.text)) {
+      if (fold == WordFold::NFKC_CF_ACCENTS && !isAscii(token.text)) {
         foldBuf = una::norm::to_unaccent_utf8(token.text);
         token.text = foldBuf;
       }
@@ -389,7 +413,7 @@ private:
       }
       if (sawLetNum) {
         token.text = std::string_view(w, (size_t) (s - w));
-        token.setOffset((int) (w - loweredBase), (int) (s - loweredBase));
+        token.setOffset((int) (w - textBase), (int) (s - textBase));
         dfaCur = s;
         return true;
       }
@@ -417,6 +441,9 @@ public:
       }
       gap += token.positionIncrement - 1;
     }
+    // Empty folds consume no position, but retain any upstream stop holes.
+    // With no stop filter, gap stays zero and only this EOF branch is added.
+    if (gap) token.finalPositionIncrement += gap;
     return false;
   }
 
@@ -483,12 +510,16 @@ std::string_view applyLowercase(std::string_view in, std::string& buf) {
   return buf;
 }
 
-std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
-  return std::make_unique<UnicodeWordTokenizer>();
+std::unique_ptr<Tokenizer> makeReferenceWordTokenizer() {
+  return std::make_unique<ReferenceWordTokenizer>();
 }
 
-std::unique_ptr<Tokenizer> makeStandardTokenizer(bool foldAccents) {
-  return std::make_unique<StandardTokenizer>(foldAccents);
+std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
+  return std::make_unique<StandardTokenizer>(WordFold::NONE);
+}
+
+std::unique_ptr<Tokenizer> makeStandardTokenizer(WordFold fold) {
+  return std::make_unique<StandardTokenizer>(fold);
 }
 
 std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream> source) {
@@ -497,6 +528,77 @@ std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream>
 
 std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source) {
   return std::make_unique<AccentFoldFilter>(std::move(source));
+}
+
+namespace {
+class NfkcCfCharFilter : public CharFilter {
+  std::string scratch;
+
+  void filter() override {
+    if (isAscii(input)) {
+      if (std::none_of(input.begin(), input.end(), [](char c) { return c >= 'A' && c <= 'Z'; })) return;
+      auto out = bytewiseOutput();
+      ascii::lowerCopy(out.data(), input.data(), input.size());
+      return;
+    }
+    if (applyNfkcCf(input, scratch) == input) return;
+    // Split only at normalization-safe boundaries: a starter that cannot
+    // compose backwards and has no leading NFKD non-starters. This preserves
+    // Hangul composition, canonical reordering and stream-safe NFC behavior.
+    // Mapping a changed normalization segment to its source span also handles
+    // expansions, contractions, and reordered combining marks.
+    size_t start = 0;
+    auto emit = [&](size_t end) {
+      auto part = input.substr(start, end - start);
+      replace(start, end, applyNfkcCf(part, scratch));
+      start = end;
+    };
+    auto decoded = una::views::utf8(input);
+    for (auto it = decoded.begin(); it != decoded.end(); ++it) {
+      uint32_t cp = (uint32_t) *it;
+      auto mapping = nfkc_cf_data::lookup(cp).mapping;
+      if (mapping) {
+        std::string_view bytes((const char*) nfkc_cf_data::utf8 + (mapping & 0xFFFFFF),
+                               (mapping >> 24) & 127);
+        if (bytes.empty()) continue;
+        cp = (uint32_t) *una::views::utf8(bytes).begin();
+      }
+      size_t offset = (size_t) (it.begin() - input.begin());
+      if (offset > start && !(nfkc_cf_data::lookup(cp).props & 0x7FF)) emit(offset);
+    }
+    emit(input.size());
+  }
+};
+
+} // namespace
+
+std::unique_ptr<CharFilter> makeNfkcCfCharFilter() {
+  return std::make_unique<NfkcCfCharFilter>();
+}
+
+TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,
+                       std::vector<CharStage> cleanups)
+    : charStages(std::move(cleanups)), head(head), tail(std::move(tail)), stateful(stateful) {}
+
+void TokenChain::setFilteredValue(std::string_view value) {
+  if (value.size() > (size_t) std::numeric_limits<int>::max())
+    throw std::length_error("Analysis input exceeds byte-offset limit");
+  for (auto& stage : charStages) value = stage.filter->apply(value);
+  head.setValue(value);
+}
+
+void TokenChain::normalizeCharFilters(std::string& term) {
+  std::string_view value = term;
+  for (auto& stage : charStages) {
+    if (stage.normalizing) value = stage.filter->apply(value);
+  }
+  if (value.data() != term.data()) term.assign(value);
+}
+
+int TokenChain::sourceOffset(int offset, bool isEnd) {
+  for (auto it = charStages.rbegin(); it != charStages.rend(); ++it)
+    offset = it->filter->correctOffset(offset, isEnd);
+  return offset;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +644,7 @@ public:
   // Inherit normalization forwarding: multiterm input is folded, never stemmed.
 };
 
-std::unique_ptr<const TokenFilterFactory> kstemFilter(const api::AnalyzerComponent& def) {
+std::unique_ptr<TokenFilterFactory> kstemFilter(const api::AnalyzerComponent& def) {
   struct Factory : TokenFilterFactory {
     bool possessive = true;
 
@@ -594,7 +696,7 @@ std::unique_ptr<const TokenizerFactory> plainTokenizer(const api::AnalyzerCompon
 
 template <std::unique_ptr<TokenStream> (*Make)(std::unique_ptr<TokenStream>),
           bool Normalizing = true, bool Stateful = false>
-std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
+std::unique_ptr<TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
   requireNoParams(def, "filter");
   struct Factory : TokenFilterFactory {
     std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
@@ -608,73 +710,189 @@ std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerCompone
   return factory;
 }
 
-struct TokenizerEntry {
-  std::string_view name;
-  std::unique_ptr<const TokenizerFactory> (*make)(const api::AnalyzerComponent&);
+struct StopWordHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view word) const noexcept { return std::hash<std::string_view>{}(word); }
 };
-struct FilterEntry {
-  std::string_view name;
-  std::unique_ptr<const TokenFilterFactory> (*make)(const api::AnalyzerComponent&);
-};
+using StopWords = boost::unordered_flat_set<std::string, StopWordHash, std::equal_to<>>;
 
-// The registries: adding a component is one line here plus its factory (a
-// param-taking one reads its Val params in the maker).  unicode_word is
-// stateful: it carries a segmentation cursor and rebuilds it in reset().
-constexpr TokenizerEntry TOKENIZERS[] = {
-  {"whitespace", plainTokenizer<makeWhitespaceTokenizer>},
-  {"keyword", plainTokenizer<makeKeywordTokenizer>},
-  {"unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>},
-};
-constexpr FilterEntry FILTERS[] = {
-  {"lowercase", plainFilter<makeLowercaseFilter>},
-  {"nfkc_cf", plainFilter<makeNfkcCasefoldFilter>},
-  {"fold", plainFilter<makeAccentFoldFilter>},
-  {"english_possessive", plainFilter<makeEnglishPossessiveFilter, false>},
-  {"kstem", kstemFilter},
-};
+class StopFilter : public TokenFilter {
+  std::shared_ptr<const StopWords> words;
+public:
+  StopFilter(std::unique_ptr<TokenStream> source, std::shared_ptr<const StopWords> words)
+      : TokenFilter(std::move(source)), words(std::move(words)) {}
 
-template <class Entry, size_t N>
-std::string joinNames(const Entry (&table)[N]) {
-  std::string out;
-  for (const auto& entry : table) {
-    if (!out.empty()) out += ", ";
-    out += entry.name;
+  void reset() override {
+    TokenFilter::reset();
+    token.finalPositionIncrement = 0;
   }
-  return out;
+
+  bool incrementToken() override {
+    int skipped = 0;
+    while (source().incrementToken()) {
+      if (!words->contains(token.text)) {
+        token.positionIncrement += skipped;
+        return true;
+      }
+      skipped += token.positionIncrement;
+    }
+    // Each stop stage contributes only its own pending holes. Token::clear()
+    // leaves this stream attribute intact as exhaustion propagates downstream.
+    token.finalPositionIncrement += skipped;
+    return false;
+  }
+};
+
+std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def) {
+  struct Factory : TokenFilterFactory {
+    std::vector<std::string> authored;
+    std::shared_ptr<const StopWords> words;
+
+    void prepare(TokenChain& preceding, InvalidStopWords invalidStopWords) override {
+      auto normalized = std::make_shared<StopWords>();
+      auto source = std::move(authored);
+      normalized->reserve(source.size());
+      for (const auto& word : source) {
+        preceding.setValue(word);
+        preceding.reset();
+        size_t count = 0;
+        std::string text;
+        while (preceding.tail->incrementToken()) {
+          if (++count == 1) text.assign(preceding.getToken().text);
+        }
+        if (count != 1) {
+          auto message = fmt::format("filter 'stop': word '{}' produced {} tokens; expected exactly one", word, count);
+          if (invalidStopWords == InvalidStopWords::REJECT) throw std::invalid_argument(message);
+          LOG_WARN("Dropping stored stop word: {}", message);
+          continue;
+        }
+        normalized->insert(std::move(text));
+      }
+      words = std::move(normalized);
+    }
+
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      return std::make_unique<StopFilter>(std::move(source), words);
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = def.name;
+  factory->stateful = true;
+  auto add = [&](std::string_view word) {
+    factory->authored.emplace_back(word);
+  };
+  for (const auto& [key, value] : def.params) {
+    if (key != "words") throw std::invalid_argument("filter 'stop': unknown parameter '" + std::string(key) +
+                                                  "'; valid parameters: words");
+    if (auto* list = std::get_if<api::ArrStr>(&value->kind)) {
+      for (auto word : list->v) add(word);
+    } else if (auto* list = std::get_if<api::ArrVal>(&value->kind)) {
+      for (const auto& item : list->v) {
+        auto* word = std::get_if<std::string_view>(&item.kind);
+        if (!word) throw std::invalid_argument("filter 'stop': words must be a list of strings");
+        add(*word);
+      }
+    } else {
+      throw std::invalid_argument("filter 'stop': words must be a list of strings");
+    }
+  }
+  if (factory->authored.empty())
+    throw std::invalid_argument("filter 'stop': words is required and must be a non-empty list of strings");
+  return factory;
 }
 
 }  // namespace
 
+void AnalysisRegistry::registerBuiltins() {
+  // unicode_word is stateful: it carries a segmentation cursor and rebuilds it in reset().
+  addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
+  addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
+  addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
+  addFilter("lowercase", plainFilter<makeLowercaseFilter>);
+  addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
+  addFilter("fold", plainFilter<makeAccentFoldFilter>);
+  addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
+  addFilter("kstem", kstemFilter);
+  addFilter("stop", stopFilter);
+  registerBuiltinCharFilters();
+
+  api::AnalyzerComponent unicodeWord;
+  unicodeWord.name = "unicode_word";
+  api::AnalyzerComponent nfkc, fold, kstem;
+  nfkc.name = "nfkc_cf";
+  fold.name = "fold";
+  kstem.name = "kstem";
+  api::AnalyzerDef standard;
+  standard.tokenizer = unicodeWord;
+  std::array<api::AnalyzerComponent, 1> standardFilters{nfkc};
+  standard.filters = standardFilters;
+  addAnalyzer("standard", standard);
+  api::AnalyzerDef english;
+  english.tokenizer = unicodeWord;
+  std::array<api::AnalyzerComponent, 3> englishFilters{nfkc, fold, kstem};
+  english.filters = englishFilters;
+  addAnalyzer("english", english);
+}
+
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def) {
-  if (def.name.empty()) {
-    throw std::invalid_argument("tokenizer component has no name; valid tokenizers: " + joinNames(TOKENIZERS));
-  }
-  for (const auto& entry : TOKENIZERS) {
-    if (entry.name == def.name) return entry.make(def);
-  }
-  throw std::invalid_argument("unknown tokenizer '" + std::string(def.name) +
-                              "'; valid tokenizers: " + joinNames(TOKENIZERS));
+  return globalAnalysisRegistry().makeTokenizer(def);
 }
 
-std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
-  if (def.name.empty()) {
-    throw std::invalid_argument("filter component has no name; valid filters: " + joinNames(FILTERS));
-  }
-  for (const auto& entry : FILTERS) {
-    if (entry.name == def.name) return entry.make(def);
-  }
-  throw std::invalid_argument("unknown filter '" + std::string(def.name) +
-                              "'; valid filters: " + joinNames(FILTERS));
+std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
+  return globalAnalysisRegistry().makeFilter(def);
 }
 
-std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
+std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def) {
+  return globalAnalysisRegistry().makeCharFilter(def);
+}
+
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, InvalidStopWords invalidStopWords) {
+  return compile(def, globalAnalysisRegistry(), invalidStopWords);
+}
+
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& authored, const AnalysisRegistry& registry,
+                                                  InvalidStopWords invalidStopWords) {
+  api::AnalyzerDef def = authored;
+  std::string presetName;
+  if (!authored.name.empty()) {
+    if (authored.tokenizer || !authored.filters.empty()) {
+      throw std::invalid_argument("analyzer '" + std::string(authored.name) +
+                                  "' is a named analyzer; it takes no tokenizer or filters");
+    }
+    const api::AnalyzerDef* preset = registry.findAnalyzer(authored.name);
+    if (!preset) {
+      std::string valid;
+      for (const auto& name : registry.analyzerNames()) {
+        if (!valid.empty()) valid += ", ";
+        valid += name;
+      }
+      throw std::invalid_argument("unknown analyzer '" + std::string(authored.name) + "'; valid analyzers: " +
+                                  (valid.empty() ? "none" : valid));
+    }
+    // char_filters next to a name replace the preset's, as they do when a
+    // field sets only char_filters under an inherited analyzer.
+    def = *preset;
+    if (!authored.char_filters.empty()) def.char_filters = authored.char_filters;
+    presetName = std::string(authored.name);
+  }
   api::AnalyzerComponent whitespace;
   whitespace.name = "whitespace";
-  auto tokenizer = makeTokenizerFactory(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
+  auto tokenizer = registry.makeTokenizer(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
+  std::vector<std::unique_ptr<const CharFilterFactory>> cleanups;
+  for (const auto& filter : def.char_filters) cleanups.push_back(registry.makeCharFilter(filter));
+  std::vector<TokenChain::CharStage> stages;
+  for (const auto& factory : cleanups) stages.push_back({factory->create(), factory->normalizing});
+  auto head = tokenizer->create();
+  auto& headRef = *head;
+  TokenChain preceding(headRef, std::move(head), tokenizer->stateful, std::move(stages));
   std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
   filters.reserve(def.filters.size());
   for (const auto& filter : def.filters) {
-    filters.push_back(makeTokenFilterFactory(filter));
+    auto factory = registry.makeFilter(filter);
+    factory->prepare(preceding, invalidStopWords);
+    preceding.stateful = preceding.stateful || factory->stateful;
+    preceding.tail = factory->create(std::move(preceding.tail));
+    filters.push_back(std::move(factory));
   }
   api::AnalyzerDef effective = def;
   if (!effective.tokenizer) effective.tokenizer = whitespace;
@@ -685,27 +903,37 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
   // Give the empty chain the same representation everywhere.
   if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
+  if (def.char_filters.empty()) value["char_filters"] = glz::generic_sorted_u64::array_t{};
   if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(json)));
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(cleanups),
+                                                      std::move(json), std::move(presetName)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical)
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
+                   std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical,
+                   std::string presetName)
     : canonical(std::move(canonical)), tokenizer(std::move(tok)),
-      filters(std::move(fs)),
+      filters(std::move(fs)), charFilters(std::move(cs)), presetName(std::move(presetName)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
+      fusedLowercase(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "lowercase"),
       stateful(tokenizer->stateful ||
                std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
 
 std::unique_ptr<TokenChain> Analyzer::createChain() const {
-  std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer(fusedFold) : tokenizer->create();
+  std::unique_ptr<Tokenizer> head =
+      fusedHead ? makeStandardTokenizer(fusedFold ? WordFold::NFKC_CF_ACCENTS : WordFold::NFKC_CF)
+      : fusedLowercase ? makeStandardTokenizer(WordFold::LOWERCASE)
+      : tokenizer->create();
   auto& headRef = *head;
   std::unique_ptr<TokenStream> tail = std::move(head);
-  for (size_t i = fusedFold ? 2 : fusedHead ? 1 : 0; i < filters.size(); i++) {
+  for (size_t i = fusedFold ? 2 : fusedHead || fusedLowercase ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
-  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
+  std::vector<TokenChain::CharStage> cleanups;
+  for (const auto& factory : charFilters) cleanups.push_back({factory->create(), factory->normalizing});
+  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups));
 }
 
 }  // namespace luxir

@@ -164,8 +164,10 @@ public:
 
   /// memory consumed by this table (does not traverse into values, only includes shallow value size)
   size_t memSize() const {
-    return tableSize_ * sizeof(entry_type) + sizeof(TermValHash<T,Hasher>) ;
+    return tableBytes() + sizeof(TermValHash<T,Hasher>);
   }
+
+  size_t tableBytes() const { return table_ ? tableSize_ * sizeof(entry_type) : 0; }
 
   template<typename... Args>
   std::pair<iterator, bool> try_emplace(std::string_view str, Args &&... args) {

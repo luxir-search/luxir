@@ -1,7 +1,9 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
+#include "test/TestUtils.h"
 
 #include <algorithm>
 #include <bit>
@@ -205,7 +207,7 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
                    const std::vector<RawTermSpec>& terms,
                    std::unique_ptr<PostingsReader>& reader,
                    SegFieldInfo& fieldInfo) {
-  PostingsWriter postingsWriter(dir, 0, 1000000);
+  PostingsWriter postingsWriter(dir, 0, 1, 1000000);
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField("f");
@@ -231,9 +233,10 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
     }
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  reader = std::make_unique<PostingsReader>(dir, 0);
+  reader = std::make_unique<PostingsReader>(dir, 0, 1);
   FieldReader fieldReader(*reader);
   ASSERT_TRUE(fieldReader.readNextField());
   fieldReader.readFieldInfo(fieldInfo);
@@ -251,7 +254,7 @@ public:
 void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
                                std::unique_ptr<PostingsReader>& reader,
                                SegFieldInfo& fieldInfo) {
-  PostingsWriter postingsWriter(dir, 0, 1);
+  PostingsWriter postingsWriter(dir, 0, 1, 1);
   auto& finfo = postingsWriter.addField("f");
   finfo.type = FieldType::TEXT;
   finfo.flags = FieldType::INDEX_DOCS;
@@ -288,9 +291,10 @@ void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
     tableOut->write(&header, sizeof(header));
     tableOut->write(rows, sizeof(rows));
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  reader = std::make_unique<PostingsReader>(dir, 0);
+  reader = std::make_unique<PostingsReader>(dir, 0, 1);
   FieldReader fieldReader(*reader);
   ASSERT_TRUE(fieldReader.readNextField());
   fieldReader.readFieldInfo(fieldInfo);
@@ -841,7 +845,7 @@ TEST_F(TermsDictTest, QueryStatsOnlyPathMatchesDocsEnumAcrossIndexLevels) {
     SCOPED_TRACE(level.label);
     RAMDir dir;
     auto schema = schemaForLevel(level.type, level.flags);
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots, schema);
     indexQueryStatsTerms(writer, level.type, terms);
 
@@ -960,7 +964,7 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     SCOPED_TRACE(level.label);
     RAMDir dir;
     auto schema = schemaForLevel(level.type, level.flags);
-    CommitSnapshotRegistry writerSnapshots(dir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots, schema);
     addMergeSegment(writer, level.type == FieldType::STRING, 3, 2);
     addMergeSegment(writer, level.type == FieldType::STRING, 4, 3);

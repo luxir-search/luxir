@@ -184,7 +184,7 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   auto commit = httpRequest(port, http::verb::post, "/collections/metrics/_update", R"({"commit":{}})");
   ASSERT_EQ(200, commit.result_int()) << commit.body();
   auto search = httpRequest(port, http::verb::post, "/collections/metrics/_search",
-      R"({"ops":{"q":{"top_docs":{"limit":1,"get_number":true}}}})");
+      R"({"ops":{"q":{"top_docs":{"limit":1,"count_limit":-1}}}})");
   ASSERT_EQ(200, search.result_int()) << search.body();
   ASSERT_EQ(400, httpRequest(port, http::verb::post, "/collections/metrics/_search", "{").result_int());
   ASSERT_EQ(404, httpRequest(port, http::verb::get, "/does-not-exist").result_int());
@@ -225,7 +225,9 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   ASSERT_EQ(200, metrics.result_int());
   EXPECT_EQ(prometheusContentType, metrics[http::field::content_type]);
   EXPECT_NE(std::string::npos, metrics.body().find("luxir_index_documents{"));
+#ifdef __linux__
   EXPECT_NE(std::string::npos, metrics.body().find("\nprocess_threads "));
+#endif
   auto bare = httpRequest(port, http::verb::get, "/metrics?collections=false&system=false").body();
   EXPECT_EQ(std::string::npos, bare.find("luxir_index_documents{"));
   EXPECT_EQ(std::string::npos, bare.find("\nprocess_threads "));

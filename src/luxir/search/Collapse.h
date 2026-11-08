@@ -12,6 +12,7 @@
 
 #include "luxir/api/build.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/DateOutput.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/OrdMapStr.h"
@@ -40,7 +41,7 @@ struct CollapseKey {
 };
 
 struct CollapseKeyHash {
-  size_t operator()(const CollapseKey& key) const {
+  template <typename Key> size_t operator()(const Key& key) const {
     size_t hash = 0;
     boost::hash_combine(hash, key.singleton.has_value());
     if (key.singleton) boost::hash_combine(hash, *key.singleton);
@@ -64,6 +65,7 @@ struct CollapsePlan {
     luxir::api::GroupComponent_::Type type;
     std::shared_ptr<OrdMap> ords;
     IndexReader::FieldSegments segments;
+    ValueNature nature = ValueNature::NUMBER;
     bool ordinal() const { return type == luxir::api::GroupComponent_::Type::STRING
                                || type == luxir::api::GroupComponent_::Type::ID; }
   };
@@ -95,6 +97,22 @@ struct CollapsePlan {
       }
     }
     return &key;
+  }
+
+  void renderKeys(std::span<const api::GroupKey> keys, uint64_t flags,
+                  std::pmr::memory_resource& mr) const {
+    if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+    for (size_t i = 0; i < fields.size(); i++) {
+      withDateOutput(fields[i].nature, flags, mr, [&] { return fields[i].name; }, [&](auto output) {
+        if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
+          for (const auto& key : keys) {
+            if (key.singleton) continue;
+            auto& component = const_cast<api::GroupComponent&>(key.component[i]);
+            if (auto* value = std::get_if<int64_t>(&component.value)) component.value = output(*value);
+          }
+        }
+      });
+    }
   }
 
   void emit(luxir::api::GroupKey& out, const CollapseKey& key,
@@ -140,11 +158,12 @@ public:
     columns.clear();
     columns.resize(plan.fields.size());
     scratch.components.resize(plan.fields.size());
-    auto& postings = plan.reader.segments()[(size_t)segment].postingsReader();
+    auto& seg = plan.reader.segments()[(size_t)segment];
     for (size_t i = 0; i < columns.size(); i++) {
       auto* info = plan.fields[i].segments.at((size_t)segment);
       if (!info) continue;
-      columns[i].dense = info->docsWithField == postings.maxDoc();
+      auto& postings = seg.postingsReader();
+      columns[i].dense = info->docsWithField == seg.maxDoc();
       if (plan.fields[i].ordinal()) {
         columns[i].ords.emplace(postings, *info);
         columns[i].mapping = plan.fields[i].ords->getSegToGlobal(segment);

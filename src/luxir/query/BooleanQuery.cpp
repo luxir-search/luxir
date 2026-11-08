@@ -12,7 +12,18 @@ Query::Weight* BooleanQuery::createWeight(Context& context, int32_t flags,
     return plan.singleChild->createWeight(context, flags, multiplier);
   }
   return context.pool.make<BooleanQuery::Weight>(
-      context, *this, plan, flags, multiplier);
+      context, *this, plan, flags, multiplier, ScorePolicy{});
+}
+
+Query::Weight* BooleanQuery::makeDisjunctionWeight(
+    Context& context, const Query& owner, std::span<Query*> clauses,
+    ScorePolicy policy, int32_t flags, float multiplier) {
+  assert(!clauses.empty());
+  CompiledBoolean plan;
+  plan.optional = clauses;
+  plan.minShouldMatch = 1;
+  return context.pool.make<BooleanQuery::Weight>(
+      context, owner, plan, flags, multiplier, policy);
 }
 
 } // namespace luxir

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <benchmark/benchmark.h>
 
 #include <array>
@@ -191,7 +192,7 @@ struct EffectiveFixture {
   static constexpr int32_t MAX_DOC = 2048;
 
   RAMDir dir;
-  CommitSnapshotRegistry snapshots{dir};
+  CommitSnapshotRegistry snapshots{test::reserveIncarnation(dir)};
   IndexWriter writer;
   std::shared_ptr<IndexReader> withoutDeletes;
   std::shared_ptr<IndexReader> withDeletes;
@@ -227,7 +228,7 @@ void BM_FilterCacheEffectiveDocSet(benchmark::State& state, bool deletes) {
   auto& fixture = effectiveFixture();
   auto reader = deletes ? fixture.withDeletes : fixture.withoutDeletes;
   if (reader->segments().size() != 1
-      || (reader->segments()[0].liveDocs() != nullptr) != deletes) {
+      || reader->segments()[0].hasDeletes() != deletes) {
     state.SkipWithError("unexpected effectiveDocSet benchmark segment shape");
     return;
   }

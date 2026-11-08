@@ -119,7 +119,7 @@ TEST_F(MinScoreTest, topDocsExcludesHitsCountsAndFacets) {
     auto req = localReq(h.getSearchEngine());
     auto& top = req->collection("main").topDocs("q")
         .exprQuery("rescore(body_w:alpha, pop_i)")
-        .minScore(3.5f).fields({"id"}).getNumber().limit(-1);
+        .minScore(3.5f).fields({"id"}).countLimit().limit(-1);
     top.facet("f", "cat_s").limit(-1);
     top.sum("s", "pop_i");
     req->execute(maxParallel);
@@ -140,7 +140,7 @@ TEST_F(MinScoreTest, appliesWithoutScoredRanking) {
   auto count = localReq(h.getSearchEngine());
   count->collection("main").topDocs("q")
       .exprQuery("rescore(body_w:alpha, pop_i)")
-      .minScore(5.0f).getNumber().limit(0);
+      .minScore(5.0f).countLimit().limit(0);
   count->execute();
   ASSERT_OK(count);
   EXPECT_EQ(2, count->getMatchCount());
@@ -150,7 +150,7 @@ TEST_F(MinScoreTest, appliesWithoutScoredRanking) {
   auto& cur = sorted->collection("main").topDocs("q")
       .exprQuery("rescore(body_w:alpha, pop_i)")
       .minScore(2.0f).matchFilter("cat_s", "even")
-      .fields({"id"}).getNumber().limit(-1);
+      .fields({"id"}).countLimit().limit(-1);
   auto& td = std::get<api::TopDocs>(cur.rawOp().kind);
   auto* sorts = api::build::allocArray(td.sort, 1, cur.mr());
   sorts[0].expr = api::build::arenaStr(cur.mr(), "pop_i");
@@ -163,7 +163,7 @@ TEST_F(MinScoreTest, appliesWithoutScoredRanking) {
   // Match-all scores 1, so a cut-off above it matches nothing.
   auto none = localReq(h.getSearchEngine());
   none->collection("main").topDocs("q").allQuery().minScore(1.5f)
-      .fields({"id"}).getNumber().limit(-1);
+      .fields({"id"}).countLimit().limit(-1);
   none->execute();
   ASSERT_OK(none);
   EXPECT_EQ(0, none->getMatchCount());
@@ -177,7 +177,7 @@ TEST_F(MinScoreTest, rescoreMinScoreFiltersInScoredAndFilterPositions) {
   auto scored = localReq(h.getSearchEngine());
   scored->collection("main").topDocs("q")
       .exprQuery("boost(rescore(body_w:alpha, pop_i, min_score=4), boost=2)")
-      .fields({"id"}).getScores().getNumber().limit(-1);
+      .fields({"id"}).getScores().countLimit().limit(-1);
   scored->execute();
   ASSERT_OK(scored);
   EXPECT_EQ((std::vector<std::string>{"d6", "d5", "d4"}), ids(*scored));
@@ -186,7 +186,7 @@ TEST_F(MinScoreTest, rescoreMinScoreFiltersInScoredAndFilterPositions) {
   // As a filter the rescore is unscored, but its cut-off still applies.
   auto filtered = localReq(h.getSearchEngine());
   auto& cur = filtered->collection("main").topDocs("q").allQuery()
-      .fields({"id"}).getNumber().limit(-1);
+      .fields({"id"}).countLimit().limit(-1);
   cur.filter(exprQuery(cur.mr(), "rescore(body_w:alpha, pop_i, min_score=5)"));
   filtered->execute();
   ASSERT_OK(filtered);
@@ -219,7 +219,7 @@ TEST_F(MinScoreTest, knnSimilarityL2IsMaxDistance) {
     for (int32_t maxParallel : {1, -1}) {
       auto req = localReq(h.getSearchEngine());
       auto& cur = req->collection("main").topDocs("q")
-          .fields({"id"}).getNumber().limit(-1);
+          .fields({"id"}).countLimit().limit(-1);
       cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {0, 0}, 4, 0, exact,
                                0, 0, 2.0f);
       cur.facet("f", "cat_s").limit(-1);
@@ -246,7 +246,7 @@ TEST_F(MinScoreTest, knnSimilarityCosineBeforeBoostAndAsFilter) {
 
   auto boosted = localReq(h.getSearchEngine());
   auto& cur = boosted->collection("main").topDocs("q")
-      .fields({"id"}).getNumber().limit(-1);
+      .fields({"id"}).countLimit().limit(-1);
   auto knn = qb::knn(cur.mr(), "embedding_v", {1, 0}, 4, 0, false, 0, 0, 0.5f);
   cur.rawQuery() = qb::boost(cur.mr(), knn, 0.1f);
   boosted->execute();
@@ -258,7 +258,7 @@ TEST_F(MinScoreTest, knnSimilarityCosineBeforeBoostAndAsFilter) {
   for (int run = 0; run < 2; run++) {
     auto filtered = localReq(h.getSearchEngine());
     auto& fcur = filtered->collection("main").topDocs("q").allQuery()
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     fcur.filter(qb::knn(fcur.mr(), "embedding_v", {1, 0}, 4, 0, false, 0, 0,
                         -0.5f));
     filtered->execute();
@@ -288,7 +288,7 @@ TEST_F(MinScoreTest, jsonShorthandAndFusionSource) {
 
   auto shorthand = localReq(h.getSearchEngine());
   parseQueryRequest(R"json({"query":"rescore(body_w:alpha, pop_i)",
-    "min_score":4,"get_number":true,"fields":["id"],"limit":-1})json",
+    "min_score":4,"count_limit":-1,"fields":["id"],"limit":-1})json",
       shorthand->rawRequest(), shorthand->mr);
   shorthand->collection("main");
   shorthand->execute();
@@ -299,7 +299,7 @@ TEST_F(MinScoreTest, jsonShorthandAndFusionSource) {
   auto fused = localReq(h.getSearchEngine());
   parseQueryRequest(R"json({"ops":{"q":{"fusion":{
     "sources":{"a":{"query":"rescore(body_w:alpha, pop_i)","min_score":5,"limit":10}},
-    "rrf":{},"limit":10,"get_number":true,"fields":["id"]}}}})json",
+    "rrf":{},"limit":10,"count_limit":-1,"fields":["id"]}}}})json",
       fused->rawRequest(), fused->mr);
   fused->collection("main");
   fused->execute();
@@ -324,7 +324,7 @@ TEST_F(MinScoreTest, jsonShorthandMatchQueryWithOps) {
   auto run = [&](const std::string& minScore) {
     auto req = localReq(h.getSearchEngine());
     parseQueryRequest(R"json({"query":{"match":{"body_w":"gamma"}},)json" + minScore
-        + R"json("get_number":true,"get_scores":true,"fields":["id"],"limit":-1,
+        + R"json("count_limit":-1,"get_scores":true,"fields":["id"],"limit":-1,
         "ops":{"f":{"field_facet":{"field":"cat_s","limit":-1}},"s":"sum(pop_i)"}})json",
         req->rawRequest(), req->mr);
     req->collection("main");
@@ -400,7 +400,7 @@ TEST_F(MinScoreTest, bulkTopKCountAndDomain) {
                   bool filtered, bool domain = false) {
     auto req = localReq(h.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q")
-        .fields({"id"}).getScores().getNumber(exact)
+        .fields({"id"}).getScores().countLimit(exact ? -1 : 0)
         .limit(limit < 0 ? nDocs : limit).batchSize(nDocs);
     cur.rawQuery() = qb::boolean(cur.mr(), {}, {
         qb::match(cur.mr(), "body_w", "alpha"),
@@ -507,7 +507,7 @@ TEST_F(MinScoreTest, selectiveConjunctionAndProhibitionBoundVerification) {
     SkipStatsScope stats;
     auto req = localReq(h.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q")
-        .fields({"id"}).getNumber().limit(-1);
+        .fields({"id"}).countLimit().limit(-1);
     auto cutoff = exprQuery(cur.mr(),
         "rescore(body_w:alpha, pop_i, min_score=2)");
     auto rare = qb::match(cur.mr(), "tag_s", "rare");
@@ -652,7 +652,7 @@ TEST_F(MinScoreTest, bulkPlansAndScoreScalingMatchPull) {
         ASSERT_EQ(Answer::YES, plan.available);
         EXPECT_EQ(Answer::YES, plan.supportsMatchWindows);
         EXPECT_EQ(Answer::NO, plan.supportsExactCandidateScoring);
-        EXPECT_EQ(childPlan.acceptsWindowFilter, plan.acceptsWindowFilter);
+        EXPECT_EQ(childPlan.windowFilterConsumption, plan.windowFilterConsumption);
         EXPECT_EQ(Answer::NO, plan.supportsReposition());
         EXPECT_EQ(-1, plan.constantCount);
         auto* bulk = supplier->buildBulk(pool, plan);
@@ -727,7 +727,7 @@ TEST_F(MinScoreTest, unreachableTermFloorSkipsImpactsForCount) {
   SkipStats::reset();
   auto req = localReq(h.getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("body_w", "alpha")
-      .minScore(100000.0f).getNumber().limit(0);
+      .minScore(100000.0f).countLimit().limit(0);
   req->execute(1);
   ASSERT_OK(req);
   EXPECT_EQ(0, req->getMatchCount());

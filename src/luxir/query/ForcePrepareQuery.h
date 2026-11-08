@@ -99,7 +99,8 @@ public:
       : Query::Weight(context, query, flags) {
       childWeight = query.child->createWeight(context, flags, multiplier);
       // Forces prepare; scoring behavior is otherwise the child's.
-      traits |= NEEDS_PREPARE | (childWeight->getFlags() & IS_CONSTANT_SCORING);
+      traits |= NEEDS_PREPARE
+          | (childWeight->getFlags() & (IS_CONSTANT_SCORING | CONSUMES_DOMAIN));
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {

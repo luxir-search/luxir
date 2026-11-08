@@ -54,6 +54,9 @@ public:
 
   virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
 
+  /// Visit members in ascending document order.
+  template <typename Visitor> void forEach(Visitor&& visitor) const;
+
   // Heap bytes owned by this DocSet, including capacity rather than logical
   // cardinality. Cache accounting uses this after immutable publication.
   virtual size_t ramBytesUsed() const = 0;
@@ -65,6 +68,13 @@ public:
   /// segment's maxDoc).  Result is BITSET if any input is BITSET, otherwise
   /// ARRAY.
   static std::unique_ptr<DocSet> union_(std::span<DocSet*> sets);
+
+  /// Base minus the union of exclusions. Null base means [0, maxDoc);
+  /// exclusions must be non-null. All inputs must be within that range and
+  /// bitsets must have size maxDoc. Always returns a new non-null set:
+  /// array bases use DocSetBuilder's density rule, bitset/null bases stay bits.
+  static std::unique_ptr<DocSet> andNot(
+      DocSet* base, std::span<DocSet*> exclusions, int32_t maxDoc);
 
   virtual ~DocSet() = default;
 };
@@ -264,6 +274,16 @@ public:
   }
 
 };
+
+template <typename Visitor>
+void DocSet::forEach(Visitor&& visitor) const {
+  if (type == ARRAY) {
+    for (int32_t doc : ((const ArrDocSet*)this)->docs()) visitor(doc);
+  } else {
+    const auto& bits = ((const BitDocSet*)this)->bits();
+    FixedBitSet::visitOnes(bits.words, FixedBitSet::sizeInWords(bits.size()), std::forward<Visitor>(visitor));
+  }
+}
 
 /// AND a window-local bitset (bit 0 == windowStart) with a segment-wide
 /// FixedBitSet (bit 0 == doc 0). Words outside [windowStart, windowEnd) are
@@ -470,7 +490,7 @@ public:
     }
   }
 
-  bool get(int32_t doc) {
+  LUXIR_INLINE bool get(int32_t doc) {
     if (words != nullptr) {
       return (words[(uint32_t) doc >> 6] >> (doc & 63)) & 1;
     }
@@ -688,6 +708,40 @@ public:
     return bits ? bitCard : (int32_t) docs.size();
   }
 
+  // Every doc in [begin, end), all above the docs added so far.
+  void addRange(int32_t begin, int32_t end) {
+    assert(begin >= 0 && begin <= end && end <= max);
+    if (begin == end) {
+      return;
+    }
+    #ifndef NDEBUG
+    assert(begin > lastDoc);
+    lastDoc = end - 1;
+    #endif
+    int32_t n = end - begin;
+    if (!bits) {
+      if ((int32_t) docs.size() + n <= arrayLimit()) {
+        for (int32_t doc = begin; doc < end; doc++) {
+          docs.emplace_back(doc);
+        }
+        return;
+      }
+      promoteToBits();
+    }
+    int32_t firstWord = begin >> 6;
+    int32_t lastWord = (end - 1) >> 6;
+    uint64_t firstMask = ~0ULL << (begin & 63);
+    uint64_t lastMask = ~0ULL >> (63 - ((end - 1) & 63));
+    if (firstWord == lastWord) {
+      bits->words[firstWord] |= firstMask & lastMask;
+    } else {
+      bits->words[firstWord] |= firstMask;
+      std::fill(bits->words + firstWord + 1, bits->words + lastWord, ~0ULL);
+      bits->words[lastWord] |= lastMask;
+    }
+    bitCard += n;
+  }
+
   void addWindowWords(const uint64_t* words, int32_t windowStart,
                       int32_t windowEnd, int32_t wordCard) {
     assert(words != nullptr);
@@ -827,6 +881,67 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
 
   outputDocs.shrink_to_fit();
   return std::make_unique<ArrDocSet>(std::move(outputDocs));
+}
+
+inline std::unique_ptr<DocSet> DocSet::andNot(
+    DocSet* base, std::span<DocSet*> exclusions, int32_t maxDoc) {
+  auto validate = [maxDoc](DocSet* set) {
+    if (set->type == BITSET) {
+      if (((BitDocSet*) set)->bits().size() != maxDoc) {
+        throw std::invalid_argument("DocSet bitset sizes differ");
+      }
+    } else {
+      auto docs = ((ArrDocSet*) set)->docs();
+      if (!docs.empty() && (docs.front() < 0 || docs.back() >= maxDoc)) {
+        throw std::invalid_argument("DocSet array is outside bitset range");
+      }
+    }
+  };
+  if (base != nullptr) validate(base);
+  for (DocSet* excluded : exclusions) validate(excluded);
+
+  if (base != nullptr && base->type == ARRAY) {
+    DocSetBuilder builder(maxDoc);
+    // Ascending base docs let array probes gallop forward through exclusions.
+    std::vector<DocSetProbe> probes(exclusions.begin(), exclusions.end());
+    for (int32_t doc : ((ArrDocSet*) base)->docs()) {
+      bool excluded = false;
+      for (auto& probe : probes) {
+        if (probe.get(doc)) {
+          excluded = true;
+          break;
+        }
+      }
+      if (!excluded) builder.add(doc);
+    }
+    return builder.build();
+  }
+
+  auto result = std::make_unique<RAMBitDocSet>(maxDoc);
+  auto& bits = result->mutableBits();
+  size_t numWords = FixedBitSet::sizeInWords(maxDoc);
+  if (base == nullptr) {
+    std::fill(bits.words, bits.words + numWords, ~0ULL);
+  } else {
+    const auto& from = ((BitDocSet*) base)->bits();
+    std::copy(from.words, from.words + FixedBitSet::sizeInWords(from.size()), bits.words);
+  }
+  for (DocSet* excluded : exclusions) {
+    if (excluded->type == BITSET) {
+      const auto& drop = ((BitDocSet*) excluded)->bits();
+      for (size_t word = 0; word < numWords; word++) {
+        bits.words[word] &= ~drop.words[word];
+      }
+    } else {
+      for (int32_t doc : ((ArrDocSet*) excluded)->docs()) {
+        bits.words[doc >> 6] &= ~(1ULL << (doc & 63));
+      }
+    }
+  }
+  if ((maxDoc & 63) != 0) {
+    bits.words[numWords - 1] &= (1ULL << (maxDoc & 63)) - 1;
+  }
+  return result;
 }
 
 inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {

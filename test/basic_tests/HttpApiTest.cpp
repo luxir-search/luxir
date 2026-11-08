@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "luxir/store/Manifest.h"
 #include <array>
 #include <atomic>
@@ -19,6 +20,7 @@
 
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
@@ -28,6 +30,8 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/BuildInfo.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir::test {
 
@@ -55,12 +59,31 @@ protected:
     return "{\"commit\":\"" + token + "\"," + body.substr(1);
   }
 
+  // Only the response envelope's timing varies; nested user data is unchanged.
+  static void expectResponse(std::string_view expected, std::string_view actual) {
+    glz::generic_sorted_u64 a, b;
+    ASSERT_FALSE(glz::read_json(a, expected)) << expected;
+    ASSERT_FALSE(glz::read_json(b, actual)) << actual;
+    ASSERT_TRUE(a.is_object());
+    ASSERT_TRUE(b.is_object());
+    a.get_object().erase("took_us");
+    b.get_object().erase("took_us");
+    EXPECT_EQ(glz::write_json(a).value(), glz::write_json(b).value());
+  }
+
   static std::string explicitQuery(const std::string& body) {
-    auto split = body.find(',', body.find("\"commit\":"));
-    EXPECT_NE(std::string::npos, split);
-    if (split == std::string::npos) return {};
-    return body.substr(0, split + 1) + "\"ops\":{\"q\":{" +
-        body.substr(split + 1, body.size() - split - 2) + "}}\n";
+    glz::generic_sorted_u64 query;
+    auto error = glz::read_json(query, body);
+    EXPECT_FALSE(error) << body;
+    if (error) return {};
+    glz::generic_sorted_u64 response = glz::generic_sorted_u64::object_t{};
+    for (const char* key : {"request_id", "commit", "took_us", "error", "warnings", "profile", "more"}) {
+      if (!query.contains(key)) continue;
+      response[key] = std::move(query[key]);
+      query.get_object().erase(key);
+    }
+    response["ops"]["q"] = std::move(query);
+    return glz::write_json(response).value();
   }
 
   static bool waitForShardThreads(HttpServer& server, int expected,
@@ -147,6 +170,7 @@ protected:
     EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
+    a.took_us = b.took_us = 0;
     std::string normalizedA, normalizedB;
     ASSERT_TRUE(api::write_json(a, normalizedA));
     ASSERT_TRUE(api::write_json(b, normalizedB));
@@ -274,6 +298,31 @@ TEST_F(HttpApiTest, prettySearchMultipleBatches) {
     }
     EXPECT_EQ((std::map<std::string, std::size_t>{{"a", 3}, {"b", 3}}), docsByOp);
   }
+}
+
+TEST_F(HttpApiTest, buildInfo) {
+  for (const auto* target : {"/", "/?pretty=false"}) {
+    auto res = httpRequest(port(), http::verb::get, target);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("application/json", res[http::field::content_type]);
+    expectJsonObject(res.body(), std::string_view(target) == "/");
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body()));
+    EXPECT_EQ(buildInfo().version, root["version"].get_string());
+    EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
+    EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+  }
+  auto res = httpRequest(port(), http::verb::post, "/");
+  EXPECT_EQ(405, res.result_int());
+  EXPECT_EQ("GET", res[http::field::allow]);
+
+  // _stats (shared with gRPC) and Prometheus report the same commit.
+  auto stats = httpRequest(port(), http::verb::get, "/_stats");
+  glz::generic_i64 statsJson;
+  ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
+  EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  auto metrics = httpRequest(port(), http::verb::get, "/metrics");
+  EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {
@@ -735,7 +784,9 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   ASSERT_NE(nullptr, seg);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
+  auto info = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  const auto& segment = info->segments[0];
+  EXPECT_EQ("s" + Postings::segmentKey(segment.seg_id, segment.creator_epoch), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
 }
 
@@ -772,7 +823,7 @@ TEST_F(HttpApiTest, searchMinScore) {
   auto search = [&](const std::string& query, const std::string& minScore) {
     auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
         R"({"query":)" + query + R"(,"min_score":)" + minScore
-        + R"j(,"get_number":true,"fields":["id"],"ops":{"s":"sum(rank_i)"}})j");
+        + R"j(,"count_limit":-1,"fields":["id"],"ops":{"s":"sum(rank_i)"}})j");
     EXPECT_EQ(200, res.result_int()) << res.body();
     return res.body();
   };
@@ -827,7 +878,7 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(withCommit(
+  expectResponse(withCommit(
       R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n"),
       response.body());
 }
@@ -840,10 +891,10 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
 
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_pb_s","limit":-1,)"
-      R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
+      R"("ops":{"hits":{"top_docs":{"limit":1,"count_limit":-1,"fields":["id"],)"
       R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(withCommit(
+  expectResponse(withCommit(
       R"({"ops":{"cats":{"buckets":[)"
       R"({"val":"x","count":2,"hits":{"found":2,"docs":[{"id":"pb2"}]}},)"
       R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n"),
@@ -857,7 +908,7 @@ TEST_F(HttpApiTest, shorthandCarriesRequestLevelKeys) {
 
   // request-level keys (max_parallel, time_zone) mix with shorthand TopDocs keys
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
-      R"({"query":"title_w:dune","limit":0,"get_number":true,"max_parallel":-1,"time_zone":"UTC"})");
+      R"({"query":"title_w:dune","limit":0,"count_limit":-1,"max_parallel":-1,"time_zone":"UTC"})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("found":2)"), std::string::npos) << res.body();
 
@@ -881,9 +932,10 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
     ASSERT_EQ(200, response.result_int()) << response.body();
-    EXPECT_EQ(withCommit(
+    SCOPED_TRACE(mp);
+    expectResponse(withCommit(
         R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n"),
-        response.body()) << "max_parallel=" << mp;
+        response.body());
   }
 }
 
@@ -1018,7 +1070,7 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   localServer.shutdown();
 
-  EXPECT_FALSE(std::filesystem::exists(base / "t" / "t0" / "unsafe"));
+  EXPECT_TRUE(test::catalogIncarnations(base, "unsafe").empty());
   EXPECT_FALSE(std::filesystem::exists(absolute));
   std::filesystem::remove_all(base);
 }
@@ -1045,9 +1097,8 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  FSDirectory container(base / "t" / "t0" / "bad");
-  auto incarnation = *CollectionStorage::current(container);
-  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "bad" / incarnation)) {
+  auto incarnation = test::selectedIncarnation(base, "bad");
+  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "i" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
@@ -1123,6 +1174,46 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "geo": {"type":"geo_point", "index":"range", "multi":true,
+              "ignore_malformed":true, "ignore_z_value":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, authored.result_int()) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_malformed": true)"), std::string::npos) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_z_value": true)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  ASSERT_EQ(200, resolved.result_int()) << resolved.body();
+  EXPECT_NE(resolved.body().find(R"("ignore_malformed": true)"), std::string::npos) << resolved.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"obj","geo":{"lat":40.7128,"lon":-74.0060}},)"
+      R"j({"id":"str","geo":["40.7128,-74.0060","POINT (-0.1278 51.5074 12)"]},)j"
+      R"({"id":"hash","geo":"dr5regw3p"},)"
+      R"({"id":"bad","geo":"not a point","home_p":"51.5074,-0.1278"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(update.body().find(R"("errors")"), std::string::npos) << update.body();
+
+  auto near = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},)"
+      R"("fields":["id"],"count_limit":-1})");
+  ASSERT_EQ(200, near.result_int()) << near.body();
+  for (const char* id : {R"("obj")", R"("str")", R"("hash")"}) {
+    EXPECT_NE(near.body().find(id), std::string::npos) << id << near.body();
+  }
+  EXPECT_EQ(near.body().find(R"("bad")"), std::string::npos) << near.body();
+
+  auto london = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"home_p","lat":51.5074,"lon":-0.1278,"radius_meters":10}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, london.result_int()) << london.body();
+  EXPECT_NE(london.body().find(R"("bad")"), std::string::npos) << london.body();
+}
+
 TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
@@ -1176,6 +1267,61 @@ TEST_F(HttpApiTest, malformedUpdateJsonIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, responsesReportTook) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"t1"},{"id":"t2"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("took_us":)"), std::string::npos) << update.body();
+
+  // An operation named took_us survives both transport and comparison helpers.
+  auto named = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"took_us":{"top_docs":{"query":"id:t1","fields":["id"]}}}})");
+  ASSERT_EQ(200, named.result_int()) << named.body();
+  expectResponse(withCommit(R"({"ops":{"took_us":{"docs":[{"id":"t1"}]}}})"), named.body());
+
+  auto stream = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+      "{\"id\":\"t3\"}\n{\"_end_\":{}}\n{\"id\":\"t4\"}\n{\"_end_\":{}}\n", "application/x-ndjson");
+  ASSERT_EQ(200, stream.result_int()) << stream.body();
+  auto acks = splitLines(stream.body());
+  ASSERT_EQ(3u, acks.size()) << stream.body();
+  for (const auto& ack : acks) {
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, ack)) << ack;
+    EXPECT_FALSE(root.contains("took_us")) << ack;
+  }
+
+  // Only the final line of a batched search carries took_us.
+  auto search = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"limit":-1,"batch_size":1,"fields":["id"]})");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  auto lines = splitLines(search.body());
+  ASSERT_GT(lines.size(), 1u) << search.body();
+  for (size_t i = 0; i < lines.size(); i++) {
+    EXPECT_EQ(i + 1 == lines.size(), lines[i].find(R"("took_us":)") != std::string::npos) << lines[i];
+  }
+}
+
+TEST_F(HttpApiTest, searchErrorsReportTook) {
+  helper.index(flatdoc("id", "floor"), UpdateMessage::COMMIT);
+  auto future = helper.getIndexWriter()->snapshots.snapshot()->id;
+  future.index_gen++;
+  for (const char* format : {"", "&format=docs"}) for (bool pretty : {false, true}) {
+    auto target = "/collections/main/_search?min_commit=" + future.token() +
+        "&min_commit_timeout_ms=10" + format + (pretty ? "&pretty" : "");
+    auto response = httpRequest(port(), http::verb::post, target,
+        R"({"request_id":"timed-error","query":"*:*"})");
+    ASSERT_EQ(503, response.result_int()) << response.body();
+    EXPECT_EQ("application/json", response[http::field::content_type]);
+    expectJsonObject(response.body(), pretty && std::string_view(format).empty());
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, response.body())) << response.body();
+    EXPECT_EQ("timed-error", root["request_id"].get_string());
+    EXPECT_EQ("stale_replica", root["error"]["code"].get_string());
+    ASSERT_TRUE(root.contains("took_us")) << response.body();
+    EXPECT_GE(root["took_us"].get<int64_t>(), 10000);
+  }
 }
 
 TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
@@ -1363,28 +1509,56 @@ TEST_F(HttpApiTest, ndjsonEndRejectsFieldMap) {
             std::string::npos) << update.body();
 }
 
-// "found" is opt-in: it appears only when get_number is requested (an exact count
-// forgoes dynamic pruning).  A default query carries no count, and absence must be
-// omitted rather than rendered as found:0 (indistinguishable from zero matches).
-TEST_F(HttpApiTest, foundIsOptInWithGetNumber) {
+// "found" is opt-in: nonzero count_limit requests a count. A default query
+// carries no count, and absence must be omitted rather than rendered as found:0.
+TEST_F(HttpApiTest, foundIsOptInWithCountLimit) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("f1"), "title_w", std::string("foundtoken alpha")),
     flatdoc("id", std::string("f2"), "title_w", std::string("foundtoken beta")),
   }, UpdateMessage::COMMIT);
 
-  // Default request (no get_number): "found" omitted, docs still returned.
+  // Default request (no count_limit): "found" omitted, docs still returned.
   HttpReq noCount(port());
   noCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).execute();
   ASSERT_EQ(200, noCount.status()) << noCount.rawResponse();
   EXPECT_EQ(noCount.rawResponse().find(R"("found")"), std::string::npos) << noCount.rawResponse();
   EXPECT_EQ((std::size_t)2, noCount.getDocs().size()) << noCount.rawResponse();
 
-  // With get_number: "found" present and accurate.
+  // With count_limit: "found" present and accurate.
   HttpReq withCount(port());
   withCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).withStats().execute();
   ASSERT_EQ(200, withCount.status()) << withCount.rawResponse();
   EXPECT_NE(withCount.rawResponse().find(R"("found")"), std::string::npos) << withCount.rawResponse();
   EXPECT_EQ((int64_t)2, withCount.found()) << withCount.rawResponse();
+}
+
+TEST_F(HttpApiTest, countLimit) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 30; i++) {
+    docs.push_back(flatdoc("id", "t" + std::to_string(i), "title_w",
+                           i % 2 ? "counttoken other" : "counttoken keep"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto search = [&](std::string_view limit) {
+    auto res = httpRequest(port(), http::verb::get,
+        "/collections/main/_search?query=*%3A*&fields=id&count_limit=" + std::string(limit));
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  for (auto limit : {"-1", "-2", "5", "100"}) {
+    auto exact = search(limit);
+    EXPECT_NE(std::string::npos, exact.find(R"("found":30,"docs")")) << exact;
+    EXPECT_EQ(std::string::npos, exact.find("found_gte")) << exact;
+  }
+  auto none = search("0");
+  EXPECT_EQ(std::string::npos, none.find(R"("found")")) << none;
+  auto bounded = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?count_limit=5",
+      R"({"query":"*:*","fields":["id"],"filter":["title_w:counttoken AND title_w:keep"]})");
+  ASSERT_EQ(200, bounded.result_int()) << bounded.body();
+  EXPECT_NE(std::string::npos, bounded.body().find(R"("found":5,"found_gte":true)")) << bounded.body();
+  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-3");
+  EXPECT_EQ(400, invalid.result_int()) << invalid.body();
 }
 
 TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
@@ -1569,6 +1743,60 @@ TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
   ASSERT_EQ(200, query.status()) << query.rawResponse();
   EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
 
+  localServer.shutdown();
+}
+
+// Batches complete in stream order, but a batch frees its admission slot once
+// it is indexed: a stalled batch must not hold back the batches behind it.
+TEST_F(HttpApiTest, ndjsonStalledBatchDoesNotHoldBackLaterBatches) {
+  LuxirConfig config;
+  config.server.workers = 4;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 2;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  static constexpr int kDocCount = 12;
+  // If slots were held until completion, only the rest of the window (one
+  // batch) could index behind the stalled one.
+  static constexpr int kOvertakers = 5;
+  std::promise<void> release;
+  std::shared_future<void> released = release.get_future().share();
+  std::promise<void> overtaken;
+  std::atomic<int> behind{0};
+  Signal::listen("httpBatchIndexing", [&](void* ordinal, void*, void*) -> void* {
+    if ((uintptr_t)ordinal == 0) {
+      released.wait_for(std::chrono::seconds(10));
+    } else if (++behind == kOvertakers) {
+      overtaken.set_value();
+    }
+    return nullptr;
+  });
+
+  std::string body;
+  for (int i = 0; i < kDocCount; i++) {
+    body += R"({"id":"stall-)" + std::to_string(i) + R"(","title_w":"stalledbatch"})" "\n";
+  }
+  body += R"({"_end_":{"commit":{}}})" "\n";
+  auto update = std::async(std::launch::async, [&] {
+    return httpRequest(localServer.getPort(), http::verb::post, "/collections/stall/_update",
+                       std::move(body), "application/x-ndjson");
+  });
+  auto overtakenState = overtaken.get_future().wait_for(std::chrono::seconds(5));
+  int behindWhileStalled = behind.load();
+  release.set_value();
+  auto response = update.get();
+  Signal::unlisten("httpBatchIndexing");
+  EXPECT_EQ(std::future_status::ready, overtakenState)
+      << behindWhileStalled << " batches indexed behind the stalled one";
+  ASSERT_EQ(200, response.result_int()) << response.body();
+
+  HttpReq query(localServer.getPort());
+  query.collection("stall").matchQuery("title_w", "stalledbatch").fields({"id"})
+      .limit(kDocCount).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
   localServer.shutdown();
 }
 
@@ -2172,7 +2400,8 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
   dupReq.collection("main").matchQuery("title_w", "fulldecode").fields({"id"})
       .limit(10).withStats().execute();
   ASSERT_EQ(200, dupReq.status()) << dupReq.rawResponse();
-  EXPECT_EQ((int64_t)2, dupReq.found()) << dupReq.rawResponse();
+  // Local id collisions keep the later document, including with allow_dups.
+  EXPECT_EQ((int64_t)1, dupReq.found()) << dupReq.rawResponse();
 
   HttpReq delReq(port());
   delReq.collection("main").matchQuery("title_w", "deletestream").fields({"id"})
@@ -2523,8 +2752,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   HttpReq full(port());
   full.matchQuery("status_s", "active").fields({"id"}).execute();
   ASSERT_EQ(200, full.status());
-  EXPECT_EQ(explicitQuery(res.body()),
-            full.rawResponse());
+  expectResponse(explicitQuery(res.body()), full.rawResponse());
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
   // an unknown root key is rejected with a client-facing error
@@ -2546,7 +2774,7 @@ TEST_F(HttpApiTest, namedOpsPreserveNestedResultsAcrossBatches) {
       auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
           R"({"request_id":"named","max_parallel":)" + std::to_string(parallel) +
           R"(,"ops":{
-            "q1":{"top_docs":{"query":"cat_s:x","fields":["id"],"get_number":true,
+            "q1":{"top_docs":{"query":"cat_s:x","fields":["id"],"count_limit":-1,
               "batch_size":)" + std::to_string(batchSize) + R"json(,
               "ops":{"metric":"min(price_f)","q2":"max(price_f)"}}},
             "q2":{"top_docs":{"query":"id:3","fields":["id"]}},
@@ -2599,7 +2827,7 @@ TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
   for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
     auto res = httpRequest(port(), http::verb::post, target, body);
     ASSERT_EQ(200, res.result_int()) << res.body();
-    EXPECT_EQ(withCommit("{\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
+    expectResponse(withCommit("{\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
   }
   for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
                            R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
@@ -2618,7 +2846,7 @@ TEST_F(HttpApiTest, shorthandKeepsRootResultsAcrossBatches) {
   helper.indexAll(std::array{flatdoc("id", "1"), flatdoc("id", "2"), flatdoc("id", "3")},
                   UpdateMessage::COMMIT);
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
-      R"json({"fields":["id"],"batch_size":1,"get_number":true,"ops":{"q":"sum(1)"}})json");
+      R"json({"fields":["id"],"batch_size":1,"count_limit":-1,"ops":{"q":"sum(1)"}})json");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_GT(lines.size(), 1u);
@@ -2654,7 +2882,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   }, UpdateMessage::COMMIT);
 
   const std::string body =
-      R"({"collection":"","query":{"match":{"status_s":"active"}},"fields":["id"]})";
+      R"({"collection":"","flags":["date_iso"],"query":{"match":{"status_s":"active"}},"fields":["id"]})";
   auto echo = httpRequest(port(), http::verb::post,
                           "/collections/main/_search?explain=request", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
@@ -2665,6 +2893,8 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_NE(canonical.find(R"("field":"status_s")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("val":"active")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("collection":"main")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("flags":["date_iso"])"), std::string::npos) << canonical;
+  EXPECT_EQ(canonical.find("flags_set"), std::string::npos) << canonical;
   // not executed
   EXPECT_EQ(canonical.find(R"("docs")"), std::string::npos) << canonical;
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
@@ -2673,8 +2903,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            viaEcho.body());
+  expectResponse(explicitQuery(direct.body()), viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
   auto echo2 = httpRequest(port(), http::verb::post,
@@ -2725,7 +2954,7 @@ TEST_F(HttpApiTest, searchGetLimitOnlyMatchesAll) {
   }, UpdateMessage::COMMIT);
 
   auto res = httpRequest(port(), http::verb::get,
-      "/collections/main/_search?limit=1&fields=id&get_number=true");
+      "/collections/main/_search?limit=1&fields=id&count_limit=-1");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
@@ -2752,7 +2981,7 @@ TEST_F(HttpApiTest, searchPostUrlOverlayWins) {
       R"({"query":"title_w:foundation","limit":0,"fields":["id"]})");
   auto urlOnly = httpRequest(port(), http::verb::get, target);
   ASSERT_EQ(200, overlaid.result_int()) << overlaid.body();
-  EXPECT_EQ(urlOnly.body(), overlaid.body());
+  expectResponse(urlOnly.body(), overlaid.body());
 }
 
 TEST_F(HttpApiTest, searchUrlOverlayPreservesSiblingOps) {
@@ -2783,14 +3012,13 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   }, UpdateMessage::COMMIT);
 
   const std::string target =
-      "/collections/main/_search?query=title_w%3Adune&limit=4&fields=id&get_number=true";
+      "/collections/main/_search?query=title_w%3Adune&limit=4&fields=id&count_limit=-1";
   auto direct = httpRequest(port(), http::verb::get, target);
   auto echo = httpRequest(port(), http::verb::get, target + "&explain=request");
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
   ASSERT_EQ(200, postback.result_int()) << postback.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            postback.body());
+  expectResponse(explicitQuery(direct.body()), postback.body());
 
   auto echo2 = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=request", echo.body());
@@ -2804,7 +3032,7 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
       "&request_id=url%22%5Cvalue&freshness_ms=17&time_zone=UTC&profile=true&max_parallel=1"
       "&query=title_w%3Adune&limit=bad&limit=7&offset=-2&fields=id%2Ctitle_s"
       "&sort=price_i+desc&sort=score&batch_size=5&document_format=columns"
-      "&get_number=true&get_scores=false";
+      "&count_limit=-1&get_scores=false";
   auto echo = httpRequest(port(), http::verb::get, target);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
 
@@ -2820,7 +3048,7 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
   EXPECT_EQ(-2, *td["offset"].get_if<int64_t>());
   EXPECT_EQ(5, *td["batch_size"].get_if<int64_t>());
   EXPECT_EQ("columns", *td["document_format"].get_if<std::string>());
-  EXPECT_TRUE(*td["get_number"].get_if<bool>());
+  EXPECT_EQ(-1, *td["count_limit"].get_if<int64_t>());
   auto* sorts = td["sort"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, sorts);
   ASSERT_EQ(2u, sorts->size());
@@ -2911,7 +3139,7 @@ TEST_F(HttpApiTest, searchUrlKnownValueErrorsNameParam) {
     std::pair{"offset", "9223372036854775808"},
     std::pair{"batch_size", "2147483648"},
     std::pair{"document_format", "row"},
-    std::pair{"get_number", "1"},
+    std::pair{"count_limit", "1x"},
     std::pair{"get_scores", "falsex"},
   };
   for (const auto& [name, value] : badValues) {
@@ -2929,14 +3157,14 @@ TEST_F(HttpApiTest, searchUrlSemanticValidationMatchesBody) {
   auto bodyZone = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"time_zone":"Not/A/Zone","limit":0})");
   EXPECT_EQ(bodyZone.result_int(), urlZone.result_int());
-  EXPECT_EQ(bodyZone.body(), urlZone.body());
+  expectResponse(bodyZone.body(), urlZone.body());
 
   auto urlParallel = httpRequest(port(), http::verb::get,
       "/collections/main/_search?max_parallel=2&limit=0");
   auto bodyParallel = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"max_parallel":2,"limit":0})");
   EXPECT_EQ(bodyParallel.result_int(), urlParallel.result_int());
-  EXPECT_EQ(bodyParallel.body(), urlParallel.body());
+  expectResponse(bodyParallel.body(), urlParallel.body());
 }
 
 TEST_F(HttpApiTest, searchUrlTopDocsQMaterializationRule) {
@@ -3245,7 +3473,12 @@ TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                               R"({"fields": {"published": {"type": "date"}}})");
   ASSERT_EQ(200, redefine.result_int()) << redefine.body();
-  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
+  // Only published's own definition: the geo suffix templates are range-indexed.
+  size_t published = redefine.body().find("\"published\"");
+  ASSERT_NE(std::string::npos, published) << redefine.body();
+  std::string definition = redefine.body().substr(
+      published, redefine.body().find('}', published) - published);
+  EXPECT_EQ(definition.find("\"index\""), std::string::npos)
       << "whole-definition set dropped the old index property: " << redefine.body();
 
   // mode=replace_all: title/published gone, reserved fields materialized.
@@ -3496,7 +3729,7 @@ TEST_F(HttpApiTest, docsFormatSelectableInBody) {
   EXPECT_EQ(R"({"id":"b1"})" "\n", res.body());
 }
 
-// get_number puts the count in a _header_ meta record on the first line;
+// count_limit puts the count in a _header_ meta record on the first line;
 // without it the body is pure documents.
 TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   LuxirTest::clearCollection("http_docs_hdr");
@@ -3505,7 +3738,7 @@ TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   ch.index(flatdoc("id", std::string("h2")), UpdateMessage::COMMIT);
 
   auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(3u, lines.size()) << res.body();
@@ -3529,9 +3762,46 @@ TEST_F(HttpApiTest, docsFormatValidation) {
   EXPECT_EQ(400, columns.result_int()) << columns.body();
   EXPECT_NE(std::string::npos, columns.body().find("format=docs")) << columns.body();
 
+  auto adaptive = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&document_format=adaptive",
+      R"({"query":{"all":true},"fields":["id"]})");
+  EXPECT_EQ(400, adaptive.result_int()) << adaptive.body();
+  EXPECT_NE(std::string::npos, adaptive.body().find("ADAPTIVE")) << adaptive.body();
+
   auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_search?format=lines",
       R"({"query":{"all":true}})");
   EXPECT_EQ(400, unknown.result_int()) << unknown.body();
+}
+
+// document_format=adaptive answers with envelopes whose merged documents
+// carry sparse fields from docs and dense ones from columns.
+TEST_F(HttpApiTest, adaptiveFormat) {
+  LuxirTest::clearCollection("http_adaptive");
+  CollectionHelper ch("http_adaptive");
+  std::vector<Doc> docs{flatdoc("id", "a0", "year_i", (int64_t)2000, "rare_s", "x")};
+  for (int i = 1; i < 20; i++) {
+    docs.push_back(flatdoc("id", "a" + std::to_string(i), "year_i", (int64_t)(2000 + i)));
+  }
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs), UpdateMessage::COMMIT).success);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_adaptive/_search",
+      R"({"query":{"all":true},"limit":-1,"fields":["id","year_i","rare_s"],"document_format":"adaptive"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  size_t rows = 0, withRare = 0;
+  for (const auto& line : splitLines(res.body())) {
+    glz::generic_i64 body;
+    ASSERT_FALSE(glz::read_json(body, line));
+    for (const auto& row : body["docs"].get_array()) {
+      rows++;
+      EXPECT_TRUE(row.contains("year_i"));
+      if (row.contains("rare_s")) {
+        withRare++;
+        EXPECT_EQ("x", row["rare_s"].get_string());
+      }
+    }
+  }
+  EXPECT_EQ(20u, rows);
+  EXPECT_EQ(1u, withRare);
 }
 
 // An engine error before anything streams is a plain HTTP error, not a 200
@@ -3546,19 +3816,19 @@ TEST_F(HttpApiTest, docsFormatErrorBeforeFlushIsHttpError) {
 
 // Object-valued sole-underscore-field records are the reserved meta/control
 // namespace in streaming ingest: unknown names are an error, never indexed as
-// documents.  Scalar-valued ones stay documents ({"_version_":42} is a
-// legitimate one-field export; every real control carries an object).
+// documents. Scalar-valued ones stay documents and undergo document validation.
 TEST_F(HttpApiTest, ndjsonUnknownUnderscoreRecordIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_bogus_":{"x":1}})") + "\n", "application/x-ndjson");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("_bogus_")) << res.body();
 
-  // Scalar payload: classified as a document, not an unknown control (it may
-  // still fail schema-level checks, but never as a control record).
+  // Scalar payload: a document error for an engine field, not an unknown control.
   auto scalar = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_version_":42})") + "\n", "application/x-ndjson");
   EXPECT_EQ(std::string::npos, scalar.body().find("unknown control record")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("assigned by the engine")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("optimistic concurrency is not supported")) << scalar.body();
 
   // _header_ itself must carry an object.
   auto malformed = httpRequest(port(), http::verb::post, "/collections/main/_update",
@@ -3588,7 +3858,7 @@ TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
   ASSERT_EQ(200, res.result_int()) << res.body();
 
   auto check = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, check.result_int()) << check.body();
   auto lines = splitLines(check.body());
   ASSERT_EQ(3u, lines.size()) << check.body();  // header + 2 docs
@@ -3602,7 +3872,7 @@ TEST_F(HttpApiTest, fusionSubOpsEchoAndStreaming) {
       flatdoc("id", "c", "color_s", "blue")}, UpdateMessage::COMMIT);
   const std::string body = R"({"ops":{"f":{"fusion":{
     "sources":{"all":{"query":{"all":true},"limit":3}},"rrf":{},
-    "limit":2,"batch_size":1,"get_number":true,"fields":["id"],
+    "limit":2,"batch_size":1,"count_limit":-1,"fields":["id"],
     "ops":{"colors":{"field_facet":{"field":"color_s"}}}
   }}}})";
   auto echo = httpRequest(port(), http::verb::post,
@@ -3667,8 +3937,8 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
 
   auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_search?format=docs",
       R"({"ops":{)"
-      R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}},)"
-      R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}})"
+      R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"count_limit":-1,"fields":["id"]}},)"
+      R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"count_limit":-1,"fields":["id"]}})"
       R"(}})");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
@@ -3694,7 +3964,7 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
   EXPECT_EQ(4, foundByOp["qb"]);
 }
 
-// Warnings force a _header_ even without get_number: degraded execution is
+// Warnings force a _header_ even without count_limit: degraded execution is
 // never silent, docs format included.
 TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
   LuxirTest::clearCollection("http_docs_warn");
@@ -3712,7 +3982,7 @@ TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
   EXPECT_EQ(R"({"id":"w1"})", lines[1]);
 }
 
-// Zero matches: pure mode returns an empty 200 body; with get_number the body
+// Zero matches: pure mode returns an empty 200 body; with count_limit the body
 // is the single header line.
 TEST_F(HttpApiTest, docsFormatZeroResults) {
   LuxirTest::clearCollection("http_docs_zero");
@@ -3725,7 +3995,7 @@ TEST_F(HttpApiTest, docsFormatZeroResults) {
   EXPECT_TRUE(pure.body().empty()) << pure.body();
 
   auto counted = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_search?format=docs",
-      R"({"query":{"match":{"id":"nomatch"}},"get_number":true,"fields":["id"]})");
+      R"({"query":{"match":{"id":"nomatch"}},"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, counted.result_int()) << counted.body();
   EXPECT_EQ(R"({"_header_":{"found":0}})" "\n", counted.body());
 }
@@ -3773,7 +4043,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
   }
 
   auto exported = httpRequest(port(), http::verb::post, "/collections/http_rt_src/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id","num_i"]})");
   ASSERT_EQ(200, exported.result_int()) << exported.body();
   ASSERT_EQ(8u, splitLines(exported.body()).size());  // header + 7 docs
 
@@ -3783,7 +4053,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 
   // Verify by re-exporting the destination: identical doc lines, same count.
   auto reexported = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id","num_i"]})");
   ASSERT_EQ(200, reexported.result_int()) << reexported.body();
   auto a = splitLines(exported.body());
   auto b = splitLines(reexported.body());
@@ -3794,15 +4064,64 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 // server-side buffering.  A private server with a tiny stream buffer forces
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the response resumes it and every doc arrives.
-TEST_F(HttpApiTest, backpressurePausesEmitter) {
-  LuxirTest::clearCollection("http_bp");
-  CollectionHelper ch("http_bp");
+static void expectBackpressureDrains(HttpServer& server, const std::string& body,
+                                     size_t expectedDocs) {
+  SCOPED_TRACE(body);
+  net::io_context cioc;
+  tcp::socket sock(cioc);
+  sock.open(tcp::v4());
+  // Small receive buffer (set before connect) so the kernel absorbs little
+  // and the server's write queue backs up quickly.
+  sock.set_option(net::socket_base::receive_buffer_size(8192));
+  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                             (unsigned short)server.getPort()));
+
+  int64_t pausesBefore = streamPauseCount.load();
+
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
+  req.set(http::field::host, "127.0.0.1");
+  req.set(http::field::content_type, "application/json");
+  req.body() = body;
+  req.prepare_payload();
+  http::write(sock, req);
+
+  // Withhold reads until the connection backs up and the emitter parks.
+  bool paused = false;
+  for (int i = 0; i < 400 && !paused; i++) {
+    paused = streamPauseCount.load() > pausesBefore;
+    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_TRUE(paused);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  http::read(sock, buffer, res);
+  EXPECT_EQ(200, res.result_int());
+
+  // Every doc arrived once the client drained the stream.
+  size_t count = 0;
+  std::string_view text = res.body();
+  for (size_t pos = 0; (pos = text.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
+  EXPECT_EQ(expectedDocs, count);
+
+  beast::error_code ec;
+  sock.shutdown(tcp::socket::shutdown_both, ec);
+}
+
+static std::vector<Doc> backpressureDocs() {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad,
+                           "k_s", i % 2 ? "odd" : "even"));
   }
-  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
+  return docs;
+}
+
+TEST_F(HttpApiTest, backpressurePausesEmitter) {
+  LuxirTest::clearCollection("http_bp");
+  CollectionHelper ch("http_bp");
+  ASSERT_TRUE(ch.indexAll(backpressureDocs(), UpdateMessage::COMMIT).success);
 
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
@@ -3811,47 +4130,29 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   // resumes on the connection shard; 1 and -1 re-enqueue their resumes onto
   // the arena (HttpSearchRequest::resumeWhenDrained's arena-lane wrapper).
   for (std::string mp : {"0", "1", "-1"}) {
-    net::io_context cioc;
-    tcp::socket sock(cioc);
-    sock.open(tcp::v4());
-    // Small receive buffer (set before connect) so the kernel absorbs little
-    // and the server's write queue backs up quickly.
-    sock.set_option(net::socket_base::receive_buffer_size(8192));
-    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
-                               (unsigned short)bpServer.getPort()));
-
-    int64_t pausesBefore = streamPauseCount.load();
-
-    http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
-    req.set(http::field::host, "127.0.0.1");
-    req.set(http::field::content_type, "application/json");
-    req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" +
-        mp + R"(,"fields":["id","pad_s"]})";
-    req.prepare_payload();
-    http::write(sock, req);
-
-    // Withhold reads until the connection backs up and the emitter parks.
-    bool paused = false;
-    for (int i = 0; i < 400 && !paused; i++) {
-      paused = streamPauseCount.load() > pausesBefore;
-      if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    EXPECT_TRUE(paused) << "max_parallel=" << mp;
-
-    beast::flat_buffer buffer;
-    http::response<http::string_body> res;
-    http::read(sock, buffer, res);
-    EXPECT_EQ(200, res.result_int()) << "max_parallel=" << mp;
-
-    // Every doc arrived once the client drained the stream.
-    size_t count = 0;
-    std::string_view body = res.body();
-    for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
-    EXPECT_EQ(2000u, count) << "max_parallel=" << mp;
-
-    beast::error_code ec;
-    sock.shutdown(tcp::socket::shutdown_both, ec);
+    expectBackpressureDrains(bpServer,
+        R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" + mp
+            + R"(,"fields":["id","pad_s"]})",
+        2000);
   }
+  bpServer.shutdown();
+}
+
+// The engine's own parallel lane resumes inside the arena too.
+TEST_F(HttpApiTest, backpressurePausesAutoParallelEmitter) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_work = 1;
+  LuxirNode node(config);
+  CollectionHelper ch(node, "http_bp");
+  auto docs = backpressureDocs();
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).first(1000), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(1000), UpdateMessage::COMMIT).success);
+
+  HttpServer bpServer(node, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer.start();
+  expectBackpressureDrains(bpServer,
+      R"({"query":"k_s:odd k_s:even","limit":-1,"batch_size":100,"fields":["id","pad_s"]})",
+      2000);
   bpServer.shutdown();
 }
 
@@ -4036,7 +4337,7 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   // Resolving after submission still uses the same pre-output HTTP status.
   auto search = httpRequest(port(), http::verb::get, "/collections/Bad-Name/_search");
   ASSERT_EQ(400, search.result_int()) << search.body();
-  EXPECT_NE(search.body().find(R"({"error":{"kind":"invalid_request","code":"invalid_collection_name")"),
+  EXPECT_NE(search.body().find(R"("error":{"kind":"invalid_request","code":"invalid_collection_name")"),
             std::string::npos) << search.body();
 
   // A well-formed name nothing answers to is not found.
@@ -4054,7 +4355,7 @@ TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   ASSERT_EQ(400, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
-  EXPECT_NE(lines[0].find(R"({"request_id":"s1","error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
+  EXPECT_NE(lines[0].find(R"("error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
             std::string::npos) << res.body();
   EXPECT_EQ(lines[0].find(R"("docs")"), std::string::npos) << res.body();
 
@@ -4063,8 +4364,22 @@ TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   auto docs = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"request_id":"s2","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
   EXPECT_EQ(400, docs.result_int()) << docs.body();
-  EXPECT_NE(docs.body().find(R"({"request_id":"s2","error":{"kind":"invalid_request")"),
+  EXPECT_NE(docs.body().find(R"("error":{"kind":"invalid_request")"),
             std::string::npos) << docs.body();
+
+  // A degradation declared while parsing survives a later whole-request error.
+  helper.index(flatdoc("id", "warned", "title_w", "dune"), UpdateMessage::COMMIT);
+  for (const char* format : {"", "?format=docs"}) {
+    auto warned = httpRequest(port(), http::verb::post,
+        std::string("/collections/main/_search") + format,
+        R"({"query":{"simple_query":{"q":"dune~9","fields":["title_w"]}},"offset":-1})");
+    ASSERT_EQ(400, warned.result_int()) << warned.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, warned.body())) << warned.body();
+    ASSERT_TRUE(root.contains("warnings")) << warned.body();
+    EXPECT_EQ("fuzzy_clamped", root["warnings"][0]["code"].get_string());
+    EXPECT_TRUE(root.contains("took_us")) << warned.body();
+  }
 }
 
 TEST_F(HttpApiTest, envelopeEchoesRequestId) {
@@ -4075,7 +4390,7 @@ TEST_F(HttpApiTest, envelopeEchoesRequestId) {
   EXPECT_NE(res.body().find(R"({"request_id":"q9",)"), std::string::npos) << res.body();
   EXPECT_NE(res.body().find(R"("rid1")"), std::string::npos) << res.body();
 
-  // Docs format: the id rides on the first _header_ even without get_number.
+  // Docs format: the id rides on the first _header_ even without count_limit.
   auto docs = httpRequest(port(), http::verb::post,
                           "/collections/main/_search?format=docs&request_id=q10",
                           R"({"query":"title_w:requestid","fields":["id"]})");
@@ -4223,7 +4538,7 @@ TEST_F(HttpApiTest, offsetUrlOverlay) {
   ASSERT_EQ(4u, ids.size());
   auto page = httpRequest(port(), http::verb::post,
       "/collections/main/_search?offset=1&limit=2",
-      R"({"query":"title_w:dune","fields":["id"],"offset":0,"limit":10,"get_number":true})");
+      R"({"query":"title_w:dune","fields":["id"],"offset":0,"limit":10,"count_limit":-1})");
   ASSERT_EQ(200, page.result_int()) << page.body();
   auto lines = splitLines(page.body());
   ASSERT_EQ(1u, lines.size());
@@ -4276,8 +4591,7 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
   ASSERT_EQ(200, direct.result_int()) << direct.body();
-  EXPECT_EQ(explicitQuery(direct.body()),
-            replay.body());
+  expectResponse(explicitQuery(direct.body()), replay.body());
   auto again = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", explainedRequest(echo));
   ASSERT_EQ(200, again.result_int()) << again.body();
@@ -4338,11 +4652,11 @@ TEST_F(HttpApiTest, ndjsonEofKeepsAllCommitOutcomesOnFailure) {
   CollectionHelper other(*luxirNode, "eof_failure_other");
   auto cleanup = scope_guard([&] { luxirNode->deleteCollection("eof_failure_other"); });
   auto writer = helper.getIndexWriter();
-  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
-    if (source == writer.get()) throw FileIOException("commit failed");
+  Signal::listen("publishWritten", [&](void* source, void*, void*) -> void* {
+    if (source == &writer->dir.underlying()) throw FileIOException("commit failed");
     return nullptr;
   });
-  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishWritten"); });
   for (bool multiple : {false, true}) {
     std::string body = "{\"id\":\"first\"}\n";
     if (multiple) body += "{\"_update_\":{\"collection\":\"eof_failure_other\"}}\n{\"id\":\"second\"}\n";
@@ -4420,7 +4734,7 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   for (std::string format : {"rows", "columns"}) {
     auto response = httpRequest(port(), http::verb::post,
         "/collections/main/_search?collapse=key_s",
-        R"({"fields":["id"],"get_number":true,"batch_size":2,"document_format":")" + format + "\"}");
+        R"({"fields":["id"],"count_limit":-1,"batch_size":2,"document_format":")" + format + "\"}");
     ASSERT_EQ(200, response.result_int()) << response.body();
     std::vector<std::string> ids;
     for (const auto& line : splitLines(response.body())) {
@@ -4437,7 +4751,7 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   }
   auto response = httpRequest(port(), http::verb::post,
       "/collections/main/_search?format=docs&collapse=key_s",
-      R"({"fields":["id"],"get_number":true,"batch_size":1})");
+      R"({"fields":["id"],"count_limit":-1,"batch_size":1})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   auto lines = splitLines(response.body());
   ASSERT_EQ(4, lines.size());
@@ -4449,6 +4763,41 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   ASSERT_FALSE(glz::read_json(singleton, lines.back()));
   EXPECT_TRUE(singleton["_group_"]["val"].is_null());
   EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
+}
+
+TEST_F(HttpApiTest, int64StringsApplyToEnvelopeAndDocumentStreams) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "stamp", int64_t{1700000000123456789},
+      "when_dt", int64_t{1700000000123}, "large_i", int64_t{9007199254740992},
+      "values_is", std::vector<int64_t>{INT64_MIN, -9007199254740992, -9007199254740991,
+          9007199254740991, 9007199254740992, INT64_MAX}), UpdateMessage::COMMIT).success);
+  for (auto format : {"rows", "columns", "adaptive"}) for (auto framing : {"", "?format=docs"}) {
+    if (*framing != '\0' && std::string_view(format) != "rows") continue;
+    auto json = fmt::format(R"json({{"flags":["int64_str"],"query":"*:*","count_limit":-1,
+      "document_format":"{}","fields":["stamp","when_dt","large_i","values_is"]}})json", format);
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search" + std::string(framing), json);
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    for (auto text : {R"("stamp":"1700000000123456789")", R"("when_dt":1700000000123)",
+                      R"("large_i":"9007199254740992")", R"("found":1)",
+                      R"("values_is":["-9223372036854775808","-9007199254740992",-9007199254740991,9007199254740991,"9007199254740992","9223372036854775807"])"}) {
+      EXPECT_NE(std::string::npos, response.body().find(text)) << response.body();
+    }
+  }
+  auto ordinary = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":"*:*","fields":["stamp","when_dt"]})");
+  auto explicitDefault = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"flags":[],"query":"*:*","fields":["stamp","when_dt"]})");
+  expectResponse(ordinary.body(), explicitDefault.body());
+  EXPECT_NE(std::string::npos, ordinary.body().find(R"("stamp":1700000000123456789)"));
+  auto rejected = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"q":{"flags":["int64_str"],"top_docs":{}}}})");
+  EXPECT_EQ(400, rejected.result_int());
+  EXPECT_NE(std::string::npos, rejected.body().find("request-level only"));
 }
 
 } // namespace luxir::test

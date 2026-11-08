@@ -7,6 +7,7 @@
 
 #include "luxir/search/RangeFacetGrid.h"
 #include "luxir/util/NumericUtils.h"
+#include "luxir/util/ApiError.h"
 #include "test/RangeFacetTestUtils.h"
 
 using namespace luxir;
@@ -27,8 +28,7 @@ std::vector<int64_t> scanFences(TimeZone zone, int64_t center, int64_t gap, int6
   auto offset = [&](int64_t t) {
     if (zone.isUtc()) return int64_t{0};
     if (zone.isFixed()) return (int64_t)zone.offsetMinutes() * minute;
-    return duration_cast<milliseconds>(zone.ianaZone()->get_info(
-        sys_time<milliseconds>{milliseconds{t}}).offset).count();
+    return duration_cast<milliseconds>(zone.ianaZone()->offsetAt(t)).count();
   };
   std::vector<int64_t> result;
   int64_t begin = center - 3 * day, end = center + 3 * day;
@@ -56,8 +56,10 @@ TEST(RangeFacetGridTest, instantScanningOracle) {
       Case{"America/Denver", "2024-11-03T08:00Z"},
       Case{"Australia/Lord_Howe", "2024-04-06T15:00Z"},
       Case{"Australia/Lord_Howe", "2024-10-05T15:30Z"},
-      Case{"Pacific/Apia", "2011-12-30T11:00Z"},
+      Case{"Pacific/Apia", "2011-12-30T10:00Z"},
       Case{"America/New_York", "1969-10-26T06:00Z"},
+      Case{"America/New_York", "9999-03-14T07:00Z"},
+      Case{"America/New_York", "9999-11-07T06:00Z"},
       Case{"UTC", "1969-01-05T00:00Z"}, Case{"+05:30", "1969-01-05T00:00Z"}}) {
     for (int64_t gap : {15 * minute, 45 * minute, 60 * minute, 120 * minute, day}) {
       for (int64_t origin : {int64_t{0}, 5 * minute, 17 * minute, 360 * minute}) {
@@ -261,7 +263,24 @@ TEST(RangeFacetGridTest, bucketCapAdviceFollowsBounds) {
         epoch("2024-03-10T05:17Z"), epoch("2024-03-10T08:17Z"));
 }
 
-TEST(RangeFacetGridTest, calendarSkippedIntervalCacheMatchesDirectLookup) {
+// Apia skipped 2011-12-30. With noon-phased daily cells the skipped label is
+// Dec 30 noon; the Dec 29 noon cell spans the jump.
+TEST(RangeFacetGridTest, apiaSkippedLabelWithNoonPhase) {
+  int64_t start = epoch("2011-12-28T22:00Z");  // Dec 28 12:00 at -10
+  int64_t end = epoch("2011-12-31T22:00Z");    // Jan 1 12:00 at +14
+  auto grid = Grid::calendar(CalendarUnit::DAY, 1, zone("Pacific/Apia"), start);
+  auto built = grid.fences(start, end, true);
+  EXPECT_EQ((std::vector<int64_t>{start, epoch("2011-12-29T22:00Z"), epoch("2011-12-30T22:00Z"), end}),
+            built.values);
+  EXPECT_EQ(std::vector<int64_t>{epoch("2011-12-30T12:00Z")}, built.skippedCivil);
+  EXPECT_EQ(built.skippedCivil, grid.skippedCalendarCells(start, end));
+  // Reported only when the surviving fence it shares lies within the span.
+  int64_t surviving = epoch("2011-12-30T22:00Z");
+  EXPECT_EQ(built.skippedCivil, grid.skippedCalendarCells(start, surviving));
+  EXPECT_TRUE(grid.skippedCalendarCells(start, surviving - 1).empty());
+}
+
+TEST(RangeFacetGridTest, localResolverCacheMatchesDirectLookup) {
   struct Case { std::string_view zone, center; };
   for (auto c : std::array{
       Case{"America/New_York", "2024-03-10"},
@@ -272,14 +291,14 @@ TEST(RangeFacetGridTest, calendarSkippedIntervalCacheMatchesDirectLookup) {
     SCOPED_TRACE(std::string(c.zone));
     auto z = zone(c.zone);
     for (int direction : {1, -1}) {
-      datetime_detail::LocalTimeResolver resolver(z, std::nullopt);
-      for (int step = -48; step <= 48; step++) {
-        int64_t civil = epoch(c.center) + direction * step * 60 * minute;
-        ASSERT_TRUE(resolver.resolve(civil));
-        for (int64_t width : {int64_t{1}, 60 * minute, day, 7 * day, 40 * day}) {
-          EXPECT_EQ(civilIntervalSkipped(civil, civil + width, z),
-                    resolver.intervalSkipped(civil, civil + width))
-              << "civil=" << civil << " width=" << width;
+      for (auto preferred : {std::optional<std::chrono::seconds>{}, std::optional{civilFromInstant(
+               epoch(c.center) + 60 * day, z)->offset}}) {
+        datetime_detail::LocalTimeResolver resolver(z, preferred);
+        for (int step = -48 * 4; step <= 48 * 4; step++) {
+          int64_t civil = epoch(c.center) + direction * step * 15 * minute;
+          for (int64_t at : {civil, civil + 1, civil - 1}) {
+            EXPECT_EQ(instantFromCivil(at, z, preferred), resolver.resolve(at)) << "civil=" << at;
+          }
         }
       }
     }
@@ -342,4 +361,57 @@ TEST(RangeFacetGridTest, piecewiseRunsMatchFenceSearch) {
     RangeFacetRunCursor cursor;
     EXPECT_EQ(0u, cursor.bucketOf(fences.front(), runs, fences));
   }
+}
+
+TEST(RangeFacetGridTest, nanosecondCalendarAndTransitionFences) {
+  constexpr int64_t scale = 1000000;
+  for (auto [name, text] : {std::pair{"America/New_York", "2024-03-10"},
+      std::pair{"America/New_York", "2024-11-03"}, std::pair{"Pacific/Apia", "2011-12-30"},
+      std::pair{"Australia/Lord_Howe", "2024-10-05"}, std::pair{"UTC", "1969-01-01"}}) {
+    auto tz = zone(name);
+    int64_t center = epoch(text), start = center - 2 * day, end = center + 2 * day;
+    for (bool calendar : {false, true}) {
+      auto ms = calendar ? Grid::calendar(CalendarUnit::DAY, 1, tz)
+          : Grid::fixed(FieldType::DATE, 45 * minute, 17 * minute, tz);
+      auto ns = calendar ? Grid::calendar(CalendarUnit::DAY, 1, tz, std::nullopt, DateUnit::NANOS)
+          : Grid::fixed(FieldType::DATE, 45 * minute * scale, 17 * minute * scale, tz, DateUnit::NANOS);
+      auto expected = ms.fences(start, end, true);
+      for (auto& value : expected.values) value *= scale;
+      auto actual = ns.fences(start * scale, end * scale, true);
+      EXPECT_EQ(expected.values, actual.values) << name;
+      EXPECT_EQ(expected.skippedCivil, actual.skippedCivil) << name;
+      for (size_t i = 1; i + 2 < actual.values.size(); i++) {
+        auto cell = ns.floor(actual.values[i] + 1);
+        EXPECT_EQ(actual.values[i], cell.key);
+        EXPECT_EQ(actual.values[i + 1], ns.next(cell).key);
+        EXPECT_EQ(cell.key, ns.floor(actual.values[i + 1] - 1).key);
+      }
+    }
+  }
+  int64_t start = epoch("2024-01-31") * scale + 7, end = epoch("2024-04-01") * scale + 7;
+  auto month = Grid::calendar(CalendarUnit::MONTH, 1, TimeZone::utc(), start, DateUnit::NANOS);
+  EXPECT_EQ((std::vector<int64_t>{start, epoch("2024-02-29") * scale + 7,
+      epoch("2024-03-31") * scale + 7, end}), month.fences(start, end, true).values);
+}
+
+TEST(RangeFacetGridTest, nanosecondClippedFencesKeepTheirPhase) {
+  auto grid = Grid::fixed(FieldType::DATE, 5, 0, TimeZone::utc(), DateUnit::NANOS);
+  auto first = grid.floor(INT64_MIN + 1);
+  EXPECT_EQ(INT64_MIN, first.key);
+  EXPECT_EQ(INT64_MIN + 3, grid.next(first).key);
+  EXPECT_EQ((std::vector<int64_t>{INT64_MIN + 1, INT64_MIN + 3, INT64_MIN + 8}),
+      grid.fences(INT64_MIN + 1, INT64_MIN + 8, true).values);
+  auto last = grid.floor(INT64_MAX - 1);
+  EXPECT_EQ(INT64_MAX - 2, last.key);
+  EXPECT_EQ(INT64_MAX, grid.next(last).key);
+  EXPECT_EQ((std::vector<int64_t>{INT64_MAX - 2, INT64_MAX}),
+      grid.fences(INT64_MAX - 1, INT64_MAX - 1, false).values);
+  for (auto name : {"+18:00", "-18:00", "America/New_York"}) {
+    for (int64_t start : {INT64_MIN + 1, INT64_MAX - 4}) {
+      auto phased = Grid::fixed(FieldType::DATE, 3, 0, zone(name), DateUnit::NANOS, start);
+      EXPECT_EQ(start, phased.floor(start + 1).key);
+      EXPECT_EQ(start + 3, phased.next(phased.floor(start)).key);
+    }
+  }
+  EXPECT_THROW(grid.next({INT64_MAX}), RequestError);
 }

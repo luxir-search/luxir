@@ -11,10 +11,12 @@
 #include <sstream>
 #include <thread>
 #include "luxir/luxir_main.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/BuildInfo.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/util/thread.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
@@ -44,7 +46,7 @@ class SignalWatcher {
   std::thread thread;
 
   void run() {
-    pthread_setname_np(pthread_self(), "luxir_signals");
+    nameThisThread("luxir_signals");
     sigset_t set = shutdownSignals();
     bool stopping = false;
     for (;;) {
@@ -73,11 +75,13 @@ public:
 
 } // namespace
 
-int luxir_main(int argc, char** argv) {
+int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
   CLI::App app{"Luxir search engine"};
-  app.set_version_flag("--version", "Luxir " + std::string(buildVersion()) + " (" + std::string(buildCpuTarget()) + ")");
+  const auto& build = buildInfo();
+  app.set_version_flag("--version", fmt::format("Luxir {} ({}) commit {}",
+      build.version, build.cpuTarget, build.sourceCommit));
   LuxirConfig config;
   config.addOptions(app);
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
@@ -121,6 +125,13 @@ int luxir_main(int argc, char** argv) {
     config.apply();
   } catch (const std::exception &e) {
     LOG_ERROR("Invalid configuration: {}", e.what());
+    return 1;
+  }
+
+  try {
+    initPlugins(addPlugins);
+  } catch (const std::exception &e) {
+    LOG_ERROR("Plugin initialization failed: {}", e.what());
     return 1;
   }
 
@@ -193,7 +204,8 @@ int luxir_main(int argc, char** argv) {
 
 std::string luxir_banner() {
   std::stringstream ss;
-  ss << "Luxir " << buildVersion() << " (" << buildCpuTarget() << ")";
+  const auto& build = buildInfo();
+  ss << "Luxir " << build.version << " (" << build.cpuTarget << ") commit " << build.sourceCommit;
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else

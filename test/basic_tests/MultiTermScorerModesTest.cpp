@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <map>
 #include <string>
@@ -529,7 +530,7 @@ TEST_F(MultiTermScorerModesTest,
         ? qb::boolean(top.mr(), {}, {beta, alpha})
         : qb::boolean(top.mr(), {}, {alpha, beta});
     top.fields({"id"}).getScores().limit(10);
-    if (exhaustive) top.getNumber();
+    if (exhaustive) top.countLimit();
     req->execute(parallel);
     EXPECT_TRUE(req->ok()) << req->toString();
 
@@ -725,6 +726,9 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   expectDocSetShape(emptyDocsSupplier.describeScorer(buildContext),
                     Query::MatchState::EMPTY);
 
+  // Weights of one query share its expansions, so each query needs its own
+  // address for the lifetime of the context.
+  std::deque<PrefixQuery> prefixes;
   struct ModeShape {
     ScorerMode mode;
     Query::ClauseShape windowFillClause;
@@ -737,7 +741,7 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
            ModeShape{ScorerMode::FORCE_WINDOWED, Query::ClauseShape::NONE},
            ModeShape{ScorerMode::FORCE_HEAP, Query::ClauseShape::NONE}}) {
     ScorerModeGuard modeGuard(mode);
-    PrefixQuery prefix("body_w", "q");
+    PrefixQuery& prefix = prefixes.emplace_back("body_w", "q");
     auto* prefixWeight = prefix.createWeight(
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto* prefixSupplier = prefixWeight->scorerSupplier(ti.pool, segment);
@@ -763,7 +767,7 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   {
     DenseFillGuard denseFillGuard(true);
     ScorerModeGuard modeGuard(ScorerMode::FORCE_EAGER);
-    PrefixQuery prefix("body_w", "q");
+    PrefixQuery& prefix = prefixes.emplace_back("body_w", "q");
     auto* prefixWeight = prefix.createWeight(context, 0);
     auto* prefixSupplier = prefixWeight->scorerSupplier(ti.pool, segment);
     ASSERT_NE(nullptr, prefixSupplier);

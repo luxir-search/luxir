@@ -75,13 +75,13 @@ public:
     }
 
     void analyze(std::span<const std::string_view> values, int64_t& pos, bool& first) {
-      Token& tok = chain->head.getToken();
+      Token& tok = chain->getToken();
       TokenStream& tail = *chain->tail;
       PackedTerm::TermBuffer scratch;
       for (std::string_view value : values) {
         if (!first) pos += TextFieldType::POSITION_INCREMENT_GAP;
         first = false;
-        chain->head.setValue(value);
+        chain->setValue(value);
         chain->reset();
         while (tail.incrementToken()) {
           pos += tok.positionIncrement;

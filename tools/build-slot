@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs COMMAND while holding one of SLOTS lock files named PREFIX-<n>. Builds
+# sharing PREFIX (e.g. from several worktrees, or the host and the development
+# container) then share one machine-wide limit instead of each assuming the
+# whole machine. The lock belongs to the inherited file descriptor, so it is
+# released when the command exits, including on a crash. If a slot file cannot
+# be opened, COMMAND runs without a slot.
+# Usage: tools/build-slot PREFIX SLOTS COMMAND [ARGS...]
+set -u
+prefix=$1 slots=$2
+shift 2
+dir=${prefix%/*}
+[[ -d $dir ]] || mkdir -p "$dir" 2>/dev/null
+if [[ ! -w $dir ]]; then
+  exec "$@"
+fi
+while :; do
+  for (( i = 0; i < slots; i++ )); do
+    if ! { exec {fd}>>"$prefix-$i"; } 2>/dev/null; then
+      exec "$@"
+    fi
+    if flock -n "$fd"; then
+      exec "$@"
+    fi
+    exec {fd}>&-
+  done
+  sleep 0.2
+done

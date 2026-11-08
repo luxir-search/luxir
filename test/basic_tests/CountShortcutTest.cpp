@@ -47,14 +47,14 @@ protected:
     for (auto name : {"number", "numbers", "scan", "middle"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::INT;
-      field.multi = std::string_view(name) == "numbers";
+      field.multi = (std::string_view(name) == "numbers") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }
     for (auto name : {"geo", "geos", "geo_scan", "geo_full"}) {
       auto& field = schema.field(name);
       field.type = api::FieldDef::FieldClass::GEO_POINT;
-      field.multi = std::string_view(name) == "geos";
+      field.multi = (std::string_view(name) == "geos") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
       field.index = std::string_view(name) == "geo_scan"
           ? api::FieldDef::IndexMode::NONE : api::FieldDef::IndexMode::RANGE;
     }
@@ -110,7 +110,7 @@ protected:
     if (!scorer) return 0;
     int64_t count = 0;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
-      if (segment.liveDocs() && !segment.liveDocs()->docset().get(doc)) continue;
+      if (segment.hasDeletes() && !segment.liveDocSet()->get(doc)) continue;
       if (!domain || domain->get(doc)) ++count;
     }
     return count;
@@ -125,27 +125,27 @@ protected:
         DocSetBuilder selected(segment.maxDoc()), unfiltered(segment.maxDoc()), empty(segment.maxDoc());
         for (int doc = 0; doc < segment.maxDoc(); doc += 3) {
           unfiltered.add(std::min(doc + 2, segment.maxDoc() - 1));
-          if (!segment.liveDocs() || segment.liveDocs()->docset().get(doc)) selected.add(doc);
+          if (!segment.hasDeletes() || segment.liveDocSet()->get(doc)) selected.add(doc);
         }
         auto domain = selected.build();
         auto rawDomain = unfiltered.build();
         auto noDocs = empty.build();
         for (DocSet* eligibility : { (DocSet*)nullptr, domain.get(), rawDomain.get(), noDocs.get() }) {
           auto shortcut = weight->countShortcut(segment, eligibility);
-          if (!eligibility && !segment.liveDocs() && shortcut.maxMatches != 0) {
+          if (!eligibility && !segment.hasDeletes() && shortcut.maxMatches != 0) {
             EXPECT_EQ(unrestricted, shortcut.how);
           }
           auto* supplier = weight->scorerSupplier(pool, segment);
           auto resolved = QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
             return &resolver == weight ? supplier : resolver.scorerSupplier(pool, segment);
           }, Query::CountHow::INDEX_WALK);
-          auto executorCount = eligibility || segment.liveDocs()
+          auto executorCount = eligibility || segment.hasDeletes()
               ? std::nullopt : QueryPrep::supplierCount(supplier);
           int64_t count = iterated(supplier, pool, segment, eligibility);
           EXPECT_GE(shortcut.maxMatches, count);
           if (shortcut.how != Query::CountHow::ITERATE) { EXPECT_TRUE(resolved.has_value()); }
           if (resolved) { EXPECT_EQ(count, *resolved); }
-          if (!eligibility && !segment.liveDocs() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
+          if (!eligibility && !segment.hasDeletes() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
             EXPECT_TRUE(executorCount.has_value());
           }
           if (executorCount) { EXPECT_EQ(count, *executorCount); }
@@ -244,6 +244,31 @@ TEST_P(CountShortcutTest, booleanBoundsAndSingletonsAgree) {
   }
 }
 
+TEST_P(CountShortcutTest, wholeMatchAllUsesOnlyCachedEffectiveCard) {
+  deleteSome();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  AllQuery query;
+  auto* weight = query.createWeight(context, 0);
+  QueryPrep::WholeMembershipPlan plan(*weight, nullptr, {});
+  auto& segment = reader->segments()[0];
+  RAMBitDocSet domain(segment.maxDoc());
+  domain.mutableBits().set(1);
+  EXPECT_EQ(-1, domain.cachedCard());
+  EXPECT_FALSE(resolveWholeMembershipForTests(plan, *reader, segment, &domain).available);
+  EXPECT_EQ(-1, domain.cachedCard());
+
+  DocSetBuilder builder(segment.maxDoc());
+  builder.add(1);
+  auto effective = builder.build();
+  ASSERT_EQ(1, effective->cachedCard());
+  EXPECT_EQ(Query::CountHow::ITERATE, weight->countShortcut(segment, effective.get()).how);
+  auto result = resolveWholeMembershipForTests(plan, *reader, segment, effective.get());
+  EXPECT_TRUE(result.available);
+  EXPECT_EQ(1, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+}
+
 TEST_P(CountShortcutTest, probesStopBeforeIndexWalks) {
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -314,7 +339,7 @@ TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::range(op.mr(), "number", qb::valI64(op.mr(), -10), nullptr,
                              qb::valI64(op.mr(), 10), nullptr);
       if (shape == 2) {
@@ -346,7 +371,7 @@ TEST_P(CountShortcutTest, topDocsKeepsNumericCountExecutor) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::range(op.mr(), field, qb::valI64(op.mr(), -10), nullptr,
                               qb::valI64(op.mr(), 10), nullptr);
     req->execute(false);
@@ -382,7 +407,7 @@ TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::geoBox(op.mr(), "geo", -bound, bound, -20, 20);
       if (filtered) op.allQuery().filter(query);
       else op.rawQuery() = query;
@@ -431,7 +456,7 @@ TEST_P(CountShortcutTest, pointsEmptyDisjunctionUsesWholeCacheRouting) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::boolean(op.mr(), {},
         {qb::match(op.mr(), "body_w", "alpha"),
          qb::range(op.mr(), "number", qb::valI64(op.mr(), 0), nullptr,
@@ -564,7 +589,7 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       AllQuery all;
       TermQuery term("body_w", "alpha");
       ExistsQuery exists("number");
@@ -583,7 +608,7 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       auto* weight = references[kind]->createWeight(context, 0);
       int64_t expected = 0;
       for (auto& segment : reader->segments()) {
-        DocSet* domain = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
+        DocSet* domain = segment.liveDocSet();
         expected += iterated(weight->scorerSupplier(pool, segment), pool, segment, domain);
       }
       EXPECT_EQ(expected, req->getMatchCount());

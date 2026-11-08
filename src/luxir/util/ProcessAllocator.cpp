@@ -41,6 +41,9 @@ extern "C" int __sanitizer_install_malloc_and_free_hooks(
     void (*malloc_hook)(const volatile void*, size_t),
     void (*free_hook)(const volatile void*));
 #endif
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 #elif defined(__GLIBC__)
 #include <gnu/libc-version.h>
 #include <malloc.h>
@@ -60,7 +63,14 @@ void appendControl(std::ostringstream& out, const char* name) {
   }
 }
 #elif LUXIR_SANITIZER
+#if defined(__APPLE__)
+// Darwin mallocs a thread's thread_local block on first use, which would
+// re-enter the hook. A pthread key's slot is preallocated, so it holds the
+// count itself.
+pthread_key_t allocatedBytesKey;
+#else
 constinit thread_local uint64_t allocatedBytes = 0;
+#endif
 
 #if defined(__clang__)
 __attribute__((disable_sanitizer_instrumentation))
@@ -68,7 +78,12 @@ __attribute__((disable_sanitizer_instrumentation))
 __attribute__((no_sanitize("address", "thread", "undefined")))
 #endif
 void countAllocation(const volatile void*, size_t size) {
+#if defined(__APPLE__)
+  uintptr_t bytes = (uintptr_t)pthread_getspecific(allocatedBytesKey);
+  pthread_setspecific(allocatedBytesKey, (void*)(bytes + size));
+#else
   allocatedBytes += size;
+#endif
 }
 #endif
 
@@ -390,10 +405,19 @@ std::optional<uint64_t> threadAllocatedBytes() {
   return *counter;
 #elif LUXIR_SANITIZER
   // The test counter's startup initializer installs this before any AllocScope.
-  static const int installed = __sanitizer_install_malloc_and_free_hooks(
-      countAllocation, [](const volatile void*) {});
+  static const int installed = [] {
+#if defined(__APPLE__)
+    if (pthread_key_create(&allocatedBytesKey, nullptr) != 0) return 0;
+#endif
+    return __sanitizer_install_malloc_and_free_hooks(
+        countAllocation, [](const volatile void*) {});
+  }();
   if (!installed) std::abort();
+#if defined(__APPLE__)
+  return (uint64_t)(uintptr_t)pthread_getspecific(allocatedBytesKey);
+#else
   return allocatedBytes;
+#endif
 #else
   return std::nullopt;
 #endif

@@ -155,7 +155,7 @@ LUXIR_BENCHMARK_CAPTURE(BM_CollapseRetainedRemap, remap_tuple, true, true);
 template <bool Ordered>
 static void BM_CappedAdmission(benchmark::State& state) {
   CollectionHelper helper("cap_admission");
-  if (!helper.indexMatchesShape({1})) {
+  if (!helper.indexMatchesShape(std::vector<int32_t>{1})) {
     helper.clear();
     ASSERT_TRUE(helper.indexAll({flatdoc("id", "one")}, UpdateMessage::COMMIT).success);
   }

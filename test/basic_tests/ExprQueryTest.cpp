@@ -78,6 +78,16 @@ public:
   }
 };
 
+TEST_F(ExprQueryTest, phraseOptions) {
+  auto exact = search("multi_match(Blade Runner, fields=[title_un^2, body_un], mode=per_field, phrase={})");
+  ASSERT_EQ(1u, exact.size());
+  EXPECT_TRUE(hasId(exact, "d1"));
+  EXPECT_TRUE(search("multi_match(The Man, fields=[title_un], mode=per_field, phrase={})").empty());
+  auto sloppy = search("multi_match(The Man, fields=[title_un], mode=per_field, phrase={slop: 2})");
+  ASSERT_EQ(1u, sloppy.size());
+  EXPECT_TRUE(hasId(sloppy, "d2"));
+}
+
 class BoostQueryTest : public LuxirTest {
 protected:
   static void assertPrunedTopKMatchesExhaustive(IndexReader& reader, Query& query,

@@ -19,7 +19,7 @@ namespace luxir {
 struct CorruptionMarker {
   static constexpr std::string_view kPrefix = "corrupted_";
 
-  static bool isMarker(std::string_view name) { return name.starts_with(kPrefix); }
+  static bool isMarker(std::string_view name) { return name.starts_with(kPrefix) && !name.ends_with(".tmp"); }
 
   // Writes a durable marker naming `files`.
   static void write(Directory& dir, std::span<const std::string> files, std::string_view reason);

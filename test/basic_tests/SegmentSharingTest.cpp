@@ -159,7 +159,8 @@ TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
   EXPECT_EQ(2, deleted->liveDocs());
 
   // The same segment set can be opened through another publisher's reader.
-  auto independent = PostingsReader::create(writer->dir, before->segments()[0].segInfo.seg_id);
+  auto stored = readDurableIndexInfo(writer->dir);
+  auto independent = PostingsReader::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch);
   auto snapshot = *writer->snapshots.snapshot();
   snapshot.openReaders[0] = independent;
   auto separate = std::make_shared<IndexReader>(writer->dir, snapshot, before.get());
@@ -290,6 +291,7 @@ TEST_F(SegmentSharingTest, mergeReleasesItsSources) {
   auto latest = current();
   EXPECT_EQ(&after->segments()[0].postingsReader(), &latest->segments()[0].postingsReader());
   after.reset();
+  writer->testDrain();  // retired readers are dropped in the background
   for (auto& source : sources) EXPECT_TRUE(source.expired());
   EXPECT_EQ(1798, readAll(*latest));
 }
@@ -308,15 +310,20 @@ TEST_F(SegmentSharingTest, newIncarnationSharesNothing) {
   root.info.index_gen++;
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(root.info, bytes));
-  Manifest::write(writer->dir, root.info.index_gen, bytes);
+  Manifest::write(writer->dir, root.info.index_gen, bytes, root->writer_epoch);
+  IncarnationState::install(writer->dir, Manifest::tip(root->index_gen, root->writer_epoch));
   auto rerooted = std::make_shared<IndexReader>(writer->dir, before.get());
   ASSERT_EQ(root.info.incarnation, rerooted->incarnation());
   EXPECT_NE(&before->segments()[0].postingsReader(), &rerooted->segments()[0].postingsReader());
   EXPECT_EQ(900, readAll(*rerooted));
   rerooted.reset();
-  writer->dir.deleteFile(Manifest::name(root.info.index_gen));
+  writer->dir.deleteFile(Manifest::name(root.info.index_gen, root->writer_epoch));
 
-  helper->clear();
+  node->deleteCollection("share");
+  writer.reset();
+  helper = std::make_unique<CollectionHelper>(*node, "share");
+  writer = helper->getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
   nextId = 0;
   addSegment(900);
   auto snapshot = writer->snapshots.snapshot();

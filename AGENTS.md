@@ -28,6 +28,16 @@ grep -n "warning:" /tmp/build.log
 [ $ec -ne 0 ] && tail -100 /tmp/build.log
 ```
 
+### Concurrent builds and worktrees
+
+Builds size their compile parallelism from cores and memory, and
+concurrent builds (other worktrees, presets, or the dev container) share one
+machine-wide limit, so running several at once needs no manual `-j` or job
+caps. Native vcpkg dependencies and the ARM64 toolchain and packages are
+shared between worktrees; ccache objects are shared only when the checkouts are
+configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`.
+See [Parallelism and shared caches](docs/dev/build-setup.md#parallelism-and-shared-caches).
+
 ### Iterate (default): non-ASan, fastest edit-build-test
 
 ```bash

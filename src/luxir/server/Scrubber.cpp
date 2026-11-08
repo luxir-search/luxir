@@ -38,7 +38,10 @@ void Scrubber::stop() {
 void Scrubber::run(std::stop_token stop) {
   nameThisThread("luxir_scrub");
   // CPU priority only: the byte rate is what keeps a pass off the disks.
+  // macOS has no per-thread nice, and its QoS classes also lower I/O priority.
+#if defined(__linux__)
   (void)setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+#endif
   while (!stop.stop_requested()) {
     {
       std::unique_lock lock(wakeMutex);
@@ -113,7 +116,7 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
           auto* api = dynamic_cast<const ApiError*>(&e);
           if (api && api->code == "file_not_held") continue;
           errors.fetch_add(1, std::memory_order_relaxed);
-          LOG_WARN("Could not scrub file '{}' of collection '{}': {}", file.name, entry.id.label(), e.what());
+          LOG_WARN("Could not scrub file '{}' of collection '{}': {}", file.name, entry.collection->getId().label(), e.what());
           continue;
         }
         files.fetch_add(1, std::memory_order_relaxed);
@@ -121,10 +124,11 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
         mismatches.fetch_add(1, std::memory_order_relaxed);
         corrupted++;
         std::array<std::string, 1> suspects{file.name};
-        collections.fail(entry.id, entry.collection, problem, suspects);
+        auto name = entry.collection->getId();
+        collections.fail(name, entry.collection, problem, suspects);
         LOG_ERROR("Collection '{}' (commit {}) is corrupt and no longer serves: {}",
-                  entry.id.label(), snapshot->id.token(), problem);
-        if (auto* follower = node.getFollower()) follower->repair(entry.id, entry.collection, problem, std::span(&file, 1));
+                  name.label(), snapshot->id.token(), problem);
+        if (auto* follower = node.getFollower()) follower->repair(name, entry.collection, problem, std::span(&file, 1));
         break;
       }
     }

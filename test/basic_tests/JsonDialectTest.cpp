@@ -21,6 +21,8 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/schema/Schema.h"
 
 namespace {
 using namespace std::string_view_literals;
@@ -179,14 +181,14 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   // shorthand: root TopDocs keys register as ops["q"]; request-level keys mix in
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r,
-        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","get_number":true})", mr));
+        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","count_limit":-1})", mr));
     EXPECT_TRUE(r.json_shorthand);
     EXPECT_EQ(-1, r.max_parallel);
     EXPECT_EQ("UTC", r.time_zone);
     ASSERT_EQ(1u, r.ops.size());
     const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
     EXPECT_EQ(5, *td.limit);
-    EXPECT_TRUE(td.get_number);
+    EXPECT_EQ(-1, td.count_limit);
     ASSERT_TRUE(td.query.has_value());
     EXPECT_EQ("title_w:dune", std::get<P::ExprQuery>(td.query->kind).q); }
 
@@ -701,7 +703,7 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
   const P::FieldDef* tmpl = def.templates.at("_x").operator->();
   ASSERT_NE(nullptr, tmpl);
-  EXPECT_TRUE(*tmpl->multi);
+  EXPECT_EQ(P::FieldDef::MultiMode::DEFAULT, *tmpl->multi);
 
   // write(read(x)) is text-identity: the canonical form round-trips exactly.
   std::string out;
@@ -722,6 +724,27 @@ TEST(JsonDialect, FieldDefStringShorthand) {
   std::string out;
   ASSERT_TRUE(P::write_json(def, out));
   EXPECT_EQ(R"({"fields":{"year":{"type":"int"},"tag":{"type":"string"}}})", out);
+}
+
+TEST(JsonDialect, MultiModeGoldenWireAndBinaryPresence) {
+  for (auto [json, expected] : {
+      std::pair{"false", P::FieldDef::MultiMode::SINGLE},
+      {"true", P::FieldDef::MultiMode::DEFAULT},
+      {R"("set")", P::FieldDef::MultiMode::SET},
+      {R"("array")", P::FieldDef::MultiMode::ARRAY}}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::FieldDef def, decoded;
+    std::string input = std::string(R"({"multi":)") + json + "}";
+    ASSERT_TRUE(P::read_json(def, input, mr));
+    EXPECT_EQ(expected, def.multi);
+    std::string output;
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(P::write_json(def, output));
+    EXPECT_EQ(input, output);
+    ASSERT_TRUE(P::encode(def, wire));
+    ASSERT_TRUE(P::decode(decoded, P::copyToPaddedInput(wire, mr), mr));
+    EXPECT_EQ(expected, decoded.multi);
+  }
 }
 
 TEST(JsonDialect, AnalyzerComponentStringShorthand) {
@@ -772,6 +795,67 @@ TEST(JsonDialect, AnalyzerComponentStringShorthand) {
   EXPECT_TRUE(nameless.analyzer->tokenizer->name.empty());
 }
 
+TEST(JsonDialect, AnalyzerDefNamedForms) {
+  // "english" == {"name": "english"} in analyzer position; char_filters read
+  // like filters; the generated writer stays canonical (object form).
+  std::pmr::monotonic_buffer_resource mr;
+  std::string err;
+  P::FieldDef bare;
+  ASSERT_TRUE(P::read_json(bare, R"({"type":"text","analyzer":"english"})", mr, &err)) << err;
+  ASSERT_TRUE(bare.analyzer.has_value());
+  EXPECT_EQ("english", bare.analyzer->name);
+  EXPECT_FALSE(bare.analyzer->tokenizer.has_value());
+  EXPECT_TRUE(bare.analyzer->filters.empty());
+  P::FieldDef object;
+  ASSERT_TRUE(P::read_json(object, R"({"type":"text","analyzer":{"name":"english"}})", mr, &err)) << err;
+  EXPECT_EQ("english", object.analyzer->name);
+  std::string out;
+  ASSERT_TRUE(P::write_json(bare, out));
+  EXPECT_EQ(R"({"type":"text","analyzer":{"name":"english"}})", out);
+
+  P::AnalyzerDef top;
+  ASSERT_TRUE(P::read_json(top, R"("standard")", mr, &err)) << err;
+  EXPECT_EQ("standard", top.name);
+
+  P::AnalyzerDef full;
+  ASSERT_TRUE(P::read_json(full,
+      R"({"char_filters":["a",{"name":"b","params":{"k":true}}],"tokenizer":"whitespace","filters":["lowercase"]})", mr, &err)) << err;
+  ASSERT_EQ(2u, full.char_filters.size());
+  EXPECT_EQ("a", full.char_filters[0].name);
+  EXPECT_EQ("b", full.char_filters[1].name);
+  EXPECT_TRUE(full.name.empty());
+  ASSERT_TRUE(P::write_json(full, out));
+  EXPECT_EQ(R"({"tokenizer":"whitespace","filters":["lowercase"],"char_filters":["a",{"name":"b","params":{"k":true}}]})", out);
+
+  P::AnalyzerDef bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"nam":"english"})", mr));
+  EXPECT_FALSE(P::read_json(bad, R"({"name":5})", mr));
+}
+
+TEST(JsonDialect, AnalyzerEmptyNames) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (auto json : {R"({"type":"text","analyzer":""})", R"({"type":"text","analyzer":{"name":""}})"}) {
+    P::FieldDef def;
+    std::string error;
+    EXPECT_FALSE(P::read_json(def, json, mr, &error)) << json;
+    EXPECT_NE(std::string::npos, error.find("analyzer name must not be empty; use {} to inherit or name an analyzer"))
+        << error;
+  }
+}
+
+TEST(JsonDialect, AnalyzerEmptyObjectInherits) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SchemaDef def;
+  std::string error;
+  ASSERT_TRUE(P::read_json(def, R"({
+    "templates":{"_body":{"type":"text","analyzer":{"tokenizer":"keyword","filters":["lowercase"]}}},
+    "fields":{"body":{"parent":"_body","analyzer":{}}}
+  })", mr, &error)) << error;
+  auto schema = luxir::Schema::fromProto(def);
+  auto* analyzer = ((luxir::TextFieldType*)schema->getFieldTypePtr("body"))->analyzer_.get();
+  EXPECT_EQ(R"({"char_filters":[],"filters":["lowercase"],"tokenizer":"keyword"})", analyzer->canonical);
+}
+
 TEST(JsonDialect, FieldDefStrictReads) {
   std::pmr::monotonic_buffer_resource mr;
   {  // unknown key -> error, not silent ignore
@@ -811,3 +895,159 @@ TEST(JsonDialect, UnknownKeyIsNamed) {
 }
 
 }  // namespace
+
+TEST(JsonDialect, MultiMatchWeightedFields) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query sugar, object;
+  ASSERT_TRUE(P::read_json(sugar,
+      R"({"multi_match":{"text":"dune","fields":["title_t^2","body_t"],"mode":"per_field"}})", mr));
+  ASSERT_TRUE(P::read_json(object,
+      R"({"multi_match":{"text":"dune","fields":[{"field":"title_t","weight":2},{"field":"body_t"}],"mode":"per_field"}})", mr));
+  std::string sugarJson, objectJson;
+  ASSERT_TRUE(P::write_json(sugar, sugarJson));
+  ASSERT_TRUE(P::write_json(object, objectJson));
+  EXPECT_EQ(objectJson, sugarJson);
+  EXPECT_NE(std::string::npos, sugarJson.find(R"("fields":[{"field":"title_t","weight":2},{"field":"body_t"}])"));
+  const auto& match = std::get<P::MultiMatchQuery>(sugar.kind);
+  EXPECT_EQ(P::MultiMatchQuery::Mode::PER_FIELD, match.mode);
+  ASSERT_EQ(2u, match.fields.size());
+  ASSERT_TRUE(match.fields[0].weight);
+  EXPECT_FLOAT_EQ(2.0f, *match.fields[0].weight);
+  EXPECT_FALSE(match.fields[1].weight);
+
+  P::WeightedField root;
+  ASSERT_TRUE(P::read_json(root, R"("title_t^2")", mr));
+  EXPECT_EQ("title_t", root.field);
+  ASSERT_TRUE(root.weight);
+  EXPECT_FLOAT_EQ(2.0f, *root.weight);
+  for (auto shorthand : {"a^", "a^x", "a^1^2", "^2"}) {
+    P::WeightedField field;
+    EXPECT_FALSE(P::read_json(field, std::string("\"") + shorthand + "\"", mr)) << shorthand;
+  }
+  std::string error;
+  EXPECT_FALSE(P::read_json(object, R"({"combined_fields":{}})", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+  EXPECT_NE(std::string::npos, error.find("combined_fields")) << error;
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"query":"dune"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"type":"cross_fields"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"mode":"best_fields"}})", mr));
+}
+
+TEST(JsonDialect, MultiFieldTieName) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (std::string json : {
+           R"({"multi_match":{"text":"dune","fields":["title_t"],"tie":0.25}})",
+           R"({"dis_max":{"queries":[{"all":true}],"tie":0.25}})"}) {
+    P::Query query;
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("tie":0.25)")) << out;
+
+    json.replace(json.find(R"("tie")"), 5, R"("tie_breaker")");
+    std::string error;
+    EXPECT_FALSE(P::read_json(query, json, mr, &error));
+    EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+    EXPECT_NE(std::string::npos, error.find("tie_breaker")) << error;
+  }
+}
+
+TEST(JsonDialect, MultiMatchPhraseOptions) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::MultiMatchQuery absent;
+  ASSERT_TRUE(P::read_json(absent, R"({"text":"dune","fields":["title_t"],"mode":"per_field"})", mr));
+  EXPECT_FALSE(absent.phrase);
+  for (auto value : {"{}", "{\"slop\":2}"}) {
+    P::MultiMatchQuery query;
+    std::string json = std::string(R"({"text":"dune","fields":["title_t"],"mode":"per_field","phrase":)") + value + "}";
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    ASSERT_TRUE(query.phrase);
+    EXPECT_EQ(value == std::string_view("{}") ? 0 : 2, query.phrase->slop);
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("phrase":{)")) << out;
+    P::MultiMatchQuery roundTrip;
+    ASSERT_TRUE(P::read_json(roundTrip, out, mr));
+    ASSERT_TRUE(roundTrip.phrase);
+    EXPECT_EQ(query.phrase->slop, roundTrip.phrase->slop);
+  }
+  for (auto json : {R"({"slop":2})", R"({"max_expansions":50})", R"({"mode":"phrase"})",
+                    R"({"mode":"phrase_prefix"})", R"({"mode":"bool_prefix"})",
+                    R"({"phrase":2})", R"({"phrase":{"bogus":1}})"}) {
+    P::MultiMatchQuery query;
+    EXPECT_FALSE(P::read_json(query, json, mr)) << json;
+  }
+}
+
+TEST(JsonDialect, PackedRequestFlagsNamesAndCanonicalOverrides) {
+  for (auto mode : {"date_native", "date_iso", "date_ms", "date_ns"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    std::string json = fmt::format(R"json({{"flags":["{}"],"query":"when_dt:2","ops":{{
+      "child":{{"flags":["date_native"],"domain":{{"query":"when_dt:2"}},"expr_op":"min(when_dt)"}},
+      "bare":"avg(when_dt)"}}}})json", mode);
+    ASSERT_TRUE(P::read_json(request, json, mr)) << json;
+    EXPECT_EQ(3u, request.flags_set);
+    const auto& children = std::get<P::TopDocs>(request.ops.at("q")->kind).ops;
+    EXPECT_EQ(3u, children.at("child")->flags_set);
+    EXPECT_EQ(0u, children.at("child")->flags);
+    EXPECT_EQ(0u, children.at("bare")->flags_set);
+    std::string echo;
+    ASSERT_TRUE(P::write_json(request, echo));
+    EXPECT_NE(std::string::npos, echo.find(fmt::format(R"("flags":["{}"])", mode)));
+    EXPECT_NE(std::string::npos, echo.find(R"("flags":["date_native"])"));
+    EXPECT_EQ(std::string::npos, echo.find("flags_set"));
+    P::SearchRequest replay;
+    ASSERT_TRUE(P::read_json(replay, echo, mr));
+    EXPECT_EQ(request.flags, replay.flags);
+    EXPECT_EQ(request.flags_set, replay.flags_set);
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest empty;
+  ASSERT_TRUE(P::read_json(empty, R"({"flags":[]})", mr));
+  EXPECT_EQ(0u, empty.flags_set);
+  empty.flags = 3; // unset bits do not override anything
+  std::string echo;
+  ASSERT_TRUE(P::write_json(empty, echo));
+  EXPECT_EQ("{}", echo);
+}
+
+TEST(JsonDialect, PackedRequestFlagsRejectAmbiguousAndUnsupportedNames) {
+  for (auto flags : {R"(["date_ms","date_ms"])", R"(["date_iso","date_ns"])",
+                     R"(["int64_str","int64_str"])", R"(["DATE_MS"])", R"(["unknown"])",
+                     R"("date_ms")", "null", "[1]"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    P::SearchOp op;
+    std::string error;
+    EXPECT_FALSE(P::read_json(request, std::string(R"({"flags":)") + flags + "}", mr, &error)) << flags;
+    EXPECT_FALSE(P::read_json(op, std::string(R"json({"expr_op":"min(when_dt)","flags":)json") + flags + "}", mr, &error)) << flags;
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest request;
+  P::SearchOp op;
+  EXPECT_FALSE(P::read_json(request, R"({"flags":[],"flags":["date_ms"]})", mr));
+  EXPECT_FALSE(P::read_json(op, R"({"flags":[],"top_docs":{},"flags":["date_ns"]})", mr));
+  EXPECT_FALSE(P::read_json(request, R"({"flags":2,"flags_set":3})", mr));
+}
+
+TEST(JsonDialect, Int64StringsAreRequestOnlyAndKeepOtherFlagGroups) {
+  for (auto names : {R"(["int64_str","date_ns"])", R"(["date_ns","int64_str"])"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    ASSERT_TRUE(P::read_json(request, std::string(R"({"flags":)") + names + "}", mr));
+    EXPECT_EQ(7u, request.flags);
+    EXPECT_EQ(7u, request.flags_set);
+    std::string echo;
+    ASSERT_TRUE(P::write_json(request, echo));
+    EXPECT_EQ(R"({"flags":["date_ns","int64_str"]})", echo);
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchOp op;
+  std::string error;
+  EXPECT_FALSE(P::read_json(op, R"json({"flags":["int64_str"],"expr_op":"min(when_dt)"})json", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("request-level only"));
+  op.flags_set = 4; // attempting to clear is also an op-level override
+  std::string echo;
+  EXPECT_FALSE(P::write_json(op, echo));
+}

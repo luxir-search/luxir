@@ -21,6 +21,7 @@ namespace luxir::QueryPrep {
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
 inline bool disableProhibitedCacheForTests = false;
+inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
@@ -98,6 +99,13 @@ struct PreparedSource {
 inline bool anyNeedsPrepare(std::span<Query::Weight*> weights) {
   for (auto* weight : weights) {
     if (weight->needsPrepare()) return true;
+  }
+  return false;
+}
+
+inline bool anyConsumesDomain(std::span<Query::Weight*> weights) {
+  for (auto* weight : weights) {
+    if (weight->consumesDomain()) return true;
   }
   return false;
 }
@@ -324,6 +332,10 @@ public:
       .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
       .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
       .directDocSet = Query::DirectDocSetAccess::SUPPORTED,
+      .membershipConsumption = buildContext.membershipConsumption
+              == Query::MembershipConsumption::CANDIDATES
+          ? Query::MembershipConsumption::CANDIDATES
+          : Query::MembershipConsumption::WINDOWS,
     };
   }
 
@@ -1060,7 +1072,13 @@ public:
            || (size_t)segment.ord < fieldSortCacheRoutes.size());
     bool routed = fieldSortCacheRoutes.empty()
         || fieldSortCacheRoutes[(size_t)segment.ord] != 0;
-    auto shortcut = weight->countShortcut(segment, incomingDomain);
+    // Unlike countShortcut's general domains, incomingDomain is effective:
+    // parent eligibility already includes liveDocs. Match-all can use its
+    // cached card even when it is a bucket rather than canonical liveDocs.
+    int64_t domainCard = incomingDomain == nullptr ? -1 : incomingDomain->cachedCard();
+    auto shortcut = weight->matchesAllDocs() && domainCard >= 0
+        ? Query::CountShortcut{domainCard, Query::CountHow::METADATA}
+        : weight->countShortcut(segment, incomingDomain);
     auto count = resolveCount(shortcut, std::forward<SupplierFor>(supplierFor));
     // Empty effective counts still need raw residency for Weight omission.
     bool cacheZero = cacheUse != nullptr && routed
@@ -1415,8 +1433,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocs() == nullptr
-          ? nullptr : &segment.liveDocs()->docset();
+      DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));
     }
@@ -1510,6 +1527,35 @@ inline DomainHandle materializeEffectiveIntersection(
   if (ptrs.empty()) return {};
   if (ptrs.size() == 1) return std::move(sets[0]);
   return DomainHandle(DocSet::intersect(ptrs));
+}
+
+// domain AND NOT (union of sources), under the live-filtered domain contract:
+// a null domain is every doc of a segment without deletes. Each source is
+// materialized inside the domain through its filter cache use, exactly like a
+// filter clause, so a cached exclusion is reused rather than re-run. The
+// result is never null: callers install it as a required domain supplier.
+inline DomainHandle materializeEffectiveExclusion(
+    std::span<const PreparedSource> sources, IndexReader& reader,
+    IndexReader::Segment& segment, DomainHandle domain) {
+  DocSet* base = domain.get();
+  assert(base != nullptr || !segment.hasDeletes());
+  std::vector<DomainHandle> excluded;
+  std::vector<DocSet*> ptrs;
+  excluded.reserve(sources.size());
+  ptrs.reserve(sources.size());
+  for (auto& source : sources) {
+    DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
+    if (set.get() == nullptr) {
+      set = DomainHandle(materialize(
+          source.segmentSource(), segment, base));
+    }
+    if (set.get()->card() > 0) {
+      ptrs.push_back(set.get());
+      excluded.push_back(std::move(set));
+    }
+  }
+  if (excluded.empty() && base != nullptr) return domain;
+  return DomainHandle(DocSet::andNot(base, ptrs, segment.maxDoc()));
 }
 
 } // namespace luxir::QueryPrep
