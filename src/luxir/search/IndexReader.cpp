@@ -7,10 +7,10 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
-#include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/SchemaCache.h"
 #include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
@@ -50,26 +50,26 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
+std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
   std::string deleteFileName = Postings::getLiveDocsFileName(
-    Postings::getSortableString(segId), liveGen);
+    Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
 
   auto deleteFile = dir.openFile(deleteFileName, expectSynced);
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing
-      IREADER_DEBUG("Delete file {} not found for segment {} (liveGen={})",
-                deleteFileName, segId, liveGen);
+      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})",
+                deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen);
       return nullptr;
     } else {
       throw std::filesystem::filesystem_error(
-              std::format("Delete file {} not found for segment {} (liveGen={})",
-                         deleteFileName, segId, liveGen),
+              std::format("Delete file {} not found for segment s{} (liveGen={})",
+                         deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
   }
-  IREADER_DEBUG("Successfully opened delete file {} for segment {}", deleteFileName, segId);
+  IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
 
   InputStream deleteStream = deleteFile->getInputStream();
 
@@ -118,8 +118,8 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   // FixedBitSet with live docs - memory map directly!
   uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
 
-  IREADER_DEBUG("Loaded {} deleted documents from {} for segment {}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, segId, numLiveDocs);
+  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
+            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
 
   return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), numLiveDocs);
 }
@@ -207,12 +207,13 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         prevAuxByName.clear();
         prevSegAuxByKey.clear();
       }
-      if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
+      if (preferredSchema && preferredSchema->binding == SchemaBinding(*indexInfo.schema)) {
         schema = preferredSchema;
-      } else if (previous && previousReader->schema()->gen_ == indexInfo.schema_gen) {
+      } else if (previous && previousReader->schema()->binding == SchemaBinding(*indexInfo.schema)) {
         schema = previousReader->schema();
       } else {
-        schema = Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen);
+        SchemaCache schemas; // standalone readers have no node owner
+        schema = schemas.load(dir, indexInfo);
       }
       indexGen = indexInfo.index_gen;
       core->segmentFiles.clear();
@@ -221,7 +222,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         auto& files = core->segmentFiles.emplace_back();
         files.segId = segment.seg_id;
         std::string liveName = segment.live_gen == 0 ? std::string()
-            : Postings::getLiveDocsFileName(Postings::getSortableString(segment.seg_id), segment.live_gen);
+            : Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), segment.live_gen, segment.live_epoch);
         for (const auto& file : segment.files) {
           (file.name == liveName ? files.liveDocs : files.files)
               .push_back({std::string(file.name), file.size, file.xxh3});
@@ -270,7 +271,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         if (!postingsReader && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
           postingsReader = prevSeg->sharedPostingsReader;
         }
-        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
+        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true);
         if (!postingsReader) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
           retry = true;
@@ -282,7 +283,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             && prevFiles->liveDocs == files.liveDocs) {
           liveDocs = prevSeg->sharedLiveDocs;
         } else if (liveGen > 0) {
-          liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
+          liveDocs = LiveDocs::create(dir, segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs, missingFileOK, true);
           if (!liveDocs) {
             // Failed to create LiveDocs (delete file not found) - trigger retry
             retry = true;
@@ -300,8 +301,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           if (prevIt != prevSegAuxByKey.end()
               && prevIt->second->getGen() == info.gen
               && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
-            IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
-                          info.name, segId, info.gen);
+            IREADER_DEBUG("Reusing segment overlay '{}' for seg=s{} (gen={}) from previous IndexReader",
+                          info.name, Postings::segmentKey(segId, segment.creator_epoch), info.gen);
             segmentAuxReaders.push_back(prevIt->second);
             continue;
           }
@@ -309,8 +310,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           auto aux = openKnownAux(dir, info, missingFileOK);
           if (!aux && (info.kind == VectorAuxReader::KIND
                        || info.kind == TestOverlayAuxReader::KIND)) {
-            IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
-                          info.name, segId);
+            IREADER_DEBUG("Segment overlay file missing for '{}' seg=s{} - triggering retry",
+                          info.name, Postings::segmentKey(segId, segment.creator_epoch));
             retry = true;
             break;
           }
@@ -331,7 +332,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
-        totalMaxDoc += segs.back().postingsReader().maxDoc();
+        totalMaxDoc += segs.back().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
       }
@@ -474,7 +475,22 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
       break;
     }
   }
-  return record ? FieldSegments(record, core->segs.data()) : FieldSegments{};
+  if (!record) return {};
+  FieldSegments result(record, core->segs.data());
+  if (sharedSchema) {
+    if (auto* expected = sharedSchema->getFieldTypePtr(name)) {
+      const auto& persisted = result.totals();
+      if (expected->type() != persisted.type
+          || expected->segmentTypeFlags() != FieldType::typeParameters(persisted.type, persisted.typeFlags)) {
+        throw RequestError(std::format(
+            "Field '{}': schema {} does not match persisted {}",
+            name, FieldType::describeType(expected->type(), expected->segmentTypeFlags()),
+            FieldType::describeType(persisted.type, persisted.typeFlags)),
+            "field_type_mismatch");
+      }
+    }
+  }
+  return result;
 }
 
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
@@ -487,16 +503,21 @@ std::string_view IndexReader::FieldSegments::name() const noexcept {
   return record ? std::string_view(record->name) : std::string_view{};
 }
 
-const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
-  if (!record) return nullptr;
+int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
+  assert(record);
   assert(segment < record->numSegments);
-  auto& postings = segments[segment].postingsReader();
   int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
   if (ordinal == FieldRecord::UNRESOLVED) {
-    ordinal = postings.findOrdinal(record->name);
+    ordinal = segments[segment].postingsReader().findOrdinal(record->name);
     record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
-  return postings.fieldInfo(ordinal);
+  return ordinal;
+}
+
+const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
+  if (!record) return nullptr;
+  int32_t ordinal = ordinalAt(segment);
+  return ordinal < 0 ? nullptr : segments[segment].postingsReader().fieldInfo(ordinal);
 }
 
 bool IndexReader::FieldSegments::exists() const noexcept {
@@ -512,14 +533,24 @@ const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
   auto* totals = record->totals.load(std::memory_order_acquire);
   if (!totals) {
     auto fresh = std::make_unique<HeaderTotals>();
+    std::optional<SegFieldInfo> first;
     for (size_t i = 0; i < size(); i++) {
       fresh->stats.maxDoc += segments[i].maxDoc();
-      if (auto* info = at(i)) {
-        fresh->stats.docsWithField += info->docsWithField;
-        fresh->stats.sumDocFreq += info->sumDocFreq;
-        fresh->stats.sumTotalTermFreq += info->sumTotalTermFreq;
-        fresh->flags |= info->flags;
+      int32_t ordinal = ordinalAt(i);
+      if (ordinal < 0) continue;
+      SegFieldInfo info{};
+      FieldReader fields(segments[i].postingsReader(), ordinal);
+      fields.readFieldInfo(info);
+      if (first) first->requireCompatibleType(info);
+      else {
+        first = info;
+        fresh->type = info.type;
+        fresh->typeFlags = FieldType::typeParameters(info.type, info.typeFlags);
       }
+      fresh->stats.docsWithField += info.docsWithField;
+      fresh->stats.sumDocFreq += info.sumDocFreq;
+      fresh->stats.sumTotalTermFreq += info.sumTotalTermFreq;
+      fresh->flags |= info.flags;
     }
     if (record->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,
@@ -539,46 +570,51 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
   return record ? totals().flags : 0;
 }
 
-std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
-  callOnce(projectableOnce, [this] {
+void IndexReader::PhysicalCore::buildFieldCatalogs() {
+  callOnce(fieldCatalogsOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
-    // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
+    // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
       auto& postingsReader = seg.postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(postingsReader);
-      while (fieldReader.readNextField()) {
+      for (int32_t ordinal = 0; fieldReader.readNextField(); ordinal++) {
         SegFieldInfo fi;
         fieldReader.readFieldInfo(fi);
         std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
-        if (fi.type == FieldType::BIN && (fi.flags & FieldType::STORED)) {
+        if (FieldType::storage(fi.type) == FieldType::Storage::BIN && (fi.flags & FieldType::STORED)) {
           // A stored-fields resource: its metadata lists the fields it holds.
           // An empty resource is never written, but guard the reader's
           // precondition anyway.
           if (fi.numValues <= 0) continue;
-          StoredFieldsReader sfr(postingsReader, fi);
-          for (std::string_view name : sfr.fieldNames()) {
+          const auto* field = postingsReader.fieldInfo(ordinal);
+          for (std::string_view name : field->stored->fieldNames) {
             auto& resources = sources[name].storedResources;
             if (std::ranges::find(resources, physicalName) == resources.end()) {
               resources.push_back(physicalName);
             }
           }
-        } else if (fi.flags & FieldType::COLUMN_STORED) {
-          sources[physicalName].column = true;
+        } else if (FieldType::storage(fi.type) != FieldType::Storage::BIN) {
+          sources[physicalName].column |= (fi.flags & FieldType::COLUMN_STORED) != 0;
         }
       }
     }
     std::vector<ProjectableField> fields;
+    std::vector<std::string_view> names;
     fields.reserve(sources.size());
+    names.reserve(sources.size());
     for (auto& [name, source] : sources) {
-      source.name = name;
-      fields.push_back(std::move(source));
+      names.push_back(name);
+      if (source.column || !source.storedResources.empty()) {
+        source.name = name;
+        fields.push_back(std::move(source));
+      }
     }
     projectable = std::move(fields);
+    physicalNames = std::move(names);
   });
-  return projectable;
 }
 
 std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
@@ -602,20 +638,16 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
       bool stored = !derived && type->isStored() && std::ranges::find(source.storedResources,
           std::string_view(type->storedResource_)) != source.storedResources.end();
       bool retrievable = false;
-      switch (type->type()) {
-        case FieldType::TEXT:
+      switch (FieldType::storage(type->type())) {
+        case FieldType::Storage::TEXT:
           retrievable = stored;
           break;
-        case FieldType::STRING:
-        case FieldType::ID:
+        case FieldType::Storage::TERMS:
           // Stored STRING/ID also fall back to their own older segment columns
           // even if the current schema no longer enables a column.
           retrievable = stored || (source.column && (type->isStored() || type->hasColumn()));
           break;
-        case FieldType::INT:
-        case FieldType::FLOAT:
-        case FieldType::DOUBLE:
-        case FieldType::DATE:
+        case FieldType::Storage::INT64:
           retrievable = source.column && type->hasColumn();
           break;
         default:
@@ -628,4 +660,12 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
   return retrievable;
 }
 
+std::span<const std::string> IndexReader::searchableFields() {
+  assert(sharedSchema);
+  callOnce(searchableOnce, [this] {
+    searchable = sharedSchema->searchableFields(core->physicalFieldNames());
+  });
+  return searchable;
 }
+
+} // namespace luxir

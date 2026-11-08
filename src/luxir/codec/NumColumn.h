@@ -90,6 +90,17 @@ public:
     return (int32_t)std::min<int64_t>(BLOCK_SIZE, nValues - start);
   }
 
+  // Rank intervals this block's encoding proves cannot match / all match
+  // [lo, hi]; nullopt when the encoding proves nothing beyond its zones.
+  std::optional<NumColumnFormat::RankBounds> rankBounds(
+      int64_t blockNum, int64_t lo, int64_t hi) const {
+    const auto& info = blockInfo(blockNum);
+    if (!info.linearFit()) return std::nullopt;
+    return NumColumnFormat::linearRankBounds(
+        info, valueAt(blockNum * (int64_t)BLOCK_SIZE),
+        (uint32_t)valuesInBlock(blockNum), lo, hi);
+  }
+
   int64_t valueAt(int64_t rank) const {
     assert(rank >= 0 && rank < nValues);
     uint64_t rankInBlock = (uint64_t)rank % BLOCK_SIZE;
@@ -131,6 +142,21 @@ public:
     uint64_t cur = LinearPack::select64(payload, rankInBlock, info.bits(), mask);
     return {reconstruct(info, rankInBlock - 1, prev),
             reconstruct(info, rankInBlock, cur)};
+  }
+
+  // Decode comparable residuals without restoring the block's base/gcd.
+  // Returns the global rank of out[0] and the number of valid values in count.
+  int64_t decodeResidualFrame(int64_t rank, uint32_t* out,
+                              uint32_t& count) const {
+    assert(rank >= 0 && rank < nValues);
+    int64_t start = rank / BULK_SIZE * BULK_SIZE;
+    const auto& info = blockInfo(start / BLOCK_SIZE);
+    assert(info.residualComparable());
+    count = (uint32_t)std::min<int64_t>(BULK_SIZE, nValues - start);
+    LinearPack::unpack128(
+        blocks + info.payloadOffset(), (uint64_t)start % BLOCK_SIZE, count,
+        info.bits(), LinearPack::mask32(info.bits()), out);
+    return start;
   }
 
   // Decode the 128-aligned frame containing rank. Returns the global rank of

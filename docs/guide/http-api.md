@@ -13,6 +13,7 @@ credentials. Administration and snapshot routes may name another tenant under
 
 | Method and path | Purpose |
 |---|---|
+| `GET /` | Binary version, full source commit hash, and CPU target. |
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
@@ -21,6 +22,8 @@ credentials. Administration and snapshot routes may name another tenant under
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
+| `POST /collections/_rename` | Rename one collection; body `{"from":"old","to":"new"}`. The destination must be free. |
+| `POST /collections/_swap` | Exchange two collection names in one catalog update; body `{"a":"live","b":"staging"}`. |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
 | `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
@@ -28,7 +31,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
-| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are
@@ -43,6 +46,32 @@ published by that operation. Search response envelopes include the token of the
 reader they used. See
 [Collection lifecycle](operations.md#collection-lifecycle) for deletion
 semantics under concurrent use.
+
+Rename returns `{from,to}`; swap returns `{a,b}`. Both names must be distinct
+and in the route's tenant. Requests admitted during a swap may see either binding
+per name; both names may briefly select the same collection. Missing names return 404, an occupied rename target
+409, an in-progress transition 503, and read-only nodes or followers 403.
+The gRPC equivalents are `luxir.Admin/RenameCollection` and
+`luxir.Admin/SwapCollections`, with an optional `tenant` in each request.
+
+## Build information
+
+`GET /` returns metadata compiled into the running binary, without collecting
+statistics or accessing Git at runtime:
+
+```json
+{
+  "version": "0.1.0",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "cpu_target": "x86-64-v2"
+}
+```
+
+`source_commit` identifies the checkout's HEAD at build time; it does not describe
+uncommitted edits. It is `"unknown"` for source archives built without an explicit
+commit hash, or when the build could not read the checkout's Git repository. `luxir --version` and the startup banner report the same version,
+commit, and CPU target. The root endpoint defaults to pretty JSON; use
+`/?pretty=false` for compact output.
 
 ## Content types and framing
 
@@ -69,7 +98,7 @@ query's `found`, `docs`, and sub-`ops` directly in the response envelope.
 Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
 `?pretty=false`) is a URL-only, best-effort formatting hint that applies to
 every JSON body of the request, errors and ingest acknowledgements included.
-Schema, collection list, and stats responses default to pretty; every other
+Build information, schema, collection list, and stats responses default to pretty; every other
 route defaults to compact. `_stats?format=prometheus` is
 `text/plain; version=0.0.4` and ignores `pretty`. Indentation is two spaces but is not part of the
 contract. A pretty stream is sent as `application/json`, still chunked, with
@@ -98,6 +127,42 @@ the named response shape.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":"books"` even when the original body omitted it.
+
+### Packed request flags
+
+The request and each operation wrapper accept a lowercase `flags` name array:
+
+```json
+{"flags":["date_ms"],"ops":{"q":{"flags":["date_native"],"top_docs":{"query":"when_dt:2"}}}}
+```
+
+Operations inherit their parent's options. Naming a date mode replaces the
+inherited date mode, including `date_native` to restore field-native literal
+units and numeric output. An empty array overrides nothing. The root shorthand
+accepts request flags beside `query`, `filter`, and other request controls. A bare expression
+op inherits flags; use an `expr_op` wrapper to override them.
+
+Duplicate or conflicting names, unknown names, and reserved flags are request
+errors. Canonical echo and both explain modes emit names, including an explicit
+`date_native` override, rather than numeric masks. See
+[date literal units and output](dates.md#request-flags-and-literal-units).
+`date_iso` emits UTC strings, while `date_ms` and `date_ns` emit numeric dates
+in the named unit. This applies to documents, facets, groups, sort values and
+DATE metrics; the same output types are used over gRPC.
+
+`estimate_count` lets every list in its scope that leaves `count_limit` unset
+estimate `found`; see [counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded).
+
+`int64_str` is request-level only. For example, `"flags": ["date_ns",
+"int64_str"]` renders JSON int64 and uint64 values as decimal strings only
+when they fall outside JavaScript's safe integer range, -9007199254740991
+through 9007199254740991 (`Number.isSafeInteger`). All other integers stay
+JSON numbers. The rule covers every integer in search responses, including
+fields, arrays, metrics, facets, group keys/ranks, counts, headers and profile
+metadata, in both envelope and docs formats. It does not apply to doubles.
+Clients using this flag must accept either a number or a string for a 64-bit
+value. Setting or clearing the flag on any operation is an error. Binary gRPC
+responses retain their integer types.
 
 ### Explain modes
 

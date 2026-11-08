@@ -517,6 +517,27 @@ public:
             leavesOutsideValues.best, inside, lead, topCount};
   }
 
+  // Total expected physical exposure, not a stopping boundary. Bound-order
+  // seeds and their remainder can revisit windows; charge both. An ordinary
+  // walk uses the same sweep estimate as the field-sort route price, except
+  // when keys worsen with doc order and it meets its best leaves first.
+  Query::Demand expectedWindowDemand(const ExactDomainSortCosts::Rest& rest,
+                                     int64_t sourceCost, int32_t maxDoc,
+                                     int64_t seedLeaves = 0) const {
+    auto reading = ExactDomainSortCosts::read(rest);
+    double leaves = seedLeaves > 0
+        ? (double)seedLeaves + rest.floor
+        : primaryKeys->docOrderTrend() < -0.5
+            ? (double)rest.floor : reading.empty + reading.swept;
+    int64_t leafSize = clauses[0].comparator->keyBatch()->leafBlockSize();
+    int64_t span = (int64_t)std::clamp(std::ceil(leaves * leafSize),
+        (double)std::min(maxDoc, DocsEnumMeta::L1_DOCS), (double)maxDoc);
+    int64_t candidates = (int64_t)std::ceil(
+        (double)sourceCost * span / std::max(1, maxDoc));
+    return Query::Demand::fromCandidatesAndSpan(candidates, span,
+                                                Query::ExecutionUse::MATCH_WINDOWS);
+  }
+
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
   // SCORE, DOC, and EXPR apply direction in this clause walk.
   template <bool Member = false>

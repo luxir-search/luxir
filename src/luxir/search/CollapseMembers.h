@@ -38,6 +38,9 @@ public:
 
 // Cold response-stage evaluation. Emits the list's actual rank clauses (not
 // the head_sort clauses), with their native types and exact missing values.
+void renderSortRanks(std::span<const luxir::api::ArrVal> ranks, const SortPlan& sort,
+                     uint64_t flags, std::pmr::memory_resource& mr);
+
 void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
                       IndexReader& reader, segdoc doc, float score,
                       std::pmr::memory_resource& mr);

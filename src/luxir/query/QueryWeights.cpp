@@ -5,16 +5,20 @@
 // queries without a .cpp of their own. Each is its class's key function; see
 // docs/dev/codebase-map.md.
 
+#include <set>
+
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
+#include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/MultiTermQuery.h"
@@ -50,6 +54,93 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
   return nullptr;
 }
 
+Query::Weight* AutomatonQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  if (automatonKind != Kind::MATCH || !caseInsensitive) {
+    return MultiTermQuery::createWeight(context, flags, multiplier);
+  }
+  // A scored weight rewrites to the union of indexed case variants. Unscored
+  // weights of the same query match that union as a constant-score filter once
+  // it exists, so the variant scan is charged to the request's budget once;
+  // before it, they take the multi-term filter form. The parser builds a
+  // query's scored weight before its count weight, so in a ranked request the
+  // rewrite exists by then.
+  Query*& rewritten = MultiTermQuery::Weight::sharedRewrite(context, *this);
+  if ((flags & NEED_SCORES) == 0) {
+    if (rewritten == nullptr) return MultiTermQuery::createWeight(context, flags, multiplier);
+    auto* filter = context.pool.make<ConstantScoreQuery>(rewritten);
+    filter->markPlannerGenerated();
+    return filter->createWeight(context, flags, multiplier);
+  }
+  if (rewritten == nullptr) rewritten = rewriteCaseVariants(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
+
+Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
+  // Discover the union across segments before computing shared synonym stats.
+  // Unlike fuzzy, case matching promises every alternate, so an operator limit
+  // rejects rather than truncates, as this query's filter form does.
+  MultiTermBudget& budget = context.multiTermBudget();
+  RequestMemResource variantMemory(
+      context.planningContext().memoryTracker, field, "multi-term selection");
+  std::pmr::set<std::pmr::string> variants(&variantMemory);
+  if (auto* fieldInfo = context.getCachedFieldInfo(field)) {
+    for (auto& segment : context.topReader.segments()) {
+      const auto* segInfo = fieldInfo->segInfos.at(segment);
+      if (segInfo == nullptr) continue;
+      MemPool scratch;
+      TermsEnum te(scratch, segment.postingsReader(), *segInfo);
+      auto* filtered = createFilteredEnum(scratch, te);
+      filtered->setAllowance(budget.scanAllowance());
+      int32_t segmentVariants = 0;
+      int64_t segmentPostings = 0;
+      while (filtered->next()) {
+        if (++segmentVariants > budget.maxExpansions()) {
+          budget.throwTooManyExpansions(describe());
+        }
+        segmentPostings += filtered->terms().postingsState().docFreq;
+        variants.emplace(filtered->termView());
+      }
+      if (filtered->stoppedAtVisitLimit()) budget.throwTermsExamined(describe());
+      if (!budget.chargePostings(segmentPostings)) budget.throwPostings(describe());
+    }
+  }
+
+  Query* rewritten;
+  if (variants.empty()) {
+    rewritten = context.pool.make<MatchNoDocsQuery>();
+  } else {
+    // MATCH patterns are escaped literals. Recover the analyzed/normalized
+    // token, without normalizing again, to prefer its own case slightly.
+    std::string exactTerm;
+    exactTerm.reserve(pattern.size());
+    for (size_t p = 0; p < pattern.size(); p++) {
+      if (pattern[p] == '\\') p++;
+      assert(p < pattern.size());
+      exactTerm.push_back(pattern[p]);
+    }
+    auto terms = context.pool.make_span<CombinedFieldQuery::Term>(variants.size());
+    size_t i = 0;
+    for (const auto& variant : variants) {
+      char* copy = context.pool.alloc(variant.size());
+      memcpy(copy, variant.data(), variant.size());
+      terms[i++] = {0, std::string_view(copy, variant.size()),
+                    std::string_view(variant) == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
+    }
+    auto fields = context.pool.make_span<std::string_view>(1);
+    auto weights = context.pool.make_span<float>(1);
+    fields[0] = field;
+    weights[0] = 1.0f;
+    rewritten = context.pool.make<CombinedFieldQuery>(fields, weights, terms);
+  }
+  return rewritten;
+}
+
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
                                         float multiplier) {
   return child->createWeight(context, flags, multiplier * boost);
@@ -79,7 +170,7 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
 
   MemPool scratch;
   auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
-  truncateCandidates(context, candidates);
+  truncateCandidates(candidates);
   if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
 
   Similarity::TermStats blendedStats = {};
@@ -103,9 +194,42 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
       std::span<Query*>{}, std::span<Query*>{});
 }
 
+Query::Weight* CombinedFieldQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  if ((flags & NEED_SCORES) != 0) {
+    return context.pool.make<CombinedFieldQuery::Weight>(context, *this, flags, multiplier);
+  }
+  // Unscored: the same match set as a disjunction of the per-field terms,
+  // which keeps the term planner's docs-only and window-fill routes.
+  Query* rewritten;
+  if (terms.size() == 1) {
+    rewritten = context.pool.make<TermQuery>(fields[terms[0].field], terms[0].text);
+  } else {
+    auto clauses = context.pool.make_span<Query*>(terms.size());
+    for (size_t i = 0; i < terms.size(); i++) {
+      clauses[i] = context.pool.make<TermQuery>(fields[terms[i].field], terms[i].text);
+    }
+    rewritten = context.pool.make<BooleanQuery>(
+        std::span<Query*>{}, clauses, std::span<Query*>{}, std::span<Query*>{});
+  }
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
+
 Query::Weight* FuzzyQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  Query* rewritten = rewriteToDisjunction(context);
+  // The kept terms do not depend on flags, so every weight the request builds
+  // for this query (ranking, count, domain) reuses one dictionary scan.
+  struct Rewrite {
+    Query* query;
+  };
+  Query* rewritten = context.getOrCreateLogicalPlan<Rewrite>(*this, [&]() {
+    return context.pool.make<Rewrite>(rewriteToDisjunction(context));
+  }).query;
 #ifndef NDEBUG
   if (context.logicalValidationActive()) {
     rewritten->validateLogical(context.planningContext(), multiplier);
@@ -122,6 +246,12 @@ Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
                                               float multiplier) {
+  float score = constantWhenScored(flags, multiplier);
+  return context.pool.make<Weight>(context, *this, flags, score);
+}
+
+Query::Weight* GeoPolygonQuery::createWeight(Context& context, int32_t flags,
+                                             float multiplier) {
   float score = constantWhenScored(flags, multiplier);
   return context.pool.make<Weight>(context, *this, flags, score);
 }

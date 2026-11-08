@@ -32,6 +32,7 @@ struct AggregateExprOptions {
   std::string_view opName;
   int* nestingBudget = nullptr;
   FieldResolver* fieldResolver = nullptr;
+  bool shareProducers = true;
 };
 
 class AggregateExprParser {
@@ -73,13 +74,21 @@ public:
   }
 
   uint32_t makeFunction(std::string_view name, size_t pos,
-                        std::span<const uint32_t> children) {
+                        std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
-    assert(function != nullptr && function->evalBucketScalar != nullptr);
+    assert(function != nullptr);
+    if (function->evalBucketScalar == nullptr) {
+      fail(pos, fmt::format(
+          "{}() is a per-document value function and is not valid on bucket values",
+          name));
+    }
+    std::array<uint32_t, VALUE_MAX_ARITY> indices{};
+    std::copy(args.begin(), args.end(), indices.begin());
+    std::span<uint32_t> children(indices.data(), args.size());
     ResolvedValue resolved = resolveFunction(*function, pos, children);
     AggregateNode node;
-    node.kind = children.size() == 1
-        ? AggregateNodeKind::UNARY : AggregateNodeKind::BINARY;
+    node.kind = AggregateNodeKind::FUNCTION;
+    node.childCount = (uint8_t)children.size();
     node.type = valueDouble(resolved.type)
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
@@ -114,7 +123,7 @@ public:
     }
     if (lookup.value != nullptr
         && lookup.value->evalBucketScalar != nullptr) {
-      std::array<uint32_t, 2> args{};
+      std::array<uint32_t, VALUE_MAX_ARITY> args{};
       uint8_t count = grammar.parseArguments(
           name, pos, lookup.value->minArity, lookup.value->maxArity,
           [&](uint8_t argument) {
@@ -140,8 +149,8 @@ public:
 
 private:
   ResolvedValue resolveFunction(const ValueFunction& function, size_t pos,
-                                std::span<const uint32_t> children) {
-    std::array<ResolvedValue, 2> args{};
+                                std::span<uint32_t> children) {
+    std::array<ResolvedValue, VALUE_MAX_ARITY> args{};
     for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
       args[i] = {
@@ -149,8 +158,20 @@ private:
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
     }
+    auto conversions = function.dateConversionOperands(
+        std::span<const ResolvedValue>(args.data(), children.size()));
+    for (size_t convert = 0; convert < children.size(); convert++) {
+      if (!conversions[convert]) continue;
+      AggregateNode scale;
+      scale.intValue = 1000000;
+      scale.sourcePos = pos;
+      std::array<uint32_t, 2> inputs{children[convert], program->addNode(scale)};
+      children[convert] = makeFunction("mul", pos, inputs);
+      program->nodes[children[convert]].nature = ValueNature::DATE_NS;
+      args[convert].nature = ValueNature::DATE_NS;
+    }
     try {
-      return function.resolve(
+      return function.resolveOperands(
           std::span<const ResolvedValue>(args.data(), children.size()));
     } catch (const std::exception& error) {
       fail(pos, error.what());
@@ -236,7 +257,7 @@ private:
           "op '{}': scores are not available in aggregate expressions",
           opts.opName));
     }
-    if (input != nullptr && valueArray(input->root().type)) {
+    if (input != nullptr && !function.acceptsValues && valueArray(input->root().type)) {
       std::string_view argument = cur->slice(argumentStart, argumentEnd);
       fail(pos, fmt::format(
           "{}() requires one scalar per document; '{}' produces a {}; "
@@ -244,7 +265,7 @@ private:
           name, argument, valueTypeName(input->root().type),
           ValueFunctionRegistry::arrayReducerNames()));
     }
-    if (input != nullptr && input->root().type == ValueType::COLUMN_ONLY) {
+    if (input != nullptr && !function.acceptsValues && input->root().type == ValueType::COLUMN_ONLY) {
       fail(pos, fmt::format("{}() requires a numeric expression", name));
     }
 
@@ -256,12 +277,10 @@ private:
       fail(pos, error.what());
     }
 
-    AggregateLeaf leaf;
-    leaf.input = input;
-    leaf.resolved = resolved;
-    leaf.arguments = program->copyConstants(trailing);
-    leaf.stateOffset = program->stateBytes;
-    program->stateBytes += leaf.resolved.state.bytes;
+    auto arguments = program->copyConstants(trailing);
+    AggregateLeaf leaf{program->addProducer({&function, input, resolved, arguments},
+                                          opts.shareProducers),
+                       arguments};
     uint32_t leafIndex = (uint32_t)program->leaves.size();
     program->leaves.push_back(leaf);
 

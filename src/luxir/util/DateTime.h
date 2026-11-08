@@ -23,11 +23,15 @@
 
 namespace luxir {
 
-// Date/time helpers for the DATE field type.  Dates are stored internally as
-// int64 milliseconds since the Unix epoch (1970-01-01T00:00:00Z), the same
-// convention Solr (DatePointField) and OpenSearch (date) use.  Millis is a
-// naturally-sorting signed integer, so the value lives in the standard int
-// column with identity encoding (no sortable-bits transform like FLOAT/DOUBLE).
+// Date/time helpers for the DATE field type.  Parsing, date math and civil
+// arithmetic work in int64 milliseconds since the Unix epoch
+// (1970-01-01T00:00:00Z), the convention Solr (DatePointField) and OpenSearch
+// (date) use, with a sub-millisecond remainder carried beside it.  A field
+// stores int64 units since the epoch at its DateUnit (millis or nanos);
+// the conversion happens at the edges (toDateUnits,
+// dateUnitWindow).  The value is a naturally-sorting signed integer, so it
+// lives in the standard int column with identity encoding (no sortable-bits
+// transform like FLOAT/DOUBLE).
 //
 // parseDateToEpochMillis accepts the union of OpenSearch's default
 // "strict_date_optional_time || epoch_millis" (a superset of Solr's canonical
@@ -42,7 +46,8 @@ namespace luxir {
 // separator ('...Z||+1d').  Commands chain left-to-right.  Solr word units
 // are case-insensitive; OpenSearch's one-letter units are case-sensitive
 // ('M' month, 'm' minute).  Returns nullopt if the text is not a recognized
-// form.  Fractional seconds beyond millisecond precision are truncated.
+// form.  Fractional seconds keep up to nanosecond precision (DateRange's
+// loNanos/hiNanos); digits beyond nine are truncated.
 //
 // parseDateRange additionally reports the time WINDOW the text denotes at its
 // own granularity: '2024-06-25' is the whole day, '2024-06' the whole month,
@@ -57,9 +62,9 @@ namespace datetime_detail {
 // Supported instant range = the span representable by std::chrono::year, whose
 // backing store is a 16-bit field ([-32767, 32767]).  Years outside this would
 // silently narrow in the chrono::year constructor and slip past ymd.ok(), so we
-// reject them; the matching epoch-millis bounds clamp the bare-integer path so
-// every stored value also formats back safely.  The range is absurdly wide for
-// real timestamps (year +/-32767), so this rejects only garbage.
+// reject them. The matching epoch-millis bounds limit text parsing and civil
+// arithmetic and ms ingest. Formatting rejects values
+// outside this civil range before constructing a chrono::year.
 inline constexpr int kMinYear = -32767;
 inline constexpr int kMaxYear = 32767;
 inline constexpr int64_t kMsPerDay = 86400000LL;
@@ -293,15 +298,110 @@ inline std::string timeZoneResolutionError(std::string_view spec) {
       + std::string(timeZoneDatabaseVersion()) + ")";
 }
 
-// The [start, end) window a date text denotes at its own granularity.
+// The [start, end) window a date text denotes at its own granularity.  Each
+// edge is epoch millis plus a sub-millisecond remainder in [0, 999999] ns,
+// nonzero only for literals with more than three fractional digits.
 struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
   bool granuleSkipped = false;
+  int32_t loNanos = 0;
+  int32_t hiNanos = 0;
   // NOW-anchored with no rounding coarser than a millisecond: the window
   // moves with every request millisecond.
   bool unroundedNow = false;
 };
+
+// Unit of an epoch value. Stored NANOS values reserve the int64 extrema for
+// saturated query bounds and exclusive fences (1677-09-21 to 2262-04-11).
+enum class DateUnit : uint8_t { MILLIS, NANOS };
+
+inline constexpr int64_t dateUnitNanos(DateUnit unit) {
+  switch (unit) {
+    case DateUnit::MILLIS: return 1000000LL;
+    case DateUnit::NANOS: return 1LL;
+  }
+  throw std::invalid_argument("Unknown date unit");
+}
+
+inline constexpr std::string_view dateUnitName(DateUnit unit) {
+  switch (unit) {
+    case DateUnit::MILLIS: return "ms";
+    case DateUnit::NANOS: return "ns";
+  }
+  throw std::invalid_argument("Unknown date unit");
+}
+
+namespace datetime_detail {
+
+// Floor (or ceiling) of an instant, millis + nanos, in units of unitNanos.
+// Exact in __int128 even when millis is an int64 extremum.
+inline __int128 toUnits128(int64_t millis, int32_t nanos, int64_t unitNanos, bool roundUp) {
+  __int128 total = (__int128)millis * 1000000 + nanos;
+  __int128 quotient = total / unitNanos;
+  __int128 remainder = total % unitNanos;
+  if (remainder < 0 && !roundUp) --quotient;
+  if (remainder > 0 && roundUp) ++quotient;
+  return quotient;
+}
+
+inline std::optional<int64_t> epochInteger(std::string_view text) {
+  if (text.empty() || text.size() > kMaxLiteralParseLen) return std::nullopt;
+  if (text.starts_with('+')) {
+    text.remove_prefix(1);
+    if (text.empty() || !isAsciiDigit(text.front())) return std::nullopt;
+  }
+  int64_t value;
+  auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size()) return std::nullopt;
+  return value;
+}
+
+} // namespace datetime_detail
+
+inline int64_t clampDateUnits(__int128 value) {
+  return (int64_t)std::clamp(value, (__int128)INT64_MIN, (__int128)INT64_MAX);
+}
+
+inline __int128 convertDateUnits(int64_t value, DateUnit from, DateUnit to) {
+  __int128 nanos = (__int128)value * dateUnitNanos(from);
+  int64_t divisor = dateUnitNanos(to);
+  return nanos / divisor - (nanos % divisor < 0);
+}
+
+inline int64_t dateEpochMillis(int64_t value, DateUnit unit) {
+  return (int64_t)convertDateUnits(value, unit, DateUnit::MILLIS);
+}
+
+// A stored instant in the given unit, rounded down (or up). Finer digits are
+// truncated toward earlier time. NANOS excludes both int64 extrema; bounds
+// use dateUnitWindow instead. nullopt when outside the stored domain.
+inline std::optional<int64_t> toDateUnits(int64_t millis, int32_t nanos,
+                                          DateUnit unit,
+                                          bool roundUp = false) {
+  __int128 units = datetime_detail::toUnits128(
+      millis, nanos, dateUnitNanos(unit), roundUp);
+  int64_t min = std::numeric_limits<int64_t>::min();
+  int64_t max = std::numeric_limits<int64_t>::max();
+  if (unit == DateUnit::NANOS) { ++min; --max; }
+  if (units < min || units > max) {
+    return std::nullopt;
+  }
+  return (int64_t)units;
+}
+
+// A query window in the field's units: [floor(lo), ceil(hiExclusive)), so a
+// stored value matches when the instants it truncates from overlap the
+// window (a sub-millisecond literal on an ms field matches its millisecond).
+// Edges outside int64 saturate, so a bound past the NANOS range keeps its
+// meaning (everything after it, or nothing before it).
+inline std::pair<int64_t, int64_t> dateUnitWindow(const DateRange& range,
+                                                  DateUnit unit) {
+  namespace dd = datetime_detail;
+  int64_t unitNanos = dateUnitNanos(unit);
+  return {clampDateUnits(dd::toUnits128(range.lo, range.loNanos, unitNanos, false)),
+          clampDateUnits(dd::toUnits128(range.hiExclusive, range.hiNanos, unitNanos, true))};
+}
 
 // A parsed literal additionally preserves whether an offset token was present.
 // That bit distinguishes an offset-less civil literal from Z/+00:00 in a
@@ -426,30 +526,29 @@ public:
 // Parse only the literal forms above. Date-math splitting calls this for each
 // possible fixed anchor, so it deliberately requires the whole input.
 inline std::optional<DateLiteralRange> parseDateLiteralRange(
-    std::string_view s, const TimeZone& frameZone) {
+    std::string_view s, const TimeZone& frameZone, DateUnit numericUnit = DateUnit::MILLIS) {
   using namespace std::chrono;
   namespace dd = datetime_detail;
   Cursor input{s};
   if (input.atEnd() || input.size() > dd::kMaxLiteralParseLen) return std::nullopt;
 
-  // Bare integer => epoch millis (OpenSearch epoch_millis).  A real ISO date
+  // Bare integer => epoch units. A real ISO date
   // always carries a '-' between year and month, so an all-digit run (after an
   // optional leading sign) is unambiguous.  Detected with range-checked
   // algorithms; converted with from_chars, which reports overflow as an error
   // rather than wrapping (signed-overflow UB).
-  {
-    Cursor integer = input;
-    bool leadingPlus = integer.consume('+');
-    if (!leadingPlus) integer.consume('-');
-    std::string_view digits = integer.takeWhile(dd::isAsciiDigit);
-    if (!digits.empty() && integer.atEnd()) {
-      int64_t v = 0;
-      std::string_view token = input.slice(leadingPlus ? 1 : 0, input.size());
-      auto [ptr, ec] = std::from_chars(token.begin(), token.end(), v);
-      if (ec != std::errc{} || ptr != token.end()) return std::nullopt;
-      if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
-      return DateLiteralRange{DateRange{v, v + 1}, false};
+  if (auto integer = dd::epochInteger(s)) {
+    int64_t v = *integer;
+    if (numericUnit == DateUnit::NANOS) {
+      int64_t millis = dateEpochMillis(v, numericUnit);
+      int32_t nanos = (int32_t)((__int128)v - (__int128)millis * 1000000);
+      DateRange range{millis, millis + (nanos + 1) / 1000000};
+      range.loNanos = nanos;
+      range.hiNanos = (nanos + 1) % 1000000;
+      return DateLiteralRange{range, false};
     }
+    if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
+    return DateLiteralRange{DateRange{v, v + 1}, false};
   }
 
   Cursor c = input;
@@ -470,6 +569,10 @@ inline std::optional<DateLiteralRange> parseDateLiteralRange(
   }
 
   int hh = 0, mm = 0, ss = 0, frac = 0, offsetMin = 0;
+  // Fractional digits past the millisecond, as nanos, and the sub-millisecond
+  // granule they pin down (0 = the literal stops at millis or coarser).
+  int32_t subNanos = 0;
+  int32_t granuleNanos = 0;
   bool hasExplicitOffset = false;
   // The granule width the text pins down, as fixed millis; 0 = a calendar
   // month (variable width, handled by date arithmetic below).
@@ -493,11 +596,21 @@ inline std::optional<DateLiteralRange> parseDateLiteralRange(
           c.advance();
           if (!dd::isAsciiDigit(c.peek())) return std::nullopt;  // need >= 1 digit
           granuleMs = 1;
-          int scale = 100;  // first three fractional digits -> millis; rest truncated
+          // First three fractional digits -> millis, the next six -> nanos;
+          // the rest are truncated.
+          int digits = 0;
+          int32_t scale = 100000000;
           while (dd::isAsciiDigit(c.peek())) {
-            if (scale > 0) { frac += (c.peek() - '0') * scale; scale /= 10; }
+            if (digits < 9) {
+              int32_t digit = (c.peek() - '0') * scale;
+              if (digits < 3) frac += digit / 1000000;
+              else subNanos += digit;
+              scale /= 10;
+            }
+            ++digits;
             c.advance();
           }
+          if (digits > 3) granuleNanos = digits >= 9 ? 1 : scale * 10;
         }
       }
     }
@@ -574,7 +687,15 @@ inline std::optional<DateLiteralRange> parseDateLiteralRange(
 
   bool granuleSkipped = !hasExplicitOffset && civilNext
       && civilIntervalSkipped(civilLo, *civilNext, frameZone);
-  return DateLiteralRange{DateRange{*lo, *last + 1, granuleSkipped}, hasExplicitOffset};
+  DateRange range{*lo, *last + 1, granuleSkipped};
+  if (granuleNanos != 0) {
+    // A sub-millisecond granule sits inside the one millisecond at *lo.
+    int32_t hiNanos = subNanos + granuleNanos;
+    range.loNanos = subNanos;
+    range.hiExclusive = *lo + hiNanos / 1000000;
+    range.hiNanos = hiNanos % 1000000;
+  }
+  return DateLiteralRange{range, hasExplicitOffset};
 }
 
 namespace datetime_detail {
@@ -782,9 +903,13 @@ struct DateMathResult {
 // the lower edge and rounds the upper edge to the unit's last millisecond;
 // later commands transform both. This is exactly the interval the existing
 // DATE range fold needs for gte/gt/lte/lt semantics. rounded is true when some
-// /unit coarser than a millisecond was applied.
+// /unit coarser than a millisecond was applied.  The edges carry the
+// anchor's sub-millisecond part (loNanos, and hiLastNanos for the last
+// inclusive nano of the high edge's millisecond) through additions, which are
+// whole milliseconds; rounding to any unit clears it.
 inline std::optional<DateMathResult> applyDateMath(
-    int64_t anchor, std::string_view math, const TimeZone& zone) {
+    int64_t anchor, std::string_view math, const TimeZone& zone,
+    int32_t loNanos = 0, int32_t hiLastNanos = 999999) {
   Cursor cur{math};
   if (cur.atEnd()) return std::nullopt;
   int64_t lo = anchor;
@@ -815,6 +940,8 @@ inline std::optional<DateMathResult> applyDateMath(
       if (!lowWindow || !highWindow) return std::nullopt;
       lo = lowWindow->first;
       hi = highWindow->second;
+      loNanos = 0;
+      hiLastNanos = 999999;
       rounded |= *unit != DateMathUnit::MILLISECOND;
     } else {
       auto newLo = addUnit(lo, amount, *unit, zone);
@@ -825,7 +952,21 @@ inline std::optional<DateMathResult> applyDateMath(
     }
   }
   if (!supportedInstant(lo) || !supportedInstant(hi) || lo > hi) return std::nullopt;
-  return DateMathResult{.range = {lo, hi + 1}, .rounded = rounded};
+  DateRange range{lo, hi + 1};
+  range.loNanos = loNanos;
+  if (hiLastNanos != 999999) {
+    range.hiExclusive = hi;
+    range.hiNanos = hiLastNanos + 1;
+  }
+  return DateMathResult{.range = range, .rounded = rounded};
+}
+
+// The math edges for a literal anchor: its start, and the last nano of its
+// first millisecond, or of its sub-millisecond granule.
+inline std::pair<int32_t, int32_t> anchorNanos(const DateRange& anchor) {
+  if (anchor.loNanos == 0 && anchor.hiNanos == 0) return {0, 999999};
+  return {anchor.loNanos,
+          (int32_t)((anchor.hiExclusive - anchor.lo) * 1000000 + anchor.hiNanos - 1)};
 }
 
 inline bool startsWithNow(const Cursor& input) {
@@ -856,7 +997,8 @@ inline std::optional<int64_t> civilCalendarAt(
 }
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
-                                               const TimeZone& zone) {
+                                               const TimeZone& zone,
+                                               DateUnit numericUnit = DateUnit::MILLIS) {
   namespace dd = datetime_detail;
   Cursor input{s};
   if (input.atEnd() || input.size() > dd::kMaxDateMathParseLen
@@ -881,7 +1023,7 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   }
 
   // A literal without math retains Luxir's existing granularity window.
-  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()), zone)) {
+  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()), zone, numericUnit)) {
     return literal->range;
   }
 
@@ -893,10 +1035,12 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     separatorScan.advance(2);
     size_t mathStart = separatorScan.position();
     if (separatorScan.findNext("||")) return std::nullopt;
-    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone, numericUnit);
     if (!anchor) return std::nullopt;
+    auto [loNanos, hiLastNanos] = dd::anchorNanos(anchor->range);
     auto result = dd::applyDateMath(
-        anchor->range.lo, input.slice(mathStart, input.size()), zone);
+        anchor->range.lo, input.slice(mathStart, input.size()), zone,
+        loNanos, hiLastNanos);
     if (!result) return std::nullopt;
     result->range.granuleSkipped = anchor->range.granuleSkipped;
     return result->range;
@@ -912,10 +1056,12 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     char c = suffixScan.peek();
     if (c != '+' && c != '-' && c != '/') continue;
     size_t separator = suffixScan.position();
-    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone, numericUnit);
     if (!anchor) continue;
+    auto [loNanos, hiLastNanos] = dd::anchorNanos(anchor->range);
     if (auto result = dd::applyDateMath(
-            anchor->range.lo, input.slice(separator, input.size()), zone)) {
+            anchor->range.lo, input.slice(separator, input.size()), zone,
+            loNanos, hiLastNanos)) {
       result->range.granuleSkipped = anchor->range.granuleSkipped;
       return result->range;
     }
@@ -928,7 +1074,7 @@ inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s,
                                                       const TimeZone& zone) {
   auto r = parseDateRange(s, nowEpochMillis, zone);
   if (!r) return std::nullopt;
-  return r->lo;  // ingest/sort use the window start (an instant)
+  return toDateUnits(r->lo, r->loNanos, DateUnit::MILLIS);
 }
 
 // Ingest has no request time-zone surface and intentionally remains UTC.
@@ -941,13 +1087,24 @@ inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
   return parseDateToEpochMillis(s, currentEpochMillis(), TimeZone::utc());
 }
 
-// Render epoch millis as canonical UTC ISO-8601: 'YYYY-MM-DDThh:mm:ssZ', with
-// '.fff' appended only when the sub-second part is non-zero (Solr's output
-// form).  Used by tests and the (future) JSON rendering layer; the gRPC layer
-// returns the raw millis column.
-inline std::string formatEpochMillisIso8601(int64_t millis) {
+// Render an epoch value in UTC, with 3 fraction digits for ms and the fewest
+// of 3/6/9 that is exact for ns. Bound sentinels can be formatted too.
+inline std::string formatDateIso8601(int64_t value, DateUnit dateUnit) {
   using namespace std::chrono;
-  sys_time<milliseconds> tp{milliseconds{millis}};
+  namespace dd = datetime_detail;
+  int64_t unit = dateUnitNanos(dateUnit);
+  int64_t unitsPerSecond = 1000000000LL / unit;
+  int64_t secs = value / unitsPerSecond;
+  int64_t rem = value % unitsPerSecond;
+  if (rem < 0) {
+    rem += unitsPerSecond;
+    --secs;
+  }
+  int64_t nanos = rem * unit;
+  if (secs < dd::kMinEpochMs / 1000 || secs > dd::kMaxEpochMs / 1000) {
+    throw std::out_of_range("Date is outside the supported ISO-8601 year range");
+  }
+  sys_seconds tp{seconds{secs}};
   sys_days dp = floor<days>(tp);
   year_month_day ymd{dp};
   hh_mm_ss hms{tp - dp};
@@ -957,12 +1114,17 @@ inline std::string formatEpochMillisIso8601(int64_t millis) {
   int hh = (int)hms.hours().count();
   int mm = (int)hms.minutes().count();
   int ss = (int)hms.seconds().count();
-  int ms = (int)hms.subseconds().count();
-  char buf[40];
-  int len = ms != 0
-    ? std::snprintf(buf, sizeof buf, "%04d-%02u-%02uT%02d:%02d:%02d.%03dZ", y, mo, d, hh, mm, ss, ms)
-    : std::snprintf(buf, sizeof buf, "%04d-%02u-%02uT%02d:%02d:%02dZ", y, mo, d, hh, mm, ss);
+  char buf[48];
+  int len = std::snprintf(buf, sizeof buf, "%04d-%02u-%02uT%02d:%02d:%02d", y, mo, d, hh, mm, ss);
+  int digits = nanos % 1000000 == 0 ? 3 : nanos % 1000 == 0 ? 6 : 9;
+  int64_t fraction = digits == 3 ? nanos / 1000000 : digits == 6 ? nanos / 1000 : nanos;
+  len += std::snprintf(buf + len, sizeof buf - (size_t)len, ".%0*lld", digits, (long long)fraction);
+  buf[len++] = 'Z';
   return std::string(buf, (size_t)len);
+}
+
+inline std::string formatEpochMillisIso8601(int64_t millis) {
+  return formatDateIso8601(millis, DateUnit::MILLIS);
 }
 
 } // namespace luxir

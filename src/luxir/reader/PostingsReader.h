@@ -12,6 +12,7 @@
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
 #include "SegFieldInfo.h"
+#include "StoredFieldsMetadata.h"
 #include "VersionRuns.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
@@ -57,6 +58,11 @@ public:
     // Field-sort planning reads every segment's leaf bounds. Keep the view
     // with the header rather than rebuilding it for each request.
     std::optional<NumColumnFormat::LeafMeta> leafMeta;
+    std::unique_ptr<const StoredFieldsMetadata> stored;
+
+    size_t allocatedBytes() const {
+      return sizeof(*this) + (stored ? stored->allocatedBytes() : 0);
+    }
     const NumColumnFormat::LeafMeta* numericLeafMeta() const noexcept {
       return leafMeta ? &*leafMeta : nullptr;
     }
@@ -83,9 +89,9 @@ public:
   // Static factory method to create PostingsReader with optional handling of missing files.
   // Returns nullptr if missingFileOK=true and any required files are missing.
   // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
-  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false, bool expectSynced = false);
+  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK = false, bool expectSynced = false);
 
-  explicit PostingsReader(Directory& dir, uint64_t segId);
+  explicit PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~PostingsReader();
   PostingsReader(const PostingsReader&) = delete;
   PostingsReader& operator=(const PostingsReader&) = delete;
@@ -95,7 +101,7 @@ private:
   PostingsReader() = default;
 
   // Initialize from files, returns false if missing files and missingFileOK=true
-  bool initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced = false);
+  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced);
 
 public:
 
@@ -115,6 +121,7 @@ public:
   struct FieldCacheStats {
     size_t pages = 0;
     size_t entries = 0;
+    size_t entryBytes = 0;
     size_t bytes = 0;
   };
   FieldCacheStats fieldCacheStats() const noexcept;

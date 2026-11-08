@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <limits>
+#include <optional>
+
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
@@ -19,7 +22,7 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
   if (req.maxParallel > 1 || req.maxParallel < -1) {
     throw RequestError(
-      "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
+      "max_parallel must be 0 (engine default, serial today), 1 (serial "
       "on the shared executor), or -1 (unlimited parallelism); values "
       "above 1 are reserved for a parallelism budget and not implemented");
   }
@@ -65,9 +68,21 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
+  // With the operator's opt-in, max_parallel 0 fans a heavy request out across
+  // segments once parsing shows enough work; light requests stay serial and
+  // pay no handoff.
+  std::optional<oneapi::tbb::task_group> autoTg;
   try {
     root = prepare(req);
     root->init();
+    size_t autoMinWork = searchConfig().auto_parallel_min_work;
+    // SkipStats counters are single-threaded; instrumented runs stay serial.
+    if (autoMinWork > 0 && req.maxParallel == 0 && req.tg == nullptr
+        && !SkipStats::enabled && req.reader->segments().size() > 1
+        && root->workEstimate() >= autoMinWork) {
+      req.tg = &autoTg.emplace();
+      req.autoParallel = true;
+    }
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and
@@ -75,9 +90,17 @@ void SearchEngine::submitBody(SearchRequest& req) {
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
     fallback = ErrorKind::INTERNAL;
-    rootCalc->start(req.tg);
+    if (autoTg.has_value()) {
+      // The receiving thread may be outside the arena; tasks must spawn in it.
+      node.executeIsolated([&] {
+        rootCalc->start(req.tg);
+        req.tg->wait();
+      });
+    } else {
+      rootCalc->start(req.tg);
+    }
 
-    if (req.tg) {
+    if (req.tg && !autoTg.has_value()) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
       req.tg->wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
@@ -87,7 +110,13 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
       req.tg->cancel();
-      try { req.tg->wait(); } catch (...) {}
+      if (autoTg.has_value()) {
+        node.executeIsolated([&] {
+          try { req.tg->wait(); } catch (...) {}
+        });
+      } else {
+        try { req.tg->wait(); } catch (...) {}
+      }
     }
     ErrorInfo info = classifyException(e, fallback);
     if (info.kind == ErrorKind::INTERNAL) {
@@ -119,11 +148,28 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  // autoTg dies with this frame; later emitter resumptions must not see it.
+  if (autoTg.has_value()) req.tg = nullptr;
   execution.finish();
   req.bodyDone();
 }
 
-void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
+  try {
+    // Isolated: a -1 request waiting on its task group helps only with its own
+    // tasks, never stealing another request's.
+    node.getTaskArena().enqueue([this, &req, maxParallel] {
+      oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
+    });
+  } catch (const std::exception& e) {
+    // Nothing was queued: complete the request here so its transport still
+    // sees exactly one final reply.
+    req.setError(classifyException(e, ErrorKind::INTERNAL));
+    req.bodyDone();
+  }
+}
+
+void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
   metrics().start(metricActivity(MetricStage::SEARCH));
@@ -135,10 +181,19 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
       waits.awaitCommit(std::move(collection), std::move(floor),
           waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
-            node.getTaskArena().enqueue([this, &req, maxParallel, result = std::move(result)] {
-              if (result.error) { req.setError(*result.error); req.bodyDone(); }
-              else { req.floorCollection = result.collection; submit(req, maxParallel); }
-            });
+            if (!result.error) {
+              req.floorCollection = result.collection;
+              enqueueSubmit(req, maxParallel);
+              return;
+            }
+            // CommitWaits swallows a throw from here, which would strand the
+            // request: if the enqueue fails, fail the request on this thread.
+            auto fail = [&req, error = *result.error] { req.setError(error); req.bodyDone(); };
+            try {
+              node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
+            } catch (...) {
+              fail();
+            }
           });
       return;
 
@@ -148,24 +203,26 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
       return;
     }
   }
-  if (maxParallel == 0) {
+  // 0 and -1 start on the receiving thread when its transport allows it.
+  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1);
+  if (!runOnReceiver) {
+    // Off the receiving thread: always for an offloading transport, and for
+    // 1 (serial on the arena, the escape hatch for a query expected to be
+    // expensive).  Other values are rejected in prepare(), on the arena like 1.
+    enqueueSubmit(req, maxParallel);
+  } else if (maxParallel == 0) {
     // Default lane: the whole query runs serially right here on the receiving
     // transport thread.  No scheduler hop, and the arena's parked width never
     // wakes - the transport accepts that this thread is occupied for the
     // query's duration.
     submit(req, maxParallel);
-  } else if (maxParallel == -1) {
+  } else {
     // Parallel lane: the request starts right here, inside the arena, so it
     // pays no handoff; arena workers steal the tasks it spawns and this thread
     // helps in its own waits.  Entry takes a reserved slot (never queues
     // behind arena backlog).  Like the default lane, this transport thread is
     // occupied for the query's (now parallel) duration.
     node.executeIsolated([&] { submit(req, maxParallel); });
-  } else {
-    // 1 = serial off the receiving thread: the escape hatch for a query
-    // expected to be expensive, so it does not occupy this transport thread.
-    // Other values are rejected in prepare(), on the arena like 1.
-    node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
   }
 }
 

@@ -12,15 +12,19 @@
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
+#include "luxir/util/NumericUtils.h"
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <optional>
 #include <ranges>
+#include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
 
-// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
+// Numeric indexing adds this 16-byte-per-value peak outside inverter.pool, so the
 // inverter autoflush cap must leave headroom for the transient sort array.
 struct FlushPoint {
   int64_t value;
@@ -28,6 +32,54 @@ struct FlushPoint {
 };
 
 static_assert(sizeof(FlushPoint) == 16);
+
+inline std::vector<FlushPoint> collectNumericPoints(
+    Inverter& inverter, LongStream& values, DocStream& docs, int64_t count,
+    IntStream* lengths = nullptr) {
+  std::vector<FlushPoint> points;
+  points.reserve((size_t)count);
+  inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
+  values.visitValues(inverter.pool, [&](int64_t value) { points.push_back({value, 0}); });
+  std::optional<IntStream::Reader> sizes;
+  if (lengths) sizes.emplace(*lengths, inverter.pool);
+  size_t index = 0;
+  docs.forEachDoc(inverter.pool, [&](int32_t docid) {
+    int32_t length = sizes ? sizes->next() : 1;
+    assert(length >= 0);
+    for (int32_t i = 0; i < length; i++) {
+      assert(index < points.size());
+      points[index++].docid = docid;
+    }
+  });
+  assert(index == points.size());
+  assert(!sizes || sizes->eof());
+  return points;
+}
+
+inline void writeNumericPostings(PostingsWriter& postingsWriter,
+                                 PostingsWriter::IndexFieldInfo& fieldInfo,
+                                 std::vector<FlushPoint>& points) {
+  sortPointsByValueDocid(std::span<FlushPoint>(points));
+  TextWriter writer(postingsWriter);
+  writer.startField(&fieldInfo);
+  size_t begin = 0;
+  while (begin < points.size()) {
+    auto term = encodeNumericTerm(points[begin].value);
+    char packed[PackedTerm::getMemSize(8)];
+    PackedTerm::write(packed, term.data(), (uint32_t)term.size());
+    writer.startTerm(PackedTerm(packed));
+    size_t end = begin;
+    int32_t previousDoc = -1;
+    while (end < points.size() && points[end].value == points[begin].value) {
+      int32_t doc = points[end++].docid;
+      if (doc != previousDoc) writer.addDoc(doc, 1);
+      previousDoc = doc;
+    }
+    writer.endTerm(PackedTerm(packed));
+    begin = end;
+  }
+  writer.endField();
+}
 
 inline void writePoints(PostingsWriter& postingsWriter,
                         PostingsWriter::IndexFieldInfo& fieldInfo,
@@ -49,50 +101,6 @@ inline void writeGeoPoints(PostingsWriter& postingsWriter,
   auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
-}
-
-[[noreturn]] inline void throwGeoPointWire(std::string_view fieldName,
-                                           std::string_view detail) {
-  throw DocumentError(fmt::format(
-      "field '{}': cannot coerce value to GEO_POINT [x, y] = [lon, lat]: {}",
-      fieldName, detail));
-}
-
-inline GeoPoint parseGeoPointWire(const IndexVal& val,
-                                  std::string_view fieldName) {
-  auto checkArity = [&](size_t size) {
-    if (size != 2) {
-      throwGeoPointWire(fieldName,
-                        fmt::format("expected exactly 2 elements, got {}", size));
-    }
-  };
-  if (const auto* a = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
-    checkArity(a->v.size());
-    return {a->v[1], a->v[0]};
-  }
-  if (const auto* a = std::get_if<luxir::api::ArrInt>(&val.kind)) {
-    checkArity(a->v.size());
-    return {(double)a->v[1], (double)a->v[0]};
-  }
-  if (const auto* a = std::get_if<luxir::api::ArrVal>(&val.kind)) {
-    checkArity(a->v.size());
-    auto numeric = [&](size_t index) {
-      const IndexVal& element = a->v[index];
-      if (!std::holds_alternative<int64_t>(element.kind) &&
-          !std::holds_alternative<double>(element.kind) &&
-          !std::holds_alternative<float>(element.kind)) {
-        throwGeoPointWire(fieldName,
-                          fmt::format("element {} ({}) is not numeric", index,
-                                      coerce::describe(element)));
-      }
-      return coerce::toDouble(element, fieldName);
-    };
-    double longitude = numeric(0);
-    double latitude = numeric(1);
-    return {latitude, longitude};
-  }
-  throwGeoPointWire(fieldName,
-                    "expected a two-element numeric array");
 }
 
 //
@@ -158,6 +166,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -166,6 +175,11 @@ public:
     auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     auto full = numVals >= postingsWriter.getMaxDoc();
+
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
 
     // push values
     {
@@ -203,18 +217,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(pointIndex < points.size());
-          points[pointIndex++].docid = docid;
-        });
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }
@@ -237,11 +240,14 @@ public:
 };
 
 
+// Numeric sets sort and deduplicate encoded values before appending. Arrays
+// retain source order and repeats. GEO_POINT is always an array.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   IntStream lengthStream;
   DocStream docsWithVal;
+  std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
   int64_t numVals = 0;
   int32_t numDocs = 0;
 
@@ -266,21 +272,19 @@ public:
       return;
     }
     if (coerce::isNull(val)) return;
-    // Coercions last, element-wise through the field type.  Materialize the
-    // full array before indexMulti: a throw partway through a lazy transform
-    // would leave already-appended values without their doc/length entries
-    // (the column reconstructs positionally, corrupting later docs); a throw
-    // before any stream mutation just fails the doc.
-    std::vector<int64_t> encoded;
+    // Validate/materialize before mutating any stream. A failed coercion may
+    // retain scratch capacity, which still belongs to the inverter's budget.
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           elem, std::string_view(fieldName), inverter.coerceContext));
     });
     if (!wasArray) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           val, std::string_view(fieldName), inverter.coerceContext));
     }
-    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
+    appendDocValues(inverter);
   }
 
   void index(Inverter& inverter, int64_t int64) override {
@@ -299,12 +303,20 @@ public:
   }
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
-    int64_t n = 0;
-    for (auto val : values) {
-      longStream.addVal(inverter.pool, val);
-      n++;
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
+    for (auto val : values) docValues.push_back(val);
+    appendDocValues(inverter);
+  }
+
+  void appendDocValues(Inverter& inverter) {
+    if (docValues.empty()) return;
+    if (fieldType->multiSet()) {
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
     }
-    if (n == 0) return;
+    for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
+    int64_t n = (int64_t)docValues.size();
     numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);
@@ -326,6 +338,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -334,6 +347,11 @@ public:
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     auto full = numDocs >= postingsWriter.getMaxDoc();
+
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
 
     // push values
     {
@@ -367,26 +385,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-
-        IntStream::Reader lengths(lengthStream, inverter.pool);
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(!lengths.eof());
-          int32_t length = lengths.next();
-          assert(length >= 0);
-          for (int32_t i = 0; i < length; i++) {
-            assert(pointIndex < points.size());
-            points[pointIndex++].docid = docid;
-          }
-        });
-        assert(lengths.eof());
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }
@@ -431,22 +430,14 @@ public:
                   const std::shared_ptr<FieldType>& fieldType)
     : IntColHandler(inverter, fieldName, fieldType) {}
 
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    indexSingle(inverter, geo::encodePoint(latitude, longitude));
-  }
-
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
     if (points.size() != 1) {
-      throw DocumentError("single-valued GEO_POINT field received multiple points");
+      throw DocumentError(fmt::format(
+          "Field '{}' is single-valued but received multiple values",
+          std::string_view(fieldName)));
     }
-    index(inverter, points[0].latitude, points[0].longitude);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    if (coerce::isNull(val)) return;
-    GeoPoint point = parseGeoPointWire(val, std::string_view(fieldName));
-    index(inverter, point.latitude, point.longitude);
+    indexSingle(inverter, geo::encodePoint(points[0].latitude, points[0].longitude));
   }
 };
 
@@ -456,35 +447,11 @@ public:
                        const std::shared_ptr<FieldType>& fieldType)
     : MultiIntColHandler(inverter, fieldName, fieldType) {}
 
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    int64_t packed = geo::encodePoint(latitude, longitude);
-    indexMulti(inverter, std::views::single(packed));
-  }
-
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
-    std::vector<int64_t> packed;
-    packed.reserve(points.size());
-    for (const auto& point : points) {
-      packed.push_back(geo::encodePoint(point.latitude, point.longitude));
-    }
-    indexMulti(inverter, packed);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    if (coerce::isNull(val)) return;
-    const auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind);
-    if (arr == nullptr) {
-      throwGeoPointWire(std::string_view(fieldName),
-                        "multi-valued fields require an array of point arrays");
-    }
-    std::vector<GeoPoint> points;
-    points.reserve(arr->v.size());
-    for (const auto& point : arr->v) {
-      points.push_back(parseGeoPointWire(point, std::string_view(fieldName)));
-    }
-    index(inverter, std::span<const GeoPoint>(points));
+    indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {
+      return geo::encodePoint(point.latitude, point.longitude);
+    }));
   }
 };
-
 
 } // namespace luxir::handler

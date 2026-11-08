@@ -80,12 +80,12 @@ public:
 
   void doFusion() override { doFusionImpl<true>(); }
 
-  api::Val* getTargetForSub(SearchResponse* response, Calculator* child) override {
+  api::Val* getTargetForSub(SearchResponse* response, SearchOp& child) override {
     auto& children = thisOp().groupOps;
-    auto found = children.find(child->getOp().name);
-    if (found != children.end() && found->second == &child->getOp()) {
+    auto found = children.find(child.name);
+    if (found != children.end() && found->second == &child) {
       assert(pageGroups != nullptr && response == op.req.lastResponse);
-      return build::opsSlot(pageGroups->ops, children.size(), child->getOp().name, response->mr);
+      return build::opsSlot(pageGroups->ops, children.size(), child.name, response->mr);
     }
     return FusionOp::Calc::getTargetForSub(response, child);
   }
@@ -120,10 +120,10 @@ public:
       auto* child = subCalcs[i].get();
       return [this, child]() { child->calcAll(taskGroup, fusedDomains); };
     });
-    bool enrich = op.fusionProto.collapse->get_number || op.headSort || !op.groupOps.empty();
+    bool enrich = op.fusionProto.collapse->get_count || op.headSort || !op.groupOps.empty();
     CollapsedPageSettings settings{op, *op.collapse, *op.fusionProto.collapse, rankSort,
         op.headSort, op.groupOps, op.fusionProto.fields, op.fusionProto.batch_size,
-        op.fusionProto.offset, op.fusionProto.get_number, op.fusionProto.get_scores,
+        op.fusionProto.offset, op.needsCount(), op.fusionProto.get_scores,
         op.fusionProto.document_format, enrich ? members.get() : nullptr,
         fusedDomains, pageGroups, true};
     emitCollapsedPage(settings, *this, *groups);

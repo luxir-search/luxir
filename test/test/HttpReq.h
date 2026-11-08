@@ -77,7 +77,7 @@ public:
     if (limit_)  j += R"(,"limit":)"      + std::to_string(*limit_);
     if (offset_) j += R"(,"offset":)"     + std::to_string(*offset_);
     if (batch_)  j += R"(,"batch_size":)" + std::to_string(*batch_);
-    if (count_)  j += R"(,"get_number":true)";
+    if (count_)  j += R"(,"count_limit":-1)";
     if (scores_) j += R"(,"get_scores":true)";
     if (!fields_.empty()) {
       j += R"(,"fields":[)";
@@ -196,7 +196,20 @@ private:
     if (auto* d = el.get_if<double>())      { out = *d;          return true; }
     if (auto* b = el.get_if<bool>())        { out = *b;          return true; }
     if (auto* a = el.get_if<Json::array_t>()) {
-      // Best-effort: homogeneous string or numeric arrays.
+      // Best-effort: homogeneous string or numeric arrays, or arrays of
+      // numeric arrays (multi-valued GEO_POINT).
+      if (!a->empty() && (*a)[0].get_if<Json::array_t>() != nullptr) {
+        std::vector<std::vector<double>> nested;
+        for (const Json& e : *a) {
+          FieldVal inner;
+          if (!toFieldVal(e, inner)) return false;
+          if (auto* d = std::get_if<std::vector<double>>(&inner)) nested.push_back(std::move(*d));
+          else if (auto* i = std::get_if<std::vector<int64_t>>(&inner)) nested.emplace_back(i->begin(), i->end());
+          else return false;
+        }
+        out = std::move(nested);
+        return true;
+      }
       std::vector<std::string> svs;
       std::vector<int64_t> ivs;
       std::vector<double> dvs;

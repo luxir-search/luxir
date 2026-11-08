@@ -72,7 +72,9 @@ public:
   OpCursor& filter(const luxir::api::Query& query,
                    std::initializer_list<std::string_view> exceptOps = {});
   OpCursor& matchFilter(std::string_view field, std::string_view value);
-  OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
+  OpCursor& prefixQuery(std::string_view field, std::string_view prefix, int maxExpansions = 0);
+  OpCursor& wildcardQuery(std::string_view field, std::string_view pattern);
+  OpCursor& regexQuery(std::string_view field, std::string_view pattern);
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
   OpCursor& simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames);
@@ -83,11 +85,11 @@ public:
   OpCursor& fields(std::initializer_list<std::string> fieldNames);
   OpCursor& fields(std::span<const std::string> fieldNames);
   OpCursor& batchSize(int32_t n);
-  OpCursor& getNumber(bool v = true);
+  OpCursor& countLimit(int64_t n = -1);
   OpCursor& getScores(bool v = true);
   OpCursor& minScore(float v);
   OpCursor& documentFormat(luxir::api::DocFormat v);
-  OpCursor& withStats() { return getNumber().getScores(); }
+  OpCursor& withStats() { return countLimit().getScores(); }
 
   // --- configure a facet op ---
   OpCursor& limit(int64_t n);     // TopDocs / Fusion / FieldFacet, by op kind
@@ -149,6 +151,8 @@ public:
 
   ReplyStatus reply(SearchResponse& response) override {
     responses.push_back(&response);  // retain; the response's arena stays alive until done()
+    // took_us differs on every execution; tests compare whole responses.
+    response.proto.took_us = 0;
     return ReplyStatus::OK;
   }
   void replyCallback(SearchResponse& response) override { unused(response); }
@@ -366,6 +370,15 @@ private:
       std::vector<std::vector<float>> vals;
       for (const auto& vec : av->v) {
         if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
+      }
+      doc.push_back({std::string(name), std::move(vals)});
+    } else if (const auto* av = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+      // A list of double arrays (multi-valued GEO_POINT); other lists are not read.
+      std::vector<std::vector<double>> vals;
+      for (const auto& elem : av->v) {
+        const auto* a = std::get_if<luxir::api::ArrDouble>(&elem.kind);
+        if (a == nullptr) return;
+        vals.emplace_back(a->v.begin(), a->v.end());
       }
       doc.push_back({std::string(name), std::move(vals)});
     }
@@ -598,10 +611,24 @@ inline OpCursor& OpCursor::exprQuery(std::string_view q) {
   e.q = build::arenaStr(req_->mr, q);
   return *this;
 }
-inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix) {
+inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix,
+                                       int maxExpansions) {
   auto& p = getOrCreateQuery().kind.emplace<luxir::api::PrefixQuery>();
   p.field = build::arenaStr(req_->mr, field);
   p.prefix = build::arenaStr(req_->mr, prefix);
+  p.max_expansions = maxExpansions;
+  return *this;
+}
+inline OpCursor& OpCursor::wildcardQuery(std::string_view field, std::string_view pattern) {
+  auto& w = getOrCreateQuery().kind.emplace<luxir::api::WildcardQuery>();
+  w.field = build::arenaStr(req_->mr, field);
+  w.pattern = build::arenaStr(req_->mr, pattern);
+  return *this;
+}
+inline OpCursor& OpCursor::regexQuery(std::string_view field, std::string_view pattern) {
+  auto& r = getOrCreateQuery().kind.emplace<luxir::api::RegexQuery>();
+  r.field = build::arenaStr(req_->mr, field);
+  r.pattern = build::arenaStr(req_->mr, pattern);
   return *this;
 }
 inline OpCursor& OpCursor::fuzzyQuery(std::string_view field, std::string_view term,
@@ -643,7 +670,7 @@ inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
   return *this;
 }
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
-inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
+inline OpCursor& OpCursor::countLimit(int64_t n) { asTopDocs().count_limit = n; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
 inline OpCursor& OpCursor::minScore(float v) { asTopDocs().min_score = v; return *this; }
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }

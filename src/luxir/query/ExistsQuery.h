@@ -165,7 +165,7 @@ public:
       MembershipWork membershipWork(int32_t maxDoc) override {
         unused(maxDoc);
         double matches = (double)cost();
-        return {matches, 4 * matches, 0, 32, 64};
+        return {matches, 4 * matches, 0, 32, 64, 0, true};
       }
 
       Query::ScorerShape describeScorer(
@@ -198,7 +198,7 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount
-            && segment.liveDocs() == nullptr) {
+            && !segment.hasDeletes()) {
           return {
             BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO, nullptr, cost(),

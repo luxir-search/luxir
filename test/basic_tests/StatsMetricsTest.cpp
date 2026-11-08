@@ -184,7 +184,7 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   auto commit = httpRequest(port, http::verb::post, "/collections/metrics/_update", R"({"commit":{}})");
   ASSERT_EQ(200, commit.result_int()) << commit.body();
   auto search = httpRequest(port, http::verb::post, "/collections/metrics/_search",
-      R"({"ops":{"q":{"top_docs":{"limit":1,"get_number":true}}}})");
+      R"({"ops":{"q":{"top_docs":{"limit":1,"count_limit":-1}}}})");
   ASSERT_EQ(200, search.result_int()) << search.body();
   ASSERT_EQ(400, httpRequest(port, http::verb::post, "/collections/metrics/_search", "{").result_int());
   ASSERT_EQ(404, httpRequest(port, http::verb::get, "/does-not-exist").result_int());

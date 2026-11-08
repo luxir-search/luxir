@@ -1,0 +1,74 @@
+name: Compare vector search refs
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Pinned vector dataset
+        type: choice
+        default: dbpedia-openai3-1536-100k
+        options:
+          - dbpedia-openai3-1536-100k
+          - cohere-wikipedia-en-v3-1024-100k
+        required: true
+      base_ref:
+        description: Base ref or full SHA in this repository
+        type: string
+        default: main
+        required: true
+      candidate_repo:
+        description: Public candidate owner/repository (empty uses this repository)
+        type: string
+      candidate_ref:
+        description: Candidate ref or full SHA (refs/pull/NUMBER/head also works)
+        type: string
+        required: true
+      candidate_field_settings:
+        description: Candidate-only vector field settings as JSON
+        type: string
+        default: '{}'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      WORK_DIR: ${{ github.workspace }}/.vector-work
+      DATASET_CACHE: ${{ github.workspace }}/.vector-dataset
+      LUXIR_CACHE_DIR: ${{ github.workspace }}/.vector-ccache
+      DEPS_REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install harness dependencies and run tests
+        run: |
+          python3 -m venv "$RUNNER_TEMP/bench-venv"
+          "$RUNNER_TEMP/bench-venv/bin/pip" install -r tools/benchmarks/requirements.txt
+          "$RUNNER_TEMP/bench-venv/bin/python" -m unittest discover -s tools/benchmarks -p 'test_*.py'
+      - name: Build refs and compare
+        env:
+          DATASET: ${{ inputs.dataset }}
+          BASE_REPO: ${{ github.repository }}
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REPO: ${{ inputs.candidate_repo || github.repository }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          CANDIDATE_FIELD_SETTINGS: ${{ inputs.candidate_field_settings || '{}' }}
+          BENCH_PYTHON: ${{ runner.temp }}/bench-venv/bin/python
+          BENCH_LABEL: GitHub Actions x86
+        # Hosted runners count two cores; compile with every CPU.
+        run: BUILD_JOBS=$(nproc) tools/benchmarks/compare-refs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: vector-compare-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/.vector-work/evidence/
+            !${{ github.workspace }}/.vector-work/evidence/benchmark/*/data/**
+          retention-days: 14

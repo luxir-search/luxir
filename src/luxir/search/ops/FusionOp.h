@@ -13,6 +13,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/api/RequestFlags.h"
 #include "SearchOp.h"
 #include "TopDocsReq.h"
 #include "luxir/query/Query.h"
@@ -100,6 +101,20 @@ public:
         filterUses[i] = context.getFilterUse(*filters[i].query);
       }
     }
+  }
+
+  bool ownsMatchDomain() const override { return true; }
+
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
+    return total;
+  }
+
+  bool needsCount() const {
+    return fusionProto.count_limit.has_value()
+        ? *fusionProto.count_limit != 0
+        : (flags & RequestFlags::ESTIMATE_COUNT) != 0;
   }
 
   // Min-max normalize one source's merged ranked scores in place:
@@ -234,14 +249,14 @@ public:
       return static_cast<FusionOp&>(op);
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       auto& target = slotTarget<luxir::api::ArrVal>(*ourVal, resp->mr);
       assert(std::holds_alternative<luxir::api::DocList>(target.kind)
              || std::holds_alternative<std::monostate>(target.kind));
       auto& dl = oneofMut<luxir::api::DocList>(target);
-      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -508,7 +523,7 @@ public:
       DocEmission emission = underBucketSlot()
           ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
-      emitDocsResponse(op.req, getDocList,
+      emitDocsResponse(op.req, op.flags, getDocList,
         numCollected,
         [this](int64_t i) { return fusedList[i].first; },
         [this](int64_t i) { return fusedList[i].second; },
@@ -516,7 +531,7 @@ public:
         op.fusionProto.fields,
         op.fusionProto.batch_size,
         op.fusionProto.offset,
-        op.fusionProto.get_number,
+        op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
         emission);

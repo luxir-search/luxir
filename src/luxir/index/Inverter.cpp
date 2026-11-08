@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/GeoPointCoerce.h"
 
 // include the actual index handlers
 #include "handler/IdHandler.h"
@@ -31,6 +32,10 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
 size_t Inverter::retainedDeleteBytes() const {
   if (failed() || idHandler_ == nullptr) return 0;
   return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
+}
+
+size_t Inverter::deleteCount() const {
+  return idHandler_ == nullptr ? 0 : static_cast<handler::IdHandler&>(*idHandler_).nonzeroWatermarks;
 }
 
 
@@ -104,48 +109,49 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
   // Names are already resolved; dynamic FieldTypes can be template prototypes.
   u_ptr<IndexHandler> fieldHandler;
 
-  switch (fieldType->type()) {
-    case FieldType::Type::TEXT:
-      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
-      break;
-    case FieldType::Type::ID:
-      fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
-      idHandler_ = fieldHandler.get();
-      break;
-    case FieldType::Type::STRING:
-      if (!fieldType->indexed() && fieldType->hasColumn()) {
-        // If the field is not indexed (column stored only), use StrColHandler
-        fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
-      } else {
-        // indexed and column stored (via ord)
-        fieldHandler = pool.make_unique<handler::StrHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::INT:
-    case FieldType::Type::FLOAT:
-    case FieldType::Type::DOUBLE:
-    case FieldType::Type::DATE:
-      // One handler pair serves the whole int-column family: the stored
-      // encoding (raw ints, sortable bits, epoch millis) comes from
-      // FieldType::coerceColInt64, not the handler.
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::GEO_POINT:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::VECTOR:
-      fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
-      break;
-    default:
-      throw std::runtime_error("Unknown field type: " + std::string(name));
+  if (fieldType->type() == FieldType::ID) {
+    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
+    idHandler_ = fieldHandler.get();
+  } else if (fieldType->type() == FieldType::GEO_POINT) {
+    if (fieldType->multiValued()) {
+      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
+    } else {
+      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
+    }
+  } else {
+    switch (FieldType::storage(fieldType->type())) {
+      case FieldType::Storage::TEXT:
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+        break;
+      case FieldType::Storage::TERMS:
+        if (!fieldType->indexed() && fieldType->hasColumn()) {
+          // If the field is not indexed (column stored only), use StrColHandler
+          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
+        } else {
+          // indexed and column stored (via ord)
+          if (fieldType->multiArray()) {
+            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+          } else {
+            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+          }
+        }
+        break;
+      case FieldType::Storage::INT64:
+        // One handler pair serves the whole int-column family: the stored
+        // encoding (raw ints, sortable bits, epoch millis) comes from
+        // FieldType::coerceColInt64, not the handler.
+        if (fieldType->multiValued()) {
+          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
+        } else {
+          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
+        }
+        break;
+      case FieldType::Storage::VECTOR:
+        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
+        break;
+      default:
+        throw std::runtime_error("Unknown field type: " + std::string(name));
+    }
   }
 
 
@@ -219,6 +225,20 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (shape == LogicalField::Shape::GEO) {
+    // Parse once for every branch, and fully before any branch indexes.
+    geoPoints.clear();
+    auto account = scope_guard([&] {
+      size_t bytes = geoPoints.capacity() * sizeof(GeoPoint);
+      inverter.addExtraRam((int64_t)bytes - (int64_t)geoScratchBytes);
+      geoScratchBytes = bytes;
+    });
+    const auto& geoType = static_cast<const GeoPointFieldType&>(*fieldType);
+    coerce::GeoPointInput{std::string_view(fieldName), geoType.ignoreMalformed, geoType.ignoreZValue}
+        .forEachPoint(val, [&](const GeoPoint& point) { geoPoints.push_back(point); });
+    indexPoints(inverter, geoPoints);
+    return;
+  }
   checkShape(val);
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);
@@ -244,10 +264,19 @@ void Inverter::InputHandler::index(Inverter& inverter, std::span<const int64_t> 
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, double latitude, double longitude) {
-  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, latitude, longitude); });
+  GeoPoint point{latitude, longitude};
+  index(inverter, std::span<const GeoPoint>(&point, 1));
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint> points) {
+  for (const auto& point : points) {
+    coerce::checkGeoPoint(point, std::string_view(fieldName), "typed geo point");
+  }
+  indexPoints(inverter, points);
+}
+
+// Points already range-checked.
+void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const GeoPoint> points) {
   if (points.size() > 1 && !multi) {
     throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                     std::string_view(fieldName)));
@@ -322,9 +351,9 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
 
     // Start with generation 1 for the first liveDocs file.
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, nullptr);
     }
     liveGen = 1;
     liveDocs = numLiveDocs;

@@ -148,7 +148,7 @@ TEST_F(AllQueryCapabilityShapeTest,
 
   auto runCount = [&]() {
     auto req = localReq(helper.getSearchEngine());
-    auto& top = req->collection("main").topDocs("q").getNumber().limit(0);
+    auto& top = req->collection("main").topDocs("q").countLimit().limit(0);
     top.rawQuery() = qb::boolean(
         top.mr(), {}, {},
         {qb::match(top.mr(), "body_w", "excluded")});
@@ -231,7 +231,7 @@ TEST_F(AllQueryCapabilityShapeTest,
 
   auto req = localReq(helper.getSearchEngine());
   auto& top = req->collection("main").topDocs("q")
-      .getNumber().fields({"id"}).limit(100);
+      .countLimit().fields({"id"}).limit(100);
   top.rawQuery() = qb::boolean(
       top.mr(), {}, {},
       {qb::match(top.mr(), "body_w", "excluded")});

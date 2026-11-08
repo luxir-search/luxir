@@ -13,6 +13,7 @@
 #include "FacetEmit.h"
 #include "FacetExecution.h"
 #include "DistinctFacetCounts.h"
+#include "FacetTermFilter.h"
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
@@ -80,6 +81,37 @@ public:
 
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
+  ValueNature outputNature = ValueNature::NUMBER;
+  FieldType::Type valueType = FieldType::NONE;
+
+  // Hands `emit` the decoder from an encoded column value to its output:
+  // sortable bits back to float/double, date ticks in the request's date
+  // mode, integers as stored.
+  template <typename Emit>
+  void withValueOutput(std::pmr::memory_resource& mr, Emit emit) const {
+    switch (valueType) {
+      case FieldType::FLOAT:
+        emit([](int64_t value) { return sortableInt32ToFloat((int32_t)value); });
+        break;
+      case FieldType::DOUBLE:
+        emit([](int64_t value) { return sortableInt64ToDouble(value); });
+        break;
+      default:
+        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        break;
+    }
+  }
+
+  template <typename Label>
+  void emitFieldBuckets(api::FacetResult& result,
+                        const std::vector<std::pair<Label, int64_t>>& buckets,
+                        std::pmr::memory_resource& mr) const {
+    if constexpr (std::is_same_v<Label, int64_t>) {
+      withValueOutput(mr, [&](auto output) {
+        emitBuckets(result, buckets, mr, output);
+      });
+    } else emitBuckets(result, buckets, mr);
+  }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
     return segInfos.at((size_t)segnum);
@@ -89,6 +121,13 @@ public:
     int64_t limit, int64_t minCount, bool missing)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
+    if (!fieldName.empty()) {
+      auto& type = *req.schema->getFieldTypeEx(fieldName);
+      valueType = type.type();
+      if (type.type() == FieldType::DATE) {
+        outputNature = dateValueNature(DateFieldType::unitOf(type));
+      }
+    }
   }
 
   virtual ~FacetReq() = default;
@@ -109,13 +148,13 @@ public:
   // Distinct missing counts need document identities, not a scalar missing
   // total. The column presence set is independent of bucket/range predicates.
   void forEachMissing(DocSet* domain, int32_t segnum, auto&& accept) {
-    auto& postings = reader.segments()[(size_t)segnum].postingsReader();
+    auto& segment = reader.segments()[(size_t)segnum];
     auto* info = fieldInfo(segnum);
-    if (info == nullptr) { forEachDomainDoc(domain, postings.maxDoc(), accept); return; }
-    DocsReader docs(postings, *info);
+    if (info == nullptr) { forEachDomainDoc(domain, segment.maxDoc(), accept); return; }
+    DocsReader docs(segment.postingsReader(), *info);
     if (!docs.hasBitset()) return;
     screaming::BitSet::Iterator values(docs.bitset());
-    forEachDomainDoc(domain, postings.maxDoc(), [&](int32_t doc) {
+    forEachDomainDoc(domain, segment.maxDoc(), [&](int32_t doc) {
       if (values.val() < doc) values.advance(doc);
       if (values.val() != doc) accept(doc);
     });
@@ -135,9 +174,14 @@ public:
   // The points format here is the same one-dimensional numeric format used
   // by range counts. Other points shapes must use the column predicate.
   static bool numericIdentityPoints(const SegFieldInfo& info) {
-    return info.pointsMetaOff != 0 && (info.type == FieldType::INT
-        || info.type == FieldType::FLOAT || info.type == FieldType::DOUBLE
-        || info.type == FieldType::DATE);
+    return info.pointsMetaOff != 0 && FieldType::usesOneDimensionalPoints(info.type);
+  }
+
+  // Value counts are document counts when every present doc has one value,
+  // even if the segment uses the multi-valued column representation.
+  static bool valuesAreDocuments(const SegFieldInfo& info) {
+    return !(info.flags & FieldType::MULTI_VALUED)
+        || info.numValues == info.docsWithField;
   }
 
   // Compare a block's shared column pass with its points fences before
@@ -153,8 +197,8 @@ public:
   // whole domain to missing_num; otherwise the visitor owns the column walk.
   bool withIntColumn(DocSet* domain, int32_t segnum, int64_t& missing_num,
                      auto&& visitColumn) {
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    int32_t maxDoc = postingsReader.maxDoc();
+    auto& segment = reader.segments()[segnum];
+    int32_t maxDoc = segment.maxDoc();
     auto* info = fieldInfo(segnum);
     bool found = info != nullptr;
     if (!found) {
@@ -163,7 +207,7 @@ public:
       return false;
     }
     const auto& segFieldInfo = *info;
-    IntColReader intColReader(postingsReader, segFieldInfo);
+    IntColReader intColReader(segment.postingsReader(), segFieldInfo);
     visitColumn(intColReader, maxDoc);
     return true;
   }
@@ -173,8 +217,8 @@ public:
   // missing is an out parameter that is incremented for every domain doc that does not have the field.
   // The value returned is if the field exists in the segment.
   bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, auto&& callback) {
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    int32_t maxDoc = postingsReader.maxDoc();
+    auto& segment = reader.segments()[segnum];
+    int32_t maxDoc = segment.maxDoc();
     auto* info = fieldInfo(segnum);
     bool found = info != nullptr;
     if (!found) {
@@ -186,28 +230,102 @@ public:
     // Walk the domain over the int column.  forEachIntColValue owns the
     // domain-type x single/multi x dense/sparse dispatch (and the one
     // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
-    IntColReader intColReader(postingsReader, segFieldInfo);
+    IntColReader intColReader(segment.postingsReader(), segFieldInfo);
     forEachIntColValue(domain, intColReader, maxDoc, missing_num, callback);
     return true;
+  }
+
+  using DocBucketSet = boost::unordered_flat_set<int64_t, boost::hash<int64_t>,
+      std::equal_to<int64_t>, std::pmr::polymorphic_allocator<int64_t>>;
+
+  // Deliver a document once per distinct value (field facets). Only arrays
+  // can repeat a value within a doc; everything else hands the caller's
+  // callback to the plain walk unchanged.
+  bool facetSegIntDistinct(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                           auto&& callback) {
+    auto* info = fieldInfo(segnum);
+    if (!info || valuesAreDocuments(*info) || !(info->flags & FieldType::MULTI_ARRAY)) {
+      return facetSegIntCol(domain, segnum, missing_num,
+                            std::forward<decltype(callback)>(callback));
+    }
+    return facetSegIntBucketsDedup(domain, segnum, missing_num,
+        [](int64_t value) -> std::optional<int64_t> { return value; }, callback);
+  }
+
+  // Deliver a document once per mapped bucket. bucketOf returns an optional
+  // stable key, not a growing directory's mutable index. SET mappings must be
+  // monotonic: values in the same bucket are adjacent. Single-valued walks keep
+  // no dedup state; ARRAY scratch is reused per doc and charged to the request.
+  bool facetSegIntBuckets(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                          auto&& bucketOf, auto&& callback) {
+    auto* info = fieldInfo(segnum);
+    if (!info || valuesAreDocuments(*info)) {
+      return facetSegIntCol(domain, segnum, missing_num,
+          [&](int32_t doc, int64_t value) LUXIR_INLINE {
+            if (auto bucket = bucketOf(value)) callback(doc, *bucket);
+          });
+    }
+    return facetSegIntBucketsDedup(domain, segnum, missing_num, bucketOf, callback);
+  }
+
+  // Keep the dedup walks outside the plain walk's inlining context. Their
+  // additional instantiations otherwise change GCC's hot-loop codegen.
+  bool LUXIR_NOINLINE facetSegIntBucketsDedup(
+      DocSet* domain, int32_t segnum, int64_t& missing_num,
+      auto&& bucketOf, auto&& callback) {
+    return withIntColumn(domain, segnum, missing_num,
+        [&](IntColReader& column, int32_t maxDoc) {
+          if (column.multiSet()) {
+            int32_t lastDoc = -1;
+            int64_t lastBucket = 0;
+            forEachIntColValue(domain, column, maxDoc, missing_num,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  auto bucket = bucketOf(value);
+                  if (!bucket || (doc == lastDoc && *bucket == lastBucket)) return;
+                  lastDoc = doc;
+                  lastBucket = *bucket;
+                  callback(doc, *bucket);
+                });
+          } else {
+            FacetCountResource resource(req.memoryTracker, facetName, "facet document dedup");
+            DocBucketSet seen{&resource};
+            int32_t lastDoc = -1;
+            forEachIntColValue(domain, column, maxDoc, missing_num,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  auto bucket = bucketOf(value);
+                  if (!bucket) return;
+                  if (doc != lastDoc) {
+                    seen.clear();
+                    lastDoc = doc;
+                  }
+                  if (seen.insert(*bucket).second) callback(doc, *bucket);
+                });
+          }
+        });
   }
 
   // callback(docid, ord) per value, ord 0-based in `ordSpace`
   // (forEachOrdValue).
   bool facetSegOrdCol(DocSet* domain, int32_t segnum, int64_t& missing_num,
                       const OrdMap::SegToGlobal& ordSpace, auto&& callback) {
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    int32_t maxDoc = postingsReader.maxDoc();
+    auto& segment = reader.segments()[segnum];
+    int32_t maxDoc = segment.maxDoc();
     auto* info = fieldInfo(segnum);
     if (!info) {
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
     const auto& segFieldInfo = *info;
-    OrdColReader ordColReader(postingsReader, segFieldInfo);
-    forEachOrdValue(domain, ordColReader, ordSpace, maxDoc, missing_num,
-                    callback);
+    OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
+    forEachOrdDocument(domain, ordColReader, ordSpace, maxDoc, missing_num,
+                    req.memoryTracker, facetName, callback);
     return true;
   }
+};
+
+// inlineResult's default key filter: every key may be an ordinary bucket.
+struct AcceptAnyFacetKey {
+  constexpr bool operator()(int64_t) const { return true; }
 };
 
 class FieldFacetReq : public FacetReq {
@@ -215,6 +333,9 @@ public:
   const ReqFieldFacet& fieldFacet;
   std::span<const int64_t> selectedInts;
   std::span<const std::string_view> selectedStrings;
+  // Which global ords may be ordinary buckets: a string facet's term_filter,
+  // owned by StrFacetOp. Null keeps every key.
+  const FacetOrdFilter* termFilter = nullptr;
 
 protected:
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -333,14 +454,13 @@ public:
     template <bool Identity = false>
     DomainHandle materializeTermDomain(
         int32_t segnum, std::string_view term, DocSet* inputDomain) {
-      auto& postingsReader =
-          fieldOp().reader.segments()[(size_t)segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
+      auto& segment = fieldOp().reader.segments()[(size_t)segnum];
+      int32_t maxDoc = segment.maxDoc();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       std::unique_ptr<DocSet> domain;
       if (auto* info = fieldOp().fieldInfo(segnum)) {
         const auto& segFieldInfo = *info;
-        TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
+        TermsEnum terms(poolGuard.pool(), segment.postingsReader(), segFieldInfo);
         if (terms.seek(term)) {
           int32_t docFreq = terms.docFreq();
           DocsOnlyEnum postings(terms);
@@ -364,7 +484,7 @@ public:
                          DomainHandle eligibility, FacetBucketFeed feed,
                          const std::shared_ptr<OrdMap>& ordMap = {}) {
       auto& facet = fieldOp();
-      auto& postings = facet.reader.segments()[segnum].postingsReader();
+      int32_t maxDoc = facet.reader.segments()[segnum].maxDoc();
       auto* info = facet.fieldInfo((int32_t)segnum);
       bool identityLeads = false;
       if (info) {
@@ -391,7 +511,7 @@ public:
         }
         return;
       }
-      feedFacetBucketDomainChunks(postings.maxDoc(), buckets,
+      feedFacetBucketDomainChunks(maxDoc, buckets,
           forcedFacetBucketDomainByteBudget ? forcedFacetBucketDomainByteBudget
               : FACET_BUCKET_DOMAIN_BYTES, feed,
           [&](auto chunk) {
@@ -401,7 +521,7 @@ public:
                 if (chunk[i].id) owner.emplace(chunk[i].id->value, (int32_t)i);
               } else owner.emplace(chunk[i].key, (int32_t)i);
             }
-            return buildFacetBucketDomains(postings.maxDoc(), chunk.size(), [&](auto&& accept) {
+            return buildFacetBucketDomains(maxDoc, chunk.size(), [&](auto&& accept) {
               int64_t missing = 0;
               if constexpr (std::is_same_v<Key, std::string_view>) {
                 assert(ordMap || !info);
@@ -468,7 +588,7 @@ public:
       emitted.reserve(finalized.size());
       for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
       auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
-      emitBuckets(out, emitted, op.req.lastResponse->mr);
+      fieldOp().emitFieldBuckets(out, emitted, op.req.lastResponse->mr);
       if (fieldOp().missing) out.missing = missing;
       using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
       auto buckets = selectedBuckets<ChildKey>(finalized,
@@ -499,12 +619,14 @@ public:
       return data.release();
     }
 
+    // `accept` picks which keys may join the ordinary page; selected values
+    // are captured regardless.
     template <typename Label, typename Data, typename ResolveLabel, typename ExecuteChildren,
-              typename KeyLess = std::less<int64_t>>
+              typename KeyLess = std::less<int64_t>, typename Accept = AcceptAnyFacetKey>
     void inlineResult(std::unique_ptr<Data> mergedData,
                       std::span<const std::optional<int64_t>> pinKeys,
                       ResolveLabel&& resolveLabel, ExecuteChildren&& executeChildren,
-                      KeyLess keyLess = {}) {
+                      KeyLess keyLess = {}, Accept accept = {}) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = fieldOp().minCount;
@@ -567,8 +689,8 @@ public:
       size_t finalizedSlot = 0;
       if (finalizer.needsCandidates() || capturePins) {
         counts.forEachEntry([&](int64_t key, char* entry) {
-          int64_t count = counts.occurrenceCount(entry);
-          finalizer.add({key, count, {entry, finalizedSlot}});
+          int64_t count = loadUnaligned<int64_t>(entry);
+          if (accept(key)) finalizer.add({key, count, {entry, finalizedSlot}});
           if (capturePins) {
             auto pin = pinByKey.find(key);
             if (pin != pinByKey.end()) {
@@ -590,7 +712,7 @@ public:
       for (const auto& bucket : finalized) {
         emitted.emplace_back(resolveLabel(bucket), bucket.count);
       }
-      emitBuckets(facetResultProto, emitted, mr);
+      fieldOp().emitFieldBuckets(facetResultProto, emitted, mr);
       if (missing) {
         facetResultProto.missing = missing_count;
       }
@@ -631,8 +753,8 @@ public:
 
   public:
     using Calculator::Calculator;
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       luxir::api::Val* target = nullptr;
       routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
           [&](luxir::api::Val& val) { target = &val; });
@@ -648,7 +770,7 @@ public:
       // array must be sized for their sum or opsSlot's pre-sized array
       // overflows.
       std::size_t cap = fieldOp().subOps.size() + fieldOp().inlineSubOps.size();
-      return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
+      return build::opsSlot(fr.ops, cap, sub.name, resp->mr);
     };
   };
 
@@ -667,18 +789,19 @@ public:
     void collect(DistinctFacetCounts& data, int32_t segnum, DocSet* domain) {
       auto& facet = this->fieldOp();
       auto pool = MemPool::threadLocalPoolGuard();
-      auto& postings = facet.reader.segments()[(size_t)segnum].postingsReader();
+      auto& segment = facet.reader.segments()[(size_t)segnum];
       auto* info = facet.fieldInfo(segnum);
       int64_t missing = 0;
       facet.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-        if (!info) { missing = domain ? domain->card() : postings.maxDoc(); return; }
+        if (!info) { missing = domain ? domain->card() : segment.maxDoc(); return; }
+        auto& postings = segment.postingsReader();
         if constexpr (Ordinal) {
           OrdColReader column(postings, *info);
-          forEachOrdValue(domain, column, ordMap->getSegToGlobal(segnum), postings.maxDoc(), missing,
+          forEachOrdValue(domain, column, ordMap->getSegToGlobal(segnum), segment.maxDoc(), missing,
               [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
         } else {
           IntColReader column(postings, *info);
-          forEachIntColValue(domain, column, postings.maxDoc(), missing,
+          forEachIntColValue(domain, column, segment.maxDoc(), missing,
               [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
         }
       });
@@ -688,6 +811,30 @@ public:
               [&](int32_t doc) { missingBucket(group(doc)); });
         });
       }
+    }
+
+    // term_filter selection: the distinct counter has no page floor, so the
+    // term tier runs once over the counted ords; zero-count padding walks
+    // the accepted ords only.
+    template <typename Finalizer>
+    LUXIR_NOINLINE void selectFiltered(const DistinctFacetCounts& data, const FacetOrdFilter& filter,
+                                       OrdMapStr& labels, Finalizer& finalizer) {
+      auto& facet = this->fieldOp();
+      auto accept = filter.select([&](auto&& visit) {
+        for (auto [value, count] : data.counts) if (count > 0) visit(value);
+      }, labels);
+      for (auto [value, count] : data.counts) {
+        if (count > 0 && accept(value)) finalizer.add({value, count, {}});
+      }
+      if (facet.minCount != 0) return;
+      FacetOrdFilter::Terms terms(filter, filter.hasTermTier() ? &labels : nullptr);
+      int64_t padded = 0;
+      terms.forEachAccepted([&](int64_t ord) {
+        if (data.count(ord) != 0) return true;
+        finalizer.add({ord, 0, {}});
+        // Zero counts tie, and the smaller ord wins a tie, so later ones lose.
+        return facet.limit < 0 || ++padded < facet.limit;
+      });
     }
 
     void result(std::unique_ptr<DistinctFacetCounts> data) {
@@ -703,6 +850,10 @@ public:
         }
       } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
       auto finalized = this->finishCountBuckets([&](auto& finalizer) {
+        if constexpr (Ordinal) if (facet.termFilter != nullptr) {
+          selectFiltered(*data, *facet.termFilter, *labels, finalizer);
+          return;
+        }
         for (auto [value, count] : data->counts) if (count > 0) finalizer.add({value, count, {}});
         if constexpr (Ordinal) if (facet.minCount == 0) {
           for (uint64_t value = 0; value < valueDimension.size; value++) {
@@ -945,15 +1096,15 @@ public:
           int64_t keyBase = thisOp().useVector ? thisOp().globalMin : 0;
           thisOp().withIntColumn(domain, segnum, data.missing_num,
               [&](IntColReader& column, int32_t maxDoc) {
-                if (!column.multiValued()) {
+                if (!column.multiValued() || column.multiSet()) {
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
                         data.counts.add(value - keyBase, docid);
                       });
                 } else {
-                  // Values retain insertion order, including non-adjacent
-                  // repeats. Only the first occurrence feeds the metrics.
-                  boost::unordered_flat_map<int64_t, char*> seen;
+                  FacetCountResource resource(thisOp().req.memoryTracker, thisOp().facetName,
+                      "facet document dedup");
+                  DocBucketSet seen{&resource};
                   int32_t lastDoc = -1;
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
@@ -962,12 +1113,8 @@ public:
                           lastDoc = docid;
                         }
                         int64_t key = value - keyBase;
-                        auto [it, first] = seen.try_emplace(key, nullptr);
-                        if (first) {
-                          it->second = data.counts.resolveEntry(key);
-                          data.counts.touchEntry(it->second, docid);
-                        } else {
-                          data.counts.addOccurrence(it->second);
+                        if (seen.insert(key).second) {
+                          data.counts.touchEntry(data.counts.resolveEntry(key), docid);
                         }
                       });
                 }
@@ -994,14 +1141,14 @@ public:
         }
         if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
           int64_t minVal = data.minValue;
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
+          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
             [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countVec)[val - minVal]++;
             });
         } else {
           auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
+          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
             [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countMap)[val]++;
@@ -1248,8 +1395,8 @@ public:
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       driver.contribute([&](MergeableStrFacet& data) {
         boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
-        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         DomainView domainView(domain, maxDoc);
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto* info = thisOp().fieldInfo(segnum);
@@ -1258,6 +1405,7 @@ public:
           data.missing_num += domainView.card;
           return;
         }
+        auto& postingsReader = segment.postingsReader();
         const auto& segFieldInfo = *info;
         if (domainView.compCard != 0) {
           domainView.materializeBits(poolGuard.pool());
@@ -1289,13 +1437,14 @@ public:
       inlineDriver->contribute([&](MergeableTextInline& data) {
         InlineSegmentScope scope(data.inlineCalcs, segnum);
         data.counts.initialize(0, false, true);
-        auto& postings = thisOp().reader.segments()[(size_t)segnum].postingsReader();
-        DomainView view(domain, postings.maxDoc());
+        auto& segment = thisOp().reader.segments()[(size_t)segnum];
+        DomainView view(domain, segment.maxDoc());
         auto* field = thisOp().fieldInfo(segnum);
         if (!field) {
           data.missing_num += view.card;
           return;
         }
+        auto& postings = segment.postingsReader();
         const auto& info = *field;
         TermsEnum terms(MemPool::threadLocal(), postings, info);
         int32_t lastDoc = -1;
@@ -1669,15 +1818,15 @@ public:
     }
 
     luxir::api::Val* getTargetForSub(
-        SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+        SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       luxir::api::Val* target = nullptr;
       routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
           [&](luxir::api::Val& val) { target = &val; });
       auto& result = oneofMut<luxir::api::FacetResult>(*target);
       return build::opsSlot(
-          result.ops, fixedOp().subOps.size(), sub->getOp().name, resp->mr);
+          result.ops, fixedOp().subOps.size(), sub.name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -1731,36 +1880,82 @@ public:
 class IntFacetRangeReq : public FixedBucketFacetReq {
   std::span<const int64_t> fences;
   int64_t affineGap;
-  FieldType::Type valueType;
   bool affine;
   std::optional<RangeFacetGrid> grid;
   std::optional<int64_t> wideningStart, wideningEnd;
   std::span<const RangeFacetRun> runs;
 
   template <bool Distinct> struct GrowingStorage;
+  // The op's fixed fences, or a bounds:data facet's finished layout, with their
+  // lookup. zone() narrows the lookup to the buckets [lo, lo + span] that a
+  // column zone's [min, max] reaches, once per zone (forEachIntColZone), so
+  // zoneBucketOf() searches only the fences inside the zone: a branchless
+  // compare-count over a few, or the full rule over many (unclustered data).
   struct BucketLayout {
+    static constexpr size_t SCAN_FENCES = 8;
     std::span<const int64_t> fences;
     int64_t gap;
     std::span<const RangeFacetRun> runs;
+    // The outer fences, held by value: a value walk's counter stores could
+    // alias them through fences.
+    int64_t start;
+    int64_t end;
     RangeFacetRunCursor cursor{};
-    size_t bucketOf(int64_t value) {
-      if (gap) return (size_t)(((uint64_t)value - (uint64_t)fences.front()) / (uint64_t)gap);
+    size_t lo = 0;
+    size_t span = 0;
+
+    BucketLayout(std::span<const int64_t> fences, int64_t gap,
+                 std::span<const RangeFacetRun> runs)
+      : fences(fences), gap(gap), runs(runs),
+        start(fences.empty() ? 0 : fences.front()),
+        end(fences.empty() ? 0 : fences.back()) {}
+
+    bool inRange(int64_t value) const { return value >= start && value < end; }
+
+    // Bucket of an in-range value.
+    LUXIR_INLINE size_t bucketOf(int64_t value) {
+      if (gap) return (size_t)(((uint64_t)value - (uint64_t)start) / (uint64_t)gap);
       return cursor.bucketOf(value, runs, fences);
     }
+
+    IntZoneVerdict zone(int64_t min, int64_t max) {
+      if (max < start || min >= end) return IntZoneVerdict::SKIP;
+      lo = min < start ? 0 : bucketOf(min);
+      size_t hi = max >= end ? fences.size() - 2 : bucketOf(max);
+      span = hi - lo;
+      return span == 0 && min >= start && max < end
+          ? IntZoneVerdict::WHOLE : IntZoneVerdict::VALUES;
+    }
+
+    // Bucket of an in-range value of the last zone().
+    LUXIR_INLINE size_t zoneBucketOf(int64_t value) {
+      const int64_t* inner = fences.data() + lo + 1;
+      if (span <= SCAN_FENCES) {
+        size_t bucket = lo;
+        for (size_t i = 0; i < span; i++) bucket += (size_t)(value >= inner[i]);
+        return bucket;
+      }
+      if (gap || !runs.empty()) return bucketOf(value);
+      return lo + (size_t)(std::upper_bound(inner, inner + span, value) - inner);
+    }
   };
+
+  BucketLayout fixedLayout() const { return {fences, affine ? affineGap : 0, runs}; }
 
   std::vector<DomainHandle> bucketDomains(size_t segnum,
       std::span<const SelectedFacetBucket<size_t>> buckets, DocSet* eligibility,
       BucketLayout layout) {
     std::vector<int32_t> builderOfBucket(layout.fences.size() - 1, -1);
     for (size_t i = 0; i < buckets.size(); i++) builderOfBucket[buckets[i].key] = (int32_t)i;
-    int64_t start = layout.fences.front(), end = layout.fences.back();
+    if (auto domains = zoneBucketDomains(segnum, buckets, builderOfBucket, eligibility, layout)) {
+      return std::move(*domains);
+    }
     return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
         [&](auto&& accept) {
           int64_t missing = 0;
           facetSegIntCol(eligibility, (int32_t)segnum, missing, accept);
         }, [&](int64_t value) {
-          return value < start || value >= end ? -1 : builderOfBucket[layout.bucketOf(value)];
+          return layout.inRange(value) ? builderOfBucket[layout.bucketOf(value)] : -1;
         });
   }
 
@@ -1792,41 +1987,118 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   Calculator* createDataCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
                                     const StructuralConstraint* structural);
 
-  // Bucket index for an in-range value (caller checks [front, back)).
-  size_t bucketOf(int64_t val) const {
-    if (affine) {
-      return (size_t)(((uint64_t)val - (uint64_t)fences.front())
-                      / (uint64_t)affineGap);
-    }
-    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val) - fences.begin() - 1);
+  // Walks a segment's column zone by zone (forEachIntColZone). False, having
+  // visited nothing, for a column shape the zone walk does not cover.
+  template <class V>
+  bool facetSegIntZones(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                        V& visitor) {
+    if (disableZoneRangeFacetForTests) return false;
+    auto* info = fieldInfo(segnum);
+    if (info && !valuesAreDocuments(*info)) return false;
+    bool walked = true;
+    withIntColumn(domain, segnum, missing_num,
+        [&](IntColReader& column, int32_t maxDoc) {
+          walked = forEachIntColZone(domain, column, maxDoc, missing_num, visitor);
+        });
+    return walked;
   }
-  LUXIR_INLINE size_t bucketOf(int64_t val, RangeFacetRunCursor& cursor) const {
-    if (affine) return bucketOf(val);
-    return cursor.bucketOf(val, runs);
+
+  // bucketDomains over a dense single-valued column, zone by zone: a zone
+  // inside one bucket adds its domain docs as a doc range, and a zone outside
+  // the chunk's fences adds nothing. nullopt when the column has another shape.
+  std::optional<std::vector<DomainHandle>> zoneBucketDomains(size_t segnum,
+      std::span<const SelectedFacetBucket<size_t>> buckets,
+      std::span<const int32_t> builderOfBucket, DocSet* eligibility,
+      BucketLayout layout) {
+    struct Builders {
+      static constexpr bool needsDocs() { return true; }
+      BucketLayout layout;
+      std::span<const int32_t> builderOfBucket;
+      int64_t chunkStart;
+      int64_t chunkEnd;
+      std::vector<DocSetBuilder> builders;
+      IntZoneVerdict zone(int64_t min, int64_t max) {
+        if (max < chunkStart || min >= chunkEnd) return IntZoneVerdict::SKIP;
+        IntZoneVerdict verdict = layout.zone(min, max);
+        // A zone whose buckets all lie outside the chunk adds nothing.
+        if (verdict != IntZoneVerdict::SKIP
+            && layout.span <= BucketLayout::SCAN_FENCES) {
+          bool any = false;
+          for (size_t i = 0; i <= layout.span; i++) {
+            any |= builderOfBucket[layout.lo + i] >= 0;
+          }
+          if (!any) return IntZoneVerdict::SKIP;
+        }
+        return verdict;
+      }
+      void run(const IntZoneRun& run) {
+        int32_t builder = builderOfBucket[layout.lo];
+        if (builder < 0) return;
+        auto& target = builders[(size_t)builder];
+        int32_t begin = (int32_t)run.begin;
+        int32_t end = (int32_t)run.end;
+        switch (run.kind) {
+          case IntZoneRun::Kind::ALL:
+            target.addRange(begin, end);
+            break;
+          case IntZoneRun::Kind::BITS:
+            target.addWindowWords(run.words, begin, end, (int32_t)run.count);
+            break;
+          case IntZoneRun::Kind::ARRAY:
+            target.addSorted(run.docs);
+            break;
+        }
+        skipCount(SkipStats::rangeFacetZoneDomainRuns);
+      }
+      LUXIR_INLINE void value(int64_t doc, int64_t val) {
+        if (!layout.inRange(val)) return;
+        int32_t builder = builderOfBucket[layout.zoneBucketOf(val)];
+        if (builder >= 0) builders[(size_t)builder].add((int32_t)doc);
+      }
+    };
+    size_t first = buckets.front().key, last = buckets.front().key;
+    for (const auto& bucket : buckets) {
+      first = std::min(first, bucket.key);
+      last = std::max(last, bucket.key);
+    }
+    Builders visitor{layout, builderOfBucket, layout.fences[first],
+                     layout.fences[last + 1], {}};
+    int32_t maxDoc = reader.segments()[segnum].maxDoc();
+    visitor.builders.reserve(buckets.size());
+    for (size_t i = 0; i < buckets.size(); i++) visitor.builders.emplace_back(maxDoc);
+    int64_t missing = 0;
+    if (!facetSegIntZones(eligibility, (int32_t)segnum, missing, visitor)) {
+      return std::nullopt;
+    }
+    std::vector<DomainHandle> domains;
+    domains.reserve(buckets.size());
+    for (auto& builder : visitor.builders) domains.emplace_back(builder.build());
+    return domains;
   }
 
 public:
   static inline bool disablePointsRangeFacetForTests = false;
+  static inline bool disableZoneRangeFacetForTests = false;
 
   std::span<const int64_t> bucketFences() const { return fences; }
 
   IntFacetRangeReq(SearchRequest& req,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
-    FieldType::Type valueType, int64_t minCount, bool missing,
+    int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
         req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
-    fences(fences), affineGap(affineGap), valueType(valueType),
+    fences(fences), affineGap(affineGap),
     affine(affine), runs(runs) {}
 
   IntFacetRangeReq(SearchRequest& req,
       std::string_view fieldName, std::string_view facetName,
       RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
-      FieldType::Type valueType, int64_t minCount, bool missing)
+      int64_t minCount, bool missing)
     : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
-      affineGap(0), valueType(valueType), affine(false), grid(std::move(grid)),
+      affineGap(0), affine(false), grid(std::move(grid)),
       wideningStart(start), wideningEnd(end) {}
 
   size_t facetBucketResidentBytes() const override;
@@ -1878,7 +2150,8 @@ public:
       std::span<const size_t> emitted, std::pmr::memory_resource& mr,
       std::span<const int64_t> layout) const {
     size_t n = emitted.size();
-    auto emitBounds = [&]<typename Outer>(auto decode) {
+    withValueOutput(mr, [&](auto decode) {
+      using Outer = typename FacetOutputTypes<decltype(decode(int64_t{}))>::ArrayColumn;
       auto& bucketIds = result.bucket_ids.emplace().kind.emplace<Outer>();
       auto* pairs = build::allocArray(bucketIds.v, n, mr);
       int64_t* counts = build::allocArray(result.counts, n, mr);
@@ -1889,23 +2162,7 @@ public:
         bounds[1] = decode(layout[bucket + 1]);
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
-    };
-    switch (valueType) {
-      case FieldType::Type::FLOAT:
-        emitBounds.template operator()<luxir::api::ArrArrFloat>(
-            [](int64_t encoded) {
-              return sortableInt32ToFloat((int32_t)encoded);
-            });
-        break;
-      case FieldType::Type::DOUBLE:
-        emitBounds.template operator()<luxir::api::ArrArrDouble>(
-            [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
-        break;
-      default:
-        emitBounds.template operator()<luxir::api::ArrArrInt>(
-            [](int64_t value) { return value; });
-        break;
-    }
+    });
     if (missing) result.missing = merged.missing_num;
   }
 
@@ -1922,22 +2179,13 @@ public:
       if constexpr (Distinct) {
         auto& range = rangeOp();
         int64_t missing = 0;
-        if (range.runs.empty()) {
-          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-            range.facetSegIntCol(domain, segnum, missing,
-                [&](int32_t doc, int64_t value) LUXIR_INLINE {
-                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
-                });
-          });
-        } else {
-          RangeFacetRunCursor cursor;
-          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-            range.facetSegIntCol(domain, segnum, missing,
-                [&](int32_t doc, int64_t value) LUXIR_INLINE {
-                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value, cursor), group(doc));
-                });
-          });
-        }
+        BucketLayout layout = range.fixedLayout();
+        range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+          range.facetSegIntCol(domain, segnum, missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                if (layout.inRange(value)) add((int64_t)layout.bucketOf(value), group(doc));
+              });
+        });
         if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
             [&](auto group, auto, auto missingBucket) {
               range.forEachMissing(domain, segnum,
@@ -1949,16 +2197,14 @@ public:
       auto& segment = rangeOp().reader.segments()[segnum];
       bool noSubOps = rangeOp().subOps.empty();
       if (!IntFacetRangeReq::disablePointsRangeFacetForTests
-          && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
+          && domain == nullptr && !segment.hasDeletes() && noSubOps
           && start < end) {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (auto* info = rangeOp().fieldInfo(segnum)) {
           const auto& segFieldInfo = *info;
-          bool oneDimensionalNumeric = segFieldInfo.type == FieldType::INT
-                                      || segFieldInfo.type == FieldType::FLOAT
-                                      || segFieldInfo.type == FieldType::DOUBLE
-                                      || segFieldInfo.type == FieldType::DATE;
-          if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric) {
+          bool oneDimensionalNumeric = FieldType::usesOneDimensionalPoints(segFieldInfo.type);
+          if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric
+              && valuesAreDocuments(segFieldInfo)) {
             IntColReader column(segment.postingsReader(), segFieldInfo);
             PointsReader points(segment.postingsReader(), segFieldInfo);
             if (points.pointCount() != (uint64_t)column.numValues()) {
@@ -1984,27 +2230,31 @@ public:
           }
         }
       }
-      // Select the lookup form once per segment. The plain closure retains
-      // the original captures and generated affine loop; only run collectors
-      // carry the mutable cursor. Both use the same lifecycle and producer.
-      if (rangeOp().runs.empty()) {
-        // Capture by value so the counter store cannot alias the captures.
-        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
-            [start, end, counts = std::span(data.counts), &range = rangeOp()]
-              (int32_t docid, int64_t val) LUXIR_INLINE {
-            unused(docid);
-            if (val < start || val >= end) return;
-            counts[range.bucketOf(val)]++;
-          });
-      } else {
-        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
-            [start, end, counts = std::span(data.counts), &range = rangeOp(), cursor = RangeFacetRunCursor{}]
-              (int32_t docid, int64_t val) mutable LUXIR_INLINE {
-            unused(docid);
-            if (val < start || val >= end) return;
-            counts[range.bucketOf(val, cursor)]++;
-          });
+      struct Counter {
+        static constexpr bool needsDocs() { return false; }
+        BucketLayout layout;
+        std::span<int64_t> counts;
+        IntZoneVerdict zone(int64_t min, int64_t max) { return layout.zone(min, max); }
+        void run(const IntZoneRun& run) {
+          counts[layout.lo] += run.count;
+          skipCount(SkipStats::rangeFacetZoneRuns);
+        }
+        LUXIR_INLINE void value(int64_t rank, int64_t val) {
+          unused(rank);
+          if (layout.inRange(val)) counts[layout.zoneBucketOf(val)]++;
+        }
+      } counter{rangeOp().fixedLayout(), data.counts};
+      if (rangeOp().facetSegIntZones(domain, segnum, data.missing_num, counter)) {
+        return;
       }
+      // Capture the layout by value so the counter store cannot alias it.
+      rangeOp().facetSegIntBuckets(domain, segnum, data.missing_num,
+          [layout = rangeOp().fixedLayout()](int64_t value) mutable LUXIR_INLINE -> std::optional<int64_t> {
+            if (!layout.inRange(value)) return std::nullopt;
+            return (int64_t)layout.bucketOf(value);
+          }, [counts = std::span(data.counts)](int32_t, int64_t bucket) LUXIR_INLINE {
+            counts[(size_t)bucket]++;
+          });
       }
     }
 
@@ -2012,14 +2262,14 @@ public:
         std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, this->input[segnum], feed,
-          {range.fences, range.affine ? range.affineGap : 0, range.runs}, false);
+          range.fixedLayout(), false);
     }
     void feedIdentityDomains(size_t segnum,
         std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, std::move(eligibility), feed,
-          {range.fences, range.affine ? range.affineGap : 0, range.runs}, true);
+          range.fixedLayout(), true);
     }
 
   public:

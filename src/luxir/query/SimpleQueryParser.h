@@ -461,6 +461,9 @@ private:
     api::Val v;
     v.kind = value;
     try {
+      if (fieldType.type() == FieldType::DATE) {
+        return ((DateFieldType&)fieldType).tryCoerceDateRange(v, opts.coerceContext).has_value();
+      }
       fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
       return true;
     } catch (const std::exception&) {

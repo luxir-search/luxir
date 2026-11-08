@@ -241,11 +241,11 @@ inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t header
     size_t metaSize = sizeof(VersionBlockHeader) + (bh.step ? 0 : sizeof(NumBlockInfo));
     auto check = [&](const NumBlockInfo& info, bool monotonic) {
       uint8_t bits = info.bits();
-      if ((bits > NumColumnFormat::MAX_PACKED_BITS && bits != 64) || !info.gcd
+      if ((!info.forPacked() && bits != NumBlockInfo::RAW_BITS) || !info.gcd
           || (monotonic && info.gcd != 1)) invalid();
       uint64_t payload = info.payloadOffset();
-      uint64_t bytes = bits == 64 ? (uint64_t)view.size() * 8
-          : LinearPack::packedByteSize(view.size(), bits);
+      uint64_t bytes = info.forPacked() ? LinearPack::packedByteSize(view.size(), bits)
+          : (uint64_t)view.size() * 8;
       if (payload < metaSize || payload > limit - entry.offset
           || bytes + LinearPack::TAIL_PAD > limit - entry.offset - payload) invalid();
     };

@@ -117,7 +117,7 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
   bool innerHits = mode == 4 || mode == 8;
   auto json = body + R"(,"collapse":{"field":)" + collapse
       + (nullKeys ? R"(,"missing":"group")" : "")
-      + (mode == 0 || mode == 10 || innerHits ? "}}" : R"(,"get_number":true,"head_sort":"price_i asc")"
+      + (mode == 0 || mode == 10 || innerHits ? "}}" : R"(,"get_count":true,"head_sort":"price_i asc")"
           + (mode >= 5 ? R"(,"ops":)" + ops : "") + "}}");
   if ((mode >= 16 && mode <= 21) || mode >= 24) {
     // The same catalog cards under ordinary string/numeric facet identities.
@@ -155,7 +155,7 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
           if (tuple) filter += " AND shop_s:" + std::string(std::get<std::string_view>(key.component[1].value));
           auto members = execute(R"({"collection":")" + name + R"(","query":")" + query
               + R"(","filter":[")" + filter
-              + R"("],"sort":"price_i asc","limit":1,"get_number":true,"fields":["id"])"
+              + R"("],"sort":"price_i asc","limit":1,"count_limit":-1,"fields":["id"])"
               + (mode == 8 ? R"(,"ops":)" + ops : "") + "}");
           peak = std::max(peak, members->memoryTracker.peak());
           int32_t rows = members->docList()->row_count;
@@ -293,7 +293,7 @@ static void BM_RootDomainReset(benchmark::State& state, bool reset) {
     ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
   }
   auto json = R"({"collection":")" + std::string("root_domain_reset_") + std::to_string(docs) + R"JSON(",
-        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},"domain":)JSON"
+        "ops":{"n":{"top_docs":{"limit":0,"count_limit":-1},"domain":)JSON"
       + (reset ? R"({"query":"stock_i:>0"})" : R"({"filter":["stock_i:>0"]})") + "}}}";
   auto run = [&]() {
     auto req = localReq(helper.getSearchEngine());
@@ -349,7 +349,7 @@ static void BM_CollapseMetricOrder(benchmark::State& state, bool facet, bool two
     body += R"JSON("limit":0,"ops":{"products":{"field_facet":{"field":"key_s",
       "limit":10,"sort":["order asc"],"ops":{"order":")JSON" + metric + R"("}}}}})";
   } else {
-    body += R"JSON("limit":10,"get_number":true,"collapse":{"field":"key_s","sort":)JSON"
+    body += R"JSON("limit":10,"count_limit":-1,"collapse":{"field":"key_s","sort":)JSON"
         + std::string(twoClauses ? R"(["lo asc","hi desc"])" : R"(["lo asc"])")
         + R"JSON(,"ops":{"lo":"min(price_i)")JSON"
         + (twoClauses ? R"JSON(,"hi":"max(rank_i)")JSON" : "") + "}}}";
@@ -402,7 +402,7 @@ static void BM_FusionCollapse(benchmark::State& state, bool collapsed) {
   std::string json = R"({"collection":")" + name + R"(","ops":{"f":{"fusion":{
     "rrf":{},"sources":{"price":{"sort":"price_i asc","limit":1000},
     "rank":{"sort":"rank_i asc","limit":1000}},"limit":10,
-    "get_number":true,"fields":["id"])";
+    "count_limit":-1,"fields":["id"])";
   if (collapsed) json += R"(,"collapse":"key_s")";
   json += "}}}}";
   auto execute = [&] {
@@ -451,7 +451,7 @@ static void BM_Diversify(benchmark::State& state) {
   }
   std::string body = R"({"collection":")" + name
       + R"(","sort":"rank_i desc","fields":["id"],"limit":)" + std::to_string(page)
-      + R"(,"get_number":)" + (totals ? "true" : "false");
+      + R"(,"count_limit":)" + (totals ? "-1" : "0");
   if (cap) body += R"(,"diversify":{"field":"key_s","max_per_key":)" + std::to_string(cap) + '}';
   body += '}';
   auto execute = [&] {

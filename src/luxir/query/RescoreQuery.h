@@ -333,6 +333,13 @@ class RescoreQuery final : public Query {
 
     int64_t cost() override { return childSupplier->cost(); }
 
+    // The scorer forwards its child's approximation enums.
+    void approximationCosts(
+        MemPool& planPool, const Query::PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) override {
+      childSupplier->approximationCosts(planPool, context, out);
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
       Query::ScorerShape child = childSupplier->describeScorer(buildContext);
@@ -379,10 +386,17 @@ class RescoreQuery final : public Query {
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (!bulkContext.requireConstantCount) {
-        return {
+        BulkPlan plan{
           BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
           BulkAnswer::NO,
         };
+        // Candidates are rescored through the child, so only a child that
+        // needs no rescoring lets the program compose with an exact count.
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING) {
+          plan.rankingScoresExact =
+              childSupplier->planBulk(use, bulkContext).rankingScoresExact;
+        }
+        return plan;
       }
       return childSupplier->planBulk(use, bulkContext);
     }

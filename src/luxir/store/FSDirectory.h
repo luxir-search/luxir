@@ -4,8 +4,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
+#include <limits>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -23,8 +29,21 @@ class RAMDelegatingFile;
 /// InputFile backed by mmap. The mapping remains valid after its fd is closed
 /// and after the underlying file is unlinked.
 class MMapInputFile : public InputFile {
+  // The kernel reads at most max(read_ahead_kb, max_sectors_kb) pages per
+  // MADV_WILLNEED call (128 KiB on common devices) and drops the rest of the
+  // range, so advice goes out in chunks of this size.
+  static constexpr size_t ADVISE_BYTES = 128 * 1024;
+  // A prefetch of at least this many bytes checks residency first: mincore
+  // costs a few ns per mapped page, advice on a resident page tens of ns.
+  static constexpr size_t CHECK_BYTES = 64 * 1024;
+  static constexpr size_t CHECK_PAGES = 2048;
+
   char* data_;
   size_t sz_;
+  // mincore reports every page of a file the process can neither own nor
+  // write as resident (to close a page-cache side channel), so residency is
+  // only checked for files it reports truthfully.
+  bool checkResidency_;
 
 public:
   // The caller retains ownership of fd. O_DIRECT affects pread, not mmap.
@@ -39,12 +58,14 @@ public:
     if (mapped == MAP_FAILED) {
       throw FileIOException("MMapInputFile: mmap failed for " + path.string() + ": " + strerror(errno));
     }
+    bool checkResidency = st.st_uid == geteuid() || faccessat(AT_FDCWD, path.c_str(), W_OK, AT_EACCESS) == 0;
     try {
-      return std::make_shared<MMapInputFile>((char*)mapped, size);
+      return std::make_shared<MMapInputFile>((char*)mapped, size, checkResidency);
     } catch (...) { munmap(mapped, size); throw; }
   }
 
-  MMapInputFile(char* data, size_t size) : data_(data), sz_(size) {}
+  MMapInputFile(char* data, size_t size, bool checkResidency = false)
+    : data_(data), sz_(size), checkResidency_(checkResidency) {}
 
   ~MMapInputFile() override {
     if (data_ && sz_ > 0) {
@@ -60,8 +81,26 @@ public:
   void prefetch(size_t offset, size_t length) override {
     if (offset >= sz_ || length == 0) return;
     static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-    size_t start = offset / pageSize * pageSize;
-    (void)madvise(data_ + start, offset - start + std::min(length, sz_ - offset), MADV_WILLNEED);
+    char* start = data_ + offset / pageSize * pageSize;
+    char* end = data_ + offset + std::min(length, sz_ - offset);
+    if (!checkResidency_ || (size_t)(end - start) < CHECK_BYTES) return advise(start, end);
+#if defined(__APPLE__)
+    char vec[CHECK_PAGES];
+#else
+    unsigned char vec[CHECK_PAGES];
+#endif
+    while (start < end) {
+      size_t pages = std::min(CHECK_PAGES, ((size_t)(end - start) + pageSize - 1) / pageSize);
+      if (mincore(start, pages * pageSize, vec) != 0) return advise(start, end);
+      for (size_t i = 0; i < pages;) {
+        if (vec[i] & 1) { i++; continue; }
+        size_t run = i + 1;
+        while (run < pages && !(vec[run] & 1)) run++;
+        advise(start + i * pageSize, std::min(end, start + run * pageSize));
+        i = run;
+      }
+      start += pages * pageSize;
+    }
   }
 
   std::string_view read() override {
@@ -70,6 +109,13 @@ public:
 
   InputStream getInputStream() override {
     return {data_, data_ + sz_};
+  }
+
+private:
+  static void advise(char* start, char* end) {
+    for (; start < end; start += ADVISE_BYTES) {
+      (void)madvise(start, std::min(ADVISE_BYTES, (size_t)(end - start)), MADV_WILLNEED);
+    }
   }
 };
 
@@ -184,7 +230,7 @@ class FSFile : public File {
   friend class RAMDelegatingFile;
 
   std::filesystem::path path_;
-  std::filesystem::path tmpPath_;  // write to temp, rename on finish
+  std::filesystem::path tmpPath_;  // write to temp, install create-only on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
   XXH3_state_t hash;
@@ -449,31 +495,99 @@ public:
 
 /// Filesystem-backed Directory using mmap for reads and buffered writes.
 class FSDirectory : public Directory {
+public:
+  struct ParentSync {
+    std::mutex mutex;
+    bool durable = false;
+  };
+private:
   std::filesystem::path basePath_;
+  std::filesystem::path durabilityRoot;
+  std::shared_ptr<ParentSync> parents;
+  inline static std::atomic<uint64_t> nextPublishTemp{0};
+  static constexpr std::string_view publishTempPrefix = ".luxir-publish-";
+
+  static PublicationVersion versionOf(int fd, std::span<const std::byte> bytes) {
+    struct stat info;
+    if (::fstat(fd, &info) < 0) throw FileIOException("Publication fstat failed: " + std::string(strerror(errno)));
+#if defined(__APPLE__)
+    auto modified = info.st_mtimespec;
+#else
+    auto modified = info.st_mtim;
+#endif
+    // Reused metadata must also match the content hash. Identical CAS bytes
+    // are the same logical state: the engine includes its revision and op.
+    return std::format("{}:{}:{}:{}:{}:{:016x}", info.st_dev, info.st_ino,
+        modified.tv_sec, modified.tv_nsec, info.st_size, XXH3_64bits(bytes.data(), bytes.size()));
+  }
+
+  // Fresh file descriptions serialize threads and processes alike. Deletion
+  // shares this lock with publication so it cannot race a Match check/install.
+  // No fsync holds the lock; local filesystems release it on process death.
+  // Network filesystems that can revoke a stalled client's lock are unsafe.
+  int lockDirectory() const {
+    int fd = ::open(basePath_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ENOENT) return -1;
+      throw FileIOException("Cannot open publication directory: " + basePath_.string() + ": " + strerror(errno));
+    }
+    while (::flock(fd, LOCK_EX) < 0) {
+      if (errno != EINTR) {
+        auto message = "Cannot lock publication directory: " + basePath_.string() + ": " + strerror(errno);
+        ::close(fd);
+        throw FileIOException(message);
+      }
+    }
+    return fd;
+  }
 
   std::filesystem::path filePath(std::string_view name) const {
+    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\\0", 0, 3) != std::string_view::npos) {
+      throw std::invalid_argument("invalid directory file name");
+    }
     return basePath_ / name;
   }
 
 public:
+  // Listings hide scratch files. Owned factories remove dead processes' temps.
+  static bool isPublishTemp(std::string_view name) { return name.starts_with(publishTempPrefix); }
+  Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
+
   void linkFile(Directory& source, std::string_view name) override {
+    std::filesystem::create_directories(basePath_);
     auto& fs = dynamic_cast<FSDirectory&>(source.underlying());
     std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
   }
 
-  // Without `create`, the directory must already exist: opening never
-  // re-creates a directory removed concurrently.
-  explicit FSDirectory(const std::filesystem::path& path, bool create = true) : basePath_(path) {
-    if (create) std::filesystem::create_directories(basePath_);
-    else if (!std::filesystem::is_directory(basePath_)) {
-      throw std::filesystem::filesystem_error("directory does not exist", basePath_,
-          std::make_error_code(std::errc::no_such_file_or_directory));
+  explicit FSDirectory(const std::filesystem::path& path, std::filesystem::path root = {},
+                       std::shared_ptr<ParentSync> parents = std::make_shared<ParentSync>())
+      : basePath_(std::filesystem::absolute(path).lexically_normal()),
+        durabilityRoot(root.empty() ? basePath_ : std::filesystem::absolute(root).lexically_normal()),
+        parents(std::move(parents)) {
+    if (root.empty()) while (!std::filesystem::is_directory(durabilityRoot)) durabilityRoot = durabilityRoot.parent_path();
+  }
+
+  static void cleanPublicationTemps(const std::filesystem::path& path) {
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+      auto name = entry.path().filename().string();
+      if (!isPublishTemp(name)) continue;
+      auto text = std::string_view(name).substr(publishTempPrefix.size());
+      auto dash = text.find('-');
+      if (dash == std::string_view::npos) continue;
+      uint64_t pid = 0;
+      auto [end, error] = std::from_chars(text.data(), text.data() + dash, pid);
+      if (error == std::errc() && end == text.data() + dash && pid <= (uint64_t)std::numeric_limits<pid_t>::max()
+          && (pid == 0 || (::kill((pid_t)pid, 0) < 0 && errno == ESRCH))) {
+        if (::unlink(entry.path().c_str()) < 0 && errno != ENOENT) throw FileIOException("Cannot remove publication temp: " + entry.path().string());
+      }
     }
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
+    if (!std::filesystem::exists(basePath_)) return;
     auto startIdx = target.size();
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      if (isPublishTemp(entry.path().filename().string())) continue;
       // A file may be deleted between readdir and stat; skip on any error.
       std::error_code ec;
       if (!entry.is_regular_file(ec) || ec) {
@@ -509,11 +623,13 @@ public:
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
+    std::filesystem::create_directories(basePath_);
     return std::make_unique<FSFile>(name, filePath(name));
   }
 
   std::unique_ptr<File> createFile(
       std::string_view name, FileCreateOptions options) override {
+    std::filesystem::create_directories(basePath_);
     if (!options.ramDelegating) return createFile(name);
     if (options.ramSpillBytes == 0) {
       throw std::invalid_argument("RAM-delegating file requires a spill threshold");
@@ -525,10 +641,14 @@ public:
 
   bool deleteFile(std::string_view name) override {
     auto path = filePath(name);
+    int fd = lockDirectory();
+    if (fd < 0) return false;
+    auto unlock = scope_guard([&] { ::close(fd); });
     return std::filesystem::remove(path);
   }
 
   void deletePrefix(std::string_view prefix) override {
+    if (!std::filesystem::exists(basePath_)) return;
     std::vector<std::string> toDelete;
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
       if (entry.is_regular_file()) {
@@ -556,25 +676,105 @@ public:
       fsFile.openFd();
     }
     fsFile.closeFd();
-    // Atomic rename from temp to final path. Existing mmap readers of the old
-    // inode are unaffected because the mapping keeps the old inode alive.
-    std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
+    if (::link(fsFile.tmpPath_.c_str(), fsFile.path_.c_str()) < 0) {
+      throw FileIOException("File install failed: " + fsFile.path_.string() + ": " + strerror(errno));
+    }
+    if (::unlink(fsFile.tmpPath_.c_str()) < 0) throw FileIOException("Cannot remove file temp: " + fsFile.tmpPath_.string());
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    std::filesystem::rename(filePath(from), filePath(to));
+  std::optional<Publication> readPublished(std::string_view name) override {
+    auto path = filePath(name);
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ENOENT) return {};
+      throw FileIOException("Publication open failed: " + path.string() + ": " + strerror(errno));
+    }
+    auto close = scope_guard([&] { ::close(fd); });
+    auto file = MMapInputFile::map(fd, path);
+    auto bytes = file->read();
+    return Publication{std::string(bytes), versionOf(fd, std::as_bytes(std::span(bytes)))};
   }
 
-  // Fsync the given files.  Use "." to fsync the directory itself
-  // (to ensure renames/creates are durable).
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    if (isPublishTemp(name)) throw std::invalid_argument("reserved publication temp name");
+    auto target = filePath(name);
+    std::filesystem::create_directories(basePath_);
+    std::filesystem::path temp;
+    int fd;
+    for (;;) {
+      temp = filePath(std::format("{}{}-{}", publishTempPrefix, getpid(),
+          nextPublishTemp.fetch_add(1, std::memory_order_relaxed)));
+      fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+      if (fd >= 0) break;
+      if (errno != EEXIST) throw FileIOException("Cannot create publication temp: " + temp.string() + ": " + strerror(errno));
+    }
+    auto cleanup = scope_guard([&] { ::close(fd); ::unlink(temp.c_str()); });
+    // The open hook exposes the fd for real I/O failure injection in tests.
+    Signal::emit("publishOpened", this, &name, &fd);
+    size_t written = 0;
+    while (written < bytes.size()) {
+      auto count = ::write(fd, bytes.data() + written,
+          std::min(bytes.size() - written, (size_t)std::numeric_limits<ssize_t>::max()));
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) throw FileIOException("Publication write failed: " + temp.string() + ": " + (count ? strerror(errno) : "zero write"));
+      written += (size_t)count;
+    }
+    Signal::emit("publishWritten", this, &name);
+    if (::fsync(fd) < 0) throw FileIOException("Publication fsync failed: " + temp.string() + ": " + strerror(errno));
+    std::string syncedName(name);
+    Signal::emit("fsSynced", &basePath_, &syncedName);
+    Signal::emit("publishSynced", this, &name);
+    auto version = versionOf(fd, bytes);
+    {
+      int directoryFd = lockDirectory();
+      if (directoryFd < 0) throw FileIOException("Publication directory was removed: " + basePath_.string());
+      auto unlock = scope_guard([&] { ::close(directoryFd); });
+      if (condition.version) {
+        auto current = readPublished(name);
+        if (!current || current->version != *condition.version) return {};
+        Signal::emit("publishMatched", this, &name);
+      }
+      if (condition.mode == PublishMode::CREATE_ONLY) {
+        if (::link(temp.c_str(), target.c_str()) < 0) {
+          if (errno == EEXIST) return {};
+          throw FileIOException("Publication link failed: " + target.string() + ": " + strerror(errno));
+        }
+      } else if (::rename(temp.c_str(), target.c_str()) < 0) {
+        throw FileIOException("Publication rename failed: " + target.string() + ": " + strerror(errno));
+      }
+    }
+    if (condition.mode == PublishMode::CREATE_ONLY) {
+      if (::unlink(temp.c_str()) < 0) throw FileIOException("Publication temp removal failed: " + temp.string() + ": " + strerror(errno));
+    }
+    syncDirectory();
+    return version;
+  }
+
+  // The factory shares parent durability across views of each path. A new
+  // owner re-syncs the chain: an earlier mkdir may have lacked its parent sync.
+  void syncDirectory() {
+    std::filesystem::create_directories(basePath_);
+    auto sync = [](const std::filesystem::path& path) {
+      int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (fd < 0) throw FileIOException("Cannot open directory for fsync: " + path.string() + ": " + strerror(errno));
+      auto close = scope_guard([&] { ::close(fd); });
+      if (::fsync(fd) < 0) throw FileIOException("Directory fsync failed: " + path.string() + ": " + strerror(errno));
+      Signal::emit("fsSynced", (void*)&path);
+    };
+    sync(basePath_);
+    std::lock_guard lock(parents->mutex);
+    if (!parents->durable) {
+      for (auto path = basePath_; path != durabilityRoot && path != path.root_path();) {
+        path = path.parent_path();
+        sync(path);
+      }
+      parents->durable = true;
+    }
+  }
+
   void sync(std::span<const std::string> filenames) override {
     for (auto& name : filenames) {
-      int fd;
-      if (name == ".") {
-        fd = ::open(basePath_.c_str(), O_RDONLY);
-      } else {
-        fd = ::open(filePath(name).c_str(), O_RDONLY);
-      }
+      int fd = ::open(filePath(name).c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
         throw std::runtime_error("FSDirectory::sync: failed to open " + name + ": " + strerror(errno));
       }
@@ -585,9 +785,25 @@ public:
       ::close(fd);
       Signal::emit("fsSynced", &basePath_, (void*)&name);
     }
+    syncDirectory();
+  }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    {
+      int fd = lockDirectory();
+      if (fd < 0) return;
+      auto unlock = scope_guard([&] { ::close(fd); });
+      for (const auto& name : names) {
+        if (::unlink(filePath(name).c_str()) < 0 && errno != ENOENT) {
+          throw FileIOException("Cannot delete file: " + std::string(name) + ": " + strerror(errno));
+        }
+      }
+    }
+    syncDirectory();
   }
 
   void clear() override {
+    if (!std::filesystem::exists(basePath_)) return;
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
       if (entry.is_regular_file()) {
         std::filesystem::remove(entry.path());
