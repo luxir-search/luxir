@@ -164,9 +164,10 @@ public:
 class SegmentOverlay : public SegmentPart<AuxReader> {
 public:
   const AuxInfo info;
-  SegmentOverlay(AuxInfo info, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+  const SegmentOverlayPolicy policy;
+  SegmentOverlay(AuxInfo info, SegmentOverlayPolicy policy, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
                  std::shared_ptr<const UnreadableHook> onUnreadable)
-      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), info(std::move(info)) {}
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), info(std::move(info)), policy(policy) {}
   std::shared_ptr<AuxReader> get();
 };
 
@@ -247,7 +248,7 @@ public:
       return sharedLive ? sharedLive->get() : nullptr;
     }
 
-    // Every overlay of a known kind, materialized.
+    // Every overlay of a known kind opened with the segment, materialized.
     std::vector<std::shared_ptr<AuxReader>> auxReaders() const;
 
     // The overlay `name`, materialized on first use; null when absent.
