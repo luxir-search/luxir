@@ -443,6 +443,15 @@ public:
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
+      // A term no segment can hold empties the phrase: check them all before
+      // the statistics lookups, which would open the segments for the others.
+      for (std::string_view term : query.getTerms()) {
+        if (context.termAbsentEverywhere(*cachedFieldInfo, term)) {
+          cachedFieldInfo = nullptr;
+          return;
+        }
+      }
+
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;
       double idf = 0.0;

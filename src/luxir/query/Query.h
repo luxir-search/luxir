@@ -701,7 +701,8 @@ public:
   // summarizes: EMPTY is a proof that none does (over live and deleted
   // documents alike), UNKNOWN is always legal, NONEMPTY says only that the
   // summary offers no proof of absence. A pure function of the logical tree
-  // and the view; it must never read a segment. Composites combine their
+  // and the view; it must never read a segment's data (a term membership
+  // overlay behind the view may read its own bytes). Composites combine their
   // children's answers (QueryPruning evaluates them once per segment).
   virtual MatchState mayMatch(const SummaryView& view) const {
     unused(view);
@@ -1567,6 +1568,16 @@ public:
     }
 
   public:
+    // Whether every segment's summary or membership overlay proves `term` absent.
+    bool termAbsentEverywhere(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
+      auto name = cachedFieldInfo.segInfos.name();
+      QueryPruning::fetchMembershipProbes(topReader, name, term);
+      for (const auto& segment : topReader.segments()) {
+        if (!QueryPruning::termAbsent(segment, name, term)) return false;
+      }
+      return true;
+    }
+
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
       CachedTermInfo& result = iter->second;
@@ -1575,6 +1586,7 @@ public:
       }
 
       auto numSegs = numSegments();
+      QueryPruning::fetchMembershipProbes(topReader, cachedFieldInfo.segInfos.name(), term);
       // TermsEnums survive missing-term lookups; allocate them before the
       // temporary postings states that can be rewound below.
       for (size_t i = 0; i < numSegs; i++) {
@@ -1617,6 +1629,7 @@ public:
     bool lookupTermStats(CachedFieldInfo& cachedFieldInfo, std::string_view term, Similarity::TermStats& result) {
       result = {};
       bool found = false;
+      QueryPruning::fetchMembershipProbes(topReader, cachedFieldInfo.segInfos.name(), term);
       for (int i = 0; i < (int)numSegments(); ++i) {
         if (QueryPruning::termAbsent(topReader.segments()[(size_t)i], cachedFieldInfo.segInfos.name(), term)) {
           continue;

@@ -6,11 +6,19 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <format>
+#include <mutex>
+#include <set>
 
 #include "luxir/plugin/Registries.h"
+#include "luxir/query/QueryPruning.h"
+#include "luxir/server/JsonRequest.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
@@ -123,4 +131,106 @@ TEST_F(SegmentOverlayPluginTest, badDefinitionsFailTheSchemaRequest) {
   EXPECT_ANY_THROW(setSchema(helper, R"({"segment_overlays":[{"name":"f","kind":"example_field_list","fields":[]}]})"));
   EXPECT_ANY_THROW(setSchema(helper, R"({"segment_overlays":[{"name":"f","kind":"example_field_list","fields":["a_s"],"params":{"nope":1}}]})"));
   EXPECT_ANY_THROW(setSchema(helper, R"({"segment_overlays":[{"name":"f","kind":"example_field_list","fields":["a_s"]},{"name":"f","kind":"example_field_list","fields":["b_s"]}]})"));
+}
+
+namespace {
+
+// Term membership through a restart, so that no segment starts out open.
+class TermMembershipTest : public LuxirTest {
+protected:
+  std::filesystem::path path = std::filesystem::temp_directory_path() / ("luxir-membership-" + newUuid());
+  LuxirConfig config;
+  std::mutex mutex;
+  std::multiset<uint64_t> opened;
+
+  void SetUp() override {
+    initPlugins(addConfiguredPlugins);
+    config.store.backend = "fs";
+    config.store.data_dir = path;
+    config.index.merge_factor = 100;
+    QueryPruning::disableForTests = false;
+    Signal::listen("segmentMaterialized", [this](void* segId, void*, void*) -> void* {
+      std::lock_guard lock(mutex);
+      opened.insert(*(const uint64_t*)segId);
+      return nullptr;
+    });
+    LuxirNode node(config);
+    CollectionHelper helper(node, "logs");
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    std::string_view json = R"({"fields":{"a_s":"string"},"segment_overlays":[{"name":"m","kind":"example_absent_prefix","fields":["a_s"],"params":{"prefix":"mm"}}]})";
+    ASSERT_TRUE(api::read_json(def, json, arena));
+    helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
+    // Two segments whose term bounds [aa, zz] admit anything between.
+    for (std::string_view segment : {"s1", "s2"}) {
+      std::vector<Doc> batch{flatdoc("id", std::string(segment) + "a", "a_s", "aa"), flatdoc("id", std::string(segment) + "z", "a_s", "zz"),
+                             flatdoc("id", std::string(segment) + "m", "a_s", "mmpresent")};
+      ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+    }
+    helper.commit();
+  }
+
+  void TearDown() override {
+    Signal::unlisten("segmentMaterialized");
+    QueryPruning::disableForTests = false;
+    std::filesystem::remove_all(path);
+  }
+
+  // Hits and segments opened for a term query against a freshly started node.
+  std::pair<int64_t, size_t> search(std::string_view term, bool dispatch = false) {
+    {
+      std::lock_guard lock(mutex);
+      opened.clear();
+    }
+    LuxirNode node(config);
+    CollectionHelper helper(node, "logs");
+    auto req = localReq(helper.getSearchEngine());
+    std::string json = std::format(R"({{"ops":{{"q":{{"top_docs":{{"query":{{"match":{{"a_s":"{}"}}}},"limit":100,"fields":["id"]}}}}}}}})", term);
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("logs");
+    if (dispatch) {
+      helper.getSearchEngine().dispatch(*req.get(), 0, SearchEngine::Receiver::MAY_EXECUTE);
+    } else {
+      req->execute();
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    int64_t hits = (int64_t)req->getDocs("q").size();
+    std::lock_guard lock(mutex);
+    return {hits, opened.size()};
+  }
+};
+
+}  // namespace
+
+TEST_F(TermMembershipTest, aProvenAbsentTermOpensNoSegment) {
+  auto [hits, segments] = search("mm-not-indexed");
+  EXPECT_EQ(0, hits);
+  EXPECT_EQ(0u, segments) << "a segment was opened for a term its overlay proves absent";
+}
+
+TEST_F(TermMembershipTest, aDispatchedSearchFetchesNoDictionaryForAProvenAbsentTerm) {
+  auto [hits, segments] = search("mm-not-indexed", /*dispatch=*/true);
+  EXPECT_EQ(0, hits);
+  EXPECT_EQ(0u, segments);
+  EXPECT_EQ(2, search("aa", /*dispatch=*/true).first);
+}
+
+TEST_F(TermMembershipTest, aTermInsideTheBoundsWithoutProofStillOpensSegments) {
+  auto [hits, segments] = search("nn-not-indexed");
+  EXPECT_EQ(0, hits);
+  EXPECT_EQ(2u, segments);
+}
+
+TEST_F(TermMembershipTest, presentTermsAreUnaffected) {
+  auto [hits, segments] = search("aa");
+  EXPECT_EQ(2, hits);
+  EXPECT_EQ(2u, segments);
+}
+
+// The overlay here lies on purpose. Filtering on a wrong proof loses hits, which
+// is why an implementation must never answer "absent" unless it is certain.
+TEST_F(TermMembershipTest, aWrongProofDropsHits) {
+  EXPECT_EQ(0, search("mmpresent").first);
+  QueryPruning::disableForTests = true;
+  EXPECT_EQ(2, search("mmpresent").first);
 }

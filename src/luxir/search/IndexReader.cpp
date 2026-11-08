@@ -320,6 +320,36 @@ std::vector<std::shared_ptr<AuxReader>> Segment::auxReaders() const {
   return readers;
 }
 
+bool Segment::hasTermMembership() const noexcept {
+  return std::ranges::any_of(sharedOverlays, [](const auto& overlay) { return overlay->policy.termMembership; });
+}
+
+bool Segment::membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why) const noexcept {
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->policy.termMembership) continue;
+    try {
+      const auto* membership = overlay->get()->termMembership();
+      if (membership == nullptr || !membership->provesAbsent(field, term)) continue;
+      if (why != nullptr && why->empty()) why->assign(membership->label());
+      return true;
+    } catch (const std::exception& e) {
+      LOG_DEBUG("Overlay '{}' answered nothing for a term probe: {}", overlay->info.name, e.what());
+    } catch (...) {
+    }
+  }
+  return false;
+}
+
+void Segment::declareMembershipProbes(std::string_view field, std::string_view term, ReadSet& reads) const noexcept {
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->policy.termMembership) continue;
+    try {
+      if (const auto* membership = overlay->get()->termMembership()) membership->declareProbe(field, term, reads);
+    } catch (...) {
+    }
+  }
+}
+
 std::shared_ptr<AuxReader> Segment::getAuxReader(std::string_view name) const {
   for (const auto& overlay : sharedOverlays) {
     if (overlay->info.name == name) return overlay->get();

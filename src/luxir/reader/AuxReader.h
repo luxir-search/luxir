@@ -10,6 +10,8 @@
 
 namespace luxir {
 
+class TermMembership;
+
 // How a segment's overlay of some kind is opened.
 struct SegmentOverlayPolicy {
   // Opened by whatever consults it, not with the segment: materializing the
@@ -20,6 +22,8 @@ struct SegmentOverlayPolicy {
   // segment stays in service. Transient failures (a failed fetch, a memory
   // limit) still throw, and a later use retries.
   bool advisory = false;
+  // The overlay's reader implements TermMembership, so pruning consults it.
+  bool termMembership = false;
 };
 
 /// Read-side handle for one entry in IndexInfo.aux_indexes.  Subclasses own
@@ -48,6 +52,9 @@ public:
   virtual std::string_view getName() const = 0;
   uint64_t getGen() const noexcept { return gen; }
   uint64_t getBuiltCoreGen() const noexcept { return builtCoreGen; }
+
+  // Non-null when this overlay can prove terms absent from its segment.
+  virtual const TermMembership* termMembership() const noexcept { return nullptr; }
 
 protected:
   AuxReader(uint64_t gen, uint64_t builtCoreGen) noexcept

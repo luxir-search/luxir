@@ -3,6 +3,8 @@
 
 #include "luxir/query/QueryPruning.h"
 
+#include <latch>
+
 #include "luxir/query/Query.h"
 #include "luxir/query/SummaryView.h"
 
@@ -37,7 +39,7 @@ const SegmentMask& QueryPruning::membership(const Query& query) {
   SegmentMask mask(segments.size(), true);
   if (!disableForTests) {
     for (const auto& segment : segments) {
-      SummaryView view(segment.summary());
+      SummaryView view(segment.summary(), nullptr, &segment);
       if (query.mayMatch(view) == Query::MatchState::EMPTY) mask.clear((size_t)segment.ord);
     }
   }
@@ -61,13 +63,41 @@ std::string QueryPruning::reason(const Query& query, size_t ord) const {
   if (auto collection = collectionReason(query); !collection.empty()) return "collection summary: " + collection;
   if (segment.numLive() == 0) return "live_docs=0";
   std::string why;
-  SummaryView view(segment.summary(), &why);
+  SummaryView view(segment.summary(), &why, &segment);
   if (query.mayMatch(view) != Query::MatchState::EMPTY) return {};
   return why.empty() ? std::string("proven empty") : why;
 }
 
 bool QueryPruning::termAbsent(const IndexReader::Segment& segment, std::string_view field, std::string_view term) {
-  return !disableForTests && SummaryView::provesTermAbsent(segment.summary(), field, term);
+  if (disableForTests) return false;
+  return SummaryView::provesTermAbsent(segment.summary(), field, term)
+         || (segment.hasTermMembership() && segment.membershipProvesAbsent(field, term));
+}
+
+void QueryPruning::fetchMembershipProbes(IndexReader& reader, std::string_view field, std::string_view term) noexcept {
+  if (disableForTests) return;
+  try {
+    ReadSet reads;
+    for (const auto& segment : reader.segments()) {
+      if (segment.hasTermMembership() && !SummaryView::provesTermAbsent(segment.summary(), field, term)) {
+        segment.declareMembershipProbes(field, term, reads);
+      }
+    }
+    if (reads.empty()) return;
+    std::latch finished((std::ptrdiff_t)reads.size());
+    for (const auto& read : reads) {
+      try {
+        // A range that did not arrive is read on first touch.
+        read.file->fetchRanges(read.ranges, kNoReadDeadline, [&finished](std::exception_ptr) { finished.count_down(); });
+      } catch (...) {
+        finished.count_down();
+      }
+    }
+    finished.wait();
+  } catch (const std::exception& e) {
+    LOG_DEBUG("Term membership probes not fetched ahead: {}", e.what());
+  } catch (...) {
+  }
 }
 
 } // namespace luxir
