@@ -134,10 +134,12 @@ public:
   const uint64_t segId;
   const uint64_t creatorEpoch;
   const int32_t maxDoc;
+  const std::shared_ptr<const SegmentSummary> summary;  // handed to the reader it opens; may be null
   SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, std::unique_ptr<HeldFiles> files,
-              std::shared_ptr<Metrics> metrics, std::shared_ptr<const UnreadableHook> onUnreadable)
+              std::shared_ptr<const SegmentSummary> summary, std::shared_ptr<Metrics> metrics,
+              std::shared_ptr<const UnreadableHook> onUnreadable)
       : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId),
-        creatorEpoch(creatorEpoch), maxDoc(maxDoc) {}
+        creatorEpoch(creatorEpoch), maxDoc(maxDoc), summary(std::move(summary)) {}
   SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, std::shared_ptr<PostingsReader> opened)
       : SegmentPart(std::move(opened)), segId(segId), creatorEpoch(creatorEpoch), maxDoc(maxDoc) {}
   std::shared_ptr<PostingsReader> get();
