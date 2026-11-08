@@ -759,3 +759,60 @@ TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
   expectValidInventory(writer->dir, *after);
   EXPECT_EQ(fileInventory(*before), fileInventory(*after));
 }
+
+namespace {
+
+// The test overlay's policy and failure for one test, with one committed overlay.
+class OverlayPolicyGuard {
+public:
+  OverlayPolicyGuard(SegmentOverlayPolicy policy, bool failOpen) {
+    TestOverlayAuxReader::policyForTests = policy;
+    TestOverlayAuxReader::failOpenForTests = failOpen;
+  }
+  ~OverlayPolicyGuard() {
+    TestOverlayAuxReader::policyForTests = {};
+    TestOverlayAuxReader::failOpenForTests = false;
+  }
+};
+
+void commitWithTestOverlay(CollectionHelper& h) {
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  h.commit({std::string(TestOverlayAuxReader::NAME)});
+}
+
+}  // namespace
+
+TEST_F(IndexReaderAuxTest, onDemandOverlayIsNotOpenedWithItsSegment) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  OverlayPolicyGuard guard({.onDemand = true}, /*failOpen=*/true);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  ASSERT_EQ(1u, reader->segments().size());
+  const auto& segment = reader->segments()[0];
+  segment.materialize();  // would throw if it opened the failing overlay
+  EXPECT_TRUE(segment.isMaterialized());
+  EXPECT_TRUE(segment.auxReaders().empty());
+}
+
+TEST_F(IndexReaderAuxTest, advisoryOverlayFailureLeavesTheSegmentInService) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  OverlayPolicyGuard guard({.onDemand = true, .advisory = true}, /*failOpen=*/true);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  const auto& segment = reader->segments()[0];
+  auto aux = segment.getAuxReader(TestOverlayAuxReader::NAME);
+  ASSERT_NE(nullptr, aux);
+  EXPECT_NE(nullptr, dynamic_cast<UnavailableAuxReader*>(aux.get()));
+  EXPECT_EQ(TestOverlayAuxReader::KIND, aux->getKind());
+  segment.materialize();
+  EXPECT_TRUE(segment.isMaterialized());
+  EXPECT_EQ(2, segment.postingsReader().maxDoc());
+}
+
+TEST_F(IndexReaderAuxTest, requiredOverlayFailureStillFailsTheSegment) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  OverlayPolicyGuard guard({}, /*failOpen=*/true);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  EXPECT_ANY_THROW(reader->segments()[0].materialize());
+}
