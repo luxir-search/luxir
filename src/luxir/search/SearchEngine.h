@@ -4,6 +4,7 @@
 #pragma once
 
 #include "SearchRequest.h"
+#include "luxir/store/FetchCountdown.h"
 #include "luxir/server/LuxirNode.h"
 
 namespace luxir {
@@ -17,7 +18,28 @@ struct SearchConfig;
 class SearchEngine {
   LuxirNode& node;
 
-  void submitBody(SearchRequest& req);
+  // Prepares the request, then executes it. With mayDefer, the reads that
+  // materializing its segments needs are fetched first (fetchAhead); when
+  // they do not complete inline, execution resumes on an arena worker once
+  // they finish, and no thread waits for them. ownTg is the task group run()
+  // made on its stack, which a deferred request leaves behind.
+  void submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg);
+  // Fetches `reads` ahead of the work that needs them. False when they
+  // completed inline (local files): the caller goes on. True when the request
+  // was handed over: `resume` runs on an arena worker once they finish, with
+  // the task group it made for a -1 request (null otherwise), and the caller
+  // must not touch the request again.
+  bool fetchAhead(SearchRequest& req, ReadSet reads, oneapi::tbb::task_group* ownTg,
+                  std::function<void(oneapi::tbb::task_group*)> resume);
+  // Materializes the segments and runs the calculators, then finishBody().
+  void execute(SearchRequest& req, RootOp* root, const SegmentMask& segments, MetricScope& execution);
+  // Records a failure on the request after draining its task group.
+  void failBody(SearchRequest& req, std::exception& e, ErrorKind fallback);
+  // Releases segment state, fills the profile and warnings, and sends the final response.
+  void finishBody(SearchRequest& req, RootOp* root, MetricScope& execution);
+  // submit(), but with mayDefer the request may finish on an arena worker
+  // after this returns (dispatch's lanes, which complete through replies).
+  void run(SearchRequest& req, int32_t maxParallel, bool mayDefer);
   // Runs submit() on an arena worker; -1's waits stay within the request.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
   RootOp* prepare(SearchRequest& req);
@@ -55,7 +77,9 @@ public:
   // serially on a worker, -1 starts on a worker and fans out from there.
   void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver);
 
-  // Synchronous execution on the calling thread (dispatch() routes here).
+  // Synchronous execution on the calling thread: the request has finished
+  // when this returns. dispatch() routes through the same body, except that
+  // there a request whose segments must be fetched first resumes on a worker.
   // maxParallel: 0 / 1 = single-threaded, -1 = unlimited intra-request
   // parallelism (task_group), >1 reserved (rejected as a request error).
   void submit(SearchRequest& req, int32_t maxParallel = 0);
