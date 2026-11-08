@@ -42,7 +42,7 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
   }
   schema.set(helper.collection());
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   for (auto id : {"one", "two"}) {
     ASSERT_TRUE(helper.index(flatdoc("id", id, "n_i", 7, "when_dt", (int64_t)123,
         "nano", 7, "nanos", vec_i(1, 2), "text_w", "words", "many_is", vec_i(1, 2)), UpdateMessage::COMMIT).success);
@@ -125,7 +125,7 @@ TEST_F(FieldTypeContractTest, changedDateUnitFailsOnlyFieldUsers) {
 TEST_F(FieldTypeContractTest, mixedDateUnitsRefuseMerge) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   setValueType(helper, api::FieldDef::FieldClass::DATE);
   ASSERT_TRUE(helper.index(flatdoc("id", "old", "value", 1), UpdateMessage::COMMIT).success);
   SchemaBuilder removed;
@@ -177,7 +177,7 @@ TEST_F(FieldTypeContractTest, schemaMismatchFailsOnlyFieldUsers) {
 TEST_F(FieldTypeContractTest, refusedMergeReleasesPolicyAndOtherMergesProceed) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   setValueType(helper, api::FieldDef::FieldClass::INT);
   ASSERT_TRUE(helper.index(flatdoc("id", "old", "value", 1), UpdateMessage::COMMIT).success);
   setValueType(helper, api::FieldDef::FieldClass::DATE);
@@ -198,7 +198,7 @@ TEST_F(FieldTypeContractTest, refusedMergeReleasesPolicyAndOtherMergesProceed) {
 
   // Two larger compatible segments can merge at another level even while
   // the original incompatible pair remains present at level zero.
-  writer->mergePolicy->setMergeFactor(2);
+  writer->setMergeFactor(2);
   for (int segment = 0; segment < 2; segment++) {
     CollectionHelper::UpdateBuilder request;
     for (int i = 0; i < 2; i++) request.add(flatdoc(

@@ -124,7 +124,7 @@ class ForceMergeTest : public LuxirTest {};
 TEST_F(ForceMergeTest, concurrentUncommittedIngestionDoesNotBlockPublish) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "base-a-", 2));
   ASSERT_TRUE(addSegment(helper, "base-b-", 2));
 
@@ -152,7 +152,7 @@ TEST_F(ForceMergeTest, concurrentUncommittedIngestionDoesNotBlockPublish) {
 TEST_F(ForceMergeTest, overlappingRequestsSerializeThroughDurablePublish) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "overlap-a-", 2));
   ASSERT_TRUE(addSegment(helper, "overlap-b-", 2));
 
@@ -172,9 +172,9 @@ TEST_F(ForceMergeTest, overlappingRequestsSerializeThroughDurablePublish) {
 TEST_F(ForceMergeTest, waitForMergesComposesWithMaxSegments) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "wait-a-", 1));
-  writer->mergePolicy->setMergeFactor(2);
+  writer->setMergeFactor(2);
 
   MergeGate gate;
   ASSERT_TRUE(addSegment(helper, "wait-b-", 1));
@@ -192,7 +192,7 @@ TEST_F(ForceMergeTest, mergeFailureReturnsErrorAndPreservesSources) {
   CollectionHelper helper("main");
   enableL2VectorSuffix(helper.collection());
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "failure-a-", 2));
   ASSERT_TRUE(addSegment(helper, "failure-b-", 2));
   helper.commit({"vec.embedding_v"});
@@ -219,7 +219,7 @@ TEST_F(ForceMergeTest, mergeFailureReturnsErrorAndPreservesSources) {
 TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecovers) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "large-", 5));
   ASSERT_TRUE(addSegment(helper, "small-", 2));
   ASSERT_TRUE(addSegment(helper, "medium-", 4));
@@ -233,7 +233,7 @@ TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecover
   std::sort(liveDocs.begin(), liveDocs.end());
   EXPECT_EQ((std::vector<int32_t>{3, 4, 5}), liveDocs);
 
-  writer->mergePolicy->setMergeFactor(2);
+  writer->setMergeFactor(2);
   ASSERT_TRUE(addSegment(helper, "policy-", 1));
   EXPECT_TRUE(commit(helper, 0, /*waitForMerges=*/true).success);
   EXPECT_FALSE(writer->testMergeRunning());
@@ -255,7 +255,7 @@ TEST_F(ForceMergeTest, policyMergesYieldToPendingForceMerge) {
 
   CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter iw(snapshots, schema);
-  iw.mergePolicy->setMergeFactor(2);
+  iw.setMergeFactor(2);
   // Three concurrently busy inverters, released idle: the commit flushes all
   // three, and any two of them fill a merge level.
   std::vector<Inverter*> inverters;
@@ -279,7 +279,7 @@ TEST_F(ForceMergeTest, policyMergesYieldToPendingForceMerge) {
 TEST_F(ForceMergeTest, dirtySingletonRewritesAndCleanSingletonStillPublishes) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "singleton-", 3));
   EXPECT_TRUE(helper.deleteById("singleton-1", UpdateMessage::COMMIT).success);
 
@@ -306,7 +306,7 @@ TEST_F(ForceMergeTest, dirtySingletonRewritesAndCleanSingletonStillPublishes) {
 
 TEST_F(ForceMergeTest, emptyCommitIsResumeForm) {
   CollectionHelper helper("main");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "resume-a-", 1));
   ASSERT_TRUE(addSegment(helper, "resume-b-", 1));
 

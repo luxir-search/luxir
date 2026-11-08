@@ -825,7 +825,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
 
   for (int i = 0; i < 400; i++) {
     h.index(flatdoc("id", "active" + std::to_string(i),
@@ -1174,7 +1174,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(2);
+  iw->setMergeFactor(2);
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "a" + std::to_string(i),

@@ -209,7 +209,7 @@ TEST_F(EmitDocsTest, siblingFailureDuringColumnLoads) {
 
 TEST_F(EmitDocsTest, defaultWideProjectionDecodesOnlyHitSegments) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   constexpr int FIELDS = 200;
   for (int seg = 0; seg < 4; seg++) {
     std::vector<Doc> docs;

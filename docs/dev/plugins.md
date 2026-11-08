@@ -264,9 +264,100 @@ It also registers a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
 its documents), two HTTP routes and a per-node state with query, op and route
 counters. The makers and handlers reach that state through their contexts.
+Its `example_bounds_overlap` merge policy is covered by `MergePolicyPluginTest`.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
+
+## Segment overlays
+
+`Registries::segmentOverlays` (`src/luxir/index/SegmentOverlayRegistry.h`) maps kind names
+to per-segment overlays: extra immutable files a plugin writes for each segment, which the
+manifest then tracks with the segment (replication, snapshots, retirement). A collection
+selects them in its schema:
+
+    "segment_overlays": [{"name": "ids", "kind": "my_kind", "fields": ["trace_id"],
+                          "params": {...}, "min_docs": 10000}]
+
+`fields` are physical field names or globs with one `*`, resolved against each segment; a
+segment with none of them gets no overlay. The schema request builds the kind once, so an
+unknown kind or a param the maker refuses is an `invalid_schema` error.
+
+A kind (`SegmentOverlayKindInfo`) has:
+
+- `maker`: reads `SegmentOverlayContext::params` and returns a `SegmentOverlayKind`, whose
+  `build(const SegmentOverlayBuild&)` writes the overlay's files, each named by
+  `request.fileName(fnum)`, and returns their descriptors and a small `meta` blob. `meta`
+  goes in the manifest and is available when the overlay opens, with no I/O. Returning
+  `nullopt` means the segment needs no overlay. A build that throws leaves the segment
+  without the overlay; indexing is not affected.
+- `open`: returns the `AuxReader` for an existing overlay.
+- `policy`: `onDemand` overlays are opened by whatever consults them, not with the segment,
+  and `advisory` overlays that cannot be read answer nothing instead of taking the segment
+  out of service. Both default to true.
+
+Overlays are built when a merge finishes and, at commits, for segments that lack one, a few
+per commit: newly flushed segments and, after the schema gains an overlay, the older ones.
+Read a built overlay with `Segment::getAuxReader("<kind>.<name>")`. Files are read by range
+on object stores, so an overlay can be larger than what one query touches.
+
+## Merge policies
+
+`Registries::mergePolicies` (`src/luxir/index/MergePolicyRegistry.h`) maps names to
+merge policy makers. `tiered` (`TieredMergePolicy`) is built in and is the default. A
+collection selects one in its schema, `"merge_policy": {"name": ..., "params": {...}}`;
+the schema request builds the policy once, so an unknown name or a param the maker
+refuses is an `invalid_schema` error. Each collection's writer builds its own instance
+and rebuilds it when the schema's `merge_policy` or the node merge factor changes.
+
+The maker receives a `MergePolicyContext`: `params` (a `ParamReader`; keys the maker
+does not read are refused afterwards) and `nodeMergeFactor` (the node's
+`--indexing.merge-factor`). It returns a `std::unique_ptr<MergePolicy>`.
+
+A policy (`src/luxir/index/MergePolicy.h`) implements one call:
+
+```cpp
+std::vector<MergeSpec> findMerges(std::span<const MergeSegment> segments) const;
+```
+
+`segments` are the collection's live segments in segId order, each with `maxDoc`,
+`liveDocs`, `bytes`, the update version range (`minVersion`/`maxVersion`, which follows
+ingest order), `firstCommitTime` and a `summary`. `summary->numericBounds(field)`
+returns the inclusive bounds of a physical numeric field's column in its
+order-preserving int64 encoding, deleted documents included, or nullopt when the
+segment has no values for it. The first call per segment may open its metadata;
+the writer keeps it for later calls. Each `MergeSpec` lists segment ids to merge into
+one, most urgent first. The optional `level(segment)` is reported as the segment's
+`merge_level` in stats.
+
+The writer owns everything else: it asks when no merge is in flight, runs one merge
+at a time (after a flush, the first spec that includes the flushed segment, so a
+merge that failed is not retried on every flush; after a merge, the first spec),
+asks again when the scheduled merge starts so segments flushed in between can
+join, drops ids that are unknown, empty or
+already merging, skips a spec left with fewer than two segments, and applies merge
+admission (merged doc and ord-dictionary limits, the RAM budget). Calls hold the
+writer's index lock: keep them to in-memory work beyond the summary reads. A policy
+that throws is logged and treated as choosing nothing. Names are `[a-z0-9_]+`;
+duplicates and built-in names cannot be registered. To extend the built-in, build it
+inside your maker with `MergePolicyRegistry::global().make("tiered", params, ...)`
+or construct `TieredMergePolicy` and delegate to it.
+
+The example plugin registers `example_bounds_overlap` (params `field`, `min_segments`):
+it groups segments whose bounds on `field` overlap or touch and merges each group
+of at least `min_segments`, which keeps time or tenant ranges per segment tight:
+
+```cpp
+r.mergePolicies.add("example_bounds_overlap", [](const luxir::MergePolicyContext& ctx) {
+  std::string field(ctx.params.requireString("field"));
+  int64_t minSegments = ctx.params.getInt("min_segments", 2);
+  if (minSegments < 2) ctx.params.fail("min_segments", "must be at least 2");
+  return std::make_unique<BoundsOverlapPolicy>(std::move(field), minSegments);
+});
+```
+
+`MergePolicyPluginTest` selects it per collection, checks which segments it merges,
+switches the collection to `tiered` and checks the error for an unknown name.
 
 ## Analysis components
 

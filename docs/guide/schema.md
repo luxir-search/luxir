@@ -411,6 +411,48 @@ There is no automatic retraining. Changing `zstd_dictionary`,
 merge can train another. After a restart, the dictionary from the largest
 live segment carrying one is used.
 
+### Merge policy
+
+Segments written by flushes are merged in the background. The top-level
+`merge_policy` chooses how: `name` selects a registered policy and `params`
+configures it. Without one, the collection uses `tiered` with the node's
+`--indexing.merge-factor` (default 10).
+
+```http
+POST /collections/logs/_schema
+
+{
+  "merge_policy": {"name": "tiered", "params": {"merge_factor": 4}}
+}
+```
+
+| Policy | Params | Behavior |
+|---|---|---|
+| `tiered` | `merge_factor` (integer, at least 2; default the node's `--indexing.merge-factor`) | A segment's level is how many times `merge_factor` divides into its document count. Once `merge_factor` segments share a level, that level's segments merge into one, lowest level first |
+
+Plugins can register other policies, for example one that merges only
+segments with overlapping ranges on a timestamp or tenant field, so each
+segment covers a narrow range. An unknown name or an invalid param fails the
+schema request and lists what is valid. `mode=set` replaces `merge_policy`
+only when the request names one; a change applies to merge decisions from the
+next one on and does not rewrite existing segments. A collection whose stored
+schema names a policy the binary no longer has fails to load, like one naming
+an unknown analyzer.
+
+### Segment overlays
+
+Plugins can attach extra per-segment structures to a collection, for example
+filters that let a search skip segments. The top-level `segment_overlays`
+lists them: `name` is unique in the schema, `kind` is registered by a plugin,
+`fields` names the physical fields covered (exact names or globs with one
+`*`), `params` configures the kind, and segments with fewer than `min_docs`
+documents get no overlay.
+
+An overlay never affects indexing or results if it fails to build or read: the
+segment simply goes without it. Segments written before the overlay was added
+gain it over later commits. An unknown kind or an invalid param fails the
+schema request. `mode=set` replaces the list only when the request names one.
+
 ## Text analysis
 
 A text analyzer applies an ordered list of `char_filters` to the whole value,

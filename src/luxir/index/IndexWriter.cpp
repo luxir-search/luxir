@@ -155,8 +155,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
-  mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
-  mergePolicy->setMergeFactor(mergeFactor);
+  this->mergeFactor = std::max(2, mergeFactor);
   writerState = IncarnationState::claim(dir);
   writerEpoch = writerState.value.epoch;
   auto manifest = Manifest::load(dir, &writerState);
@@ -213,7 +212,6 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         seg.auxOverlays.push_back(fromWire(overlay));
         currentSegmentOverlays_.push_back({segId, fromWire(overlay)});
       }
-      mergePolicy->_update(&seg);
       lastCommittedSegIds.push_back(segId);
     }
     // Sort to ensure consistent ordering for comparison (currently not needed since we sort when doing commit)
@@ -545,12 +543,12 @@ void IndexWriter::_releaseMergeWaiterHoldsLocked() {
 // transaction so a rejected graph submission cannot strand a wait_for_merges
 // commit or leave the policy throttle engaged.
 bool IndexWriter::_submitMergeLocked(MergeMessage* msg) {
-  mergePolicy->outstandingMerges++;
+  outstandingMerges++;
   _addMergeWaiterHoldsLocked();
 
   auto rollback = [&]() {
-    assert(mergePolicy->outstandingMerges > 0);
-    mergePolicy->outstandingMerges--;
+    assert(outstandingMerges > 0);
+    outstandingMerges--;
     _releaseMergeWaiterHoldsLocked();
   };
 
@@ -643,15 +641,146 @@ void IndexWriter::completeForceMerge(MergeMessage& msg) {
   completeForceMergeOrigins(completedOrigins);
 }
 
-// Caller must hold indexMutex.  Flushes that landed while a pending force
-// merge held policy merges off submitted none, so check every level after.
-void IndexWriter::_resumePolicyMergesLocked() {
-  if (_forceMergePendingLocked()) return;
-  try {
-    mergePolicy->_maybeMergeSegments(nullptr);
-  } catch (const std::exception& e) {
-    LOG_ERROR("Policy merge resume failed: exception={}", e.what());
+class IndexWriter::PolicySegmentSummary final : public MergeSegmentSummary {
+  IndexWriter& iw;
+  SegInfo& seg;
+
+public:
+  PolicySegmentSummary(IndexWriter& iw, SegInfo& seg) : iw(iw), seg(seg) {}
+
+  // Opens the segment's PostingsReader on first use; the writer keeps it.
+  std::optional<NumericBounds> numericBounds(std::string_view field) const override {
+    try {
+      auto reader = iw.getSegmentPostingsReader(seg);
+      const auto* info = reader->fieldInfo(field);
+      if (!info || !info->columnBounds || info->numValues == 0) return std::nullopt;
+      return NumericBounds{info->columnBounds->min, info->columnBounds->max};
+    } catch (const std::exception& e) {
+      LOG_WARN("Merge policy summary unavailable for seg={}: {}", seg.segId, e.what());
+      return std::nullopt;
+    }
   }
+};
+
+namespace {
+
+MergeSegment mergeSegmentOf(const SegInfo& seg, const MergeSegmentSummary& summary) {
+  MergeSegment out;
+  out.segId = seg.segId;
+  out.maxDoc = seg.maxDoc;
+  out.liveDocs = seg.liveDocs;
+  for (const auto& file : seg.files) out.bytes += file.size;
+  out.minVersion = seg.minVersion;
+  out.maxVersion = seg.maxVersion;
+  out.firstCommitTime = seg.firstCommitTime;
+  out.summary = &summary;
+  return out;
+}
+
+class PolicyMergeMessage : public MergeMessage {
+public:
+  void handle(IndexWriter& iw) override { unused(iw); }
+  void done(IndexWriter& iw) override {
+    unused(iw);
+    delete this;
+  }
+};
+
+}  // namespace
+
+void IndexWriter::setMergeFactor(int32_t factor) {
+  const std::lock_guard<std::mutex> lock(indexMutex);
+  mergeFactor = std::max(2, factor);
+}
+
+MergePolicy& IndexWriter::_mergePolicyLocked() {
+  auto snapshot = lastSnapshot.load();
+  std::shared_ptr<const MergePolicySpec> spec = snapshot && snapshot->schema ? snapshot->schema->mergePolicy : nullptr;
+  auto& active = activeMergePolicy;
+  if (!active.policy || active.spec != spec || active.nodeMergeFactor != mergeFactor) {
+    std::unique_ptr<MergePolicy> policy;
+    try {
+      policy = MergePolicyRegistry::global().make(spec.get(), mergeFactor);
+    } catch (const std::exception& e) {
+      // The schema was validated when it was set; a maker can still refuse
+      // it later (a plugin changed between restarts). Keep merging.
+      LOG_ERROR("Merge policy '{}' could not be built; using the default: {}", spec ? spec->def.name : "",
+                e.what());
+      policy = std::make_unique<TieredMergePolicy>(mergeFactor);
+    }
+    active.spec = std::move(spec);
+    active.nodeMergeFactor = mergeFactor;
+    active.policy = std::move(policy);
+  }
+  return *active.policy;
+}
+
+std::vector<SegInfo*> IndexWriter::_selectPolicyMergeLocked(uint64_t triggerSegId) {
+  std::vector<SegInfo*> live;
+  live.reserve(segInfos.size());
+  for (auto& [segId, seg] : segInfos) {
+    unused(segId);
+    live.push_back(seg.get());
+  }
+  std::ranges::sort(live, {}, &SegInfo::segId);
+  std::vector<PolicySegmentSummary> summaries;
+  summaries.reserve(live.size());
+  std::vector<MergeSegment> segments;
+  segments.reserve(live.size());
+  for (SegInfo* seg : live) {
+    summaries.emplace_back(*this, *seg);
+    segments.push_back(mergeSegmentOf(*seg, summaries.back()));
+  }
+
+  std::vector<MergeSpec> merges;
+  try {
+    merges = _mergePolicyLocked().findMerges(segments);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Merge policy failed to choose merges: {}", e.what());
+    return {};
+  }
+
+  std::vector<SegInfo*> selected;
+  auto chosen = std::ranges::find_if(merges, [&](const MergeSpec& spec) {
+    return triggerSegId == 0 || std::ranges::contains(spec, triggerSegId);
+  });
+  if (chosen == merges.end()) return selected;
+  for (uint64_t segId : *chosen) {
+    auto it = std::ranges::lower_bound(live, segId, {}, &SegInfo::segId);
+    if (it == live.end() || (*it)->segId != segId) continue;
+    SegInfo* seg = *it;
+    // An empty segment waits for its commit-time drop; a merging one is
+    // another merge's source.
+    if (seg->liveDocs == 0 || seg->merging || std::ranges::contains(selected, seg)) continue;
+    selected.push_back(seg);
+  }
+  return selected;
+}
+
+int32_t IndexWriter::_mergeLevelLocked(SegInfo& seg) {
+  PolicySegmentSummary summary(*this, seg);
+  return _mergePolicyLocked().level(mergeSegmentOf(seg, summary));
+}
+
+bool IndexWriter::_maybeMergeSegmentsLocked(uint64_t triggerSegId) {
+  if (outstandingMerges > 0 || _forceMergePendingLocked()) return false;
+  try {
+    if (_selectPolicyMergeLocked(triggerSegId).size() < 2) return false;
+    auto msg = std::make_unique<PolicyMergeMessage>();
+    msg->triggerSegId = triggerSegId;
+    if (!_submitMergeLocked(msg.get())) return false;
+    msg.release();
+    return true;
+  } catch (const std::exception& e) {
+    LOG_ERROR("Policy merge submission failed: exception={}", e.what());
+    return false;
+  }
+}
+
+// Caller must hold indexMutex.  Flushes that landed while a pending force
+// merge held policy merges off submitted none, so ask the policy again after.
+void IndexWriter::_resumePolicyMergesLocked() {
+  _maybeMergeSegmentsLocked();
 }
 
 // Returns true when the merge message itself should be completed by the merge
@@ -1144,7 +1273,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     // A later merge submission adds its own hold before entering the graph.
     if (msg.waitForMerges) {
       waitingForMerges.push_back(&msg);
-      commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
+      commitInfo.leftToFlush += (uint32_t)outstandingMerges;
     }
 
     // first look at any flushing inverters that are not marked for a commit yet
@@ -1536,7 +1665,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // commitSequencerNode while a merge still holds it as a waiter).
     // We do this with the lock held since segInfo could go away otherwise.
     if (success) {
-      mergePolicy->_maybeMergeSegments(iter.first->second.get());
+      _maybeMergeSegmentsLocked(iter.first->second->segId);
     }
 
     // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
@@ -1944,10 +2073,7 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
   auto it = segInfos.find(segId);
   // It's not an error if not found since someone else may have deleted it already.
   if (it != segInfos.end()) {
-    SegInfo* seg = it->second.get();
-    INDEX_DEBUG("ToDelete += {}", *seg);
-    // Remove from merge policy
-    mergePolicy->_remove(seg);
+    INDEX_DEBUG("ToDelete += {}", *it->second);
     // Move the segment to deletion list instead of just erasing it
     segmentsToDelete.push_back(std::move(it->second));
     segInfos.erase(it);
@@ -2132,6 +2258,50 @@ void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noe
   }
 }
 
+std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema& schema,
+                                                      std::vector<std::string>& outFiles) noexcept {
+  std::vector<AuxInfo> built;
+  for (const auto& spec : schema.segmentOverlays) {
+    std::string overlayName = spec->overlayName();
+    std::vector<std::string> staged;
+    try {
+      if (seg.maxDoc < spec->def.min_docs) continue;
+      if (!seg.attemptedPluginOverlays.insert(overlayName).second) continue;
+      if (std::ranges::any_of(seg.auxOverlays, [&](const AuxInfo& info) { return info.name == overlayName; })) continue;
+      auto reader = getSegmentPostingsReader(seg);
+      uint64_t gen = nextSegmentOverlayGen(seg);
+      SegmentOverlayBuild request{seg.segId, seg.maxDoc, *reader, spec->resolveFields(*reader), dir,
+                                  [&](uint32_t fnum) {
+                                    std::string name = Postings::getSegmentOverlayFileName(seg.segId, overlayName, gen, fnum,
+                                                                                           seg.creatorEpoch, writerEpoch);
+                                    staged.push_back(name);
+                                    return name;
+                                  }};
+      if (request.fields.empty()) continue;
+      auto output = SegmentOverlayRegistry::global().make(*spec)->build(request);
+      if (!output) {
+        deleteStagedOverlayFiles(staged, "empty plugin overlay build");
+        continue;
+      }
+      AuxInfo info;
+      info.kind = std::string(spec->def.kind);
+      info.name = std::move(overlayName);
+      info.gen = gen;
+      info.files = std::move(output->files);
+      info.opaque_meta = std::move(output->meta);
+      built.push_back(std::move(info));
+      outFiles.insert(outFiles.end(), staged.begin(), staged.end());
+    } catch (const std::exception& e) {
+      deleteStagedOverlayFiles(staged, "plugin overlay build failure");
+      LOG_WARN("Overlay '{}' not built for seg={}: {}", spec->overlayName(), seg.segId, e.what());
+    } catch (...) {
+      deleteStagedOverlayFiles(staged, "plugin overlay build failure");
+      LOG_WARN("Overlay '{}' not built for seg={}: unknown exception", spec->overlayName(), seg.segId);
+    }
+  }
+  return built;
+}
+
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
   std::lock_guard lock(indexMutex);
   return seg.nextOverlayGen++;
@@ -2261,6 +2431,18 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
         info.opaque_meta.assign((const std::byte*)testMeta.data(),
                                 (const std::byte*)testMeta.data() + testMeta.size());
         stagedOverlays.push_back({seg, std::move(info)});
+      }
+    }
+
+    if (auto current = getSchema(); !current->segmentOverlays.empty()) {
+      // Bounded per commit: a collection that just enabled an overlay reaches
+      // its older segments over several commits.
+      size_t budget = PLUGIN_OVERLAY_BUILDS_PER_COMMIT;
+      for (size_t i = segsToKeep.size(); i > 0 && budget > 0; i--) {
+        auto* seg = segsToKeep[i - 1];
+        size_t attempted = seg->attemptedPluginOverlays.size();
+        for (auto& info : buildPluginOverlays(*seg, *current, stagedFiles)) stagedOverlays.push_back({seg, std::move(info)});
+        if (seg->attemptedPluginOverlays.size() != attempted) budget--;
       }
     }
 
@@ -2577,8 +2759,8 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
     // count first, let a policy chain submit (and add its waiter holds), then
     // remove this merge's waiter holds, and only then release zero-count
     // waiters.
-    assert(mergePolicy->outstandingMerges > 0);
-    mergePolicy->outstandingMerges--;
+    assert(outstandingMerges > 0);
+    outstandingMerges--;
 
     // On a contained merge FAILURE the caller passes chainNextMerge=false: the
     // sources were restored unchanged, so _maybeMergeSegments would immediately
@@ -2589,7 +2771,7 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
     bool anotherMerge = false;
     if (chainNextMerge) {
       try {
-        anotherMerge = mergePolicy->_maybeMergeSegments(nullptr);
+        anotherMerge = _maybeMergeSegmentsLocked();
       } catch (const std::exception& e) {
         LOG_ERROR("Policy merge chaining failed: exception={}", e.what());
       } catch (...) {
@@ -2599,7 +2781,7 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 
     _releaseMergeWaiterHoldsLocked();
 
-    if (allowSyntheticCommit && !anotherMerge && mergePolicy->outstandingMerges == 0
+    if (allowSyntheticCommit && !anotherMerge && outstandingMerges == 0
         && waitingForMerges.empty()) {
       if (busyInverters.empty() && flushingInverters.empty() && idleInverters.empty()) {
         // no indexing activity, so let's trigger a commit.
@@ -2628,6 +2810,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   std::vector<SegInfo*> segs;
   std::vector<uint64_t> sourceSegIds;
   bool clientOrigin = msg.forcedBy != nullptr;
+  int32_t mergeLevel = -1;  // the policy level of a policy merge, for the mergeStart signal
   bool allowSingleSourceRewrite = false;
   bool allowSyntheticCommit = false;
   bool chainNextMerge = false;
@@ -2680,17 +2863,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           segs.clear();
         }
       } else {
-        segs.reserve(mergePolicy->mergeFactor * 2);
-        for (auto& [segId, seg] : segInfos) {
-          unused(segId);
-          if (seg->mergeLevel == msg.mergeLevel) {
-            if (seg->liveDocs == 0) {
-              // This can occur after deletes are applied but before commit-time removal.
-              continue;
-            }
-            segs.push_back(seg.get());
-          }
-        }
+        // Asked again rather than replaying the decision that submitted
+        // this merge: segments flushed since then take part.
+        segs = _selectPolicyMergeLocked(msg.triggerSegId);
+        if (!segs.empty()) mergeLevel = _mergeLevelLocked(*segs.front());
       }
 
       // Segment-local ords are signed int32. Admit only sources whose summed
@@ -2748,10 +2924,6 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         seg->mergedLiveGen = seg->liveGen;
         markedSegmentCount++;
       }
-
-      // Sanity check this merge. a bug in testDeleteAllData led to merge accounting getting out-of-sync
-      // with actual segments and resulted in a merge loop.
-      mergePolicy->_sanityCheck();
     }
 
     if (segs.empty()) {
@@ -2772,7 +2944,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         segs[0]->mergedLiveGen = -1;
         markedSegmentCount = 0;
       }
-      INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment at level {}; skipping", msg.mergeLevel);
+      INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment; skipping");
     } else {
       metric.emplace(*metrics, MetricStage::MERGE);
       sourceSegIds.reserve(segs.size());
@@ -2786,7 +2958,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "merge_start_signal";
 
       try {
-        luxir::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
+        luxir::Signal::emit("mergeStart", (void*)(int64_t)mergeLevel, (void*)segs.size());
 
     phase = "sort_sources";
     // Sort the list of segments by the segId.
@@ -2864,6 +3036,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
       phase = "segment_summary";
       writeSegmentSummary(*newSegInfo, pwriter);
+      phase = "plugin_overlays";
+      {
+        std::vector<std::string> pluginOverlayFiles;
+        for (auto& info : buildPluginOverlays(*newSegInfo, *mergeSchema, pluginOverlayFiles)) newSegInfo->auxOverlays.push_back(std::move(info));
+        newSegInfo->unsyncedFiles.insert(newSegInfo->unsyncedFiles.end(), pluginOverlayFiles.begin(), pluginOverlayFiles.end());
+      }
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
@@ -2979,7 +3157,6 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
         if (newSegInfo->liveDocs > 0) {
           segInfos.reserve(segInfos.size() + 1);
-          mergePolicy->_prepareUpdate(newSegInfo.get());
         }
 
         size_t personalDeleteCount = newSegInfo->personalDeletes.size();
@@ -3019,12 +3196,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // Concurrent applications can delete the entire output during the
         // merge. Still publish source removal when no output survives.
         if (newSegInfo->liveDocs > 0) {
-          auto* publishedSegInfo = newSegInfo.get();
           auto [iter, success] = segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
           unused(iter);
           assert(success);
           outputPublished = true;
-          mergePolicy->_update(publishedSegInfo);
         }
         // Keep pinned ancestors pointing at the latest output even if an
         // intermediate output is reclaimed before their application finishes.
@@ -3083,7 +3258,6 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
             if (it != segmentsToDelete.end() && (*it)->liveDocs > 0) {
               auto restored = std::move(*it);
               segmentsToDelete.erase(it);
-              mergePolicy->_update(restored.get());
               segInfos.emplace(restored->segId, std::move(restored));
             }
           }
@@ -3248,7 +3422,7 @@ void IndexWriter::testDeleteAllData() {
       LOG_ERROR("Error trying to clear index. There are busy or flushing inverters!");
       return;
     }
-    if (mergePolicy && mergePolicy->outstandingMerges > 0) {
+    if (outstandingMerges > 0) {
       LOG_ERROR("Error trying to clear index. There is a merge running!");
       return;
     }
@@ -3307,7 +3481,6 @@ void IndexWriter::testDeleteAllData() {
   publish(initial, arena);
   publicationLock.unlock();
   tryDeleteSegments();
-  mergePolicy->refresh(); // we can't call this with lock held since it tries to acquire.
 
 
 
@@ -3356,7 +3529,7 @@ void IndexWriter::testReseedActiveVectorOverlayNamesFromManifest() {
 
 bool IndexWriter::testMergeRunning() {
   std::lock_guard<std::mutex> lock(indexMutex);
-  return mergePolicy && mergePolicy->outstandingMerges > 0;
+  return outstandingMerges > 0;
 }
 
 std::optional<IndexWriter::MergeFailureInfo> IndexWriter::testLastMergeFailure() {
@@ -3387,7 +3560,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.coreGen = coreGen;
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
-    out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    out.activeMerges = (uint64_t)outstandingMerges;
     static_cast<DeletePassStats&>(out) = deletePassStats;
     out.completedUpdateVersion = completedUpdateVersion;
     out.minInverterDocVersion = minInverterDocVersion;
@@ -3440,7 +3613,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       std::ranges::transform(seg->auxOverlays, std::back_inserter(dst.overlays), copyAux);
       dst.maxDoc = seg->maxDoc;
       dst.liveDocs = seg->liveDocs;
-      dst.mergeLevel = std::max(0, seg->mergeLevel);
+      dst.mergeLevel = std::max(0, _mergeLevelLocked(*seg));
       dst.merging = seg->merging;
     }
   }

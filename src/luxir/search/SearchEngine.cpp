@@ -8,6 +8,7 @@
 #include "luxir/server/CommitWaits.h"
 #include "luxir/store/FetchCountdown.h"
 #include "ProtobufSearchParser.h"
+#include "TermReads.h"
 #include "luxir/search/ops/RootOp.h"
 
 namespace luxir {
@@ -17,6 +18,11 @@ const SearchConfig& SearchEngine::searchConfig() const {
 }
 
 RootOp* SearchEngine::prepare(SearchRequest& req) {
+  admit(req);
+  return parse(req);
+}
+
+void SearchEngine::admit(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
   if (req.maxParallel > 1 || req.maxParallel < -1) {
     throw RequestError(
@@ -26,7 +32,9 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   }
   getResources(req);
   req.lastResponse = SearchResponse::create(req, true);
+}
 
+RootOp* SearchEngine::parse(SearchRequest& req) {
   ProtobufSearchParser parser(req);
   return parser.parse();
 }
@@ -80,10 +88,35 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::ta
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
+  try {
+    admit(req);
+  } catch (std::exception& e) {
+    failBody(req, e, ErrorKind::INVALID_REQUEST);
+    finishBody(req, nullptr, *execution);
+    return;
+  }
+  if (mayDefer) {
+    // Parsing seeks terms in the segments it may match: fetch the term
+    // dictionaries first, so those seeks read resident bytes.
+    ReadSet reads;
+    try {
+      declareTermReads(req.proto, *req.schema, *req.reader, reads);
+    } catch (const std::exception& e) {
+      LOG_DEBUG("declaring term reads failed: {}", e.what());  // parse reads them as it goes
+      reads.clear();
+    }
+    auto resume = [this, &req, execution](oneapi::tbb::task_group* tg) { plan(req, true, tg, execution); };
+    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+  }
+  plan(req, mayDefer, ownTg, execution);
+}
+
+void SearchEngine::plan(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg,
+                        std::shared_ptr<MetricScope> execution) {
   RootOp* root = nullptr;
   SegmentMask segments;
   try {
-    root = prepare(req);
+    root = parse(req);
     root->init();
     // The one batched point: planning is done and every op's root mask is
     // known, so the segments the search needs materialize now, together:

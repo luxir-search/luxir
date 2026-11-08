@@ -2588,6 +2588,37 @@ message SchemaDef {
   // the defaults without one. mode=set replaces the named entries and keeps
   // the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // How the collection's segments merge: a policy registered under `name`
+  // (built in: "tiered"; plugins add others) and its params. Absent selects
+  // "tiered" with the node's --indexing.merge-factor. An unknown name or a
+  // bad param fails the schema request. mode=set replaces it only when the
+  // request names one; it applies to merge decisions from the next one on.
+  MergePolicyDef merge_policy = 6;
+
+  // Per-segment overlays registered by plugins (for example term filters),
+  // built for the segments of this collection. mode=set replaces the list
+  // only when the request names one. An unknown kind or a bad param fails the
+  // schema request. Segments written earlier gain an overlay at later commits.
+  repeated SegmentOverlayDef segment_overlays = 7;
+}
+
+// One plugin overlay of a collection's segments (SchemaDef.segment_overlays).
+message SegmentOverlayDef {
+  string name = 1;  // [a-z0-9_]+, unique in the schema
+  string kind = 2;  // a kind registered by a plugin
+  // The physical fields the overlay covers: exact names, or globs with one '*'.
+  repeated string fields = 3;
+  map<string, Val> params = 4;  // read by the kind's maker
+  int32 min_docs = 5;           // segments with fewer documents get no overlay
+}
+
+// A merge policy selection (SchemaDef.merge_policy).
+message MergePolicyDef {
+  string name = 1;
+  // Typed params, read by the policy's maker. "tiered" takes merge_factor:
+  // the number of same-level segments that merge into one (>= 2).
+  map<string, Val> params = 2;
 }
 
 message SchemaRequest {

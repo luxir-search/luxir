@@ -28,7 +28,7 @@ protected:
     auto writer = helper.getIndexWriter();
     writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
         FilterCacheConfig{.maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     for (int seg = 0; seg < 4; seg++) {
       auto& inverter = writer->obtainInverter();
       for (int i = 0; i < 160; i++) {

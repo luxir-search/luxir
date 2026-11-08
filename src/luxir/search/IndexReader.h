@@ -598,6 +598,9 @@ public:
   // (FetchCountdown) and then materialize on resident bytes. Reads of
   // memory-backed and mapped files complete inline.
   void declareMaterialize(const SegmentMask& mask, ReadSet& reads) const;
+  // Adds the reads that opening the base of each segment of `mask` makes
+  // (what a term dictionary seek opens), for a fetch ahead of parsing.
+  void declareBases(const SegmentMask& mask, ReadSet& reads) const;
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the readers its publisher holds open (CommitSnapshot::openReaders).

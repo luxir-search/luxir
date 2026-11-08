@@ -684,7 +684,7 @@ TEST_F(KnnQueryTest, forcePrepareCanonicalMainPreparesOnceAcrossVariants) {
 TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);
-  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  h.getIndexWriter()->setMergeFactor(100);
   for (int32_t i = 0; i < 8; i++) {
     h.index(flatdoc(
         "id", std::to_string(i),
@@ -4129,7 +4129,7 @@ TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
   for (auto ann : {pqAnn(8, 2, 2), rabitqAnn(8), rabitqAnn(8, 4)}) for (bool multi : {false, true}) {
     CollectionHelper h("main");
     h.clear();
-    h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+    h.getIndexWriter()->setMergeFactor(100);
     std::string field = multi ? "emb_vs" : "emb_v";
     if (multi) installMultiVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
     else installVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
@@ -4315,7 +4315,7 @@ TEST_F(KnnQueryTest, completionIgnoresOverlayWithNoLiveVectors) {
   KnnQuery::tuning.completion = KnnQuery::Completion::FORCE;
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 1), 4);
-  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  h.getIndexWriter()->setMergeFactor(100);
   std::vector<std::string> deleted;
   for (int i = 0; i < 256; i++) {
     auto doc = flatdoc("id", "a" + std::to_string(i));
@@ -4492,7 +4492,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
   KnnQuery::tuning.plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 16;
   KnnQuery::tuning.filteredCoverageAlpha = 0.5; // The crafted sizes assume this exponent.
   CollectionHelper h("main");
-  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  h.getIndexWriter()->setMergeFactor(100);
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
   for (int s = 0; s < 2; s++) {
     for (int i = 0; i < 1024; i++) {
@@ -4596,7 +4596,7 @@ TEST_F(KnnQueryTest, candidateCapStillAdmitsLaterExactHits) {
   MaxKnnCandidatesGuard cap(1);
   EngineWrapperGuard wrapper([](VectorEngine& engine) { return std::make_unique<ExactLastEngine>(engine); });
   CollectionHelper h("main");
-  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  h.getIndexWriter()->setMergeFactor(100);
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
   for (int i = 0; i < 128; i++)
     h.index(flatdoc("id", std::to_string(i), "emb_v", std::vector<float>{(float)i, 0, 0, 0}));

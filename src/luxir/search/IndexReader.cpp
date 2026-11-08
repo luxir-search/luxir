@@ -50,12 +50,16 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   if (info.kind == TestOverlayAuxReader::KIND) {
     return TestOverlayAuxReader::open(dir, info, missingFileOK);
   }
+  if (const auto* registered = SegmentOverlayRegistry::global().find(info.kind)) {
+    return registered->open(dir, info);
+  }
   IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
   return nullptr;
 }
 
 SegmentOverlayPolicy overlayPolicyOf(std::string_view kind) {
   if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  if (const auto* registered = SegmentOverlayRegistry::global().find(kind)) return registered->policy;
   return {};
 }
 
@@ -329,6 +333,12 @@ void IndexReader::declareMaterialize(const SegmentMask& mask, ReadSet& reads) co
   }
 }
 
+void IndexReader::declareBases(const SegmentMask& mask, ReadSet& reads) const {
+  for (const auto& segment : core->segs) {
+    if (mask.test((size_t)segment.ord) && !segment.isOpen()) segment.sharedBase->declareReads(reads);
+  }
+}
+
 void IndexReader::materialize(const SegmentMask& mask) {
   std::vector<const Segment*> pending;
   for (const auto& segment : core->segs) {
@@ -585,7 +595,8 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
             }
             continue;
           }
-          if (info.kind != VectorAuxReader::KIND && info.kind != TestOverlayAuxReader::KIND) {
+          if (info.kind != VectorAuxReader::KIND && info.kind != TestOverlayAuxReader::KIND
+              && !SegmentOverlayRegistry::global().find(info.kind)) {
             IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
             continue;
           }

@@ -82,7 +82,7 @@ struct SketchAggregateFixture {
     helper = CollectionHelper(node, collectionName);
     auto writer = helper.getIndexWriter();
     // Eight explicit flushes cannot trigger a background merge at this factor.
-    writer->mergePolicy->setMergeFactor(1000);
+    writer->setMergeFactor(1000);
     std::array<std::string, 100> hosts;
     for (size_t i = 0; i < hosts.size(); i++) hosts[i] = "host-" + std::to_string(i);
 

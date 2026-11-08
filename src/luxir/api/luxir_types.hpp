@@ -79,7 +79,7 @@ struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
 struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVal; struct ColVector; struct MultiVector; struct ColInt;
-struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
+struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct MergePolicyDef; struct SegmentOverlayDef; struct SchemaDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef; struct StoredResourceDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
@@ -830,10 +830,23 @@ struct StoredResourceDef {
   std::optional<std::int32_t> zstd_dictionary_bytes;
   std::optional<bool> zstd_dictionary;                          // align 1
 };
-struct SchemaDef {                                                // needs StoredResourceDef
+struct MergePolicyDef {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+};
+struct SegmentOverlayDef {
+  std::string_view name;
+  std::string_view kind;
+  std::span<const std::string_view> fields;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+  int32_t min_docs = 0;
+};
+struct SchemaDef {                                                // needs StoredResourceDef, MergePolicyDef, SegmentOverlayDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
   map_view<std::string_view, StoredResourceDef> stored_resources;
+  std::optional<MergePolicyDef> merge_policy;
+  std::span<const SegmentOverlayDef> segment_overlays;
 };
 struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
 struct ColVector { std::span<const Vector> v; };
@@ -1234,7 +1247,7 @@ LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUX
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVal) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
-LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
+LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(MergePolicyDef) LUXIR_TD(SegmentOverlayDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
@@ -1286,7 +1299,7 @@ LUXIR_ENTRY(ColVal) LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef)
 LUXIR_ENTRY(VectorAnnDef)
-LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
+LUXIR_ENTRY(MergePolicyDef) LUXIR_ENTRY(SegmentOverlayDef) LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(RenameCollectionRequest) LUXIR_ENTRY(RenameCollectionResponse) LUXIR_ENTRY(SwapCollectionsRequest) LUXIR_ENTRY(SwapCollectionsResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
