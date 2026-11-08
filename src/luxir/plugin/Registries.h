@@ -3,6 +3,7 @@
 
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
+#include "luxir/index/SegmentOverlayRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
@@ -31,6 +32,8 @@ struct Registries {
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
   HitDecoratorRegistry& hitDecorators;
+  // Per-segment overlays, selected per collection (SchemaDef.segment_overlays).
+  SegmentOverlayRegistry& segmentOverlays;
 
   static Registries global();
   // Freezes every registry.

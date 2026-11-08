@@ -234,6 +234,47 @@ void noParams(const api::AnalyzerComponent& def) {
   if (!def.params.empty()) throw std::invalid_argument("'" + std::string(def.name) + "' takes no parameters");
 }
 
+namespace {
+
+class FieldListOverlay final : public SegmentOverlayKind {
+  bool fail;
+
+public:
+  explicit FieldListOverlay(bool fail) : fail(fail) {}
+  std::optional<SegmentOverlayOutput> build(const SegmentOverlayBuild& request) const override {
+    if (fail) throw std::runtime_error("example_field_list: failing as asked");
+    std::string text;
+    for (const auto& field : request.fields) text += field + "\n";
+    auto file = request.dir.createFile(request.fileName(0));
+    OutputStream os;
+    os.setFile(&*file);
+    os.write(text.data(), text.size());
+    os.close();
+    request.dir.finishFile(*file);
+    SegmentOverlayOutput output;
+    output.files.push_back(file->descriptor());
+    const std::string meta = std::to_string(request.fields.size());
+    output.meta.assign((const std::byte*)meta.data(), (const std::byte*)meta.data() + meta.size());
+    return output;
+  }
+};
+
+}  // namespace
+
+// Public to the example's tests: what an example_field_list overlay holds.
+class FieldListReader final : public AuxReader {
+  std::string name;
+
+public:
+  std::string fields;
+  std::string meta;
+  FieldListReader(const api::AuxIndexInfo& info, std::string fields)
+      : AuxReader(info.gen, info.built_core_gen), name(info.name), fields(std::move(fields)),
+        meta((const char*)info.opaque_meta.data(), info.opaque_meta.size()) {}
+  std::string_view getKind() const override { return "example_field_list"; }
+  std::string_view getName() const override { return name; }
+};
+
 // Test-only plugin that exercises the plugin framework: analysis components,
 // query types, search ops, HTTP routes, the node lifecycle, and storage
 // backends and layers.
@@ -329,6 +370,18 @@ public:
       if (mode != "count" && mode != "deny") ctx.params.fail("whole_segment_files", "must be count or deny");
       return std::make_unique<test::StrictLayer>(std::move(inner),
           mode == "deny" ? test::StrictWholeFiles::DENY : test::StrictWholeFiles::COUNT);
+    });
+
+    // Writes a file naming the fields it covers; "fail" makes every build throw.
+    r.segmentOverlays.add("example_field_list", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
+      },
+      .open = [](std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info) -> std::shared_ptr<AuxReader> {
+        auto held = files.front()->acquire({0, files.front()->size()});
+        auto bytes = held.bytes();
+        return std::make_shared<FieldListReader>(info, std::string(bytes.data(), bytes.size()));
+      },
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());

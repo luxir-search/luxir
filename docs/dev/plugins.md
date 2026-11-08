@@ -453,6 +453,38 @@ counters. The makers and handlers reach that state through their contexts.
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
 
+## Segment overlays
+
+`Registries::segmentOverlays` (`src/luxir/index/SegmentOverlayRegistry.h`) maps kind names
+to per-segment overlays: extra immutable files a plugin writes for each segment, which the
+manifest then tracks with the segment (replication, snapshots, retirement). A collection
+selects them in its schema:
+
+    "segment_overlays": [{"name": "ids", "kind": "my_kind", "fields": ["trace_id"],
+                          "params": {...}, "min_docs": 10000}]
+
+`fields` are physical field names or globs with one `*`, resolved against each segment; a
+segment with none of them gets no overlay. The schema request builds the kind once, so an
+unknown kind or a param the maker refuses is an `invalid_schema` error.
+
+A kind (`SegmentOverlayKindInfo`) has:
+
+- `maker`: reads `SegmentOverlayContext::params` and returns a `SegmentOverlayKind`, whose
+  `build(const SegmentOverlayBuild&)` writes the overlay's files, each named by
+  `request.fileName(fnum)`, and returns their descriptors and a small `meta` blob. `meta`
+  goes in the manifest and is available when the overlay opens, with no I/O. Returning
+  `nullopt` means the segment needs no overlay. A build that throws leaves the segment
+  without the overlay; indexing is not affected.
+- `open`: returns the `AuxReader` from the overlay's files, which the snapshot already
+  opened (in manifest order). It runs on first use, and reports invalid bytes by throwing
+  `SegmentCorruptError`.
+- `policy`: an `OverlayPolicy`. `ADVISORY` (the default) overlays with invalid bytes read
+  as absent instead of taking the segment out of service; `REQUIRED` ones fail every use.
+
+Overlays are built when a merge finishes and, at commits, for segments that lack one, a few
+per commit: newly flushed segments and, after the schema gains an overlay, the older ones.
+Read a built overlay with `Segment::getAuxReader("<kind>.<name>")`.
+
 ## Analysis components
 
 `Registries::analysis` (`src/luxir/analysis/AnalysisRegistry.h`) maps names to makers

@@ -57,13 +57,15 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 OverlayPolicy overlayPolicyOf(std::string_view kind) {
   if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  if (const auto* registered = SegmentOverlayRegistry::global().find(kind)) return registered->policy;
   return OverlayPolicy::REQUIRED;
 }
 
 } // namespace
 
 bool SegmentOverlay::knownKind(std::string_view kind) {
-  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND;
+  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND
+      || SegmentOverlayRegistry::global().find(kind) != nullptr;
 }
 
 std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir::api::AuxIndexInfo& entry,
@@ -94,6 +96,8 @@ std::shared_ptr<AuxReader> SegmentOverlay::get() {
     std::pmr::monotonic_buffer_resource arena;
     auto entry = toWire(info, arena);
     try {
+      const auto* registered = SegmentOverlayRegistry::global().find(info.kind);
+      if (registered) return registered->open(files, entry);
       if (files.size() != 1) {
         corruptSegment(segment, std::format("overlay '{}': expected 1 file, got {}", info.name, files.size()));
       }
