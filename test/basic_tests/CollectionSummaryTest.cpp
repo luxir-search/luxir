@@ -69,7 +69,7 @@ protected:
     LuxirTest::SetUp();
     helper = std::make_unique<CollectionHelper>("collsum");
     helper->clear();
-    helper->getIndexWriter()->mergePolicy->setMergeFactor(100);
+    helper->getIndexWriter()->setMergeFactor(100);
     helper->getIndexWriter()->collectionSummaryMaxBytes = 64 * 1024;
     QueryPruning::disableForTests = false;
     Signal::listen("segmentMaterialized", [this](void*, void*, void*) -> void* {
