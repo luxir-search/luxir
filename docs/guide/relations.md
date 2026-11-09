@@ -138,8 +138,8 @@ unique among matching clauses in the emitted result; a duplicate is reported
 when that result is emitted, so a streamed response can fail after its first
 batches. Inner hits are collected only from query branches that determine the
 parent match (`must`, `should`, wrapper scores, fusion sources). A `has_child`
-inside a boolean `filter`, a `must_not`, a `dis_max` branch, or a kNN
-prefilter restricts or scores the parents but produces no inner hits.
+inside a boolean `filter`, a `must_not`, or a kNN prefilter restricts the
+parents but produces no inner hits.
 
 ## Vector and hybrid retrieval
 
