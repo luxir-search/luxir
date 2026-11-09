@@ -2450,6 +2450,7 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
+    NESTED = 30;   // array of objects indexed as hidden block-joined child documents
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2568,6 +2569,9 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only: the child object's fields. Addressed as "<path>.<field>".
+  map<string, FieldDef> fields = 41;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

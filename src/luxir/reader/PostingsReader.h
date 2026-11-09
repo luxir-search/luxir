@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+
 #include <atomic>
 #include <limits>
 #include <memory>
@@ -20,6 +23,7 @@
 namespace luxir {
 
 class PostingsReader;
+class NestedBlocks;
 class FieldReader;
 class TermsEnum;
 class DocsEnum;
@@ -48,6 +52,8 @@ class PostingsReader {
   const uint32_t* fieldOffsets = nullptr;
   int64_t fieldOffsetsLoc = 0;
   std::unique_ptr<std::atomic<FieldPage*>[]> fieldPages;
+  std::once_flag nestedBlocksOnce;
+  std::shared_ptr<const NestedBlocks> nestedBlocksValue;
 
 public:
   struct Field : SegFieldInfo {
@@ -111,6 +117,10 @@ public:
 
   int32_t numFields() const noexcept { return nFields; }
   const VersionRuns& versionRuns() const { return versions; }
+
+  // Block-join topology of nested documents, or null without nested docs.
+  // Built once from the segment's immutable postings and shared by all snapshots.
+  std::shared_ptr<const NestedBlocks> nestedBlocks();
 
   // Immutable headers, decoded on first use and shared by all snapshots.
   // Missing names and ordinals outside the field index return nullptr.

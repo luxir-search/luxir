@@ -66,6 +66,13 @@ public:
 
   map_type fieldTypeMap;
   std::set<std::string, std::less<>> relations;
+  // Declared nested paths. Children live in hidden block-joined documents;
+  // the path's own field keeps the original JSON for retrieval.
+  struct NestedDef { std::map<std::string, std::string, std::less<>> fields; };
+  std::map<std::string, NestedDef, std::less<>> nested;
+  // The physical child field for "<path>.<field>", or empty if not a nested field.
+  std::string nestedPhysical(std::string_view name) const;
+  static std::string nestedFieldName(std::string_view path, std::string_view field);
   SchemaBinding binding;
   FileDescriptor file;
   uint64_t gen_ = 0;          // schema generation, set when persisted

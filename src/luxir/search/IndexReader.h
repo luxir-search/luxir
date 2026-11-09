@@ -352,6 +352,8 @@ private:
               std::shared_ptr<FilterCache> filterCache);
 
   std::once_flag relationsOnce;
+  std::once_flag nestedRootsOnce;
+  std::vector<std::unique_ptr<DocSet>> nestedRoots;
   std::shared_ptr<RelationReader> relationsReader;
 public:
   RelationReader& relations();

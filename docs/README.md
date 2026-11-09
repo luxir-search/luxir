@@ -101,5 +101,7 @@ state, and commits are crash-safe on immutable segments.
 Rule of thumb: a page that assumes a source checkout belongs in `dev/` or
 `design/`. Pages in `guide/` start from a running server and a client.
 
+Nested objects: [Nested objects](guide/nested.md) covers block-joined object arrays.
+
 Parent and child records: [Relations](guide/relations.md) covers product variants,
 document chunks, parent-aware vector retrieval, and matching-child evidence.

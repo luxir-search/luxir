@@ -3,6 +3,7 @@
 #include "luxir/search/RelationReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/StrColReader.h"
+#include "luxir/reader/NestedBlocks.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/schema/Schema.h"
 #include <numeric>
@@ -45,10 +46,11 @@ RelationReader::RelationReader(IndexReader& reader) {
       out.relation[i] = entry->second;
     }
     tokens.push_back(strings(reader, segment.ord, "luxir_family_s", docs));
+    auto blocks = segment.postingsReader().nestedBlocks();
     DocSetBuilder roots(segment.maxDoc());
     for (auto doc : docs) {
       if (segment.liveDocs() && !segment.liveDocs()->docset().get(doc)) continue;
-      if (out.relation[doc] != 0) continue;
+      if (out.relation[doc] != 0 || (blocks && blocks->isChild(doc))) continue;
       roots.add(doc);
       if (!tokens.back()[doc].empty()) families[tokens.back()[doc]] = {segment.ord, doc};
     }
@@ -73,6 +75,21 @@ RelationReader& IndexReader::relations() {
 DocSet* IndexReader::rootDomain(int32_t segment) {
   if (!schema()->relations.empty() || field("luxir_relation_s").exists()) return relations().segments[segment].roots.get();
   auto& seg = segments()[segment];
+  if (field(NestedBlocks::PATH_FIELD).exists()) {
+    std::call_once(nestedRootsOnce, [this] {
+      nestedRoots.resize(segments().size());
+      for (auto& s : segments()) {
+        auto blocks = s.postingsReader().nestedBlocks();
+        if (!blocks) continue;
+        DocSetBuilder roots(s.maxDoc());
+        for (int32_t doc = 0; doc < s.maxDoc(); ++doc) {
+          if (!blocks->isChild(doc) && (!s.liveDocs() || s.liveDocs()->docset().get(doc))) roots.add(doc);
+        }
+        nestedRoots[s.ord] = roots.build();
+      }
+    });
+    if (nestedRoots[segment]) return nestedRoots[segment].get();
+  }
   return seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
 }
 }

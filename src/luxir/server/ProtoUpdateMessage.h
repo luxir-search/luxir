@@ -52,6 +52,12 @@ public:
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
+  // Maps logical documents to their physical block when nested objects expand.
+  struct BlockLayout {
+    std::vector<uint32_t> ends;           // end index in req->docs per logical doc
+    std::vector<std::string> errors;      // per logical doc, empty when valid
+  };
+  const BlockLayout* blockLayout = nullptr;
   // Client-visible document count when a request expands into more physical records.
   std::optional<size_t> logicalDocCount;
   // The collection the transport resolved and submitted to; replica waits
