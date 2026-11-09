@@ -570,9 +570,11 @@ allowed. Fields resolve through their `search` bindings, like `match`.
 Duplicate physical targets keep the larger weight, and field order does not
 affect the query.
 
-In `combined` mode, TEXT fields sharing an analyzer and `long_terms` policy
-form a group scored as one field with BM25F. Group membership is determined
-by the schema, independently of the query text. Each group analyzes the text
+In `combined` mode, TEXT fields with the same effective analysis and
+`long_terms` policy form a group scored as one field with BM25F, whether the
+analyzer is inherited from a common parent or declared inline on each field.
+Group membership is determined by the schema, independently of the query text.
+Each group analyzes the text
 once; a term found in several fields saturates once within that group.
 A weight scales its field's term frequency and document length, including
 in a group with just one field. For a term, frequency is the weighted sum of
