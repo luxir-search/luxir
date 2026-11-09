@@ -367,6 +367,6 @@ TEST_F(ParentChildTest, tokensAndUnsupportedPositionsAreRejected) {
     EXPECT_FALSE(update(helper, R"("child_updates":[{"parent_id":"p","relation":"variants","family":")" + token + R"(","docs":[{"id":"v"}]}])").success);
   }
   EXPECT_TRUE(update(helper, R"("child_updates":[{"parent_id":"p","relation":"variants","family":")" + family.families.at("p") + R"(","docs":[{"id":"w","color":"blue"}]}])").success);
-  auto req = search(R"("query":{"dis_max":{"queries":[{"has_child":{"relation":"variants"}}]}})", 1, false);
+  auto req = search(R"("query":{"dis_max":{"queries":[{"has_child":{"relation":"variants"}},{"match":{"field":"title_s","val":"x"}}]}})", 1, false);
   EXPECT_NE(std::string::npos, req->errorMsg().find("has_child")) << req->errorMsg();
 }
