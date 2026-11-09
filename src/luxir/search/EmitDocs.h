@@ -35,6 +35,7 @@
 
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/OrdColReader.h"
+#include "luxir/search/InnerHits.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
@@ -970,6 +971,7 @@ public:
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
+  std::vector<Query::SegmentSource*> evidence;
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
@@ -1001,10 +1003,10 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
                  bool getScores, luxir::api::DocFormat placement, bool parallel, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, std::vector<Query::SegmentSource*> evidence)
       : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
+        metadata(std::move(metadata)), evidence(std::move(evidence)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
         foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
         placement(placement),
         parallel(parallel), colCap(colCap),
@@ -1096,6 +1098,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       fieldMetadataResolved = true;
     }
     if (metadata) metadata(docListProto, batchStart, batchEnd, mr);
+    emitInnerHits(*req.reader, evidence, segDocs, docListProto, mr);
 
     // An isolated context: cancellation of the request group, or of whatever
     // context a resumed emitter runs in, must not skip loaders and leave a
@@ -1439,6 +1442,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
+    if (field.name.starts_with("luxir_")) return;
     if (extraNames.contains(field.name)) {
       throw RequestError("Extra column '" + std::string(field.name)
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
@@ -1455,7 +1459,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
-    auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
+    auto source = req.schema->resolveFor(f == "_family_" ? "luxir_family_s" : f, OpClass::RETRIEVE);
     if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
       auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
       std::string message = "Field '" + std::string(f) + "' has no retrievable value";
@@ -1537,7 +1541,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       DocBatchMetadata metadata = {},
                       bool foundGte = false,
                       bool foundEstimated = false,
-                      std::span<const ExtraColumn> extraColumns = {})
+                      std::span<const ExtraColumn> extraColumns = {},
+                      std::vector<Query::SegmentSource*> evidence = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1583,7 +1588,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata), std::move(evidence));
   req.streamStarted();
   emitter->produce();
 }

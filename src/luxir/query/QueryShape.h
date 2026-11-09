@@ -59,6 +59,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
     case QueryKind::DIS_MAX:
+    case QueryKind::HAS_CHILD:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
@@ -103,6 +104,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
       return true;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::HAS_CHILD:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -145,6 +147,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_POLYGON:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::HAS_CHILD:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -194,6 +197,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
     case QueryKind::MIN_SCORE:
+    case QueryKind::HAS_CHILD:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -255,6 +259,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::ALL:
     case QueryKind::NONE:
     case QueryKind::RESCORE:
+    case QueryKind::HAS_CHILD:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return Query::VerificationWork::UNKNOWN;

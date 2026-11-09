@@ -7,6 +7,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/ApiError.h"
@@ -64,6 +65,7 @@ public:
   using map_type = PhysicalFieldMap;
 
   map_type fieldTypeMap;
+  std::set<std::string, std::less<>> relations;
   SchemaBinding binding;
   FileDescriptor file;
   uint64_t gen_ = 0;          // schema generation, set when persisted

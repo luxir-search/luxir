@@ -303,6 +303,8 @@ public:
 
 
   public:
+    virtual std::vector<Query::SegmentSource*> evidenceSources() { return {}; }
+
     class ExecutionProfileScope {
       ExecutionProfilePieceState* state;
       std::chrono::steady_clock::time_point started;

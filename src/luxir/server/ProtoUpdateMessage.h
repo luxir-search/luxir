@@ -6,6 +6,7 @@
 #include <memory>
 #include <stop_token>
 #include <memory_resource>
+#include <optional>
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -51,6 +52,8 @@ public:
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
+  // Client-visible document count when a request expands into more physical records.
+  std::optional<size_t> logicalDocCount;
   // The collection the transport resolved and submitted to; replica waits
   // target it rather than re-resolving req->collection.
   CollectionId target;

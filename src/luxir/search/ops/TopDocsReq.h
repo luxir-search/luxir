@@ -698,6 +698,13 @@ public:
 
   class CalcBase : public SearchOp::Calculator {
   public:
+    std::vector<Query::SegmentSource*> evidenceSources() override {
+      std::vector<Query::SegmentSource*> sources;
+      if (preparedWeight) sources.push_back(preparedWeight.get());
+      for (auto& source : preparedFilterSources) if (source.prepared) sources.push_back(source.prepared.get());
+      return sources;
+    }
+
     // Page result columns live in the final response arena, pinned through
     // all streaming batches. They are sliced only after every binding closes.
     luxir::api::GroupTable* pageGroups = nullptr;
@@ -835,7 +842,8 @@ public:
 
     DomainHandle resetBaseHandle(int32_t segment) {
       auto& seg = thisOp().req.reader->segments()[(size_t)segment];
-      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().req.reader);
+      DomainHandle live = DomainHandle::pinned(
+          thisOp().req.reader->rootDomain(seg.ord), thisOp().req.reader);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -850,7 +858,7 @@ public:
       if constexpr (Structural) return resetBaseHandle(segment).get();
       else {
         auto& seg = op.req.reader->segments()[(size_t)segment];
-        return seg.liveDocSet();
+        return thisOp().req.reader->rootDomain(seg.ord);
       }
     }
 

@@ -143,6 +143,7 @@ class IndexWriter {
   std::string incarnation;
 
 public:
+  uint64_t epoch() const noexcept { return writerEpoch; }
 
   // The node's and the collection's counters; set by the collection that opens
   // this writer.

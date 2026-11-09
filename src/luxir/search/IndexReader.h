@@ -28,6 +28,7 @@ class FieldType;
 class FilterCache;
 class OrdMap;
 class Schema;
+class RelationReader;
 struct CommitSnapshot;
 
 /// LiveDocs holds the live document bitmap for a segment
@@ -350,7 +351,11 @@ private:
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
 
+  std::once_flag relationsOnce;
+  std::shared_ptr<RelationReader> relationsReader;
 public:
+  RelationReader& relations();
+  DocSet* rootDomain(int32_t segment);
   const std::shared_ptr<Schema>& schema() const noexcept {
     assert(sharedSchema);
     return sharedSchema;

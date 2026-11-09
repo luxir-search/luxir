@@ -33,6 +33,7 @@ struct ParseContext {
   IndexReader* reader = nullptr;
   // Null for offline parsing; request parsers pass their engine's node.
   LuxirNode* node = nullptr;
+  bool childScope = false;
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;
