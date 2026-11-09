@@ -39,6 +39,24 @@ public:
   const std::filesystem::path& path() const { return path_; }
 };
 
+std::string layoutError(const std::filesystem::path& path, bool writable) {
+  FSDirFactory factory(path, !writable);
+  try {
+    TenantCatalog::initialize(factory, writable);
+  } catch (const std::runtime_error& error) {
+    return error.what();
+  }
+  ADD_FAILURE() << "layout was accepted";
+  return {};
+}
+
+void expectLayoutError(const std::filesystem::path& path, std::initializer_list<std::string_view> parts) {
+  for (bool writable : {true, false}) {
+    auto message = layoutError(path, writable);
+    for (auto part : parts) EXPECT_NE(message.find(part), std::string::npos) << message;
+  }
+}
+
 } // namespace
 
 TEST(DirLockTest, rejectsSecondFSDirFactory) {
@@ -85,6 +103,7 @@ TEST(DirLockTest, unownedFactoryRequiresAnExistingDataDir) {
   // Layout validation belongs to the engine.
   FSDirFactory reader(tempDir.path(), true);
   EXPECT_THROW(TenantCatalog::initialize(reader, false), ReadOnlyError);
+  EXPECT_NE(layoutError(tempDir.path(), false).find("read-only"), std::string::npos);
 }
 
 // The decorator is the enforcement point, so it must reject every mutator on the
@@ -144,9 +163,7 @@ TEST(DirLockTest, refusesDataFromAnotherLayout) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "t");
   std::ofstream(tempDir.path() / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
-  { FSDirFactory writer(tempDir.path()); EXPECT_THROW(TenantCatalog::initialize(writer, true), std::runtime_error); }
-  FSDirFactory reader(tempDir.path(), true);
-  EXPECT_THROW(TenantCatalog::initialize(reader, false), std::runtime_error);
+  expectLayoutError(tempDir.path(), {"older layout \"tenant/collection/incarnation 1\"", "\"tenant/catalog/incarnation 2\""});
 }
 
 TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
@@ -224,7 +241,23 @@ TEST(DirLockTest, publicationTempsBelongToOnlyOneNode) {
 TEST(DirLockTest, refusesTheEarlierCollectionsDirectory) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "c" / "default" / "main");
-  { FSDirFactory writer(tempDir.path()); EXPECT_THROW(TenantCatalog::initialize(writer, true), std::runtime_error); }
-  FSDirFactory reader(tempDir.path(), true);
-  EXPECT_THROW(TenantCatalog::initialize(reader, false), std::runtime_error);
+  expectLayoutError(tempDir.path(), {"pre-layout collections tree"});
+}
+
+TEST(DirLockTest, refusesAnUnknownRootMarker) {
+  TempDir tempDir;
+  std::ofstream(tempDir.path() / "LAYOUT") << "something/else 7\n";
+  expectLayoutError(tempDir.path(), {"unsupported data directory layout \"something/else 7\"", "\"tenant/catalog/incarnation 2\""});
+}
+
+TEST(DirLockTest, summarizesAnUnprintableRootMarker) {
+  TempDir tempDir;
+  std::ofstream(tempDir.path() / "LAYOUT") << std::string(100, 'x');
+  expectLayoutError(tempDir.path(), {"unsupported data directory layout \"<100 bytes>\""});
+}
+
+TEST(DirLockTest, refusesAnUnrecognizedNonEmptyDirectory) {
+  TempDir tempDir;
+  std::filesystem::create_directories(tempDir.path() / "stray");
+  expectLayoutError(tempDir.path(), {"no LAYOUT marker but is not empty", "stray"});
 }

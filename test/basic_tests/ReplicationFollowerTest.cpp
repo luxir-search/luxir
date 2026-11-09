@@ -1308,7 +1308,7 @@ TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
   { std::ofstream file(sentinel); file << "keep me"; }
   auto unrelated = pull();
   EXPECT_NE(0, unrelated.first);
-  EXPECT_NE(std::string::npos, unrelated.second.find("empty data directory"));
+  EXPECT_NE(std::string::npos, unrelated.second.find("no LAYOUT marker but is not empty"));
   EXPECT_TRUE(std::filesystem::exists(sentinel));
   followerConfig.store.data_dir = (path / "offline").string();
   stopSource();
@@ -2291,5 +2291,14 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   auto base = path / "follower";
   EXPECT_TRUE(std::filesystem::exists(base / "t" / "t0" / "i" / target / root));
   EXPECT_TRUE(std::filesystem::exists(base / "node" / "replication.json"));
+
+  auto older = path / "older-layout";
+  std::filesystem::create_directories(older / "t");
+  std::filesystem::create_directories(older / "node");
+  std::ofstream(older / "node" / "replication.json") << "{}";
+  std::ofstream(older / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
+  auto refused = promote(older.string());
+  EXPECT_NE(0, refused.first);
+  EXPECT_NE(std::string::npos, refused.second.find("older layout")) << refused.second;
 }
 }
