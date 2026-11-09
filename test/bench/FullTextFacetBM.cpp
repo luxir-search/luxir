@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <variant>
 #include <vector>
@@ -617,6 +618,43 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
     inverter.finishDoc();
   }
 
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+// Two fields of very different length: a short title and a long, skewed body,
+// the shape of a multi_match best_fields over title and text. Zipf-drawn terms
+// so the query terms are present in both fields at different frequencies.
+void buildDisMaxMultiFieldIndex(CollectionHelper& helper, int64_t nDocs) {
+  static const ZipfTable zipf(kBodyVocab, kZipfS);
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hTitle = inverter.getIndexHandler("title_w");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
+  std::mt19937_64 rng(1234);
+  std::string title;
+  std::string body;
+  auto appendTokens = [&](std::string& out, int count) {
+    for (int t = 0; t < count; t++) {
+      out += "t";
+      out += std::to_string(zipf.sample(rng()));
+      out += ' ';
+    }
+  };
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    double u = (double)(rng() >> 11) * 0x1.0p-53;
+    title.clear();
+    body.clear();
+    appendTokens(title, 3 + (int)(rng() % 8));
+    appendTokens(body, 40 + (int)(1500.0 * u * u * u * u));
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hTitle.index(inverter, title);
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
   iw->releaseInverter(inverter, true);
   helper.commit();
 }
@@ -1242,6 +1280,82 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
 }
 
 //
+// dis_max over per-field term disjunctions: the floor has to reach each field's
+// own MaxScore disjunction to skip documents. Compares with the floor
+// forwarded (the fix) and withheld (forward=0), same query and scorers.
+//
+static void BM_DisMaxMultiField(benchmark::State& state, float tie, bool forward,
+                                bool headTerms = false) {
+  using DisMaxScorer = BooleanQuery::MaxScoreDisjunctionScorerT<true>;
+  constexpr int32_t topK = 10;
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(2'000) : 500'000;
+  std::vector<int32_t> docsPerSeg = {(int32_t)nDocs};
+
+  CollectionHelper helper;
+  static std::vector<int32_t> builtShape;
+  bool reuseIndex = builtShape == docsPerSeg && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildDisMaxMultiFieldIndex(helper, nDocs);
+    builtShape = docsPerSeg;
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+
+  auto runQuery = [&](bool pruning) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto fieldClause = [&](const char* field, std::span<const char* const> terms) -> Query* {
+      auto clauses = pool.make_span<Query*>(terms.size());
+      for (size_t i = 0; i < terms.size(); i++) {
+        clauses[i] = pool.make<TermQuery>(field, terms[i]);
+      }
+      return pool.make<BooleanQuery>(std::span<Query*>{}, clauses,
+                                     std::span<Query*>{}, std::span<Query*>{});
+    };
+    const char* midTerms[] = {"t9", "t80", "t600", "t4000"};
+    const char* frequentTerms[] = {"t1", "t12", "t300"};
+    std::span<const char* const> terms = headTerms
+        ? std::span<const char* const>(frequentTerms)
+        : std::span<const char* const>(midTerms);
+    Query* parts[] = {fieldClause("title_w", terms), fieldClause("body_w", terms)};
+    auto* dismax = DisMaxQuery::make(pool, parts, tie);
+    auto* weight = dismax->createWeight(context,
+        Query::NEED_SCORES | (pruning ? Query::ALLOW_PRUNING : 0));
+    TopDocsCollector collector(topK);
+    ScoreTopKResult result;
+    auto segments = context.topReader.segments();
+    for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer == nullptr) continue;
+      collectTopK(segnum, scorer, nullptr, nullptr, collector, pruning);
+      if (auto* outer = dynamic_cast<DisMaxScorer*>(scorer)) result.visited += outer->visited();
+    }
+    auto topDocs = collector.sort();
+    result.topDocs.assign(topDocs.begin(), topDocs.end());
+    sortScoreDocs(result.topDocs);
+    result.fp = scoreTopKFingerprint(result.topDocs);
+    return result;
+  };
+
+  DisMaxScorer::disableDisMaxFloorForwardingForTests = !forward;
+  ScoreTopKResult exhaustive = runQuery(false);
+  ScoreTopKResult pruned = runQuery(true);
+  assertSameTopK(exhaustive, pruned);
+
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runQuery(true);
+    benchmark::DoNotOptimize(result.fp);
+    visited = result.visited;
+  }
+  DisMaxScorer::disableDisMaxFloorForwardingForTests = false;
+  state.counters["visited"] = visited;
+  state.counters["forward"] = forward ? 1 : 0;
+  state.counters["tie_percent"] = std::round(tie * 100.0f);
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+//
 // Multi-segment relevance top-k for cross-segment competitive threshold sharing.
 // Segment 0 owns the global winners, so its filled top-k threshold can prune the
 // lower-scoring later segments when a shared MaxScoreAccumulator is enabled.
@@ -1860,6 +1974,14 @@ LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",  
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
+
+// dis_max over per-field term disjunctions A/B: the floor forwarded vs withheld.
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie0_forward, 0.0f, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie0_withheld, 0.0f, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie03_forward, 0.3f, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie03_withheld, 0.3f, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, head_tie0_forward, 0.0f, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, head_tie0_withheld, 0.0f, false, true);
 
 // Disjunction MaxScore A/B. t0 is the frequent low-idf clause; t1000 is rare
 // enough to lift the top-k threshold but common enough to supply k winners.

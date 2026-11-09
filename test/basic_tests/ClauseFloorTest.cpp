@@ -272,16 +272,16 @@ TEST_F(ClauseFloorTest, deletedDocs) {
   }
 }
 
-TEST_F(ClauseFloorTest, neverForwardedUnderDisMax) {
+TEST_F(ClauseFloorTest, disMaxForwardsFloors) {
   TermQuery alpha("body_w", "alpha");
   FloorQuery floor(clause);
   MemPool pool;
   Query* parts[] = {&floor, &alpha};
-  auto* dismax = DisMaxQuery::make(pool, parts, 0.3f);
-  ASSERT_EQ(QueryKind::DIS_MAX, dismax->getKind());
-  for (bool bulk : {false, true}) {
-    EXPECT_EQ(expectSame(*dismax, 5, bulk, false), 0.0f) << bulk;
-  }
+  // The pull path; a dis_max has no bulk plan.
+  auto* maxOfTwo = DisMaxQuery::make(pool, parts, 0.0f);
+  EXPECT_GT(expectSame(*maxOfTwo, 5, false), 0.0f);
+  auto* tied = DisMaxQuery::make(pool, parts, 0.3f);
+  expectSame(*tied, 5, false);
 }
 
 TEST(ClauseFloor, edgeCases) {
