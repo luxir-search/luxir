@@ -6678,7 +6678,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   LuxirNode node(nodeConfig);
   CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(3);
+  writer->setMergeFactor(3);
   writer->perInverterMaxDocs = 4;
   writer->perInverterRamBytes = 16 * 1024;
 

@@ -2589,6 +2589,21 @@ message SchemaDef {
   // the defaults without one. mode=set replaces the named entries and keeps
   // the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // How the collection's segments merge: a policy registered under `name`
+  // (built in: "tiered"; plugins add others) and its params. Absent selects
+  // "tiered" with the node's --indexing.merge-factor. An unknown name or a
+  // bad param fails the schema request. mode=set replaces it only when the
+  // request names one; it applies to merge decisions from the next one on.
+  MergePolicyDef merge_policy = 6;
+}
+
+// A merge policy selection (SchemaDef.merge_policy).
+message MergePolicyDef {
+  string name = 1;
+  // Typed params, read by the policy's maker. "tiered" takes merge_factor:
+  // the number of same-level segments that merge into one (>= 2).
+  map<string, Val> params = 2;
 }
 
 message SchemaRequest {

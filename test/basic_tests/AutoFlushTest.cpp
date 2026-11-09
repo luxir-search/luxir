@@ -542,7 +542,7 @@ TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
   IndexRamBudget budget;
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
-  iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
+  iw.setMergeFactor(1000);  // count flushed segments only
   iw.pressureFlushFloorBytes = 1;
 
   int docOrd = 0;
@@ -597,7 +597,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   IndexRamBudget budget;
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
-  iw.mergePolicy->setMergeFactor(2);
+  iw.setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
   iw.pressureFlushFloorBytes = 1;
 

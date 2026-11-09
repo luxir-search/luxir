@@ -64,7 +64,7 @@ protected:
         .maxBytes = GetParam() ? 64u << 20 : 0, .minSegmentDocs = 0,
         .admissionThreshold = 2});
     writer->snapshots.readers.filterCache = cache;
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     for (int seg = 0; seg < 3; seg++) {
       auto& inverter = writer->obtainInverter();
       auto& id = inverter.getIndexHandler("id");

@@ -226,7 +226,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_str("--indexing.max-ram-mb, capped at " +
                     std::to_string(IndexConfig::MAX_INVERTER_RAM_CAP_MB));
   app.add_option("--indexing.merge-factor", index.merge_factor,
-                 "Same-level segments required to trigger a merge")
+                 "Same-level segments required to trigger a merge (the tiered merge policy's merge_factor when a collection sets none)")
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));

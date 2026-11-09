@@ -87,7 +87,7 @@ BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReade
 }
 
 std::vector<double> indexPercentileData(CollectionHelper& helper, int segments) {
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   std::mt19937_64 random(29);
   std::lognormal_distribution<double> distribution(3.0, 1.4);
   std::vector<double> values;
@@ -106,7 +106,7 @@ std::vector<double> indexPercentileData(CollectionHelper& helper, int segments) 
 }
 
 void indexSharedSketchData(CollectionHelper& helper) {
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int segment = 0; segment < 3; segment++) {
     std::vector<Doc> docs;
     for (int i = 0; i < 600; i++) {
@@ -565,7 +565,7 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
 
 TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   helper.indexAll({
       flatdoc("id", "a", "s_ss", vecs("a", "c"), "n_is", vec_i(1, 2), "when_dt", int64_t{10},
               "s_s", "a", "n_i", 1, "n_d", 1.5),
@@ -612,7 +612,7 @@ TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
 
 TEST_F(AggregateExprTest, countTakesStringAndIdColumns) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   helper.indexAll({
       flatdoc("id", "a", "s_s", "x", "tags_ss", vecs("p", "q", "r"), "n_i", 1),
       flatdoc("id", "b", "tags_ss", vecs("p"), "n_i", 2)}, UpdateMessage::COMMIT);
@@ -658,7 +658,7 @@ TEST_F(AggregateExprTest, countTakesStringAndIdColumns) {
 
 TEST_F(AggregateExprTest, countReadsStoredValuesOfEveryColumnKind) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   SchemaBuilder schema;
   for (auto [name, indexed, array] : {std::tuple{"set", true, false}, {"array", true, true},
                                       {"raw_set", false, false}, {"raw_array", false, true}}) {
@@ -727,7 +727,7 @@ TEST_F(AggregateExprTest, countAndCardinalitySeeNoValuesInAColumnEmptiedByMerge)
 
 TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   std::mt19937_64 random(5);
   std::set<int64_t> users, values;
   for (int segment = 0; segment < 4; segment++) {

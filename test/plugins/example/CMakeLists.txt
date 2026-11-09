@@ -3,5 +3,5 @@
 
 luxir_add_plugin(NAME example
                  SOURCES ExamplePlugin.cpp
-                 TEST_SOURCES PluginExtensionTest.cpp StorageExampleTest.cpp
+                 TEST_SOURCES PluginExtensionTest.cpp StorageExampleTest.cpp MergePolicyPluginTest.cpp
                  TEST_ONLY)

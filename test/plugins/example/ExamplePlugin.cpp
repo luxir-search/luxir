@@ -44,6 +44,43 @@ class StripXFilter : public CharFilter {
   }
 };
 
+// Merge policy: merges segments whose bounds on one numeric field overlap or
+// touch, so a merged segment keeps a range on that field that excludes it
+// from queries outside it. Segments without values for the field never merge.
+class BoundsOverlapPolicy : public MergePolicy {
+public:
+  std::string field;
+  int64_t minSegments;
+
+  BoundsOverlapPolicy(std::string field, int64_t minSegments) : field(std::move(field)), minSegments(minSegments) {}
+
+  std::vector<MergeSpec> findMerges(std::span<const MergeSegment> segments) const override {
+    struct Range {
+      int64_t min, max;
+      uint64_t segId;
+    };
+    std::vector<Range> ranges;
+    for (const auto& segment : segments) {
+      if (auto bounds = segment.summary->numericBounds(field)) ranges.push_back({bounds->min, bounds->max, segment.segId});
+    }
+    std::ranges::sort(ranges, {}, &Range::min);
+    std::vector<MergeSpec> merges;
+    MergeSpec group;
+    int64_t groupMax = 0;
+    auto close = [&] {
+      if ((int64_t)group.size() >= minSegments) merges.push_back(group);
+      group.clear();
+    };
+    for (const auto& range : ranges) {
+      if (!group.empty() && range.min > groupMax) close();
+      groupMax = group.empty() ? range.max : std::max(groupMax, range.max);
+      group.push_back(range.segId);
+    }
+    close();
+    return merges;
+  }
+};
+
 void noParams(const api::AnalyzerComponent& def) {
   if (!def.params.empty()) throw std::invalid_argument("'" + std::string(def.name) + "' takes no parameters");
 }
@@ -100,6 +137,13 @@ public:
     r.storage.addLayer("counting", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&)
                                        -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingLayer>(std::move(inner));
+    });
+
+    r.mergePolicies.add("example_bounds_overlap", [](const MergePolicyContext& ctx) {
+      std::string field(ctx.params.requireString("field"));
+      int64_t minSegments = ctx.params.getInt("min_segments", 2);
+      if (minSegments < 2) ctx.params.fail("min_segments", "must be at least 2");
+      return std::make_unique<BoundsOverlapPolicy>(std::move(field), minSegments);
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());
