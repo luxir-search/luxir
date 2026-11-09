@@ -495,6 +495,13 @@ The expression form is
 `rescore(title_t:dune, expr=score * log1p(popularity_i))`, whose `$vars`
 bind from the surrounding expression's `vars` map.
 
+Top-k requests ranked by the expression skip blocks of documents when the
+column statistics prove that none of them can reach the current top-k, even
+when the child query matches every document. Per-block statistics apply to
+single-valued numeric and DATE columns. Multi-valued columns use their
+segment-wide bounds, and an expression whose bounds cannot be proven scores
+every matching document.
+
 `min_score` is the counterpart of Elasticsearch's `function_score` and
 `script_score` `min_score`: it compares the expression output, before any
 enclosing `boost`, and removes the document from the match set, so it also

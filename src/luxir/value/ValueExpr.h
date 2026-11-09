@@ -139,16 +139,24 @@ struct BoundValueNode {
   std::optional<IntColReader::BulkIterator> bulkIterator;
   BoundStringColumn* stringColumn = nullptr;
   ValueBounds bounds;
+  ValueBounds windowBounds;
+  screaming::BitSet::Iterator* windowDocs = nullptr;
+  screaming::BitSet::Selector* windowSelector = nullptr;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;
   int64_t valueEnd = 0;
   int32_t bulkLastDoc = -1;
   bool cachedPresent = false;
+  bool hasWindowBounds = false;
 };
 
 class BoundValueProgram {
+  MemPool& pool;
   ValueBounds cachedScoreBounds;
   bool boundsCached = false;
+  // Numeric single-valued column nodes, whose per-leaf stats can narrow bounds.
+  std::span<uint32_t> windowColumns;
+  std::span<ValueBounds> windowScratch;
 
 public:
   const ValueProgram& program;
@@ -172,6 +180,15 @@ public:
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
   const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
+  // Per-window column bounds, for callers that skip by score. Narrows every
+  // eligible column to the leaf zone holding `doc` (see NumColumnFormat) and
+  // returns the last doc that window covers; false from hasColumnWindows()
+  // means there is nothing to narrow.
+  bool hasColumnWindows() const { return !windowColumns.empty(); }
+  int32_t columnWindowUpTo(int32_t doc);
+  // Bounds of the program over the window columnWindowUpTo last computed.
+  // Never throws: a proof of invalidity inside a window only makes it unbounded.
+  const ValueBounds& boundsForColumnWindow(const ValueBounds& scoreBounds);
   std::string_view firstUnboundedNode() const;
 
   ValueResult evalColumn(uint32_t node, int32_t docid, float score);
@@ -185,6 +202,7 @@ private:
   void evalColumnBatch(uint32_t node, std::span<const int32_t> docids,
                        std::span<ValueResult> results);
   void propagateBounds(const ValueBounds& scoreBounds);
+  int32_t narrowColumnToWindow(uint32_t node, int32_t doc);
 };
 
 } // namespace luxir

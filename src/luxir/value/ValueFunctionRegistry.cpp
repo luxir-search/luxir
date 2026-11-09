@@ -2006,10 +2006,40 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
   return pool.make<BoundValueProgram>(pool, *this, segment, fields);
 }
 
+namespace {
+
+// Column endpoints in the stored encoding (see IntColReader::EncodedBounds)
+// to bounds over the decoded values.
+ValueBounds decodeColumnBounds(const ValueNode& node, int64_t min, int64_t max,
+                               bool mayBeMissing) {
+  ValueBounds out;
+  if (node.columnType == FieldType::FLOAT) {
+    out = ValueBounds::floating((double)sortableInt32ToFloat((int32_t)min),
+                                (double)sortableInt32ToFloat((int32_t)max),
+                                mayBeMissing);
+  } else if (node.columnType == FieldType::DOUBLE) {
+    out = ValueBounds::floating(sortableInt64ToDouble(min),
+                                sortableInt64ToDouble(max), mayBeMissing);
+  } else {
+    out = ValueBounds::integer(min, max, mayBeMissing);
+  }
+  out.type = node.type;
+  if (valueDouble(node.type) && bounded(out)
+      && (std::isnan(out.doubleMin) || std::isnan(out.doubleMax))) {
+    // NaN column values evaluate as missing. Encoded endpoint metadata
+    // cannot exclude those values to recover the non-NaN interval.
+    return ValueBounds::unbounded(node.type, true);
+  }
+  return out;
+}
+
+} // namespace
+
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
-    : program(program), segment(segment),
+    : pool(pool), program(program), segment(segment),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
+  uint32_t windowColumnCount = 0;
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
@@ -2038,28 +2068,22 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);
-        } else if (node.columnType == FieldType::FLOAT) {
-          double min = (double)sortableInt32ToFloat((int32_t)encoded.min);
-          double max = (double)sortableInt32ToFloat((int32_t)encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
-          bound.bounds.type = node.type;
-        } else if (node.columnType == FieldType::DOUBLE) {
-          double min = sortableInt64ToDouble(encoded.min);
-          double max = sortableInt64ToDouble(encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
-          bound.bounds.type = node.type;
         } else {
-          bound.bounds = ValueBounds::integer(encoded.min, encoded.max, missing);
-          bound.bounds.type = node.type;
+          bound.bounds = decodeColumnBounds(node, encoded.min, encoded.max, missing);
         }
-        if (valueDouble(node.type) && bounded(bound.bounds)
-            && (std::isnan(bound.bounds.doubleMin)
-                || std::isnan(bound.bounds.doubleMax))) {
-          // NaN column values evaluate as missing. Encoded endpoint metadata
-          // cannot exclude those values to recover the non-NaN interval.
-          bound.bounds = ValueBounds::unbounded(node.type, true);
+        if (!valueArray(node.type) && FieldType::sortsByIntColumn(node.columnType)
+            && !bound.column->multiValued() && encoded.hasValues) {
+          bound.hasWindowBounds = true;
+          windowColumnCount++;
         }
       }
+    }
+  }
+  if (windowColumnCount > 0) {
+    windowColumns = pool.make_span<uint32_t>(windowColumnCount);
+    windowColumnCount = 0;
+    for (uint32_t index = 0; index < nodes.size(); index++) {
+      if (nodes[index].hasWindowBounds) windowColumns[windowColumnCount++] = index;
     }
   }
   propagateBounds(ValueBounds::unbounded(ValueType::DOUBLE));
@@ -2097,6 +2121,91 @@ const ValueBounds& BoundValueProgram::boundsForScore(
     propagateBounds(scoreBounds);
   }
   return nodes[program.rootNode].bounds;
+}
+
+int32_t BoundValueProgram::narrowColumnToWindow(uint32_t index, int32_t doc) {
+  const ValueNode& node = program.nodes[index];
+  BoundValueNode& bound = nodes[index];
+  IntColReader& column = *bound.column;
+  auto missingToEnd = [&] {
+    bound.windowBounds = ValueBounds::unbounded(node.type, true, true);
+    return (int32_t)PostingsReader::END;
+  };
+  constexpr int64_t LEAF = NumColumnFormat::LEAF_ZONE_SIZE;
+  int64_t count = column.docsWithValue();
+  int64_t rank = doc;
+  bool dense = column.denseDocsWithValue();
+  if (!dense) {
+    if (bound.windowDocs == nullptr) {
+      const auto& bits = column.docsWithValueBitSet();
+      bound.windowDocs = pool.make<screaming::BitSet::Iterator>(bits);
+      bound.windowSelector = pool.make<screaming::BitSet::Selector>(
+          bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+    } else if (doc < bound.windowDocs->val()) {
+      bound.windowDocs->reset();
+    }
+    int32_t found = doc > bound.windowDocs->val()
+        ? bound.windowDocs->advance(doc) : bound.windowDocs->val();
+    if (found == screaming::BitSet::END) return missingToEnd();
+    rank = bound.windowDocs->rank();
+  } else if (rank >= count) {
+    return missingToEnd();
+  }
+  int64_t leaf = rank / LEAF;
+  int64_t endRank = std::min((leaf + 1) * LEAF, count);
+  int32_t lastDoc;
+  if (dense) {
+    lastDoc = (int32_t)endRank - 1;
+  } else {
+    lastDoc = endRank < count ? bound.windowSelector->select((int32_t)endRank) - 1
+                              : (int32_t)PostingsReader::END;
+  }
+  bool mayBeMissing = !dense
+      && (lastDoc == (int32_t)PostingsReader::END
+          || (int64_t)lastDoc - doc + 1 != endRank - rank);
+  NumBlockZone zone = column.leafMeta().leafZone(leaf);
+  ValueBounds narrowed = decodeColumnBounds(node, zone.min, zone.max, mayBeMissing);
+  // A leaf value need not be a matching doc's value, so nothing is attained.
+  narrowed.minAttained = narrowed.maxAttained = false;
+  bound.windowBounds = narrowed;
+  return lastDoc;
+}
+
+int32_t BoundValueProgram::columnWindowUpTo(int32_t doc) {
+  int32_t upTo = PostingsReader::END;
+  for (uint32_t index : windowColumns) {
+    upTo = std::min(upTo, narrowColumnToWindow(index, doc));
+  }
+  return upTo;
+}
+
+const ValueBounds& BoundValueProgram::boundsForColumnWindow(
+    const ValueBounds& scoreBounds) {
+  if (windowScratch.empty()) {
+    windowScratch = pool.make_span<ValueBounds>(nodes.size());
+  }
+  for (uint32_t index = 0; index < program.nodes.size(); index++) {
+    const ValueNode& node = program.nodes[index];
+    const BoundValueNode& bound = nodes[index];
+    ValueBounds& out = windowScratch[index];
+    if (node.kind == ValueNodeKind::SCORE) {
+      out = scoreBounds;
+      out.type = ValueType::DOUBLE;
+    } else if (node.kind == ValueNodeKind::FUNCTION) {
+      std::array<ValueBounds, VALUE_MAX_ARITY> children{};
+      for (uint8_t child = 0; child < node.childCount; child++) {
+        children[child] = windowScratch[node.children[child]];
+      }
+      out = node.function->bounds(
+          node, std::span<const ValueBounds>(children.data(), node.childCount));
+    } else if (bound.hasWindowBounds) {
+      out = bound.windowBounds;
+    } else {
+      out = bound.bounds;
+    }
+    if (invalid(out)) out = ValueBounds::unbounded(node.type, true);
+  }
+  return windowScratch[program.rootNode];
 }
 
 std::string_view BoundValueProgram::firstUnboundedNode() const {

@@ -3,6 +3,7 @@
 
 #include <bit>
 #include <cmath>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -58,12 +59,12 @@ struct TopKResult {
 };
 
 TopKResult collect(IndexReader& reader, Query& query, bool pruning,
-                   int64_t count = 7) {
+                   int64_t count = 7, float multiplier = 1.0f) {
   MemPool pool;
   Query::Context context(pool, reader);
   int32_t flags = Query::NEED_SCORES
       | (pruning ? Query::ALLOW_PRUNING : 0);
-  Query::Weight* weight = query.createWeight(context, flags);
+  Query::Weight* weight = query.createWeight(context, flags, multiplier);
   TopDocsCollector collector(count);
   for (auto& segment : reader.segments()) {
     Query::Scorer* scorer = weight->createScorer(pool, segment);
@@ -76,10 +77,10 @@ TopKResult collect(IndexReader& reader, Query& query, bool pruning,
   return {{sorted.begin(), sorted.end()}, visited};
 }
 
-void expectSameTopK(IndexReader& reader, Query& query,
-                    std::string_view label) {
-  TopKResult exhaustive = collect(reader, query, false);
-  TopKResult pruned = collect(reader, query, true);
+void expectSameTopK(IndexReader& reader, Query& query, std::string_view label,
+                    int64_t count = 7, float multiplier = 1.0f) {
+  TopKResult exhaustive = collect(reader, query, false, count, multiplier);
+  TopKResult pruned = collect(reader, query, true, count, multiplier);
   ASSERT_EQ(exhaustive.docs.size(), pruned.docs.size()) << label;
   for (size_t i = 0; i < exhaustive.docs.size(); i++) {
     EXPECT_EQ(exhaustive.docs[i].doc, pruned.docs[i].doc) << label << " rank " << i;
@@ -111,6 +112,83 @@ TEST_F(RescoreQueryTest, nativeDecayPruningMatchesExhaustiveResults) {
     RescoreQuery query(&child, program);
     expectSameTopK(*reader, query, name);
   }
+}
+
+TEST_F(RescoreQueryTest, columnWindowBoundsMatchExhaustiveResults) {
+  CollectionHelper helper;
+  std::mt19937 gen((uint32_t)rng_seed);
+  auto jitter = [&](int span) { return (int)(gen() % (uint32_t)span); };
+  std::vector<Doc> docs;
+  for (int i = 0; i < 6000; i++) {
+    // Values cluster by leaf-sized doc range with many ties, so per-leaf
+    // bounds differ and ties recur across and within leaves.
+    int cluster = (i / 512) % 7;
+    Doc doc = flatdoc("id_s", std::to_string(i),
+                      "body_w", i % 3 == 0 ? "alpha beta" : "alpha",
+                      "v_i", cluster * 40 - 120 + jitter(4),
+                      "d_d", (double)(cluster - 3) * 2.5 + jitter(3) * 0.25,
+                      "when_dt", int64_t{1700000000000} + cluster * 3600000,
+                      "m_is", vec_i(cluster - 3, jitter(5)));
+    if (jitter(3) != 0) {
+      doc.push_back(flatdoc("sp_i", cluster * 11 - 30 + jitter(3))[0]);
+    }
+    docs.push_back(std::move(doc));
+    if (i == 3100) {
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+      docs.clear();
+    }
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  google::protobuf::Arena arena;
+  AllQuery all;
+  TermQuery term("body_w", "alpha");
+  // Every eligible shape, plus those the bounds must leave unproven.
+  for (std::string_view expression : {
+           "v_i", "2.5 * v_i", "-v_i", "0 - v_i * 1.5", "abs(v_i)",
+           "d_d", "d_d * -2.0", "v_i + d_d",
+           "def(sp_i, 0)", "def(sp_i, 1000) * 2", "-def(sp_i, -3)",
+           "1 / (abs(v_i) + 1)", "1 / (abs(def(sp_i, 7)) + 1)",
+           "sqrt(abs(v_i))", "log(abs(v_i) + 1)", "log1p(abs(d_d))",
+           "pow(v_i, 2)", "pow(abs(v_i) + 1, 0.5)", "pow(abs(v_i) + 1, -1)",
+           "v_i > 20 ? v_i : 0 - v_i", "def(sp_i, 0) > 5 ? 3 : 1",
+           "max(v_i, def(sp_i, 0))", "min(v_i, d_d * 4)",
+           "score * def(sp_i, 1)", "score + v_i", "min(score, v_i)",
+           "max(score, d_d)", "(score + v_i) / 2", "score - v_i",
+           "gauss_decay(v_i, 0, 50, 10, 0.3)",
+           "score * exp_decay(def(sp_i, 0), 0, 20)",
+           "linear_decay(when_dt, 1700000000000, 3600000)",
+           "max(m_is) + v_i", "min(m_is) * 2", "count(m_is) + d_d"}) {
+    auto* program = parseValue(arena, *schema, expression);
+    for (Query* child : {(Query*)&all, (Query*)&term}) {
+      RescoreQuery query(child, program);
+      for (int64_t count : {3, 7, 25}) {
+        expectSameTopK(*reader, query, expression, count);
+      }
+      expectSameTopK(*reader, query, expression, 7, 0.25f);
+    }
+  }
+}
+
+TEST_F(RescoreQueryTest, columnWindowsSkipWithoutChildBlocks) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 5000; i++) {
+    docs.push_back(flatdoc("id_s", std::to_string(i), "v_i", 4 - i / 1000));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  google::protobuf::Arena arena;
+  AllQuery all;
+  RescoreQuery query(&all, parseValue(arena, *schema, "1 + v_i * 2"));
+  TopKResult pruned = collect(*reader, query, true, 5);
+  TopKResult exhaustive = collect(*reader, query, false, 5);
+  expectSameTopK(*reader, query, "1 + v_i * 2", 5);
+  EXPECT_EQ(5000, exhaustive.visited);
+  // Once the heap holds the top value, the lower leaves are skipped.
+  EXPECT_LT(pruned.visited, exhaustive.visited / 2);
 }
 
 TEST_F(RescoreQueryTest, fieldMetadataBelongsToEachWeight) {
