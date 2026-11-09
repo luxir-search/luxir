@@ -350,6 +350,7 @@ message Query {
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
     HasChildQuery has_child = 28;   // Search children and return their live parents
+    NestedQuery nested = 30;        // match within a nested path and return the root documents
   }
 }
 
@@ -357,6 +358,17 @@ message InnerHits {
   string name = 1;
   optional int32 limit = 2; // default 1; 0 disables evidence
   repeated string fields = 3;
+}
+
+// Evaluates query and filter against the child objects of one nested path; a
+// root document matches if at least one of its children matches every clause
+// on that same child. score_mode: avg (default), max, min, sum, none.
+message NestedQuery {
+  string path = 1;
+  Query query = 2;
+  repeated Query filter = 3;
+  string score_mode = 4;
+  InnerHits inner_hits = 5;
 }
 
 message HasChildQuery {

@@ -59,3 +59,26 @@ Counts, match-all, and facets over the root documents see only roots. The
 
 Returned documents keep the original structure: `answers` is returned as the
 array of objects that was written, including fields stored only for retrieval.
+
+## Query nested objects
+
+The `nested` query matches within one path and returns root documents. Clauses
+inside it apply to a single child, so a query on two child fields cannot match
+across different children:
+
+```json
+{"query": {"nested": {
+  "path": "answers",
+  "query": {"boolean": {"required": [
+    {"match": {"field": "answers.user", "val": "alice"}},
+    {"range": {"field": "answers.score", "gte": 5}}
+  ]}},
+  "score_mode": "avg",
+  "inner_hits": {"name": "matching", "limit": 3, "fields": ["user"]}
+}}}
+```
+
+`score_mode` is `avg` (default), `max`, `min`, `sum`, or `none`. `filter` adds
+non-scoring child clauses. `inner_hits` returns the matching children's original
+objects in `DocList.matches`, as with relations. A `nested` query cannot contain
+another `nested` or `has_child`, or `knn`.

@@ -1205,6 +1205,13 @@ struct InnerHits {
   std::optional<int32_t> limit;
   std::span<const std::string_view> fields;
 };
+struct NestedQuery {
+  std::string_view path;
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::span<const Query> filter;
+  std::string_view score_mode;
+  std::optional<InnerHits> inner_hits;
+};
 struct HasChildQuery {
   std::string_view relation;
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -1218,7 +1225,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery, HasChildQuery>
+               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery, HasChildQuery, NestedQuery>
       kind;
 };
 struct FamilyUpdate {
@@ -1253,7 +1260,7 @@ struct UpdateRequest {                                         // needs CommitPa
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
-LUXIR_TD(RelationDef) LUXIR_TD(HasChildQuery) LUXIR_TD(InnerHits) LUXIR_TD(FamilyUpdate) LUXIR_TD(ChildUpdate)
+LUXIR_TD(RelationDef) LUXIR_TD(HasChildQuery) LUXIR_TD(NestedQuery) LUXIR_TD(InnerHits) LUXIR_TD(FamilyUpdate) LUXIR_TD(ChildUpdate)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)

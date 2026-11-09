@@ -157,6 +157,7 @@ defaults and constraints are described in the comments and guides.
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
+- [`NestedQuery`](#message-luxir.nestedquery)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
@@ -1702,6 +1703,22 @@ Multi-valued vector column. Empty ArrVector means "doc does not have the field";
 |---|---|---|---|---|
 | <a id="field-luxir.multivector.v"></a>[`v`](#field-luxir.multivector.v) | 1 | [`ArrVector`](#message-luxir.arrvector) | repeated |  |
 
+<a id="message-luxir.nestedquery"></a>
+
+### luxir.NestedQuery
+
+Evaluates query and filter against the child objects of one nested path; a root document matches if at least one of its children matches every clause on that same child. score\_mode: avg (default), max, min, sum, none.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.nestedquery.path"></a>[`path`](#field-luxir.nestedquery.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.nestedquery.query"></a>[`query`](#field-luxir.nestedquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
+| <a id="field-luxir.nestedquery.filter"></a>[`filter`](#field-luxir.nestedquery.filter) | 3 | [`Query`](#message-luxir.query) | repeated |  |
+| <a id="field-luxir.nestedquery.score_mode"></a>[`score_mode`](#field-luxir.nestedquery.score_mode) | 4 | `string` | singular |  |
+| <a id="field-luxir.nestedquery.inner_hits"></a>[`inner_hits`](#field-luxir.nestedquery.inner_hits) | 5 | [`InnerHits`](#message-luxir.innerhits) | singular |  |
+
 <a id="message-luxir.networkinterfacestats"></a>
 
 ### luxir.NetworkInterfaceStats
@@ -1921,6 +1938,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
 | <a id="field-luxir.query.has_child"></a>[`has_child`](#field-luxir.query.has_child) | 28 | [`HasChildQuery`](#message-luxir.haschildquery) | oneof [`kind`](#oneof-luxir.query.kind) | Search children and return their live parents |
+| <a id="field-luxir.query.nested"></a>[`nested`](#field-luxir.query.nested) | 30 | [`NestedQuery`](#message-luxir.nestedquery) | oneof [`kind`](#oneof-luxir.query.kind) | match within a nested path and return the root documents |
 
 <a id="message-luxir.querybucket"></a>
 

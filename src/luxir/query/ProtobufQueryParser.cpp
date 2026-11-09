@@ -274,8 +274,27 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
                                   maxEdits, prefixLength, fuzzyQuery.max_expansions);
 }
 
+luxir::Query* ProtobufQueryParser::parseNested(const api::NestedQuery& spec) {
+  if (context.childScope || context.nestedScope) throw RequestError("nested queries cannot be nested inside a child scope");
+  if (!context.reader || !schema.nested.contains(spec.path)) throw RequestError("unknown nested path: " + std::string(spec.path));
+  if (!spec.score_mode.empty() && spec.score_mode != "avg" && spec.score_mode != "max" && spec.score_mode != "none"
+      && spec.score_mode != "min" && spec.score_mode != "sum") throw RequestError("invalid nested score_mode");
+  if (spec.inner_hits && (spec.inner_hits->name.empty() || spec.inner_hits->limit.value_or(1) < 0 || spec.inner_hits->limit.value_or(1) > 1000))
+    throw RequestError("inner_hits requires a name and limit between 0 and 1000");
+  ParseContext inner(pool, schema, context.arena, context.coerceContext, context.opName, context.warnings, &context.fields, context.node);
+  inner.nestingBudget = context.nestingBudget;
+  inner.reader = context.reader;
+  inner.nestedScope = true;
+  ProtobufQueryParser parser(inner);
+  auto* child = spec.query ? parser.parse(*spec.query) : pool.make<AllQuery>();
+  Query* filter = nullptr;
+  if (!spec.filter.empty()) filter = pool.make<BooleanQuery>(std::span<Query*>{}, std::span<Query*>{},
+      std::span<Query*>{}, parser.parseQueryList(spec.filter), 0);
+  return pool.make<NestedQuery>(child, filter, spec);
+}
+
 luxir::Query* ProtobufQueryParser::parseHasChild(const api::HasChildQuery& spec) {
-  if (context.childScope) throw RequestError("has_child cannot be nested inside a child scope");
+  if (context.childScope || context.nestedScope) throw RequestError("has_child cannot be nested inside a child scope");
   if (!context.reader || !schema.relations.contains(spec.relation)) throw RequestError("unknown relation: " + std::string(spec.relation));
   if (spec.min_children.value_or(1) < 1 || spec.max_children.value_or(INT32_MAX) < spec.min_children.value_or(1))
     throw RequestError("has_child requires 1 <= min_children <= max_children");
@@ -301,6 +320,7 @@ luxir::Query* ProtobufQueryParser::parseHasChild(const api::HasChildQuery& spec)
 }
 
 luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
+  if (context.nestedScope) throw RequestError("knn is not supported inside a nested query");
   const auto& target = context.fields.resolve(knnQuery.field, OpClass::PRIMARY, context.opName);
   auto field = api::build::arenaStr(pool, target.physicalName);
   FieldType& fieldType = *target.fieldType;
@@ -701,6 +721,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     },
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
     [&](const luxir::api::HasChildQuery& h) -> luxir::Query* { return parseHasChild(h); },
+    [&](const luxir::api::NestedQuery& n) -> luxir::Query* { return parseNested(n); },
     [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     [&](const luxir::api::PluginQuery& p) -> luxir::Query* { return parsePlugin(p); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
