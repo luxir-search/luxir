@@ -639,8 +639,10 @@ after changing source limits.
 
 ## Approximate search
 
-Exact search costs one pass over the column per query. For large collections,
-a commit can build approximate nearest-neighbor indexes as segment overlays:
+Exact search costs one pass over the column per query. With `max_parallel: -1`
+the pass splits across worker threads, so a large segment scans in a fraction
+of the serial time; `max_parallel: 0`, the default, stays serial. For large
+collections, a commit can build approximate nearest-neighbor indexes as segment overlays:
 an inverted-file (IVF) index whose lists hold RaBitQ codes by default, or
 explicit product-quantization (PQ) codes, built with FAISS. An overlay is built
 from the vector column, follows its segment through later commits and

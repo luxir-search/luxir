@@ -579,11 +579,29 @@ probe pins remain separate policies.
 
 A single query's scan and rescore run in parallel when the request executes in
 parallel mode. The selected IVF lists are split into contiguous per-segment
-chunks sized by their actual vector counts, and each chunk (plus each
-column-scanned segment) is scanned as an independent task; the terminal
-full-precision rescore runs one task per segment whose candidate bucket
-exceeds a small grain (smaller buckets, including the common small-`k`
-single-segment pool, fold inline on the calling thread).
+chunks sized by their actual vector counts, and each chunk is scanned as an
+independent task. A column-scanned segment splits the same way, on value ranks
+or, when it walks a filter's members, on document ids, into tasks of about
+`scanTaskGrainVectors` vectors (a doc's values stay in one task, and a segment
+under two grains stays whole). The terminal full-precision rescore runs one
+task per segment whose candidate bucket exceeds a small grain (smaller
+buckets, including the common small-`k` single-segment pool, fold inline on
+the calling thread).
+
+Each flat chunk keeps its own top-k. The union of those is cut once per
+segment under the total hit order (score, then segment and rank), so chunking
+cannot change which documents win or how ties break. Chunk witnesses publish
+to the interval floor as they finish so concurrent RaBitQ scans prune against
+them, and a chunk may drop witnesses already below that floor: the terminal
+pass re-registers every kept hit, and a witness below the floor cannot change
+the top-k. `exact: true`, segments the planner routes to exact, and the
+segment-completion path all use the same chunked scan; `max_parallel: 0` keeps
+the single whole-segment scan.
+
+Routing prices the parallel critical path, not CPU work: the exact arm and
+the IVF scan's linear term divide by the number of tasks they split into, up
+to the request's worker count. Completion still compares CPU work, because its
+marginal IVF round is not discounted either.
 
 All IVF chunks and segments share a bounded cut per fresh epoch and persistent
 interval witness state for the query. Task-local handlers batch admissions and

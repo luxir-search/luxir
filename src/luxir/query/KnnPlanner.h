@@ -86,10 +86,16 @@ struct KnnPlanner {
     int32_t nprobe = 0, referenceBreadth = 1;
     double minScanFraction = 0, dimFactor = 1, alpha = 0.25, flatDensity = 0.6;
     Selector selector = Selector::AUTO;
+    // Workers a parallel request can use, and the vectors per scan task (see
+    // KnnQuery::scanTaskGrainVectors). Width 1 is a serial request.
+    int32_t scanWidth = 1;
+    int64_t scanGrain = 8192;
   };
   struct Price {
     Work exact{}, linear{}, fixed{};
-    double exactCost = 0, a = 0, b = 0;
+    // exactWork is CPU work; exactCost its parallel critical path, which is
+    // what routing compares. Serial requests have exactCost == exactWork.
+    double exactWork = 0, exactCost = 0, a = 0, b = 0;
     // Selector correction to the bitmap-priced linear arm. The threshold
     // partitions folded first rounds from resolve-first, fold-on-deepen.
     double resolveExtra = 0, foldCost = 0, foldThreshold = -1, deepenCopy = 0;
@@ -127,6 +133,11 @@ struct KnnPlanner {
     if (request.nprobe == 0 && selectivity < 1)
       fraction *= std::pow(std::max(selectivity, std::numeric_limits<double>::min()), -request.alpha);
     return std::clamp(std::max(fraction, request.minScanFraction), 0.0, 1.0);
+  }
+  // Tasks a scan of n vectors splits into, capped at the workers available.
+  static double speedup(double vectors, const Request& request) {
+    return std::clamp(std::floor(vectors / (double)std::max<int64_t>(1, request.scanGrain)),
+                      1.0, (double)std::max(1, request.scanWidth));
   }
   static double arraySteps(int64_t card) { return (double)std::bit_width((uint64_t)std::max((int64_t)1, card)); }
   static bool canIvf(const Segment& s) {
@@ -179,7 +190,8 @@ struct KnnPlanner {
     p.exact[FLAT_PROBE] = !walk && s.domain ? (double)s.docsWithValue : 0;
     p.exact[SPARSE_MAP] = s.sparse && (walk || !s.multi) ? (double)(walk ? s.domainSize : s.vectors) : 0;
     p.exact[MULTI_MAP] = s.multi ? (double)(walk ? s.eligibleDocs : s.vectors) : 0;
-    p.exactCost = costs.price(p.exact);
+    p.exactWork = costs.price(p.exact);
+    p.exactCost = p.exactWork / speedup((double)(walk ? s.eligibleVectors : s.vectors), request);
     if (!canIvf(s)) return p;
     if (s.unfiltered) p.linear[s.deletes ? ENTRY_BITMAP : ENTRY_NONE] = (double)s.vectors;
     else {
@@ -212,7 +224,8 @@ struct KnnPlanner {
       p.linear[PQ_TABLE_DIM] = s.pqPerListTable ? (double)s.nlist * (1 << s.pqBits) * s.dims : 0;
     } else p.linear[RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
-    p.a = costs.price(p.linear);
+    // The linear arm runs in list-range tasks of about scanGrain live vectors.
+    p.a = costs.price(p.linear) / speedup(initialScanFraction(request, 1) * (double)s.liveVectors, request);
     p.b = costs.price(p.fixed);
     p.intervalReadFraction = costs.intervalReadFraction(s.dims);
     return p;

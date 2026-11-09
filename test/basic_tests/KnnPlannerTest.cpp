@@ -341,3 +341,20 @@ TEST(KnnPlannerTest, intervalTerminalReadsHaveSharedKFloor) {
   KnnPlanner::addIvf(totals, s, plan.prices[0], -1);
   EXPECT_EQ(0, totals.intervalVectors);
 }
+
+TEST(KnnPlannerTest, parallelScanWidthDiscountsExact) {
+  auto s = segment(100000);
+  s.domain = false; s.domainSize = s.maxDoc; s.unfiltered = true; s.codec = KnnPlanner::Codec::RABITQ; s.bounded = false;
+  KnnPlanner::Costs costs;
+  KnnPlanner::Request serial{.k = 10, .boundedTarget = 10, .referenceBreadth = 316, .dimFactor = 1}, parallel = serial;
+  parallel.scanWidth = 8;
+  auto price = KnnPlanner::price(s, serial, costs), wide = KnnPlanner::price(s, parallel, costs);
+  EXPECT_DOUBLE_EQ(price.exactWork, wide.exactWork);
+  EXPECT_DOUBLE_EQ(price.exactCost, price.exactWork);
+  // 100k vectors are 12 grain-sized chunks, capped by the 8 workers.
+  EXPECT_DOUBLE_EQ(wide.exactCost, wide.exactWork / 8);
+  s.vectors = s.liveVectors = s.docsWithValue = s.eligibleDocs = s.eligibleVectors = 12000;
+  EXPECT_DOUBLE_EQ(KnnPlanner::price(s, parallel, costs).exactCost, KnnPlanner::price(s, serial, costs).exactCost);
+  // An undersized IVF scan is one task, so only its exact arm discounts.
+  EXPECT_DOUBLE_EQ(wide.a, price.a);
+}
