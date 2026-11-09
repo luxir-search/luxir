@@ -15,16 +15,7 @@ ReplicationState ReplicationState::read(InputFile& file) {
 
 void ReplicationState::write(Directory& dir) const {
   auto bytes = glz::write_json(*this).value();
-  Directory::FileCreateOptions options; options.expectedSize = bytes.size();
-  auto file = dir.createFile("replication.json.pending", options);
-  OutputStream out(file.get());
-  out.write(bytes.data(), bytes.size()); out.close();
-  dir.finishFile(*file);
-  std::array<std::string, 1> pending{"replication.json.pending"};
-  dir.sync(pending);
-  dir.renameFile("replication.json.pending", "replication.json");
-  std::array<std::string, 1> directory{"."};
-  dir.sync(directory);
+  dir.publishFile("replication.json", std::as_bytes(std::span(bytes)), Directory::PublishMode::REPLACE);
 }
 
 } // namespace luxir

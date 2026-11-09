@@ -178,7 +178,7 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   // check each segment size
   for (size_t i=0; i<docsPerSeg.size(); i++) {
     auto& seg = reader->segments()[i];
-    ASSERT_EQ(seg.postingsReader().maxDoc(), docsPerSeg[i]);
+    ASSERT_EQ(seg.maxDoc(), docsPerSeg[i]);
   }
 
 

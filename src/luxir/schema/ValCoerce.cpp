@@ -16,13 +16,18 @@ namespace luxir {
 int64_t FieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
                                   const CoerceContext& context) const {
   unused(context);
-  coerce::throwCoerce(fieldName, val,
-                      fmt::format("a column value (field type '{}' has no int column)", name_));
+  unused(val, fieldName);
+  throw RequestError(fmt::format("Field type '{}' has no int column", name_));
 }
 
 std::optional<int64_t> FieldType::tryCoerceColInt64(
     const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
-  return coerceColInt64(val, fieldName, context);
+  try {
+    return coerceColInt64(val, fieldName, context);
+  } catch (const RequestError& e) {
+    if (e.code != "invalid_value") throw;
+    return std::nullopt;
+  }
 }
 
 std::string_view FieldType::coerceTerm(const api::Val& val, std::string_view fieldName,

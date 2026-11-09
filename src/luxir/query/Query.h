@@ -22,10 +22,13 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "MultiTermBudget.h"
+#include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/RequestMemTracker.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/DocsEnum.h"
@@ -43,6 +46,7 @@ namespace luxir {
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
+struct CombinedNormTables;
 
 enum class QueryKind : uint8_t {
   TERM = 1,
@@ -61,12 +65,16 @@ enum class QueryKind : uint8_t {
   EXISTS,
   GEO_BOX,
   GEO_DISTANCE,
+  GEO_POLYGON,
   ALL,
   NONE,
   RESCORE,
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
+  // Every query a plugin query type builds (QueryRegistry). Shape questions
+  // get the conservative answers, as for TEST.
+  PLUGIN,
   HAS_CHILD,
   TEST,
 };
@@ -366,6 +374,9 @@ protected:
 
   explicit Query(QueryKind kind) : kind(kind) {}
   Query() = delete;
+  // Queries live in pools (MemPool::make needs them trivially destructible),
+  // so the destructor is non-virtual; protecting it rejects delete via Query*.
+  ~Query() = default;
 
 private:
   // Structural hash, computed once by hash(). Only planning reaches it, and
@@ -542,10 +553,41 @@ public:
     RAW_MEMBERSHIP,
   };
 
+  // Producers and consumers price membership work in one unit, the point
+  // emission: decoding one point into a bitset, about 0.8 ns on hugin. A
+  // producer quotes its arms in it (NumericPredicateQuery's and GeoQuery's
+  // prices; PointsMaterialize prices materialization and verification) and a
+  // consumer the work that producing would spare it (Demand::sparedWork).
   struct Demand {
     int64_t candidates = std::numeric_limits<int64_t>::max();
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
+    // The candidates expected to reach this clause, or -1 when not supplied:
+    // the conjunction yield of a window entry's entries ahead, a pull
+    // clause's other approximations, or a filtered body's matches.
+    // candidates stays the lead's opportunity count.
+    double expectedCandidates = -1;
+    // The consumer's own work, in point emissions, that producing this entry
+    // would spare in proportion to the candidates it rejects: siblings it
+    // would align or advance and lead emissions it would skip. A verifier
+    // cannot spare it, because it is confirmed after that work.
+    double sparedWork = 0;
+
+    // Child opportunities precede sibling rejection. Scale a child's own
+    // full-domain estimate by the original consumer exposure, not final K.
+    // The consumer's expected candidates and spared work are full-domain too
+    // and arrive within the exposure, so they scale with it.
+    Demand exposedTo(int64_t expectedSpan, int32_t maxDoc) const {
+      if (expectedSpan >= maxDoc) return *this;
+      double fraction = (double)std::max<int64_t>(0, expectedSpan)
+          / std::max(1, maxDoc);
+      Demand exposed = *this;
+      exposed.candidates = (int64_t)std::ceil(std::min(candidates, (int64_t)maxDoc) * fraction);
+      exposed.span = std::min(span, expectedSpan);
+      if (expectedCandidates >= 0) exposed.expectedCandidates = expectedCandidates * fraction;
+      exposed.sparedWork = sparedWork * fraction;
+      return exposed;
+    }
 
     static Demand fromCandidatesAndSpan(
         int64_t candidates, int64_t span,
@@ -579,6 +621,8 @@ public:
     };
 
     Demand demand;
+    // Retained across nested resolution; local demand has already been priced.
+    int64_t expectedSpan = std::numeric_limits<int64_t>::max();
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
     MultiTermScorerMode multiTermScorerModeForTests =
         MultiTermScorerMode::AUTO;
@@ -616,6 +660,10 @@ public:
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
+    // Point emissions (see Demand) of one two-phase check, when the arm knows
+    // it. A parent choosing where verification runs prices the checks a
+    // schedule adds with it.
+    std::optional<double> verificationPoints;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -766,7 +814,7 @@ public:
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
         ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    if (domain || segment.hasDeletes()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 
@@ -779,6 +827,13 @@ public:
 
     static bool isMembershipWindowUse(BulkUse use) noexcept {
       return use == BulkUse::MATCH_WINDOWS || use == BulkUse::COUNT_WINDOWS;
+    }
+
+    // Whether a WINDOWS consumer fills windows over an explicit exposure; any
+    // other one pulls the candidates of its lead.
+    static bool fillsExposedWindows(const PlanContext& context) noexcept {
+      return isMembershipWindowUse(context.demand.horizon)
+          && context.expectedSpan != std::numeric_limits<int64_t>::max();
     }
 
     enum class BulkAnswer : uint8_t {
@@ -803,6 +858,9 @@ public:
       // Ask this same planner only for an exact scalar count arm. This never
       // authorizes a bulk build whose output would then be discarded.
       bool requireConstantCount = false;
+      // Economics only: total expected consumption, including disjoint windows
+      // and revisits. Never limits the scorer's membership or exhaustion.
+      Demand expectedConsumption{};
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };
@@ -827,6 +885,9 @@ public:
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
       BulkAnswer statelessReposition = BulkAnswer::NO;
+      // For EXACT_CANDIDATE_SCORING, with no bulk: one scorer produces every
+      // score, so a pruned ranking pass needs no rescoring of its survivors.
+      BulkAnswer rankingScoresExact = BulkAnswer::NO;
 
       [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
         if (buildState == nullptr) return statelessReposition;
@@ -862,7 +923,7 @@ public:
     virtual int64_t cost() = 0;
 
     // Cold membership economics, separate from reset availability and from
-    // cost(), whose upper bound serves lead selection. Instructions are used
+    // cost(), whose cardinality heuristic serves lead selection. Instructions are used
     // here so the linear L1 prefix walk is priced in the same units as fills.
     struct MembershipWork {
       double matches = 0;
@@ -874,6 +935,19 @@ public:
       // routes earn no production credit; a parent cannot sum child credits
       // because candidate-driven execution may never produce their full dfs.
       double savedProduce = 0;
+      // Whether matches estimates the supplier's yield. Otherwise it is only
+      // an opportunity bound (a phrase's cheapest term, a capped threshold).
+      bool knownMatches = false;
+      // Fraction of the docid space the matches can occupy: everything but
+      // the docid runs that hold no match. A conjunction leapfrogging a
+      // produced supplier skips its siblings' documents in those runs.
+      double hull = 1;
+      // Whether hull estimates where the matches lie, which yield knowledge
+      // does not imply (an exact doc set knows its count, not its spread):
+      // for a dense single-valued numeric column, the share of documents in
+      // leaves that can match. Pricing that relies on the matches' support
+      // requires it.
+      bool knownHull = false;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -889,12 +963,36 @@ public:
       }
     };
 
+    // Appends the costs of the approximations a conjunction iterates for this
+    // supplier resolved under `context`: one, its cost(), unless its scorer
+    // exposes approximation enums that the conjunction flattens in its place.
+    virtual void approximationCosts(
+        MemPool& planPool, const PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) {
+      unused(planPool, context);
+      out.push_back(cost());
+    }
+
     virtual MembershipWork membershipWork(int32_t maxDoc) {
       double matches = (double)std::min<int64_t>(cost(), maxDoc);
       // Unknown producers get a conservative scalar-verification price.
       // Materialized membership has no verifier or postings-prefix restart.
-      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
+      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64, 0, true};
       return {matches, 128.0 * maxDoc, 0, 1024, 256};
+    }
+
+    struct MembershipQuote {
+      double matches;
+      double work;
+    };
+
+    // Pure contextual instruction estimate, with no construction, allocation,
+    // or cursor movement. WINDOWS quotes segment yield and full production;
+    // CANDIDATES quotes survivors and verification after rejection proofs.
+    virtual std::optional<MembershipQuote> quoteMembership(
+        const PlanContext& context) const {
+      unused(context);
+      return std::nullopt;
     }
 
     /// Pure description of the scorer returned by resolve() for this exact build
@@ -1085,6 +1183,7 @@ public:
   // owns logical/key memos, validation tracking, and request cache Uses, but
   // deliberately does not initialize per-segment field readers.
   class PlanningContext {
+    RequestMemTracker standaloneMemoryTracker{0};
     struct CachedFilterIdentity {
       FilterKeyScope scope;
       std::optional<FilterKey> key;
@@ -1115,29 +1214,42 @@ public:
 
   public:
     struct Limits {
-      int32_t fuzzyMaxExpansions = 10000;
+      // Request-wide multi-term work allowance, shared by every planning
+      // context of one request. Null gives the context its own unlimited one.
+      MultiTermBudget* multiTermBudget = nullptr;
 
-      constexpr Limits(int32_t fuzzyMaxExpansions = 10000)
-        : fuzzyMaxExpansions(fuzzyMaxExpansions) {}
+      constexpr Limits(MultiTermBudget* multiTermBudget = nullptr)
+        : multiTermBudget(multiTermBudget) {}
     };
 
+  private:
+    std::unique_ptr<MultiTermBudget> ownedMultiTermBudget;
+
+  public:
+    RequestMemTracker& memoryTracker;
     MemPool& pool;
     IndexReader& topReader;
     std::shared_ptr<FilterCache::UseRegistry> filterUses;
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
-        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr,
+        RequestMemTracker* memoryTracker = nullptr, ExecutionProfileSink* profiles = nullptr)
+      : memoryTracker(memoryTracker ? *memoryTracker : standaloneMemoryTracker),
+        pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext), limits(limits),
-        warnings(warnings) {
+        warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
-      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
+      if (this->limits.multiTermBudget == nullptr) {
+        ownedMultiTermBudget = std::make_unique<MultiTermBudget>();
+        this->limits.multiTermBudget = ownedMultiTermBudget.get();
+      }
       auto* filterCache = topReader.filterCache();
       if (this->filterUses == nullptr) {
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
@@ -1308,6 +1420,9 @@ public:
     FilterKeyContext& filterKeyContext;
     Limits& limits;
     FieldInfoMap fieldInfoMap;
+    // Pool-owned norm tables shared by the request's CombinedFieldQuery
+    // weights, one per field weight vector; defined in CombinedFieldQuery.h.
+    CombinedNormTables* combinedNormTables = nullptr;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
             FieldInfoMap&& fieldInfoMap)
@@ -1369,6 +1484,10 @@ public:
     }
 
     PlanningContext& planningContext() const noexcept { return planning; }
+
+    MultiTermBudget& multiTermBudget() const noexcept {
+      return *limits.multiTermBudget;
+    }
 
     google::protobuf::Arena& arena() const noexcept {
       return *allocationArena;
@@ -1586,6 +1705,10 @@ public:
     /// bit-space from createWeight() input flags: input flags say what the
     /// parent requested, traits say what is true of the built weight.
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
+    // Selects matches inside the prepare domain, directly or through any
+    // descendant prepared in it (kNN top-k). Unlike ordinary predicates,
+    // exclusions applied after it can change that selection.
+    static constexpr int32_t CONSUMES_DOMAIN = 1 << 5;
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
@@ -1600,6 +1723,8 @@ public:
 
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
+
+    bool consumesDomain() const noexcept { return (traits & CONSUMES_DOMAIN) != 0; }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
@@ -1827,6 +1952,10 @@ public:
       }
       return filled;
     }
+    /// OR this scorer's matches in [windowStart, windowEnd) into windowBits,
+    /// bit i for doc windowStart + i; no bit at or past windowEnd - windowStart
+    /// is set. Windows arrive forward only but need not be contiguous: a
+    /// consumer may skip windows, and the next fill resumes at its own start.
     virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                                 int32_t windowEnd) {
       skipCount(SkipStats::countBulkFillCalls);
@@ -1927,12 +2056,16 @@ public:
     // This protocol composes with fillWindowBits. After prepareMembership it
     // can drain an exhaustive scored prefix; scoring resumes only after reset. A
     // composite retains ownership of externally driven aliases while draining.
-    // Verification-bearing scorers and composites override
-    // this single-phase default; ordinary next()/advance() remain unchanged.
+    // The default walks the private approximation and verifies only inside the
+    // span, which for a single-phase scorer is exact advance(). Composites
+    // with their own verification order override it; ordinary next()/advance()
+    // remain unchanged.
     virtual int32_t advanceWindow(int32_t min, int32_t max) {
       if (min >= max) return max;
-      int32_t doc = docId();
-      return doc < min ? advance(min) : doc;
+      int32_t doc = approximationDocId();
+      if (doc < min) doc = approximationAdvance(min);
+      while (doc < max && !matches()) doc = approximationNext();
+      return doc;
     }
 
     // Bounded private approximation for membership conjunctions. An exact
@@ -1944,6 +2077,70 @@ public:
     }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
+  };
+
+  // Metadata-only rejection, independent of exact/scoring cursor state. A
+  // possible run is a superset of matches; [target, begin) is proven empty.
+  class MembershipProof {
+  protected:
+    struct Range { int32_t begin, end; };
+
+  private:
+    Range possible{0, 0};
+    int32_t knownFrom = 0;
+
+    [[gnu::noinline]] int32_t seekPossible(int32_t target) {
+      if (target == PostingsReader::END) return target;
+      if (target >= knownFrom && target < possible.begin) return possible.begin;
+      possible = nextRange(target);
+      knownFrom = target;
+      assert(possible.begin >= target && possible.end >= possible.begin);
+      assert(possible.end > target);
+      return possible.begin;
+    }
+
+  protected:
+    // Targets can move backward when a prepared window is intersected.
+    virtual Range nextRange(int32_t target) = 0;
+
+  public:
+    virtual void reset() { possible = {0, 0}; knownFrom = 0; }
+
+    [[gnu::always_inline]] int32_t nextPossible(int32_t target) {
+      assert(target >= 0);
+      if (target >= possible.begin && target < possible.end) return target;
+      return seekPossible(target);
+    }
+
+    // After nextPossible(base) == base, [base, possibleEnd()) needs no mask.
+    int32_t possibleEnd() const { return possible.end; }
+
+    [[gnu::noinline]] void intersect(std::span<uint64_t> words, int32_t base) {
+      int32_t end = (int32_t)std::min<int64_t>(PostingsReader::END,
+          (int64_t)base + (int64_t)words.size() * 64);
+      if (base >= possible.begin && end <= possible.end) return;
+      for (int32_t doc = base; doc < end;) {
+        int32_t next = nextPossible(doc);
+        int32_t stop = std::min(next, end);
+        if (doc < stop) {
+          int32_t first = doc - base;
+          int32_t last = stop - base - 1;
+          int32_t firstWord = first >> 6;
+          int32_t lastWord = last >> 6;
+          uint64_t firstMask = ~0ULL << (first & 63);
+          uint64_t lastMask = ~0ULL >> (63 - (last & 63));
+          if (firstWord == lastWord) {
+            words[(size_t)firstWord] &= ~(firstMask & lastMask);
+          } else {
+            words[(size_t)firstWord] &= ~firstMask;
+            std::fill(words.begin() + firstWord + 1, words.begin() + lastWord, 0);
+            words[(size_t)lastWord] &= ~lastMask;
+          }
+        }
+        if (next >= end) break;
+        doc = std::min(possible.end, end);
+      }
+    }
   };
 
   /// A segment-pool-owned, single-consumption scorer construction token.
@@ -1998,12 +2195,22 @@ public:
 
     const ScorerShape& shape() const noexcept { return recordedShape; }
     const Demand& demand() const noexcept { return planContext.demand; }
+    // What the built scorer iterates as a conjunction lead: its matches, or
+    // for a two-phase scorer its approximation, which the supplier's match
+    // estimate can understate. Conjunctions order their clauses by it.
     int64_t cost() const noexcept { return resolvedCost; }
     // Inspect the resolved graph only when reuse is requested. Computing
     // this recursively during construction taxes ordinary forward searches.
     // Like build(), this borrows the originating supplier graph; keep that
     // graph alive while consulting the plan, including after consumption.
     [[gnu::cold]] virtual bool supportsReset() const noexcept { return false; }
+
+    // An optional independent resource. Only consumers that schedule from
+    // proofs build it; constructing a scorer does not change its protocols.
+    virtual MembershipProof* buildMembershipProof(MemPool& targetPool) {
+      unused(targetPool);
+      return nullptr;
+    }
 
     Scorer* build(MemPool& targetPool) {
       consume();
@@ -2139,6 +2346,16 @@ private:
     std::fill(currentBits.begin(), currentBits.end(), 0);
     fill(scorers[0], currentBits);
     for (size_t i = 1; i < scorers.size(); i++) {
+      // A membership intersection stops at its first empty result; the
+      // skipped filters resume at a later window, and only the window's
+      // words hold bits (fillWindowBits). OR them without branching, so
+      // where the first set word lands steers no branch.
+      if constexpr (!scored) {
+        uint64_t live = 0;
+        size_t words = (size_t) (end - start + 63) >> 6;
+        for (size_t word = 0; word < words; word++) live |= currentBits[word];
+        if (live == 0) return 0;
+      }
       std::fill(scratchBits.begin(), scratchBits.end(), 0);
       fill(scorers[i], scratchBits);
       for (size_t word = 0; word < currentBits.size(); word++) {

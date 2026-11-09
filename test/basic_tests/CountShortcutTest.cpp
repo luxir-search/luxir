@@ -110,7 +110,7 @@ protected:
     if (!scorer) return 0;
     int64_t count = 0;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
-      if (segment.liveDocs() && !segment.liveDocs()->docset().get(doc)) continue;
+      if (segment.hasDeletes() && !segment.liveDocSet()->get(doc)) continue;
       if (!domain || domain->get(doc)) ++count;
     }
     return count;
@@ -125,27 +125,27 @@ protected:
         DocSetBuilder selected(segment.maxDoc()), unfiltered(segment.maxDoc()), empty(segment.maxDoc());
         for (int doc = 0; doc < segment.maxDoc(); doc += 3) {
           unfiltered.add(std::min(doc + 2, segment.maxDoc() - 1));
-          if (!segment.liveDocs() || segment.liveDocs()->docset().get(doc)) selected.add(doc);
+          if (!segment.hasDeletes() || segment.liveDocSet()->get(doc)) selected.add(doc);
         }
         auto domain = selected.build();
         auto rawDomain = unfiltered.build();
         auto noDocs = empty.build();
         for (DocSet* eligibility : { (DocSet*)nullptr, domain.get(), rawDomain.get(), noDocs.get() }) {
           auto shortcut = weight->countShortcut(segment, eligibility);
-          if (!eligibility && !segment.liveDocs() && shortcut.maxMatches != 0) {
+          if (!eligibility && !segment.hasDeletes() && shortcut.maxMatches != 0) {
             EXPECT_EQ(unrestricted, shortcut.how);
           }
           auto* supplier = weight->scorerSupplier(pool, segment);
           auto resolved = QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
             return &resolver == weight ? supplier : resolver.scorerSupplier(pool, segment);
           }, Query::CountHow::INDEX_WALK);
-          auto executorCount = eligibility || segment.liveDocs()
+          auto executorCount = eligibility || segment.hasDeletes()
               ? std::nullopt : QueryPrep::supplierCount(supplier);
           int64_t count = iterated(supplier, pool, segment, eligibility);
           EXPECT_GE(shortcut.maxMatches, count);
           if (shortcut.how != Query::CountHow::ITERATE) { EXPECT_TRUE(resolved.has_value()); }
           if (resolved) { EXPECT_EQ(count, *resolved); }
-          if (!eligibility && !segment.liveDocs() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
+          if (!eligibility && !segment.hasDeletes() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
             EXPECT_TRUE(executorCount.has_value());
           }
           if (executorCount) { EXPECT_EQ(count, *executorCount); }
@@ -608,7 +608,7 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       auto* weight = references[kind]->createWeight(context, 0);
       int64_t expected = 0;
       for (auto& segment : reader->segments()) {
-        DocSet* domain = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
+        DocSet* domain = segment.liveDocSet();
         expected += iterated(weight->scorerSupplier(pool, segment), pool, segment, domain);
       }
       EXPECT_EQ(expected, req->getMatchCount());

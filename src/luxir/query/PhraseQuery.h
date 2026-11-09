@@ -431,6 +431,9 @@ public:
         : Query::Weight(context, query, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
+      // Only exact phrases prune on impacts, which is what an exact count
+      // composed with a separate ranking pass gains.
+      if (needScores && query.getSlop() == 0) traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
@@ -655,6 +658,16 @@ public:
       };
 
     public:
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        BulkPlan plan = Query::ScorerSupplier::planBulk(use, bulkContext);
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING
+            && weight.needsScores() && weight.query.getSlop() == 0) {
+          plan.rankingScoresExact = BulkAnswer::YES;
+        }
+        return plan;
+      }
+
       Supplier(PhraseQuery::Weight& weight, IndexReader::Segment& segment)
           : weight(weight), segment(segment) {}
 
@@ -667,6 +680,22 @@ public:
           if (minCost < 0 || c < minCost) minCost = c;
         }
         return minCost < 0 ? 0 : minCost;
+      }
+
+      // A two-phase conjunction flattens the phrase into its estimate's
+      // conjunction terms.
+      void approximationCosts(
+          MemPool& planPool, const Query::PlanContext& context,
+          boost::container::small_vector_base<int64_t>& out) override {
+        const EstimateMemo& estimate = estimateMemo(planPool, context);
+        if (!estimate.nonempty || context.disableBooleanTwoPhaseForTests) {
+          out.push_back(cost());
+          return;
+        }
+        for (int32_t ordinal : estimate.conjunctionOrder) {
+          int32_t source = estimate.querySlotSources[(size_t)ordinal];
+          out.push_back(weight.cachedTermInfos[(size_t)source]->docFreq(segment.ord));
+        }
       }
 
       Query::ScorerShape describeScorer(
@@ -1208,10 +1237,10 @@ public:
       for (;;) {
         for (int j = 1; j < conjunctionEnums.size(); j++) {
           if (conjunctionEnums[j]->docId() < target) {
-            int32_t id = conjunctionEnums[j]->advance(target);
+            int32_t id = conjunctionEnums[j]->advanceInline(target);
             assert(id >= target);
             if (id > target) {
-              target = firstEnum->advance(id);
+              target = firstEnum->advanceInline(id);
               goto outer;
             }
           }

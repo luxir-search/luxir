@@ -505,6 +505,7 @@ struct NumColumnFormat {
   class LeafMeta {
     const char* zones = nullptr;  // NumBlockZones, then the uint32 orders
     int64_t count = 0;
+    int64_t values = 0;
     ValueSketch sketch;
 
     int64_t orderAt(int64_t order, int64_t rank) const {
@@ -518,13 +519,22 @@ struct NumColumnFormat {
     }
 
   public:
+    // Populations of value ranks, not documents. The OUTSIDE population is
+    // exact at leaf granularity; bounded intervals can leave INSIDE uncertain.
+    struct RangeSummary {
+      int64_t outside = 0;
+      int64_t insideLower = 0;
+      int64_t insideUpper = 0;
+    };
+
     LeafMeta() = default;
 
     // `leafZones` points at the first leaf zone of a column of numValues
     // values; `end` receives the first byte past the sketch.
     LeafMeta(const char* leafZones, int64_t numValues, const char*& end)
         : zones(leafZones),
-          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE) {
+          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE),
+          values(numValues) {
       end = zones + count * (int64_t)(sizeof(NumBlockZone)
                                       + 2 * sizeof(uint32_t));
       if (count == 0) return;
@@ -550,6 +560,41 @@ struct NumColumnFormat {
     int64_t leafByMinAscending(int64_t rank) const { return orderAt(0, rank); }
     int64_t leafByMaxDescending(int64_t rank) const {
       return orderAt(1, rank);
+    }
+
+    RangeSummary summarizeRange(int64_t lo, int64_t hi) const {
+      assert(lo <= hi);
+      if (count == 0) return {};
+      // Independent boundary searches, not forward traversal of leaf ranks.
+      auto prefixCount = [&](auto predicate) {
+        int64_t begin = 0, end = count;
+        while (begin < end) {
+          int64_t mid = begin + (end - begin) / 2;
+          if (predicate(mid)) begin = mid + 1;
+          else end = mid;
+        }
+        return begin;
+      };
+      NumBlockZone tail = leafZone(count - 1);
+      int64_t padding = count * LEAF_ZONE_SIZE - values;
+      auto population = [&](int64_t leaves, bool includesTail) {
+        return leaves * LEAF_ZONE_SIZE - (includesTail ? padding : 0);
+      };
+      int64_t below = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMaxDescending(rank)).max >= lo;
+      }), tail.max < lo);
+      int64_t above = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMinAscending(rank)).min <= hi;
+      }), tail.min > hi);
+      int64_t maxInside = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMaxDescending(rank)).max > hi;
+      }), tail.max <= hi);
+      int64_t minInside = population(count - prefixCount([&](int64_t rank) {
+        return leafZone(leafByMinAscending(rank)).min < lo;
+      }), tail.min >= lo);
+      return {below + above,
+          std::max<int64_t>(0, maxInside + minInside - values),
+          std::min(maxInside - below, minInside - above)};
     }
 
     // Empty for a column without values or written without a sketch.

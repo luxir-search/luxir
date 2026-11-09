@@ -158,6 +158,15 @@ public:
             float* fa = build::allocArray(f32.v, v[i].size(), mr);
             std::copy(v[i].begin(), v[i].end(), fa);
           }
+        },
+        [&](const std::vector<std::vector<double>>& v) {
+          // A list of double arrays, the multi-valued GEO_POINT form.
+          auto& arr = val->kind.emplace<ArrVal>();
+          Val* a = build::allocArray(arr.v, v.size(), mr);
+          for (std::size_t i = 0; i < v.size(); i++) {
+            double* da = build::allocArray(a[i].kind.emplace<ArrDouble>().v, v[i].size(), mr);
+            std::copy(v[i].begin(), v[i].end(), da);
+          }
         }
       }, nv.val);
       fields[fi++] = Pair{build::arenaStr(mr, nv.name), {val}};
@@ -418,7 +427,7 @@ public:
     if (reuseIndex) {
       for (size_t i = 0; i < docsPerSeg.size(); i++) {
         auto& seg = reader->segments()[i];
-        if (seg.postingsReader().maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
+        if (seg.maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
       }
     }
     return reuseIndex;

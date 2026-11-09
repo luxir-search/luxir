@@ -146,6 +146,15 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   EXPECT_THROW(dat.coerceColInt64(sval("not a date"), "f"), std::runtime_error);
 }
 
+TEST_F(ValCoerceTest, baseTryColumnCoercion) {
+  IntFieldType integer("int");
+  // Call the base fallback while retaining virtual dispatch to the real coercer.
+  EXPECT_EQ(7, integer.FieldType::tryCoerceColInt64(sval("7"), "f"));
+  EXPECT_FALSE(integer.FieldType::tryCoerceColInt64(sval("bad"), "f"));
+  FieldType unsupported("none", FieldType::NONE, 0);
+  EXPECT_THROW(unsupported.tryCoerceColInt64(sval("7"), "f"), RequestError);
+}
+
 TEST_F(ValCoerceTest, tryColumnCoercion) {
   IntFieldType integer("_i");
   FloatFieldType floating("_f");

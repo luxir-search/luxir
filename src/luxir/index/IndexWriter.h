@@ -20,6 +20,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
+#include "luxir/store/IncarnationState.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -49,6 +50,10 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
+    uint64_t creatorEpoch;
+    uint64_t initialLiveGen = 0;
+    uint64_t initialLiveEpoch;
+    uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
@@ -75,8 +80,8 @@ public:
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
     std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
-    // Schema generation this segment was indexed under.
-    uint64_t schemaGen = 0;
+    // Oldest input schema binding; merging does not backfill fields.
+    SchemaBinding schema;
 
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
@@ -99,22 +104,22 @@ public:
     std::vector<AuxInfo> auxOverlays;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
+    uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
-    // firendly name for logs that match the segment filenames for easier debugging.
-    static std::string name(uint64_t segId) {
-      return Postings::getIndexFileNamePrefix(segId);
-    }
+    SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
+      : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
+        maxDoc(nDocs), liveDocs(nDocs) {}
 
+    // Friendly name for logs that matches the segment filenames.
     std::string name() const {
-      return name(segId);
+      return "s" + Postings::segmentKey(segId, creatorEpoch);
     }
   };
 
 
 inline std::string format_as(const SegInfo& seg) {
   return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schemaGen, seg.personalDeletes.size());
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schema.generation(), seg.personalDeletes.size());
 }
 
 
@@ -132,6 +137,8 @@ class IndexWriter {
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t completedUpdateVersion = 0; // indexMutex
+  IncarnationState writerState;
+  uint64_t writerEpoch = 0;
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 
@@ -299,7 +306,7 @@ public:
       {
         // const std::lock_guard<std::mutex> lock(iw.indexMutex);
         mergeLevel = _update(seg);
-        if (mergeLevel < 0 || outstandingMerges > 0) {
+        if (mergeLevel < 0 || outstandingMerges > 0 || iw._forceMergePendingLocked()) {
           return false;
         }
       }
@@ -350,6 +357,11 @@ public:
   // protected by indexMutex
   std::vector<std::unique_ptr<SegInfo>> segmentsToDelete;
 
+  // Retired segments whose files are deleted, waiting for segmentReleaseNode
+  // to drop their readers.  protected by retiredMutex
+  std::mutex retiredMutex;
+  std::vector<std::unique_ptr<SegInfo>> retiredSegments;
+
 
   // protected by indexMutex
   // If we don't need to look up by segment id, we could just use a vector for idleInverters.
@@ -367,6 +379,16 @@ public:
   // is completed.  Protected by indexMutex.
   std::deque<UpdateMessage*> pendingForceMerges;
   UpdateMessage* activeForceMerge = nullptr;
+  // max_segments commits from initiation through their commit body.  Until a
+  // force merge is in the (serial) merge queue, policy merges hold off: one
+  // queued ahead of it, e.g. started by the commit's own flushes, would rewrite
+  // segments the force merge rewrites again.  Policy merges submitted after it
+  // run after it.  Protected by indexMutex.
+  int32_t forceMergeIntents = 0;
+
+  bool _forceMergePendingLocked() const {
+    return forceMergeIntents > 0 || !pendingForceMerges.empty();
+  }
 
   // The last updateNumber generated (the first update number generated will be 1).
   // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
@@ -396,6 +418,7 @@ public:
   // Schema generation read from IndexInfo on startup and advanced only after
   // a new commit is durable. Protected by indexMutex.
   uint64_t schemaGen_ = 0;
+  uint64_t nextSchemaVersion = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // manifest. Both commit and schema publication update these under
@@ -533,11 +556,16 @@ public:
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
-  using PressureCheckMultiFunc =
+  using ContinueMultiFunc =
       tbb::flow::multifunction_node<tbb::flow::continue_msg, std::tuple<void*>>;
-  std::unique_ptr<PressureCheckMultiFunc> pressureCheckNode;
+  std::unique_ptr<ContinueMultiFunc> pressureCheckNode;
   std::atomic<bool> pressureCheckQueued = false;
   IndexRamBudget::PressureRegistration pressureRegistration;
+
+  // Drops retired segments' readers.  That unmaps their files, which for a
+  // large merge's sources can take most of a second (on tmpfs the unmap frees
+  // the unlinked files' pages), so it stays off the commit that retired them.
+  std::unique_ptr<ContinueMultiFunc> segmentReleaseNode;
 
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
@@ -786,6 +814,7 @@ private:
   void completeForceMergeOrigins(const std::vector<UpdateMessage*>& origins);
   void enqueueForceMerge(UpdateMessage& origin);
   void completeForceMerge(MergeMessage& msg);
+  void _resumePolicyMergesLocked();
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
@@ -838,6 +867,7 @@ private:
   void tryDeleteSegments();
   std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
+  void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
@@ -857,6 +887,9 @@ public:
 
   // Cheap test-only snapshot of committed and buffered index state.
   bool testIsEmpty();
+
+  // Waits for queued graph work, including releasing retired segments.
+  void testDrain() { updateGraph->wait_for_all(); }
 
   // Test hook for the rebuild-without-reindex path: remove an overlay entry
   // from one live segment, leaving the segment data untouched.

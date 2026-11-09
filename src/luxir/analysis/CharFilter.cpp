@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 #include "luxir/analysis/CharFilter.h"
+#include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/analysis/HtmlEntities.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/screaming.h"
@@ -397,51 +398,56 @@ class HtmlStripFilter : public CharFilter {
 };
 } // namespace
 
-std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def) {
-  constexpr std::string_view valid = "nfkc_cf, mapping, html_strip";
-  if (def.name == "mapping") {
-    struct Factory : CharFilterFactory {
-      std::shared_ptr<const MappingTrie> trie;
-      std::unique_ptr<CharFilter> create() const override { return std::make_unique<MappingFilter>(trie); }
-    };
-    auto trie = std::make_shared<MappingTrie>();
-    bool found = false;
-    for (const auto& [key, value] : def.params) {
-      if (key != "mappings") badMapping("unknown parameter '" + std::string(key) + "'; valid parameters: mappings");
-      found = true;
-      if (auto* list = std::get_if<api::ArrStr>(&value->kind)) {
-        for (auto rule : list->v) trie->add(rule);
-      } else if (auto* list = std::get_if<api::ArrVal>(&value->kind)) {
-        for (const auto& item : list->v) {
-          auto* rule = std::get_if<std::string_view>(&item.kind);
-          if (!rule) badMapping("mappings must be a list of strings");
-          trie->add(*rule);
-        }
-      } else {
-        badMapping("mappings must be a list of strings");
+namespace {
+std::unique_ptr<const CharFilterFactory> mappingCharFilter(const api::AnalyzerComponent& def) {
+  struct Factory : CharFilterFactory {
+    std::shared_ptr<const MappingTrie> trie;
+    std::unique_ptr<CharFilter> create() const override { return std::make_unique<MappingFilter>(trie); }
+  };
+  auto trie = std::make_shared<MappingTrie>();
+  bool found = false;
+  for (const auto& [key, value] : def.params) {
+    if (key != "mappings") badMapping("unknown parameter '" + std::string(key) + "'; valid parameters: mappings");
+    found = true;
+    if (auto* list = std::get_if<api::ArrStr>(&value->kind)) {
+      for (auto rule : list->v) trie->add(rule);
+    } else if (auto* list = std::get_if<api::ArrVal>(&value->kind)) {
+      for (const auto& item : list->v) {
+        auto* rule = std::get_if<std::string_view>(&item.kind);
+        if (!rule) badMapping("mappings must be a list of strings");
+        trie->add(*rule);
       }
+    } else {
+      badMapping("mappings must be a list of strings");
     }
-    if (!found) badMapping("missing required parameter 'mappings'");
-    for (auto& node : trie->nodes) std::sort(node.edges.begin(), node.edges.end());
-    auto factory = std::make_unique<Factory>();
-    factory->name = def.name;
-    factory->normalizing = true;
-    factory->trie = std::move(trie);
-    return factory;
   }
-  if (def.name == "html_strip" || def.name == "nfkc_cf") {
-    if (!def.params.empty()) throw std::invalid_argument("char filter '" + std::string(def.name) + "' takes no parameters");
-    struct Factory : CharFilterFactory {
-      std::unique_ptr<CharFilter> create() const override {
-        if (name == "html_strip") return std::make_unique<HtmlStripFilter>();
-        return makeNfkcCfCharFilter();
-      }
-    };
-    auto factory = std::make_unique<Factory>();
-    factory->name = def.name;
-    factory->normalizing = def.name != "html_strip";
-    return factory;
-  }
-  throw std::invalid_argument("unknown char filter '" + std::string(def.name) + "'; valid char filters: " + std::string(valid));
+  if (!found) badMapping("missing required parameter 'mappings'");
+  for (auto& node : trie->nodes) std::sort(node.edges.begin(), node.edges.end());
+  auto factory = std::make_unique<Factory>();
+  factory->name = def.name;
+  factory->normalizing = true;
+  factory->trie = std::move(trie);
+  return factory;
+}
+
+template <std::unique_ptr<CharFilter> (*Make)(), bool Normalizing>
+std::unique_ptr<const CharFilterFactory> plainCharFilter(const api::AnalyzerComponent& def) {
+  if (!def.params.empty()) throw std::invalid_argument("char filter '" + std::string(def.name) + "' takes no parameters");
+  struct Factory : CharFilterFactory {
+    std::unique_ptr<CharFilter> create() const override { return Make(); }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = def.name;
+  factory->normalizing = Normalizing;
+  return factory;
+}
+
+std::unique_ptr<CharFilter> makeHtmlStripFilter() { return std::make_unique<HtmlStripFilter>(); }
+} // namespace
+
+void AnalysisRegistry::registerBuiltinCharFilters() {
+  addCharFilter("nfkc_cf", plainCharFilter<makeNfkcCfCharFilter, true>);
+  addCharFilter("mapping", mappingCharFilter);
+  addCharFilter("html_strip", plainCharFilter<makeHtmlStripFilter, false>);
 }
 } // namespace luxir

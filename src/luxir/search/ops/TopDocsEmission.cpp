@@ -254,7 +254,7 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.emitCount, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata), false, calc.evidenceSources());
+    settings.documentFormat, emission, std::move(metadata), false, false, {}, calc.evidenceSources());
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
@@ -321,14 +321,23 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, false, calc.evidenceSources());
+        emission, {}, false, false, {}, calc.evidenceSources());
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
       // Opening the threshold alone does not invalidate an exhaustive count.
       int64_t found = collector.totalHits();
       bool foundGte = qr.boundedCount && collector.countIncomplete;
-      if (foundGte) found = qr.requirements.countLimit;
+      bool foundEstimated = false;
+      if (foundGte && qr.estimateCount) {
+        // Ranking pruned somewhere, so the segments' shares are the answer. All
+        // of them can still be exact, from metadata or a full count.
+        found = std::max(collector.estimatedHits, qr.requirements.countLimit);
+        foundEstimated = collector.countEstimated;
+        foundGte = !foundEstimated && collector.countFloored;
+      } else if (foundGte) {
+        found = qr.requirements.countLimit;
+      }
       emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
@@ -340,7 +349,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte, calc.evidenceSources());
+        emission, {}, foundGte, foundEstimated, {}, calc.evidenceSources());
     }
   }
 

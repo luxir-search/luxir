@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "gtest/gtest.h"
 
 #include <algorithm>
@@ -193,7 +194,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
 
   {
     FSDirectory dir(path);
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
 
     auto submit = [&](bool commit) {
@@ -223,7 +224,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
       return message.result.ok();
     };
 
-    std::string firstFile = Postings::getIndexFileName(Postings::getSortableString(1), 0);
+    std::string firstFile = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0);
     std::filesystem::path failingTmp = path / (firstFile + ".tmp");
     std::filesystem::create_symlink("/dev/full", failingTmp);
 
@@ -261,7 +262,7 @@ TEST_F(VectorColTest, indexingStreamsReuseAndCollapse) {
 
   std::vector<Directory::FileInfo> files;
   testIndex.dir.listFiles(files);
-  std::string dataPrefix = Postings::getIndexFileNamePrefix(segId) + "_";
+  std::string dataPrefix = Postings::getIndexFileNamePrefix(segId, 1);
   size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const Directory::FileInfo& file) {
     return file.name.starts_with(dataPrefix);
   });
@@ -575,7 +576,7 @@ TEST_F(VectorColTest, strictDimsRejectsMismatch) {
   auto schema = std::make_shared<Schema>();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/4);
   schema->fieldTypeMap["strict_v"] = strictType;
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   auto& vh = inverter.getIndexHandler("strict_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -809,7 +810,7 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
       "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
   schema->fieldTypeMap["cos_v"] = cosineType;
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   auto& vh = inverter.getIndexHandler("cos_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -818,27 +819,30 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
   EXPECT_NO_THROW(indexVal(inverter, vh, zero));
 }
 
-// Every element must be a finite float32, whatever arm carries it: a double past
-// float32 range, or a NaN/Inf in a double or typed f32 vector, fails the document
-// (cosine included - it is not skipped as a zero vector).
-TEST_F(VectorColTest, rejectsNonFiniteElements) {
+// Every element must be a finite float32 of magnitude at most 2^40, whatever arm
+// carries it: a double past float32 range, a NaN/Inf in a double or typed f32
+// vector, or a larger finite element fails the document (cosine included - it is
+// not skipped as a zero vector).
+TEST_F(VectorColTest, rejectsOutOfRangeElements) {
   RAMDir dir;
   auto schema = std::make_shared<Schema>();
   schema->fieldTypeMap["strict_v"] = std::make_shared<VectorFieldType>("strict_v", /*dims=*/3);
   schema->fieldTypeMap["cos_v"] = std::make_shared<VectorFieldType>(
       "cos_v", /*dims=*/3, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE);
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   std::pmr::monotonic_buffer_resource mr;
 
-  auto expectElement1 = [&](const char* field, const luxir::api::Val& val) {
+  auto expectError = [&](const char* field, const luxir::api::Val& val, std::string_view msg) {
     try {
       indexVal(inverter, inverter.getIndexHandler(field), val);
-      ADD_FAILURE() << "expected a non-finite element error";
+      ADD_FAILURE() << "expected error: " << msg;
     } catch (const std::runtime_error& e) {
-      EXPECT_NE(std::string_view(e.what()).find("element 1 is not a finite float32"),
-                std::string_view::npos) << e.what();
+      EXPECT_NE(std::string_view(e.what()).find(msg), std::string_view::npos) << e.what();
     }
+  };
+  auto expectElement1 = [&](const char* field, const luxir::api::Val& val) {
+    expectError(field, val, "element 1 is not a finite float32");
   };
   using DL = std::numeric_limits<double>;
   using FL = std::numeric_limits<float>;
@@ -848,6 +852,12 @@ TEST_F(VectorColTest, rejectsNonFiniteElements) {
   expectElement1("strict_v", makeVec(mr, {0.5f, FL::quiet_NaN(), 0.5f}));
   expectElement1("strict_v", makeVec(mr, {0.5f, FL::infinity(), 0.5f}));
   expectElement1("cos_v", makeVec(mr, {0.5f, FL::quiet_NaN(), 0.5f}));
+
+  expectError("strict_v", makeDoubles(mr, {0.5, 1e13, 0.5}), "element 1 (1e+13) exceeds");
+  expectError("cos_v", makeVec(mr, {0.5f, -1e13f, 0.5f}), "element 1 (-1e+13) exceeds");
+  inverter.setDoc(0);
+  EXPECT_NO_THROW(indexVal(inverter, inverter.getIndexHandler("strict_v"),
+                           makeVec(mr, {0.5f, -0x1p40f, 0.5f})));
 }
 
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.

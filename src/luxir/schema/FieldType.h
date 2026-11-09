@@ -14,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -54,6 +55,26 @@ public:
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
 
+  enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
+
+  static constexpr Storage storage(Type type) {
+    switch (type) {
+      case NONE: return Storage::NONE;
+      case STRING: case ID: return Storage::TERMS;
+      case TEXT: return Storage::TEXT;
+      case BIN: return Storage::BIN;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: return Storage::INT64;
+      case VECTOR: return Storage::VECTOR;
+    }
+    throw std::invalid_argument("Unknown field storage type");
+  }
+
+  static constexpr bool usesOneDimensionalPoints(Type type) {
+    return storage(type) == Storage::INT64 && type != GEO_POINT;
+  }
+
+  static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
+
   static std::string_view typeName(Type type);
   // Decode parameters using the persisted type, independently of any schema.
   // Unknown types and bits are invalid. DATE defines its unit in bit 0.
@@ -90,6 +111,22 @@ public:
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
+
+  static_assert([] {
+    constexpr flag_type bits[] = {
+      INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
+      INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
+      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
+      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+    };
+    flag_type used = 0;
+    for (auto bit : bits) {
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      used |= bit;
+    }
+    return true;
+  }(), "Field flags must use distinct single bits");
 
   const FieldType::Type type_;
   const std::string name_;
@@ -166,9 +203,6 @@ public:
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   bool isStored() { return (bool) (flags_ & STORED); }
-
-  // ID uses the indexed STRING representation in segment metadata.
-  Type persistedType() const { return type_ == ID ? STRING : type_; }
 
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce
@@ -361,7 +395,7 @@ public:
 };
 
 // Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
-// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// defaults applied: RaBitQ unless explicitly selected otherwise). Build-time
 // parameters are recorded in each overlay's VectorAuxMeta, so a change only
 // affects overlays built afterwards;
 // rabitqQueryBits is a search-time parameter read from the current schema.
@@ -370,16 +404,25 @@ struct VectorAnnConfig {
     RABITQ = 0,
     PQ = 1,
   };
-  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 0;
   static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
   static constexpr int32_t DEFAULT_PQ_BITS = 8;
 
-  Codec codec = PQ;
+  Codec codec = RABITQ;
   int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
   int32_t rabitqBits = DEFAULT_RABITQ_BITS;
   int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
   int32_t pqM = 0;    // 0 = derived from dims
   int32_t pqBits = DEFAULT_PQ_BITS;
+
+  // A second bit narrows the estimate intervals, so fewer candidates need
+  // exact rescoring; the gain shrinks as dims grow. Measured k=100 latency
+  // gain of 2 bits: about 22% at 128-256 dims, 13% at 384, 9% at 512, ~1% at
+  // >= 768; at k=10 none from 384 up. Build CPU is 1.5-1.8x either way.
+  static constexpr int32_t RABITQ_ONE_BIT_MIN_DIMS = 384;
+  int32_t resolvedRabitqBits(int32_t dims) const {
+    return rabitqBits != 0 ? rabitqBits : (dims < RABITQ_ONE_BIT_MIN_DIMS ? 2 : 1);
+  }
 };
 
 // Dense float vector field.  Values are stored as fixed-size byte blobs
@@ -406,6 +449,10 @@ public:
 
   // Squared norm at or below which a cosine vector has no direction.
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+  // Largest accepted element magnitude.  Squared norms stay below dims * 2^80,
+  // far enough under float32 range that every distance FAISS computes while
+  // training, assigning, and encoding, and every exact score, stays finite.
+  static constexpr float MAX_ELEMENT_MAGNITUDE = 0x1p40f;
 
   int32_t inputDims_;
   int32_t truncateDims_;
@@ -446,7 +493,8 @@ public:
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
-  // (or truncateDims() for an already truncated vector), all finite.  Returns
+  // (or truncateDims() for an already truncated vector), all finite with
+  // magnitude at most MAX_ELEMENT_MAGNITUDE.  Returns
   // the error text, or empty when vec is valid.  A valid vec is stored and
   // searched as its first storedSize(vec.size()) components.
   std::string inputError(std::span<const float> vec) const;

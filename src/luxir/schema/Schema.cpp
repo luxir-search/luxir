@@ -151,12 +151,13 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
 
 // An authored analyzer that says something: a tokenizer component (which must
 // then name a tokenizer - params-only input is an error, not a silent default)
-// or any filter. {} inherits; token filters alone replace the whole parent
-// analyzer and get the whitespace tokenizer; char filters alone keep its chain.
+// or any filter, or a named analyzer. {} inherits; token filters alone replace
+// the whole parent analyzer and get the whitespace tokenizer; char filters alone
+// keep its chain.
 static bool analyzerSet(const luxir::api::FieldDef& def) {
   return def.analyzer.has_value() &&
          (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty() ||
-          !def.analyzer->char_filters.empty());
+          !def.analyzer->char_filters.empty() || !def.analyzer->name.empty());
 }
 
 // Intern merged views until all physical fields have been compiled. Their
@@ -168,7 +169,7 @@ struct AnalyzerDefinitions {
   const api::AnalyzerDef* resolve(const api::FieldDef& def, const api::AnalyzerDef* parent) {
     if (!analyzerSet(def)) return parent;
     const auto& own = *def.analyzer;
-    if (own.tokenizer || !own.filters.empty() || !parent) return &own;
+    if (own.tokenizer || !own.filters.empty() || !own.name.empty() || !parent) return &own;
     auto [it, inserted] = merged.try_emplace({parent, &own}, *parent);
     if (inserted) it->second.char_filters = own.char_filters;
     return &it->second;
@@ -322,12 +323,12 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
     cfg.nlist = *def->nlist;
   }
   if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
-    fail("rabitq settings require explicit codec \"rabitq\"");
+    fail("rabitq settings require codec \"rabitq\"");
   }
   if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
   if (def->rabitq) {
     if (def->rabitq->bits) {
-      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      if (*def->rabitq->bits < 0 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [0, 9]");
       cfg.rabitqBits = *def->rabitq->bits;
     }
     if (def->rabitq->query_bits) {
@@ -582,11 +583,10 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
+      if (numericClass && !column) {
+        throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (r.type == FieldClass::VECTOR) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
@@ -738,7 +738,7 @@ static LogicalField::Shape shapeFamily(FieldClass type) {
   return LogicalField::Shape::SCALAR;
 }
 
-static std::string binding(std::optional<std::string_view> label,
+static std::string resolveBinding(std::optional<std::string_view> label,
                            const LogicalField& logical, OpClass op) {
   if (label) {
     if (foldName(*label) == "self") return "self";
@@ -1070,9 +1070,9 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
         logical->variants.emplace(label, std::move(ft));
       }
     }
-    logical->search = binding(owned.defaults ? owned.defaults->search : std::nullopt,
+    logical->search = resolveBinding(owned.defaults ? owned.defaults->search : std::nullopt,
                               *logical, OpClass::SEARCH);
-    logical->value = binding(owned.defaults ? owned.defaults->value : std::nullopt,
+    logical->value = resolveBinding(owned.defaults ? owned.defaults->value : std::nullopt,
                              *logical, OpClass::VALUE);
     // Abstract variant prototypes are kept only in their logical template.
     // Concrete physical entries are also exposed through the legacy registry.

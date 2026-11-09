@@ -854,9 +854,9 @@ serial full native rerun above passed them. Preserve the distinction between
 feature coverage, sanitizer findings, and full-suite test outcomes when
 reviewing this implementation.
 
-The final pre-PR review changed only the `has_child` protobuf tag from 26 to
-27 to avoid the plugin-query arm on `warp-0.2.0`. Debug, ASan, and release
-rebuilds were warning-free. After that change, the focused native run passed
+The final pre-PR review changed only the `has_child` protobuf tag, to avoid a
+tag used by the plugin query arm. Debug, ASan, and release rebuilds were
+warning-free. After that change, the focused native run passed
 all 22 relation, protobuf, and relation-replication tests; release benchmark
 correctness mode again passed all 12 scenarios. Full-suite counts above are
 from before this tag-only change.

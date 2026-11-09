@@ -306,6 +306,13 @@ class MinScoreQuery final : public Query {
 
     int64_t cost() override { return childSupplier->cost(); }
 
+    // The scorer forwards its child's approximation enums.
+    void approximationCosts(
+        MemPool& planPool, const Query::PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) override {
+      childSupplier->approximationCosts(planPool, context, out);
+    }
+
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
       Query::PlanContext childContext = buildContext;
@@ -534,10 +541,10 @@ public:
       childWeight = query.child->createWeight(
           context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
           1.0f);
-      // Only the prepare requirement carries over: match-all, constant
+      // Only preparation traits carry over: match-all, constant
       // counts, and count/top-k composition all describe the child's
       // unfiltered membership.
-      traits = childWeight->getFlags() & NEEDS_PREPARE;
+      traits = childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 

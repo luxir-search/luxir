@@ -168,6 +168,20 @@ public:
     }
   }
 
+  // True when the op finds its own matches rather than consuming its parent's
+  // domain whole, as a list or a fusion does.
+  virtual bool ownsMatchDomain() const { return false; }
+
+  // Upper bound on the documents this op and its children visit, from index
+  // metadata alone (see SearchConfig::auto_parallel_min_work).
+  virtual size_t workEstimate() {
+    size_t total = 0;
+    for (auto& [name, subOp] : subOps) {
+      total = saturatingAdd(total, subOp->workEstimate());
+    }
+    return total;
+  }
+
   // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
   // slots; a retained ancestor also covers Fusion sources and nested children.
   bool segmentStateRetained(IndexReader::Segment& segment) const noexcept {

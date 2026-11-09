@@ -13,6 +13,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/api/RequestFlags.h"
 #include "SearchOp.h"
 #include "TopDocsReq.h"
 #include "luxir/query/Query.h"
@@ -102,7 +103,19 @@ public:
     }
   }
 
-  bool needsCount() const { return fusionProto.count_limit.value_or(0) != 0; }
+  bool ownsMatchDomain() const override { return true; }
+
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
+    return total;
+  }
+
+  bool needsCount() const {
+    return fusionProto.count_limit.has_value()
+        ? *fusionProto.count_limit != 0
+        : (flags & RequestFlags::ESTIMATE_COUNT) != 0;
+  }
 
   // Min-max normalize one source's merged ranked scores in place:
   // (score - min) / (max - min), so the source's best document gets 1 and its
@@ -557,7 +570,7 @@ public:
         op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission, {}, false, evidenceSources());
+        emission, {}, false, false, {}, evidenceSources());
     }
   };
 

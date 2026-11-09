@@ -164,6 +164,9 @@ struct SkipStats {
   static inline int64_t conjDenseScoredFilterRejects = 0;
   static inline int64_t conjExactScoredBoundsBypasses = 0;
   static inline int64_t conjExactDirectApproxEngagements = 0;
+  // Verifiers a pull conjunction confirms inside its leading exact group
+  // (BooleanWeight sourceGroupVerifier), one per verifier per build.
+  static inline int64_t conjSourceGroupedVerifiers = 0;
   static inline int64_t conjDirectDenseEngagements = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
@@ -333,8 +336,13 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  static inline int64_t numericPredicateClassifiedBlocks = 0;
+  static inline int64_t numericPredicateProofIndexes = 0;
   static inline int64_t rangeFacetPointsArms = 0;
   // Range facet zones (blocks or leaves) counted whole, without a decode.
   static inline int64_t rangeFacetZoneRuns = 0;
@@ -496,6 +504,7 @@ struct SkipStats {
     conjDenseScoredFilterRejects = 0;
     conjExactScoredBoundsBypasses = 0;
     conjExactDirectApproxEngagements = 0;
+    conjSourceGroupedVerifiers = 0;
     conjDirectDenseEngagements = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
@@ -632,8 +641,12 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateClassifiedBlocks = 0;
+    numericPredicateProofIndexes = 0;
     rangeFacetPointsArms = 0;
     rangeFacetZoneRuns = 0;
     rangeFacetZoneDomainRuns = 0;

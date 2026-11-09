@@ -104,6 +104,10 @@ struct AggregateStateOps {
       void* state, std::span<const int64_t> raw,
       FieldType::Type columnType,
       std::span<const AggregateConstant> arguments);
+  // Ordinals identify values only within this input's pinned reader dictionary.
+  using AccumulateOrdBatch = void (*)(
+      void* state, std::span<const int64_t> ords, int64_t numOrds,
+      size_t maxSetBytes, std::span<const AggregateConstant> arguments);
   using Merge = void (*)(void* target, const void* source,
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
@@ -128,6 +132,7 @@ struct AggregateStateOps {
   bool inlineCapable = true;
   bool replayCapable = true;
   bool orderSensitive = false;
+  AccumulateOrdBatch accumulateOrdBatch = nullptr;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -180,8 +185,7 @@ struct AggregateLeaf {
 enum class AggregateNodeKind : uint8_t {
   CONSTANT,
   AGGREGATE,
-  UNARY,
-  BINARY,
+  FUNCTION,
 };
 
 struct AggregateNode {
@@ -189,7 +193,8 @@ struct AggregateNode {
   BucketValueType type = BucketValueType::INT128;
   ValueNature nature = ValueNature::NUMBER;
   const ValueFunction* function = nullptr;
-  std::array<uint32_t, 2> children{};
+  std::array<uint32_t, VALUE_MAX_ARITY> children{};
+  uint8_t childCount = 0;
   uint32_t aggregate = 0;
   size_t sourcePos = 0;
   __int128 intValue = 0;
@@ -266,6 +271,8 @@ public:
   void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
   void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
+  void addOrdBatch(uint32_t producer, std::span<const int64_t> ords,
+                   int64_t numOrds, size_t maxSetBytes);
   void fail(AggregateFailure reason);
   bool failed() const { return failure() != AggregateFailure::NONE; }
   void merge(const AggregateStateView& source);
@@ -291,6 +298,8 @@ public:
   void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
   void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
+  void addOrdBatch(uint32_t producer, std::span<const int64_t> ords,
+                   int64_t numOrds, size_t maxSetBytes);
   void fail(AggregateFailure reason);
   bool failed() const;
   BucketScalar finish(AggregateEvalScratch& scratch) const;
@@ -305,8 +314,6 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value);
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
   const AggregateProducer* producer = nullptr;
-  OrdColReader* ordColumn = nullptr;
-  OrdColReader::Iterator* ordIterator = nullptr;
   OrdMap::SegToGlobal ordMapping;
   IntColReader::BulkIterator* columnIterator = nullptr;
   AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
@@ -325,17 +332,12 @@ struct BoundAggregateInput {
   template <typename Consume>
   void forEachValue(int32_t docid, Consume&& consume) {
     if (producer->input->root().type == ValueType::COLUMN_ONLY) {
-      if (ordIterator == nullptr) return;
-      if (ordIterator->docId() < docid) ordIterator->advance(docid);
-      if (ordIterator->docId() != docid) return;
-      auto add = [&](int32_t stored) {
-        if (stored != 0) consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
-      };
-      if (ordColumn->multiValued()) {
-        auto [start, end] = ordColumn->getStartEndValueRank(ordIterator->rank());
-        for (int64_t i = start; i < end; i++) add(ordIterator->values().valueAt(i));
-      } else {
-        add(ordIterator->value());
+      BoundStringColumn* column = values->nodes[producer->input->rootNode].stringColumn;
+      if (column == nullptr || column->ords == nullptr || !column->cursor.seek(docid)) return;
+      for (int64_t rank = column->cursor.begin(); rank < column->cursor.end(); rank++) {
+        int32_t stored = column->storedOrd(docid, rank);
+        assert(stored != 0);
+        consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
       }
       return;
     }

@@ -18,6 +18,7 @@
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoPolygonQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/MultiTermQuery.h"
@@ -55,14 +56,39 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
 
 Query::Weight* AutomatonQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  if (automatonKind != Kind::MATCH || !caseInsensitive || (flags & NEED_SCORES) == 0) {
+  if (automatonKind != Kind::MATCH || !caseInsensitive) {
     return MultiTermQuery::createWeight(context, flags, multiplier);
   }
+  // A scored weight rewrites to the union of indexed case variants. Unscored
+  // weights of the same query match that union as a constant-score filter once
+  // it exists, so the variant scan is charged to the request's budget once;
+  // before it, they take the multi-term filter form. The parser builds a
+  // query's scored weight before its count weight, so in a ranked request the
+  // rewrite exists by then.
+  Query*& rewritten = MultiTermQuery::Weight::sharedRewrite(context, *this);
+  if ((flags & NEED_SCORES) == 0) {
+    if (rewritten == nullptr) return MultiTermQuery::createWeight(context, flags, multiplier);
+    auto* filter = context.pool.make<ConstantScoreQuery>(rewritten);
+    filter->markPlannerGenerated();
+    return filter->createWeight(context, flags, multiplier);
+  }
+  if (rewritten == nullptr) rewritten = rewriteCaseVariants(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
 
+Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
   // Discover the union across segments before computing shared synonym stats.
-  // Bound retained terms as well as scorer clauses. Unlike fuzzy, case matching
-  // promises every alternate, so overflow is an error rather than truncation.
-  std::set<std::string> variants;
+  // Unlike fuzzy, case matching promises every alternate, so an operator limit
+  // rejects rather than truncates, as this query's filter form does.
+  MultiTermBudget& budget = context.multiTermBudget();
+  RequestMemResource variantMemory(
+      context.planningContext().memoryTracker, field, "multi-term selection");
+  std::pmr::set<std::pmr::string> variants(&variantMemory);
   if (auto* fieldInfo = context.getCachedFieldInfo(field)) {
     for (auto& segment : context.topReader.segments()) {
       const auto* segInfo = fieldInfo->segInfos.at(segment);
@@ -70,14 +96,18 @@ Query::Weight* AutomatonQuery::createWeight(
       MemPool scratch;
       TermsEnum te(scratch, segment.postingsReader(), *segInfo);
       auto* filtered = createFilteredEnum(scratch, te);
+      filtered->setAllowance(budget.scanAllowance());
+      int32_t segmentVariants = 0;
+      int64_t segmentPostings = 0;
       while (filtered->next()) {
-        variants.emplace(filtered->termView());
-        if (variants.size() > MAX_CASE_VARIANTS) {
-          throw std::runtime_error(std::format(
-              "Match case_insensitive on field '{}' exceeds {} indexed case variants; use a folding field variant",
-              field, MAX_CASE_VARIANTS));
+        if (++segmentVariants > budget.maxExpansions()) {
+          budget.throwTooManyExpansions(describe());
         }
+        segmentPostings += filtered->terms().postingsState().docFreq;
+        variants.emplace(filtered->termView());
       }
+      if (filtered->stoppedAtVisitLimit()) budget.throwTermsExamined(describe());
+      if (!budget.chargePostings(segmentPostings)) budget.throwPostings(describe());
     }
   }
 
@@ -100,7 +130,7 @@ Query::Weight* AutomatonQuery::createWeight(
       char* copy = context.pool.alloc(variant.size());
       memcpy(copy, variant.data(), variant.size());
       terms[i++] = {0, std::string_view(copy, variant.size()),
-                    variant == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
+                    std::string_view(variant) == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
     }
     auto fields = context.pool.make_span<std::string_view>(1);
     auto weights = context.pool.make_span<float>(1);
@@ -108,12 +138,7 @@ Query::Weight* AutomatonQuery::createWeight(
     weights[0] = 1.0f;
     rewritten = context.pool.make<CombinedFieldQuery>(fields, weights, terms);
   }
-#ifndef NDEBUG
-  if (context.logicalValidationActive()) {
-    rewritten->validateLogical(context.planningContext(), multiplier);
-  }
-#endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten;
 }
 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
@@ -145,7 +170,7 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
 
   MemPool scratch;
   auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
-  truncateCandidates(context, candidates);
+  truncateCandidates(candidates);
   if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
 
   Similarity::TermStats blendedStats = {};
@@ -197,7 +222,14 @@ Query::Weight* CombinedFieldQuery::createWeight(
 
 Query::Weight* FuzzyQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  Query* rewritten = rewriteToDisjunction(context);
+  // The kept terms do not depend on flags, so every weight the request builds
+  // for this query (ranking, count, domain) reuses one dictionary scan.
+  struct Rewrite {
+    Query* query;
+  };
+  Query* rewritten = context.getOrCreateLogicalPlan<Rewrite>(*this, [&]() {
+    return context.pool.make<Rewrite>(rewriteToDisjunction(context));
+  }).query;
 #ifndef NDEBUG
   if (context.logicalValidationActive()) {
     rewritten->validateLogical(context.planningContext(), multiplier);
@@ -214,6 +246,12 @@ Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
                                               float multiplier) {
+  float score = constantWhenScored(flags, multiplier);
+  return context.pool.make<Weight>(context, *this, flags, score);
+}
+
+Query::Weight* GeoPolygonQuery::createWeight(Context& context, int32_t flags,
+                                             float multiplier) {
   float score = constantWhenScored(flags, multiplier);
   return context.pool.make<Weight>(context, *this, flags, score);
 }

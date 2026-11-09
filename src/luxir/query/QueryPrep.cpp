@@ -21,8 +21,7 @@ DomainHandle materializeEffectiveFilter(const PreparedSource& source, IndexReade
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      [[maybe_unused]] DocSet* canonical =
-          segment.liveDocs() == nullptr ? nullptr : &segment.liveDocs()->docset();
+      [[maybe_unused]] DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));
     }

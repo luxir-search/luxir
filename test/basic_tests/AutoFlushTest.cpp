@@ -9,6 +9,7 @@
 // rejected because it splits a request's shared updateVersion across segments and
 // breaks version-gated overwrite deletes. See ProtoUpdateMessage.cpp.
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -120,7 +121,7 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
       << "per-message flush should bound accumulation into multiple segments";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -357,7 +358,7 @@ TEST_F(AutoFlushTest, overBudgetReleaseFlushesIdleInverter) {
       << "an over-budget release should flush an idle inverter into its own segment";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -423,7 +424,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
 
@@ -474,7 +475,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
     auto reader = iw.snapshots.readers.getReader();
     EXPECT_EQ(reader->segments().size(), 3u);  // A shed, B shed, C at commit
     int64_t totalDocs = 0;
-    for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+    for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
     EXPECT_EQ(totalDocs, 61);
   }
 }
@@ -498,7 +499,7 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;
     auto& inverter = iw.obtainInverter();
@@ -539,7 +540,7 @@ TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
 
   IndexRamBudget budget;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
   iw.pressureFlushFloorBytes = 1;
@@ -594,7 +595,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   }
 
   IndexRamBudget budget;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
@@ -726,7 +727,7 @@ TEST(FlushWorkspaceTest, flushGrowsDrainingReservation) {
   IndexRamBudget budget;
   RAMDir dir;
   {
-    Inverter inverter(dir, 1, Schema::createDefaultSchema(), &budget);
+    Inverter inverter(dir, 1, 1, Schema::createDefaultSchema(), &budget);
     auto& tags = inverter.getIndexHandler("tags_ss");
     for (int d = 0; d < 1000; d++) {
       inverter.startDoc();
