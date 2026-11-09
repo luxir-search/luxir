@@ -323,6 +323,12 @@ class VectorAuxReader : public AuxReader {
 public:
   static constexpr std::string_view KIND = "vector_faiss";
 
+  static bool usePrecomputedTable(faiss::MetricType metric, bool byResidual,
+                                  int64_t nlist, int64_t m, int64_t ksub, int64_t ntotal, int32_t dims) {
+    // Bound the L2 residual table by the raw vector size, in floats.
+    return metric == faiss::METRIC_L2 && byResidual && (double)nlist * m * ksub <= (double)ntotal * dims;
+  }
+
   VectorAuxReader(std::string name, std::string field,
                   uint64_t gen, uint64_t builtCoreGen,
                   std::shared_ptr<InputFile> file,
@@ -441,14 +447,9 @@ public:
       }
 
       if (auto* pq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get())) {
-        // L2 by_residual keeps FAISS's nlist * M * 2^bits precomputed table
-        // only while it is no larger than the raw vectors it indexes (true
-        // under the default sqrt(N) lists); otherwise FAISS builds per-list
-        // tables at query time. Float counts avoid byte-size overflow.
-        double tableFloats = (double)pq->nlist * pq->pq.M * pq->pq.ksub;
-        double rawFloats = (double)pq->ntotal * pq->d;
         pq->use_precomputed_table = -1;
-        if (pq->metric_type == faiss::METRIC_L2 && pq->by_residual && tableFloats <= rawFloats) {
+        if (usePrecomputedTable(pq->metric_type, pq->by_residual,
+                                pq->nlist, pq->pq.M, pq->pq.ksub, pq->ntotal, pq->d)) {
           pq->use_precomputed_table = 1;
           pq->precompute_table();
         }

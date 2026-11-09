@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <cassert>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -47,7 +48,7 @@ public:
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
   // find the delete file (this is not necessarily an error, the index could have changed already).
   // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
-  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
+  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
   
   // Get the underlying FixedBitSet for direct access
   const screaming::FixedBitSet& bitset() const {
@@ -86,7 +87,7 @@ public:
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index
-      int32_t  max_doc;         // Number of live documents in this segment
+      int32_t  max_doc;         // Number of documents in this segment, deleted ones included
       int32_t  live_docs;       // Number of live documents in this segment
     };
 
@@ -100,6 +101,9 @@ public:
             :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
                 sharedAuxReaders(std::move(auxReaders)),
                 segInfo(segInfo), base(base), ord(ord) {
+      assert((segInfo.live_gen != 0) == (sharedLiveDocs != nullptr));
+      assert(segInfo.live_gen == 0 || segInfo.live_docs < segInfo.max_doc);
+      assert(segInfo.live_docs == (sharedLiveDocs ? sharedLiveDocs->numLive() : segInfo.max_doc));
     }
 
     PostingsReader& postingsReader() const noexcept {
@@ -112,9 +116,19 @@ public:
       return sharedPostingsReader;
     }
 
+    // Whether the segment has deleted documents: a live-docs generation exists,
+    // which writers create only with at least one deletion. Never opens files.
+    bool hasDeletes() const noexcept { return segInfo.live_gen != 0; }
+
     // returns null if all docs are live (no deletes)
     LiveDocs* liveDocs() const noexcept {
       return sharedLiveDocs.get();
+    }
+
+    // The segment's live docset, or null when there are no deletes.
+    BitDocSet* liveDocSet() const noexcept {
+      auto* live = liveDocs();
+      return live ? &live->docset() : nullptr;
     }
 
     // shared form of liveDocs(), for callers that cache views into its mapped bits
@@ -137,14 +151,14 @@ public:
       return segInfo.max_doc;
     }
 
-    // Get number of deleted documents
+    // Number of deleted documents, from the manifest.
     int32_t numDeletes() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numDeletes() : 0;
+      return maxDoc() - numLive();
     }
 
-    // Get number of live documents
+    // Number of live documents, from the manifest.
     int32_t numLive() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numLive() : segInfo.max_doc;
+      return segInfo.live_docs;
     }
   };
 

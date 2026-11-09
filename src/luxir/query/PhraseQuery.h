@@ -431,6 +431,9 @@ public:
         : Query::Weight(context, query, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
+      // Only exact phrases prune on impacts, which is what an exact count
+      // composed with a separate ranking pass gains.
+      if (needScores && query.getSlop() == 0) traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
@@ -655,6 +658,16 @@ public:
       };
 
     public:
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        BulkPlan plan = Query::ScorerSupplier::planBulk(use, bulkContext);
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING
+            && weight.needsScores() && weight.query.getSlop() == 0) {
+          plan.rankingScoresExact = BulkAnswer::YES;
+        }
+        return plan;
+      }
+
       Supplier(PhraseQuery::Weight& weight, IndexReader::Segment& segment)
           : weight(weight), segment(segment) {}
 

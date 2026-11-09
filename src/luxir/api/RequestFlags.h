@@ -29,6 +29,8 @@ struct RequestFlags {
       (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_LOW_BIT)
       | (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_HIGH_BIT);
   static constexpr uint64_t INT64_STR = uint64_t{1} << (int)api::RequestFlagBit::INT64_STR_BIT;
+  static constexpr uint64_t ESTIMATE_COUNT =
+      uint64_t{1} << (int)api::RequestFlagBit::ESTIMATE_COUNT_BIT;
   static constexpr std::array<std::string_view, 4> DATE_NAMES{
       "date_native", "date_iso", "date_ms", "date_ns"};
 
@@ -40,7 +42,9 @@ struct RequestFlags {
     if (level == Level::OP && ((flags | flagsSet) & INT64_STR)) {
       return "int64_str is request-level only";
     }
-    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR)) return "unknown request flag bits";
+    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR | ESTIMATE_COUNT)) {
+      return "unknown request flag bits";
+    }
     uint64_t dateSet = flagsSet & DATE_MASK;
     if (dateSet != 0 && dateSet != DATE_MASK) {
       return "flags_set must cover both date-mode bits or neither";
@@ -67,6 +71,12 @@ struct RequestFlags {
         out.flagsSet |= INT64_STR;
         continue;
       }
+      if (name == "estimate_count") {
+        if (out.flagsSet & ESTIMATE_COUNT) throw RequestError("duplicate estimate_count flag");
+        out.flags |= ESTIMATE_COUNT;
+        out.flagsSet |= ESTIMATE_COUNT;
+        continue;
+      }
       size_t mode = 0;
       for (; mode < DATE_NAMES.size(); mode++) if (DATE_NAMES[mode] == name) break;
       if (mode == DATE_NAMES.size()) {
@@ -85,6 +95,7 @@ struct RequestFlags {
     std::vector<std::string_view> out;
     if (flagsSet & DATE_MASK) out.push_back(dateName(flags));
     if (flags & flagsSet & INT64_STR) out.push_back("int64_str");
+    if (flags & flagsSet & ESTIMATE_COUNT) out.push_back("estimate_count");
     return out;
   }
 

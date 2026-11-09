@@ -135,7 +135,7 @@ public:
           const auto& segInfos = cachedFieldInfo->segInfos;
           for (size_t i = 0; i < segInfos.size(); i++) {
             if (const auto* info = segInfos.at(i)) {
-              hasNorms = info->type == FieldType::TEXT;
+              hasNorms = FieldType::storage(info->type) == FieldType::Storage::TEXT;
               break;
             }
           }
@@ -170,7 +170,7 @@ public:
 
       auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
-      if (segFieldInfo->type == FieldType::TEXT) {
+      if (FieldType::storage(segFieldInfo->type) == FieldType::Storage::TEXT) {
         normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *segFieldInfo);
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
@@ -281,7 +281,7 @@ public:
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
         if (bulkContext.requireConstantCount) {
-          if (segment.liveDocs() != nullptr) {
+          if (segment.hasDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,

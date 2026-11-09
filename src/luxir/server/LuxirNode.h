@@ -74,7 +74,7 @@ public:
   bool readOnly() const { return config.read_only; }
 
   uint64_t storageBytes() const { return collections_->storage().storageBytes(); }
-  uint64_t storageBytes(const CollectionId& id) const { return collections_->storage().collectionBytes(id); }
+  uint64_t storageBytes(const CollectionId& id) const { return collections_->storageBytes(id); }
 
   // A request's target: an empty tenant is the default tenant (the request
   // scope supplies it), and an empty name the default collection.
@@ -103,6 +103,8 @@ public:
     return createCollection(CollectionId::of(name), schema);
   }
   void deleteCollection(const CollectionId& id);
+  void renameCollection(const CollectionId& from, const CollectionId& to);
+  void swapCollections(const CollectionId& a, const CollectionId& b);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
 
   oneapi::tbb::task_arena& getTaskArena() {

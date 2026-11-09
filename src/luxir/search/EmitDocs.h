@@ -45,6 +45,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/Signal.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/util/luxir_util.h"
@@ -240,9 +241,9 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
+  if (!info) return;
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  if (!info) return;
   const auto& segFieldInfo = *info;
 
   bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
@@ -414,10 +415,10 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
-    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
     auto* info = infos.at(segNum);
     if (!info) return;
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
     const auto& segFieldInfo = *info;
 
     if (!fieldType.multiValued()) {
@@ -438,6 +439,48 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
+  });
+}
+
+// Decode a GEO_POINT column as col_val in the ingest shape, so returned
+// points index back unchanged: a single-valued field gives each document
+// [lon, lat] and a multi-valued one [[lon, lat], ...], by the field's
+// cardinality rather than the document's point count. A missing document
+// leaves the kind unset.
+inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
+                       std::span<const segdoc> segDocs, SegmentRuns runs,
+                       luxir::api::Column& fieldCol,
+                       FieldLoaders* loaders, std::pmr::memory_resource& mr)
+{
+  auto columnSize = segDocs.size();
+  if (columnSize == 0) return;
+  auto& geoCol = fieldCol.kind.emplace<luxir::api::ColVal>();
+  std::span<luxir::api::Val> target(build::allocArray(geoCol.v, columnSize, mr), columnSize);
+  bool multi = fieldType.multiValued();
+  addFieldLoader(loaders, runs, [&req, infos, segDocs, target, multi, &mr](std::span<RowIndex> idxSpan) {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+    auto* info = infos.at(segNum);
+    if (!info) return;
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    luxir::api::Val* points = nullptr;
+    auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      assert(segDocs[idxSpan[idx]].docId() == doc);
+      unused(doc);
+      luxir::api::Val* point = &target[idxSpan[idx]];
+      if (multi) {
+        if (valIdx == 0) {
+          points = build::allocArray(point->kind.emplace<luxir::api::ArrVal>().v, (size_t)numVals, mr);
+        }
+        point = points + valIdx;
+      }
+      double* lonLat = build::allocArray(point->kind.emplace<luxir::api::ArrDouble>().v, 2, mr);
+      lonLat[0] = geo::decodeLongitude(geo::unpackLongitude(val));
+      lonLat[1] = geo::decodeLatitude(geo::unpackLatitude(val));
+    };
+    IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
   });
 }
 
@@ -478,9 +521,9 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, const SegFieldInfo
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
+  if (!info) return;
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  if (!info) return;
   const auto& segFieldInfo = *info;
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
@@ -500,9 +543,9 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, const SegFieldInfo*
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
+  if (!info) return;
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  if (!info) return;
   const auto& segFieldInfo = *info;
 
   // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
@@ -583,9 +626,9 @@ inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments info
 {
   addFieldLoader(loaders, runs, [&req, infos, reqs = std::move(reqsOwned), segDocs, &mr](std::span<RowIndex> idxSpan) {
     auto segNum = segDocs[idxSpan[0]].segment();
-    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
     auto* info = infos.at(segNum);
-    auto sfr = info ? std::make_unique<StoredFieldsReader>(postingsReader, *info) : nullptr;
+    auto sfr = info ? std::make_unique<StoredFieldsReader>(req.reader->segments()[segNum].postingsReader(), *info)
+                    : nullptr;
 
     // Partition reqs: sfrReqs serve from SFR, colReqs fall back to
     // column.  The fallback is attempted for any STRING/ID field type
@@ -603,7 +646,7 @@ inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments info
         continue;
       }
       auto t = r.fieldType->type();
-      if (t == FieldType::Type::STRING || t == FieldType::Type::ID) {
+      if (FieldType::storage(t) == FieldType::Storage::TERMS) {
         colReqs.push_back(&r);
       }
     }
@@ -932,6 +975,7 @@ public:
   int64_t offset;
   bool emitCount;
   bool foundGte;
+  bool foundEstimated;
   bool getScores;
   // Resolved DocFormat: ROWS, COLUMNS or ADAPTIVE.  Every field loads as a
   // column; placeBatchColumns settles each batch's placement.  The synthetic
@@ -955,13 +999,14 @@ public:
   DocEmitterImpl(SearchRequest& req, uint64_t flags, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
-                 int64_t offset, bool emitCount, bool foundGte, bool getScores,
-                 luxir::api::DocFormat placement, bool parallel, size_t colCap,
+                 int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
+                 bool getScores, luxir::api::DocFormat placement, bool parallel, size_t colCap,
                  DocBatchMetadata metadata)
       : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
-        foundGte(foundGte), getScores(getScores), placement(placement),
+        foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
+        placement(placement),
         parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
@@ -1033,6 +1078,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     if (emitCount) {
       docListProto.found = totalHits;
       docListProto.found_gte = foundGte;
+      docListProto.found_estimated = foundEstimated;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -1198,6 +1244,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
             loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
                              pendingLoaders, pendingCols, mr, output);
           });
+          break;
+        }
+        case FieldType::Type::GEO_POINT: {
+          loadGeoCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
           break;
         }
         case FieldType::Type::ID:
@@ -1486,6 +1536,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
                       bool foundGte = false,
+                      bool foundEstimated = false,
                       std::span<const ExtraColumn> extraColumns = {})
 {
   int32_t maxBatchSize = batchSize;
@@ -1531,7 +1582,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req, flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
-      maxBatchSize, offset, emitCount, foundGte, getScores, placement,
+      maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,
       /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();

@@ -37,10 +37,69 @@ Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
 then `luxir promote` to restore it as a writer under new collection incarnations.
 Do not restore a raw directory copy over an existing writer identity.
 
+### Copying the authoritative tree
+
+The portable tree is `LAYOUT` and `t/`. Copy each file's bytes under the same
+relative key; do not copy `node/`, which contains the local `write.lock`,
+replication state and other node-private state. The destination needs a compatible
+Luxir build and the plugins referenced by the stored schemas. Hard links can
+become independent objects: link counts, inode numbers, timestamps, permissions
+and empty directories carry no index identity. Publication versions are computed
+by the destination backend, not stored in `STATE` or `CATALOG`.
+
+For a stopped node, copy into an empty destination in any order, then open the
+destination only after the entire copy finishes. A filesystem snapshot of a
+stopped node has the same rule. The format can be served by a backend that reads
+these keys directly, including a cache over an object store; this does not require
+rewriting manifests or catalog entries.
+
+For an online copy, dependency order is necessary but is not sufficient by
+itself. Capture the catalog and selected STATE bodies first and hold their
+snapshots and dependencies against retirement while copying. Install data files
+first, then their manifests, then the captured STATE bodies, and finally the
+captured CATALOG bodies. Install LAYOUT before exposing the destination. Never
+read a newer STATE or CATALOG midway through the copy: it could name files that
+were created after the data pass. Keep the captured catalogs stable against
+collection deletion or replacement as well. A coherent filesystem snapshot can
+provide the frozen source; otherwise use `luxir pull`, which pins snapshots.
+Plain recursive copying of a running writer provides none of those protections.
+
+Readers ignore publication scratch files (`.luxir-publish-*`), unfinished data
+files (`*.tmp`) and unrelated names, even if a raw copy included them. These are
+not dependencies and may be omitted. Corruption markers are portable diagnostic
+metadata and should be preserved. A new writer over the copied namespace claims
+a new epoch there; it does not fence the original namespace. Do not combine the
+subsequent histories of independently written copies. Use promotion when a
+restore should start a new lineage.
+
+### Backends, layers and options
+
+`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
+plugin build may add more (an unknown name fails startup with the list of
+registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
+backend in layers a plugin provides, such as a cache.
+`--store.option COMPONENT.KEY=VALUE` (repeatable) passes settings to the named
+backend or layer; the plugin documents its keys. Unknown keys and components
+that are not configured fail startup. The built-in `ram` and `fs` take no options.
+
+```bash
+./luxir --store.backend=s3 --store.option s3.bucket=search-data --store.layer=cache --store.option cache.bytes=10G
+```
+
+Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
+outside the layers. The effective stack is logged at startup as
+`storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
+
 ## Read-only nodes
 
-A data directory has exactly one writer, which holds `write.lock` from startup
-until exit.
+A data directory has exactly one writer, which holds `node/write.lock` from startup
+until exit. This is node admission policy. Conditional file publication uses a
+separate directory `flock`, so Match is an atomic compare-and-swap among processes
+on a local filesystem, including processes that bypass `write.lock`. All publish
+modes take that lock only for the check and install; file and directory fsyncs
+run outside it. The kernel releases the lock when the process dies. This
+guarantee does not extend to network filesystems, whose server may revoke a
+stalled client's lock.
 
 `--read-only` opens an existing data directory without that lock:
 
@@ -78,6 +137,25 @@ is no undo. `GET /collections` (canonically `/collections/_list`) returns the
 sorted collection names, including any that failed to load;
 `/_stats?collections=true` has the per-collection detail.
 
+Rename with `POST /collections/_rename` and `{"from":"old","to":"new"}`.
+Swap with `POST /collections/_swap` and `{"a":"live","b":"staging"}`.
+Both operate within one tenant; use `/tenants/TENANT/collections/...` to select
+it. The gRPC calls are `RenameCollection` and `SwapCollections`. Rename requires
+a free destination and swap requires two active collections. Read-only nodes
+and followers reject both operations.
+
+Each operation changes the catalog once, then changes each name's lookup binding.
+No files move and commit ids remain unchanged. A request keeps the collection
+it resolved at admission. During a swap, each lookup may see the old or new
+binding for that name; both names may briefly resolve to the same collection.
+Indexing into a name during a swap is undefined.
+Collection metrics, storage charges and cached data follow the incarnation.
+Session cache-size overrides follow names and apply to their new selections.
+Followers apply ready bindings independently, reusing incarnations they already
+have. A stuck download does not delay unrelated names. A lagging name keeps its
+old data only if the source has not assigned that data to another name;
+otherwise it is unavailable until its replacement is ready.
+
 Deletion is synchronous and wins over concurrent use. When the call returns,
 the name resolves to nothing, the on-disk data is gone, and the name can be
 recreated as a fresh empty collection. New requests receive
@@ -86,14 +164,20 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend collections use
-`t/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
-file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant
-`t0`, so the default collection lives in `t/t0/main/`. An incarnation is 16 hex
-digits. `t/LAYOUT` names this layout; a data directory written in another layout
-is refused at startup and must be reindexed. Deletion removes and
-syncs `CURRENT` before removing the directory tree, so an interrupted deletion
-cannot reopen the partially deleted index. If
+On the filesystem backend, incarnations live at `t/<tenant>/i/<id>/`.
+A tenant's `CATALOG` maps collection names to active incarnations and records
+reservations and retirements. Single-tenant deployments use tenant `t0`.
+Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
+monotonically by the catalog. The root `LAYOUT` marker identifies this format;
+older layouts are refused at startup and must be reindexed. Node-private state,
+including `write.lock` and `replication.json`, lives under `node/`.
+Each commit records its index format version. A collection written with another
+version is listed as failed to load, with both versions in the error, and must
+be deleted and reindexed.
+
+Deletion marks the incarnation retiring in the catalog before removing its
+directory, then removes its entry. Writer startup finishes interrupted retirements
+and discards abandoned reservations; followers preserve reserved downloads. If
 deletion fails partway (for example an I/O error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
@@ -155,34 +239,52 @@ liveness, not a deep read/write check of every collection or storage device.
 Operational statistics and Prometheus metrics are described in
 [Stats and monitoring](#stats-and-monitoring).
 
-Filesystem publication syncs new data files and then the directory before
-writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
-footer. It syncs that manifest and then the directory before acknowledging
-the commit. Startup checks the newest manifest's footer and decodes its payload;
-by default it does not hash data files (see
-[file integrity checks](#file-integrity-checks)). Torn candidates are skipped.
-Fallback candidates also require their referenced files to be present with
-matching sizes.
+Filesystem publication syncs data files and their directory entries, then writes
+an immutable `commit_<index_gen>.<epoch>` candidate with a length and xxh3
+checksum footer. It acknowledges the commit only after a durable conditional
+update of the incarnation's `STATE` tip. Each writer open claims a new epoch;
+a superseded writer cannot advance that tip. Segment files carry their creator
+epoch, and later live-doc and overlay files also carry their writer's epoch.
 
-Once the new root is durable, obsolete manifests and unreferenced data are removed.
+Startup follows `STATE`, not the highest candidate filename. If its manifest is
+invalid, recovery scans older candidates whose referenced files are present
+with matching sizes, and copies the recovered snapshot into a new incarnation.
+By default startup does not hash data files (see
+[file integrity checks](#file-integrity-checks)).
+
+Once the new tip is durable, obsolete manifests and unreferenced data are
+removed. Writer startup sweeps unreferenced index files from fenced, older
+epochs; it leaves files of newer epochs alone. These local cleanup rules and
+process-local pins are not a retention protocol for shared remote readers.
+Catalog reservation/orphan cleanup also assumes startup has exclusive authority
+to decide what was abandoned, and collection transitions use process-local
+leases. Cross-process CAS protects catalog updates and writer fencing; it does
+not turn those cleanup policies into a multi-node retention coordinator.
+Removal durably deletes `STATE` first, fencing existing writers, then removes
+the incarnation directory and its catalog entry. Only catalog reservation can
+create STATE; claiming a writer or installing a snapshot requires it to exist.
+Writer incarnation ids are never reused. A follower can reserve a deleted source id again;
+its fresh STATE owner distinguishes that lifetime from earlier publications.
+
 Replication pin counters are described in the
 [replication reference](replication.md#reference). Replication file transfers have
 a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
 HTTP responses have no write deadline.
 
-Writer startup removes leftover unreferenced
-index files using the directory listing, without reading their contents. If
-startup falls back below the highest manifest generation, it logs an error and
-skips this sweep, preserving newer files for recovery.
+Publication scratch files use the reserved `.luxir-publish-` prefix and are
+hidden from index listings. An owned filesystem view removes scratch files from
+processes confirmed dead on the same host when it opens. Live or inaccessible
+processes' files are left alone. Copied scratch names are harmless even when a
+PID cannot be checked or has been reused. Unfinished `*.tmp` data files are also
+ignored by readers.
 
-Removals are not directory-synced: a crash may restore obsolete names, but the
-newest durable manifest does not reference them. Failed publication candidates
-are removed and the directory is synced best-effort. An error response does not
-guarantee that the commit is absent: a crash or cleanup failure can leave a
-complete, unacknowledged candidate recoverable at startup. The local filename is not part
-of the commit identity: clients use the `incarnation:index_gen` token. That
-token's manifest is `<incarnation>/commit_<index_gen>`, with the generation in
-decimal; tools that list manifests in order sort by the parsed generation.
+Retirement removals are not directory-synced: a crash may restore obsolete
+names, but the durable tip does not reference them. A failed candidate is
+removed only if `STATE` definitely does not name it. An error response can still
+have an unknown outcome; a visible candidate alone does not prove a commit.
+Clients continue to use `incarnation:index_gen` tokens. Candidate generations
+are decimal and epochs are lowercase base36; tools resolve the candidate from
+`STATE` rather than sorting the directory listing.
 
 Set log verbosity with:
 
@@ -313,8 +415,18 @@ the response correlates directly with a directory listing: each segment's
 are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
-`update_version` are numeric. The schema and its history are embedded in each
-`commit_<index_gen>` manifest.
+`update_version` are numeric. The `commit_<index_gen>.<epoch>` manifest selected
+by `STATE` references an immutable `schema_0.0.<local>.<epoch>` file in the
+incarnation. Schema files contain the authored definition and field introduction
+history, with the same length/xxh3 footer as manifests. They participate in the
+ordinary file inventory, transfers, verification and snapshot retention. Copy
+them with the data files before copying manifests.
+
+Each node shares parsed schema versions across its snapshots and readers.
+`memory.schema_cache_bytes` reports an estimated owned payload, charged once per
+cached version to its schema tenant and released with its last user. This is
+separate from RAM backing-file bytes and allocator RSS; it excludes allocator
+overhead and analysis factories' private resources.
 
 ### Prometheus scraping
 
@@ -337,6 +449,12 @@ client load.
 
 ### Service and engine metrics
 
+Response `took_us` measures one complete request message through readiness to
+serialize its final response; `luxir_request_duration_seconds` also covers
+HTTP body reception and response delivery, and counts an entire gRPC stream
+as one call. `luxir_search_duration_seconds` starts later, at engine submission,
+and shares the search's final-response endpoint with `took_us`.
+
 | Metric or family | Meaning |
 | --- | --- |
 | `luxir_requests_total`, `luxir_requests_in_flight`, `luxir_request_duration_seconds` | HTTP requests or gRPC calls, by `transport`, bounded `operation`, and completion `outcome`. Duration includes body reception after HTTP headers, execution, waits, and response delivery. A gRPC stream is one call, regardless of its message count. |
@@ -358,7 +476,7 @@ client load.
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
 | `luxir_scrub_*_total`, `luxir_scrub_last_pass_end_timestamp_seconds` | Checksum scrub passes, files, read bytes, mismatches, and other check errors, and when the last pass ended. Present only while scrubbing is enabled; the timestamp is absent before the first pass. |
 | `luxir_multiterm_expansion_refills_total` | Process-wide multi-term expansion refills. |
-| `luxir_build_info`, `luxir_node_read_only` | Build version and CPU target, and read-only configuration. |
+| `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target and source commit, and read-only configuration. |
 | `luxir_stats_duration_seconds` | Time gathering the response, excluding serialization. |
 
 With `collections=true`:
@@ -601,8 +719,31 @@ Search has its own limits:
 ```
 
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
-  such as facet aggregate state; `0` (the default) is unlimited.
+  such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
+  request across segments in parallel, like `-1`, when its lists and
+  operations visit at least that many documents by index metadata. Counts that
+  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
+  serial. Parallel runs cost more CPU in exchange for latency, so set it only
+  where large requests are common.
+- Multi-term expansion limits are operator opt-ins, all off by default (`0`).
+  With limits off, broad patterns on high-cardinality fields simply run. Operators
+  exposing public endpoints can bound this work using the following options.
+  A request cannot raise or disable an operator limit. Exceeding one fails with
+  `RESOURCE_EXHAUSTED` naming the query and limit, never a truncated match set.
+  See [Expansion limits](query-reference.md#expansion-limits).
+  - `search.multiterm-max-expansions`: terms one query may expand per segment,
+    counting selected terms for a capped prefix. A merge can change whether a
+    query passes.
+  - `search.multiterm-max-terms-examined`: dictionary terms visited across all
+    multi-term and fuzzy scans, including refills, whether matching or not.
+  - `search.multiterm-max-postings`: request-wide estimate, the summed docFreq of
+    selected terms, not postings decoded. Fuzzy's scored rewrite is excluded.
+  - `search.multiterm-min-prefix-length`: pattern-only minimum literal prefix in
+    bytes for unbounded prefix, wildcard, and regex queries. Finite languages
+    are exempt. It never consults the index or cache. A type-ahead endpoint
+    using N rejects keystrokes shorter than N. Default `0` disables the rule.
 - `multi_match` field lists containing patterns may resolve to at most `64`
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).

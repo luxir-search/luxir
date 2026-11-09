@@ -1158,7 +1158,7 @@ TEST_F(IntColTest, denseAfterFlushAndMerge) {
     ASSERT_EQ(dense.size(), reader->segments().size());
     for (size_t s = 0; s < dense.size(); s++) {
       auto& segment = reader->segments()[s];
-      int32_t maxDoc = segment.postingsReader().maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       for (std::string_view field : {"x_i", "xs_is"}) {
         auto* fieldInfo = segment.postingsReader().fieldInfo(field);
         ASSERT_TRUE(fieldInfo != nullptr);

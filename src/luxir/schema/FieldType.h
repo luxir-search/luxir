@@ -14,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -54,6 +55,26 @@ public:
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
 
+  enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
+
+  static constexpr Storage storage(Type type) {
+    switch (type) {
+      case NONE: return Storage::NONE;
+      case STRING: case ID: return Storage::TERMS;
+      case TEXT: return Storage::TEXT;
+      case BIN: return Storage::BIN;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: return Storage::INT64;
+      case VECTOR: return Storage::VECTOR;
+    }
+    throw std::invalid_argument("Unknown field storage type");
+  }
+
+  static constexpr bool usesOneDimensionalPoints(Type type) {
+    return storage(type) == Storage::INT64 && type != GEO_POINT;
+  }
+
+  static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
+
   static std::string_view typeName(Type type);
   // Decode parameters using the persisted type, independently of any schema.
   // Unknown types and bits are invalid. DATE defines its unit in bit 0.
@@ -90,6 +111,22 @@ public:
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
+
+  static_assert([] {
+    constexpr flag_type bits[] = {
+      INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
+      INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
+      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
+      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+    };
+    flag_type used = 0;
+    for (auto bit : bits) {
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      used |= bit;
+    }
+    return true;
+  }(), "Field flags must use distinct single bits");
 
   const FieldType::Type type_;
   const std::string name_;
@@ -166,9 +203,6 @@ public:
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   bool isStored() { return (bool) (flags_ & STORED); }
-
-  // ID uses the indexed STRING representation in segment metadata.
-  Type persistedType() const { return type_ == ID ? STRING : type_; }
 
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce

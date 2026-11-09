@@ -17,6 +17,7 @@ enum RequestFlagBit {
   DATE_MODE_LOW_BIT = 0;
   DATE_MODE_HIGH_BIT = 1;
   INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
+  ESTIMATE_COUNT_BIT = 3; // lists with an unset or positive count_limit may estimate found
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -50,12 +51,12 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose, today
-  // serial: over HTTP normally inline on the receiving thread, over gRPC on
-  // the shared executor. 1 runs serially on the shared executor; -1 permits
-  // unlimited parallelism, with shared workers joining in (starting on the
-  // receiving HTTP thread, or on the shared executor over gRPC). Other values
-  // are rejected.
+  // Intra-request parallelism: 0 (default) lets the engine choose: serial
+  // (over HTTP normally inline on the receiving thread, over gRPC on the shared
+  // executor) unless the operator's search.auto-parallel-min-work admits it.
+  // 1 runs serially on the shared executor; -1 permits unlimited parallelism,
+  // with shared workers joining in (starting on the receiving HTTP thread, or
+  // on the shared executor over gRPC). Other values are rejected.
   int32 max_parallel = 8;
 
   // Require a local snapshot at least this new (incarnation:index_gen).
@@ -180,9 +181,11 @@ message TopDocs {
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
   // Match count: unset or 0 omits found; -1 counts exactly; positive N permits
-  // stopping at N with found_gte. An exact count is also valid for N.
-  // Must be >= -1. Ops, collapse, diversify, field sorts, nested lists and
-  // limit 0 retain exact counting.
+  // stopping at N with found_gte; -2 asks for an estimate, like the
+  // estimate_count flag but for this list alone. The flag applies to an unset
+  // or positive count_limit, never to an explicit 0 or -1. An exact count is
+  // valid for every nonzero value. Must be >= -2. Ops, collapse, diversify,
+  // field sorts, nested lists and limit 0 retain exact counting.
   optional sint64 count_limit = 5;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
@@ -254,10 +257,11 @@ message Fusion {
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  // Match count: unset or 0 omits found; -1 requests exact; positive N permits
-  // a lower bound. Fusion always supplies an exact count, also valid for N.
-  // Counts eligible groups with collapse, otherwise source-union documents.
-  // Must be >= -1.
+  // Match count: unset or 0 omits found; -1 requests exact; -2 permits an
+  // estimate; positive N permits a lower bound. Fusion always supplies an exact
+  // count, which is valid for -2, N and an unset count_limit under the
+  // estimate_count flag. Counts eligible groups with collapse, otherwise
+  // source-union documents. Must be >= -2.
   optional sint64 count_limit = 5;
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
@@ -342,6 +346,7 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
+    GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
   }
@@ -620,6 +625,38 @@ message GeoDistanceQuery {
   double radius_meters = 4; // inclusive radius, finite and non-negative
 }
 
+// A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the
+// VALUE array contract [x, y] = [lon, lat] does not apply.
+message GeoLatLon {
+  double lat = 1; // degrees in [-90, 90], finite
+  double lon = 2; // degrees in [-180, 180], finite
+}
+
+// A ring lists its vertices in order; the last connects back to the first,
+// and repeating the first vertex at the end is optional. It needs at least 3
+// distinct vertices.
+message GeoRing {
+  repeated GeoLatLon points = 1;
+}
+
+// One polygon: an outer ring and optional holes. A point is inside it when it
+// is inside the outer ring and inside none of its holes, each ring by the
+// even-odd rule, so a self-intersecting ring still has an interior. Holes
+// apply to this polygon only.
+message GeoPolygon {
+  repeated GeoLatLon points = 1; // the outer ring, as in GeoRing
+  repeated GeoRing holes = 2;
+}
+
+// Matches when at least one GEO_POINT value is inside any of the polygons,
+// their union. Edges are straight lines in latitude/longitude and do not
+// cross the dateline: split such a polygon into two polygons of the same
+// query. A point exactly on an edge may match either way.
+message GeoPolygonQuery {
+  string field = 1;
+  repeated GeoPolygon polygons = 2; // at least one
+}
+
 message Filter {
   Query query = 1; // required; restricts matches without contributing to scores
 
@@ -656,6 +693,15 @@ message PrefixQuery {
   // After whole-prefix normalization, also match simple Unicode case
   // alternates. TEXT fields are supported. Uses a constant-score automaton.
   bool case_insensitive = 3;
+
+  // Max term expansions per segment. Unset/0 = every term with the prefix.
+  // A positive value keeps only the terms with the highest document frequency
+  // in each segment (ties go to the lower term), so a short prefix over a
+  // large dictionary costs at most this many postings lists per segment.
+  // Any positive value is valid; negative values are rejected. Selection also
+  // supports case_insensitive. Operator expansion and request memory limits
+  // still apply.
+  int32 max_expansions = 4;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
@@ -703,8 +749,8 @@ message FuzzyQuery {
   optional int32 prefix_length = 4;
 
   // Max term expansions, closest terms first. Unset/0 = default 50. A
-  // positive value requests that cap; the operator/clause budget may lower it
-  // with a warning. Negative values are rejected.
+  // positive value is honored as given, with no upper bound. Negative values
+  // are rejected.
   int32 max_expansions = 5;
 }
 
@@ -794,6 +840,38 @@ enum SelectionMode {
   ALL = 1;
 }
 
+// Restricts which terms of a STRING or ID field can become ordinary buckets of
+// a FieldFacet. Every set condition must hold (AND). Counts are exact: the
+// filter chooses buckets after counting and never narrows the query domain, so
+// it is not the same as adding a filter to the search. Terms are tested as
+// indexed: prefix, regex, include, and exclude values are normalized the way
+// the field normalizes query text, and ID fields use them verbatim.
+message TermFilter {
+  // Keeps terms starting with this prefix. Empty = unset.
+  string prefix = 1;
+
+  // Keeps terms matching this regular expression in full, with RegexQuery
+  // syntax. Empty = unset.
+  string regex = 2;
+
+  // Drops terms matching this regular expression in full. Empty = unset.
+  string exclude_regex = 3;
+
+  // Keeps only these exact terms. An empty list is unset, so it cannot be used
+  // to match nothing.
+  repeated string include = 4;
+
+  // Drops these exact terms.
+  repeated string exclude = 5;
+
+  // Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes)
+  // modulo num_partitions equals partition, so num_partitions requests with
+  // partition 0..num_partitions-1 together return every term once. Unset when
+  // num_partitions is 0; otherwise partition must be below num_partitions.
+  uint32 partition = 6;
+  uint32 num_partitions = 7;
+}
+
 // Buckets of distinct field values, using the field's value binding.
 // STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount,
 // missing, selections, sub-operations, and metric sorts. Distinct counts are
@@ -834,6 +912,12 @@ message FieldFacet {
   // Exact distinct keys per bucket, also usable without collapse. Same key
   // types and missing policies as Collapse. Conflicting measures are errors.
   Collapse count_distinct = 10;
+  // STRING/ID only. Restricts which terms can be ordinary buckets while counts
+  // stay exact; see TermFilter. It applies to the ordinary page and to
+  // mincount=0 padding. `missing` still counts every document in the domain
+  // without a value, and selected buckets are returned whether or not they
+  // pass the filter.
+  TermFilter term_filter = 11;
 }
 
 message CalendarGap {
@@ -1014,6 +1098,12 @@ message SearchResponse {
   Error error = 3;
   repeated Warning warnings = 4; // final response only, on success or failure
   ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its final response is ready to serialize. Includes parsing,
+  // any min_commit wait, execution, and earlier streamed batches, including any
+  // pause while the client reads them. Excludes serializing, queueing, and
+  // sending the final response. Final response only.
+  uint64 took_us = 8;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
@@ -1050,11 +1140,16 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Match count when count_limit is nonzero. Counts groups with
-  // collapse; otherwise Fusion counts source-union documents before paging.
+  // Match count when count_limit is nonzero or the estimate_count flag applies.
+  // Counts groups with collapse; otherwise Fusion counts source-union documents
+  // before paging.
   optional sint64 found = 1;
-  // True when found is a lower bound; false means the count is exact.
+  // True when found is a lower bound. Neither this nor found_estimated means
+  // the count is exact.
   bool found_gte = 9;
+  // True when found was extrapolated from a sample of the index; it may be
+  // above or below the exact count, within what index statistics allow.
+  bool found_estimated = 16;
   optional sint64 found_docs = 2; // Collapse only, when count_limit is nonzero, after missing=drop.
   optional sint64 found_groups = 8; // Diversify only, with nonzero count_limit: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
@@ -1264,6 +1359,12 @@ message UpdateResponse {
   // Any collection error sets the response status to ERROR and a top-level error;
   // every admitted collection outcome is retained. HTTP status remains 200.
   map<string, CollectionCommit> commits = 10;
+
+  // Server-side wall time in microseconds from receipt of the complete request
+  // message until its response is ready to serialize, including parsing and any
+  // commit and replica wait. Excludes serializing, queueing, and sending the
+  // response. HTTP NDJSON stream acknowledgments do not carry this field.
+  uint64 took_us = 11;
 }
 
 
@@ -1390,8 +1491,9 @@ message ColVector {
 }
 
 // Column of a field type that has no typed arm (an object, an interval, a
-// boolean): v[i] holds what document i's row entry would.  An unset kind
-// means missing.
+// boolean, a geo point): v[i] holds what document i's row entry would.  An
+// unset kind means missing.  A geo point is an arr_d [lon, lat], and a
+// multi-valued geo field an arr of such pairs, the shapes ingest reads.
 message ColVal {
   repeated Val v = 1;
 }
@@ -1451,6 +1553,19 @@ message DeleteCollectionRequest {
 message DeleteCollectionResponse {
   string name = 1;
 }
+
+message RenameCollectionRequest {
+  string from = 1;
+  string to = 2;
+  string tenant = 3;
+}
+message RenameCollectionResponse { string from = 1; string to = 2; }
+message SwapCollectionsRequest {
+  string a = 1;
+  string b = 2;
+  string tenant = 3;
+}
+message SwapCollectionsResponse { string a = 1; string b = 2; }
 
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
@@ -1557,6 +1672,8 @@ message ServiceStats {
   string version = 1;
   // The CPU target the binary was built for.
   string cpu_target = 20;
+  // The full Git commit the binary was built from, or "unknown".
+  string source_commit = 23;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
@@ -1833,6 +1950,8 @@ message MemoryStats {
   uint64 node_budget_bytes = 5;
   // Per-request tracked search memory ceiling; zero disables rejection.
   uint64 search_request_limit_bytes = 6;
+  // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
+  uint64 schema_cache_bytes = 7;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1840,6 +1959,11 @@ message ReplicationCatalog {
   string boot = 1;
   string cursor = 2;
   repeated ReplicationCatalogEntry collections = 3;
+  repeated ReplicationTenant tenants = 4;
+}
+message ReplicationTenant {
+  string tenant = 1;
+  uint64 revision = 2;
 }
 message ReplicationCatalogEntry {
   string commit = 1;
@@ -1991,9 +2115,9 @@ message IndexStats {
 
 // Ids and generations that appear in filenames are reported in their
 // filesystem spelling so stats output correlates directly with directory
-// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// listings and logs: "seg" includes the creator epoch (e.g. "s0a.2"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// in filenames (e.g. live_gen "01" written in epoch 3 -> file "s0a.2__L01.3").
 // Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,

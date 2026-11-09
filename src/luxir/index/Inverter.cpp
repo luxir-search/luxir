@@ -109,52 +109,49 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
   // Names are already resolved; dynamic FieldTypes can be template prototypes.
   u_ptr<IndexHandler> fieldHandler;
 
-  switch (fieldType->type()) {
-    case FieldType::Type::TEXT:
-      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
-      break;
-    case FieldType::Type::ID:
-      fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
-      idHandler_ = fieldHandler.get();
-      break;
-    case FieldType::Type::STRING:
-      if (!fieldType->indexed() && fieldType->hasColumn()) {
-        // If the field is not indexed (column stored only), use StrColHandler
-        fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
-      } else {
-        // indexed and column stored (via ord)
-        if (fieldType->multiArray()) {
-          fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+  if (fieldType->type() == FieldType::ID) {
+    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
+    idHandler_ = fieldHandler.get();
+  } else if (fieldType->type() == FieldType::GEO_POINT) {
+    if (fieldType->multiValued()) {
+      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
+    } else {
+      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
+    }
+  } else {
+    switch (FieldType::storage(fieldType->type())) {
+      case FieldType::Storage::TEXT:
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+        break;
+      case FieldType::Storage::TERMS:
+        if (!fieldType->indexed() && fieldType->hasColumn()) {
+          // If the field is not indexed (column stored only), use StrColHandler
+          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
         } else {
-          fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+          // indexed and column stored (via ord)
+          if (fieldType->multiArray()) {
+            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+          } else {
+            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+          }
         }
-      }
-      break;
-    case FieldType::Type::INT:
-    case FieldType::Type::FLOAT:
-    case FieldType::Type::DOUBLE:
-    case FieldType::Type::DATE:
-      // One handler pair serves the whole int-column family: the stored
-      // encoding (raw ints, sortable bits, epoch millis) comes from
-      // FieldType::coerceColInt64, not the handler.
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::GEO_POINT:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::VECTOR:
-      fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
-      break;
-    default:
-      throw std::runtime_error("Unknown field type: " + std::string(name));
+        break;
+      case FieldType::Storage::INT64:
+        // One handler pair serves the whole int-column family: the stored
+        // encoding (raw ints, sortable bits, epoch millis) comes from
+        // FieldType::coerceColInt64, not the handler.
+        if (fieldType->multiValued()) {
+          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
+        } else {
+          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
+        }
+        break;
+      case FieldType::Storage::VECTOR:
+        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
+        break;
+      default:
+        throw std::runtime_error("Unknown field type: " + std::string(name));
+    }
   }
 
 
@@ -354,9 +351,9 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
 
     // Start with generation 1 for the first liveDocs file.
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, nullptr);
     }
     liveGen = 1;
     liveDocs = numLiveDocs;

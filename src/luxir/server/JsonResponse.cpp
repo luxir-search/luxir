@@ -500,6 +500,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     appendInt<Int64Str>(out, *docs.found);
     out += ',';
     if (docs.found_gte) out += R"("found_gte":true,)";
+    if (docs.found_estimated) out += R"("found_estimated":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -635,6 +636,10 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
     appendKey("commit");
     appendJsonString(out, resp.commit);
   }
+  if (resp.took_us != 0) {  // final response only
+    appendKey("took_us");
+    appendInt<Int64Str>(out, resp.took_us);
+  }
   if (resp.error.has_value()) {
     // A failed request carries no op results; warnings declared before the
     // failure still ride along.
@@ -740,6 +745,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       marker += R"("found":)";
       appendInt<Int64Str>(marker, *docs.found);
       if (docs.found_gte) marker += R"(,"found_gte":true)";
+      if (docs.found_estimated) marker += R"(,"found_estimated":true)";
       first = false;
     }
     if (haveFoundDocs) {

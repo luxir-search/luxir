@@ -180,12 +180,12 @@ TEST_F(BoundedCountTest, exactFallbacksAndValidation) {
     EXPECT_FALSE(result->docList()->found_gte);
   }
   auto bad = localReq(luxirNode->getSearchEngine());
-  parseQueryRequest(search(query, -2), bad->rawRequest(), bad->mr);
+  parseQueryRequest(search(query, -3), bad->rawRequest(), bad->mr);
   bad->collection("bounded");
   ExpectLog quiet("Search request rejected");
   bad->execute(1);
   EXPECT_FALSE(bad->ok());
-  EXPECT_NE(std::string::npos, bad->errorMsg().find("count_limit must be >= -1"));
+  EXPECT_NE(std::string::npos, bad->errorMsg().find("count_limit must be >= -2"));
 }
 
 TEST_F(BoundedCountTest, explicitDomainCountsExactly) {

@@ -720,25 +720,40 @@ private:
   }
 
   static bool isStoredField(const SegFieldInfo& info) {
-    return info.type == FieldType::BIN && (info.flags & FieldType::STORED) != 0;
+    return FieldType::storage(info.type) == FieldType::Storage::BIN && (info.flags & FieldType::STORED) != 0;
   }
 
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
-    return type != FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+    return FieldType::usesOneDimensionalPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static bool hasGeoPoints(FieldType::Type type, int32_t flags) {
-    return type == FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+    return FieldType::usesGeoPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
+    bool allIndexed = true;
     for (const auto& field : fields) {
       if (type == FieldType::Type::NONE) {
         type = field.segFieldInfo.type;
       }
       allFlags |= field.segFieldInfo.flags;
+      if (field.segFieldInfo.numValues != 0
+          && !(field.segFieldInfo.flags & FieldType::INDEX_DOCS)) allIndexed = false;
+    }
+    // Numeric postings are an optional complete acceleration of the column.
+    // A mode change can leave inputs without postings; their values must not
+    // disappear behind a partial dictionary. Keep the merged column instead.
+    // TODO: take the merged index structures from the current schema instead
+    // of the inputs' flags. Today postings drop on mixed inputs (none -> match
+    // never takes effect for merged data) while points are synthesized from
+    // the column (range -> none never takes effect). Building postings from
+    // the column as synthesizePointRun does for points would let index mode
+    // changes converge in both directions.
+    if (FieldType::storage(type) == FieldType::Storage::INT64 && !allIndexed) {
+      allFlags &= ~FieldType::INDEX_DOCS_FREQS_POSITIONS;
     }
   }
 
@@ -765,6 +780,7 @@ private:
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
+    auto storage = FieldType::storage(type);
 
     int64_t numValues = 0;
     int64_t docsWithField = 0;
@@ -782,7 +798,7 @@ private:
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues) : 0;
 
-    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Ord columns hold the term-order -> doc-order transposition in RAM until the
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus a pool delta stream per multi-valued doc.  This is the
@@ -804,7 +820,7 @@ private:
       return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
-    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
       return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
@@ -836,14 +852,15 @@ private:
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
+    auto storage = FieldType::storage(type);
 
-    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0) {
       return MergeCostModel::ORD_COL_STREAMS;
     }
-    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       return MergeCostModel::TEXT_STREAMS;
     }
-    if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+    if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
         && (allFlags & FieldType::INDEX_DOCS) == 0) {
       return MergeCostModel::STR_COL_STREAMS;
     }
@@ -1462,8 +1479,7 @@ private:
         // Cuts land on block-leading terms, so a range holding a heavy term
         // runs long: queue ranges by their share of the source bytes.
         batch.work = planBytes == 0 ? fieldWork / (int64_t) outputs.size()
-            : (int64_t) ((long double) fieldWork * (long double) outputs[i]->plan.bytes
-                         / (long double) planBytes);
+            : (int64_t) ((__int128) fieldWork * outputs[i]->plan.bytes / planBytes);
         batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);
@@ -1658,7 +1674,7 @@ private:
     // dedicated merger.  Recognize them by the combination of type=BIN and
     // flags=STORED set by StoredFieldsWriter::finish().
     const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
-    if (firstInfo.type == FieldType::BIN
+    if (FieldType::storage(firstInfo.type) == FieldType::Storage::BIN
         && (firstInfo.flags & FieldType::STORED) != 0) {
       mergeStoredFields(mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
@@ -1682,12 +1698,12 @@ private:
     }
 
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
-    int32_t allFlags = 0;
-    FieldType::Type type = firstInfo.type;
-    for (auto* field : compactFields) {
-      allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
-    }
-    bool isText = type == FieldType::Type::TEXT;
+    int32_t allFlags;
+    FieldType::Type type;
+    batchTypeAndFlags(mergeFieldInfos, type, allFlags);
+    allFlags &= ~FieldType::SEGMENT_MARKERS;
+    auto storage = FieldType::storage(type);
+    bool isText = storage == FieldType::Storage::TEXT;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
       int64_t serialCost = estimateCost(mergeFieldInfos);
@@ -1730,7 +1746,7 @@ private:
     }
 
     // if this is an indexed string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (type == FieldType::Type::STRING) && (allFlags & FieldType::INDEX_DOCS);
+    bool isOrdCol = (storage == FieldType::Storage::TERMS) && (allFlags & FieldType::INDEX_DOCS);
     if (isOrdCol && (allFlags & FieldType::MULTI_ARRAY)) {
       mergeArrayOrdColumn(compactFields, outputFieldInfo, pool);
       return;
@@ -1769,7 +1785,7 @@ private:
     } else if (isText) {
       NormsWriter::writeValues(pool, postingsWriter, outputFieldInfo, preparedNorms,
                                normDocsWithField);
-    } else if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+    } else if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use
       // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
@@ -1995,8 +2011,8 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    assert(outputFieldInfo.type == FieldType::Type::STRING
-           || outputFieldInfo.type == FieldType::Type::VECTOR);
+    assert(FieldType::storage(outputFieldInfo.type) == FieldType::Storage::TERMS
+           || FieldType::storage(outputFieldInfo.type) == FieldType::Storage::VECTOR);
     assert(!(outputFieldInfo.flags & FieldType::INDEX_DOCS));
 
     bool multiValued = (outputFieldInfo.flags & FieldType::MULTI_VALUED) != 0;

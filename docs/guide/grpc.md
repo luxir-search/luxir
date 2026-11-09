@@ -68,6 +68,12 @@ several `SearchRequest` messages. Each request may produce several
 `SearchResponse` messages when a document list is batched; `more` tells the
 client another response belongs to the same logical request. Set `request_id`
 when several requests share a call and use the echoed value for correlation.
+The final response of each request carries `took_us`, the server-side wall
+time in microseconds from receipt of the complete request message until its
+final response is ready to serialize. It includes parsing, any `min_commit`
+wait, execution, and earlier streamed batches, including any pause while the
+client reads them. It excludes serializing, queueing, and sending the final
+response.
 
 One request contains:
 
@@ -78,12 +84,14 @@ One request contains:
   response; string field facets are currently instrumented.
 - `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
   for unlimited (shared workers join in across segments and operations).
-  `0` (the default) lets the engine decide; today that is serial. Over gRPC
+  `0` (the default) lets the engine decide: serial, unless the operator has set
+  `search.auto-parallel-min-work` and the request visits at least that many
+  documents, in which case it runs like `-1`. Over gRPC
   every search runs on the shared worker pool, never on the completion-queue
   thread that received it: gRPC offers a connection's new calls to its
   preferred completion queue first, so running queries there would
-  serialize the calls multiplexed on that connection. `0` and `1` therefore
-  behave alike,
+  serialize the calls multiplexed on that connection. A serial `0` and `1`
+  therefore behave alike,
   and `-1` fans out from a worker. Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
@@ -127,7 +135,11 @@ returns one [`UpdateResponse`](../reference/protobuf.md#message-luxir.updateresp
 for each. Each message has its own overwrite, atomicity, return-ID, and commit
 settings; all-or-none never spans messages.
 `request_id` is echoed so responses can be associated without depending on
-completion timing. Responses may complete out of request order.
+completion timing. Responses may complete out of request order. Each
+response's `took_us` is the server-side wall time in microseconds from receipt
+of its complete request message until the response is ready to serialize,
+including parsing and any commit and replica wait. It excludes serializing,
+queueing, and sending the response.
 
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
@@ -181,7 +193,10 @@ Subops inherit their parent's effective word. The date mode occupies bits 0-1:
 `flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
 Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
 or clear it in either word. It affects HTTP JSON rendering only, and binary
-gRPC responses retain their integer types. Unknown bits are rejected in either
+gRPC responses retain their integer types. Bit 3 is `estimate_count`: lists in
+its scope with an unset or positive `count_limit` may estimate `found` (see
+[counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded)). Clearing
+it on an op stops its subops inheriting it. Unknown bits are rejected in either
 word. Bits absent from `flags_set` have no effect on inheritance.
 
 `RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the

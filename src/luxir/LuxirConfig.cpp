@@ -173,9 +173,31 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
       ->default_val(replication.retry_ms);
 
-  app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
-      ->default_val(store.backend)
-      ->check(CLI::IsMember({"ram", "fs"}));
+  // Names are validated against the registries when storage opens: options are added before plugins register.
+  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs; plugins may add more)")
+      ->default_val(store.backend);
+  app.add_option("--store.layer", store.layers,
+                 "Storage layer wrapped around the backend (repeatable, innermost first; provided by plugins)")
+      ->expected(1)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
+  app.add_option_function<std::vector<std::string>>("--store.option",
+      [&options = store.options](const std::vector<std::string>& pairs) {
+        for (const auto& pair : pairs) {
+          auto eq = pair.find('=');
+          auto dot = pair.find('.');
+          if (eq == std::string::npos || dot == std::string::npos || dot == 0 || dot + 1 >= eq) {
+            throw CLI::ValidationError("--store.option", "expected COMPONENT.KEY=VALUE, got '" + pair + "'");
+          }
+          auto component = pair.substr(0, dot);
+          if (component.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos) {
+            throw CLI::ValidationError("--store.option", "component '" + component + "' must use [a-z0-9_]+");
+          }
+          options[component][pair.substr(dot + 1, eq - dot - 1)] = pair.substr(eq + 1);
+        }
+      },
+      "Backend or layer setting COMPONENT.KEY=VALUE (repeatable)")
+      ->expected(1)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
   app.add_option("--store.ram-limit-mb", store.ram_limit_mb, "RAM storage allocation limit in MiB (0 = unlimited)")->check(CLI::Range((uint64_t)0, UINT64_MAX / (1024 * 1024)));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
@@ -249,6 +271,36 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.auto-parallel-min-work",
+                 search.auto_parallel_min_work,
+                 "Operator opt-in: run a max_parallel 0 request in parallel when its "
+                 "lists visit at least this many documents by index metadata (0 = off, default)")
+      ->default_val(search.auto_parallel_min_work)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-expansions",
+                 search.multiterm_max_expansions,
+                 "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
+                 "a merge can change acceptance (0 = off, default)")
+      ->default_val(search.multiterm_max_expansions)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-terms-examined",
+                 search.multiterm_max_terms_examined,
+                 "Dictionary terms all multi-term and fuzzy scans of one request "
+                 "may visit; operator opt-in (0 = off, default)")
+      ->default_val(search.multiterm_max_terms_examined)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-postings",
+                 search.multiterm_max_postings,
+                 "Operator opt-in postings estimate: summed selected docFreq, excluding "
+                 "fuzzy scored rewrites (0 = off, default)")
+      ->default_val(search.multiterm_max_postings)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-min-prefix-length",
+                 search.multiterm_min_prefix_length,
+                 "Pattern-only minimum literal prefix in bytes for unbounded prefix/wildcard/regex; "
+                 "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
+      ->default_val(search.multiterm_min_prefix_length)
+      ->check(CLI::NonNegativeNumber);
 }
 
 void LuxirConfig::resolveRamBudgets() {
@@ -300,11 +352,6 @@ void LuxirConfig::normalize() {
 
   if (store.backend == "ram" && store.data_dir != "luxir_data") {
     spdlog::warn("store.data-dir is ignored when store.backend=ram");
-  }
-
-  if (read_only && store.backend != "fs") {
-    throw std::runtime_error("--read-only requires --store.backend=fs; there is no "
-                             "existing data directory to serve with backend=" + store.backend);
   }
 
   // Only an explicit value can be over the pool's addressability; the derived

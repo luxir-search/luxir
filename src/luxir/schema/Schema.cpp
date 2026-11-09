@@ -583,11 +583,10 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
+      if (numericClass && !column) {
+        throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (r.type == FieldClass::VECTOR) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
@@ -739,7 +738,7 @@ static LogicalField::Shape shapeFamily(FieldClass type) {
   return LogicalField::Shape::SCALAR;
 }
 
-static std::string binding(std::optional<std::string_view> label,
+static std::string resolveBinding(std::optional<std::string_view> label,
                            const LogicalField& logical, OpClass op) {
   if (label) {
     if (foldName(*label) == "self") return "self";
@@ -1036,9 +1035,9 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
         logical->variants.emplace(label, std::move(ft));
       }
     }
-    logical->search = binding(owned.defaults ? owned.defaults->search : std::nullopt,
+    logical->search = resolveBinding(owned.defaults ? owned.defaults->search : std::nullopt,
                               *logical, OpClass::SEARCH);
-    logical->value = binding(owned.defaults ? owned.defaults->value : std::nullopt,
+    logical->value = resolveBinding(owned.defaults ? owned.defaults->value : std::nullopt,
                              *logical, OpClass::VALUE);
     // Abstract variant prototypes are kept only in their logical template.
     // Concrete physical entries are also exposed through the legacy registry.

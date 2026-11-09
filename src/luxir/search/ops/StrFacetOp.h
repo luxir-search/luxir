@@ -149,6 +149,9 @@ class StrFacetOp : public FieldFacetReq {
   };
   std::vector<PinnedBucket> pinnedBuckets;
   bool inlineAllCandidate = false;
+  // term_filter resolved over this facet's global ords; FieldFacetReq's
+  // termFilter points here. Unset when no filter (or one that keeps all).
+  std::optional<FacetOrdFilter> resolvedTermFilter;
 
 public:
   class MergeableStrData : public luxir::MergeableData {
@@ -360,17 +363,24 @@ public:
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
-    std::span<const std::string_view> selected) :
+    std::span<const std::string_view> selected,
+    std::optional<FacetTermFilterSpec> termFilterSpec = std::nullopt) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
   ordMap(std::move(ordMap)) {
-    if (!selected.empty()) {
+    if (!selected.empty() || termFilterSpec) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
       pinnedBuckets.reserve(selected.size());
       for (std::string_view key : selected) {
         auto stats = lookup.termStats(key);
         pinnedBuckets.push_back({key, stats.globalOrd, stats.docFreq});
+      }
+      if (termFilterSpec) {
+        resolvedTermFilter = FacetOrdFilter::resolve(std::move(*termFilterSpec), lookup,
+            this->ordMap ? this->ordMap->numOrds() : 0);
+        // With limit 0 there are no ordinary buckets for it to choose.
+        if (resolvedTermFilter && limit != 0) termFilter = &*resolvedTermFilter;
       }
     }
     enableExecutionProfile();
@@ -444,8 +454,30 @@ public:
     bool full = false;
     int64_t floorCount = 0;
     int64_t floorOrd = 0;
+    // term_filter (null keeps every ord). An ord must pass it before it is
+    // counted or admitted. Its term tier runs here, behind the floor, unless
+    // the caller resolved it up front (`selection`). Replay rows share one
+    // Terms; otherwise the sink opens its own term lookups when it is built,
+    // so no later pool scope can rewind beneath them.
+    const FacetOrdFilter* filter;
+    const FacetOrdFilter::Selection* selection;
+    FacetOrdFilter::Terms* sharedTerms;
+    std::optional<MemPool::ScopeGuard> termsPool;
+    std::optional<OrdMapStr> ownLabels;
+    std::optional<FacetOrdFilter::Terms> ownTerms;
 
-    LUXIR_NOINLINE void admit(int64_t ord, int64_t count) {
+    FacetOrdFilter::Terms& terms() { return sharedTerms ? *sharedTerms : *ownTerms; }
+
+    bool accepts(int64_t ord) {
+      if (selection != nullptr) return (*selection)(ord);
+      return filter->containsOrd(ord)
+          && (!filter->hasTermTier() || terms().acceptsTerm(ord));
+    }
+
+    LUXIR_NOINLINE void addSlow(int64_t ord, int64_t count) {
+      if (filter != nullptr && !accepts(ord)) return;
+      if (counted < paddingTarget) countedOrds.push_back(ord);
+      counted++;
       finalizer.add({ord, count, {}});
       if (const auto* worst = finalizer.worst()) {
         full = true;
@@ -454,10 +486,37 @@ public:
       }
     }
 
+    LUXIR_NOINLINE void padFiltered(const boost::unordered_flat_set<int64_t>& present) {
+      size_t emitted = counted;
+      auto pad = [&](int64_t ord) {
+        if (present.contains(ord)) return true;
+        finalizer.add({ord, 0, {}});
+        return ++emitted < paddingTarget;
+      };
+      if (sharedTerms == nullptr) {
+        ownTerms->forEachAccepted(pad);
+        return;
+      }
+      for (size_t i = 0; emitted < paddingTarget; i++) {
+        auto ord = sharedTerms->acceptedAt(i);
+        if (!ord || !pad(*ord)) break;
+      }
+    }
+
   public:
-    OrdCountSink(const StrFacetOp& op, bool allowZeroPadding)
+    OrdCountSink(const StrFacetOp& op, bool allowZeroPadding,
+                 const FacetOrdFilter::Selection* selection = nullptr,
+                 FacetOrdFilter::Terms* terms = nullptr)
       : op(op),
-        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder) {
+        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder),
+        filter(op.termFilter), selection(selection), sharedTerms(terms) {
+      if (filter != nullptr && sharedTerms == nullptr) {
+        if (filter->hasTermTier()) {
+          termsPool.emplace(MemPool::threadLocal());
+          ownLabels.emplace(termsPool->pool(), op.ordMap.get(), op.reader, op.segInfos);
+        }
+        ownTerms.emplace(*filter, ownLabels ? &*ownLabels : nullptr);
+      }
       if (allowZeroPadding && op.minCount == 0) {
         int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
         paddingTarget = op.limit < 0 ? (size_t)numGlobalOrds : (size_t)op.limit;
@@ -465,18 +524,21 @@ public:
     }
 
     LUXIR_INLINE void add(int64_t ord, int64_t count) {
-      if (counted < paddingTarget) countedOrds.push_back(ord);
-      counted++;
       // countFieldBucketOrder: a newcomer must beat the page's worst bucket
-      // on count, or tie it with a smaller ord.
+      // on count, or tie it with a smaller ord. Losing implies a full page,
+      // so counted already covers paddingTarget and the ord needs neither
+      // remembering nor a term_filter test.
       if (full && (count < floorCount
                    || (count == floorCount && ord > floorOrd))) {
+        counted++;
         return;
       }
-      admit(ord, count);
+      addSlow(ord, count);
     }
 
-    // Counted ords added so far.
+    // Ords added so far that passed term_filter, plus the ones the floor
+    // rejected once the page was full (they need no filter test). The early
+    // stops in facetResult read size() >= limit as a full page.
     size_t size() const { return counted; }
 
     // pinCounts carries the count each selected value was found to have, read
@@ -488,13 +550,17 @@ public:
       if (counted < paddingTarget) {
         boost::unordered_flat_set<int64_t> present(
             countedOrds.begin(), countedOrds.end());
-        int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
-        size_t emitted = counted;
-        for (int64_t ord = 0;
-             ord < numGlobalOrds && emitted < paddingTarget; ord++) {
-          if (present.contains(ord)) continue;
-          finalizer.add({ord, 0, {}});
-          emitted++;
+        if (filter != nullptr) {
+          padFiltered(present);
+        } else {
+          int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
+          size_t emitted = counted;
+          for (int64_t ord = 0;
+               ord < numGlobalOrds && emitted < paddingTarget; ord++) {
+            if (present.contains(ord)) continue;
+            finalizer.add({ord, 0, {}});
+            emitted++;
+          }
         }
       }
       return op.finishPage(finalizer.finish(), pinCounts);
@@ -510,8 +576,10 @@ public:
   // delete this wrapper.
   std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
       const std::vector<std::pair<int64_t, int64_t>>& ordCounts,
-      bool allowZeroPadding) const {
-    auto sink = ordCountSink(allowZeroPadding);
+      bool allowZeroPadding,
+      const FacetOrdFilter::Selection* selection = nullptr,
+      FacetOrdFilter::Terms* terms = nullptr) const {
+    OrdCountSink sink(*this, allowZeroPadding, selection, terms);
     for (auto [ord, count] : ordCounts) sink.add(ord, count);
     return sink.finish();
   }
@@ -602,8 +670,7 @@ public:
       int64_t totalDomainSize = 0;
       inlineExpectedValues = inlineOps.empty() ? -1 : 0;
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-        auto& postings = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postings.maxDoc();
+        int32_t maxDoc = thisOp().reader.segments()[segnum].maxDoc();
         int64_t domainSize = domains[segnum].get() != nullptr
             ? domains[segnum].get()->card() : maxDoc;
         if (domainSize > std::numeric_limits<int64_t>::max()
@@ -714,8 +781,8 @@ public:
                ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableFieldFacetInline& data) {
         InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
-        PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
           profile->wire.domain_size = domain ? domain->card() : maxDoc;
@@ -756,7 +823,7 @@ public:
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
-          OrdColReader ordColReader(postingsReader, *segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), *segFieldInfo);
           OrdValueBatches values(domain, ordColReader, mapping, maxDoc,
                                  false, nullptr);
           OrdValueBatches::Batch batch;
@@ -797,8 +864,8 @@ public:
                       ExecutionProfilePieceState* profile,
                       bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
-        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         int32_t domainSize = domain ? domain->card() : maxDoc;
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
@@ -816,6 +883,7 @@ public:
           }
           return; // field not found, but still a contribution (driver releases)
         }
+        auto& postingsReader = segment.postingsReader();
         const auto& segFieldInfo = *info;
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
@@ -848,7 +916,7 @@ public:
                     ? 0 : (int64_t)thisOp().ordMap->topTerms().entries.size(),
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
-                .allowTopTerms = allowTopTerms,
+                .allowTopTerms = allowTopTerms && thisOp().termFilter == nullptr,
                 .hasGlobalOrdMap = thisOp().ordMap != nullptr,
                 .readerHasNoDeletes =
                     thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
@@ -1354,7 +1422,11 @@ public:
         // buckets after sorting/truncating the competitive nonzero buckets.
         auto min = std::max<int64_t>(thisOp().minCount, 1);
 
-        if (allTopTerms) {
+        if (thisOp().termFilter != nullptr) {
+          // TOP_TERMS is never planned under a filter (countSegment).
+          assert(!allTopTerms);
+          collectFiltered(*mergedData, *thisOp().termFilter, min, limit, ordCounts);
+        } else if (allTopTerms) {
           assert(thisOp().ordMap != nullptr);
           for (const auto& entry : thisOp().ordMap->topTerms().entries) {
             if (entry.df < min) break;
@@ -1438,6 +1510,66 @@ public:
       emitPage(ordCounts.finish(pinCounts), missing_count);
     }
 
+    // Streams the counted ords term_filter can keep into the sink, which
+    // applies the filter itself. Dense counters are walked only over the
+    // filter's ord intervals; sparse ones are probed per accepted ord when
+    // the filter is narrower than what they hold.
+    LUXIR_NOINLINE void collectFiltered(MergeableStrData& data, const FacetOrdFilter& filter,
+                                        int64_t min, int64_t limit, OrdCountSink& out) {
+      auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&data.counts);
+      auto* skinnyCounts = std::get_if<SkinnyCounter8>(&data.counts);
+      auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&data.counts);
+      auto* spanCounts = std::get_if<SpanCounter>(&data.counts);
+      auto forEachRangeOrd = [&](size_t size, auto&& visit) {
+        for (const auto& interval : filter.ranges()) {
+          size_t end = std::min((size_t)interval.hi, size);
+          for (size_t ord = (size_t)interval.lo; ord < end; ord++) visit((int64_t)ord);
+        }
+      };
+      if (vecCounts) {
+        forEachRangeOrd(vecCounts->size(), [&](int64_t ord) {
+          int64_t count = (*vecCounts)[(size_t)ord];
+          if (count >= min) out.add(ord, count);
+        });
+      } else if (skinnyCounts) {
+        // As the unfiltered walk: overflowed ords first, which outcount every
+        // ord that did not overflow.
+        for (auto [ord, count] : skinnyCounts->overflow) {
+          count += skinnyCounts->counts[ord];
+          skinnyCounts->counts[ord] = 0;
+          if (count >= min) out.add(ord, count);
+        }
+        if (limit == -1 || (int64_t)out.size() < limit) {
+          forEachRangeOrd(skinnyCounts->counts.size(), [&](int64_t ord) {
+            int64_t count = skinnyCounts->counts[(size_t)ord];
+            if (count >= min) out.add(ord, count);
+          });
+        }
+      } else if (mapCounts) {
+        if (filter.width() < (int64_t)mapCounts->size()) {
+          forEachRangeOrd(std::numeric_limits<size_t>::max(), [&](int64_t ord) {
+            auto it = mapCounts->find(ord);
+            if (it != mapCounts->end() && it->second >= min) out.add(ord, it->second);
+          });
+        } else {
+          for (auto& [ord, count] : *mapCounts) {
+            if (count >= min) out.add(ord, count);
+          }
+        }
+      } else if (spanCounts) {
+        if (filter.width() < (int64_t)spanCounts->distinct()) {
+          forEachRangeOrd(spanCounts->maxOrd, [&](int64_t ord) {
+            int64_t count = spanCounts->total(ord);
+            if (count >= min) out.add(ord, count);
+          });
+        } else {
+          collectSparseCounts(*spanCounts, min, limit, out);
+        }
+      } else {
+        assert(false);
+      }
+    }
+
     void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
                   int64_t missingCount) {
 
@@ -1451,6 +1583,10 @@ public:
 
 
     void facetResult2(std::unique_ptr<MergeableFieldFacetInline> mergedData) {
+      if (thisOp().termFilter != nullptr) {
+        facetResult2Filtered(std::move(mergedData), *thisOp().termFilter);
+        return;
+      }
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
                        thisOp().reader, thisOp().segInfos);
@@ -1463,6 +1599,29 @@ public:
                 ? thisOp().pinnedBuckets[bucket.pinIndex].key
                 : labels.ordToStr(*bucket.key));
           }, [this](auto& buckets) { executeResultChildren(buckets); });
+    }
+
+    // facetResult2 under term_filter. There is no page floor here, so the
+    // term tier runs once, ascending, over the ords the filter's intervals
+    // keep. Out of line, so the unfiltered page keeps its inlining.
+    LUXIR_NOINLINE void facetResult2Filtered(std::unique_ptr<MergeableFieldFacetInline> mergedData,
+                                             const FacetOrdFilter& filter) {
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
+                       thisOp().reader, thisOp().segInfos);
+      std::vector<std::optional<int64_t>> pins;
+      pins.reserve(thisOp().pinnedBuckets.size());
+      for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
+      auto accept = filter.select([&](auto&& visit) {
+        mergedData->counts.forEachEntry([&](int64_t key, char*) { visit(key); });
+      }, labels);
+      inlineResult<std::string>(std::move(mergedData), pins,
+          [&](const auto& bucket) {
+            return std::string(bucket.pinned()
+                ? thisOp().pinnedBuckets[bucket.pinIndex].key
+                : labels.ordToStr(*bucket.key));
+          }, [this](auto& buckets) { executeResultChildren(buckets); },
+          std::less<int64_t>{}, [&](int64_t key) { return accept(key); });
     }
 
 
@@ -1482,9 +1641,8 @@ public:
       auto selected = StrFacetSelectedOrdMap::selectedBuckets(buckets);
 
       for (size_t segnum = 0; segnum < numSegments; segnum++) {
-        auto& postingsReader =
-            thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         auto poolGuard = MemPool::threadLocalPoolGuard();
         // Reserved up front: DocSetBuilder holds a pointer into its own
         // optional bitset, so it must never be reallocated once built into.
@@ -1494,7 +1652,7 @@ public:
 
         if (auto* info = thisOp().fieldInfo((int32_t)segnum)) {
           const auto& segFieldInfo = *info;
-          OrdColReader ordColReader(postingsReader, segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
           auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
           StrFacetSelectedOrdMap selectedMap(mapping, selected);
           int64_t missing_num = 0;
@@ -1532,7 +1690,7 @@ public:
       BucketDomainCost cost;
       for (size_t segnum = 0; segnum < input.size(); segnum++) {
         int32_t segmentMax =
-            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+            thisOp().reader.segments()[segnum].maxDoc();
         cost.maxDocs += segmentMax;
         DocSet* domain = input[segnum].get();
         cost.domainDocs += domain != nullptr ? domain->card() : segmentMax;
@@ -1683,6 +1841,18 @@ public:
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
                          *child.req.reader, child.segInfos);
+      // term_filter: one term-tier pass over every row's ords, and one
+      // ascending accepted-ord stream for every row's zero-count padding.
+      std::optional<FacetOrdFilter::Selection> selection;
+      std::optional<FacetOrdFilter::Terms> terms;
+      if (const auto* filter = child.termFilter) {
+        selection.emplace(filter->select([&](auto&& visit) {
+          for (const auto& row : rows) {
+            for (auto [ord, count] : row) visit(ord);
+          }
+        }, ordMapStr));
+        terms.emplace(*filter, filter->hasTermTier() ? &ordMapStr : nullptr);
+      }
       std::vector<std::pair<std::string, int64_t>> countVec;
       for (const auto& bucket : buckets) {
         int32_t owner = bucket.owner.value;
@@ -1690,7 +1860,8 @@ public:
         assert(owner >= 0 && owner < (int32_t)rows.size());
         assert(output >= 0 && output < (int32_t)arr.v.size());
         auto& ordCounts = rows[(size_t)owner];
-        auto finalized = child.finalizeOrdCounts(ordCounts, true);
+        auto finalized = child.finalizeOrdCounts(ordCounts, true,
+            selection ? &*selection : nullptr, terms ? &*terms : nullptr);
         countVec.clear();
         countVec.reserve(finalized.size());
         for (const auto& result : finalized) {
@@ -1817,9 +1988,8 @@ public:
     void replaySegment(Bank& bank,
                        std::vector<int64_t>& missingCounts,
                        int32_t segnum) {
-      auto& postingsReader =
-          child.reader.segments()[(size_t)segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
+      auto& segment = child.reader.segments()[(size_t)segnum];
+      int32_t maxDoc = segment.maxDoc();
       auto profile = parent.profilePiece(
           TrackProfile ? profileRun : nullptr, segnum);
       int64_t routedDocs = 0;
@@ -1827,21 +1997,10 @@ public:
 
       auto* parentInfo = source.segInfos.at((size_t)segnum);
       if (!parentInfo) return;
-      const auto& parentFieldInfo = *parentInfo;
-      OrdColReader parentColumn(postingsReader, parentFieldInfo);
-      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
-      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
-
       auto* childFieldInfo = child.fieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
-      auto childMapping = child.ordMap->getSegToGlobal(segnum);
-      if (childFieldFound) {
-        childColumn.emplace(postingsReader, *childFieldInfo);
-        childIterator.emplace(*childColumn);
-      }
-
       if (!childFieldFound && !child.missing) {
         if constexpr (TrackProfile) {
           if (auto* piece = profile.get()) {
@@ -1850,6 +2009,17 @@ public:
           }
         }
         return;
+      }
+
+      auto& postingsReader = segment.postingsReader();
+      const auto& parentFieldInfo = *parentInfo;
+      OrdColReader parentColumn(postingsReader, parentFieldInfo);
+      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
+      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
+      auto childMapping = child.ordMap->getSegToGlobal(segnum);
+      if (childFieldFound) {
+        childColumn.emplace(postingsReader, *childFieldInfo);
+        childIterator.emplace(*childColumn);
       }
 
       selected.visit([&](const auto& selectedMap) {
@@ -1906,9 +2076,7 @@ public:
       }
       __int128 childValues = 0;
       for (size_t segnum = 0; segnum < source.domains.size(); segnum++) {
-        auto& postingsReader =
-            child.reader.segments()[segnum].postingsReader();
-        int32_t segmentMax = postingsReader.maxDoc();
+        int32_t segmentMax = child.reader.segments()[segnum].maxDoc();
         maxDocs += segmentMax;
         DocSet* domain = source.domains[segnum].get();
         domainDocs += domain != nullptr ? domain->card() : segmentMax;

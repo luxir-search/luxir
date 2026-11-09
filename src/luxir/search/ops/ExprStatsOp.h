@@ -33,6 +33,9 @@ namespace luxir {
 class ExprStatsOp : public SearchOp {
   static constexpr std::string_view FACET_STATE_BREAKER =
       "facet aggregate state";
+  // Cap on an optional exact ordinal set per state: an L2-sized working set
+  // (2M ords); larger dictionaries use the sketch.
+  static constexpr size_t MAX_ORD_SET_BYTES = 256 * 1024;
 
   AggregateProgram& aggregate;
   std::span<const AggregateFieldInfos> fields;
@@ -57,12 +60,11 @@ class ExprStatsOp : public SearchOp {
     }
     auto infos = fields[aggregate.leaves.front().producer].values[producer.input->rootNode];
     for (auto& segment : req.reader->segments()) {
-      auto& postings = segment.postingsReader();
-      if (postings.maxDoc() == 0) continue;
+      if (segment.maxDoc() == 0) continue;
       auto* field = infos.at((size_t)segment.ord);
       if (!field) return nullptr;
       const auto& info = *field;
-      if (info.docsWithField != postings.maxDoc()) return nullptr;
+      if (info.docsWithField != segment.maxDoc()) return nullptr;
     }
     return producer.resolved.denseFacetState;
   }
@@ -196,23 +198,32 @@ public:
       const ValueNode& root = binding.producer->input->root();
       BoundValueNode& bound = binding.values->nodes[
           binding.producer->input->rootNode];
-      if (!bound.column) return;
+      bool ordinals = root.type == ValueType::COLUMN_ONLY;
+      if (ordinals ? bound.stringColumn == nullptr || bound.stringColumn->ords == nullptr
+                   : !bound.column) return;
+      int64_t numOrds = ordinals ? thisOp().fields[binding.producerIndex].ords->numOrds() : 0;
+      size_t maxSetBytes = disableCardinalityOrdSetsForTests ? 0 : MAX_ORD_SET_BYTES;
       std::array<int64_t, BATCH_SIZE> values;
       size_t count = 0;
       auto flush = [&] {
-        accumulator.addRawBatch(
-            binding.producerIndex,
-            std::span<const int64_t>(values.data(), count), root.columnType);
+        auto batch = std::span<const int64_t>(values.data(), count);
+        if (ordinals) accumulator.addOrdBatch(
+            binding.producerIndex, batch, numOrds, maxSetBytes);
+        else accumulator.addRawBatch(binding.producerIndex, batch, root.columnType);
         count = 0;
       };
       int64_t missing = 0;
-      forEachIntColValue(
-          domain, *bound.column, maxDoc, missing,
-          [&](int32_t docid, int64_t value) LUXIR_INLINE {
-            unused(docid);
-            values[count++] = value;
-            if (count == values.size()) flush();
-          });
+      auto consume = [&](int32_t docid, int64_t value) LUXIR_INLINE {
+        unused(docid);
+        values[count++] = value;
+        if (count == values.size()) flush();
+      };
+      if (ordinals) {
+        forEachOrdValue(domain, *bound.stringColumn->ords, binding.ordMapping,
+                        maxDoc, missing, consume);
+      } else {
+        forEachIntColValue(domain, *bound.column, maxDoc, missing, consume);
+      }
       if (count != 0) flush();
     }
 
@@ -304,9 +315,11 @@ public:
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
               thisOp().aggregate, pool, segment, thisOp().fields);
 
-          int32_t maxDoc = segment.postingsReader().maxDoc();
+          int32_t maxDoc = segment.maxDoc();
           for (BoundAggregateInput& binding : bindings) {
-            if (binding.columnScan) {
+            if (binding.columnScan
+                && !(disableOrdinalAggregateBatchesForTests
+                     && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
             } else {
@@ -690,13 +703,12 @@ public:
       static constexpr size_t BATCH_SIZE = 256;
       auto poolGuard = MemPool::threadLocalPoolGuard();
       auto& segment = child.req.reader->segments()[(size_t)segnum];
-      auto& postings = segment.postingsReader();
-      int32_t maxDoc = postings.maxDoc();
+      int32_t maxDoc = segment.maxDoc();
 
       auto* info = source.segInfos.at((size_t)segnum);
       if (!info) return;
       const auto& parentInfo = *info;
-      OrdColReader parentColumn(postings, parentInfo);
+      OrdColReader parentColumn(segment.postingsReader(), parentInfo);
       auto mapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
 

@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <algorithm>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
 
 #include "OrdMap.h"
 #include "luxir/reader/TermsEnum.h"
@@ -87,6 +91,42 @@ public:
       if (tenum->seek(term)) return mapping.globalOrd(tenum->ord());
     }
     return std::nullopt;
+  }
+
+  // The smallest global ord whose term is >= target, or numOrds() when every
+  // term is smaller. Global ords follow term order, so the smallest segment
+  // ceiling is the global one.
+  int64_t ceilOrd(std::string_view target) {
+    if (ordMap == nullptr) return 0;
+    int64_t numOrds = ordMap->numOrds();
+    int firstFull = ordMap->firstFullSeg();
+    if (firstFull >= 0) {
+      TermsEnum* tenum = getTermsEnum(firstFull);
+      return tenum->seekCeil(target) ? tenum->ord() : numOrds;
+    }
+    int64_t ceiling = numOrds;
+    for (int32_t segnum = 0; segnum < (int32_t)enums.size(); segnum++) {
+      auto mapping = ordMap->getSegToGlobal(segnum);
+      if (mapping.numOrds == 0) continue;
+      TermsEnum* tenum = getTermsEnum(segnum);
+      if (tenum->seekCeil(target)) {
+        ceiling = std::min(ceiling, mapping.globalOrd(tenum->ord()));
+      }
+    }
+    return ceiling;
+  }
+
+  // Global ords [first, second) of the terms that start with `prefix`.
+  std::pair<int64_t, int64_t> prefixRange(std::string_view prefix) {
+    int64_t numOrds = ordMap ? ordMap->numOrds() : 0;
+    int64_t lo = ceilOrd(prefix);
+    // The first byte string after every extension of prefix: drop trailing
+    // 0xff bytes, then increment the last one. Terms compare as unsigned bytes.
+    std::string after(prefix);
+    while (!after.empty() && (uint8_t)after.back() == 0xff) after.pop_back();
+    if (after.empty()) return {lo, numOrds};
+    after.back() = (char)((uint8_t)after.back() + 1);
+    return {lo, std::max(lo, ceilOrd(after))};
   }
 
   // Resolve a global ordinal and sum its exact segment docFreqs in one pass.
