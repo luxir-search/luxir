@@ -225,6 +225,7 @@ TEST_F(ParentChildTest, optionalBranchEvidenceMustMatchItsParentPredicate) {
     {"has_child":{"relation":"variants","query":{"all":true},"inner_hits":{"name":"rejected"}}}
   ]}}]}})");
   ASSERT_EQ(std::vector<std::string>{"p"}, ids(*req));
+  EXPECT_TRUE(req->docList()->matches.empty());
 }
 
 TEST_F(ParentChildTest, vectorMatchesIndependentExhaustiveParentOracle) {
@@ -369,5 +370,4 @@ TEST_F(ParentChildTest, tokensAndUnsupportedPositionsAreRejected) {
   // A dis_max branch still returns the matching parents.
   auto req = search(R"("query":{"dis_max":{"queries":[{"has_child":{"relation":"variants","inner_hits":{"name":"w"}}},{"match":{"field":"title_s","val":"x"}}]}})");
   ASSERT_EQ(std::vector<std::string>{"p"}, ids(*req));
-  EXPECT_TRUE(req->docList()->matches.empty());
 }
