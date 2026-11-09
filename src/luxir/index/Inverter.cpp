@@ -239,6 +239,25 @@ void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
     indexPoints(inverter, geoPoints);
     return;
   }
+  // A numeric field's empty string is no value: nothing reaches any branch, so
+  // a text variant cannot index it either. Array elements drop the same way.
+  if (fieldType->emptyStringIsMissing) {
+    if (coerce::isEmptyString(val)) return;
+    if (auto* arr = std::get_if<api::ArrStr>(&val.kind);
+        arr && std::ranges::any_of(arr->v, &std::string_view::empty)) {
+      std::vector<std::string_view> kept;
+      std::ranges::copy_if(arr->v, std::back_inserter(kept), [](std::string_view s) { return !s.empty(); });
+      if (!kept.empty()) index(inverter, coerce::scalarVal(api::ArrStr{.v = kept}));
+      return;
+    }
+    if (auto* arr = std::get_if<api::ArrVal>(&val.kind);
+        arr && std::ranges::any_of(arr->v, coerce::isEmptyString)) {
+      std::vector<api::Val> kept;
+      std::ranges::copy_if(arr->v, std::back_inserter(kept), [](const api::Val& v) { return !coerce::isEmptyString(v); });
+      if (!kept.empty()) index(inverter, coerce::scalarVal(api::ArrVal{.v = kept}));
+      return;
+    }
+  }
   checkShape(val);
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);

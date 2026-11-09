@@ -1060,6 +1060,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.coerce"></a>[`coerce`](#field-luxir.fielddef.coerce) | 40 | `bool` | optional | INT, FLOAT and DOUBLE only. Treat a zero-length string as no value, like a null or an absent field. A whitespace-only or otherwise unparsable string still fails the document. Unset inherits, else true. Set false to reject empty strings too. |
 
 <a id="message-luxir.fielddefaults"></a>
 

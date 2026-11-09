@@ -50,6 +50,11 @@ inline bool isNull(const api::Val& val) {
       || std::holds_alternative<google::protobuf::NullValue>(val.kind);
 }
 
+inline bool isEmptyString(const api::Val& val) {
+  auto s = std::get_if<std::string_view>(&val.kind);
+  return s && s->empty();
+}
+
 inline bool isArray(const api::Val& val) {
   return std::holds_alternative<api::ArrVal>(val.kind)
       || std::holds_alternative<api::ArrStr>(val.kind)

@@ -283,6 +283,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `coerce` | `int`, `float`, `double` only; default `true`. A zero-length string is treated as no value, like a null or an absent field, and an empty array element is dropped. A whitespace-only or otherwise unparsable string still fails the document. Set `false` to reject empty strings too. Applies to ingest; a query value must still parse. |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the

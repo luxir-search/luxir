@@ -133,8 +133,9 @@ public:
   ~IntColHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    // explicit null means "no value", same as an absent field
-    if (coerce::isNull(val)) return;
+    // explicit null means "no value", same as an absent field; a numeric
+    // variant under a non-numeric field sees an empty string here
+    if (coerce::isNull(val) || (fieldType->emptyStringIsMissing && coerce::isEmptyString(val))) return;
     indexSingle(inverter, fieldType->coerceColInt64(
         val, std::string_view(fieldName), inverter.coerceContext));
   }
@@ -271,12 +272,13 @@ public:
       index(inverter, std::get<int64_t>(val.kind));
       return;
     }
-    if (coerce::isNull(val)) return;
+    if (coerce::isNull(val) || (fieldType->emptyStringIsMissing && coerce::isEmptyString(val))) return;
     // Validate/materialize before mutating any stream. A failed coercion may
     // retain scratch capacity, which still belongs to the inverter's budget.
     docValues.clear();
     auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
+      if (fieldType->emptyStringIsMissing && coerce::isEmptyString(elem)) return;
       docValues.push_back(fieldType->coerceColInt64(
           elem, std::string_view(fieldName), inverter.coerceContext));
     });
