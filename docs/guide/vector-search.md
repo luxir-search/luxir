@@ -350,7 +350,8 @@ filtered vectors from the filter's size and an estimated cost of each. A
 selective filter is usually cheaper to score exactly, and then returns exact
 results for that segment. If a segment on its index ends up costing more than
 an exact scan would, for example because the filter excludes the vectors
-nearest the query, it switches to an exact scan partway through the query.
+nearest the query, or because a query far from the data leaves too many
+candidates to rescore, it switches to an exact scan partway through the query.
 
 The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a

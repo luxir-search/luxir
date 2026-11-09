@@ -411,8 +411,14 @@ folding the first round. Predicted rounds are one at initial coverage,
 otherwise `1 + ceil(log2(coverage / initial_coverage))`. The bounded terminal
 allowance is one shared pool capped by eligible vectors; interval terminal
 reads are a dimension-dependent fraction of examined vectors, fitted for
-independent filters (anti-correlated filters read far more, and completion
-bounds that error). Filter placement is assumed
+independent filters and in-distribution queries (anti-correlated filters and
+out-of-distribution queries read far more, and completion bounds that error).
+That prior prices the initial routing; profiles report it as
+`prior_terminal_reads`. After the scan the host reprices terminal reads from
+the surviving records: a record counts if its upper bound reaches the k-th
+best unit estimate less the mean interval half-width of the top k, the
+stand-in for the exact floor the terminal pass will establish, and that count
+is `predicted_terminal_reads`. Filter placement is assumed
 independent of centroid order, and group diversity is not predicted from doc
 counts. RaBitQ extra-bit survival is a fitted function of dimensions until a
 segment has scanned; completion then uses the observed rate.
@@ -448,12 +454,17 @@ FAISS's scanner and its selector interface.
 
 At each joined round boundary, the host previews the next allocation without
 advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost
-exceeds its full-domain exact cost, the slot completes exactly. This is a cost
-rule, not a regret bound. Explicit probe pins disable completion, and idle
+exceeds its full-domain exact cost, the slot completes exactly. Interval slots
+add the expected cost of their surviving records' terminal reads, scaled by
+the next round's entries. When scanning has finished, the same check runs on
+the terminal cost alone: a slot whose survivors would cost more to read than
+an exact scan of it (about 27% of its vectors at 1024 dimensions) completes
+instead. This is a cost rule, not a regret bound. Explicit probe pins disable completion, and idle
 slots never trigger it. Completion removes the slot from allocation,
 recomputes effort over the active IVF slots, and runs one exact top-k pass over
-the slot's full domain without pooled exclusions. Interval records and
-lower-bound witnesses stay valid. In document mode only the completed slot's
+the slot's full domain without pooled exclusions. The slot's interval records
+are dropped, since the exact pass supersedes them, and their lower-bound
+witnesses stay valid. In document mode only the completed slot's
 approximate candidates are retracted: nominees never evict across slots, so the
 active pool continues and deepens only if it falls short. Group admission can
 evict another slot's members, so in group mode the active bounded pool starts
@@ -583,10 +594,11 @@ chunks sized by their actual vector counts, and each chunk is scanned as an
 independent task. A column-scanned segment splits the same way, on value ranks
 or, when it walks a filter's members, on document ids, into tasks of about
 `scanTaskGrainVectors` vectors (a doc's values stay in one task, and a segment
-under two grains stays whole). The terminal full-precision rescore runs one
-task per segment whose candidate bucket exceeds a small grain (smaller
-buckets, including the common small-`k` single-segment pool, fold inline on
-the calling thread).
+under two grains stays whole). The terminal full-precision rescore splits each
+segment's reads into tasks of about `rescoreTaskGrainCandidates` candidates in
+rank order, so its read-ahead stays sequential; a bucket under the grain folds
+inline on the calling thread, including the common small-`k` single-segment
+pool.
 
 Each flat chunk keeps its own top-k. The union of those is cut once per
 segment under the total hit order (score, then segment and rank), so chunking

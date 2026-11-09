@@ -3759,8 +3759,9 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
             spawns = counter.count();
           }
           int64_t expected = parallel ? segments - 1 : 0;
-          if (parallel && approximate && grain == 1) expected += segments - 1;
-          EXPECT_EQ(expected, spawns);
+          // Grain 1 splits every rescore bucket, so count at least one task each.
+          if (parallel && approximate && grain == 1) EXPECT_GE(spawns, expected + segments - 1);
+          else EXPECT_EQ(expected, spawns);
           int hits = 0;
           for (auto& segment : reader->segments()) {
             auto* scorer = prepared->createScorer(pool, segment);
@@ -3793,7 +3794,7 @@ TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
   for (bool parallel : {false, true}) {
     for (int64_t grain : {1, 1000}) {
       SCOPED_TRACE(::testing::Message() << "parallel=" << parallel << ", grain=" << grain);
-      ScanGrainGuard grains(grain, 1);
+      ScanGrainGuard grains(grain, 1 << 20);
       MemPool pool;
       Query::Context context(pool, *reader);
       KnnQuery query("embedding_v", fieldType, queryVec, 10, 4, 160, 1, false);
@@ -4253,10 +4254,78 @@ TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
   }
 }
 
+// A query whose 1-bit intervals barely separate leaves too many survivors to
+// read; the terminal check replaces the IVF arm with an exact scan. An
+// in-distribution query keeps the IVF arm, and the repriced terminal estimate
+// tracks the reads in both cases.
+TEST_F(KnnQueryTest, terminalCompletionOnLowContrastQueries) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
+  KnnQuery::tuning.completion = KnnQuery::Completion::AUTO;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(8), 64);
+  std::mt19937 rng(11);
+  std::normal_distribution<float> normal;
+  std::vector<std::vector<float>> vectors;
+  for (int i = 0; i < 1500; i++) {
+    std::vector<float> v(64);
+    for (auto& x : v) x = normal(rng);
+    h.index(flatdoc("id", std::to_string(i), "emb_v", v));
+    vectors.push_back(std::move(v));
+  }
+  h.commit({"*"});
+  auto run = [&](const std::vector<float>& q, bool exact, KnnQuery::Stats* stats, int k = 10) {
+    KnnQuery::statsForTests = stats;
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, "emb_v", q, k, 0, 0, exact);
+    req->execute(-1);
+    EXPECT_OK(req);
+    return resultIds(*req);
+  };
+  // A random point in the data's own distribution has no near neighbors.
+  std::vector<float> lowContrast(64);
+  for (auto& x : lowContrast) x = normal(rng);
+  KnnQuery::Stats low;
+  auto lowIds = run(lowContrast, false, &low);
+  EXPECT_EQ(lowIds, run(lowContrast, true, nullptr));
+  ASSERT_EQ(1u, low.completions.size());
+  EXPECT_STREQ("terminal", low.completions[0].reason);
+  EXPECT_EQ(0, low.terminalReads.load()) << "a completed segment's interval records are superseded";
+
+  auto within3x = [](const KnnQuery::Stats& stats) {
+    double reads = (double)stats.terminalReads.load(), predicted = stats.predictedTerminalReads.load();
+    ASSERT_GT(reads, 0);
+    EXPECT_LT(predicted, 3 * reads);
+    EXPECT_GT(predicted, reads / 3);
+  };
+  // Without the switch the estimate must track the expensive reads too.
+  KnnQuery::tuning.completion = KnnQuery::Completion::OFF;
+  KnnQuery::Stats kept;
+  run(lowContrast, false, &kept);
+  within3x(kept);
+  KnnQuery::tuning.completion = KnnQuery::Completion::AUTO;
+
+  // A k-th neighbor this close leaves almost no overlapping intervals.
+  auto near = vectors[7];
+  near[0] += 0.01f;
+  KnnQuery::Stats high;
+  auto highIds = run(near, false, &high, 1);
+  ASSERT_EQ(highIds.size(), 1u);
+  EXPECT_EQ(highIds[0], "7");
+  EXPECT_EQ(0u, high.completions.size());
+  within3x(high);
+}
+
 TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
-  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests, KnnQuery::tuning.plannerCosts);
+  // Scan-side completion only: terminal reads on this tiny corpus always
+  // price above an exact scan of its 4-d vectors.
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::TERMINAL_READ] = 0;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::TERMINAL_DIM] = 0;
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 4), 4);
   for (int i = 0; i < 512; i++)

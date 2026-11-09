@@ -169,7 +169,7 @@ public:
     std::atomic<double> initialBudget{0}, coveredFraction{0}, targetExamined{0};
     std::atomic<int64_t> plannedExact{0}, plannedIvf{0}, switches{0};
     std::atomic<int64_t> foldedEligible{0}, foldedRemaining{0};
-    std::atomic<double> predictedCost{0}, modeledActualCost{0};
+    std::atomic<double> predictedCost{0}, modeledActualCost{0}, predictedTerminalReads{0};
     std::array<std::atomic<double>, KnnPlanner::NUM_UNITS> costWork{}, predictedExactWork{};
     std::vector<VectorSearchWork> segmentWork; // Last prepare, under workMutex.
     std::vector<CompletionEvent> completions;
@@ -1373,19 +1373,27 @@ public:
       // run. List sizes are exact; unseen-list yield assumes the remaining
       // domain is independent within the unscanned population. Depth uses
       // the fresh rank count. Observed extra-bit survival replaces its seed.
-      auto tryComplete = [&](const VectorSearchRequest& next) {
+      // Null next is the terminal boundary: no further scan, only the exact
+      // reads of the interval records that survived it.
+      auto tryComplete = [&](const VectorSearchRequest* next) {
         if (tuning.completion == Completion::OFF || query.getNProbe() > 0) return false;
         bool force = tuning.completion == Completion::FORCE;
-        auto projected = force ? std::vector<VectorSearchWork>(numSegs) : baseEngine->preview(next);
+        if (force && next == nullptr) return false; // Already forced at this boundary.
+        auto projected = force || next == nullptr ? std::vector<VectorSearchWork>(numSegs) : baseEngine->preview(*next);
+        std::vector<int64_t> survivors(numSegs);
+        if (intervalEngine && !force) intervals.likelyReads(survivors);
         std::vector<size_t> selected;
         for (size_t i = 0; i < numSegs; i++) if (activeIvf[i]) {
           auto& w = projected[i];
-          if (!force && w.ivfRounds == 0) continue; // No work on this slot.
+          if (!force && next != nullptr && w.ivfRounds == 0) continue; // No work on this slot.
+          if (next == nullptr && planSegments[i].bounded) continue;
           const auto& input = planSegments[i];
           const auto& spent = workBySeg[i];
           int64_t eligible = activeEligibleVectors(i);
           int64_t population = input.vectors;
-          if (next.round == VectorSearchRound::DEPTH) {
+          if (next == nullptr) {
+            // Nothing is scanned at the terminal boundary.
+          } else if (next->round == VectorSearchRound::DEPTH) {
             if (rankEligibility[i].remaining >= 0) eligible = rankEligibility[i].remaining;
           } else {
             population -= spent.physicalEntries - spent.depthEntries;
@@ -1403,21 +1411,27 @@ public:
           }
           double marginal = tuning.plannerCosts.price(KnnPlanner::actualWork(input, w));
           // The first deepen folds a still-resolving domain before scanning.
-          if (!input.unfiltered && rankEligibility[i].original < 0)
+          if (next != nullptr && !input.unfiltered && rankEligibility[i].original < 0)
             marginal += tuning.plannerCosts.price(KnnPlanner::foldWork(input));
-          if (segApproxInPool[i] && rankEligibility[i].owned.empty()
+          if (next != nullptr && segApproxInPool[i] && rankEligibility[i].owned.empty()
               && (input.unfiltered || KnnPlanner::borrowDomain(input)))
             marginal += ((input.vectors + 63) / 64) * tuning.plannerCosts.units[KnnPlanner::FOLD_WORD];
-          double cumulative = tuning.plannerCosts.price(KnnPlanner::actualWork(input, spent));
+          // Interval survivors grow with the entries scanned, and each costs
+          // a full-precision read at the end.
+          double reads = input.bounded ? 0 : (double)survivors[i]
+              * ((double)(spent.physicalEntries + w.physicalEntries) / std::max((int64_t)1, spent.physicalEntries));
+          marginal += KnnPlanner::terminalCost(reads, reads * input.dims, tuning.plannerCosts);
+          double cumulative = next == nullptr ? 0 : tuning.plannerCosts.price(KnnPlanner::actualWork(input, spent));
           // Compare work with work: the marginal IVF round is not discounted
           // for parallelism, so the exact arm must not be either.
           double exact = plan.prices[i].exactWork;
           if (!force && cumulative + marginal <= exact) continue;
-          completions.push_back({(int32_t)i, roundNumber, force ? "forced" : marginal > exact ? "marginal" : "cumulative",
+          completions.push_back({(int32_t)i, roundNumber, force ? "forced" : next == nullptr ? "terminal" : marginal > exact ? "marginal" : "cumulative",
               exact, marginal, cumulative, spent.physicalEntries, spent.ivfRounds});
           selected.push_back(i);
         }
         if (selected.empty()) return false;
+        intervals.dropSegments(selected);
         for (size_t i : selected) {
           auto& seg = reader.segments()[i];
           DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
@@ -1569,9 +1583,12 @@ public:
         bool examinedDone = (double)eligibleExamined >= targetExamined - slack;
         // FORCE exercises completion even when round one already filled or
         // exhausted the ANN arm. Production completion only prices more work.
-        if (tuning.completion == Completion::FORCE && tryComplete(request)) continue;
+        if (tuning.completion == Completion::FORCE && tryComplete(&request)) continue;
         bool coverageDone = coveredFraction + 1e-15 >= initialFraction || result.breadthExhausted;
-        if (boundedDone && unitsFilled && examinedDone && coverageDone) break;
+        if (boundedDone && unitsFilled && examinedDone && coverageDone) {
+          if (tryComplete(nullptr)) continue;
+          break;
+        }
         // A full candidate pool cannot take another hit, so wider scans would
         // be wasted work whatever the remaining obligations.
         if (!intervalEngine && poolSize >= maxVectorHits) break;
@@ -1606,7 +1623,7 @@ public:
           }
           auto next = request;
           next.round = VectorSearchRound::DEPTH; next.candidates = kReq;
-          if (tryComplete(next)) continue;
+          if (tryComplete(&next)) continue;
           foldSeen();
           round = VectorSearchRound::DEPTH;
           continue;
@@ -1625,18 +1642,27 @@ public:
           scanFraction = std::min(target, maxFraction);
           auto next = request;
           next.round = VectorSearchRound::BREADTH; next.scanFraction = scanFraction; next.candidates = kReq;
-          if (tryComplete(next)) continue;
+          if (tryComplete(&next)) continue;
           round = VectorSearchRound::BREADTH;
           foldSeen();
           continue;
         }
 
+        if (tryComplete(nullptr)) continue;
         break;
       }
 
       // Both terminal stages read in segment/value-rank order. Bounded
       // candidates are mandatory seed reads; interval records bypass their cut.
       candidateHits.insert(candidateHits.end(), exactCandidates.begin(), exactCandidates.end());
+      // Reprice the planner's static read prior with what the scan observed.
+      // Bounded reads stay priced by their shared budget.
+      double observedIntervalReads = -1;
+      if (intervalEngine && (statsForTests || profile)) {
+        std::vector<int64_t> survivors(numSegs);
+        intervals.likelyReads(survivors);
+        observedIntervalReads = (double)std::accumulate(survivors.begin(), survivors.end(), (int64_t)0);
+      }
       if (statsForTests && intervalEngine) {
         statsForTests->retainedPeak += (int64_t)intervals.peakRetained();
         statsForTests->retainedTerminal += (int64_t)intervals.retained().size();
@@ -1665,7 +1691,17 @@ public:
         for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i])
           selectors += KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial);
         plan.cost = KnnPlanner::totalCost(modeled, planRequest, tuning.plannerCosts, selectors);
+        double priorReads = KnnPlanner::terminalReads(modeled, effort.coverage, planRequest.k);
+        double predictedReads = priorReads;
+        double predictedDims = KnnPlanner::terminalDims(modeled, effort.coverage, planRequest.k);
+        if (observedIntervalReads >= 0) {
+          double priorInterval = KnnPlanner::intervalTerminalReads(modeled, effort.coverage, planRequest.k);
+          predictedReads += observedIntervalReads - priorInterval;
+          if (modeled.intervalReads > 0)
+            predictedDims += (observedIntervalReads - priorInterval) * modeled.intervalDims / modeled.intervalReads;
+        }
         if (statsForTests) {
+          statsForTests->predictedTerminalReads += predictedReads;
           statsForTests->predictedCost += plan.cost;
           statsForTests->modeledActualCost += tuning.plannerCosts.requestCost;
         }
@@ -1697,10 +1733,9 @@ public:
                 plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
                     + KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial),
                 plan.prices[i].a, plan.prices[i].b));
-            piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; predicted_terminal_reads={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
+            piece.details.push_back(std::format("predicted_coverage={}; predicted_total={}; predicted_ivf_rounds={}; predicted_terminal_dims={}; predicted_terminal_reads={}; prior_terminal_reads={}; rounds={}; coverage={}; entries={}; selector_passes={}; terminal_reads={}",
                 KnnPlanner::coverage(modeled, planRequest), plan.cost, KnnPlanner::rounds(modeled, planRequest),
-                KnnPlanner::terminalDims(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k),
-                KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k), work.rounds,
+                predictedDims, predictedReads, priorReads, work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
             for (size_t f = 0; f < features.size(); f++)
@@ -3264,7 +3299,11 @@ private:
       for (size_t b = 0; b < selected.size();) {
         size_t e = b + 1;
         while (e < selected.size() && records[selected[e]].hit.segOrd == records[selected[b]].hit.segOrd) e++;
-        buckets.emplace_back(b, e);
+        // A parallel request splits a segment's reads into grain-sized tasks;
+        // the rank order within each one keeps its read-ahead sequential.
+        size_t pieces = parallel ? std::max<size_t>(1, (e - b) / (size_t)std::max<int64_t>(1, rescoreTaskGrainCandidates)) : 1;
+        size_t step = (e - b) / pieces;
+        for (size_t p = 0; p < pieces; p++) buckets.emplace_back(b + p * step, p + 1 == pieces ? e : b + (p + 1) * step);
         b = e;
       }
       std::vector<int64_t> readsByBucket(buckets.size());
