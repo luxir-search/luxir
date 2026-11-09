@@ -15,6 +15,7 @@
 
 #include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchOpRegistry.h"
+#include "luxir/search/ops/NestedOp.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
@@ -512,6 +513,17 @@ public:
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
+      },
+      [&](const luxir::api::NestedOp& nestedOp) -> SearchOp* {
+        if (!req.schema->nested.contains(nestedOp.path)) throw RequestError("unknown nested path: " + std::string(nestedOp.path));
+        auto* op = luxir::arenaCreate<NestedOp>(req.arena, req, name, nestedOp.path, false);
+        addSubs(*op, nestedOp.ops, depth, OpsPlacement::PLUGIN);
+        return op;
+      },
+      [&](const luxir::api::ReverseNestedOp& reverseOp) -> SearchOp* {
+        auto* op = luxir::arenaCreate<NestedOp>(req.arena, req, name, std::string_view{}, true);
+        addSubs(*op, reverseOp.ops, depth, OpsPlacement::PLUGIN);
+        return op;
       },
       [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
         return parsePluginOp(name, pluginOp, depth);
@@ -1101,6 +1113,24 @@ public:
     out.useFieldSort = true;
     out.rankNeedsScores = false;
     for (const auto& sortSpec : sorts) {
+      if (sortSpec.nested) {
+        const auto& nested = *sortSpec.nested;
+        if (!req.schema->nested.contains(nested.path)) throw RequestError("unknown nested path: " + std::string(nested.path));
+        if (!std::string_view(sortSpec.expr).starts_with(std::string(nested.path) + "."))
+          throw RequestError("nested sort field must be under its path: " + std::string(sortSpec.expr));
+        const auto& target = fields.resolve(sortSpec.expr, OpClass::VALUE, "sort");
+        auto type = target.fieldType->type();
+        if (!FieldType::sortsByIntColumn(type) || target.fieldType->multiValued())
+          throw RequestError("nested sort requires a single-valued numeric or date field: " + std::string(sortSpec.expr));
+        SortField::SortOrder nestedOrder = sortSpec.dir == luxir::api::SortSpec_::SortDir::DESC ? SortField::DESC : SortField::ASC;
+        auto mode = nested.mode.empty() ? (nestedOrder == SortField::DESC ? std::string_view("max") : std::string_view("min")) : nested.mode;
+        if (mode != "min" && mode != "max" && !((mode == "sum" || mode == "avg") && type == FieldType::INT))
+          throw RequestError("nested sort mode must be min, max, or sum/avg on integer fields");
+        SortField field(target.physicalName, *target.fieldType, nestedOrder, FieldComparator::MISSING_LAST);
+        field.setNested(nested.path, mode);
+        out.clauses.emplace_back(std::move(field));
+        continue;
+      }
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
       options.fieldResolver = &fields;
       options.opName = "sort";

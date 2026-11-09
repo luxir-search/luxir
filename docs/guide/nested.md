@@ -82,3 +82,34 @@ across different children:
 non-scoring child clauses. `inner_hits` returns the matching children's original
 objects in `DocList.matches`, as with relations. A `nested` query cannot contain
 another `nested` or `has_child`, or `knn`.
+
+## Aggregate over nested objects
+
+The `nested` operation re-points the current documents at a path's child
+documents and runs its sub-operations there; `reverse_nested` points them back
+at the root documents. Each returns a `DocList` with `found` and `ops`.
+
+```json
+{"ops": {"q": {"top_docs": {"query": {"all": true}, "ops": {
+  "n": {"nested": {"path": "answers", "ops": {
+    "by_user": {"field_facet": {"field": "answers.user"}},
+    "questions": {"reverse_nested": {"ops": {
+      "by_title": {"field_facet": {"field": "title_s"}}
+    }}}
+  }}}
+}}}}}
+```
+
+## Sort by a nested field
+
+Add `nested` to a sort clause to order root documents by a child field:
+
+```json
+{"sort": [{"expr": "answers.score", "dir": "asc",
+           "nested": {"path": "answers", "mode": "min"}}]}
+```
+
+The field must be single-valued numeric or date. `mode` is `min` (default for
+ascending), `max` (default for descending), or `sum`/`avg` on integer fields.
+Documents without a value in the path sort last. Sorting by a string field and
+filtering the children that participate in the sort are not yet supported.

@@ -69,7 +69,7 @@ struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Qu
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct GeoLatLon; struct GeoRing; struct GeoPolygon; struct GeoPolygonQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
-struct DisMaxQuery; struct PluginQuery; struct PluginOp;
+struct DisMaxQuery; struct PluginQuery; struct PluginOp; struct NestedOp; struct ReverseNestedOp; struct NestedSort;
 struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct TermFilter; struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
@@ -153,11 +153,13 @@ struct CalendarGap {
   int32_t n = 0;
   Unit unit = Unit::UNKNOWN;
 };
+struct NestedSort { std::string_view path; std::string_view mode; };
 struct SortSpec {
   using SortDir = luxir::api::SortSpec_::SortDir;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
   SortDir dir = SortDir::UNKNOWN;
+  std::optional<NestedSort> nested;
 };
 struct ExistsQuery { std::string_view field; };
 struct PrefixQuery {
@@ -935,6 +937,13 @@ struct Domain {
   std::span<const Query> filter;
   std::optional<bool> apply_parent_filters;
 };
+struct NestedOp {
+  std::string_view path;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+};
+struct ReverseNestedOp {
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+};
 struct ExprOp {
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
@@ -1071,7 +1080,7 @@ struct PluginOp {
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,PluginOp,Domain
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp, PluginOp> kind;
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp, PluginOp, NestedOp, ReverseNestedOp> kind;
   std::optional<Domain> domain;
   uint64_t flags = 0;
   uint64_t flags_set = 0;
@@ -1260,7 +1269,7 @@ struct UpdateRequest {                                         // needs CommitPa
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
-LUXIR_TD(RelationDef) LUXIR_TD(HasChildQuery) LUXIR_TD(NestedQuery) LUXIR_TD(InnerHits) LUXIR_TD(FamilyUpdate) LUXIR_TD(ChildUpdate)
+LUXIR_TD(RelationDef) LUXIR_TD(HasChildQuery) LUXIR_TD(NestedQuery) LUXIR_TD(NestedOp) LUXIR_TD(ReverseNestedOp) LUXIR_TD(NestedSort) LUXIR_TD(InnerHits) LUXIR_TD(FamilyUpdate) LUXIR_TD(ChildUpdate)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
