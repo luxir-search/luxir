@@ -1095,6 +1095,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.fields"></a>[`fields`](#field-luxir.fielddef.fields) | 41 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | NESTED only: the child object's fields. Addressed as "&lt;path&gt;.&lt;field&gt;". |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -2946,6 +2947,7 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.nested"></a>[`NESTED`](#value-luxir.fielddef.fieldclass.nested) | 30 | array of objects indexed as hidden block-joined child documents |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 

@@ -3,6 +3,7 @@
 
 #include "luxir/util/proto.h"
 #include "ProtoUpdateMessage.h"
+#include "luxir/reader/NestedBlocks.h"
 #include "LuxirNode.h"
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
@@ -109,46 +110,61 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
 
-  int32_t failed = 0;
-  int32_t docIndex = -1;
-  for (const auto &doc : request.docs) {
-    docIndex++;
+  auto indexOne = [&](const luxir::api::Map& doc) {
     size_t nFields = doc.fields.size();
     if (handlers.size() < nFields) {
       handlers.resize(nFields);
     }
-
-    auto docMark = inverter.undoMark();
     inverter.startDoc();
+    // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
+    // handler is a name's identity, so its claim finds an earlier occurrence without
+    // a per-doc map; a repeat replaces the value at the first occurrence's position.
+    fields.clear();
+    size_t raw = 0;
+    for (const auto& [name, val] : doc.fields) {
+      Inverter::InputHandler*& handler = handlers[raw++];
+      auto fname = fieldMap.resolve(name);
+      if (!fname) continue;
+      // A cached handler proves its name was accepted; creation validates a
+      // new name (a derived selector is not a document key, and the engine
+      // assigns _version_).
+      if (handler == nullptr || *handler != *fname) {
+        if (*fname == "_version_") {
+          throw DocumentError("Field '_version_' is assigned by the engine; optimistic concurrency is not supported");
+        }
+        handler = &inverter.getIndexHandler(*fname);
+      }
+      uint32_t slot = handler->claim(inverter, (uint32_t)fields.size());
+      if (slot == fields.size()) fields.emplace_back(handler, &*val);
+      else fields[slot].second = &*val;
+    }
+    for (const auto& [handler, val] : fields) {
+      handler->index(inverter, *val);
+    }
+    inverter.finishDoc();
+  };
+
+  const auto* layout = msg.blockLayout;
+  const size_t logicalDocs = layout ? layout->ends.size() : request.docs.size();
+  int32_t failed = 0;
+  size_t physical = 0;
+  for (size_t docIndex = 0; docIndex < logicalDocs; docIndex++) {
+    size_t begin = physical;
+    size_t end = layout ? layout->ends[docIndex] : docIndex + 1;
+    physical = end;
+    const auto& root = request.docs[end - 1];
+    auto docMark = inverter.undoMark();
+    int32_t blockFirst = inverter.getMaxDoc();
 
     try {
-      // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
-      // handler is a name's identity, so its claim finds an earlier occurrence without
-      // a per-doc map; a repeat replaces the value at the first occurrence's position.
-      fields.clear();
-      size_t raw = 0;
-      for (const auto& [name, val] : doc.fields) {
-        Inverter::InputHandler*& handler = handlers[raw++];
-        auto fname = fieldMap.resolve(name);
-        if (!fname) continue;
-        // A cached handler proves its name was accepted; creation validates a
-        // new name (a derived selector is not a document key, and the engine
-        // assigns _version_).
-        if (handler == nullptr || *handler != *fname) {
-          if (*fname == "_version_") {
-            throw DocumentError("Field '_version_' is assigned by the engine; optimistic concurrency is not supported");
-          }
-          handler = &inverter.getIndexHandler(*fname);
-        }
-        uint32_t slot = handler->claim(inverter, (uint32_t)fields.size());
-        if (slot == fields.size()) fields.emplace_back(handler, &*val);
-        else fields[slot].second = &*val;
+      if (layout && !layout->errors[docIndex].empty()) {
+        throw DocumentError(layout->errors[docIndex]);
       }
-      for (const auto& [handler, val] : fields) {
-        handler->index(inverter, *val);
-      }
-
-      inverter.finishDoc();
+      for (size_t p = begin; p + 1 < end; p++) indexOne(request.docs[p]);
+      // Record the block before its root indexes: a root deleted while indexing
+      // (a newer delete already seen for its id) takes its children with it.
+      if (end - begin > 1) inverter.noteBlock(blockFirst, inverter.getMaxDoc());
+      indexOne(root);
     } catch (const FileIOException&) {
       // A direct column/stored-fields write may have appended only a prefix.
       // The inverter must be discarded, not recovered as a document error.
@@ -165,13 +181,13 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, responseDocId(doc, fieldMap),
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, responseDocId(root, fieldMap),
                   info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), responseDocId(doc, fieldMap));
-      err.index = docIndex;
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), responseDocId(root, fieldMap));
+      err.index = (int32_t)docIndex;
       err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
       if (allOrNone) {
@@ -187,24 +203,106 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
         return;
       }
 
-      // Undo this doc's id map mutations and mark the partially indexed doc as
-      // deleted, then continue with the next doc.
+      // Undo this doc's id map mutations and mark every physical record of its
+      // partially indexed block deleted, then continue with the next doc.
       inverter.rollbackTo(docMark);
-      inverter.deleteDoc(inverter.getDoc());
+      for (int32_t docid = blockFirst; docid <= inverter.getDoc(); docid++) {
+        inverter.deleteDoc(docid);
+      }
       continue;
     }
 
     if (returnIds) {
-      msg.addId(responseDocId(doc, fieldMap));
+      msg.addId(responseDocId(root, fieldMap));
     }
   }
 
   if (failed > 0) {
     // ERROR only if nothing in the request had any effect.
-    bool anySuccess = failed < (int32_t)request.docs.size() || !request.delete_ids.empty();
+    bool anySuccess = failed < (int32_t)logicalDocs || !request.delete_ids.empty();
     msg.getResponse()->status = anySuccess ? ProtoUpdateMessage::ResponseStatus::PARTIAL
                                            : ProtoUpdateMessage::ResponseStatus::ERROR;
   }
+}
+
+using BlockLayout = ProtoUpdateMessage::BlockLayout;
+
+// Expands documents with nested paths into child records followed by the root,
+// whose nested field holds the original JSON. Returns false when nothing expands.
+static bool expandNested(ProtoUpdateMessage& msg, const api::UpdateRequest& request,
+    std::pmr::memory_resource& mr, std::vector<api::Map>& out, BlockLayout& layout) {
+  if (msg.schema->nested.empty()) return false;
+  const FieldNameMap fieldMap(request);
+  auto has = [&](const api::Map& doc) {
+    for (const auto& [name, val] : doc.fields) {
+      auto mapped = fieldMap.resolve(name);
+      if (mapped && msg.schema->nested.contains(*mapped)) return true;
+    }
+    return false;
+  };
+  if (std::ranges::none_of(request.docs, has)) return false;
+  if (!request.field_map.empty()) throw RequestError("field_map is not supported with nested fields");
+  auto add = [&](api::Map& doc, size_t capacity, std::string_view name, const api::Val& value) {
+    *api::build::mapSlot(doc.fields, capacity, api::build::arenaStr(mr, name), mr) = value;
+  };
+  auto text = [&](std::string_view value) { api::Val v; v.kind = api::build::arenaStr(mr, value); return v; };
+  for (const auto& doc : request.docs) {
+    std::string error;
+    if (!has(doc)) {
+      out.push_back(doc);
+      layout.ends.push_back((uint32_t)out.size());
+      layout.errors.emplace_back();
+      continue;
+    }
+    api::Map root;
+    size_t capacity = doc.fields.size();
+    std::vector<api::Map> children;
+    for (const auto& [name, val] : doc.fields) {
+      auto mapped = fieldMap.resolve(name);
+      auto found = mapped ? msg.schema->nested.find(*mapped) : msg.schema->nested.end();
+      if (found == msg.schema->nested.end()) {
+        if (mapped) add(root, capacity, *mapped, *val);
+        continue;
+      }
+      if (val->isNull()) continue;
+      std::span<const api::Val> values;
+      if (const auto* array = std::get_if<api::ArrVal>(&val->kind)) values = array->v;
+      else if (std::holds_alternative<api::Map>(val->kind)) values = std::span<const api::Val>(&*val, 1);
+      else { error = "nested field '" + std::string(found->first) + "' requires an object or an array of objects"; break; }
+      for (const auto& element : values) {
+        const auto* object = std::get_if<api::Map>(&element.kind);
+        if (!object) { error = "nested field '" + std::string(found->first) + "' requires an object or an array of objects"; break; }
+        api::Map child;
+        size_t childCapacity = object->fields.size() + 1;
+        for (const auto& [field, value] : object->fields) {
+          auto physical = found->second.fields.find(field);
+          if (physical == found->second.fields.end()) {
+            error = "unknown field '" + std::string(field) + "' in nested path '" + std::string(found->first) + "'";
+            break;
+          }
+          add(child, childCapacity, physical->second, *value);
+        }
+        if (!error.empty()) break;
+        add(child, childCapacity, NestedBlocks::PATH_FIELD, text(found->first));
+        children.push_back(child);
+      }
+      if (!error.empty()) break;
+      std::string json;
+      if (!api::write_json(*val, json)) { error = "cannot serialize nested source"; break; }
+      add(root, capacity, found->first, text(json));
+    }
+    // A bad document stays one (empty) physical record: update() reports it.
+    if (!error.empty()) {
+      children.clear();
+      root = api::Map();
+      if (auto id = docId(doc, fieldMap); !id.empty()) add(root, 1, "id", text(id));
+    }
+    out.insert(out.end(), children.begin(), children.end());
+    out.push_back(root);
+    layout.ends.push_back((uint32_t)out.size());
+    layout.errors.push_back(std::move(error));
+  }
+  return true;
 }
 
 
@@ -327,6 +425,14 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   if (!original->families.empty() || !original->child_updates.empty()) {
     logicalDocCount = original->docs.size() + original->families.size();
     for (const auto& update : original->child_updates) *logicalDocCount += update.docs.size();
+  }
+  // Nested objects become hidden child records written just before their root.
+  std::vector<api::Map> nestedDocs;
+  BlockLayout layout;
+  if (expandNested(*this, expanded, expansionArena, nestedDocs, layout)) {
+    logicalDocCount = layout.ends.size() + (logicalDocCount.value_or(expanded.docs.size()) - expanded.docs.size());
+    blockLayout = &layout;
+    expanded.docs = nestedDocs;
   }
   req = &expanded;
   auto restore = scope_guard([&]() {

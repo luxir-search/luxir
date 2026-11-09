@@ -98,6 +98,9 @@ public:
   // versions. Set before indexing docs.
   bool overwrite = false;
 
+  // (root doc, first child doc) of each nested block in this inverter, by root.
+  std::vector<std::pair<int32_t, int32_t>> blockRoots;
+
   // Populated by IdHandler::flush() with sorted delete lists.
   std::unique_ptr<SortedDeletes> sortedDeletes;
 
@@ -393,6 +396,18 @@ public:
   /// column streams; deleting it via liveDocs is the recovery mechanism.
   void deleteDoc(int docid) {
     deleted.push_back(docid);
+    if (blockRoots.empty()) return;
+    auto found = std::lower_bound(blockRoots.begin(), blockRoots.end(), docid,
+        [](const std::pair<int32_t, int32_t>& block, int32_t doc) { return block.first < doc; });
+    if (found == blockRoots.end() || found->first != docid) return;
+    for (int32_t child = found->second; child < docid; ++child) deleted.push_back(child);
+  }
+
+  // A root document whose hidden children occupy [firstChild, root). Roots are
+  // recorded before they are indexed, so deleting one also deletes its block.
+  void noteBlock(int32_t firstChild, int32_t root) {
+    assert(blockRoots.empty() || blockRoots.back().first < root);
+    blockRoots.emplace_back(root, firstChild);
   }
 
   // Rollback support for failed documents / failed all_or_none requests.

@@ -3,6 +3,7 @@
 
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
+#include "luxir/reader/NestedBlocks.h"
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
@@ -3504,6 +3505,8 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
   std::atomic<int32_t> newDeletesCount = 0;
 
+  auto blocks = reader.nestedBlocks();
+
   // Read the "id" field using TermsEnum
   auto* idFieldInfo = reader.fieldInfo("id");
   if (!idFieldInfo) {
@@ -3535,12 +3538,17 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       ensureLiveBits();
       // A doc can be hit from several chunks or packets (or by several id values);
       // only the clear that finds its bit set counts it.
-      std::atomic_ref<uint64_t> word(liveBits->words[hit.docId >> 6]);
-      uint64_t mask = (uint64_t)1 << (hit.docId & 63);
-      if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
-        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.name());
-        cleared++;
-      }
+      auto clear = [&](int32_t doc) {
+        std::atomic_ref<uint64_t> word(liveBits->words[doc >> 6]);
+        uint64_t mask = (uint64_t)1 << (doc & 63);
+        if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
+          INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", doc, seg.name());
+          cleared++;
+        }
+      };
+      clear(hit.docId);
+      // A nested root takes its whole block: the children written just before it.
+      if (blocks) for (int32_t child = hit.docId - 1; child >= 0 && blocks->isChild(child); --child) clear(child);
     }
     newDeletesCount.fetch_add(cleared, std::memory_order_relaxed);
     hits.clear();

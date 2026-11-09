@@ -50,6 +50,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/search/RelationReader.h"
 #include "luxir/util/thread.h"
 
 namespace luxir {
@@ -771,7 +772,7 @@ struct ExtraColumn {
 };
 
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, NESTED_SOURCE };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -1206,6 +1207,19 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           registerColumn();
           continue;
         }
+        case ReturnField::Kind::NESTED_SOURCE: {
+          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+          luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+          for (int i = 0; i < columnSize; i++) {
+            int32_t rowDoc = segDocs[i].docId();
+            auto json = RelationReader::strings(*req.reader, segDocs[i].segment(), rf.physicalName, std::span(&rowDoc, 1));
+            if (json[0].empty()) continue; // root without this nested path
+            if (!luxir::api::read_json(values[i], luxir::api::build::arenaStr(mr, json[0]), mr))
+              throw std::runtime_error("invalid stored nested source");
+          }
+          registerColumn();
+          continue;
+        }
         case ReturnField::Kind::PHYSICAL:
           break;
       }
@@ -1443,6 +1457,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
     if (field.name.starts_with("luxir_")) return;
+    if (req.schema->nested.contains(field.name)) {
+      picked.push_back({field.name, field.name, nullptr, ReturnField::Kind::NESTED_SOURCE, true});
+      return;
+    }
     if (extraNames.contains(field.name)) {
       throw RequestError("Extra column '" + std::string(field.name)
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
@@ -1457,6 +1475,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
+      return;
+    }
+    if (req.schema->nested.contains(f)) {
+      picked.push_back({f, f, nullptr, ReturnField::Kind::NESTED_SOURCE, false});
       return;
     }
     auto source = req.schema->resolveFor(f == "_family_" ? "luxir_family_s" : f, OpClass::RETRIEVE);

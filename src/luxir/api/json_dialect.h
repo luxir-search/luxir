@@ -960,6 +960,9 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
           } else if (key == "ignore_z_value") {
             util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
+          } else if (key == "fields") {
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
+            glz::util::parse_repeated<V>(true, fields, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

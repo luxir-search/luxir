@@ -38,7 +38,9 @@ public:
     auto& memo = fields[(size_t)op];
     auto found = memo.find(name);
     if (found == memo.end()) {
-      auto target = schema.resolveFor(prefix.empty() ? std::string(name) : name == "id" ? std::string("luxir_child_s") : prefix + std::string(name), op);
+      std::string physical = prefix.empty() ? schema.nestedPhysical(name) : std::string();
+      auto target = schema.resolveFor(!physical.empty() ? physical
+          : prefix.empty() ? std::string(name) : name == "id" ? std::string("luxir_child_s") : prefix + std::string(name), op);
       found = memo.emplace(std::string(name), std::move(target)).first;
     }
     const auto& target = found->second;

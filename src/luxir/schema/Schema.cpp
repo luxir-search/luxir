@@ -93,6 +93,19 @@ static bool isIdChar(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
+std::string Schema::nestedFieldName(std::string_view path, std::string_view field) {
+  return "luxir_nest_" + std::to_string(path.size()) + "_" + std::string(path) + "_" + std::string(field);
+}
+
+std::string Schema::nestedPhysical(std::string_view name) const {
+  auto dot = name.find('.');
+  if (dot == std::string_view::npos) return {};
+  auto found = nested.find(name.substr(0, dot));
+  if (found == nested.end()) return {};
+  auto field = found->second.fields.find(name.substr(dot + 1));
+  return field == found->second.fields.end() ? std::string{} : field->second;
+}
+
 bool Schema::validFieldName(std::string_view name) {
   // Field names land in filenames (block-bounds, vector overlays), so bound
   // them well under the 255-byte filesystem component limit.
@@ -961,10 +974,50 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       for (const auto& [name, field] : rd.fields) {
         if (!validFieldName(name) || name == "id" || name.starts_with("luxir_"))
           throw SchemaError("invalid child field: " + std::string(name));
+        if (field->type && *field->type == FieldClass::NESTED) throw SchemaError("relation fields cannot be nested: " + std::string(name));
         auto physical = api::build::arenaStr(baseArena, "luxir_rel_" + std::to_string(relation.size()) + "_" + std::string(relation) + "_" + std::string(name));
         entries.push_back({physical, *field, false});
       }
     }
+  }
+
+  // Nested paths: the authored entry (kept above for GET) becomes a hidden JSON
+  // column, and each child field a physical field on the hidden child records.
+  size_t authored = entries.size();
+  for (size_t i = 0; i < authored; i++) {
+    auto& entry = entries[i];
+    bool isNested = entry.def.type && *entry.def.type == FieldClass::NESTED;
+    if (!isNested) {
+      if (!entry.def.fields.empty()) throw SchemaError("fields is only valid for type nested: " + std::string(entry.name));
+      continue;
+    }
+    if (entry.isTemplate) throw SchemaError("nested fields cannot be templates: " + std::string(entry.name));
+    if (entry.def.fields.empty()) throw SchemaError("nested field requires fields: " + std::string(entry.name));
+    if (schema->relations.contains(std::string(entry.name))) throw SchemaError("nested path clashes with a relation: " + std::string(entry.name));
+    auto& nestedDef = schema->nested[std::string(entry.name)];
+    std::vector<std::pair<std::string_view, const api::FieldDef*>> children;
+    for (const auto& [name, field] : entry.def.fields) {
+      if (!validFieldName(name) || name.starts_with("luxir_")) throw SchemaError("invalid nested field: " + std::string(name));
+      if (field->type && *field->type == FieldClass::NESTED) throw SchemaError("nested fields cannot contain nested fields: " + std::string(name));
+      children.emplace_back(name, &*field);
+    }
+    entry.def.type = FieldClass::STRING;
+    entry.def.column = true;
+    entry.def.index = api::FieldDef_::IndexMode::NONE;
+    entry.def.fields = {};
+    std::string path(entry.name);
+    for (const auto& [name, field] : children) {
+      auto physical = api::build::arenaStr(baseArena, Schema::nestedFieldName(path, name));
+      nestedDef.fields.emplace(std::string(name), std::string(physical));
+      entries.push_back({physical, *field, false});
+    }
+  }
+  if (!schema->nested.empty()) {
+    SourceEntry entry{"luxir_nested_s", {}, false};
+    entry.def.type = FieldClass::STRING;
+    entry.def.column = false;
+    entry.def.index = api::FieldDef_::IndexMode::MATCH;
+    entries.push_back(entry);
   }
 
   // ---- resolve the whole merged graph ----
