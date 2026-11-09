@@ -215,7 +215,7 @@ static std::string childKey(std::string_view family, std::string_view relation, 
       + std::to_string(relation.size()) + ":" + std::string(relation) + std::string(id);
 }
 
-static api::UpdateRequest expandRelations(ProtoUpdateMessage& msg, std::pmr::memory_resource& mr,
+static api::UpdateRequest expandRelations(ProtoUpdateMessage& msg, uint64_t writerEpoch, std::pmr::memory_resource& mr,
     std::vector<api::Map>& docs, std::vector<std::string_view>& deletes) {
   auto request = *msg.req;
   FieldNameMap fieldMap(request);
@@ -269,7 +269,9 @@ static api::UpdateRequest expandRelations(ProtoUpdateMessage& msg, std::pmr::mem
     validateDoc(*family.parent);
     auto id = docId(*family.parent, fieldMap);
     if (id.empty() || !parentIds.insert(std::string(id)).second) throw RequestError("families require distinct non-empty parent ids");
-    std::string token = std::to_string(msg.updateVersion) + ":" + std::string(id);
+    // The writer epoch keeps a token unique across restarts: an update version
+    // can be reassigned after a crash before the update was committed.
+    std::string token = std::to_string(msg.updateVersion) + "-" + std::to_string(writerEpoch) + ":" + std::string(id);
     api::Map parent;
     for (const auto& [name, value] : family.parent->fields) add(parent, family.parent->fields.size() + 1, name, *value);
     add(parent, family.parent->fields.size() + 1, "luxir_family_s", string(token));
@@ -289,12 +291,15 @@ static api::UpdateRequest expandRelations(ProtoUpdateMessage& msg, std::pmr::mem
   for (const auto& update : request.child_updates) {
     if (!msg.schema->relations.contains(update.relation)) throw RequestError("unknown child update relation");
     auto colon = update.family.find(':');
-    if (update.parent_id.empty() || colon == std::string_view::npos || colon == 0
+    auto dash = update.family.find('-');
+    if (update.parent_id.empty() || colon == std::string_view::npos || dash == std::string_view::npos
+        || dash == 0 || dash + 1 >= colon
         || update.family.substr(colon + 1) != update.parent_id
-        || update.family.substr(0, colon).find_first_not_of("0123456789") != std::string_view::npos)
+        || update.family.substr(0, dash).find_first_not_of("0123456789") != std::string_view::npos
+        || update.family.substr(dash + 1, colon - dash - 1).find_first_not_of("0123456789") != std::string_view::npos)
       throw RequestError("child_updates requires the family's incarnation token and matching parent_id");
     uint64_t version = 0;
-    auto parsed = std::from_chars(update.family.data(), update.family.data() + colon, version);
+    auto parsed = std::from_chars(update.family.data(), update.family.data() + dash, version);
     if (parsed.ec != std::errc{} || version >= msg.updateVersion)
       throw RequestError("child update token must come from an earlier family update");
     if (parentIds.contains(std::string(update.parent_id))) throw RequestError("cannot replace a family and mutate its children together");
@@ -316,12 +321,20 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   std::pmr::monotonic_buffer_resource expansionArena;
   std::vector<api::Map> expandedDocs;
   std::vector<std::string_view> expandedDeletes;
-  auto expanded = expandRelations(*this, expansionArena, expandedDocs, expandedDeletes);
+  int exceptionsAtEntry = std::uncaught_exceptions();
+  auto expanded = expandRelations(*this, iw.epoch(), expansionArena, expandedDocs, expandedDeletes);
   const auto* original = req;
+  if (!original->families.empty() || !original->child_updates.empty()) {
+    logicalDocCount = original->docs.size() + original->families.size();
+    for (const auto& update : original->child_updates) *logicalDocCount += update.docs.size();
+  }
   req = &expanded;
   auto restore = scope_guard([&]() {
     req = original;
-    if (getResponse()->status == ResponseStatus::ERROR) getResponse()->families = {};
+    // An exception leaving here becomes an error response later, and the
+    // tokens it would carry never reached a committed update.
+    if (std::uncaught_exceptions() > exceptionsAtEntry || getResponse()->status == ResponseStatus::ERROR)
+      getResponse()->families = {};
   });
 
   // Counts the batch for the node and its collection as it leaves, however
@@ -347,8 +360,9 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
       auto outcome = failed ? MetricOutcome::ERROR : MetricOutcome::OK;
       auto nanos = nanosSince(start);
       auto errors = msg.docErrors();
-      uint64_t rejected = failed ? req.docs.size() : errors.size();
-      uint64_t accepted = req.docs.size() - rejected;
+      uint64_t docs = msg.logicalDocCount.value_or(req.docs.size());
+      uint64_t rejected = failed ? docs : std::min<uint64_t>(errors.size(), docs);
+      uint64_t accepted = docs - rejected;
       uint64_t deleteIds = failed ? 0 : req.delete_ids.size();
       node.complete(metricActivity(MetricStage::INDEX_BATCH), outcome, nanos);
       node.add(MetricCounter::DOCUMENTS_ACCEPTED, accepted);

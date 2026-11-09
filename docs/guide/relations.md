@@ -134,7 +134,12 @@ and row documents with the original child `id`, selected source fields,
 `_score_`, and `_relation_`. An absent `fields` list returns the child source.
 An absent `inner_hits` disables evidence retrieval; `limit: 0` also disables
 it. The default inner-hit limit is 1, and the maximum is 1000. Names must be
-unique among matching clauses in the emitted result.
+unique among matching clauses in the emitted result; a duplicate is reported
+when that result is emitted, so a streamed response can fail after its first
+batches. Inner hits are collected only from query branches that determine the
+parent match (`must`, `should`, wrapper scores, fusion sources). A `has_child`
+inside a boolean `filter`, a `must_not`, or a kNN prefilter restricts the
+parents but produces no inner hits; `dis_max` does not accept `has_child`.
 
 ## Vector and hybrid retrieval
 
@@ -156,7 +161,8 @@ enclosing parent filters are translated into child eligibility before kNN.
 
 A grouped vector query admits its best vector child per selected parent.
 Its inner hits and child counts describe that admitted window, not every
-similar child in the family. Asking for more inner hits does not run another
+similar child in the family, so `min_children` above 1 matches nothing when
+the only child clause is a grouped kNN. Asking for more inner hits does not run another
 vector search or fabricate additional witnesses. Approximate execution uses
 the existing group-aware vector engine and its underfill warnings.
 
@@ -174,8 +180,10 @@ best combined text/vector child outside its candidate window.
 
 ## Execution and scope
 
-The reader caches parent-incarnation links and root domains for its immutable
-snapshot. Join preparation translates the parent domain, evaluates child
+The reader builds parent-incarnation links and root domains for its immutable
+snapshot once, on first use, with a whole-index pass over the relation fields.
+That pass runs after each commit that changes the snapshot and blocks queries
+of that snapshot until it finishes; budget for it on large indexes. Join preparation translates the parent domain, evaluates child
 filters and retrieval, reduces scores by parent, and produces ordered parent
 scorers. Projection reads stored child source only for emitted witnesses.
 Query domains, parent accumulators, and witness lists are charged to the

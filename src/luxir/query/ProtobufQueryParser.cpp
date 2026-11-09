@@ -362,7 +362,7 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
 
   bool groups = knnQuery.unit == "groups" || (context.childScope && (knnQuery.unit.empty() || knnQuery.unit == "parents"));
   if (!knnQuery.unit.empty() && knnQuery.unit != "docs" && !groups) {
-    throw std::runtime_error("knn.unit must be docs or groups");
+    throw std::runtime_error(context.childScope ? "knn.unit must be docs, groups or parents" : "knn.unit must be docs or groups");
   }
   if (groups && context.collapse == nullptr) {
     throw std::runtime_error("knn.unit groups requires an enclosing collapse");

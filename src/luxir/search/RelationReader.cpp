@@ -67,8 +67,7 @@ RelationReader::RelationReader(IndexReader& reader) {
   }
 }
 RelationReader& IndexReader::relations() {
-  std::lock_guard lock(relationsMutex);
-  if (!relationsReader) relationsReader = std::make_shared<RelationReader>(*this);
+  std::call_once(relationsOnce, [this] { relationsReader = std::make_shared<RelationReader>(*this); });
   return *relationsReader;
 }
 DocSet* IndexReader::rootDomain(int32_t segment) {

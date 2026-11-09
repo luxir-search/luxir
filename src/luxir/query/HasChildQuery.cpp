@@ -76,9 +76,9 @@ public:
         filter(join.filter ? join.filter->createWeight(context, 0) : nullptr), multiplier(multiplier) {
     traits |= NEEDS_PREPARE;
   }
-  Query::Scorer* createScorer(MemPool&, IndexReader::Segment&) override { throw std::logic_error("has_child requires prepare"); }
+  Query::Scorer* createScorer(MemPool&, IndexReader::Segment&) override { throw RequestError("has_child is not supported in this query position"); }
   Query::ScorerSupplier* scorerSupplierImpl(MemPool&, IndexReader::Segment&, Query::SupplierExecutionMode) override {
-    throw std::logic_error("has_child requires prepare");
+    throw RequestError("has_child is not supported in this query position");
   }
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     child->releaseSegmentState(segment);

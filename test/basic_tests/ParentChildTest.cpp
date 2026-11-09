@@ -356,3 +356,17 @@ TEST_F(ParentChildTest, requestMemoryLimitsDomainsAndWitnessGrowth) {
   ASSERT_EQ(std::vector<std::string>{"p"}, ids(*req));
   EXPECT_EQ(300, req->docList()->matches[0].fields.at("matched")->docList()->found);
 }
+
+TEST_F(ParentChildTest, tokensAndUnsupportedPositionsAreRejected) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  auto family = update(helper, R"("families":[{"parent":{"id":"p"},"children":{"variants":[{"id":"v","color":"red"}]}}])");
+  ASSERT_TRUE(family.success);
+  // The token carries the writer epoch: a bare version never validates.
+  for (std::string token : {"1:p", "x-1:p"}) {
+    EXPECT_FALSE(update(helper, R"("child_updates":[{"parent_id":"p","relation":"variants","family":")" + token + R"(","docs":[{"id":"v"}]}])").success);
+  }
+  EXPECT_TRUE(update(helper, R"("child_updates":[{"parent_id":"p","relation":"variants","family":")" + family.families.at("p") + R"(","docs":[{"id":"w","color":"blue"}]}])").success);
+  auto req = search(R"("query":{"dis_max":{"queries":[{"has_child":{"relation":"variants"}}]}})", 1, false);
+  EXPECT_NE(std::string::npos, req->errorMsg().find("has_child")) << req->errorMsg();
+}

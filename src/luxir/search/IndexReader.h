@@ -351,7 +351,7 @@ private:
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
 
-  std::mutex relationsMutex;
+  std::once_flag relationsOnce;
   std::shared_ptr<RelationReader> relationsReader;
 public:
   RelationReader& relations();
