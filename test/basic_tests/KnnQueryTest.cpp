@@ -4215,6 +4215,51 @@ TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
   }
 }
 
+TEST_F(KnnQueryTest, profileReportsEffectiveNprobeAndProbedLists) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 160; i++) {
+    float x = (float)i;
+    h.index(flatdoc("id", std::to_string(i), "embedding_v", std::vector<float>{x, x * 0.01f, x * 0.02f, x * 0.03f}));
+  }
+  h.commit({"*"});
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto auxReader = reader->segments()[0].getAuxReader("vec.embedding_v");
+  ASSERT_NE(auxReader, nullptr);
+  auto* aux = (VectorAuxReader*)auxReader.get();
+
+  auto details = [&](int32_t nprobe, bool exact, std::string expectedStrategy) {
+    auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile();
+    configKnn(req->topDocs("q"), "embedding_v", {0, 0, 0, 0}, 3, nprobe, 0, exact);
+    req->execute();
+    EXPECT_OK(req);
+    std::string joined;
+    for (const auto& op : req->responses.back()->proto.profile->ops) for (const auto& piece : op.pieces) {
+      if (piece.kind != "knn") continue;
+      EXPECT_EQ(expectedStrategy, piece.strategy);
+      for (auto detail : piece.details) joined += std::string(detail) + "\n";
+    }
+    return joined;
+  };
+  auto hasDetail = [](const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; };
+
+  auto pinned = details(2, false, "ivf");
+  EXPECT_TRUE(hasDetail(pinned, "effective_nprobe=2;")) << pinned;
+  EXPECT_TRUE(hasDetail(pinned, "segment_nlist=" + std::to_string(aux->getNList()) + ";")) << pinned;
+  EXPECT_FALSE(hasDetail(pinned, "lists_probed=0;")) << pinned;
+
+  auto byDefault = details(0, false, "ivf");
+  EXPECT_TRUE(hasDetail(byDefault, "effective_nprobe=")) << byDefault;
+  EXPECT_TRUE(hasDetail(byDefault, "reference_nlist=" + std::to_string(defaultIvfNList(160)) + ";")) << byDefault;
+
+  auto exact = details(0, true, "exact");
+  EXPECT_TRUE(hasDetail(exact, "lists_probed=0;")) << exact;
+}
+
 TEST_F(KnnQueryTest, completionRetiresBoundedQuotaAndRefillsActiveSlot) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;

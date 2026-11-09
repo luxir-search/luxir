@@ -1690,6 +1690,9 @@ public:
                 KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k), work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
+            piece.details.push_back(std::format("reference_nlist={}; effective_nprobe={:.6g}; segment_nlist={}; lists_probed={}; refine_target={}",
+                planRequest.referenceBreadth, effort.initial * planRequest.referenceBreadth, input.nlist,
+                work.listSetups, planRequest.boundedTarget));
             for (size_t f = 0; f < features.size(); f++)
               piece.details.push_back(std::format("{}={}", KnnPlanner::unitNames[f], features[f]));
             for (const auto& event : completions) if ((size_t)event.segment == i)

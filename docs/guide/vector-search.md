@@ -920,6 +920,18 @@ reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
 the search exhaustive over IVF lists, but bounded estimates or empirical
 intervals still decide which values are rescored.
 
+To see what effort a query actually spent, send `profile: true` and read the
+`knn(<field>)` op: `coverage` (fraction of live vectors in probed lists),
+`effective_nprobe` against `reference_nlist`, and `terminal_reads`. See
+[profiling](searching.md#request-level-controls). Recall itself needs ground truth from an
+`exact: true` run of the same queries; the engine does not report it.
+
+Measure recall with queries drawn from the application's real query
+distribution. Synthetic query vectors far from the data, for example with
+uniform random components, sit at nearly equal distance from every list and
+every code, so IVF coverage and 1-bit interval selection both lose their
+discrimination.
+
 `exact: true` uses a path that guarantees the true top-k and does not
 consult overlays. Everything else about
 the query is identical (filters, multi-valued collapse, score scale), which
