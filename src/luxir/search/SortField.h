@@ -102,6 +102,8 @@ public:
         return stringSortModeOverride.exchange(value);
     }
     
+    bool isNested() const { return !nestedPath.empty(); }
+
     void setNested(std::string_view path, std::string_view mode) {
         nestedPath = std::string(path);
         nestedMode = std::string(mode);

@@ -122,6 +122,8 @@ struct SearchParserImpl {
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
   const CollapsePlan* inheritedFacetMeasure = nullptr;
+  // Inside a nested op, whose domain is child documents.
+  bool underNestedOp = false;
   std::span<ParsedFilter>* owningList = nullptr;
   std::string_view owningListChild;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
@@ -516,12 +518,18 @@ public:
       },
       [&](const luxir::api::NestedOp& nestedOp) -> SearchOp* {
         if (!req.schema->nested.contains(nestedOp.path)) throw RequestError("unknown nested path: " + std::string(nestedOp.path));
+        if (underNestedOp) throw RequestError("nested operations cannot nest; use reverse_nested to return to the root");
         auto* op = luxir::arenaCreate<NestedOp>(req.arena, req, name, nestedOp.path, false);
+        underNestedOp = true;
+        auto restoreNested = scope_guard([&]() noexcept { underNestedOp = false; });
         addSubs(*op, nestedOp.ops, depth, OpsPlacement::PLUGIN);
         return op;
       },
       [&](const luxir::api::ReverseNestedOp& reverseOp) -> SearchOp* {
         auto* op = luxir::arenaCreate<NestedOp>(req.arena, req, name, std::string_view{}, true);
+        bool wasNested = underNestedOp;
+        underNestedOp = false;
+        auto restoreNested = scope_guard([&]() noexcept { underNestedOp = wasNested; });
         addSubs(*op, reverseOp.ops, depth, OpsPlacement::PLUGIN);
         return op;
       },

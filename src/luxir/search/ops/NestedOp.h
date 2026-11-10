@@ -51,9 +51,11 @@ public:
       auto found = blocks->paths.find(nestedOp.path);
       if (found == blocks->paths.end()) return out.build();
       auto& bits = found->second;
+      auto* live = segment.liveDocSet();
       for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) {
+        if (live && !live->get(doc)) continue; // a failed block's child has no root
         int32_t root = blocks->rootOf(doc);
-        if (in ? in->get(root) : true) out.add(doc);
+        if (!in || in->get(root)) out.add(doc);
       }
       return out.build();
     }

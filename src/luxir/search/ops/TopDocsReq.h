@@ -258,7 +258,8 @@ public:
       const SortPlan& sortPlan, const Query* query,
       std::span<const ParsedFilter> filters) {
     if (!sortPlan.useFieldSort || sortPlan.clauses.empty()
-        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN
+        || sortPlan.clauses[0].getSortField().isNested()) {
       return std::nullopt;
     }
     std::string_view field = sortPlan.clauses[0].getSortField().getFieldName();
@@ -276,7 +277,8 @@ public:
 
   static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan) {
     if (sortPlan.clauses.size() != 1
-        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN
+        || sortPlan.clauses[0].getSortField().isNested()) {
       return false;
     }
     return FieldType::sortsByIntColumn(const_cast<FieldType&>(

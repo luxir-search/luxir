@@ -404,7 +404,10 @@ public:
     if (found == blocks->paths.end()) return;
     std::vector<int32_t> children;
     auto& bits = found->second;
-    for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) children.push_back(doc);
+    auto* live = segment.liveDocSet();
+    for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) {
+      if (!live || live->get(doc)) children.push_back(doc); // dead children may precede a later block
+    }
     std::vector<int64_t> sums(segment.maxDoc());
     std::vector<int32_t> counts(segment.maxDoc());
     auto guard = MemPool::threadLocalPoolGuard();
