@@ -3,6 +3,7 @@
 #include "luxir/query/HasChildQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/reader/NestedBlocks.h"
 #include "luxir/search/RelationReader.h"
 #include "luxir/search/SearchRequest.h"
 #include <map>
@@ -37,7 +38,7 @@ struct Matches {
   explicit Matches(std::pmr::memory_resource* resource) : witnesses(resource) {}
 };
 class JoinedWeight final : public Query::Weight {
-  HasChildQuery& join;
+  JoinQuery& join;
   Query::Weight* child;
   Query::Weight* filter;
   float multiplier;
@@ -70,7 +71,7 @@ class JoinedWeight final : public Query::Weight {
     }
   };
 public:
-  JoinedWeight(Query::Context& context, HasChildQuery& join, int32_t flags, float multiplier)
+  JoinedWeight(Query::Context& context, JoinQuery& join, int32_t flags, float multiplier)
       : Query::Weight(context, join, flags), join(join),
         child(join.child->createWeight(context, flags | Query::NEED_SCORES)),
         filter(join.filter ? join.filter->createWeight(context, 0) : nullptr), multiplier(multiplier) {
@@ -92,24 +93,14 @@ public:
     auto* tracker = request ? &request->memoryTracker : nullptr;
     auto storage = std::make_shared<JoinStorage>(tracker);
     JoinStorage scratch(tracker);
-    auto& topology = ctx.reader.relations();
-    auto ordinal = topology.relationOrdinals.find(join.spec.relation);
-    uint32_t relationId = ordinal == topology.relationOrdinals.end() ? 0 : ordinal->second;
+    auto topology = join.topology(ctx.reader);
     std::vector<std::unique_ptr<DocSet>> owned;
     std::vector<DocSet*> domains;
     for (auto& segment : ctx.reader.segments()) {
       // Covers sparse builder growth, conversion to bits, and the overlapping
       // old/new domains while applying a child filter.
       scratch.reserve((((size_t)segment.maxDoc() + 63) / 64 * 8) * 4 + 512);
-      auto& relation = topology.segments[segment.ord];
-      DocSetBuilder builder(segment.maxDoc());
-      for (int32_t doc : relation.children) {
-        auto parent = relation.parents[doc];
-        if (parent.segment < 0 || relation.relation[doc] != relationId) continue;
-        auto* allowed = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[parent.segment];
-        if (!allowed || allowed->get(parent.doc)) builder.add(doc);
-      }
-      owned.push_back(builder.build());
+      owned.push_back(topology->childDomain(segment, ctx.domainPerSeg));
       domains.push_back(owned.back().get());
     }
     PrepareContext childContext(ctx.reader, domains, ctx.parallel, ctx.warnings);
@@ -144,8 +135,7 @@ public:
       auto* scorer = QueryPrep::createScorer(guard.pool(), segment, source.segmentSource());
       if (scorer) for (int32_t doc; (doc = scorer->next()) != PostingsReader::END; ) {
         if (!domains[segment.ord]->get(doc)) continue;
-        auto parent = topology.segments[segment.ord].parents[doc];
-        auto [entry, inserted] = matches.try_emplace(Key(parent.segment, parent.doc), storage->resource());
+        auto [entry, inserted] = matches.try_emplace(topology->parentOf(segment.ord, doc), storage->resource());
         auto& match = entry->second;
         float score = scorer->score();
         ++match.count;
@@ -187,7 +177,71 @@ public:
   }
 };
 }
-Query::Weight* HasChildQuery::createWeight(Context& context, int32_t flags, float multiplier) {
+namespace {
+class RelationTopology final : public JoinTopology {
+  IndexReader& reader;
+  RelationReader& relations;
+  uint32_t relationId;
+public:
+  RelationTopology(IndexReader& reader, std::string_view relation)
+      : reader(reader), relations(reader.relations()) {
+    auto ordinal = relations.relationOrdinals.find(relation);
+    relationId = ordinal == relations.relationOrdinals.end() ? 0 : ordinal->second;
+  }
+  std::unique_ptr<DocSet> childDomain(IndexReader::Segment& segment, std::span<DocSet* const> parents) override {
+    auto& relation = relations.segments[segment.ord];
+    DocSetBuilder builder(segment.maxDoc());
+    for (int32_t doc : relation.children) {
+      auto parent = relation.parents[doc];
+      if (parent.segment < 0 || relation.relation[doc] != relationId) continue;
+      auto* allowed = parents.empty() ? nullptr : parents[parent.segment];
+      if (!allowed || allowed->get(parent.doc)) builder.add(doc);
+    }
+    return builder.build();
+  }
+  std::pair<int32_t, int32_t> parentOf(int32_t segment, int32_t doc) override {
+    auto parent = relations.segments[segment].parents[doc];
+    return {parent.segment, parent.doc};
+  }
+};
+class NestedTopology final : public JoinTopology {
+  IndexReader& reader;
+  std::string_view path;
+  std::vector<std::shared_ptr<const NestedBlocks>> blocks;
+public:
+  NestedTopology(IndexReader& reader, std::string_view path) : reader(reader), path(path) {
+    for (auto& segment : reader.segments()) blocks.push_back(segment.postingsReader().nestedBlocks());
+  }
+  std::unique_ptr<DocSet> childDomain(IndexReader::Segment& segment, std::span<DocSet* const> parents) override {
+    DocSetBuilder builder(segment.maxDoc());
+    auto& nested = blocks[segment.ord];
+    if (!nested) return builder.build();
+    auto found = nested->paths.find(path);
+    if (found == nested->paths.end()) return builder.build();
+    auto* allowed = parents.empty() ? nullptr : parents[segment.ord];
+    auto* live = segment.liveDocSet();
+    auto& bits = found->second;
+    for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) {
+      // Dead children can sit in front of a later live block: a block that failed
+      // partway has no root of its own. Test the child, then resolve its root.
+      if (live && !live->get(doc)) continue;
+      int32_t root = nested->rootOf(doc);
+      if (!allowed || allowed->get(root)) builder.add(doc);
+    }
+    return builder.build();
+  }
+  std::pair<int32_t, int32_t> parentOf(int32_t segment, int32_t doc) override {
+    return {segment, blocks[segment]->rootOf(doc)};
+  }
+};
+}
+std::unique_ptr<JoinTopology> HasChildQuery::topology(IndexReader& reader) {
+  return std::make_unique<RelationTopology>(reader, spec.relation);
+}
+std::unique_ptr<JoinTopology> NestedQuery::topology(IndexReader& reader) {
+  return std::make_unique<NestedTopology>(reader, path);
+}
+Query::Weight* JoinQuery::createWeight(Context& context, int32_t flags, float multiplier) {
   return context.pool.make<JoinedWeight>(context, *this, flags, multiplier);
 }
 }

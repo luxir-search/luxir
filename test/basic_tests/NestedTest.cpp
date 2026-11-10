@@ -147,3 +147,67 @@ TEST_F(NestedTest, schemaRejectsNestedInsideNested) {
   ASSERT_TRUE(api::read_json(def, R"({"fields":{"a":{"type":"nested","fields":{"b":{"type":"nested","fields":{"c":{"type":"string"}}}}}}})", mr));
   EXPECT_THROW(Schema::fromProto(def, Schema::createDefaultSchema().get()), SchemaError);
 }
+
+// Correlation: two child clauses must match the same child, across segments.
+TEST_F(NestedTest, nestedQueryCorrelatesSameChildAcrossSegments) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  ASSERT_TRUE(update(helper, R"("docs":[
+    {"id":"cross","answers":[{"user":"alice","score":1,"body":"red"},{"user":"bob","score":9,"body":"blue"}]},
+    {"id":"same","answers":[{"user":"alice","score":9,"body":"red"}]}
+  ])").success);
+  ASSERT_TRUE(update(helper, R"("docs":[{"id":"later","answers":[{"user":"alice","score":8,"body":"red green"}]}])").success);
+  // user alice AND score >= 5 must be one child: cross has alice(1), bob(9), so no match.
+  auto req = search(R"("query":{"nested":{"path":"answers","query":{"boolean":{"required":[
+      {"match":{"field":"answers.user","val":"alice"}},{"range":{"field":"answers.score","gte":5}}]}}}},
+      "fields":["id"],"sort":["id"])");
+  std::vector<std::string> got;
+  for (const auto& doc : req->docList()->docs) got.emplace_back(doc.fields.at("id")->asString());
+  EXPECT_EQ((std::vector<std::string>{"later", "same"}), got);
+  EXPECT_EQ(2, req->docList()->found);
+}
+
+TEST_F(NestedTest, nestedScoreModesAndInnerHits) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  ASSERT_TRUE(update(helper, R"("docs":[{"id":"a","answers":[{"user":"x","body":"red red red"},{"user":"y","body":"red"}]}])").success);
+  auto scoreFor = [&](std::string_view mode) {
+    auto req = search("\"query\":{\"nested\":{\"path\":\"answers\",\"score_mode\":\"" + std::string(mode)
+        + "\",\"query\":{\"match\":{\"field\":\"answers.body\",\"val\":\"red\"}}}},\"get_scores\":true,\"fields\":[\"id\",\"_score_\"]");
+    return std::get<float>(req->docList()->docs.at(0).fields.at("_score_")->kind);
+  };
+  float avg = scoreFor("avg"), sum = scoreFor("sum"), max = scoreFor("max"), min = scoreFor("min"), none = scoreFor("none");
+  EXPECT_NEAR(sum / 2, avg, 1e-5);
+  EXPECT_GT(max, min);
+  EXPECT_FLOAT_EQ(1.0f, none);
+  auto req = search(R"("query":{"nested":{"path":"answers","query":{"match":{"field":"answers.user","val":"y"}},
+    "inner_hits":{"name":"hit","limit":2,"fields":["user"]}}},"fields":["id"])");
+  ASSERT_EQ(1u, req->docList()->matches.size());
+  auto* list = req->docList()->matches[0].fields.at("hit")->docList();
+  ASSERT_EQ(1u, list->docs.size());
+  EXPECT_EQ("y", list->docs[0].fields.at("user")->asString());
+}
+
+// A block that fails partway leaves dead children with no root; they must not
+// attach to the next root, and a trailing failed block must be harmless.
+TEST_F(NestedTest, deadChildrenOfFailedBlocksStayInvisible) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  auto first = update(helper, R"("docs":[
+    {"id":"bad","answers":[{"user":"b"},{"user":"c","score":"not a number"}]},
+    {"id":"good","answers":[{"user":"d","score":1}]},
+    {"id":"tail","answers":[{"user":"e"},{"user":"f","score":"not a number"}]}
+  ])");
+  ASSERT_EQ(2u, first.errors.size());
+  EXPECT_EQ(1, count());
+  auto matches = [&](std::string_view user) {
+    return search("\"query\":{\"nested\":{\"path\":\"answers\",\"query\":{\"match\":{\"field\":\"answers.user\",\"val\":\""
+        + std::string(user) + "\"}},\"inner_hits\":{\"name\":\"h\"}}},\"fields\":[\"id\"]");
+  };
+  EXPECT_TRUE(matches("b")->docList()->docs.empty());
+  EXPECT_TRUE(matches("e")->docList()->docs.empty());
+  auto good = matches("d");
+  ASSERT_EQ(1u, good->docList()->docs.size());
+  EXPECT_EQ("good", good->docList()->docs[0].fields.at("id")->asString());
+  EXPECT_EQ("d", good->docList()->matches[0].fields.at("h")->docList()->docs[0].fields.at("user")->asString());
+}

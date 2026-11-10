@@ -1,7 +1,9 @@
 // Copyright 2026 Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 #include "luxir/search/InnerHits.h"
+#include "luxir/schema/Schema.h"
 #include "luxir/search/RelationReader.h"
+#include "luxir/reader/NestedBlocks.h"
 #include "luxir/api/build.h"
 #include <set>
 
@@ -29,9 +31,26 @@ void emitInnerHits(IndexReader& reader, std::span<Query::SegmentSource* const> s
     auto* hits = api::build::allocArray(value.docs, entry.hits.size(), mr);
     for (size_t h = 0; h < entry.hits.size(); ++h) {
       auto hit = entry.hits[h];
-      auto json = RelationReader::strings(reader, hit.segment, "luxir_source_s", std::span(&hit.doc, 1));
       api::Map source;
-      if (json[0].empty() || !api::read_json(source, api::build::arenaStr(mr, json[0]), mr)) throw std::runtime_error("invalid stored child source");
+      if (reader.schema()->nested.contains(entry.relation)) {
+        // A nested child's source is the element of the root's stored array.
+        auto blocks = reader.segments()[hit.segment].postingsReader().nestedBlocks();
+        int32_t root = blocks->rootOf(hit.doc);
+        auto& pathBits = blocks->paths.find(entry.relation)->second;
+        int32_t ordinal = 0;
+        auto* live = reader.segments()[hit.segment].liveDocSet();
+        for (int32_t doc = blocks->blockStart(root); doc < hit.doc; ++doc)
+          ordinal += pathBits.get(doc) && (!live || live->get(doc));
+        auto rootJson = RelationReader::strings(reader, hit.segment, entry.relation, std::span(&root, 1));
+        api::Val stored;
+        if (rootJson[0].empty() || !api::read_json(stored, api::build::arenaStr(mr, rootJson[0]), mr)) throw std::runtime_error("invalid stored nested source");
+        const api::Val* element = &stored;
+        if (auto* array = std::get_if<api::ArrVal>(&stored.kind)) element = &array->v[(size_t)ordinal];
+        source = std::get<api::Map>(element->kind);
+      } else {
+        auto json = RelationReader::strings(reader, hit.segment, "luxir_source_s", std::span(&hit.doc, 1));
+        if (json[0].empty() || !api::read_json(source, api::build::arenaStr(mr, json[0]), mr)) throw std::runtime_error("invalid stored child source");
+      }
       size_t capacity = source.fields.size() + 2;
       for (auto [name, val] : source.fields) {
         if (!entry.spec.fields.empty() && name != "id" && !std::ranges::contains(entry.spec.fields, std::string_view("*"))

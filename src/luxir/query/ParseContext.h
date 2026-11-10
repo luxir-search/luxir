@@ -34,6 +34,7 @@ struct ParseContext {
   // Null for offline parsing; request parsers pass their engine's node.
   LuxirNode* node = nullptr;
   bool childScope = false;
+  bool nestedScope = false; // inside a nested query
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;

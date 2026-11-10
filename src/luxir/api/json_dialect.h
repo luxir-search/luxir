@@ -1192,6 +1192,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::MultiMatchQuery>);
           } else if (key == "has_child") {
             arm(std::in_place_type<api::HasChildQuery>);
+          } else if (key == "nested") {
+            arm(std::in_place_type<api::NestedQuery>);
           } else if (key == "dis_max") {
             arm(std::in_place_type<api::DisMaxQuery>);
           } else if (key == "plugin") {
