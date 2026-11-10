@@ -117,22 +117,32 @@ public:
         : (int32_t)scratch.size();
     assert(docStart <= docEnd);
 
-    const char* p = buf + docStart;
-    const char* pend = buf + docEnd;
+    decodeDoc(std::string_view(buf + docStart, (size_t)(docEnd - docStart)), metadata->fieldNames,
+              valueSpanScratch, callback);
+  }
+
+  // Decodes one encoded document (as readChunkDocs hands it out) against the
+  // field table of the resource that encoded it, calling back like readDoc.
+  // valueScratch holds the values span between callbacks.
+  template <class Callback>
+  static void decodeDoc(std::string_view encoded, std::span<const std::string_view> fieldNames,
+                        std::vector<std::string_view>& valueScratch, Callback&& callback) {
+    const char* p = encoded.data();
+    const char* pend = p + encoded.size();
     uint32_t numFields = InputStream::readVint(p, pend);
     for (uint32_t i = 0; i < numFields; i++) {
       uint32_t fid = InputStream::readVint(p, pend);
       uint32_t numValues = InputStream::readVint(p, pend);
-      assert(fid < metadata->fieldNames.size());
-      std::string_view fieldName = metadata->fieldNames[fid];
-      valueSpanScratch.resize(0);
-      valueSpanScratch.reserve(numValues);
+      assert(fid < fieldNames.size());
+      std::string_view fieldName = fieldNames[fid];
+      valueScratch.resize(0);
+      valueScratch.reserve(numValues);
       for (uint32_t v = 0; v < numValues; v++) {
         uint32_t length = InputStream::readVint(p, pend);
-        valueSpanScratch.emplace_back(p, length);
+        valueScratch.emplace_back(p, length);
         p += length;
       }
-      callback(fieldName, std::span<const std::string_view>(valueSpanScratch));
+      callback(fieldName, std::span<const std::string_view>(valueScratch));
     }
     assert(p == pend);
   }
