@@ -117,10 +117,13 @@ locations, browse `src/luxir/<area>/`.
      forward by run-merging and rebuilds geo BKDs from the merged column.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
-   - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN
+   - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
+     (`codec/VectorCodec.h`: f32, f16, per-vector int8) for exact flat KNN
+   - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
+     per encoding, shared by the flat column scan and candidate rescore
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column or the `keep_original` companion column
    - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
-   - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
+   - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 
 7. **Storage** (`src/luxir/store/`)

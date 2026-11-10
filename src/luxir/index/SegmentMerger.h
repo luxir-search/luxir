@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
@@ -2004,6 +2006,15 @@ private:
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
   // variable-size), and the per-doc endValueRankReader (if the field is multi-valued).
+  //
+  // Vector columns: values are self-describing in their segment's encoding, so
+  // when every input shares one encoding the bytes are copied verbatim (never
+  // re-quantized).  Inputs with different encodings (a schema change between
+  // them) are written in the schema's current encoding, transcoding the
+  // others, so a field converges to its declared encoding.  Transcoding clamps
+  // to the F16 range and renormalizes unit-length cosine rows written as F32.
+  // Columns without a vector field type (the keep_original companion) keep
+  // the first input's encoding.
   void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     assert(sortedFields.size() == segs.size());
@@ -2054,6 +2065,29 @@ private:
       valDocOut = postingsWriter.getOutputStream();
       valDocWriter = pool.make_unique_align<MonoWriter>(8, pool, *valDocOut);
     }
+
+    bool isVector = outputFieldInfo.type == FieldType::Type::VECTOR;
+    VectorEncoding outEncoding = VectorEncoding::F32;
+    bool renormalize = false;
+    if (isVector) {
+      auto* vtype = dynamic_cast<const VectorFieldType*>(
+          schema.getFieldTypePtr(std::string_view(outputFieldInfo.fieldname)));
+      if (vtype != nullptr) {
+        outEncoding = vtype->encoding();
+        renormalize = outEncoding == VectorEncoding::F32
+            && vtype->metric() == VectorFieldType::METRIC_COSINE
+            && (vtype->normalizeOnWrite() || vtype->normalized());
+      } else {
+        for (auto* f : sortedFields) {
+          if (f == nullptr) continue;
+          outEncoding = (VectorEncoding)f->segFieldInfo.vectorEncoding;
+          break;
+        }
+      }
+    }
+    outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
+    std::vector<float> transcodeFloats;
+    std::vector<char> transcodeBytes;
 
     int32_t docsWithField = 0;
     int64_t totalValues = 0;
@@ -2113,6 +2147,36 @@ private:
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
 
+      // Identity unless this input's vector encoding differs from the output's.
+      auto inEncoding = (VectorEncoding)field->segFieldInfo.vectorEncoding;
+      bool transcode = isVector && inEncoding != outEncoding && reader.numValues() > 0;
+      int32_t transcodeDims = 0;
+      if (transcode) {
+        transcodeDims = vcodec::dimsFromBytes(inEncoding, reader.fixedValueSize());
+        if (!reader.isFixedSize() || transcodeDims <= 0) {
+          throw std::runtime_error("SegmentMerger: invalid vector column in field "
+                                   + std::string((std::string_view)field->segFieldInfo.fieldname));
+        }
+        transcodeFloats.resize((size_t)transcodeDims);
+        transcodeBytes.resize((size_t)vcodec::bytesPerVector(outEncoding, transcodeDims));
+      }
+      auto convert = [&](std::string_view value) {
+        if (!transcode) return value;
+        vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
+        if (outEncoding == VectorEncoding::F16) {
+          for (auto& x : transcodeFloats) x = std::clamp(x, -vcodec::F16_MAX, vcodec::F16_MAX);
+        } else if (renormalize) {
+          double normSq = 0.0;
+          for (float x : transcodeFloats) normSq += (double)x * (double)x;
+          if (normSq > VectorFieldType::MIN_COSINE_NORM_SQ) {
+            float inv = (float)(1.0 / std::sqrt(normSq));
+            for (auto& x : transcodeFloats) x *= inv;
+          }
+        }
+        vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
+        return std::string_view(transcodeBytes.data(), transcodeBytes.size());
+      };
+
       if (reader.docsReader().hasBitset() && !docsWriter) {
         isDense = false;
         docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
@@ -2132,12 +2196,12 @@ private:
         if (multiValued) {
           auto [startValueRank, endValueRank] = iter.valueRange();
           for (int64_t r = startValueRank; r < endValueRank; r++) {
-            emitValue(reader.valueAt(r));
+            emitValue(convert(reader.valueAt(r)));
             if (valDocWriter) valDocWriter->addInt64(mappedDoc);
           }
           endValueRankWriter->addInt64(totalValues);
         } else {
-          emitValue(iter.value());
+          emitValue(convert(iter.value()));
         }
 
         if (docsWriter) {

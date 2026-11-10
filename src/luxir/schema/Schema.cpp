@@ -62,6 +62,10 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  bool hasVectorEncoding = false;
+  VectorEncoding vectorEncoding = VectorEncoding::F32;
+  bool hasVectorKeepOriginal = false;
+  bool vectorKeepOriginal = false;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
@@ -290,6 +294,28 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  // encoding: explicit set on this field overrides; otherwise inherit.
+  if (def.encoding.has_value()) {
+    if (!vcodec::valid((int32_t)*def.encoding)) {
+      throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
+                        " (field: " + std::string(name) + "); valid: f32, f16, int8");
+    }
+    r.hasVectorEncoding = true;
+    r.vectorEncoding = (VectorEncoding)*def.encoding;
+  } else {
+    r.hasVectorEncoding = parentResolved.hasVectorEncoding;
+    r.vectorEncoding = parentResolved.vectorEncoding;
+  }
+
+  // keep_original: explicit set on this field overrides; otherwise inherit.
+  if (def.keep_original.has_value()) {
+    r.hasVectorKeepOriginal = true;
+    r.vectorKeepOriginal = *def.keep_original;
+  } else {
+    r.hasVectorKeepOriginal = parentResolved.hasVectorKeepOriginal;
+    r.vectorKeepOriginal = parentResolved.vectorKeepOriginal;
+  }
+
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
                                               : parentResolved.geoIgnoreMalformed;
@@ -441,11 +467,12 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.encoding.has_value() || def.keep_original.has_value() ||
                     def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
-      name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/keep_original/ann are only "
+      "valid for vector fields (field: " + name + ")");
   }
   if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
@@ -713,7 +740,8 @@ struct FieldCompiler {
                                                truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               ann, r.vectorTruncateDims);
+                                               r.vectorEncoding, r.vectorKeepOriginal, ann,
+                                               r.vectorTruncateDims);
         break;
       }
       default:

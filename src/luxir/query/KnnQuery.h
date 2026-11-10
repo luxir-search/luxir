@@ -44,6 +44,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/VectorScorer.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
@@ -2180,21 +2181,20 @@ public:
         return false;
       }
       template <bool Multi, class Emit>
-      LUXIR_INLINE void scoreRun(VectorReader& vr, const VectorSearchRequest& request, Emit& emit,
+      LUXIR_INLINE void scoreRun(VectorReader& vr, const VectorScorer& scorer, Emit& emit,
                                 int64_t& scored, int32_t doc, int64_t begin, int64_t end) {
         emit(doc, [&]() LUXIR_INLINE {
           scored += end - begin;
           if constexpr (Multi) {
             auto [rank, score] = bestInRun(begin, end, [&](int64_t r) LUXIR_INLINE {
-              return exactScore(request.query, vr.vectorAtRank(r), dims, metric, normalizeColumnOnCosineRescore, 0.0f);
+              return scorer.score(vr.rowAtRank(r), 0.0f);
             });
             return VectorEngineHit{score, segOrd, rank};
-          } else return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(begin), dims, metric,
-              normalizeColumnOnCosineRescore, 0.0f), segOrd, begin};
+          } else return VectorEngineHit{scorer.score(vr.rowAtRank(begin), 0.0f), segOrd, begin};
         });
       }
       template <bool Multi, bool Sparse, class Emit>
-      LUXIR_NOINLINE VectorSearchWork scanDomain(VectorReader& vr, const VectorSearchRequest& request,
+      LUXIR_NOINLINE VectorSearchWork scanDomain(VectorReader& vr, const VectorSearchRequest& request, const VectorScorer& scorer,
                                                 std::span<const uint8_t> elig, Emit emit) {
         auto& col = vr.strColReader();
         RowReadAhead::Gate gate;
@@ -2288,7 +2288,7 @@ public:
               multiMaps++;
               auto run = queuedRanges->front();
               queuedRanges->pop_front();
-              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, run.begin, run.end);
+              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vr, scorer, emit, vectorsScored, doc, run.begin, run.end);
               return;
             }
           }
@@ -2296,7 +2296,7 @@ public:
           if (rank < 0) return;
           if constexpr (Multi) multiMaps++;
           auto [begin, end] = valueRange(rank);
-          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vr, request, emit, vectorsScored, doc, begin, end);
+          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vr, scorer, emit, vectorsScored, doc, begin, end);
         });
         VectorSearchWork work;
         work.domainDocs = count; work.exactVectors = vectorsScored;
@@ -2304,7 +2304,7 @@ public:
         return work;
       }
       template <bool Filtered, bool Multi, bool Sparse, class Emit>
-      LUXIR_NOINLINE VectorSearchWork scanSequential(VectorReader& vr, const VectorSearchRequest& request,
+      LUXIR_NOINLINE VectorSearchWork scanSequential(VectorReader& vr, const VectorSearchRequest& request, const VectorScorer& scorer,
                                                     std::span<const uint8_t> elig, Emit emit) {
         auto& col = vr.strColReader();
         int64_t numVals = vr.numVectors(), vectorsScored = 0, domainProbes = 0, sparseMaps = 0, multiMaps = 0;
@@ -2346,7 +2346,7 @@ public:
               valDoc.next();
             } while (end < numVals && (int32_t)valDoc.value() == doc);
             readAhead(rank);
-            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, rank, end);
+            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, scorer, emit, vectorsScored, doc, rank, end);
             rank = end;
           }
         } else {
@@ -2357,7 +2357,7 @@ public:
             if (pooledInRun(elig, rank, rank + 1)) continue;
             if constexpr (Sparse) sparseMaps++;
             int32_t doc = Sparse ? v2d.resolve(rank) : (int32_t)rank;
-            if (eligibleDoc(doc)) scoreRun<false>(vr, request, emit, vectorsScored, doc, rank, rank + 1);
+            if (eligibleDoc(doc)) scoreRun<false>(vr, scorer, emit, vectorsScored, doc, rank, rank + 1);
           }
         }
         VectorSearchWork work;
@@ -2367,10 +2367,10 @@ public:
       }
       template <bool Multi, bool Sparse, class Emit>
       VectorSearchWork scan(VectorReader& vr, const VectorSearchRequest& request,
-                            std::span<const uint8_t> elig, bool walk, Emit emit) {
-        if (walk) return scanDomain<Multi, Sparse>(vr, request, elig, emit);
-        if (domain) return scanSequential<true, Multi, Sparse>(vr, request, elig, emit);
-        return scanSequential<false, Multi, Sparse>(vr, request, elig, emit);
+                            const VectorScorer& scorer, std::span<const uint8_t> elig, bool walk, Emit emit) {
+        if (walk) return scanDomain<Multi, Sparse>(vr, request, scorer, elig, emit);
+        if (domain) return scanSequential<true, Multi, Sparse>(vr, request, scorer, elig, emit);
+        return scanSequential<false, Multi, Sparse>(vr, request, scorer, elig, emit);
       }
 
     public:
@@ -2420,6 +2420,8 @@ public:
             "KnnQuery: query vector dims {} do not match segment dims {}",
             dims, vr.dims()));
         }
+        VectorScorer scorer(request.query, dims, metric, normalizeColumnOnCosineRescore,
+                            vr.encoding());
 
         // Flat exclusions are doc-granular: an emitted rank is that doc's maximum.
         std::span<const uint8_t> elig = (size_t)segOrd < request.eligible.size()
@@ -2429,11 +2431,11 @@ public:
             domain ? domain->card() : 0, vr.docsWithValue(), tuning.flatDomainDensityThreshold);
         auto dispatch = [&](auto emit) {
           if (vr.isMultiValued()) {
-            if (sparse) return scan<true, true>(vr, request, elig, walk, emit);
-            return scan<true, false>(vr, request, elig, walk, emit);
+            if (sparse) return scan<true, true>(vr, request, scorer, elig, walk, emit);
+            return scan<true, false>(vr, request, scorer, elig, walk, emit);
           }
-          if (sparse) return scan<false, true>(vr, request, elig, walk, emit);
-          return scan<false, false>(vr, request, elig, walk, emit);
+          if (sparse) return scan<false, true>(vr, request, scorer, elig, walk, emit);
+          return scan<false, false>(vr, request, scorer, elig, walk, emit);
         };
         if constexpr (Groups) {
           CollapseKeyReader keys(*groupPlan);
@@ -2449,7 +2451,7 @@ public:
           unused(doc);
           heap.offer(makeHit());
         });
-        result.work.scoreBytes = result.work.exactVectors * dims * (int64_t)sizeof(float);
+        result.work.scoreBytes = result.work.exactVectors * (int64_t)vr.valueBytes();
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         result.boundedSelection = VectorSelection::COMPLETE;
@@ -3136,12 +3138,17 @@ private:
         buckets.emplace_back(b, e);
         b = e;
       }
-      std::vector<int64_t> readsByBucket(buckets.size());
+      std::vector<int64_t> readsByBucket(buckets.size()), bytesByBucket(buckets.size());
       auto readBucket = [&](size_t bucket) {
         return [&, bucket]() {
           auto [b, e] = buckets[bucket];
           int32_t segOrd = records[selected[b]].hit.segOrd;
           VectorReader column(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd));
+          if (column.dims() != dims) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: query vector dims {} do not match segment dims {}", dims, column.dims()));
+          }
+          VectorScorer scorer(queryPtr, dims, metric, normalizeColumnOnCosineRescore, column.encoding());
           RowReadAhead::Gate gate;
           RowReadAhead ahead(gate, column.strColReader());
           auto rankAt = [&](int64_t i) { return records[selected[b + (size_t)i]].hit.valueRank; };
@@ -3153,8 +3160,7 @@ private:
             // may already have established a better exact member.
             if (!seed && record.upper < record.unit->exact.load(std::memory_order_relaxed)) continue;
             ahead.sparseAt((int64_t)(i - b), count, [&](int64_t pos) { auto rank = rankAt(pos); ahead.queueRows(rank, rank + 1); });
-            float score = exactScore(queryPtr, column.vectorAtRank(record.hit.valueRank), dims,
-                metric, normalizeColumnOnCosineRescore, record.hit.score);
+            float score = scorer.score(column.rowAtRank(record.hit.valueRank), record.hit.score);
             record.hit.score = score;
             record.exact = true;
             float best = record.unit->exact.load(std::memory_order_relaxed);
@@ -3162,6 +3168,7 @@ private:
             reads++;
           }
           readsByBucket[bucket] = reads;
+          bytesByBucket[bucket] = reads * (int64_t)column.valueBytes();
         };
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
@@ -3179,7 +3186,7 @@ private:
         int32_t segOrd = records[selected[buckets[i].first]].hit.segOrd;
         auto& work = workBySeg[(size_t)segOrd];
         (seed ? work.seedReads : work.remainingReads) += readsByBucket[i];
-        work.scoreBytes += readsByBucket[i] * dims * (int64_t)sizeof(float);
+        work.scoreBytes += bytesByBucket[i];
       }
     };
     readStage(true, KnnIntervalCollector<Groups>::NO_FLOOR);
@@ -3216,50 +3223,8 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // Query and stored vectors share inputError's element bound, which keeps
-  // every exact and FAISS distance finite.  A NaN score would break the
-  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
-  // cuts deterministic and std::sort defined, so any NaN that slips past the
-  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
-  // minCompetitiveVal starts at lowest() and admits only strictly greater
-  // scores, and a kNN hit must rank last, not be counted in matches yet
-  // vanish from the returned docs.
   static float finiteScore(float score) {
-    if (!std::isnan(score)) [[likely]] return score;
-    return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
-  }
-
-  // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
-  // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
-  static LUXIR_INLINE float exactScore(const float* queryPtr,
-                          std::span<const float> vec,
-                          int32_t dims,
-                          int32_t metric,
-                          bool normalizeColumnOnCosineRescore,
-                          float fallbackScore) {
-    assert(queryPtr != nullptr);
-    assert((int32_t)vec.size() == dims);
-    switch (metric) {
-      case (int32_t)luxir::api::VectorMetric::L2: {
-        float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
-        return finiteScore(1.0f / (1.0f + dist));
-      }
-      case (int32_t)luxir::api::VectorMetric::IP:
-        return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case (int32_t)luxir::api::VectorMetric::COSINE: {
-        float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
-        if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
-
-        // Raw-column cosine pays the vector norm at query time.  This is the
-        // explicit tradeoff for preserving the originally submitted bytes when
-        // normalize_on_write=false; the default cosine path stores unit vectors.
-        float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) return 0.0f;
-        return finiteScore(sum / std::sqrt(normSq));
-      }
-      default:
-        return fallbackScore;
-    }
+    return VectorScorer::finiteScore(score);
   }
 
   static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {
