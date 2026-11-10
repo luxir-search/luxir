@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/search/HitDecorator.h"
 
 #include <algorithm>
 #include <chrono>
@@ -146,6 +147,7 @@ class SearchOp {
   std::vector<uint32_t> segmentStateRetentions;
 
 public:
+  std::vector<std::shared_ptr<HitDecorator>> decorators;
   SearchRequest& req;
   std::string_view name;
   uint64_t flags = 0; // effective packed options, set by the parser
