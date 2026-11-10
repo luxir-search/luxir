@@ -17,18 +17,25 @@ struct NativeValueOutput {
 };
 
 struct BooleanValueOutput {
-  template <typename T> bool operator()(T value) const { return value != 0; }
+  template <typename T> requires (std::is_arithmetic_v<T> || std::is_same_v<T, __int128>)
+  bool operator()(T value) const { return value != 0; }
 };
 
 struct DecimalValueOutput {
   DecimalScale scale;
   explicit DecimalValueOutput(int scale) : scale(scale) {}
-  template <typename T> double operator()(T raw) const { return scale(raw); }
+  template <typename T> requires (std::is_arithmetic_v<T> || std::is_same_v<T, __int128>)
+  double operator()(T raw) const { return scale(raw); }
 };
 
 struct ValueOutputContext {
   std::string source;
   std::pmr::memory_resource& mr;
+};
+
+struct IpValueOutput {
+  ValueOutputContext context;
+  std::string_view operator()(std::string_view value) const;
 };
 
 struct NumericValueOutput {
@@ -55,6 +62,9 @@ void selectValueOutput(ValueNature nature, uint64_t flags, Emit emit) {
     return;
   }
   switch (nature) {
+    case ValueNature::IP:
+      emit.template operator()<IpValueOutput>();
+      return;
     case ValueNature::BOOLEAN:
       emit.template operator()<BooleanValueOutput>();
       return;
@@ -88,21 +98,41 @@ inline bool nativeValueOutput(ValueNature nature, uint64_t flags) {
   return native;
 }
 
-template <typename Source, typename Emit>
+template <typename Value = void, typename Source, typename Emit>
 void withNatureOutput(ValueNature nature, uint64_t flags,
                       std::pmr::memory_resource& mr, Source source, Emit emit) {
   selectValueOutput(nature, flags, [&]<typename Output>(auto... parameters) {
-    if constexpr (std::is_constructible_v<Output, decltype(parameters)...>) emit(Output{parameters...});
+    if constexpr (!std::is_void_v<Value> && !std::is_invocable_v<Output, Value>) {
+      throw std::logic_error("Output policy does not support the column value type");
+    } else if constexpr (std::is_constructible_v<Output, decltype(parameters)...>) emit(Output{parameters...});
     else emit(Output{parameters..., ValueOutputContext{std::string(source()), mr}});
   });
 }
 
 template <typename Output>
-void renderValue(api::Val& value, const Output& output) {
+void renderValueVariant(auto& value, const Output& output) {
   if constexpr (!std::is_same_v<Output, NativeValueOutput>) {
-    if (auto* integer = std::get_if<int64_t>(&value.kind)) value.kind = output(*integer);
-    else if (auto* number = std::get_if<double>(&value.kind)) value.kind = output(*number);
+    if constexpr (std::is_invocable_v<Output, int64_t>) {
+      if (auto* integer = std::get_if<int64_t>(&value)) { value = output(*integer); return; }
+    }
+    if constexpr (std::is_invocable_v<Output, double>) {
+      if (auto* number = std::get_if<double>(&value)) { value = output(*number); return; }
+    }
+    if constexpr (std::is_invocable_v<Output, std::string_view>) {
+      if (auto* text = std::get_if<std::string_view>(&value)) value = output(*text);
+    }
   }
+}
+
+template <typename Output>
+void renderValue(api::Val& value, const Output& output) {
+  renderValueVariant(value.kind, output);
+}
+
+template <typename Output>
+std::string_view outputTerm(std::string_view value, std::pmr::memory_resource& mr, const Output& output) {
+  if constexpr (std::is_same_v<Output, NativeValueOutput>) return api::build::arenaStr(mr, value);
+  else return output(value);
 }
 
 } // namespace luxir

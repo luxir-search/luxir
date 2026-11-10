@@ -854,25 +854,32 @@ public:
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
-    target.fieldType->requireCapability(FieldType::MATCH
-        | (caseInsensitive && !FieldType::isNumericColumn(target.fieldType->type()) ? FieldType::PATTERN : 0u),
-        "Match query", target.physicalName);
-    return createMatchQueryImpl(target, value, op, minMatch, boost, caseInsensitive);
+    if (value.empty() && FieldType::isNumericColumn(target.fieldType->type())) {
+      target.fieldType->requireCapability(FieldType::MATCH, "Match query", target.physicalName);
+      return matchNoDocs();
+    }
+    return createMatchQuery(target, coerce::scalarVal(value), op, minMatch, boost, caseInsensitive);
   }
 
 private:
-  Query* createMatchQueryImpl(const ResolvedFieldHandle& target, std::string_view value,
+  FieldType::TermWindow retainTermWindow(FieldType::TermWindow window, const char* buf) {
+    if (window.lo.data() == buf) {
+      bool point = window.point();
+      window.lo = poolCopy(window.lo);
+      window.hi = point ? window.lo : poolCopy(window.hi);
+    }
+    return window;
+  }
+
+  Query* createMatchQueryImpl(const ResolvedFieldHandle& target, FieldType::TermWindow window,
                               Operator op, int minMatch, float boost, bool caseInsensitive) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    if (FieldType::isNumericColumn(fieldType.type())) {
-      if (value.empty()) return matchNoDocs();
-      requireNumericColumn(target);
-      api::Val literal;
-      literal.kind = value;
-      return createNumericPredicate(field,
-          coerceIntWindow(target, literal, FieldType::LiteralUse::MATCH), boost);
+    if (!window.point()) {
+      Query* query = pool.make<TermRangeQuery>(field, window.lo, true, window.hi, true);
+      return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
     }
+    auto value = window.lo;
     switch (FieldType::storage(fieldType.type())) {
       case FieldType::Storage::TEXT: {
         auto terms = caseInsensitive ? analyzeText<false>(target, value) : analyzeText(target, value);
@@ -942,17 +949,9 @@ public:
           coerceIntWindow(target, val, FieldType::LiteralUse::MATCH), boost);
     }
     char buf[coerce::TEXT_BUF_SIZE];
-    std::string_view text = coerce::isNull(val)
-        ? std::string_view{}
-        : fieldType.coerceTerm(val, field, buf);
-    // A rendered numeric lives in stack-local buf: TEXT analysis copies terms
-    // out anyway, but the STRING/ID pass-through keeps the view, so copy it
-    // into the pool.  String/bytes arms view the request bytes, which already
-    // outlive the query tree.
-    if (text.data() == buf) {
-      text = poolCopy(text);
-    }
-    return createMatchQueryImpl(target, text, op, minMatch, boost, caseInsensitive);
+    auto window = fieldType.coerceTermWindow(coerce::isNull(val) ? coerce::scalarVal(std::string_view{}) : val,
+                                             field, buf);
+    return createMatchQueryImpl(target, retainTermWindow(window, buf), op, minMatch, boost, caseInsensitive);
   }
 
   struct WeightedField {
@@ -985,7 +984,11 @@ private:
       warnSkippedGranule(target, value, *window);
       return createNumericPredicate(poolCopy(target.physicalName), *window, weight);
     }
-    return createMatchQuery(target, text, op, minMatch, weight);
+    type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
+    char buf[coerce::TEXT_BUF_SIZE];
+    auto window = type.tryCoerceTermWindow(coerce::scalarVal(text), target.physicalName, buf);
+    if (!window) return nullptr;
+    return createMatchQueryImpl(target, retainTermWindow(*window, buf), op, minMatch, weight, false);
   }
 
   // Expand selectors, resolve search bindings, and keep the largest weight

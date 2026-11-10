@@ -288,3 +288,7 @@ unless its slop reaches that gap.
   relationships with IDs or flatten the fields in the producer.
 - Binary is reserved in the wire/schema enum but is not a usable engine field
   type in the current release.
+
+IP fields accept address strings and return canonical text. IPv4 and its
+v4-mapped IPv6 spelling are equal; CIDR is a match-query literal, not an
+ingest value. See [IP addresses](schema.md#ip-addresses).

@@ -63,11 +63,15 @@ struct CollapsePlan {
   struct Field {
     std::string name;
     luxir::api::GroupComponent_::Type type;
+    FieldType::Storage storage;
     std::shared_ptr<OrdMap> ords;
     IndexReader::FieldSegments segments;
     ValueNature nature = ValueNature::NUMBER;
-    bool ordinal() const { return type == luxir::api::GroupComponent_::Type::STRING
-                               || type == luxir::api::GroupComponent_::Type::ID; }
+    Field(std::string name, luxir::api::GroupComponent_::Type type, FieldType::Storage storage,
+          std::shared_ptr<OrdMap> ords, IndexReader::FieldSegments segments,
+          ValueNature nature = ValueNature::NUMBER)
+      : name(std::move(name)), type(type), storage(storage), ords(std::move(ords)), segments(segments), nature(nature) {}
+    bool ordinal() const { return storage == FieldType::Storage::TERMS; }
   };
   std::vector<Field> fields;
   luxir::api::Collapse_::MissingPolicy missing;
@@ -110,7 +114,7 @@ struct CollapsePlan {
           for (const auto& key : keys) {
             if (key.singleton) continue;
             auto& component = const_cast<api::GroupComponent&>(key.component[i]);
-            if (auto* value = std::get_if<int64_t>(&component.value)) component.value = output(*value);
+            renderValueVariant(component.value, output);
           }
         }
       });

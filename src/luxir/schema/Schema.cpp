@@ -539,7 +539,7 @@ struct FieldCompiler {
       // defaults by type
       switch (r.type) {
         case FieldClass::ID:     index = IndexMode::MATCH; break;
-        case FieldClass::STRING: index = IndexMode::MATCH; break;
+        case FieldClass::STRING: case FieldClass::IP: index = IndexMode::MATCH; break;
         case FieldClass::TEXT:   index = IndexMode::MATCH; break;
         case FieldClass::INT:    index = IndexMode::NONE; break;
         default: index = IndexMode::NONE; break;
@@ -603,6 +603,10 @@ struct FieldCompiler {
       stored = (r.type == FieldClass::TEXT);
     }
 
+    if (r.type == FieldClass::IP) {
+      if (index != IndexMode::MATCH) throw SchemaError("ip requires index=match (field: " + std::string(name) + ")");
+      if (stored && !derived) throw SchemaError("stored=true is not supported for ip fields (field: " + std::string(name) + ")");
+    }
     if (geoClass && stored) {
       throw SchemaError("stored=true is not supported for geo_point fields (field: " +
                         std::string(name) + ")");
@@ -666,6 +670,9 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        break;
+      case FieldClass::IP:
+        ft = std::make_shared<IpFieldType>(name, flags);
         break;
       case FieldClass::DECIMAL:
         if (!r.scale || *r.scale < 0 || *r.scale > DecimalFieldType::MAX_SCALE) {
@@ -1188,7 +1195,9 @@ std::vector<std::string> Schema::searchableFields(
   for (const auto& [name, type] : fieldTypeMap) addRoot(name);
   for (auto name : physicalNames) addRoot(name);
   auto termTarget = [](FieldType& type) {
-    return type.indexed() && type.supports(FieldType::FREE_TEXT);
+    auto storage = FieldType::storage(type.type());
+    return type.indexed() && type.supports(FieldType::MATCH)
+        && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT);
   };
   std::vector<std::string> names;
   for (auto root : roots) {
@@ -1260,6 +1269,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   }
   add(templates, "_i", FieldClass::INT);
   add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_ip", FieldClass::IP);
+  add(templates, "_ips", FieldClass::IP).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_b", FieldClass::BOOLEAN);
   add(templates, "_bs", FieldClass::BOOLEAN).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_f", FieldClass::FLOAT);

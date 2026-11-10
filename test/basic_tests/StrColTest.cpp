@@ -27,6 +27,30 @@ protected:
 };
 
 
+TEST_F(StrColTest, preparedTextBorrowsInput) {
+  StrFieldType type("s");
+  handler::StringValue<false> value(type);
+  std::string longText(300, 'x');
+  std::string_view strings[] = {"", "short", longText};
+  auto prepared = value.prepareMany(strings, "s");
+  EXPECT_EQ(strings, prepared.data());
+  EXPECT_EQ(3, prepared.size());
+  auto array = coerce::scalarVal(api::ArrStr{strings});
+  EXPECT_EQ(strings, value.prepareMany(array, "s").data());
+  EXPECT_EQ(longText.data(), value.prepare(strings[2], "s").data());
+  ::hpp_proto::bytes_view bytes = std::as_bytes(std::span(longText));
+  EXPECT_EQ(longText.data(), value.prepare(bytes, "s").data());
+  EXPECT_EQ(longText.data(), value.prepare(coerce::scalarVal(bytes), "s").data());
+  EXPECT_EQ(0, value.retainedBytes());
+
+  handler::StringValue<true> packed(type);
+  prepared = packed.prepareMany(strings, "s");
+  EXPECT_EQ(strings[1].data(), prepared[1].data());
+  EXPECT_EQ(PackedTerm::MAX_LEN, prepared[2].size());
+  EXPECT_NE(longText.data(), prepared[2].data());
+}
+
+
 TEST_F(StrColTest, basic) {
   {
     // single doc
@@ -1210,6 +1234,35 @@ TEST_F(StrColTest, materializationScratchIsAccountedAndReused) {
   EXPECT_LE(inverter.extraRamBytes, retained + token.size()); // Only column bytes may grow.
   iw->releaseInverter(inverter, true);
   helper.commit();
+}
+
+TEST_F(StrColTest, scalarIndexingKeepsArrayScratchAccounted) {
+  for (bool indexed : {false, true}) {
+    CollectionHelper helper;
+    SchemaBuilder schema;
+    auto& field = schema.field("value");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = indexed ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
+    field.column = true;
+    field.multi = api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    auto iw = helper.getIndexWriter();
+    auto& inverter = iw->obtainInverter();
+    auto& input = inverter.getIndexHandler("value");
+    std::string token(300, 'a');
+    std::vector<std::string_view> values(1000, token);
+    inverter.startDoc();
+    input.index(inverter, values);
+    inverter.finishDoc();
+    size_t retained = inverter.extraRamBytes;
+    EXPECT_GE(retained, values.size() * sizeof(std::string_view));
+    inverter.startDoc();
+    input.index(inverter, coerce::scalarVal(std::string_view("scalar")));
+    inverter.finishDoc();
+    EXPECT_GE(inverter.extraRamBytes, retained);
+    iw->releaseInverter(inverter, true);
+    helper.commit();
+  }
 }
 
 TEST_F(StrColTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {

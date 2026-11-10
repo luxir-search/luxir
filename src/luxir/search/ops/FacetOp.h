@@ -97,7 +97,7 @@ public:
         emit([](int64_t value) { return sortableInt64ToDouble(value); });
         break;
       default:
-        withNatureOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        withNatureOutput<int64_t>(outputNature, flags, mr, [this] { return fieldName; }, emit);
         break;
     }
   }
@@ -110,7 +110,9 @@ public:
       withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
-    } else emitBuckets(result, buckets, mr);
+    } else withNatureOutput<std::string_view>(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+      emitBuckets(result, buckets, mr, output);
+    });
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
@@ -1533,7 +1535,7 @@ public:
         assert(bucket.key.has_value());
         countVec.emplace_back(std::move(*bucket.key), bucket.count);
       }
-      emitBuckets(facetResultProto, countVec, mr);
+      thisOp().emitFieldBuckets(facetResultProto, countVec, mr);
       if (missing) {
         facetResultProto.missing = merged.missing_num;
       }

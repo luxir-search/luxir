@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ValueOutput.h"
+#include "luxir/util/IpAddress.h"
 
 #include <cmath>
 #include <limits>
@@ -18,6 +19,11 @@ bool insideNanos(double value) {
 }
 
 } // namespace
+
+std::string_view IpValueOutput::operator()(std::string_view value) const {
+  char buffer[ip::TEXT_BUF_SIZE];
+  return api::build::arenaStr(context.mr, ip::format(value, buffer));
+}
 
 int64_t NumericValueOutput::operator()(int64_t value) const {
   __int128 converted = convertDateUnits(value, from, to);

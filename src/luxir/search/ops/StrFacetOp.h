@@ -1871,7 +1871,7 @@ public:
         }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));
-        emitBuckets(facetResultProto, countVec, mr);
+        child.emitFieldBuckets(facetResultProto, countVec, mr);
         if (child.missing) {
           facetResultProto.missing = missingCounts[(size_t)owner];
         }

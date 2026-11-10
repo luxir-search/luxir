@@ -38,7 +38,7 @@ namespace {
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
 constexpr uint64_t kReferenceVersion = 11;
-constexpr uint64_t kReferenceDigest = 0x55b370a984df3e31;
+constexpr uint64_t kReferenceDigest = 0x29fa249bcd32cd60;
 
 // A small index over every default field template's kind, with two segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -60,7 +60,7 @@ void buildReferenceIndex(CollectionHelper& ch) {
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "on_b", true,
-              "flags_bs", std::vector<bool>{true, false}, "decimal_value", "1.005", "f_f", 1.5f, "d_d", 2.25,
+              "flags_bs", std::vector<bool>{true, false}, "address_ip", "10.0.0.1", "addresses_ips", vecs("10.0.0.2", "2001:db8::1"), "decimal_value", "1.005", "f_f", 1.5f, "d_d", 2.25,
               "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0},
               "code_sc", "k1", "codes_ssc", vecs("k2", "k3"), "fs_fs", std::vector<double>{0.5, -1.25},
               "ds_ds", std::vector<double>{3.75}, "dts_dts", vecs("2026-01-02T03:04:05Z", "2024-02-29T00:00:00Z"),

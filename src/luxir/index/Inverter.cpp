@@ -213,14 +213,14 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
     char buf[coerce::TEXT_BUF_SIZE];
     std::vector<std::string> storage;
     coerce::forEachElement(val, [&](const IndexVal& elem) {
-      storage.emplace_back(fieldType->coerceTerm(elem, name, buf));
+      storage.emplace_back(coerce::toText(elem, name, buf));
     });
     std::vector<std::string_view> views(storage.begin(), storage.end());
     writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
   } else {
     // Numeric / bool scalars: store canonical text before normalization.
     char buf[coerce::TEXT_BUF_SIZE];
-    writer->addValue(doc, name, fieldType->coerceTerm(val, name, buf));
+    writer->addValue(doc, name, coerce::toText(val, name, buf));
   }
 }
 

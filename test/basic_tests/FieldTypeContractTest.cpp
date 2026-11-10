@@ -41,10 +41,11 @@ TEST_F(FieldTypeContractTest, operationCapabilities) {
       | F::TERM_FILTER | F::RANGE | F::SORT | F::FIELD_FACET | F::COLLAPSE | F::VALUE_EXPR;
   const uint32_t text = F::MATCH | F::ANY_OF | F::PREFIX | F::PATTERN | F::FUZZY | F::FREE_TEXT | F::RANGE | F::FIELD_FACET;
   const uint32_t numeric = F::MATCH | F::ANY_OF | F::RANGE | F::SORT | F::FIELD_FACET | F::RANGE_FACET | F::VALUE_EXPR;
-  struct Case { std::shared_ptr<FieldType> type; uint32_t expected; };
+  struct Case { std::shared_ptr<FieldType> type; uint32_t expected; std::string_view literal = "7"; };
   const Case cases[] = {
       {std::make_shared<FieldType>("none", F::NONE, 0), 0},
       {std::make_shared<StrFieldType>("string"), terms},
+      {std::make_shared<IpFieldType>("ip"), terms & ~(F::PREFIX | F::PATTERN | F::FUZZY | F::FREE_TEXT | F::TERM_FILTER), "10.0.0.1"},
       {std::make_shared<TextFieldType>("text"), text},
       {std::make_shared<StoredFieldType>("bin"), 0},
       {std::make_shared<IntFieldType>("int"), numeric | F::COLLAPSE},
@@ -67,7 +68,9 @@ TEST_F(FieldTypeContractTest, operationCapabilities) {
     EXPECT_EQ(c.expected, c.type->capabilities());
     c.type->flags_ = flags;
     auto catalog = schema->searchableFields();
-    EXPECT_EQ((c.expected & F::FREE_TEXT) != 0, std::ranges::contains(catalog, c.type->name_));
+    auto storage = FieldType::storage(c.type->type());
+    EXPECT_EQ((c.expected & F::MATCH) != 0 && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT),
+              std::ranges::contains(catalog, c.type->name_));
     for (auto capability : {F::MATCH, F::ANY_OF, F::PREFIX, F::PATTERN, F::FUZZY, F::RANGE,
                            F::SORT, F::FIELD_FACET, F::RANGE_FACET, F::COLLAPSE, F::VALUE_EXPR, F::TERM_FILTER}) {
       SCOPED_TRACE(capability);
@@ -77,14 +80,13 @@ TEST_F(FieldTypeContractTest, operationCapabilities) {
         MemPool pool;
         QueryBuilder builder(pool, *schema, CoerceContext{});
         auto name = c.type->name_;
-        api::Val value = coerce::scalarVal(std::string_view("7"));
+        api::Val value = coerce::scalarVal(c.literal);
         std::string op;
         switch (capability) {
           case F::MATCH: builder.createMatchQuery(name, value); break;
           case F::ANY_OF: {
-            int64_t seven = 7;
             api::Val values;
-            values.kind.emplace<api::ArrInt>().v = {&seven, 1};
+            values.kind.emplace<api::ArrVal>().v = {&value, 1};
             builder.createAnyOfQuery(builder.canonicalizeFieldValues(name, ValueSequence(values, "values")));
             break;
           }
@@ -176,7 +178,7 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
 }
 
 TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
-  for (int type = FieldType::NONE; type <= FieldType::DECIMAL; type++) {
+  for (int type = FieldType::NONE; type <= FieldType::IP; type++) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
     PostingsWriter writer(dir, 1, 1, 0);

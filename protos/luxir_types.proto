@@ -1115,7 +1115,7 @@ message SearchResponse {
 
 // Typed collapse identity. Component types follow the resolved schema fields.
 message GroupComponent {
-  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; DECIMAL = 5; } // INT carries signed int64 values.
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; DECIMAL = 5; IP = 6; } // INT carries signed int64 values.
   Type type = 1;
   oneof value {
     google.protobuf.NullValue null = 2;
@@ -2435,12 +2435,13 @@ message FieldDef {
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
     BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
+    IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
   // Index acceleration. Numeric Match/Range and geographic predicates can
-  // scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH;
+  // scan a column with NONE. Term queries on STRING/TEXT/ID/IP require MATCH;
   // STRING columns alone do not provide term-query support.
   enum IndexMode {
     NONE = 0;    // no index

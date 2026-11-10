@@ -11,6 +11,7 @@
 #include <array>
 #include "luxir/util/DateTime.h"
 #include "luxir/util/NumericUtils.h"
+#include "luxir/util/IpAddress.h"
 
 namespace luxir::coerce {
 
@@ -255,6 +256,58 @@ std::string_view FieldType::coerceTerm(const api::Val& val, std::string_view fie
   unused(buf);
   coerce::throwCoerce(fieldName, val,
                       fmt::format("a term (field type '{}' is not term-backed)", name_));
+}
+
+FieldType::TermWindow FieldType::coerceTermWindow(const api::Val& val,
+    std::string_view fieldName, std::span<char> buf) const {
+  auto term = coerceTerm(val, fieldName, buf);
+  return {term, term};
+}
+
+std::optional<FieldType::TermWindow> FieldType::tryCoerceTermWindow(const api::Val& val,
+    std::string_view fieldName, std::span<char> buf) const {
+  try {
+    return coerceTermWindow(val, fieldName, buf);
+  } catch (const RequestError& e) {
+    if (e.code != "invalid_value") throw;
+    return std::nullopt;
+  }
+}
+
+std::string_view IpFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
+    std::span<char> buf) const {
+  if (auto* text = std::get_if<std::string_view>(&val.kind)) {
+    if (auto address = ip::parse(*text)) {
+      if (buf.size() < ip::BYTES) throw std::logic_error("IP coercion buffer is too small");
+      std::memcpy(buf.data(), address->data(), ip::BYTES);
+      return {buf.data(), ip::BYTES};
+    }
+  }
+  coerce::throwCoerce(fieldName, val, "an IP address");
+}
+
+std::optional<FieldType::TermWindow> IpFieldType::tryCoerceTermWindow(const api::Val& val,
+    std::string_view fieldName, std::span<char> buf) const {
+  unused(fieldName);
+  if (auto* text = std::get_if<std::string_view>(&val.kind)) {
+    if (buf.size() < 2 * ip::BYTES) throw std::logic_error("IP window buffer is too small");
+    if (auto range = ip::parseCidr(*text)) {
+      std::memcpy(buf.data(), range->lo.data(), ip::BYTES);
+      std::memcpy(buf.data() + ip::BYTES, range->hi.data(), ip::BYTES);
+      return TermWindow{{buf.data(), ip::BYTES}, {buf.data() + ip::BYTES, ip::BYTES}};
+    }
+    if (auto address = ip::parse(*text)) {
+      std::memcpy(buf.data(), address->data(), ip::BYTES);
+      return TermWindow{{buf.data(), ip::BYTES}, {buf.data(), ip::BYTES}};
+    }
+  }
+  return std::nullopt;
+}
+
+FieldType::TermWindow IpFieldType::coerceTermWindow(const api::Val& val,
+    std::string_view fieldName, std::span<char> buf) const {
+  if (auto range = tryCoerceTermWindow(val, fieldName, buf)) return *range;
+  coerce::throwCoerce(fieldName, val, "an IP address or CIDR");
 }
 
 int64_t IntFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
