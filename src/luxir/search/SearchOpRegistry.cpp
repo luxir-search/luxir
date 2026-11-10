@@ -24,8 +24,9 @@ SearchOpRegistry& SearchOpRegistry::global() {
 namespace {
 
 // SearchOp arm keys and the other keys a SearchOp object reads.
-constexpr std::array<std::string_view, 10> RESERVED = {
+constexpr std::array<std::string_view, 12> RESERVED = {
     "top_docs", "fusion", "field_facet", "range_facet", "query_facet", "expr_op", "plugin",
+    "nested", "reverse_nested",
     "domain", "flags", "flags_set"};
 
 }  // namespace

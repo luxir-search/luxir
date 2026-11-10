@@ -639,7 +639,7 @@ void readPluginArm(std::string_view name, std::string_view &nameOut,
 }
 
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 8,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 10,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -694,6 +694,10 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::RangeFacet>);
           } else if (key == "query_facet") {
             arm(std::in_place_type<api::QueryFacet>);
+          } else if (key == "nested") {
+            arm(std::in_place_type<api::NestedOp>);
+          } else if (key == "reverse_nested") {
+            arm(std::in_place_type<api::ReverseNestedOp>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
           } else if (key == "plugin") {
@@ -792,6 +796,8 @@ struct from<JSON, luxir::api::SortSpec> {
             glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
           } else if (key == "dir") {
             util::from_json<V>(value.dir, ctx, vit, vend);
+          } else if (key == "nested") {
+            util::from_json<V>(value.nested, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

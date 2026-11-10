@@ -188,6 +188,55 @@ TEST_F(NestedTest, nestedScoreModesAndInnerHits) {
   EXPECT_EQ("y", list->docs[0].fields.at("user")->asString());
 }
 
+TEST_F(NestedTest, nestedAggregationsAndReverseNested) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  ASSERT_TRUE(update(helper, R"("docs":[
+    {"id":"a","title_s":"t1","answers":[{"user":"x"},{"user":"y"}]},
+    {"id":"b","title_s":"t2","answers":[{"user":"x"}]},
+    {"id":"c","title_s":"t3"}
+  ])").success);
+  auto req = localReq(luxirNode->getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","ops":{"q":{"top_docs":{"limit":0,"count_limit":-1,"query":{"all":true},"ops":{
+    "n":{"nested":{"path":"answers","ops":{
+      "users":{"field_facet":{"field":"answers.user"}},
+      "back":{"reverse_nested":{"ops":{"titles":{"field_facet":{"field":"title_s"}}}}}
+    }}}}}}}})", req->mr));
+  req->execute(1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  auto* q = req->responses[0]->proto.ops.at("q")->docList();
+  EXPECT_EQ(3, q->found);
+  auto* nested = q->ops.at("n")->docList();
+  ASSERT_NE(nullptr, nested);
+  EXPECT_EQ(3, nested->found); // child documents under the matched roots
+  auto* users = nested->ops.at("users")->facetResult();
+  ASSERT_NE(nullptr, users);
+  // x appears twice, y once.
+  EXPECT_EQ(2u, users->counts.size());
+  auto* back = nested->ops.at("back")->docList();
+  EXPECT_EQ(2, back->found); // roots with at least one child
+}
+
+TEST_F(NestedTest, nestedSortByChildField) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  ASSERT_TRUE(update(helper, R"("docs":[
+    {"id":"a","answers":[{"score":5},{"score":1}]},
+    {"id":"b","answers":[{"score":3}]},
+    {"id":"c"}
+  ])").success);
+  auto ids = [&](std::string_view sort) {
+    auto req = search("\"query\":{\"all\":true},\"fields\":[\"id\"],\"sort\":[" + std::string(sort) + "]");
+    std::vector<std::string> out;
+    for (const auto& doc : req->docList()->docs) out.emplace_back(doc.fields.at("id")->asString());
+    return out;
+  };
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "c"}),
+            ids(R"({"expr":"answers.score","dir":"asc","nested":{"path":"answers","mode":"min"}})")); // 1, 3, missing
+  EXPECT_EQ((std::vector<std::string>{"b", "a", "c"}),
+            ids(R"({"expr":"answers.score","dir":"asc","nested":{"path":"answers","mode":"max"}})")); // 3, 5
+}
+
 // A block that fails partway leaves dead children with no root; they must not
 // attach to the next root, and a trailing failed block must be harmless.
 TEST_F(NestedTest, deadChildrenOfFailedBlocksStayInvisible) {
@@ -210,4 +259,33 @@ TEST_F(NestedTest, deadChildrenOfFailedBlocksStayInvisible) {
   ASSERT_EQ(1u, good->docList()->docs.size());
   EXPECT_EQ("good", good->docList()->docs[0].fields.at("id")->asString());
   EXPECT_EQ("d", good->docList()->matches[0].fields.at("h")->docList()->docs[0].fields.at("user")->asString());
+}
+
+TEST_F(NestedTest, aggregationsAndSortIgnoreDeadChildrenOfFailedBlocks) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  ASSERT_EQ(1u, update(helper, R"("docs":[
+    {"id":"bad","answers":[{"user":"b","score":9},{"user":"c","score":"not a number"}]},
+    {"id":"good","answers":[{"user":"d","score":1}]}
+  ])").errors.size());
+  auto req = localReq(luxirNode->getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","ops":{"q":{"top_docs":{"limit":0,"count_limit":-1,"query":{"all":true},"ops":{
+    "n":{"nested":{"path":"answers","ops":{"users":{"field_facet":{"field":"answers.user"}}}}}}}}}})", req->mr));
+  req->execute(1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  auto* nested = req->responses[0]->proto.ops.at("q")->docList()->ops.at("n")->docList();
+  EXPECT_EQ(1, nested->found);
+  auto sorted = search(R"("query":{"all":true},"fields":["id"],"sort":[{"expr":"answers.score","dir":"asc","nested":{"path":"answers","mode":"max"}}])");
+  ASSERT_EQ(1u, sorted->docList()->docs.size());
+  EXPECT_EQ("good", sorted->docList()->docs[0].fields.at("id")->asString());
+}
+
+TEST_F(NestedTest, nestedOpCannotNest) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  auto req = localReq(luxirNode->getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","ops":{"q":{"top_docs":{"limit":0,"query":{"all":true},"ops":{
+    "a":{"nested":{"path":"answers","ops":{"b":{"nested":{"path":"answers"}}}}}}}}}})", req->mr));
+  req->execute(1);
+  EXPECT_FALSE(req->ok());
 }

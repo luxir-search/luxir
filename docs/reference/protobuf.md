@@ -157,7 +157,9 @@ defaults and constraints are described in the comments and guides.
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
+- [`NestedOp`](#message-luxir.nestedop)
 - [`NestedQuery`](#message-luxir.nestedquery)
+- [`NestedSort`](#message-luxir.nestedsort)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
@@ -188,6 +190,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
+- [`ReverseNestedOp`](#message-luxir.reversenestedop)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
@@ -1703,6 +1706,19 @@ Multi-valued vector column. Empty ArrVector means "doc does not have the field";
 |---|---|---|---|---|
 | <a id="field-luxir.multivector.v"></a>[`v`](#field-luxir.multivector.v) | 1 | [`ArrVector`](#message-luxir.arrvector) | repeated |  |
 
+<a id="message-luxir.nestedop"></a>
+
+### luxir.NestedOp
+
+Runs ops over the child documents of a nested path that belong to the incoming root documents. Result: a DocList with found and ops.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.nestedop.path"></a>[`path`](#field-luxir.nestedop.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.nestedop.ops"></a>[`ops`](#field-luxir.nestedop.ops) | 2 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map |  |
+
 <a id="message-luxir.nestedquery"></a>
 
 ### luxir.NestedQuery
@@ -1718,6 +1734,19 @@ Evaluates query and filter against the child objects of one nested path; a root 
 | <a id="field-luxir.nestedquery.filter"></a>[`filter`](#field-luxir.nestedquery.filter) | 3 | [`Query`](#message-luxir.query) | repeated |  |
 | <a id="field-luxir.nestedquery.score_mode"></a>[`score_mode`](#field-luxir.nestedquery.score_mode) | 4 | `string` | singular |  |
 | <a id="field-luxir.nestedquery.inner_hits"></a>[`inner_hits`](#field-luxir.nestedquery.inner_hits) | 5 | [`InnerHits`](#message-luxir.innerhits) | singular |  |
+
+<a id="message-luxir.nestedsort"></a>
+
+### luxir.NestedSort
+
+mode: min (default for asc), max (default for desc), sum or avg (integer fields only).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.nestedsort.path"></a>[`path`](#field-luxir.nestedsort.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.nestedsort.mode"></a>[`mode`](#field-luxir.nestedsort.mode) | 2 | `string` | singular |  |
 
 <a id="message-luxir.networkinterfacestats"></a>
 
@@ -2219,6 +2248,18 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
+<a id="message-luxir.reversenestedop"></a>
+
+### luxir.ReverseNestedOp
+
+Runs ops over the root documents of the incoming (nested) domain.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.reversenestedop.ops"></a>[`ops`](#field-luxir.reversenestedop.ops) | 1 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map |  |
+
 <a id="message-luxir.rrffusion"></a>
 
 ### luxir.RrfFusion
@@ -2309,6 +2350,8 @@ A named search operation. The name is its key in the enclosing ops map.
 | <a id="field-luxir.searchop.query_facet"></a>[`query_facet`](#field-luxir.searchop.query_facet) | 10 | [`QueryFacet`](#message-luxir.queryfacet) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.expr_op"></a>[`expr_op`](#field-luxir.searchop.expr_op) | 15 | [`ExprOp`](#message-luxir.exprop) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.plugin"></a>[`plugin`](#field-luxir.searchop.plugin) | 16 | [`PluginOp`](#message-luxir.pluginop) | oneof [`kind`](#oneof-luxir.searchop.kind) | an operation registered by a compiled-in plugin |
+| <a id="field-luxir.searchop.nested"></a>[`nested`](#field-luxir.searchop.nested) | 30 | [`NestedOp`](#message-luxir.nestedop) | oneof [`kind`](#oneof-luxir.searchop.kind) | sub-operations over a nested path's child documents |
+| <a id="field-luxir.searchop.reverse_nested"></a>[`reverse_nested`](#field-luxir.searchop.reverse_nested) | 31 | [`ReverseNestedOp`](#message-luxir.reversenestedop) | oneof [`kind`](#oneof-luxir.searchop.kind) | sub-operations over the root documents of a nested domain |
 | <a id="field-luxir.searchop.domain"></a>[`domain`](#field-luxir.searchop.domain) | 20 | [`Domain`](#message-luxir.domain) | singular | optional override of the incoming document domain |
 | <a id="field-luxir.searchop.flags"></a>[`flags`](#field-luxir.searchop.flags) | 21 | `uint64` | singular | Overrides the parent's packed options, including for this op's domain, queries and facet literals. Subops inherit this op's effective options. JSON uses the same lowercase flags name array as SearchRequest. |
 | <a id="field-luxir.searchop.flags_set"></a>[`flags_set`](#field-luxir.searchop.flags_set) | 22 | `uint64` | singular | Override mask. int64\_str is request-only: bit 2 is rejected in both flags and flags\_set, including an attempted clear. Other validation is the same as SearchRequest.flags\_set. Naming date\_native in JSON explicitly replaces an inherited date mode. |
@@ -2465,6 +2508,7 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 | <a id="field-luxir.sortspec.expr"></a>[`expr`](#field-luxir.sortspec.expr) | 1 | `string` | singular |  |
 | <a id="field-luxir.sortspec.vars"></a>[`vars`](#field-luxir.sortspec.vars) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.sortspec.dir"></a>[`dir`](#field-luxir.sortspec.dir) | 10 | [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir) | singular |  |
+| <a id="field-luxir.sortspec.nested"></a>[`nested`](#field-luxir.sortspec.nested) | 30 | [`NestedSort`](#message-luxir.nestedsort) | singular | Sort root documents by a child field of a nested path. expr names the field ("&lt;path&gt;.&lt;field&gt;") and must be single-valued numeric or date. |
 
 <a id="message-luxir.statsrequest"></a>
 

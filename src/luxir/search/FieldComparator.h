@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/NestedBlocks.h"
 
 #include "luxir/search/Collector.h"
 #include "luxir/search/IndexReader.h"
@@ -375,6 +376,75 @@ public:
 
 // A comparator that can be used in a simplified collector that has values
 // that can be compared across different segments.
+// Sorts root documents by a numeric child field of a nested path, aggregating
+// each root's children. Values come from the encoded column; min/max keep the
+// encoded order, so they hold for float and double as well as integer columns.
+class NestedNumericComparator final : public FieldComparator {
+  bool reversed;
+  std::string path;
+  enum class Mode { MIN, MAX, SUM, AVG } mode;
+  std::vector<int64_t> slots;
+  std::vector<int64_t> docKeys;  // current segment: per doc, encoded key
+  static constexpr int64_t MISSING = std::numeric_limits<int64_t>::max();
+
+  // Reversed for desc so ascending compares always sort best first; missing sorts last.
+  int64_t key(int64_t value) const { return reversed ? ~value : value; }
+
+public:
+  NestedNumericComparator(bool reversed, IndexReader::FieldSegments fields, std::string_view path, std::string_view modeName)
+      : FieldComparator(fields), reversed(reversed), path(path),
+        mode(modeName == "max" ? Mode::MAX : modeName == "sum" ? Mode::SUM : modeName == "avg" ? Mode::AVG : Mode::MIN) {}
+
+  void setSegment(const IndexReader::Segment& segment) override {
+    docKeys.assign((size_t)segment.maxDoc(), MISSING);
+    auto blocks = const_cast<IndexReader::Segment&>(segment).postingsReader().nestedBlocks();
+    const auto* info = fields.at(segment);
+    if (!blocks || !info) return;
+    auto found = blocks->paths.find(path);
+    if (found == blocks->paths.end()) return;
+    std::vector<int32_t> children;
+    auto& bits = found->second;
+    auto* live = segment.liveDocSet();
+    for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) {
+      if (!live || live->get(doc)) children.push_back(doc); // dead children may precede a later block
+    }
+    std::vector<int64_t> sums(segment.maxDoc());
+    std::vector<int32_t> counts(segment.maxDoc());
+    auto guard = MemPool::threadLocalPoolGuard();
+    IntColReader::getSingleValues(guard.pool(), const_cast<IndexReader::Segment&>(segment).postingsReader(), *info,
+      std::span<const int32_t>(children), [&](size_t, int32_t doc, int64_t value) {
+        int32_t root = blocks->rootOf(doc);
+        int64_t& best = docKeys[(size_t)root];
+        if (counts[(size_t)root]++ == 0) best = value;
+        else if (mode == Mode::MIN) best = std::min(best, value);
+        else if (mode == Mode::MAX) best = std::max(best, value);
+        sums[(size_t)root] += value;
+      });
+    for (size_t root = 0; root < docKeys.size(); root++) {
+      if (counts[root] == 0) continue;
+      int64_t value = docKeys[root];
+      if (mode == Mode::SUM) value = sums[root];
+      if (mode == Mode::AVG) value = sums[root] / counts[root];
+      docKeys[root] = key(value);
+    }
+  }
+  void growSlots(int32_t capacity) override { slots.resize((size_t)capacity); }
+  void copy(int32_t slot, segdoc doc) override { slots[(size_t)slot] = docKeys[(size_t)doc.docId()]; }
+  void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc) override {
+    slots[(size_t)slot] = static_cast<NestedNumericComparator&>(other).slots[(size_t)otherSlot];
+  }
+  int compareBottom(int32_t bottomSlot, segdoc, segdoc newDoc) override {
+    return cmp(slots[(size_t)bottomSlot], docKeys[(size_t)newDoc.docId()]);
+  }
+  int compare(int32_t a, segdoc, int32_t b, segdoc) override { return cmp(slots[(size_t)a], slots[(size_t)b]); }
+  int compare(int32_t a, segdoc, FieldComparator& other, int32_t b, segdoc) override {
+    return cmp(slots[(size_t)a], static_cast<NestedNumericComparator&>(other).slots[(size_t)b]);
+  }
+
+private:
+  static int cmp(int64_t a, int64_t b) { return a < b ? -1 : a > b ? 1 : 0; }
+};
+
 class SimpleNumericFieldComparator : public FieldComparator,
                                      public FieldComparator::KeyBatch {
   // IntColBM break-even: decodeFrame wins at eight gathered values per frame.

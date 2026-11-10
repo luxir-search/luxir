@@ -93,6 +93,8 @@ message SearchOp {
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
     PluginOp plugin = 16;           // an operation registered by a compiled-in plugin
+    NestedOp nested = 30;           // sub-operations over a nested path's child documents
+    ReverseNestedOp reverse_nested = 31; // sub-operations over the root documents of a nested domain
   }
   Domain domain = 20; // optional override of the incoming document domain
   // Overrides the parent's packed options, including for this op's domain,
@@ -117,6 +119,18 @@ message PluginOp {
   string name = 1;
   map<string, Val> params = 2;
   map<string, SearchOp> ops = 3;
+}
+
+// Runs ops over the child documents of a nested path that belong to the
+// incoming root documents. Result: a DocList with found and ops.
+message NestedOp {
+  string path = 1;
+  map<string, SearchOp> ops = 2;
+}
+
+// Runs ops over the root documents of the incoming (nested) domain.
+message ReverseNestedOp {
+  map<string, SearchOp> ops = 1;
 }
 
 // An expression aggregate over the operation's incoming document domain.
@@ -311,6 +325,13 @@ message LinearFusion {
   Normalization normalization = 1;  // unset selects MIN_MAX
 }
 
+// mode: min (default for asc), max (default for desc), sum or avg
+// (integer fields only).
+message NestedSort {
+  string path = 1;
+  string mode = 2;
+}
+
 message SortSpec {
   string expr = 1;
   map<string, Val> vars = 2;
@@ -321,6 +342,10 @@ message SortSpec {
     DESC = 2;
   }
   SortDir dir = 10;
+
+  // Sort root documents by a child field of a nested path. expr names the
+  // field ("<path>.<field>") and must be single-valued numeric or date.
+  NestedSort nested = 30;
 }
 
 message Query {

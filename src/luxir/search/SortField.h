@@ -37,6 +37,8 @@ private:
     FieldComparator::MissingValue missingValue;
     const FieldType* fieldType;
     StringSortMode stringSortMode;
+    std::string nestedPath; // non-empty: sort by aggregating this nested path's children
+    std::string nestedMode;
     inline static std::atomic<StringSortMode> stringSortModeOverride =
         StringSortMode::DEFAULT;
     
@@ -100,8 +102,19 @@ public:
         return stringSortModeOverride.exchange(value);
     }
     
+    bool isNested() const { return !nestedPath.empty(); }
+
+    void setNested(std::string_view path, std::string_view mode) {
+        nestedPath = std::string(path);
+        nestedMode = std::string(mode);
+    }
+
     std::unique_ptr<FieldComparator> createComparator(
         IndexReader& reader) const {
+        if (!nestedPath.empty()) {
+            return std::make_unique<NestedNumericComparator>(
+                isReversed(), reader.field(fieldName), nestedPath, nestedMode);
+        }
         auto fields = reader.field(fieldName);
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
