@@ -241,7 +241,7 @@ private:
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
 
   static bool numericQueryable(FieldType& ft) {
-    return FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
+    return ft.supports(FieldType::MATCH) && FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
   }
 
   FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {
@@ -254,7 +254,17 @@ private:
     }
   }
 
+  void requireCapability(const FieldType& type, uint32_t capability, std::string_view operation,
+                         std::string_view field, size_t pos) {
+    try {
+      type.requireCapability(capability, operation, field);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
+    }
+  }
+
   void requireValueQueryable(std::string_view field, FieldType& ft, size_t pos) {
+    requireCapability(ft, FieldType::MATCH, "query", field, pos);
     if (!termQueryable(ft) && !numericQueryable(ft)) {
       fail(pos, fmt::format(
           "field '{}' does not support term, phrase, or range syntax", field));
@@ -970,9 +980,7 @@ private:
         }
         maxEdits = v;
       }
-      if (!termQueryable(ft)) {
-        fail(t.pos, fmt::format("fuzzy ('~') does not apply to numeric field '{}'", field));
-      }
+      requireCapability(ft, FieldType::FUZZY, "Fuzzy query", field, t.pos);
       api::FuzzyQuery fq;
       fq.field = field;
       fq.term = base;
@@ -996,9 +1004,7 @@ private:
 
     // prefix: an unescaped trailing '*' (mid-token '*' is a literal byte)
     if (t.trailingStar) {
-      if (!termQueryable(ft)) {
-        fail(t.pos, fmt::format("prefix ('*') does not apply to numeric field '{}'", field));
-      }
+      requireCapability(ft, FieldType::PREFIX, "Prefix query", field, t.pos);
       api::PrefixQuery p;
       p.field = field;
       p.prefix = text.substr(0, text.size() - 1);

@@ -462,8 +462,8 @@ TEST_F(ExprParserTest, decorationErrors) {
   expectContains(parseErr("title:dune~3"), "exceeds the maximum of 2");
   // old Lucene float similarity: a teaching error, not a silent literal
   expectContains(parseErr("title:roam~0.8"), "whole number of edits");
-  expectContains(parseErr("count:10~1"), "does not apply to numeric field");
-  expectContains(parseErr("count:10*"), "does not apply to numeric field");
+  expectContains(parseErr("count:10~1"), "Fuzzy query is not supported on int field");
+  expectContains(parseErr("count:10*"), "Prefix query is not supported on int field");
   expectContains(parseErr("title:ab*~1"), "cannot combine '*' and '~'");
 }
 

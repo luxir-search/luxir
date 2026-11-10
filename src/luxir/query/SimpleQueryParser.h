@@ -156,14 +156,9 @@ public:
   // fields are targetable too but only for exact match - see numericQueryable.
   // Everything else degrades to text.
   static bool termQueryable(FieldType& fieldType) {
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT:
-      case FieldType::Type::STRING:
-      case FieldType::Type::ID:
-        return fieldType.indexed();
-      default:
-        return false;
-    }
+    auto storage = FieldType::storage(fieldType.type());
+    return fieldType.supports(FieldType::MATCH) && fieldType.indexed()
+        && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT);
   }
 
   SimpleQueryParser(const SimpleQueryOptions& opts, std::pmr::memory_resource& arena)
@@ -183,7 +178,8 @@ public:
         throw std::runtime_error(fmt::format(
             "simple_query 'fields' entry '{}' is not a queryable text/string/id field: {}", f, e.what()));
       }
-      if (!termQueryable(*target->fieldType)) {
+      target->fieldType->requireCapability(FieldType::FREE_TEXT, "simple_query fields", f);
+      if (!target->fieldType->indexed()) {
         throw std::runtime_error(fmt::format(
             "simple_query 'fields' entry '{}' is not a queryable text/string/id field", f));
       }
@@ -430,7 +426,8 @@ private:
   // degrade to text.  Requires column storage - the match scan reads the column,
   // so a numeric field without it is not targetable and degrades to text.
   static bool numericQueryable(FieldType& fieldType) {
-    return FieldType::isNumericColumn(fieldType.type()) && fieldType.hasColumn();
+    return fieldType.supports(FieldType::MATCH) && FieldType::isNumericColumn(fieldType.type())
+        && fieldType.hasColumn();
   }
 
   static bool existsQueryable(FieldType& fieldType) {

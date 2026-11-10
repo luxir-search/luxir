@@ -1161,7 +1161,7 @@ TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults
     expectParseError(memory, *schema, expression, "integer in [0, 40000]");
   }
   expectParseError(memory, *schema, "cardinality(x_sc)", "indexed STRING or ID");
-  expectParseError(memory, *schema, "cardinality(x_t)", "TEXT");
+  expectParseError(memory, *schema, "cardinality(x_t)", "value expression is not supported on text field");
   expectParseError(memory, *schema, "cardinality(x_i, x_i)", "numeric constants");
   expectParseError(memory, *schema, "percentile_rank(x_is, 1)", "one scalar per document");
   expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");
