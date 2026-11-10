@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,6 +29,7 @@
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/FilterCache.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -1583,12 +1585,22 @@ static void BM_SkipEffectiveness(benchmark::State& state,
 // (in about 80% of docs) as the stopword. The AND ladder uses denser terms so
 // later rungs still match; its last rung matches fewer docs than k=1000.
 //
-// countLimit: 0 omits the total (pruning on), N > 0 bounds it at N (pruning
-// opens once N hits are counted), -1 counts exactly. Every case first checks
-// that its ranked scores equal the exact-count run's. found_gte=0 under a
-// bound means the engine produced the exact total anyway.
+// countLimit: 0 omits the total (pruning on), -1 asks for an exact total, and
+// N > 0 asks for a total that is exact below N. None of these is an unpruned
+// ranking: an exact total is counted apart from a ranking pass that still
+// prunes, and a bound that metadata already proves (any clause with N docs in
+// an OR) never holds pruning back. So every case is checked against an
+// exhaustive scorer walk, not against another request.
+//
+// A repeated query with a total gets it from a whole-query filter cache entry
+// once one is resident, at about the cost of no total. LadderCache::Off times
+// the count itself; Resident times the steady state of a repeated query.
+//
+// Unit-test scale is smoke coverage of these paths: the corpus is too small
+// for pruning to skip much. The full-size run is the pruning check.
 //
 enum class LadderOp { Or, And };
+enum class LadderCache { Default, Off, Resident };
 
 constexpr std::array<std::string_view, 7> kOrLadder =
     {"t200", "t50", "t2000", "t20", "t5000", "t0", "t5"};
@@ -1596,9 +1608,10 @@ constexpr std::array<std::string_view, 6> kAndLadder =
     {"t10", "t0", "t3", "t30", "t1", "t100"};
 
 struct LadderResult {
-  int64_t found = 0;
+  bool ok = false;
+  std::optional<int64_t> found;
   bool foundGte = false;
-  std::vector<float> scores;
+  std::vector<float> scores;  // every batch, in rank order
 };
 
 static LadderResult runTermLadder(const std::string& text, LadderOp op, int32_t topK,
@@ -1613,28 +1626,84 @@ static LadderResult runTermLadder(const std::string& text, LadderOp op, int32_t 
     topDocs.countLimit(countLimit);
   }
   req->execute(false);
-  EXPECT_TRUE(req->ok()) << req->errorMsg();
 
   LadderResult out;
-  const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
-  out.found = docs->found.value_or(0);
-  out.foundGte = docs->found_gte;
-  if (docs->row_count > 0) {
-    const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind);
-    out.scores.assign(scores.v.begin(), scores.v.end());
+  if (!req->ok()) {
+    ADD_FAILURE() << text << ": " << req->errorMsg();
+    return out;
   }
+  // The list streams in batches; the total rides on the first one.
+  for (auto* response : req->responses) {
+    if (response->proto.error) {
+      ADD_FAILURE() << text << ": error in a later batch";
+      return out;
+    }
+    const auto* docs = response->proto.ops.at("q")->docList();
+    if (docs->found) {
+      out.found = docs->found;
+      out.foundGte = docs->found_gte;
+    }
+    if (docs->row_count > 0) {
+      const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind);
+      out.scores.insert(out.scores.end(), scores.v.begin(), scores.v.end());
+    }
+  }
+  out.ok = true;
   return out;
 }
 
-static void BM_TermLadder(benchmark::State& state, int64_t nDocs, std::string_view shape,
-                          LadderOp op, int32_t rungs, int32_t topK, int64_t countLimit) {
-  int mergeFactor = 10;
-  if (luxir::unit_tests) {
-    nDocs = LuxirTest::scaleTestWork(200);
+// The reference ranking: every match scored, no competitive threshold, so
+// nothing can prune.
+static ScoreTopKResult exhaustiveTermLadder(IndexReader& reader,
+                                            std::span<const std::string_view> terms,
+                                            LadderOp op, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<TermQuery> queries;
+  queries.reserve(terms.size());
+  for (auto term : terms) {
+    queries.emplace_back("body_w", term);
+  }
+  std::vector<Query*> clauses;
+  clauses.reserve(terms.size());
+  for (auto& q : queries) clauses.push_back(&q);
+  BooleanQuery query = op == LadderOp::Or ? BooleanQuery({}, clauses, {}, {})
+                                          : BooleanQuery(clauses, {}, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      collector.collect(segnum, doc, scorer->score());
+    }
   }
 
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  return result;
+}
+
+static void BM_TermLadder(benchmark::State& state, int64_t nDocs, std::string_view shape,
+                          LadderOp op, int32_t rungs, int32_t topK, int64_t countLimit,
+                          LadderCache cacheMode = LadderCache::Default) {
+  int mergeFactor = 10;
   std::vector<int32_t> docsPerSeg;
-  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+  if (luxir::unit_tests) {
+    // One segment, so the dense terms span several postings blocks.
+    nDocs = LuxirTest::scaleTestWork(2'000);
+    docsPerSeg = {(int32_t) nDocs};
+    if (countLimit > 0) countLimit = 100;
+  } else {
+    CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+  }
   CollectionHelper helper;
   bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
   if (!reuseIndex) {
@@ -1645,34 +1714,64 @@ static void BM_TermLadder(benchmark::State& state, int64_t nDocs, std::string_vi
       ? std::span<const std::string_view>(kOrLadder)
       : std::span<const std::string_view>(kAndLadder);
   ASSERT_LE((size_t) rungs, ladder.size());
+  ladder = ladder.first((size_t) rungs);
   std::string text;
-  for (int32_t i = 0; i < rungs; i++) {
-    if (i) text.push_back(' ');
-    text.append(ladder[i]);
+  for (auto term : ladder) {
+    if (!text.empty()) text.push_back(' ');
+    text.append(term);
   }
 
-  // Rank safety: the pruned or bounded run must rank the same scores as the
-  // exhaustive one. Summation order may differ across paths, so compare with
-  // a relative tolerance per rank rather than bit-for-bit.
-  LadderResult exact = runTermLadder(text, op, topK, -1);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  FilterCache* cache = reader->filterCache();
+  size_t cacheBytes = cache != nullptr ? cache->configuration().maxBytes : 0;
+  auto restoreCache = scope_guard([&]() {
+    if (cache != nullptr && cacheMode == LadderCache::Off) cache->resize(cacheBytes);
+  });
+  if (cache != nullptr && cacheMode == LadderCache::Off) {
+    cache->resize(0);
+  }
+  if (cacheMode == LadderCache::Resident) {
+    // The cache admits a whole-query entry on a repeat sighting.
+    for (int i = 0; i < 3; i++) {
+      runTermLadder(text, op, topK, -1);
+    }
+  }
+
+  // Rank safety and count semantics, checked once outside timing. Scores are
+  // compared rank by rank over the whole list: summation order differs across
+  // paths, and a dropped doc shifts every later rank.
+  ScoreTopKResult exact = exhaustiveTermLadder(*reader, ladder, op, topK);
   LadderResult measured = runTermLadder(text, op, topK, countLimit);
-  ASSERT_EQ(exact.scores.size(), measured.scores.size()) << text;
-  for (size_t i = 0; i < exact.scores.size(); i++) {
-    ASSERT_NEAR(exact.scores[i], measured.scores[i], std::abs(exact.scores[i]) * 1e-5f)
+  ASSERT_TRUE(measured.ok);
+  ASSERT_EQ(exact.topDocs.size(), measured.scores.size()) << text;
+  for (size_t i = 0; i < exact.topDocs.size(); i++) {
+    float expected = exact.topDocs[i].score;
+    ASSERT_NEAR(expected, measured.scores[i], std::abs(expected) * 1e-5f)
         << text << " rank " << i;
   }
+  ASSERT_EQ(countLimit != 0, measured.found.has_value()) << text;
+  if (measured.foundGte) {
+    ASSERT_GT(countLimit, 0) << text;
+    ASSERT_EQ(countLimit, *measured.found) << text;
+    ASSERT_GE(exact.visited, countLimit) << text;
+  } else if (measured.found) {
+    ASSERT_EQ(exact.visited, *measured.found) << text;
+  }
 
+  size_t rows = measured.scores.size();
+  bool sameRows = true;
   for (auto _ : state) {
     LadderResult result = runTermLadder(text, op, topK, countLimit);
-    benchmark::DoNotOptimize(result.found);
-    ASSERT_EQ(measured.scores.size(), result.scores.size());
+    sameRows &= result.scores.size() == rows;
+    benchmark::DoNotOptimize(result.scores.data());
   }
+  ASSERT_TRUE(sameRows) << text;
 
   state.counters["terms"] = rungs;
   state.counters["k"] = topK;
   state.counters["count_limit"] = (double) countLimit;
-  state.counters["matches"] = (double) exact.found;
-  state.counters["found"] = (double) measured.found;
+  state.counters["matches"] = (double) exact.visited;
+  state.counters["found"] = (double) measured.found.value_or(-1);  // -1: omitted
   state.counters["found_gte"] = measured.foundGte ? 1 : 0;
   state.counters["reused"] = reuseIndex;
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
@@ -2052,8 +2151,8 @@ LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k1000,
                         SkipQueryClass::TwoTermRare, 1000, true);
 
 // Term-count ladder: OR and AND, rungs 1..N, at k=10 and k=1000, with the
-// total omitted. Read latency per rung against matches; a rung faster than
-// its prefix is the expected MaxScore behavior, not noise.
+// total omitted. Read latency per rung against matches; a rung can be faster
+// than its prefix. k=1000 also fetches and emits 1000 ids.
 #define LUXIR_TERM_LADDER(op, name, rungs)                                         \
   LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_k10, nDocs, shape,       \
                           LadderOp::op, rungs, 10, 0);                             \
@@ -2073,15 +2172,20 @@ LUXIR_TERM_LADDER(And, conj, 5);
 LUXIR_TERM_LADDER(And, conj, 6);
 #undef LUXIR_TERM_LADDER
 
-// Cost of the total on a long ladder query: omitted vs bounded at 10,000 vs
-// exact. An exact count may force exhaustive evaluation; a bounded one can
-// prune once 10,000 hits are counted.
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_none,  nDocs, shape, LadderOp::Or, 6, 10, 0);
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_10k,   nDocs, shape, LadderOp::Or, 6, 10, 10'000);
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, disj_6_count_exact, nDocs, shape, LadderOp::Or, 6, 10, -1);
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_none,  nDocs, shape, LadderOp::And, 3, 10, 0);
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_10k,   nDocs, shape, LadderOp::And, 3, 10, 10'000);
-LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, conj_3_count_exact, nDocs, shape, LadderOp::And, 3, 10, -1);
+// Cost of the total on a long OR and a three-term AND, at k=10, against the
+// _k10 rung of the same query (total omitted). bounded and exact run with the
+// filter cache off, so the count is computed each time; exact_cached is the
+// same request once its whole-query entry is resident.
+#define LUXIR_TERM_LADDER_COUNT(op, name, rungs)                                      \
+  LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_count_10k, nDocs, shape,    \
+                          LadderOp::op, rungs, 10, 10'000, LadderCache::Off);         \
+  LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_count_exact, nDocs, shape,  \
+                          LadderOp::op, rungs, 10, -1, LadderCache::Off);             \
+  LUXIR_BENCHMARK_CAPTURE(BM_TermLadder, name##_##rungs##_count_exact_cached, nDocs,  \
+                          shape, LadderOp::op, rungs, 10, -1, LadderCache::Resident)
+LUXIR_TERM_LADDER_COUNT(Or, disj, 6);
+LUXIR_TERM_LADDER_COUNT(And, conj, 3);
+#undef LUXIR_TERM_LADDER_COUNT
 
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.
