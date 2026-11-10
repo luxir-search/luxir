@@ -8,6 +8,7 @@
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/impl/io.h>
+#include <faiss/impl/RaBitQUtils.h>
 #include <faiss/index_io.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <faiss/utils/distances.h>
@@ -219,6 +220,13 @@ struct VectorAuxListsFooter {
 
 static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 4 * sizeof(int32_t),
               "VectorAuxListsFooter layout is an on-disk contract");
+
+// Relative to the factors following the sign bytes. The derived FAISS type
+// is not standard-layout, so offsetof(SignBitFactorsWithError, f_error) is
+// not portable. Its packed base and trailing float define the wire layout.
+inline constexpr size_t RABITQ_F_ERROR_OFFSET = sizeof(faiss::rabitq_utils::SignBitFactors);
+static_assert(RABITQ_F_ERROR_OFFSET == 2 * sizeof(float));
+static_assert(sizeof(faiss::rabitq_utils::SignBitFactorsWithError) == RABITQ_F_ERROR_OFFSET + sizeof(float));
 
 struct RaBitQAmplitudes {
   const float* values = nullptr;

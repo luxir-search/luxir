@@ -80,7 +80,7 @@ public:
   static int64_t ivfBuildMinRowsPerTask;
 
   // Completes a RaBitQ code FAISS encoded for x against its list centroid:
-  // corrects the sign-bit factors of near-centroid vectors, and returns the
+  // writes the sign-bit factors for every vector, and returns the
   // amplitude stored beside the code. x and centroid are in the rotated space.
   static float finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
                                 int32_t dims, int32_t bits, faiss::MetricType metric);

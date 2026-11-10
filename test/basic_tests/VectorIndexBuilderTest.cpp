@@ -1419,7 +1419,41 @@ TEST_F(VectorIndexBuilderTest, nearCentroidRaBitQEstimatesTrackTrueDistance) {
         faiss::RaBitQuantizer quantizer((size_t)dims, metric, (size_t)bits);
         std::vector<uint8_t> code(quantizer.code_size);
         quantizer.compute_codes_core(x.data(), code.data(), 1, centroid.data());
-        VectorIndexBuilder::finishRaBitQCode(x.data(), centroid.data(), code.data(), dims, bits, metric);
+        float amplitude = VectorIndexBuilder::finishRaBitQCode(x.data(), centroid.data(), code.data(), dims, bits, metric);
+        double norm2 = 0, absSum = 0;
+        for (int32_t i = 0; i < dims; i++) {
+          double r = (double)x[i] - centroid[i];
+          norm2 += r * r;
+          absSum += std::abs(r);
+        }
+        double factor = metric == faiss::METRIC_L2 ? 2 : 1;
+        double sigma1 = factor * std::sqrt(std::max(0.0, norm2 * (norm2 * dims / (absSum * absSum) - 1)) / (dims - 1));
+        if (bits == 1) EXPECT_NEAR(amplitude, sigma1, sigma1 * 1e-5);
+        else {
+          // Recover each residual coordinate through FAISS's full-bit dot
+          // kernel. Remove its additive term to avoid centroid cancellation.
+          using namespace faiss::rabitq_utils;
+          const uint8_t* extra = code.data() + (dims + 7) / 8 + sizeof(SignBitFactorsWithError);
+          ExtraBitsFactors full;
+          std::memcpy(&full, code.data() + code.size() - sizeof(full), sizeof(full));
+          full.f_add_ex = 0;
+          if (metric == faiss::METRIC_L2) full.f_rescale_ex *= -0.5f;
+          std::array<float, dims> basis{};
+          double error2 = 0;
+          for (int32_t i = 0; i < dims; i++) {
+            basis[i] = 1;
+            double reconstructed = compute_full_multibit_distance(code.data(), extra, full,
+                basis.data(), 0, dims, bits - 1, faiss::METRIC_INNER_PRODUCT);
+            basis[i] = 0;
+            double error = reconstructed - ((double)x[i] - centroid[i]);
+            error2 += error * error;
+          }
+          double expectedAmplitude = factor * std::sqrt(error2 / (dims - 1));
+          EXPECT_NEAR(amplitude, expectedAmplitude, expectedAmplitude * 1e-5);
+          float fError;
+          std::memcpy(&fError, code.data() + (dims + 7) / 8 + RABITQ_F_ERROR_OFFSET, sizeof(fError));
+          EXPECT_NEAR(fError, sigma1 * 1.9, sigma1 * 2e-5);
+        }
         std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
             quantizer.get_distance_computer(4, centroid.data()));
         computer->set_query(query.data());
@@ -1433,6 +1467,20 @@ TEST_F(VectorIndexBuilderTest, nearCentroidRaBitQEstimatesTrackTrueDistance) {
         if (bits > 1) {
           EXPECT_NEAR(rabitq->distance_to_code_full(code.data()), truth, bound);
         }
+        // The broad distance bound also admits a zero multiplier. Align q-c
+        // with the actual residual and isolate the directional contribution
+        // from the same code's centroid-only estimate. Allow query quantization
+        // error and float cancellation, but require the residual response.
+        auto centroidOnly = code;
+        float zero = 0;
+        std::memcpy(centroidOnly.data() + (dims + 7) / 8
+            + offsetof(faiss::rabitq_utils::SignBitFactors, dp_multiplier), &zero, sizeof(zero));
+        std::vector<float> aligned(dims);
+        for (int32_t i = 0; i < dims; i++) aligned[i] = centroid[i] + (float)(((double)x[i] - centroid[i]) / std::sqrt(norm2));
+        computer->set_query(aligned.data());
+        double response = rabitq->distance_to_code_1bit(code.data()) - rabitq->distance_to_code_1bit(centroidOnly.data());
+        double expected = (metric == faiss::METRIC_L2 ? -2 : 1) * std::sqrt(norm2);
+        EXPECT_NEAR(response, expected, std::abs(expected) * 0.1 + 1e-6);
       }
     }
   }
@@ -1480,8 +1528,9 @@ TEST_F(VectorIndexBuilderTest, nearCentroidCodesKeepFullScanRecall) {
     int32_t hits = 0, total = 0;
     for (int32_t q = 0; q < 20; q++) {
       auto query = next();
-      auto approx = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, nlist, 0));
-      auto exact = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, nlist, 0, true));
+      int32_t fullProbe = defaultIvfNList((int64_t)rows * copies);
+      auto approx = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, fullProbe, 0));
+      auto exact = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, fullProbe, 0, true));
       total += (int32_t)exact.size();
       for (const auto& row : exact) hits += approx.count(row) ? 1 : 0;
     }

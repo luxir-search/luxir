@@ -301,14 +301,20 @@ TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
               aux[seg]->getRotation()->apply(x.data(), rotated.data());
               EXPECT_TRUE(std::isfinite(span[row]));
               EXPECT_GE(span[row], 0);
+              const uint8_t* code = codes.get() + row * ivf->code_size;
               if (bits == 1) {
-                auto factors = faiss::rabitq_utils::compute_vector_factors(
-                    rotated.data(), (size_t)dims, centroid.data(), ivf->metric_type, true);
-                EXPECT_NEAR(span[row], factors.f_error / 1.9f, 0.0001f);
+                ivf->rabitq.decode_core(code, x.data(), 1, nullptr);
+                double error2 = 0;
+                for (int32_t j = 0; j < dims; j++) {
+                  double error = x[j] - ((double)rotated[j] - centroid[j]);
+                  error2 += error * error;
+                }
+                double expected = std::sqrt(error2 / std::max(1, dims - 1))
+                    * (metric == api::VectorMetric::L2 ? 2 : 1);
+                EXPECT_NEAR(span[row], expected, 0.00001);
               } else {
                 // decode() only decodes sign bits. Recover the full reconstruction
                 // from FAISS's distance kernel, without unpacking any code bits.
-                const uint8_t* code = codes.get() + row * ivf->code_size;
                 float step = std::max(1.0f, 2 * std::sqrt(faiss::fvec_L2sqr(
                     rotated.data(), centroid.data(), (size_t)dims)));
                 double error2 = 0;

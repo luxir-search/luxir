@@ -2115,7 +2115,7 @@ public:
                 // f_error is beside the sign factors, already touched by the
                 // 1-bit kernel. It includes FAISS's 1.9 and the L2 factor.
                 float fError;
-                std::memcpy(&fError, code + (ivf.d + 7) / 8 + 2 * sizeof(float), sizeof(fError));
+                std::memcpy(&fError, code + (ivf.d + 7) / 8 + RABITQ_F_ERROR_OFFSET, sizeof(fError));
                 double error = fError * gateScale;
                 double optimistic = keepMax ? (double)distance + error : (double)distance - error;
                 bool reject = keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold;
