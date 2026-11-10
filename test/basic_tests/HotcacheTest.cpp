@@ -93,6 +93,13 @@ TEST(HotcacheTest, recordingDirectoryNotesEveryRangeRead) {
   EXPECT_EQ(5u, recorded[0].length);
   EXPECT_EQ(0u, recorded[2].offset);
   EXPECT_EQ(100u, recorded[2].length);
+
+  // A fetch ahead is recorded too, and the RAM file completes it inline.
+  bool fetched = false;
+  input->fetchRanges(std::vector<ByteRange>{{20, 4}}, kNoReadDeadline,
+                     [&](std::exception_ptr error) { fetched = !error; });
+  EXPECT_TRUE(fetched);
+  EXPECT_EQ(4u, recording.recorded()["f"].size());
 }
 
 namespace {

@@ -78,6 +78,10 @@ public:
 
   size_t size() override { return sz_; }
 
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline, FetchDone done) override {
+    fetchResident(ranges, (uint64_t)sz_, done);
+  }
+
   void prefetch(size_t offset, size_t length) override {
     if (offset >= sz_ || length == 0) return;
     static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
