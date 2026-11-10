@@ -52,6 +52,7 @@ public:
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  const std::string& nodeId() const { return config.node.id; }
   Mode getMode() const { return mode; }
   // Null for a missing state or a different concrete state type.
   template <class T>

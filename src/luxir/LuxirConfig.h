@@ -15,6 +15,11 @@ namespace CLI { class App; }
 
 namespace luxir {
 
+struct NodeConfig {
+  std::string id; // empty: derive at LuxirNode construction
+  void validate() const;
+};
+
 struct ServerConfig {
   // Cap on buffered (rendered/serialized) response bytes, per HTTP connection
   // and per gRPC call (an HTTP/2 connection can multiplex several calls, each
@@ -199,7 +204,6 @@ struct ReplicationConfig {
   // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
   int64_t retry_ms = 1000;
   std::string source;
-  std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.
@@ -212,6 +216,7 @@ struct ReplicationConfig {
 };
 
 struct LuxirConfig {
+  NodeConfig node;
   ReplicationConfig replication;
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process

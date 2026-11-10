@@ -11,6 +11,17 @@ The defaults are good for evaluation. Before you keep real data, decide on
 persistence and network isolation. The other settings on this page can stay
 at their defaults until you have a reason to change them.
 
+## Node identity
+
+`--node.id` sets this node's identity. If empty (the default), Luxir derives
+`hostname:port` from the HTTP listener when HTTP is enabled, otherwise from the
+gRPC listener. Without a usable hostname or positive port, it generates a random
+UUID for this node's lifetime. The id is resolved once when the node is constructed.
+Set it explicitly when hostnames and ports do not uniquely identify your nodes.
+
+An id must be 1 to 255 bytes of printable ASCII, contain neither `/` nor `\`, and
+must not be `.` or `..`.
+
 ## Persistent storage
 
 The default backend is in-memory and loses every collection when the process

@@ -9,7 +9,6 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/Uuid.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <glaze/glaze.hpp>
@@ -18,7 +17,6 @@
 #include <thread>
 #include <set>
 #include <ostream>
-#include <unistd.h>
 
 namespace luxir {
 namespace {
@@ -208,15 +206,6 @@ public:
 std::string errorMessage(const std::exception& error) {
   if (auto* system = dynamic_cast<const boost::system::system_error*>(&error)) return system->code().message();
   return error.what();
-}
-// The name the source knows this follower by: host:port of its listener, so a
-// restart resumes the same acknowledgment rows. Without a fixed port, a
-// per-process id.
-std::string defaultFollowerName(const LuxirConfig& config) {
-  int port = config.server.http.enabled ? config.server.http.port : config.server.grpc.port;
-  char host[256] = {};
-  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) return newUuid();
-  return std::string(host) + ":" + std::to_string(port);
 }
 struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
 struct PeerMismatch : std::runtime_error {
@@ -1086,9 +1075,8 @@ void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) {
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
   {
-    const auto& name = impl->node.getConfig().replication.follower_id;
     std::lock_guard lock(impl->mutex);
-    impl->follower = name.empty() ? defaultFollowerName(impl->node.getConfig()) : name;
+    impl->follower = impl->node.nodeId();
   }
   impl->threads.emplace_back([this] { impl->watch(); });
   for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });

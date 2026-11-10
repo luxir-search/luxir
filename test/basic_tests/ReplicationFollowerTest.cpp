@@ -248,14 +248,16 @@ TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   char host[256] = {};
   ASSERT_EQ(0, ::gethostname(host, sizeof(host) - 1));
   EXPECT_EQ(std::string(host) + ":9500", after.follower);
+  EXPECT_EQ(follower->nodeId(), after.follower);
   EXPECT_EQ(before.follower, after.follower);
   stopFollower();
-  followerConfig.replication.follower_id = "reader-a";
+  followerConfig.node.id = "reader-a";
   startFollower();
+  EXPECT_EQ("reader-a", follower->nodeId());
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [](const auto& row) { return row.follower == "reader-a"; });
   }));
-  followerConfig.replication.follower_id.clear();
+  followerConfig.node.id.clear();
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return !source->getReplication().status().empty() && !source->getReplication().status()[0].commit.incarnation.empty(); }));
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
@@ -1533,6 +1535,26 @@ TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
   }));
 }
 
+
+TEST_F(ReplicationFollowerTest, nodeIdConfig) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--node.id reader-a");
+  EXPECT_EQ("reader-a", config.node.id);
+  EXPECT_NO_THROW(config.normalize());
+
+  config.node.id = std::string(250, 'n') + " :\"~!";
+  EXPECT_EQ(config.node.id, LuxirNode(config).nodeId());
+  for (const auto& id : std::vector<std::string>{".", "..", "a/b", "a\\b", "\n", "\x7f", "\x80",
+                                               std::string("a\0b", 3), std::string(256, 'n')}) {
+    config.node.id = id;
+    EXPECT_THROW(config.normalize(), std::invalid_argument);
+  }
+  EXPECT_THROW(LuxirNode{config}, std::invalid_argument); // a config assembled in code is checked too
+  config.node.id.clear();
+  EXPECT_NO_THROW(config.normalize()); // empty requests automatic resolution
+}
 
 TEST_F(ReplicationFollowerTest, tenantFilterConfig) {
   LuxirConfig config;

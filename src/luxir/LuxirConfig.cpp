@@ -68,6 +68,16 @@ Rough hierarchy:
 [search]         # search defaults (hits, etc.)
 */
 
+void NodeConfig::validate() const {
+  if (id.empty()) throw std::invalid_argument("node.id must not be empty");
+  if (id.size() > 255) throw std::invalid_argument("node.id exceeds 255 bytes");
+  if (id == "." || id == "..") throw std::invalid_argument("node.id must not be '.' or '..'");
+  for (unsigned char c : id) {
+    if (c < 0x20 || c > 0x7e || c == '/' || c == '\\') {
+      throw std::invalid_argument("node.id must be printable ASCII without '/' or '\\\\'");
+    }
+  }
+}
 
 std::vector<std::string> ReplicationConfig::tenantFilter() const {
   std::vector<std::string> result;
@@ -103,7 +113,6 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
-  if (follower_id.size() > 255) throw std::invalid_argument("replication.follower-id exceeds 255 bytes");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -111,12 +120,12 @@ void ReplicationConfig::validate() const {
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
+  app.add_option("--node.id", node.id, "Node identity (default host:port, otherwise a random UUID)");
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
   app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
-  app.add_option("--replication.follower-id", replication.follower_id, "Name the source knows this follower by (default host:port)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -332,6 +341,7 @@ void LuxirConfig::resolveRamBudgets() {
 }
 
 void LuxirConfig::normalize() {
+  if (!node.id.empty()) node.validate();
   replication.validate();
   resolveRamBudgets();
 
