@@ -11,6 +11,7 @@
 #include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
 #include "luxir/util/Decimal.h"
+#include "luxir/util/IpAddress.h"
 #include "luxir/value/ValueExprParser.h"
 #include "luxir/api/RequestFlags.h"
 #include "luxir/schema/FieldSignature.h"
@@ -750,4 +751,188 @@ TEST_F(DecimalFieldTypesTest, wideMetricRanksStayRawUntilRendering) {
       EXPECT_DOUBLE_EQ((double)INT64_MAX / 100, std::get<double>(groups.ranks[1].v[0].kind));
     }
   }
+}
+
+TEST(IpAddressTest, parsingAndFormatting) {
+  EXPECT_EQ(ip::parse("10.0.0.1"), ip::parse("::ffff:10.0.0.1"));
+  for (auto text : {"10.0.0.256", "1.2.3", "fe80::1%eth0", "1.2.3.4/32", ""}) EXPECT_FALSE(ip::parse(text));
+  EXPECT_FALSE(ip::parse("10.0.0.1\0bad"sv));
+  char buffer[ip::TEXT_BUF_SIZE];
+  auto address = ip::parse("2001:0DB8:0000::1");
+  ASSERT_TRUE(address);
+  EXPECT_EQ("2001:db8::1", ip::format(ip::bytes(*address), buffer));
+  EXPECT_THROW(ip::format("bad", buffer), std::invalid_argument);
+  for (auto text : {"1.2.3.4/33", "::/129", "::/-1", "::/0junk", "1.2.3.4/"}) EXPECT_FALSE(ip::parseCidr(text));
+  auto block = ip::parseCidr("10.1.2.3/15");
+  ASSERT_TRUE(block);
+  EXPECT_EQ("10.0.0.0", ip::format(ip::bytes(block->lo), buffer));
+  EXPECT_EQ("10.1.255.255", ip::format(ip::bytes(block->hi), buffer));
+  block = ip::parseCidr("fe80::1/10");
+  ASSERT_TRUE(block);
+  EXPECT_EQ("fe80::", ip::format(ip::bytes(block->lo), buffer));
+  EXPECT_EQ("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", ip::format(ip::bytes(block->hi), buffer));
+  IpFieldType type("ip");
+  char scratch[coerce::TEXT_BUF_SIZE];
+  EXPECT_FALSE(type.tryCoerceTermWindow(coerce::scalarVal("dune"sv), "ip", scratch));
+  EXPECT_TRUE(type.tryCoerceTermWindow(coerce::scalarVal("10.0.0.0/8"sv), "ip", scratch));
+}
+
+class IpFieldTypesTest : public ScalarFieldTypesTest {
+protected:
+  void SetUp() override {
+    LuxirTest::SetUp();
+    SchemaBuilder b;
+    b.field("addr").type = FieldClass::IP;
+    auto& array = b.field("array_ip");
+    array.type = FieldClass::IP;
+    array.multi = api::FieldDef::MultiMode::ARRAY;
+    b.set(helper.collection());
+    ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "addr", "10.0.0.2", "label_s", "hello", "many_ips", vecs("2001:0db8::1", "10.0.0.1", "::ffff:10.0.0.1")),
+      flatdoc("id", "b", "addr", "::ffff:10.0.0.10", "array_ip", vecs("10.0.0.2", "::ffff:10.0.0.2", "::1")),
+      flatdoc("id", "c", "addr", "2001:0DB8:0000::1"), flatdoc("id", "d", "addr", "2001:db9::1"),
+      flatdoc("id", "e")}, UpdateMessage::COMMIT).success);
+  }
+};
+
+TEST_F(IpFieldTypesTest, literalsAndCidr) {
+  EXPECT_EQ(vecs("a"), hits(R"({"match":{"addr":"::ffff:10.0.0.2"}})"));
+  EXPECT_EQ(vecs("c"), hits(R"({"match":{"addr":"2001:db8::1"}})"));
+  for (auto cidr : {"10.1.2.3/8", "0.0.0.0/0", "::ffff:0:0/96"}) {
+    EXPECT_EQ(vecs("a", "b"), hits(std::format(R"({{"match":{{"addr":"{}"}}}})", cidr)));
+  }
+  EXPECT_EQ(vecs("a", "b", "c", "d"), hits(R"({"match":{"addr":"::/0"}})"));
+  EXPECT_EQ(vecs("a"), hits(R"({"match":{"addr":"10.0.0.2/32"}})"));
+  EXPECT_EQ(vecs("c"), hits(R"({"match":{"addr":"2001:db8:abcd::/32"}})"));
+  EXPECT_EQ(vecs("c"), hits(R"({"match":{"addr":"2001:db8::1/128"}})"));
+  EXPECT_EQ(vecs("b"), hits(R"({"range":{"field":"addr","gt":"10.0.0.2","lte":"10.0.0.10"}})"));
+  EXPECT_EQ(vecs("a"), hits(R"({"range":{"field":"addr","gte":"10.0.0.2","lt":"10.0.0.10"}})"));
+  EXPECT_EQ(vecs("a", "c"), hits(R"({"any_of":{"field":"addr","values":["10.0.0.2","2001:db8::1"]}})"));
+  EXPECT_EQ(vecs("a"), hits(R"({"multi_match":{"text":"hello","fields":["*"]}})"));
+  EXPECT_EQ(vecs("b"), hits(R"({"multi_match":{"text":"10.0.0.10","fields":["*"]}})"));
+  EXPECT_EQ(vecs("a"), hits(R"({"simple_query":{"q":"addr:10.0.0.2","fields":["label_s"]}})"));
+  EXPECT_TRUE(run(R"({"query":{"simple_query":{"q":"addr:dune","fields":["label_s"]}}})")->ok());
+  EXPECT_EQ(vecs("c"), hits(R"({"expr":"addr:'2001:db8::1'"})"));
+  auto typed = localReq(helper.getSearchEngine());
+  auto& top = typed->collection("main").topDocs("q").fields({"id"});
+  auto& query = top.rawQuery().kind.emplace<api::AnyOfQuery>();
+  query.field = "addr";
+  auto* values = api::build::allocMessage<api::Val>(typed->mr);
+  auto* strings = api::build::allocArray(values->kind.emplace<api::ArrStr>().v, 2, typed->mr);
+  strings[0] = "::ffff:10.0.0.2"; strings[1] = "2001:db8::1";
+  query.values = values;
+  typed->execute(false);
+  ASSERT_OK(typed);
+  EXPECT_EQ(2u, typed->getDocs().size());
+}
+
+TEST_F(IpFieldTypesTest, outputFacetsSortAndCollapse) {
+  for (auto format : {"rows", "columns"}) {
+    auto req = run(std::format(R"({{"fields":["id","addr","many_ips","array_ip"],"sort":"id","limit":-1,"document_format":"{}",
+      "ops":{{"f":{{"field_facet":{{"field":"addr","limit":-1}}}}}}}})", format));
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "b", "addr", "10.0.0.10", "array_ip", vecs("10.0.0.2", "10.0.0.2", "::1")));
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "a", "addr", "10.0.0.2", "many_ips", vecs("10.0.0.1", "2001:db8::1")));
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "c", "addr", "2001:db8::1"));
+    const auto& ids = std::get<api::ColStr>(req->docList()->ops.at("f")->facetResult()->bucket_ids->kind).v;
+    EXPECT_EQ(vecs("10.0.0.2", "10.0.0.10", "2001:db8::1", "2001:db9::1"), std::vector<std::string>(ids.begin(), ids.end()));
+    auto body = renderSearchResponseBody(req->responses[0]->proto);
+    EXPECT_NE(std::string::npos, body.find("2001:db8::1"));
+  }
+  auto selected = run(R"({"limit":0,"ops":{"f":{"field_facet":{"field":"addr","selected":["::ffff:10.0.0.2"],"limit":0}}}})");
+  ASSERT_OK(selected);
+  EXPECT_EQ(1, selected->docList()->ops.at("f")->facetResult()->counts[0]);
+  ASSERT_TRUE(helper.index(flatdoc("id", "z", "addr", "10.0.0.2"), UpdateMessage::COMMIT).success);
+  auto req = run(R"({"query":{"match":{"addr":"::/0"}},"sort":"addr asc","fields":["id","addr"],"get_scores":true,
+    "collapse":{"field":"addr","head_sort":"id desc"}})");
+  ASSERT_OK(req);
+  const auto& groups = *req->docList()->groups;
+  ASSERT_EQ(4u, groups.keys.size());
+  EXPECT_EQ(api::GroupComponent_::Type::IP, groups.keys[0].component[0].type);
+  EXPECT_EQ("10.0.0.2", std::get<std::string_view>(groups.keys[0].component[0].value));
+  EXPECT_EQ("10.0.0.10", std::get<std::string_view>(groups.keys[1].component[0].value));
+  EXPECT_EQ("10.0.0.2", std::get<std::string_view>(groups.ranks[0].v[0].kind));
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(req->responses[0]->proto, bytes));
+  bytes.resize(bytes.size() + 16);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SearchResponse decoded;
+  ASSERT_TRUE(api::decode(decoded, std::span(bytes).first(bytes.size() - 16), arena));
+  EXPECT_EQ(api::GroupComponent_::Type::IP, decoded.ops.at("q")->docList()->groups->keys[0].component[0].type);
+  auto nested = run(R"({"limit":0,"ops":{"outer":{"field_facet":{"field":"addr","limit":-1,
+    "ops":{"inner":{"field_facet":{"field":"many_ips","limit":-1}}}}}}})");
+  ASSERT_OK(nested);
+  EXPECT_NE(std::string::npos, renderSearchResponseBody(nested->responses[0]->proto).find("10.0.0.1"));
+  auto count = run(R"json({"ops":{"n":{"expr_op":{"expr":"sum(count(many_ips))"}}}})json");
+  ASSERT_OK(count);
+  EXPECT_EQ(2, std::get<int64_t>(count->responses[0]->proto.ops.at("n")->kind));
+}
+
+TEST_F(IpFieldTypesTest, validationIsAtomic) {
+  for (auto value : {R"(123)", R"(true)", R"("bad")", R"("10.0.0.1\u0000bad")"}) {
+    EXPECT_FALSE(indexJson(std::format(R"({{"addr":{}}})", value)).success);
+    EXPECT_FALSE(run(std::format(R"({{"query":{{"match":{{"addr":{}}}}}}})", value))->ok());
+  }
+  EXPECT_FALSE(helper.index(flatdoc("id", "a", "many_ips", vecs("192.0.2.1", "bad")), UpdateMessage::COMMIT).success);
+  EXPECT_FALSE(indexJson(R"({"id":"a","many_ips":["192.0.2.1",42]})").success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "next", "many_ips", vecs("192.0.2.2", "192.0.2.3")), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(vecs("a"), hits(R"({"match":{"addr":"10.0.0.2"}})"));
+  EXPECT_TRUE(hits(R"({"match":{"many_ips":"192.0.2.1"}})").empty());
+  EXPECT_EQ(vecs("next"), hits(R"({"match":{"many_ips":"192.0.2.3"}})"));
+  for (auto query : {R"({"prefix":{"field":"addr","prefix":"10"}})",
+      R"({"wildcard":{"field":"addr","pattern":"10.*"}})",
+      R"({"regex":{"field":"addr","pattern":".*"}})",
+      R"({"fuzzy":{"field":"addr","term":"10.0.0.2"}})",
+      R"({"any_of":{"field":"addr","values":["10.0.0.0/8"]}})",
+      R"({"match":{"field":"addr","val":"10.0.0.2","case_insensitive":true}})",
+      R"({"range":{"field":"addr","gte":"10.0.0.0/8"}})"}) {
+    EXPECT_FALSE(run(std::format(R"({{"query":{}}})", query))->ok()) << query;
+  }
+  EXPECT_FALSE(run(R"({"ops":{"f":{"field_facet":{"field":"addr","term_filter":{"prefix":"10"}}}}})")->ok());
+  EXPECT_FALSE(run(R"({"query":{"simple_query":{"q":"10.0.0.2","fields":["addr"]}}})")->ok());
+  for (auto property : {R"("stored":true)", R"("index":"none")", R"("index":"range")"}) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef definition;
+    ASSERT_TRUE(api::read_json(definition, std::format(R"({{"fields":{{"bad":{{"type":"ip",{}}}}}}})", property), arena));
+    EXPECT_THROW(Schema::fromProto(definition), SchemaError);
+  }
+}
+
+TEST_F(IpFieldTypesTest, persistenceMergeAndTypeCheck) {
+  auto writer = helper.getIndexWriter();
+  IndexReader reader(writer->dir);
+  EXPECT_EQ(FieldType::IP, reader.field("addr").at(0)->type);
+  ASSERT_TRUE(helper.index(flatdoc("id", "f", "addr", "10.0.0.3"), UpdateMessage::COMMIT).success);
+  writer->mergeSegments();
+  EXPECT_EQ(vecs("a", "b", "f"), hits(R"({"match":{"addr":"10.0.0.0/8"}})"));
+  ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  writer->mergeSegments();
+  EXPECT_EQ(vecs("b", "f"), hits(R"({"match":{"addr":"10.0.0.0/8"}})"));
+  SchemaBuilder removed;
+  removed.replaceAll(helper.collection());
+  SchemaBuilder changed;
+  changed.field("addr").type = FieldClass::STRING;
+  changed.set(helper.collection());
+  IndexReader mismatch(writer->dir);
+  EXPECT_THROW(mismatch.field("addr"), RequestError);
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "addr", "hello"), UpdateMessage::COMMIT).success);
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ExpectLog quiet("Incompatible persisted types for field 'addr'");
+  auto result = helper.submit(merge);
+  EXPECT_FALSE(result.success);
+  EXPECT_NE(std::string::npos, result.error_message.find("type 'ip'"));
+}
+
+TEST_F(IpFieldTypesTest, storedStringSourceAndIpVariant) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef definition;
+  ASSERT_TRUE(api::read_json(definition, R"({"fields":{"source":{"type":"string","stored":true,
+    "variants":{"ip":{"type":"ip"}}}}})", arena));
+  helper.collection().setSchema(Schema::fromProto(definition, helper.collection().getSchema().get()));
+  ASSERT_TRUE(helper.index(flatdoc("id", "variant", "source", "::ffff:192.0.2.1"), UpdateMessage::COMMIT).success);
+  auto req = run(R"({"query":{"match":{"source__ip":"192.0.2.1"}},"fields":["source","source__ip"]})");
+  ASSERT_OK(req);
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("source", "::ffff:192.0.2.1", "source__ip", "192.0.2.1"));
 }

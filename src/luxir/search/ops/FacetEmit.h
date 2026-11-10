@@ -261,16 +261,17 @@ inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
   }
 }
 
+template <typename Output = NativeValueOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<std::string, int64_t>>& buckets,
-                        std::pmr::memory_resource& mr) {
+                        std::pmr::memory_resource& mr, Output output = {}) {
   auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
   size_t n = buckets.size();
   std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
   int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
   for (size_t i = 0; i < n; i++) {
     // bucket strings live in the transient countVec; copy into the arena.
-    ids[i] = build::arenaStr(mr, buckets[i].first);
+    ids[i] = outputTerm(buckets[i].first, mr, output);
     counts[i] = buckets[i].second;
   }
 }

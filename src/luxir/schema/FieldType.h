@@ -57,7 +57,8 @@ public:
     DATE,     // timestamp; column-stored as int64 epoch units (default ms)
     GEO_POINT, // latitude/longitude point; packed into one int64 column value
     BOOLEAN,  // true/false; column-stored as 0/1
-    DECIMAL   // fixed-point number; scale in type flags
+    DECIMAL,  // fixed-point number; scale in type flags
+    IP        // 16-byte address term
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
@@ -65,7 +66,7 @@ public:
   static constexpr Storage storage(Type type) {
     switch (type) {
       case NONE: return Storage::NONE;
-      case STRING: case ID: return Storage::TERMS;
+      case STRING: case ID: case IP: return Storage::TERMS;
       case TEXT: return Storage::TEXT;
       case BIN: return Storage::BIN;
       case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: return Storage::INT64;
@@ -155,6 +156,8 @@ public:
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  // String and bytes arms already contain term bytes, before normalization or fitting.
+  const bool rawTextTerms;
   // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
   // When STORED is set, raw values are routed to the stored-fields resource
@@ -163,8 +166,8 @@ public:
   std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   // constructor
-  FieldType(std::string_view name, FieldType::Type type, int flags) :
-     type_(type), name_(name), flags_(flags) {
+  FieldType(std::string_view name, FieldType::Type type, int flags, bool rawTextTerms = false) :
+     type_(type), name_(name), flags_(flags), rawTextTerms(rawTextTerms) {
     if ((flags_ & MULTI_VALUED) && arrayOnly(type)) flags_ |= MULTI_ARRAY;
   }
 
@@ -268,6 +271,15 @@ public:
       const api::Val& val, LiteralUse use, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
+  struct TermWindow {
+    std::string_view lo, hi;
+    bool point() const { return lo == hi; }
+  };
+  virtual TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const;
+  virtual std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const;
+
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
   // and return a view of it; string/bytes arms pass through as views of the
@@ -284,7 +296,7 @@ public:
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
-    : FieldType(name, FieldType::TEXT, flags), analyzer_(std::move(analyzer)) {}
+    : FieldType(name, FieldType::TEXT, flags, true), analyzer_(std::move(analyzer)) {}
 
   // Parameterless components by name (tests, benches, hand-built schemas);
   // throws like Analyzer::compile.  Defined in FieldType.cpp so this header
@@ -313,7 +325,7 @@ public:
 
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
                std::shared_ptr<const Analyzer> normalizer = {})
-    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)) {}
+    : FieldType(name, FieldType::STRING, flags, true), normalizer(std::move(normalizer)) {}
   void signatureProps(SignatureProps& out) const override;
 
   // Hot paths (ingest and query literals) must retain a chain from normalizer->createChain().
@@ -321,6 +333,22 @@ public:
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
+};
+
+class IpFieldType : public FieldType {
+public:
+  IpFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED)
+    : FieldType(name, FieldType::IP, flags) {}
+  ValueNature valueNature() const override { return ValueNature::IP; }
+  uint32_t capabilities() const override {
+    return FieldType::capabilities() & ~(PREFIX | PATTERN | FUZZY | FREE_TEXT | TERM_FILTER);
+  }
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const override;
 };
 
 class IntFieldType : public FieldType {
@@ -471,7 +499,7 @@ public:
 // Unique id field
 class IdFieldType : public FieldType {
 public:
-  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
+  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags, true) {
   }
   void signatureProps(SignatureProps& out) const override;
 

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "luxir/schema/ValCoerce.h"
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
@@ -151,10 +153,8 @@ class SimpleQueryParser {
   };
 
 public:
-  // Term-backed and indexed fields, which support every arm (match / phrase /
-  // prefix / fuzzy) and which bare clauses may expand over.  Numeric column
-  // fields are targetable too but only for exact match - see numericQueryable.
-  // Everything else degrades to text.
+  // Indexed term fields are explicitly targetable. FREE_TEXT controls bare
+  // expansion; fields without it take only exact-match literals, like numerics.
   static bool termQueryable(FieldType& fieldType) {
     auto storage = FieldType::storage(fieldType.type());
     return fieldType.supports(FieldType::MATCH) && fieldType.indexed()
@@ -440,18 +440,20 @@ private:
       case FieldType::Type::DATE: return "date";
       case FieldType::Type::BOOLEAN: return "boolean";
       case FieldType::Type::DECIMAL: return "decimal";
+      case FieldType::Type::IP: return "IP address";
       default: return "number";  // FLOAT / DOUBLE
     }
   }
 
-  // Whether `value` can be coerced to the numeric field's native value.  A value
-  // that cannot (price:abc) is not a numeric query and degrades to text, so
-  // simple_query still never hard-fails at build.  Uses the same coercion
-  // contract as ingest / query build, which signals failure by throwing.
-  bool numericCoercible(FieldType& fieldType, std::string_view value) {
+  // Failed literal probes degrade to text, keeping simple_query build lenient.
+  bool literalCoercible(FieldType& fieldType, std::string_view value) {
     api::Val v;
     v.kind = value;
     try {
+      if (!FieldType::isNumericColumn(fieldType.type())) {
+        char scratch[coerce::TEXT_BUF_SIZE];
+        return fieldType.tryCoerceTermWindow(v, fieldType.name(), scratch).has_value();
+      }
       return fieldType.tryCoerceIntWindow(v, FieldType::LiteralUse::MATCH,
                                            fieldType.name(), opts.coerceContext).has_value();
     } catch (const std::exception&) {
@@ -935,8 +937,8 @@ private:
                 }
               } else if (phrase->text.empty()) {
                 clearPending(st);
-              } else if (numericQueryable(*fieldType)
-                         && !numericCoercible(*fieldType, phrase->text)) {
+              } else if ((numericQueryable(*fieldType) || !fieldType->supports(FieldType::FREE_TEXT))
+                         && !literalCoercible(*fieldType, phrase->text)) {
                 // Uncoercible numeric value: degrade like an unknown field -
                 // the head stays literal text and the quoted value is a
                 // phrase over the default fields (declared).
@@ -1023,16 +1025,14 @@ private:
             addUnit(st, allocQuery(q));
             return;
           }
-          if (numericQueryable(*ft)) {
-            // Otherwise numeric column fields take only an exact-match arm
-            // (field:value).  Wildcard '*' / fuzzy '~' have no numeric meaning,
-            // and a value that is not a valid number/date cannot be a numeric
-            // query; both degrade to text (like an unknown field), declared.
+          if (numericQueryable(*ft) || !ft->supports(FieldType::FREE_TEXT)) {
+            // Column numerics and fields without free-text expansion take
+            // exact-match literals. Unsupported syntax degrades to text.
             if (prefix || sawFuzzy) {
               warn("numeric_field_syntax",
-                   fmt::format("field '{}' is numeric; wildcard '*' and fuzzy '~' do not "
+                   fmt::format("field '{}' requires exact-match syntax; wildcard '*' and fuzzy '~' do not "
                                "apply - use {}:value for an exact match", head, head));
-            } else if (!numericCoercible(*ft, tail)) {
+            } else if (!literalCoercible(*ft, tail)) {
               warn("numeric_field_value",
                    fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
                                tail, numericTypeName(ft->type()), head));

@@ -472,8 +472,8 @@ public:
 
   // Search selectors for this reader's schema: concrete declarations and
   // dynamic roots observed in its metadata, including their variants.
-  // Only indexed TEXT/STRING/ID search targets are included. Sorted by name;
-  // built once on first use, independent of storage or column availability.
+  // Only indexed term-match targets are included. Sorted by name; built once
+  // on first use, independent of column availability.
   std::span<const std::string> searchableFields();
 
   // Opens a published snapshot, reusing what it shares with previousReader

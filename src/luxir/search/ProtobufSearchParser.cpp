@@ -595,13 +595,15 @@ public:
         case FieldType::DATE: wireType = Type::DATE; break;
         case FieldType::BOOLEAN: wireType = Type::BOOLEAN; break;
         case FieldType::DECIMAL: wireType = Type::DECIMAL; break;
+        case FieldType::IP: wireType = Type::IP; break;
         default: throw std::logic_error("Unhandled collapse key wire type");
       }
-      bool ordinal = FieldType::storage(type.type()) == FieldType::Storage::TERMS;
+      auto storage = FieldType::storage(type.type());
+      bool ordinal = storage == FieldType::Storage::TERMS;
       if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
         throw RequestError("string collapse key must be indexed: " + std::string(name));
       }
-      collapse->fields.push_back({field.physicalName, wireType,
+      collapse->fields.push_back({field.physicalName, wireType, storage,
           ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
           req.reader->field(field.physicalName), type.valueNature()});
     }

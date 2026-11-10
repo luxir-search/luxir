@@ -35,6 +35,7 @@ enum class ValueNature : uint8_t {
   DATE_NS,
   GEO_POINT,
   BOOLEAN,
+  IP,
   DECIMAL_0, DECIMAL_1, DECIMAL_2, DECIMAL_3, DECIMAL_4,
   DECIMAL_5, DECIMAL_6, DECIMAL_7, DECIMAL_8, DECIMAL_9,
   DECIMAL_10, DECIMAL_11, DECIMAL_12, DECIMAL_13, DECIMAL_14,
@@ -60,6 +61,7 @@ inline std::string_view valueNatureName(ValueNature nature) {
   switch (nature) {
     case ValueNature::NUMBER: return "number";
     case ValueNature::BOOLEAN: return "boolean";
+    case ValueNature::IP: return "ip";
     case ValueNature::GEO_POINT: return "GEO_POINT";
     case ValueNature::DATE_MS: return "DATE unit 'ms'";
     case ValueNature::DATE_NS: return "DATE unit 'ns'";

@@ -2881,13 +2881,14 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
 | <a id="value-luxir.fielddef.fieldclass.boolean"></a>[`BOOLEAN`](#value-luxir.fielddef.fieldclass.boolean) | 11 | true/false, stored as 0/1 in the int column |
+| <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
 | <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
 ### luxir.FieldDef.IndexMode
 
-Index acceleration. Numeric Match/Range and geographic predicates can scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH; STRING columns alone do not provide term-query support.
+Index acceleration. Numeric Match/Range and geographic predicates can scan a column with NONE. Term queries on STRING/TEXT/ID/IP require MATCH; STRING columns alone do not provide term-query support.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2951,6 +2952,7 @@ SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts an
 | <a id="value-luxir.groupcomponent.type.date"></a>[`DATE`](#value-luxir.groupcomponent.type.date) | 3 |  |
 | <a id="value-luxir.groupcomponent.type.boolean"></a>[`BOOLEAN`](#value-luxir.groupcomponent.type.boolean) | 4 |  |
 | <a id="value-luxir.groupcomponent.type.decimal"></a>[`DECIMAL`](#value-luxir.groupcomponent.type.decimal) | 5 |  |
+| <a id="value-luxir.groupcomponent.type.ip"></a>[`IP`](#value-luxir.groupcomponent.type.ip) | 6 |  |
 
 <a id="enum-luxir.linearfusion.normalization"></a>
 

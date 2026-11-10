@@ -97,7 +97,7 @@ public:
   FieldType* physical(std::string_view name) const;
 
   // Concrete declarations plus roots observed in reader metadata. Search
-  // bindings and variants must be indexed TEXT/STRING/ID. Names are sorted;
+  // bindings and variants must be indexed term-match fields. Names are sorted;
   // absent declared fields and variants of observed roots are included.
   std::vector<std::string> searchableFields(std::span<const std::string_view> physicalNames = {}) const;
 

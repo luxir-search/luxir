@@ -92,6 +92,13 @@ their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
 
+IP `match` literals accept an address or CIDR. Host bits are masked, so
+`10.1.2.3/8` matches `10.0.0.0/8`; `2001:db8::/32` matches that IPv6 network.
+IP `any_of` members and range bounds require single addresses. Strict and
+inclusive range bounds follow address byte order. IP fields reject
+`case_insensitive`, prefix, wildcard/regexp, and fuzzy matching. See
+[IP addresses](schema.md#ip-addresses).
+
 With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
 value matches indexed terms that differ only in simple Unicode case: `FOO`
 matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants

@@ -70,7 +70,7 @@ void VectorFieldType::signatureProps(SignatureProps& out) const {
 
 std::string_view FieldType::typeName(Type type) {
   static constexpr std::string_view names[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal"
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip"
   };
   return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
 }
@@ -107,7 +107,7 @@ uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
       DateFieldType::unitFromTypeFlags(typeFlags);
       return typeFlags;
     case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
-    case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN:
+    case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN: case IP:
       if (typeFlags == 0) return 0;
       throw std::runtime_error(std::format(
           "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
@@ -145,7 +145,7 @@ void StrFieldType::normalize(std::string& value) const {
 
 TextFieldType::TextFieldType(std::string_view name, int flags, std::string_view tokenizer,
                              std::vector<std::string> filters)
-    : FieldType(name, FieldType::TEXT, flags) {
+    : FieldType(name, FieldType::TEXT, flags, true) {
   api::AnalyzerDef def;
   def.tokenizer.emplace().name = tokenizer;
   std::vector<api::AnalyzerComponent> components(filters.size());

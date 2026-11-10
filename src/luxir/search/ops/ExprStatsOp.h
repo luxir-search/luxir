@@ -123,7 +123,7 @@ public:
 
   template <typename Emit>
   void withOutput(uint64_t outputFlags, std::pmr::memory_resource& mr, Emit emit) const {
-    withNatureOutput(aggregate.root().nature, outputFlags, mr, [this] {
+    withNatureOutput<int64_t>(aggregate.root().nature, outputFlags, mr, [this] {
       std::string sources;
       for (const auto& producer : aggregate.producers) {
         auto description = producer.input->describeDateSources(producer.input->rootNode);
