@@ -1131,10 +1131,12 @@ public:
             ivf = dynamic_cast<faiss::IndexIVF*>(idx);
             if (ivf == nullptr) throw std::runtime_error("KnnQuery: vector aux is not an IVF index");
             if (seg.hasDeletes()) {
-              rankLivePerSeg[i] = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
+              auto live = seg.liveDocsShared();
+              const auto& bitmap = live->rankLiveBitmap(query.getField(), [&]() {
                 VectorReader vr(seg.postingsReader(), *segInfos.at(i));
                 return buildRankLiveBitmap(seg, vr, segCount);
               });
+              rankLivePerSeg[i] = std::shared_ptr<const RankLiveBitmap>(std::move(live), &bitmap);
               segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
             }
           } else {
@@ -2972,12 +2974,12 @@ private:
 
   /// Build the RankLiveBitmap (rank-space liveness + exact live vector
   /// count) for one segment's vector field.  Run once per liveDocs
-  /// generation (cached on the VectorAuxReader), and sized by the segment's
+  /// generation (cached on LiveDocs by field), and sized by the segment's
   /// smaller of live/deleted docs rather than its vectors, using the same
   /// forward doc-to-rank fold as query domains. The engines' reverse
   /// (valueRank -> docId) map is never consulted. Dense single-valued
   /// needs no walk at all: valueRank == docId, so the liveDocs words
-  /// themselves are the bitmap (borrowed and pinned via backing) and the
+  /// themselves are the bitmap (borrowed; query handles pin LiveDocs) and the
   /// segment's cached live count is the cardinality.
   static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
                                             VectorReader& vr,
@@ -2994,10 +2996,10 @@ private:
                     "liveDocs words double as the LSB-first byte bitmap");
       assert((int64_t)live.size() == numVectors);
       return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
-              seg.liveDocsShared()};
+              nullptr};
     }
 
-    auto owned = std::make_shared<std::vector<uint8_t>>();
+    auto owned = std::make_unique<std::vector<uint8_t>>();
     VectorSearchWork work;
     int64_t liveVectors = foldDomain(vr, live.docset(), live.size(), *owned, work);
     const uint8_t* data = owned->data();
