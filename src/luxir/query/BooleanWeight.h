@@ -7752,6 +7752,13 @@ class BooleanQuery::Weight final : public Query::Weight {
   SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
       SparseFilteredTopKFamily::CONJUNCTION;
 
+  bool foldsProhibitedDomain() const {
+    return !prohibitedWeights.empty()
+        && !QueryPrep::disableProhibitedDomainFoldForTests
+        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
+            || QueryPrep::anyConsumesDomain(optionalWeights));
+  }
+
   static bool sparseFilteredTopKMandatory(Query* query) {
     while (query->getKind() == QueryKind::BOOST) {
       query = static_cast<BoostQuery*>(query)->getChild();
@@ -12710,18 +12717,26 @@ public:
     auto* filterCache = context.topReader.filterCache();
     prohibitedCacheEnabled = !QueryPrep::disableProhibitedCacheForTests
         && filterCache != nullptr && filterCache->enabled();
-    if (prohibitedCacheEnabled && !prohibitedWeights.empty()) {
+    bool foldProhibited = foldsProhibitedDomain();
+    if ((prohibitedCacheEnabled || foldProhibited) && !prohibitedWeights.empty()) {
       size_t segmentCount = context.topReader.segments().size();
       prohibitedUses = context.pool.make_span<FilterCache::Use*>(
           prohibitedWeights.size());
       std::fill(prohibitedUses.begin(), prohibitedUses.end(), nullptr);
-      prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
-          prohibitedWeights.size() * segmentCount);
-      std::fill(
-          prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      if (!foldProhibited) {
+        prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
+            prohibitedWeights.size() * segmentCount);
+        std::fill(
+            prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      }
 
       MemPool routePool;
       for (size_t clause = 0; clause < prohibitedWeights.size(); clause++) {
+        if (foldProhibited) {
+          // Folding shares request-owned values even without a shared cache.
+          prohibitedUses[clause] = context.getFilterUse(*prohibitedClauses[clause]);
+          continue;
+        }
         Query::Weight* prohibitedWeight = prohibitedWeights[clause];
         if (prohibitedWeight->matchesAllDocs()) continue;
         Query::VerificationWork verificationWork =
@@ -12783,8 +12798,7 @@ public:
         QueryPrep::anyNeedsPrepare(filterWeights)) {
       traits |= NEEDS_PREPARE;
     }
-    // Every child prepares inside the domain this boolean is given, so a
-    // consumer under any clause makes this boolean one.
+    // A consumer in either prepare stage makes this boolean one.
     if (QueryPrep::anyConsumesDomain(mandatoryWeights) ||
         QueryPrep::anyConsumesDomain(optionalWeights) ||
         QueryPrep::anyConsumesDomain(prohibitedWeights) ||
@@ -12930,12 +12944,8 @@ public:
     // child consumes the domain, fold the prohibited clauses into it: the
     // domain becomes outer AND filters AND NOT prohibited, and it replaces
     // the prohibited scorers as the required domain supplier, so each
-    // exclusion is evaluated once. Excluded docs can never match this
-    // boolean, so narrowing the domain changes no other child's result.
-    bool foldProhibited = !prohibitedSources.empty()
-        && !QueryPrep::disableProhibitedDomainFoldForTests
-        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
-            || QueryPrep::anyConsumesDomain(optionalWeights));
+    // exclusion is evaluated once.
+    bool foldProhibited = foldsProhibitedDomain();
     if (!filterSources.empty() || foldProhibited) {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];

@@ -421,9 +421,31 @@ nested), its `prohibited` (must_not) clauses into the domain it hands its
 children (outer AND filters AND NOT prohibited). The folded domain then
 replaces the boolean's prohibited scorers as its required domain supplier, so
 each exclusion is materialized once, through the same filter cache uses as a
-filter clause. Scoring siblings are not folded: they intersect with the kNN's
-top-k after it ran. FAISS ids are segment-local vector value ranks, so the
-query path maps each returned value rank back through that segment's vector
+filter clause.
+
+Which constraints reach a kNN is decided on the logical query, before Weight
+creation, by one effective-role projection that both normalization and
+membership keys use, so it never depends on score demand or on whether
+required-clause inlining applies. When a boolean has a domain consumer under
+`required` or `optional`, required leaves with an automatic uniform score
+profile (ranges, prefixes, automata, exists, geo, term sets including `any_of`)
+take the filter role, since they add no score. The projection also extracts,
+by reference, the necessary non-scoring constraints of booleans reached through
+chains of `required`/`filter` children (looking through boost, constant-score
+and force-prepare wrappers): their filter, prohibited, and promoted leaves.
+That makes eligibility closed under AND re-association. It never follows an
+optional group (even with min_match) or a prohibited branch, and never extracts
+a domain consumer; extracted exclusions stay prohibited. A nested copy is
+dropped only while its boolean keeps another required clause, so rank-only
+optionals never become requirements, and a retained copy shares the extracted
+one's query-owned filter use, which is request-owned when the shared cache
+rejects admission or is absent. Scoring siblings, including terms and
+constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
+afterwards. Required-clause inlining never moves a domain consumer to a
+different prepare stage.
+
+FAISS ids are segment-local vector value ranks, so the query path maps each
+returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
 IndexReader opens and pins overlay files eagerly when it opens an index

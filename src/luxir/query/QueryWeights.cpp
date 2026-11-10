@@ -33,6 +33,13 @@
 
 namespace luxir {
 
+#ifndef NDEBUG
+void Query::Weight::assertLogicalDomainConsumption() const {
+  assert(luxir::logicalConsumesDomain(owner)
+      && "Weight consumes a domain absent from its logical query");
+}
+#endif
+
 AllQuery::Weight* AllQuery::createWeight(Context& context, int32_t flags,
                                          float multiplier) {
   AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(

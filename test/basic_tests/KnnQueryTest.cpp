@@ -18,10 +18,14 @@
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/query/NumericPredicateQuery.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/query/VectorEngine.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -1322,6 +1326,536 @@ TEST_F(KnnQueryTest, booleanProhibitedMatchAllOrNothingWithKnn) {
     EXPECT_TRUE(run(optional, true).empty());
     EXPECT_EQ(run(optional, false), (Ids{"d0", "d1", "d2"}));
   }
+}
+
+TEST_F(KnnQueryTest, logicalDomainConsumption) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "foo_w", "apple",
+                  "body_v", std::vector<float>{1, 0}), UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{1, 0};
+  KnnQuery knn("body_v", type, vector, 1);
+  TermQuery term("foo_w", "apple");
+  google::protobuf::Arena arena;
+  auto* program = ValueExprParser({reader->schema().get(), {}}, arena).parse("score");
+  Query* children[]{&term, &knn};
+  for (Query* child : children) {
+    bool expected = child == &knn;
+    BoostQuery boost(child, 2);
+    ConstantScoreQuery constant(child);
+    ForcePrepareQuery force(child);
+    MinScoreQuery minimum(child, 0);
+    RescoreQuery rescore(child, program);
+    Query* disjuncts[]{&term, child};
+    MemPool queryPool;
+    auto* dismax = DisMaxQuery::make(queryPool, disjuncts, 0.5f);
+    Query* wrappers[]{child, &boost, &constant, &force, &minimum, &rescore, dismax};
+    for (Query* query : wrappers) {
+      EXPECT_EQ(expected, logicalConsumesDomain(*query));
+      for (int flags : {0, Query::NEED_SCORES}) {
+        MemPool pool;
+        Query::Context context(pool, *reader);
+        EXPECT_EQ(expected, query->createWeight(context, flags)->consumesDomain());
+      }
+    }
+  }
+  std::array<Query*, 1> consumer{&knn};
+  for (int role = 0; role < 4; role++) {
+    std::array<std::span<Query*>, 4> clauses{};
+    clauses[role] = consumer;
+    BooleanQuery boolean(clauses[0], clauses[1], clauses[2], clauses[3]);
+    EXPECT_TRUE(logicalConsumesDomain(boolean));
+  }
+  Query* required[]{&term};
+  BooleanQuery predicate(required, {}, {}, {});
+  EXPECT_FALSE(logicalConsumesDomain(predicate));
+  BooleanQuery mandOpt(required, consumer, {}, {});
+  EXPECT_TRUE(logicalConsumesDomain(mandOpt));
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  EXPECT_FALSE(mandOpt.createWeight(context, 0)->consumesDomain());
+}
+
+class KnnBooleanDomainTest : public KnnQueryTest {
+protected:
+  CollectionHelper helper;
+  std::shared_ptr<FilterCache> cache;
+
+  enum class Shape {
+    RANGE, CONSTANT_RANGE, ANY_OF, TERM, MATCH,
+    NESTED_RANGE, NESTED_CONSTANT_RANGE, CONSUMING_CHILD, CONSTANT_CONSUMING_CHILD,
+    NEGATIVE, NESTED_FILTER, NESTED_REQUIRED, WRAPPED_REQUIRED, BOOSTED_REQUIRED,
+    FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH,
+    REQUIRED_FILTER_CONSUMER, REQUIRED_PROHIBITED_CONSUMER, FILTER_REQUIRED_CONSUMER,
+    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER
+  };
+  enum class Caller { SCORED, COUNT, FIELD_SORT, CONSTANT_SCORE, RESCORE, FACET };
+  struct Result {
+    int64_t count;
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+  };
+
+  void SetUp() override {
+    KnnQueryTest::SetUp();
+    installVecSchema(helper.collection(), api::VectorMetric::L2);
+    FilterCacheConfig config;
+    config.maxBytes = 4 * 1024 * 1024;
+    config.minSegmentDocs = 0;
+    config.admissionThreshold = 1;
+    cache = std::make_shared<FilterCache>(config);
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+    for (int i = 0; i < 4; i++) {
+      helper.index(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i,
+          "cat_s", i < 2 ? "y" : "x", "all_s", "t",
+          "foo_w", i < 2 ? "orange" : "apple",
+          "body_v", std::vector<float>{(float)i, 0}));
+    }
+    helper.commit({"*"});
+  }
+
+  static api::Query query(std::pmr::memory_resource& mr, Shape shape,
+                          bool optional = false, bool rankOnly = false) {
+    auto constraint = qb::range(mr, "rank_i", qb::valI64(mr, 2), nullptr, nullptr, nullptr);
+    if (shape == Shape::CONSTANT_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
+      constraint = qb::constantScore(mr, constraint);
+    } else if (shape == Shape::ANY_OF) {
+      auto& any = constraint.kind.emplace<api::AnyOfQuery>();
+      any.field = "cat_s";
+      auto* values = build::allocMessage<api::Val>(mr);
+      auto& strings = values->kind.emplace<api::ArrStr>();
+      build::allocArray(strings.v, 1, mr)[0] = "x";
+      any.values = values;
+    } else if (shape == Shape::TERM || shape == Shape::MATCH) {
+      constraint = qb::match(mr, shape == Shape::TERM ? "cat_s" : "foo_w",
+                             shape == Shape::TERM ? "x" : "apple");
+    }
+    auto knn = qb::knn(mr, "body_v", {0, 0}, optional ? 1 : 2, 0, true);
+    if (shape == Shape::CONSUMING_CHILD || shape == Shape::CONSTANT_CONSUMING_CHILD) {
+      auto child = qb::boolean(mr, {knn, constraint});
+      if (shape == Shape::CONSTANT_CONSUMING_CHILD) child = qb::constantScore(mr, child);
+      return qb::boolean(mr, {child});
+    }
+    auto term = qb::match(mr, "all_s", "t");
+    if (shape == Shape::REQUIRED_FILTER_CONSUMER) {
+      auto inner = qb::boolean(mr, {term}, {}, {}, {knn});
+      return qb::boolean(mr, {term, inner}, {}, {}, {constraint});
+    }
+    if (shape == Shape::REQUIRED_PROHIBITED_CONSUMER) {
+      auto excluded = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {}, {}, {excluded});
+      return qb::boolean(mr, {term, inner}, {}, {}, {constraint});
+    }
+    if (shape == Shape::FILTER_REQUIRED_CONSUMER) {
+      auto inner = qb::boolean(mr, {knn}, {}, {}, {constraint});
+      return qb::boolean(mr, {}, {}, {}, {inner});
+    }
+    if (shape == Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER) {
+      auto selected = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {}, {}, {selected});
+      return qb::boolean(mr, {}, {selected}, {}, {inner});
+    }
+    if (shape == Shape::LIFTED_OPTIONAL_CONSUMER) {
+      auto ranking = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {term}, {ranking}, {}, {constraint});
+      return qb::boolean(mr, {inner});
+    }
+    std::vector<api::Query> ranks;
+    if (rankOnly) ranks.push_back(qb::match(mr, "id", "2"));
+    if (shape == Shape::NESTED_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
+      constraint = qb::boolean(mr, std::array{constraint}, ranks);
+    } else if (shape == Shape::NEGATIVE) {
+      std::vector<api::Query> carrier;
+      if (rankOnly) carrier.push_back(qb::all());
+      constraint = qb::boolean(mr, carrier, ranks,
+          std::array{qb::match(mr, "cat_s", "y")});
+    } else if (shape == Shape::NESTED_FILTER) {
+      constraint = qb::boolean(mr, std::array{term}, ranks, {}, std::array{constraint});
+    } else if (shape == Shape::NESTED_REQUIRED || shape == Shape::WRAPPED_REQUIRED
+               || shape == Shape::BOOSTED_REQUIRED || shape == Shape::FILTER_CHAIN
+               || shape == Shape::NESTED_MIN_MATCH) {
+      constraint = qb::boolean(mr, std::array{term, constraint}, ranks);
+      if (shape == Shape::WRAPPED_REQUIRED) constraint = qb::constantScore(mr, constraint);
+      if (shape == Shape::BOOSTED_REQUIRED) constraint = qb::boost(mr, constraint, 2);
+      if (shape == Shape::FILTER_CHAIN) constraint = qb::boolean(mr, {}, {}, {}, {constraint});
+      if (shape == Shape::NESTED_MIN_MATCH) {
+        constraint = qb::boolean(mr, {constraint}, {qb::match(mr, "foo_w", "apple")}, {}, {}, 1);
+      }
+    } else if (shape == Shape::OPTIONAL_GROUP) {
+      auto group = qb::boolean(mr, {term, constraint});
+      return qb::boolean(mr, {knn}, {group}, {}, {}, 1);
+    }
+    return optional ? qb::boolean(mr, {constraint}, {knn})
+                    : qb::boolean(mr, {knn, constraint});
+  }
+
+  Result run(Shape shape, Caller caller = Caller::SCORED, bool optional = false,
+             bool rankOnly = false) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->topDocs("q").countLimit().limit(caller == Caller::COUNT ? 0 : 10)
+                   .fields({"id"});
+    auto& mr = cur.mr();
+    auto q = query(mr, shape, optional, rankOnly);
+    if (caller == Caller::SCORED) cur.getScores();
+    if (caller == Caller::FIELD_SORT) qb::sort(cur, "rank_i", qb::ASC);
+    if (caller == Caller::CONSTANT_SCORE) q = qb::constantScore(mr, q);
+    if (caller == Caller::RESCORE) q = qb::rescore(mr, q, "1");
+    cur.rawQuery() = q;
+    if (caller == Caller::FACET) {
+      cur.allQuery();
+      auto& facet = cur.facet("f", "cat_s").rawOp().kind.emplace<api::QueryFacet>();
+      auto* bucket = build::allocArray(facet.buckets, 1, mr);
+      bucket->name = "selected";
+      auto* stored = build::allocMessage<api::Query>(mr);
+      *stored = q;
+      bucket->query = stored;
+    }
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Result result{req->getMatchCount("q"), resultIds(*req), {}};
+    if (caller == Caller::FACET) {
+      result.count = req->docList("q")->ops.at("f")->facetResult()->counts[0];
+      result.ids.clear();
+    }
+    auto scores = resultScores(*req);
+    for (size_t i = 0; i < scores.size(); i++) result.scores[result.ids[i]] = scores[i];
+    std::sort(result.ids.begin(), result.ids.end());
+    return result;
+  }
+
+  void expect(Shape shape, Caller caller, int count, bool rankOnly = false) {
+    SCOPED_TRACE(::testing::Message() << (int)shape << ":" << (int)caller << ":" << rankOnly);
+    auto result = run(shape, caller, false, rankOnly);
+    EXPECT_EQ(count, result.count);
+    if (caller != Caller::COUNT && caller != Caller::FACET) {
+      EXPECT_EQ(count == 0 ? std::vector<std::string>{}
+                           : (std::vector<std::string>{"2", "3"}), result.ids);
+    }
+  }
+
+  void expect(Shape shape, std::initializer_list<std::string> ids) {
+    for (auto caller : {Caller::SCORED, Caller::COUNT, Caller::FIELD_SORT,
+                        Caller::CONSTANT_SCORE, Caller::RESCORE, Caller::FACET}) {
+      SCOPED_TRACE(::testing::Message() << (int)shape << ":" << (int)caller);
+      cache->clear();
+      for (int repeat = 0; repeat < 2; repeat++) {
+        auto result = run(shape, caller);
+        EXPECT_EQ(ids.size(), result.count);
+        if (caller != Caller::COUNT && caller != Caller::FACET) {
+          EXPECT_EQ(std::vector<std::string>(ids), result.ids);
+        }
+      }
+    }
+  }
+
+  static FilterKey key(const Query& query) {
+    FilterKeyBuilder builder;
+    FilterKeyScope scope = query.appendFilterKey(builder, {});
+    return std::move(builder).finishStructural(scope, {});
+  }
+};
+
+TEST_F(KnnBooleanDomainTest, requiredFilterConsumerKeepsOuterDomain) {
+  expect(Shape::REQUIRED_FILTER_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, requiredProhibitedConsumerKeepsOuterDomain) {
+  expect(Shape::REQUIRED_PROHIBITED_CONSUMER, {"3"});
+}
+
+TEST_F(KnnBooleanDomainTest, filterRequiredConsumerKeepsInnerDomain) {
+  expect(Shape::FILTER_REQUIRED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, negativeMergeKeepsOptionalConsumerOptional) {
+  expect(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER, {"1", "2", "3"});
+  auto result = run(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER);
+  EXPECT_FLOAT_EQ(0, result.scores.at("3"));
+}
+
+TEST_F(KnnBooleanDomainTest, optionalConsumerCanStillLift) {
+  expect(Shape::LIFTED_OPTIONAL_CONSUMER, {"2", "3"});
+  auto result = run(Shape::LIFTED_OPTIONAL_CONSUMER);
+  EXPECT_GT(result.scores.at("2"), result.scores.at("3"));
+}
+
+TEST_F(KnnBooleanDomainTest, inliningKeepsEquivalentPrepareStages) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{0, 0};
+  KnnQuery knn("body_v", type, vector, 2);
+  TermQuery term("all_s", "t");
+  NumericPredicateQuery range("rank_i", 2, 3);
+  Query* scalar[]{&term};
+  Query* consumer[]{&knn};
+  Query* filter[]{&range};
+  for (bool filterParent : {false, true}) {
+    for (int role = 0; role < 3; role++) {
+      SCOPED_TRACE(::testing::Message() << filterParent << ":" << role);
+      std::span<Query*> required = role == 0 ? std::span<Query*>(consumer) : scalar;
+      std::span<Query*> prohibited = role == 2 ? std::span<Query*>(consumer) : std::span<Query*>{};
+      std::span<Query*> filters = role == 1 ? std::span<Query*>(consumer) : std::span<Query*>{};
+      BooleanQuery inner(required, {}, prohibited, filters);
+      BoostQuery wrapped(&inner, 2);
+      Query* mandatory[]{&term, &wrapped};
+      Query* parentFilters[]{&range, &wrapped};
+      BooleanQuery query(filterParent ? std::span<Query*>(scalar) : mandatory, {}, {},
+          filterParent ? std::span<Query*>(parentFilters) : filter);
+      MemPool pool;
+      auto view = query.normalizationForTest(pool);
+      bool safe = filterParent ? role != 0 : role == 0;
+      EXPECT_EQ(safe, (view.ruleMask & BooleanQuery::R1_REQUIRED_INLINE) != 0);
+    }
+  }
+  Query* required[]{&term};
+  Query* optional[]{&knn};
+  BooleanQuery inner(required, optional, {}, filter);
+  Query* sole[]{&inner};
+  BooleanQuery query(sole, {}, {}, {});
+  MemPool pool;
+  auto view = query.normalizationForTest(pool);
+  EXPECT_NE(0u, view.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
+  EXPECT_EQ(1u, view.optionalCount);
+}
+
+TEST_F(KnnBooleanDomainTest, requiredConstraintsSelectMatchingNeighbors) {
+  for (auto shape : {Shape::RANGE, Shape::ANY_OF}) expect(shape, Caller::SCORED, 2);
+  for (auto shape : {Shape::CONSTANT_RANGE, Shape::TERM, Shape::MATCH}) {
+    expect(shape, Caller::SCORED, 0);
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, optionalKnnSelectsInsideRequiredRange) {
+  auto result = run(Shape::RANGE, Caller::SCORED, true);
+  EXPECT_EQ(2, result.count);
+  EXPECT_EQ((std::vector<std::string>{"2", "3"}), result.ids);
+  EXPECT_GT(result.scores.at("2"), 0.0f);
+  EXPECT_FLOAT_EQ(0.0f, result.scores.at("3"));
+}
+
+TEST_F(KnnBooleanDomainTest, membershipIsIndependentOfCallerAndCache) {
+  for (auto shape : {Shape::RANGE, Shape::MATCH}) {
+    int count = shape == Shape::RANGE ? 2 : 0;
+    for (auto caller : {Caller::SCORED, Caller::COUNT, Caller::FIELD_SORT,
+                        Caller::CONSTANT_SCORE, Caller::RESCORE, Caller::FACET}) {
+      cache->clear();
+      for (int repeat = 0; repeat < 2; repeat++) expect(shape, caller, count);
+      expect(shape, Caller::SCORED, count);
+    }
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, membershipKeysSeparateSelectionDomains) {
+  for (auto pair : {std::pair{Shape::RANGE, Shape::CONSTANT_RANGE},
+                    std::pair{Shape::ANY_OF, Shape::TERM},
+                    std::pair{Shape::NESTED_RANGE, Shape::NESTED_CONSTANT_RANGE}}) {
+    for (bool reverse : {false, true}) {
+      cache->clear();
+      auto first = reverse ? pair.second : pair.first;
+      auto second = reverse ? pair.first : pair.second;
+      int firstCount = reverse ? 0 : 2, secondCount = reverse ? 2 : 0;
+      expect(first, Caller::COUNT, firstCount);
+      auto hits = cache->counters().readerStableHits;
+      expect(first, Caller::COUNT, firstCount);
+      EXPECT_GT(cache->counters().readerStableHits, hits);
+      expect(second, Caller::COUNT, secondCount);
+      expect(second, Caller::SCORED, secondCount);
+      expect(first, Caller::SCORED, firstCount);
+    }
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, requiredClosureIsIndependentOfInlining) {
+  for (auto shape : {Shape::NEGATIVE, Shape::NESTED_FILTER, Shape::NESTED_REQUIRED,
+                     Shape::WRAPPED_REQUIRED, Shape::BOOSTED_REQUIRED, Shape::FILTER_CHAIN,
+                     Shape::NESTED_MIN_MATCH, Shape::NESTED_RANGE}) {
+    for (bool rankOnly : {false, true}) {
+      for (auto caller : {Caller::SCORED, Caller::COUNT, Caller::FIELD_SORT,
+                          Caller::CONSTANT_SCORE, Caller::RESCORE, Caller::FACET}) {
+        cache->clear();
+        expect(shape, caller, 2, rankOnly);
+        expect(shape, caller, 2, rankOnly);
+      }
+    }
+  }
+  for (auto shape : {Shape::NESTED_RANGE, Shape::CONSUMING_CHILD,
+                     Shape::CONSTANT_CONSUMING_CHILD}) {
+    expect(shape, Caller::COUNT, 2);
+    expect(shape, Caller::SCORED, 2);
+  }
+  for (auto shape : {Shape::NESTED_CONSTANT_RANGE, Shape::OPTIONAL_GROUP}) {
+    expect(shape, Caller::COUNT, 0);
+    expect(shape, Caller::SCORED, 0);
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, extractedExclusionHonorsFoldOverride) {
+  SearchOverridesGuard guard(QueryPrep::disableProhibitedDomainFoldForTests);
+  QueryPrep::disableProhibitedDomainFoldForTests = true;
+  for (bool rankOnly : {false, true}) {
+    expect(Shape::NEGATIVE, Caller::SCORED, 0, rankOnly);
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, extractedLeafSharesRequestMaterialization) {
+  SearchOverridesGuard guard(SkipStats::enabled);
+  SkipStats::enabled = true;
+  for (bool noCache : {false, true}) for (bool exclusion : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << noCache << ":" << exclusion);
+    FilterCacheConfig config;
+    config.minSegmentDocs = 0;
+    config.admissionThreshold = 1000;
+    auto rejected = noCache ? nullptr : std::make_shared<FilterCache>(config);
+    IndexReader reader(*helper.collection().getShard()->getDirectory(), nullptr, rejected);
+    EXPECT_EQ(rejected.get(), reader.filterCache());
+    const auto& type = (const VectorFieldType&)*reader.schema()->getFieldTypePtr("body_v");
+    std::vector<float> vector{0, 0};
+    KnnQuery knn("body_v", type, vector, 2);
+    NumericPredicateQuery range("rank_i", 2, 3), same("rank_i", 2, 3), blocked("rank_i", 0, 1);
+    BoostQuery boosted(&same, 2);
+    TermQuery rank("id", "2");
+    Query* required[]{&range};
+    Query* optional[]{&rank};
+    Query* prohibited[]{&blocked};
+    if (exclusion) optional[0] = &knn;
+    BooleanQuery inner(exclusion ? std::span<Query*>{} : std::span<Query*>(required),
+        optional, exclusion ? std::span<Query*>(prohibited) : std::span<Query*>{}, {});
+    ForcePrepareQuery forced(&inner);
+    Query* outer[]{&knn, &forced, &boosted};
+    BooleanQuery query(std::span<Query*>(outer, exclusion ? 2 : 3), {}, {}, {});
+    MemPool pool;
+    Query::Context context(pool, reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    SkipStats::reset();
+    Query::Weight::PrepareContext prepare(reader, {}, false, nullptr);
+    auto prepared = weight->prepare(prepare);
+    std::vector<int> docs;
+    for (auto& segment : reader.segments()) {
+      auto* scorer = prepared->createScorer(pool, segment);
+      if (scorer) for (int doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        docs.push_back(doc);
+      }
+    }
+    EXPECT_EQ((std::vector<int>{2, 3}), docs);
+    EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+    EXPECT_GT(SkipStats::ownedFilterServes, 1);
+    if (rejected) {
+      EXPECT_EQ(0u, rejected->counters().builds);
+      EXPECT_EQ(0u, rejected->entryCountForTest());
+    }
+  }
+  SkipStats::reset();
+}
+
+TEST_F(KnnBooleanDomainTest, projectionKeepsAuthoredQueriesReusable) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{0, 0};
+  KnnQuery knn("body_v", type, vector, 2);
+  NumericPredicateQuery range("rank_i", 2, 3);
+  Query* required[]{&range};
+  BooleanQuery inner(required, {}, {}, {});
+  ForcePrepareQuery forced(&inner);
+  Query* outer[]{&knn, &forced};
+  BooleanQuery query(outer, {}, {}, {});
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto before = inner.compiledPlanForTest(context);
+  auto originalKey = key(inner);
+  EXPECT_EQ(1u, query.compiledPlanForTest(context).filter.size());
+  auto after = inner.compiledPlanForTest(context);
+  EXPECT_EQ(before.identity, after.identity);
+  EXPECT_EQ(1u, after.mandatory.size());
+  EXPECT_TRUE(after.filter.empty());
+  EXPECT_EQ(originalKey, key(inner));
+
+  Query* consumer[]{&knn};
+  for (bool prohibited : {false, true}) {
+    std::span<Query*> exclusions = prohibited ? consumer : std::span<Query*>{};
+    std::span<Query*> filters = prohibited ? std::span<Query*>{} : consumer;
+    BooleanQuery nested({}, {}, exclusions, filters);
+    ForcePrepareQuery forced(&nested);
+    Query* required[]{&knn, &forced};
+    BooleanQuery query(required, {}, {}, {});
+    auto view = query.normalizationForTest(pool);
+    EXPECT_EQ(0u, view.filterCount);
+    EXPECT_EQ(0u, view.prohibitedCount);
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, normalizerAndKeysUseEffectiveRoles) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{0, 0};
+  KnnQuery knn("body_v", type, vector, 2);
+  NumericPredicateQuery range("rank_i", 2, 3);
+  BoostQuery boosted(&range, 2);
+  ForcePrepareQuery forced(&range);
+  Query* consumer[]{&knn};
+  Query* leaves[]{&range, &boosted, &forced};
+  for (auto* leaf : leaves) {
+    Query* required[]{&knn, leaf};
+    BooleanQuery query(required, {}, {}, {});
+    MemPool pool;
+    auto view = query.normalizationForTest(pool);
+    ASSERT_EQ(1u, view.mandatoryCount);
+    ASSERT_EQ(1u, view.filterCount);
+    EXPECT_EQ(std::type_index(typeid(KnnQuery)), view.mandatoryTypes[0]);
+    EXPECT_EQ(std::type_index(typeid(*leaf)), view.filterTypes[0]);
+    EXPECT_NE(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
+    Query* filter[]{leaf};
+    BooleanQuery explicitFilter(consumer, {}, {}, filter);
+    EXPECT_EQ(key(explicitFilter), key(query));
+  }
+  Query* constraint[]{&range};
+  std::array<std::span<Query*>, 4> roles{};
+  for (int role : {-1, 2, 3}) {
+    roles = {};
+    roles[0] = constraint;
+    if (role >= 0) roles[role] = consumer;
+    BooleanQuery query(roles[0], roles[1], roles[2], roles[3]);
+    MemPool pool;
+    auto view = query.normalizationForTest(pool);
+    EXPECT_EQ(1u, view.mandatoryCount);
+    EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
+  }
+  BooleanQuery group(constraint, {}, {}, {});
+  BoostQuery boostedGroup(&group, 2);
+  ForcePrepareQuery forcedGroup(&group);
+  Query* groups[]{&group, &boostedGroup, &forcedGroup};
+  for (auto* nested : groups) {
+    Query* required[]{&knn, nested};
+    BooleanQuery query(required, {}, {}, {});
+    MemPool pool;
+    auto view = query.normalizationForTest(pool);
+    EXPECT_EQ(1u, view.filterCount);
+    EXPECT_NE(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
+  }
+  AllQuery all;
+  BoostQuery boostedAll(&all, 2);
+  ForcePrepareQuery forcedAll(&all);
+  ConstantScoreQuery automaticAll(&all, Query::ScoreProfile::automatic(1));
+  Query* identities[]{&all, &boostedAll, &forcedAll, &automaticAll};
+  for (auto* identity : identities) {
+    Query* required[]{&knn, identity};
+    BooleanQuery query(required, {}, {}, {});
+    MemPool pool;
+    auto view = query.normalizationForTest(pool);
+    EXPECT_EQ(0u, view.filterCount);
+    EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
+  }
+  ConstantScoreQuery scoredRange(&range);
+  Query* unpromoted[]{&knn, &scoredRange};
+  BooleanQuery postFilter(unpromoted, {}, {}, {});
+  Query* promoted[]{&knn, &range};
+  BooleanQuery preFilter(promoted, {}, {}, {});
+  EXPECT_NE(key(preFilter), key(postFilter));
+  Query* rawFilter[]{&range};
+  Query* decoratedFilter[]{&scoredRange};
+  BooleanQuery raw(consumer, {}, {}, rawFilter), decorated(consumer, {}, {}, decoratedFilter);
+  EXPECT_EQ(key(raw), key(decorated));
 }
 
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {

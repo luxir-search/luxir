@@ -619,13 +619,12 @@ TEST_F(BooleanQueryDedupTest, scoringAndMembershipDedupStayDistinct) {
   Query::Context scoringContext(scoringPool, *testIndex.reader);
   EXPECT_EQ(2u, scoring.compiledPlanForTest(scoringContext).optional.size());
 
-  // Membership roles dedup by the same equality: differing constants stay
-  // apart, equal wrappers drop.
+  // Membership ignores constant scores, so both wrappers share one predicate.
   Query* filterClauses[] = {&score2, &score3};
   BooleanQuery membership({}, {}, {}, filterClauses);
   MemPool membershipPool;
   Query::Context membershipContext(membershipPool, *testIndex.reader);
-  EXPECT_EQ(2u,
+  EXPECT_EQ(1u,
             membership.compiledPlanForTest(membershipContext).filter.size());
   ConstantScoreQuery score2Again(&a2, 2.0f);
   Query* equalFilterClauses[] = {&score2, &score2Again};

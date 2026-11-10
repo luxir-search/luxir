@@ -198,6 +198,8 @@ TEST(PluginQueryTest, identityAndSharedFilterCache) {
   auto* alias = parse(R"({"field_value_alias":{"value":"x"}})");
   auto* different = parse(R"({"field_value":{"value":"y"}})");
   ASSERT_EQ(QueryKind::PLUGIN, category->getKind());
+  EXPECT_FALSE(logicalConsumesDomain(*category));
+  EXPECT_FALSE(logicalConsumesDomain(*byId));
   EXPECT_NE(nullptr, dynamic_cast<example::CategoryValueQuery*>(category));
   EXPECT_NE(nullptr, dynamic_cast<example::IdValueQuery*>(byId));
   EXPECT_TRUE(category->equals(*same));

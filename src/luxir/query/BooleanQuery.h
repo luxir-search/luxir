@@ -10,11 +10,13 @@
 #include <typeindex>
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
 #include "AllQuery.h"
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
+#include "ForcePrepareQuery.h"
 #include "TermQuery.h"
 #include "QueryPrep.h"
 
@@ -52,10 +54,11 @@ public:
     R3_REQUIRED_DISJUNCTION_HOIST = 1u << 2,
     R4_SINGLE_CLAUSE_UNWRAP = 1u << 3,
     R5_MATCH_ALL_ELIMINATE = 1u << 4,
+    R6_REQUIRED_FILTER_PROMOTE = 1u << 5,
   };
 
-  // Snapshot of the query-pointer plan immediately before duplicate removal
-  // and weight creation. It deliberately exposes no child Query pointers.
+  // Snapshot of the normalized query-pointer plan before scoring duplicate
+  // merging and weight creation. It deliberately exposes no child Query pointers.
   struct NormalizeTestView {
     size_t mandatoryCount = 0;
     size_t optionalCount = 0;
@@ -131,6 +134,158 @@ private:
     float boost = 1.0f;
   };
 
+  static bool isImplicitConstraintLeaf(const Query& clause) {
+    if (luxir::scoreProfile(clause).kind != ScoreProfile::Kind::AUTO_UNIFORM
+        || luxir::logicalConsumesDomain(clause)
+        || luxir::exactDomainIdentity(clause)) {
+      return false;
+    }
+    const Query* leaf = &clause;
+    for (;;) {
+      switch (leaf->getKind()) {
+        case QueryKind::BOOST:
+          leaf = static_cast<const BoostQuery*>(leaf)->getChild();
+          break;
+        case QueryKind::CONSTANT_SCORE:
+          leaf = static_cast<const ConstantScoreQuery*>(leaf)->getChild();
+          break;
+        case QueryKind::FORCE_PREPARE:
+          leaf = static_cast<const ForcePrepareQuery*>(leaf)->getChild();
+          break;
+        default:
+          return leaf->getKind() != QueryKind::BOOLEAN;
+      }
+    }
+  }
+
+  static void deduplicateMembership(ClauseList& clauses) {
+    if (clauses.size() < 2) return;
+    boost::unordered_flat_set<Query*> pointers;
+    boost::unordered_flat_set<FilterKey, FilterKeyHash> keys;
+    auto end = std::remove_if(clauses.begin(), clauses.end(), [&](Query* clause) {
+      if (!pointers.insert(clause).second) return true;
+      FilterKeyBuilder builder;
+      auto scope = clause->appendFilterKey(builder, {});
+      if (scope == FilterKeyScope::UNCACHEABLE) return false;
+      return !keys.insert(std::move(builder).finishStructural(scope, {})).second;
+    });
+    clauses.erase(end, clauses.end());
+  }
+
+  static Query* requiredConstraintRoles(Query* clause, MemPool& pool,
+                                        NormalizedBoolean& parent) {
+    Query* child;
+    switch (clause->getKind()) {
+      case QueryKind::BOOST:
+        child = static_cast<BoostQuery*>(clause)->getChild();
+        break;
+      case QueryKind::CONSTANT_SCORE:
+        child = static_cast<ConstantScoreQuery*>(clause)->getChild();
+        break;
+      case QueryKind::FORCE_PREPARE:
+        child = static_cast<ForcePrepareQuery*>(clause)->getChild();
+        break;
+      case QueryKind::BOOLEAN: {
+        const auto& inner = *static_cast<BooleanQuery*>(clause);
+        auto roles = inner.effectiveRoles(pool, /*requiredChain=*/true);
+        auto extractableFilter = [](Query* query) {
+          return !luxir::logicalConsumesDomain(*query)
+              && !luxir::exactDomainIdentity(*query);
+        };
+        auto extractableProhibited = [](Query* query) {
+          return !luxir::logicalConsumesDomain(*query);
+        };
+        for (auto* filter : roles.filter) {
+          if (extractableFilter(filter)) parent.filter.push_back(filter);
+        }
+        for (auto* prohibited : roles.prohibited) {
+          if (extractableProhibited(prohibited)) parent.prohibited.push_back(prohibited);
+        }
+        // Keep a required carrier so optional clauses never become required.
+        size_t required = roles.mandatory.size() + roles.filter.size();
+        auto end = std::remove_if(roles.filter.begin(), roles.filter.end(),
+            [&](Query* query) {
+              if (required <= 1 || !extractableFilter(query)) return false;
+              required--;
+              return true;
+            });
+        roles.filter.erase(end, roles.filter.end());
+        if (required != 0) {
+          auto end = std::remove_if(roles.prohibited.begin(), roles.prohibited.end(),
+              extractableProhibited);
+          roles.prohibited.erase(end, roles.prohibited.end());
+        }
+        parent.ruleMask |= roles.ruleMask;
+        auto same = [](const ClauseList& a, std::span<Query*> b) {
+          return std::ranges::equal(a, b);
+        };
+        if (same(roles.mandatory, inner.mandatory)
+            && same(roles.filter, inner.filter)
+            && same(roles.prohibited, inner.prohibited)) return clause;
+
+        // Preserve boundaries and optional matching while sharing leaf uses.
+        auto* projected = pool.make<BooleanQuery>(
+            persistClauses(pool, roles.mandatory), inner.optional,
+            persistClauses(pool, roles.prohibited),
+            persistClauses(pool, roles.filter), inner.minShouldMatch);
+        projected->markPlannerGenerated();
+        return projected;
+      }
+      default:
+        return clause;
+    }
+    auto* projectedChild = requiredConstraintRoles(child, pool, parent);
+    if (projectedChild == child) return clause;
+    Query* projected;
+    switch (clause->getKind()) {
+      case QueryKind::BOOST:
+        projected = pool.make<BoostQuery>(projectedChild,
+            static_cast<BoostQuery*>(clause)->getBoost());
+        break;
+      case QueryKind::CONSTANT_SCORE:
+        projected = pool.make<ConstantScoreQuery>(projectedChild,
+            static_cast<ConstantScoreQuery*>(clause)->getScoreProfile());
+        break;
+      case QueryKind::FORCE_PREPARE:
+        projected = pool.make<ForcePrepareQuery>(projectedChild);
+        break;
+      default:
+        std::unreachable();
+    }
+    projected->markPlannerGenerated();
+    return projected;
+  }
+
+  NormalizedBoolean effectiveRoles(MemPool& pool, bool requiredChain = false) const {
+    NormalizedBoolean roles(*this);
+    bool consumes = requiredChain;
+    for (auto clauses : {mandatory, optional}) {
+      for (const auto* clause : clauses) {
+        consumes |= luxir::logicalConsumesDomain(*clause);
+      }
+    }
+    if (!consumes) return roles;
+
+    roles.mandatory.clear();
+    roles.filter.clear();
+    // Walk only authored required clauses; extracted references need no walk.
+    for (auto* clause : mandatory) {
+      if (isImplicitConstraintLeaf(*clause)) {
+        roles.filter.push_back(clause);
+        roles.ruleMask |= R6_REQUIRED_FILTER_PROMOTE;
+      } else {
+        roles.mandatory.push_back(requiredConstraintRoles(clause, pool, roles));
+      }
+    }
+    for (auto* clause : filter) {
+      auto* projected = requiredConstraintRoles(clause, pool, roles);
+      roles.filter.push_back(projected);
+    }
+    deduplicateMembership(roles.filter);
+    deduplicateMembership(roles.prohibited);
+    return roles;
+  }
+
   static TransparentBoolean transparentBoolean(Query* query,
                                                 bool allowConstantScore) {
     float boost = 1.0f;
@@ -182,6 +337,17 @@ private:
         && query.filter.empty() && query.minShouldMatch <= 1;
   }
 
+  static bool changesConsumerPrepareStage(const BooleanQuery& inner,
+                                          bool parentIsFilter) {
+    auto consumes = [](std::span<Query*> clauses) {
+      return std::ranges::any_of(clauses, [](const Query* clause) {
+        return luxir::logicalConsumesDomain(*clause);
+      });
+    };
+    return parentIsFilter ? consumes(inner.mandatory)
+                          : consumes(inner.filter) || consumes(inner.prohibited);
+  }
+
   static void normalizeRequiredList(NormalizedBoolean& plan, ClauseList& parents,
                                     bool parentIsFilter, MemPool& pool) {
     size_t i = 0;
@@ -189,7 +355,12 @@ private:
       TransparentBoolean child = transparentBoolean(
         parents[i], /*allowConstantScore=*/parentIsFilter);
       BooleanQuery* inner = child.query;
-      if (inner != nullptr && (isPureNegative(*inner) || isComplementForm(*inner))) {
+      // Moving a selector between incoming and child domains changes its top-k.
+      if (inner == nullptr || changesConsumerPrepareStage(*inner, parentIsFilter)) {
+        i++;
+        continue;
+      }
+      if (isPureNegative(*inner) || isComplementForm(*inner)) {
         // Required complements contribute no score: drop their match-all
         // carrier (if present), strip wrappers, and merge the exclusions.
         // If an exclusion is itself a pure-negative Boolean it stays opaque;
@@ -201,8 +372,7 @@ private:
         // Re-examine the clause shifted into this slot.
         continue;
       }
-      bool hasRequired = inner != nullptr
-        && (!inner->mandatory.empty() || !inner->filter.empty());
+      bool hasRequired = !inner->mandatory.empty() || !inner->filter.empty();
       // A sole required child may lift its rank-only optionals into an outer
       // Boolean that has no optional constraint of its own. This is the same
       // required body and the same optional score decoration, while exposing
@@ -216,25 +386,25 @@ private:
       // planner probes such optionals per candidate, multi-child lifting
       // is a measured regression, so it stays opaque here.
       bool liftRankOnlyOptionals =
-          !parentIsFilter && inner != nullptr
-          && inner->minShouldMatch == 0 && parents.size() == 1
+          !parentIsFilter && inner->minShouldMatch == 0 && parents.size() == 1
           && !plan.filter.empty() && plan.optional.empty()
           && plan.minShouldMatch == 0;
       bool optionalsAllowed = parentIsFilter
-          || (inner != nullptr
-              && (inner->optional.empty() || liftRankOnlyOptionals));
-      if (inner == nullptr || inner->minShouldMatch != 0 || !hasRequired
+          || inner->optional.empty() || liftRankOnlyOptionals;
+      if (inner->minShouldMatch != 0 || !hasRequired
           || !optionalsAllowed) {
         i++;
         continue;
       }
 
+      // Inlining must retain roles already established inside the child.
+      auto innerRoles = inner->effectiveRoles(pool);
       ClauseList replacement;
       if (parentIsFilter) {
-        replacement.insert(replacement.end(), inner->mandatory.begin(), inner->mandatory.end());
-        replacement.insert(replacement.end(), inner->filter.begin(), inner->filter.end());
+        replacement.insert(replacement.end(), innerRoles.mandatory.begin(), innerRoles.mandatory.end());
+        replacement.insert(replacement.end(), innerRoles.filter.begin(), innerRoles.filter.end());
       } else {
-        for (Query* query : inner->mandatory) {
+        for (Query* query : innerRoles.mandatory) {
           replacement.push_back(scoringClause(pool, query, child.boost));
         }
         if (liftRankOnlyOptionals) {
@@ -243,15 +413,15 @@ private:
                 scoringClause(pool, query, child.boost));
           }
         }
-        plan.filter.insert(plan.filter.end(), inner->filter.begin(), inner->filter.end());
+        plan.filter.insert(plan.filter.end(), innerRoles.filter.begin(), innerRoles.filter.end());
       }
-      plan.prohibited.insert(plan.prohibited.end(), inner->prohibited.begin(),
-                             inner->prohibited.end());
+      plan.prohibited.insert(plan.prohibited.end(), innerRoles.prohibited.begin(),
+                             innerRoles.prohibited.end());
 
       parents.erase(parents.begin() + (ptrdiff_t) i);
       parents.insert(parents.begin() + (ptrdiff_t) i,
                      replacement.begin(), replacement.end());
-      plan.ruleMask |= R1_REQUIRED_INLINE;
+      plan.ruleMask |= R1_REQUIRED_INLINE | innerRoles.ruleMask;
       // Re-examine the replacement (or the clause shifted into this slot).
     }
   }
@@ -262,7 +432,7 @@ private:
   // a sole match-all IS the domain (browse-all, complement carrier), and
   // optionals never gate matching once any required clause exists, so
   // removing their match-all domain would change the match set. Wrapped
-  // match-alls (Boost/ConstantScore) are explicit scores and stay.
+  // forms stay so explicit constant scores survive.
   static void eliminateMatchAll(NormalizedBoolean& plan) {
     auto sweep = [&plan](ClauseList& list) {
       size_t i = 0;
@@ -308,10 +478,12 @@ private:
   }
 
   NormalizedBoolean normalize(MemPool& pool) const {
-    NormalizedBoolean plan(*this);
+    auto plan = effectiveRoles(pool);
 
     normalizeRequiredList(plan, plan.mandatory, /*parentIsFilter=*/false, pool);
     normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
+    deduplicateMembership(plan.filter);
+    deduplicateMembership(plan.prohibited);
     eliminateMatchAll(plan);
     flattenDisjunctions(plan, pool);
 
@@ -341,10 +513,14 @@ private:
     // Pure negation is an engine-level complement. Seed a required match-all;
     // its AUTO_UNIFORM profile makes it required-but-non-scoring. This covers
     // raw API trees; expr/simple_query already emit the equivalent carrier.
+    // Also retain a required carrier if inlining removed the last one;
+    // otherwise rank-only optionals would become matching requirements.
     // Keep minShouldMatch unchanged so deliberately impossible direct-
     // construction values remain impossible.
-    if (plan.mandatory.empty() && plan.optional.empty() && plan.filter.empty()
-        && !plan.prohibited.empty()) {
+    bool lostRequiredCarrier = plan.minShouldMatch == 0
+        && (!mandatory.empty() || !filter.empty());
+    if (plan.mandatory.empty() && plan.filter.empty() && !plan.prohibited.empty()
+        && (plan.optional.empty() || lostRequiredCarrier)) {
       auto* seed = pool.make<AllQuery>();
       seed->markPlannerGenerated();
       plan.mandatory.push_back(seed);
@@ -396,8 +572,8 @@ private:
     int32_t duplicateSlots = 0;
   };
 
-  static DuplicateGroups findDuplicateGroups(
-      MemPool& pool, std::span<Query*> clauses, bool sumBoosts) {
+  static DuplicateGroups findDuplicateScoringGroups(
+      MemPool& pool, std::span<Query*> clauses) {
     DuplicateGroups result;
     result.byClause.resize(clauses.size(), -1);
     if (clauses.size() < 2) return result;
@@ -432,12 +608,10 @@ private:
       }
       result.byClause[i] = slot;
       duplicate.count++;
-      if (sumBoosts) {
-        duplicate.boost += peeled.boost;
-        if (!std::isfinite(duplicate.boost)) {
-          throw std::runtime_error(
-              "summed duplicate-clause boost must be finite");
-        }
+      duplicate.boost += peeled.boost;
+      if (!std::isfinite(duplicate.boost)) {
+        throw std::runtime_error(
+            "summed duplicate-clause boost must be finite");
       }
     }
     return result;
@@ -459,7 +633,7 @@ private:
   static std::span<Query*> mergeDuplicateScoringClauses(
       luxir::MemPool& pool, std::span<Query*> clauses,
       int32_t* removedOut = nullptr) {
-    DuplicateGroups duplicates = findDuplicateGroups(pool, clauses, true);
+    DuplicateGroups duplicates = findDuplicateScoringGroups(pool, clauses);
     if (duplicates.duplicateSlots == 0) {
       if (removedOut != nullptr) *removedOut = 0;
       return clauses;
@@ -494,22 +668,6 @@ private:
     return {kept, out.size()};
   }
 
-  static std::span<Query*> dropDuplicateMembershipClauses(
-      luxir::MemPool& pool, std::span<Query*> clauses) {
-    DuplicateGroups duplicates = findDuplicateGroups(pool, clauses, false);
-    if (duplicates.duplicateSlots == 0) return clauses;
-    boost::container::small_vector<Query*, 16> out;
-    for (size_t i = 0; i < clauses.size(); i++) {
-      int32_t group = duplicates.byClause[i];
-      if (group >= 0
-          && i != duplicates.slots[(size_t) group].representative) continue;
-      out.push_back(clauses[i]);
-    }
-    auto* kept = pool.make_arr<Query*>(out.size());
-    std::copy(out.begin(), out.end(), kept);
-    return {kept, out.size()};
-  }
-
   static std::span<Query*> persistClauses(
       MemPool& pool, std::span<Query*> clauses) {
     if (clauses.empty()) return {};
@@ -532,10 +690,6 @@ private:
       int32_t removedOptional = 0;
       auto optionalClauses = mergeDuplicateScoringClauses(
           context.pool, normalized.optional, &removedOptional);
-      auto prohibitedClauses = dropDuplicateMembershipClauses(
-          context.pool, normalized.prohibited);
-      auto filterClauses = dropDuplicateMembershipClauses(
-          context.pool, normalized.filter);
 
       // Luxir-defined min_match semantics under duplicate removal, split by
       // the intent the value expresses (Lucene instead refuses to dedup when
@@ -557,8 +711,8 @@ private:
       // in the request pool so all Weights for this Query share one plan.
       compiled->mandatory = persistClauses(context.pool, mandatoryClauses);
       compiled->optional = persistClauses(context.pool, optionalClauses);
-      compiled->prohibited = persistClauses(context.pool, prohibitedClauses);
-      compiled->filter = persistClauses(context.pool, filterClauses);
+      compiled->prohibited = persistClauses(context.pool, normalized.prohibited);
+      compiled->filter = persistClauses(context.pool, normalized.filter);
       return compiled;
     });
   }
@@ -1025,6 +1179,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    MemPool pool;
+    auto roles = effectiveRoles(pool);
     out.appendKind(kind);
     out.appendInt32(minShouldMatch);
     FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;
@@ -1036,14 +1192,23 @@ public:
             scope, clause->appendFilterKey(out, ctx));
       }
     };
-    appendRole(FilterKeyTag::BOOLEAN_MANDATORY, mandatory);
-    bool dropOptional = (!mandatory.empty() || !filter.empty())
+    appendRole(FilterKeyTag::BOOLEAN_MANDATORY, roles.mandatory);
+    bool dropOptional = (!roles.mandatory.empty() || !roles.filter.empty())
         && minShouldMatch < 1;
     appendRole(FilterKeyTag::BOOLEAN_OPTIONAL,
-               dropOptional ? std::span<Query*>{} : optional);
-    appendRole(FilterKeyTag::BOOLEAN_PROHIBITED, prohibited);
-    appendRole(FilterKeyTag::BOOLEAN_FILTER, filter);
+               dropOptional ? std::span<Query*>{} : std::span<Query*>(roles.optional));
+    appendRole(FilterKeyTag::BOOLEAN_PROHIBITED, roles.prohibited);
+    appendRole(FilterKeyTag::BOOLEAN_FILTER, roles.filter);
     return scope;
+  }
+
+  bool shapeConsumesDomain() const {
+    for (auto clauses : {mandatory, optional, prohibited, filter}) {
+      for (const auto* clause : clauses) {
+        if (luxir::logicalConsumesDomain(*clause)) return true;
+      }
+    }
+    return false;
   }
 
   ScoreProfile shapeScoreProfile() const {
