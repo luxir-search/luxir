@@ -230,16 +230,16 @@ void emitPage(const CollapsedPageSettings& settings,
           keyAt((size_t)rank.slot), mr, pool);
       size_t slot = (size_t)(i - offset);
       if (counts) counts[i - begin] = page->counts[slot];
-      if constexpr (metricOrder) {
-        if (ranks) collector.emitRank(ranks[i - begin], rank.slot, mr);
-      } else if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
-        emitCollapseRank(ranks[i - begin], settings.sort,
-            *qr.req.reader, rank.doc, rank.score, mr);
+      if constexpr (!metricOrder) {
+        if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
+          emitCollapseRank(ranks[i - begin], settings.sort,
+              *qr.req.reader, rank.doc, rank.score, mr);
+        }
       }
     }
     settings.collapse.renderKeys(table.keys, qr.flags, mr);
     if (ranks) {
-      if constexpr (metricOrder) collector.renderRanks(table.ranks, qr.flags, mr);
+      if constexpr (metricOrder) collector.renderRanks(table.ranks, scoreDocs.subspan((size_t)begin, (size_t)(end - begin)), qr.flags, mr);
       else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
     }
   };

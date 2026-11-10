@@ -6,6 +6,7 @@
 #include "luxir/api/RequestFlags.h"
 #include "luxir/api/build.h"
 #include "luxir/value/ValueTypes.h"
+#include "luxir/util/Decimal.h"
 
 namespace luxir {
 
@@ -17,6 +18,12 @@ struct NativeValueOutput {
 
 struct BooleanValueOutput {
   template <typename T> bool operator()(T value) const { return value != 0; }
+};
+
+struct DecimalValueOutput {
+  DecimalScale scale;
+  explicit DecimalValueOutput(int scale) : scale(scale) {}
+  template <typename T> double operator()(T raw) const { return scale(raw); }
 };
 
 struct ValueOutputContext {
@@ -43,6 +50,10 @@ struct IsoValueOutput {
 // Native checks and rendering share this dispatch.
 template <typename Emit>
 void selectValueOutput(ValueNature nature, uint64_t flags, Emit emit) {
+  if (valueDecimal(nature) && !(flags & RequestFlags::DECIMAL_SCALED)) {
+    emit.template operator()<DecimalValueOutput>(valueDecimalScale(nature));
+    return;
+  }
   switch (nature) {
     case ValueNature::BOOLEAN:
       emit.template operator()<BooleanValueOutput>();

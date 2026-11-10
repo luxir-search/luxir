@@ -29,6 +29,7 @@ struct RequestFlags {
       (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_LOW_BIT)
       | (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_HIGH_BIT);
   static constexpr uint64_t INT64_STR = uint64_t{1} << (int)api::RequestFlagBit::INT64_STR_BIT;
+  static constexpr uint64_t DECIMAL_SCALED = uint64_t{1} << (int)api::RequestFlagBit::DECIMAL_SCALED_BIT;
   static constexpr uint64_t ESTIMATE_COUNT =
       uint64_t{1} << (int)api::RequestFlagBit::ESTIMATE_COUNT_BIT;
   static constexpr std::array<std::string_view, 4> DATE_NAMES{
@@ -42,7 +43,7 @@ struct RequestFlags {
     if (level == Level::OP && ((flags | flagsSet) & INT64_STR)) {
       return "int64_str is request-level only";
     }
-    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR | ESTIMATE_COUNT)) {
+    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR | ESTIMATE_COUNT | DECIMAL_SCALED)) {
       return "unknown request flag bits";
     }
     uint64_t dateSet = flagsSet & DATE_MASK;
@@ -64,6 +65,12 @@ struct RequestFlags {
                              Level level = Level::REQUEST) {
     Override out;
     for (auto name : names) {
+      if (name == "decimal_scaled") {
+        if (out.flagsSet & DECIMAL_SCALED) throw RequestError("duplicate decimal_scaled flag");
+        out.flags |= DECIMAL_SCALED;
+        out.flagsSet |= DECIMAL_SCALED;
+        continue;
+      }
       if (name == "int64_str") {
         if (level == Level::OP) throw RequestError("int64_str is request-level only");
         if (out.flagsSet & INT64_STR) throw RequestError("duplicate int64_str flag");
@@ -96,6 +103,7 @@ struct RequestFlags {
     if (flagsSet & DATE_MASK) out.push_back(dateName(flags));
     if (flags & flagsSet & INT64_STR) out.push_back("int64_str");
     if (flags & flagsSet & ESTIMATE_COUNT) out.push_back("estimate_count");
+    if (flags & flagsSet & DECIMAL_SCALED) out.push_back("decimal_scaled");
     return out;
   }
 

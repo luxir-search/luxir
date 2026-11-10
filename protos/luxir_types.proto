@@ -18,6 +18,7 @@ enum RequestFlagBit {
   DATE_MODE_HIGH_BIT = 1;
   INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
   ESTIMATE_COUNT_BIT = 3; // lists with an unset or positive count_limit may estimate found
+  DECIMAL_SCALED_BIT = 4; // decimal literals and results use raw scaled integers
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -1114,13 +1115,14 @@ message SearchResponse {
 
 // Typed collapse identity. Component types follow the resolved schema fields.
 message GroupComponent {
-  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; } // INT carries signed int64 values.
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; DECIMAL = 5; } // INT carries signed int64 values.
   Type type = 1;
   oneof value {
     google.protobuf.NullValue null = 2;
     string s = 3;
     sint64 i = 4;
     bool b = 5;
+    double d = 6;
   }
 }
 message GroupKey {
@@ -2433,6 +2435,7 @@ message FieldDef {
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
     BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
+    DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2531,6 +2534,9 @@ message FieldDef {
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
 
+  // DECIMAL only, and required there: digits after the decimal point, 0 to 18.
+  // Excess fractional digits round half away from zero.
+  optional int32 scale = 25;
   // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
   // text is converted to this precision, truncating toward earlier time.
   // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.

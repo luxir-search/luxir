@@ -158,6 +158,28 @@ private:
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
     }
+    auto natureConversions = function.natureConversions({args.data(), children.size()});
+    for (size_t i = 0; i < children.size(); i++) {
+      if (!natureConversions[i]) continue;
+      AggregateNode child = program->nodes[children[i]];
+      if (valueDecimal(child.nature)) {
+        AggregateNode scale;
+        scale.intValue = valueDecimalScale(child.nature);
+        uint32_t scaleIndex = program->addNode(scale);
+        AggregateNode decode;
+        decode.kind = AggregateNodeKind::FUNCTION;
+        decode.type = BucketValueType::DOUBLE;
+        decode.children = {children[i], scaleIndex};
+        decode.childCount = 2;
+        decode.function = ValueFunctionRegistry::decimalDecoder();
+        children[i] = program->addNode(decode);
+      } else {
+        child.nature = ValueNature::NUMBER;
+        children[i] = program->addNode(child);
+      }
+      args[i] = {program->nodes[children[i]].type == BucketValueType::DOUBLE ? ValueType::DOUBLE : ValueType::INT64,
+                 ValueNature::NUMBER};
+    }
     auto conversions = function.dateConversionOperands(
         std::span<const ResolvedValue>(args.data(), children.size()));
     for (size_t convert = 0; convert < children.size(); convert++) {
@@ -270,6 +292,10 @@ private:
     }
 
     ResolvedAggregate resolved;
+    if (input != nullptr) {
+      ResolvedValue value{input->root().type, input->root().nature};
+      if (convertValueNature(function.natures, {&value, 1}, 0)) input->rootNode = input->numericNode(input->rootNode);
+    }
     try {
       resolved = function.resolve(
           input == nullptr ? nullptr : &input->root(), trailing);

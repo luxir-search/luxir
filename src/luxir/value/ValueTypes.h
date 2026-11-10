@@ -35,15 +35,35 @@ enum class ValueNature : uint8_t {
   DATE_NS,
   GEO_POINT,
   BOOLEAN,
+  DECIMAL_0, DECIMAL_1, DECIMAL_2, DECIMAL_3, DECIMAL_4,
+  DECIMAL_5, DECIMAL_6, DECIMAL_7, DECIMAL_8, DECIMAL_9,
+  DECIMAL_10, DECIMAL_11, DECIMAL_12, DECIMAL_13, DECIMAL_14,
+  DECIMAL_15, DECIMAL_16, DECIMAL_17, DECIMAL_18,
 };
 
+inline bool valueDecimal(ValueNature nature) {
+  return nature >= ValueNature::DECIMAL_0 && nature <= ValueNature::DECIMAL_18;
+}
+
+inline ValueNature decimalValueNature(int scale) {
+  assert(scale >= 0 && scale <= 18);
+  return (ValueNature)((int)ValueNature::DECIMAL_0 + scale);
+}
+
+inline int valueDecimalScale(ValueNature nature) {
+  assert(valueDecimal(nature));
+  return (int)nature - (int)ValueNature::DECIMAL_0;
+}
+
 inline std::string_view valueNatureName(ValueNature nature) {
+  if (valueDecimal(nature)) return "decimal";
   switch (nature) {
     case ValueNature::NUMBER: return "number";
     case ValueNature::BOOLEAN: return "boolean";
     case ValueNature::GEO_POINT: return "GEO_POINT";
     case ValueNature::DATE_MS: return "DATE unit 'ms'";
     case ValueNature::DATE_NS: return "DATE unit 'ns'";
+    default: break;
   }
   return "unknown";
 }
@@ -65,6 +85,25 @@ struct ResolvedValue {
   ValueType type = ValueType::INT64;
   ValueNature nature = ValueNature::NUMBER;
 };
+
+enum class NaturePolicy : uint8_t { NUMBER, SAME, DECIMAL, RAW };
+
+inline bool convertValueNature(NaturePolicy policy, std::span<const ResolvedValue> args,
+    size_t index, size_t first = 0) {
+  auto nature = args[index].nature;
+  if (nature == ValueNature::NUMBER || valueDate(nature) || nature == ValueNature::GEO_POINT) return false;
+  if (policy == NaturePolicy::RAW) return false;
+  if (policy == NaturePolicy::DECIMAL && valueDecimal(nature)) return false;
+  if (policy == NaturePolicy::SAME && index >= first) {
+    bool same = true;
+    for (size_t i = first; i < args.size(); i++) same &= args[i].nature == nature;
+    if (same) return false;
+  }
+  if (nature != ValueNature::BOOLEAN && !valueDecimal(nature)) {
+    throw std::logic_error("value nature has no numeric conversion");
+  }
+  return true;
+}
 
 // An expression that cannot be evaluated as written (type mismatch, bad
 // argument): a request error even when detected against document values.

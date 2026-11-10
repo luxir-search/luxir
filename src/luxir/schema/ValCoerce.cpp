@@ -8,8 +8,99 @@
 #include "luxir/schema/ValCoerce.h"
 
 #include "luxir/schema/FieldType.h"
+#include <array>
 #include "luxir/util/DateTime.h"
 #include "luxir/util/NumericUtils.h"
+
+namespace luxir::coerce {
+
+std::optional<int64_t> parseScaledDecimal(std::string_view s, int32_t scale,
+    DecimalRounding rounding, DecimalError& error) {
+  // Keep the integer digits, the round digit, and a sticky bit. Fraction
+  // length and exponent only place the decimal point; neither needs a buffer.
+  error = DecimalError::INVALID;
+  if (scale < 0 || scale > 18) return std::nullopt;
+  size_t i = 0;
+  bool negative = false;
+  if (i < s.size() && (s[i] == '-' || s[i] == '+')) negative = s[i++] == '-';
+  std::array<uint8_t, 20> digits{};
+  int64_t significant = 0, fraction = 0;
+  bool sawDigit = false, point = false, sticky = false;
+  for (; i < s.size(); i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9') {
+      sawDigit = true;
+      if (point) fraction++;
+      if (significant == 0 && c == '0') continue;
+      if (significant < (int64_t)digits.size()) digits[(size_t)significant] = c - '0';
+      else sticky |= c != '0';
+      significant++;
+    } else if (c == '.' && !point) point = true;
+    else break;
+  }
+  if (!sawDigit) return std::nullopt;
+  int64_t exponent = 0;
+  if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+    i++;
+    bool minus = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) minus = s[i++] == '-';
+    size_t start = i;
+    int64_t cap = (int64_t)std::min(s.size(), (size_t)(INT64_MAX / 4)) + 64;
+    for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; i++) {
+      exponent = exponent > cap / 10 ? cap : std::min(cap, exponent * 10 + s[i] - '0');
+    }
+    if (i == start) return std::nullopt;
+    if (minus) exponent = -exponent;
+  }
+  if (i != s.size()) return std::nullopt;
+  if (significant == 0) return 0;
+  __int128 wholeDigits = (__int128)significant + exponent - fraction + scale;
+  error = negative ? DecimalError::BELOW_RANGE : DecimalError::ABOVE_RANGE;
+  if (wholeDigits > 19) return std::nullopt;
+  uint64_t magnitude = 0;
+  for (int k = 0; k < wholeDigits; k++) {
+    magnitude = magnitude * 10 + (k < significant ? digits[k] : 0);
+  }
+  uint8_t round = 0;
+  bool remainder = false;
+  if (wholeDigits < 0) remainder = true;
+  else if (wholeDigits < significant) {
+    round = digits[(size_t)wholeDigits];
+    remainder = sticky;
+    for (size_t k = (size_t)wholeDigits + 1; k < digits.size(); k++) remainder |= digits[k] != 0;
+  }
+  bool fractional = round != 0 || remainder;
+  if (rounding == DecimalRounding::EXACT && fractional) {
+    error = DecimalError::INEXACT;
+    return std::nullopt;
+  }
+  bool increment = rounding == DecimalRounding::NEAREST_AWAY ? round >= 5
+      : rounding == DecimalRounding::FLOOR ? negative && fractional
+      : rounding == DecimalRounding::CEIL && !negative && fractional;
+  magnitude += increment;
+  uint64_t limit = (uint64_t)INT64_MAX + negative;
+  if (magnitude > limit) return std::nullopt;
+  if (negative && magnitude == (uint64_t{1} << 63)) return INT64_MIN;
+  return negative ? -(int64_t)magnitude : (int64_t)magnitude;
+}
+
+std::optional<int64_t> parseScaledDecimal(const api::Val& value, int32_t scale,
+    DecimalRounding rounding, DecimalError& error) {
+  char buffer[TEXT_BUF_SIZE];
+  std::string_view text;
+  error = DecimalError::INVALID;
+  if (auto* s = std::get_if<std::string_view>(&value.kind)) text = *s;
+  else if (auto* i = std::get_if<int64_t>(&value.kind)) {
+    text = {buffer, std::to_chars(buffer, buffer + sizeof(buffer), *i).ptr};
+  } else if (auto* d = std::get_if<double>(&value.kind)) {
+    text = {buffer, std::to_chars(buffer, buffer + sizeof(buffer), *d).ptr};
+  } else if (auto* f = std::get_if<float>(&value.kind)) {
+    text = {buffer, std::to_chars(buffer, buffer + sizeof(buffer), *f).ptr};
+  } else return std::nullopt;
+  return parseScaledDecimal(text, scale, rounding, error);
+}
+
+} // namespace luxir::coerce
 
 namespace luxir {
 
@@ -28,6 +119,21 @@ std::optional<int64_t> FieldType::tryCoerceColInt64(
     if (e.code != "invalid_value") throw;
     return std::nullopt;
   }
+}
+
+__int128 FieldType::coerceGridValue(const api::Val& val, std::string_view fieldName,
+    std::string_view role, const CoerceContext& context) const {
+  unused(role);
+  return coerceColInt64(val, fieldName, context);
+}
+
+__int128 DateFieldType::coerceGridValue(const api::Val& val, std::string_view fieldName,
+    std::string_view role, const CoerceContext& context) const {
+  unused(fieldName);
+  const auto* number = std::get_if<int64_t>(&val.kind);
+  if (!number) throw RequestError(fmt::format("a DATE {} must be integer {}",
+      role, dateUnitName(context.dateInputUnit.value_or(unit))));
+  return convertDateUnits(*number, context.dateInputUnit.value_or(unit), unit);
 }
 
 namespace {
@@ -52,7 +158,81 @@ FieldType::IntWindow literalWindow(FieldType::IntWindow window, FieldType::Liter
   return window;
 }
 
+coerce::DecimalRounding boundRounding(FieldType::LiteralUse use) {
+  using Use = FieldType::LiteralUse;
+  switch (use) {
+    case Use::GTE: case Use::LT: return coerce::DecimalRounding::CEIL;
+    case Use::GT: case Use::LTE: return coerce::DecimalRounding::FLOOR;
+    default: return coerce::DecimalRounding::NEAREST_AWAY;
+  }
+}
+
+std::optional<FieldType::IntWindow> scaledWindow(const api::Val& value, int scale,
+    coerce::DecimalRounding rounding, FieldType::LiteralUse use) {
+  coerce::DecimalError error;
+  if (auto point = coerce::parseScaledDecimal(value, scale, rounding, error)) {
+    return literalWindow({*point, *point}, use);
+  }
+  using Error = coerce::DecimalError;
+  using Use = FieldType::LiteralUse;
+  if (error != Error::BELOW_RANGE && error != Error::ABOVE_RANGE) return std::nullopt;
+  bool above = error == Error::ABOVE_RANGE;
+  bool unbounded = (above && (use == Use::LTE || use == Use::LT))
+      || (!above && (use == Use::GTE || use == Use::GT));
+  return unbounded ? FieldType::IntWindow{} : FieldType::IntWindow{1, 0};
+}
+
 } // namespace
+
+FieldType::IntWindow IntFieldType::coerceIntWindow(const api::Val& val, LiteralUse use,
+    std::string_view fieldName, const CoerceContext& context) const {
+  if (use == LiteralUse::MATCH || use == LiteralUse::MEMBER) {
+    return FieldType::coerceIntWindow(val, use, fieldName, context);
+  }
+  if (auto window = tryCoerceIntWindow(val, use, fieldName, context)) return *window;
+  coerce::throwCoerce(fieldName, val, "an integer range bound");
+}
+
+std::optional<FieldType::IntWindow> IntFieldType::tryCoerceIntWindow(const api::Val& val,
+    LiteralUse use, std::string_view fieldName, const CoerceContext& context) const {
+  if (use == LiteralUse::MATCH || use == LiteralUse::MEMBER) {
+    return FieldType::tryCoerceIntWindow(val, use, fieldName, context);
+  }
+  return scaledWindow(val, 0, boundRounding(use), use);
+}
+
+int64_t DecimalFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
+    const CoerceContext& context) const {
+  unused(context);
+  coerce::DecimalError error;
+  if (auto point = coerce::parseScaledDecimal(val, scale, coerce::DecimalRounding::NEAREST_AWAY, error)) return *point;
+  coerce::throwCoerce(fieldName, val, fmt::format("a decimal with scale {} ({})", scale,
+      error == coerce::DecimalError::INVALID ? "not a decimal number" : "is out of range"));
+}
+
+std::optional<FieldType::IntWindow> DecimalFieldType::tryCoerceIntWindow(const api::Val& val,
+    LiteralUse use, std::string_view fieldName, const CoerceContext& context) const {
+  unused(fieldName);
+  auto rounding = boundRounding(use);
+  if (context.decimalScaled && (use == LiteralUse::MATCH || use == LiteralUse::MEMBER)) {
+    rounding = coerce::DecimalRounding::EXACT;
+  }
+  return scaledWindow(val, context.decimalScaled ? 0 : scale, rounding, use);
+}
+
+FieldType::IntWindow DecimalFieldType::coerceIntWindow(const api::Val& val, LiteralUse use,
+    std::string_view fieldName, const CoerceContext& context) const {
+  if (auto window = tryCoerceIntWindow(val, use, fieldName, context)) return *window;
+  coerce::throwCoerce(fieldName, val, context.decimalScaled ? "a raw scaled integer" : "a decimal literal");
+}
+
+__int128 DecimalFieldType::coerceGridValue(const api::Val& val, std::string_view fieldName,
+    std::string_view role, const CoerceContext& context) const {
+  unused(role);
+  coerce::DecimalError error;
+  if (auto point = coerce::parseScaledDecimal(val, context.decimalScaled ? 0 : scale, coerce::DecimalRounding::EXACT, error)) return *point;
+  coerce::throwCoerce(fieldName, val, "an exact multiple of the decimal field's unit");
+}
 
 FieldType::IntWindow FieldType::coerceIntWindow(
     const api::Val& val, LiteralUse use, std::string_view fieldName,

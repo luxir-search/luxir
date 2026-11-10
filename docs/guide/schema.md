@@ -16,11 +16,62 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
+| `decimal` | Fixed-point number with a required `scale` (0 to 18 digits after the point). See [Decimals](#decimals). |
 | `boolean` | `true` or `false`: flags and on/off attributes. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### Decimals
+
+`decimal` stores `value * 10^scale` as a signed 64-bit integer. Set the
+required `scale` from 0 to 18; it is inherited from `parent` like other
+properties. A direct `scale` is invalid on other types; an inherited scale
+is ignored when a child changes type. There is no default decimal
+suffix. For example:
+
+```json
+{"fields":{"price":{"type":"decimal","scale":2,"index":"range"}}}
+```
+
+JSON integers, floating-point numbers and numeric strings are accepted.
+Excess fractional digits round half away from zero: `1.005` and `"1.005"`
+become 1.01 at scale 2, and -1.005 becomes -1.01. JSON floating-point inputs
+use their shortest round-trip text, rather than their binary expansion.
+Exponents and long fractions are accepted; overflow after rounding rejects
+an ingest value. Out-of-domain exact-match literals match nothing, and
+range bounds saturate to the field's value domain. Scale is persisted with the
+field type; reading or merging data under a different type or scale is rejected.
+
+Match and `any_of` literals round like ingest. Range bounds round in the
+requested direction: `gte: 10.005` starts at 10.01, while `lt: 10.005`
+includes values through 10.00. Integer field bounds also round directionally
+(`gte: 9.5` starts at 10); integer ingest and exact-match literals still
+reject non-integral values.
+
+Results are doubles by default, computed as raw divided by `10^scale`.
+This applies to documents, facet buckets and range bounds, sort values,
+collapse keys, and decimal statistics. The int64 storage is exact; doubles
+can lose distinctions at large magnitudes.
+
+The request or operation flag `decimal_scaled` instead returns raw integers
+and interprets decimal field literals as raw integers. Integral numeric
+strings, including `"1250.0"`, mean raw 1250 at every scale; non-integral
+match literals are rejected. Bounds still round directionally in raw units.
+Ingest always uses decimal values and is unaffected by the flag. Combine
+`decimal_scaled` with `int64_str` to round-trip large raw integers through
+JSON strings. Averages and percentiles remain doubles (in raw units under the flag).
+
+Range facet gaps and origins must be exact multiples of `10^-scale`; gaps
+must be positive. With `decimal_scaled` they use raw units. Selection,
+`min`, `max`, `sum`, and `avg` retain the scale when possible, aggregating
+raw values exactly (INT128 sums). Arithmetic and mixed-scale expressions
+decode to numeric values. Expression constants always mean values, independent
+of `decimal_scaled`. Same-scale comparisons use raw values; per-document
+comparisons against numeric constants use raw integer bounds when representable.
+A decimal sum wider than int64 renders as a double by default; scaled
+output emits null with an aggregate overflow warning, as integer sums do.
 
 ### Booleans
 
@@ -288,7 +339,8 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `boolean`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `date`, `vector`, `geo_point`, `id` |
+| `scale` | `decimal` only, required from 0 to 18; inherited from `parent`. |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
@@ -332,7 +384,7 @@ Validation includes inherited ANN settings and variants.
 ### Multi-valued modes
 
 `multi` is inherited when omitted and defaults to `false` (one value).
-`true` selects the type's default: set for INT, FLOAT, DOUBLE, BOOLEAN, DATE, and
+`true` selects the type's default: set for INT, FLOAT, DOUBLE, DECIMAL, BOOLEAN, DATE, and
 STRING; array for TEXT, VECTOR, and GEO_POINT. Explicit `"set"` and `"array"`
 select a mode. Array-only primary types reject `"set"`; ID is reserved for
 the single-valued `id` field.
@@ -660,7 +712,7 @@ The primary and every variant must use types from the same group:
 
 | Group | Allowed types |
 |---|---|
-| Scalar | `text`, `string`, `int`, `float`, `double`, `boolean`, `date`. |
+| Scalar | `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 

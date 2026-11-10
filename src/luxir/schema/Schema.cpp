@@ -45,6 +45,7 @@ struct ResolvedField {
   IndexMode index = IndexMode::NONE;
   std::optional<LongTerms> longTerms;
   std::optional<ApiDateUnit> dateUnit;
+  std::optional<int32_t> scale;
   bool hasColumn = false;
   bool column = false;
   // The effective analyzer, backed by source entries or AnalyzerDefinitions;
@@ -213,6 +214,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                       " (field: " + std::string(name) + "); valid: hash128, truncate, reject");
   }
 
+  r.scale = def.scale ? def.scale : parentResolved.scale;
   r.dateUnit = def.unit ? def.unit : parentResolved.dateUnit;
   if (r.dateUnit && *r.dateUnit != ApiDateUnit::MS && *r.dateUnit != ApiDateUnit::NS) {
     throw SchemaError("unknown unit value " + std::to_string((int)*r.dateUnit) +
@@ -436,6 +438,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
+  if (def.scale && r.type != FieldClass::DECIMAL) {
+    throw SchemaError("scale is only valid for decimal fields (field: " + name + ")");
+  }
   if (def.unit && r.type != FieldClass::DATE) {
     throw SchemaError("unit is only valid for date fields (field: " + name + ")");
   }
@@ -571,7 +576,7 @@ struct FieldCompiler {
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
                         r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
-                        r.type == FieldClass::BOOLEAN;
+                        r.type == FieldClass::BOOLEAN || r.type == FieldClass::DECIMAL;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -661,6 +666,12 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        break;
+      case FieldClass::DECIMAL:
+        if (!r.scale || *r.scale < 0 || *r.scale > DecimalFieldType::MAX_SCALE) {
+          throw SchemaError("decimal requires scale 0..18 (field: " + std::string(name) + ")");
+        }
+        ft = std::make_shared<DecimalFieldType>(name, *r.scale, flags);
         break;
       case FieldClass::BOOLEAN:
         ft = std::make_shared<BoolFieldType>(name, flags);

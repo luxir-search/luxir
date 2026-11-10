@@ -53,6 +53,7 @@ TEST_F(FieldTypeContractTest, operationCapabilities) {
       {std::make_shared<IdFieldType>("id"), terms},
       {std::make_shared<VectorFieldType>("vector", 3), 0},
       {std::make_shared<DateFieldType>("date"), numeric | F::COLLAPSE},
+      {std::make_shared<DecimalFieldType>("decimal", 2), numeric | F::COLLAPSE},
       {std::make_shared<GeoPointFieldType>("geo"), F::VALUE_EXPR}};
   CollectionHelper helper;
   auto schema = Schema::createDefaultSchema();
@@ -175,13 +176,13 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
 }
 
 TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
-  for (int type = FieldType::NONE; type <= FieldType::BOOLEAN; type++) {
+  for (int type = FieldType::NONE; type <= FieldType::DECIMAL; type++) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
     PostingsWriter writer(dir, 1, 1, 0);
     auto& info = writer.addField("value");
     info.type = (FieldType::Type)type;
-    info.typeFlags = type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
+    info.typeFlags = type == FieldType::DECIMAL ? 19 : type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
     writeUnversionedRuns(writer);
     writer.finish();
     PostingsReader reader(dir, 1, 1);

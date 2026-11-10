@@ -194,13 +194,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
     return BucketScalar::failed(root.type, root.nature, stateFailure);
   }
   auto validateOutput = [](BucketScalar result) {
-    if (result.valid && result.type == BucketValueType::INT128
-        && (result.intValue < std::numeric_limits<int64_t>::min()
-            || result.intValue > std::numeric_limits<int64_t>::max())) {
-      return BucketScalar::failed(result.type, result.nature,
-                                  AggregateFailure::INT64_OUTPUT_OVERFLOW);
-    }
-    return result;
+    return valueDecimal(result.nature) ? result : integerAggregateOutput(result);
   };
   if (root.kind == AggregateNodeKind::AGGREGATE) {
     const AggregateLeaf& leaf = program->leaves[root.aggregate];
