@@ -2115,7 +2115,8 @@ public:
             } else {
               acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
                   *query, *wholeMembershipWeight, *req.reader, parsedSorts,
-                  topCount, wholeFieldSortCacheRoutes);
+                  topCount, wholeFieldSortCacheRoutes,
+                  collapse != nullptr || diversify != nullptr);
             }
             fieldSortFullyRouted = !acquireUse;
           }

@@ -491,3 +491,102 @@ LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_asc, "many_is", qb::ASC, tr
 LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_desc, "many_is", qb::DESC, true);
 LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_min_asc, "min(many_is)", qb::ASC, true);
 LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_max_desc, "max(many_is)", qb::DESC, true);
+
+// A numeric sort with a string tiebreak, as cursor paging asks for it: one
+// segment of ascending gid_i (the worst case for a descending doc-order walk)
+// beside random and tied columns, with no filter, a range filter resuming
+// after the middle of the sort, or the full keyset disjunction.
+enum class TwoKeyFilter { NONE, RANGE, KEYSET };
+
+static void BM_TwoKeySort(benchmark::State& state, const char* primary,
+                          qb::SortDir direction, const char* tiebreak,
+                          TwoKeyFilter filter) {
+  int64_t nDocs = 5'000'000;
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
+  std::string collection = std::format("two_key_sort_bm_{}", nDocs);
+  CollectionHelper helper(collection);
+  std::vector<int32_t> docsPerSeg{(int32_t)nDocs};
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    helper.clear();
+    auto iw = helper.getIndexWriter();
+    Inverter& inverter = iw->obtainInverter();
+    Inverter::InputHandler& id = inverter.getIndexHandler("id");
+    Inverter::InputHandler& uid = inverter.getIndexHandler("uid_s");
+    Inverter::InputHandler& gid = inverter.getIndexHandler("gid_i");
+    Inverter::InputHandler& rnd = inverter.getIndexHandler("rnd_i");
+    Inverter::InputHandler& ties = inverter.getIndexHandler("ties_i");
+    for (int64_t doc = 0; doc < nDocs; doc++) {
+      SplitMix64 r(doc);
+      std::string key = std::format("{:012}", doc);
+      inverter.startDoc();
+      id.index(inverter, key);
+      uid.index(inverter, key);
+      gid.index(inverter, 10 * doc + 1);
+      rnd.index(inverter, r.rint(10'000'000));
+      ties.index(inverter, r.rint(100));
+      inverter.finishDoc();
+    }
+    iw->releaseInverter(inverter, true);
+    helper.commit();
+  }
+
+  int64_t pivot = 5 * nDocs;
+  auto execute = [&]() -> int64_t {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
+    auto& mr = top.mr();
+    if (filter != TwoKeyFilter::NONE) {
+      auto* val = qb::valI64(mr, pivot);
+      bool desc = direction == qb::DESC;
+      auto before = qb::range(mr, primary, nullptr, desc ? nullptr : val,
+                              nullptr, desc ? val : nullptr);
+      if (filter == TwoKeyFilter::RANGE) {
+        top.filter(before);
+      } else {
+        auto tied = qb::boolean(
+            mr, {qb::range(mr, primary, val, nullptr, val, nullptr),
+                 qb::range(mr, "uid_s", nullptr,
+                           qb::valStr(mr, std::format("{:012}", pivot)),
+                           nullptr, nullptr)});
+        top.filter(qb::boolean(mr, {}, {before, tied}));
+      }
+    }
+    qb::sort(top, primary, direction);
+    if (tiebreak != nullptr) qb::sort(top, tiebreak, qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    int64_t current = 0;
+    for (const auto& batch : req->responses) {
+      const auto* list = batch->proto.ops.at("q")->docList();
+      if (list == nullptr) continue;
+      for (const auto& docId : std::get<api::ColStr>(list->columns.at("id").kind).v) {
+        current = current * 31 + java_string_hashcode(docId);
+      }
+    }
+    return current;
+  };
+
+  int64_t fingerprint = execute();  // warms the filter cache too
+  for (auto _ : state) {
+    int64_t current = execute();
+    benchmark::DoNotOptimize(current);
+    ASSERT_EQ(fingerprint, current);
+  }
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = reused;
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_desc, "gid_i", qb::DESC, nullptr, TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_desc_uid, "gid_i", qb::DESC, "uid_s", TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_asc, "gid_i", qb::ASC, nullptr, TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_asc_uid, "gid_i", qb::ASC, "uid_s", TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_desc_range, "gid_i", qb::DESC, nullptr, TwoKeyFilter::RANGE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_desc_uid_range, "gid_i", qb::DESC, "uid_s", TwoKeyFilter::RANGE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_desc_uid_keyset, "gid_i", qb::DESC, "uid_s", TwoKeyFilter::KEYSET);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, gid_asc_uid_keyset, "gid_i", qb::ASC, "uid_s", TwoKeyFilter::KEYSET);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, rnd_desc, "rnd_i", qb::DESC, nullptr, TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, rnd_desc_uid, "rnd_i", qb::DESC, "uid_s", TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, ties_desc, "ties_i", qb::DESC, nullptr, TwoKeyFilter::NONE);
+LUXIR_BENCHMARK_CAPTURE(BM_TwoKeySort, ties_desc_uid, "ties_i", qb::DESC, "uid_s", TwoKeyFilter::NONE);

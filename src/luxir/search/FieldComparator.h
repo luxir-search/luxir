@@ -330,6 +330,11 @@ public:
 
   virtual KeyBatch* keyBatch() { return nullptr; }
 
+  // Restart any forward-only cursor before reading a doc behind the last one
+  // read in this segment (a bound-order visit reads a tiebreak column in leaf
+  // order, not doc order). Random-access readers need nothing.
+  virtual void rewind() {}
+
   // Optional competitive segment-ord interval for string-sort pruning,
   // derived from the heap bottom (so unlike KeyBatch it REQUIRES the
   // setBottom lifecycle). READY yields the inclusive 1-based segment-ord
@@ -523,6 +528,10 @@ public:
 
   FieldComparator::KeyBatch* keyBatch() override {
     return this;
+  }
+
+  void rewind() override {
+    if (iter.has_value()) iter.emplace(*reader);
   }
 
   void growSlots(int32_t capacity) override {
@@ -1229,6 +1238,10 @@ public:
       resizeExact(values, (size_t)capacity);
       resizeExact(missing, (size_t)capacity);
     }
+  }
+
+  void rewind() override {
+    if (iter.has_value()) iter.emplace(*reader);
   }
 
   std::optional<std::string_view> getDocValue(int32_t docid) {

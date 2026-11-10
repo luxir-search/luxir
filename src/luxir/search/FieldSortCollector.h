@@ -178,6 +178,16 @@ public:
   // (measured ~40% slower on match-all single-field sort benchmarks).
   FieldComparator* soleColumn = nullptr;
   RuntimeClause* soleExpr = nullptr;
+  // The primary column when it offers key gathers (KeyBatch) and the rest of
+  // the sort can be resolved without scores: the sole clause, or the lead of a
+  // multi-clause sort. Collapse keeps the group protocol on sole-clause sorts.
+  // tiedTail marks the latter: gathered keys settle everything but primary
+  // ties, which walk clauses 1..n against the bottom, and admissions copy
+  // those clauses into the slot beside the key. tailDoc is the doc those reads
+  // last positioned tail columns at (rewind on a backward read).
+  FieldComparator* keyColumn = nullptr;
+  bool tiedTail = false;
+  int32_t tailDoc = -1;
   bool hasExpr = false;
   bool needsScores = true;
   bool needsSort = true;
@@ -302,6 +312,13 @@ public:
     for (const auto& clause : clauses) {
       this->clauses.emplace_back(clause, reader);
     }
+    // A trailing ascending DOC clause only restates the final segdoc tie-break
+    // (compare); dropping it makes the sort its prefix.
+    while (this->clauses.size() > 1
+           && this->clauses.back().descriptor.getKind() == SortClause::DOC
+           && this->clauses.back().descriptor.getOrder() == SortField::ASC) {
+      this->clauses.pop_back();
+    }
     if (this->clauses.size() == 1 && this->clauses[0].comparator != nullptr) {
       soleColumn = this->clauses[0].comparator.get();
     } else if (this->clauses.size() == 1
@@ -310,6 +327,17 @@ public:
     }
     for (const RuntimeClause& clause : this->clauses) {
       hasExpr |= clause.descriptor.getKind() == SortClause::EXPR;
+    }
+    bool sole = this->clauses.size() == 1;
+    bool resolvableUnscored = !needsScores && !Collapsed
+        && std::none_of(this->clauses.begin(), this->clauses.end(),
+            [](const RuntimeClause& clause) {
+              return clause.descriptor.getKind() == SortClause::SCORE;
+            });
+    if ((sole || resolvableUnscored) && this->clauses[0].comparator != nullptr
+        && this->clauses[0].comparator->keyBatch() != nullptr) {
+      keyColumn = this->clauses[0].comparator.get();
+      tiedTail = !sole;
     }
   }
 
@@ -340,6 +368,7 @@ public:
     segmentSourceCost = sourceCost;
     segmentWalkCard = 0;
     segmentMaxDoc = segment.maxDoc();
+    tailDoc = -1;
     for (auto& clause : clauses) {
       clause.resetCache();
       if (clause.comparator != nullptr) {
@@ -410,11 +439,14 @@ public:
   // still needed at that key - the tie rule skips a leaf whose best key ties
   // the bottom once the heap's tied entries come first in segdoc order, so
   // a heavily tied bottom needs its first few tied leaves, not all of them.
+  // A later sort clause breaks ties instead of segdoc (tieSkips false): every
+  // leaf bounded at the bottom must be visited.
   static int64_t visitFloorAt(const FieldComparator::SegmentKeys& segment,
-                              int64_t bottom, int64_t card, int64_t topCount) {
+                              int64_t bottom, int64_t card, int64_t topCount,
+                              bool tieSkips = true) {
     int64_t strict = segment.leavesBoundedBefore(bottom);
     int64_t tied = segment.leavesBoundedAtOrBefore(bottom) - strict;
-    if (tied <= 1) return strict + tied;
+    if (tied <= 1 || !tieSkips) return strict + tied;
     double before = segment.fractionBefore(bottom);
     double through = bottom == std::numeric_limits<int64_t>::max()
         ? 1.0 : segment.fractionBefore(bottom + 1);
@@ -441,8 +473,9 @@ public:
     int64_t heapSize = (int64_t)pq.size() * depth / topCount;
     auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
                                 bottomKey);
-    return bottom.has_value() ? visitFloorAt(*primaryKeys, *bottom, card, depth)
-                              : primaryKeys->leafCount();
+    return bottom.has_value()
+        ? visitFloorAt(*primaryKeys, *bottom, card, depth, clauses.size() == 1)
+        : primaryKeys->leafCount();
   }
 
   // Where a doc-order walk of the current segment meets its best keys: the
@@ -543,8 +576,8 @@ public:
   template <bool Member = false>
   int compareRank(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
-              const FieldCollector* other = nullptr) const {
-    for (size_t i = 0; i < clauses.size(); i++) {
+              const FieldCollector* other = nullptr, size_t from = 0) const {
+    for (size_t i = from; i < clauses.size(); i++) {
       const auto& clause = clauses[i];
       int cmp = 0;
       switch (clause.descriptor.getKind()) {
@@ -596,8 +629,8 @@ public:
   template <bool Member = false>
   int compare(const SortDoc& docA, const SortDoc& docB,
               CompareSource source = CompareSource::LOCAL,
-              const FieldCollector* other = nullptr) const {
-    int cmp = compareRank<Member>(docA, docB, source, other);
+              const FieldCollector* other = nullptr, size_t from = 0) const {
+    int cmp = compareRank<Member>(docA, docB, source, other, from);
     if (cmp != 0) return cmp;
     return (docA.doc > docB.doc) - (docA.doc < docB.doc);
   }
@@ -714,7 +747,7 @@ public:
     assert(heapFull());
     return classifyKeyBlock(segment, firstUnseenDoc, best,
                             batch->slotKeys[pq.top().slot], pq.top().doc,
-                            soleColumn != nullptr);
+                            clauses.size() == 1);
   }
 
   bool heapFull() const {
@@ -736,14 +769,15 @@ public:
 
   using KeyBlockPlan = FieldSortKeyBlockPlan;
 
-  // Non-null batch only when ranking is active and the sole primary clause
-  // offers order-independent masked leaf gathers (dense single-valued
-  // numeric column) with two-level bounds.
+  // Non-null batch only when ranking is active and the primary clause offers
+  // order-independent masked leaf gathers (dense single-valued numeric column)
+  // with two-level bounds. Secondary clauses are resolved at admission
+  // (keyColumn, tiedTail); bounds only ever speak for the primary.
   KeyBlockPlan maskedKeyBlockPlan() {
     KeyBlockPlan plan;
     FieldComparator::KeyBatch* batch;
-    if (topCount > 0 && !disableKeyGatherForTests && soleColumn != nullptr
-        && (batch = soleColumn->keyBatch()) != nullptr
+    if (topCount > 0 && !disableKeyGatherForTests && keyColumn != nullptr
+        && (batch = keyColumn->keyBatch()) != nullptr
         && batch->supportsMaskedLeafGather() && batch->leafBlockSize() != 0) {
       plan = {batch, batch->keyBlockSize(), batch->keyBlockCount(),
               batch->leafBlockSize(), batch->leafBlockCount()};
@@ -898,8 +932,8 @@ public:
 
   void collectWindow(int32_t segment, std::span<const int32_t> docs) {
     FieldComparator::KeyBatch* batch = nullptr;
-    if (disableKeyGatherForTests || soleColumn == nullptr
-        || (batch = soleColumn->keyBatch()) == nullptr) {
+    if (disableKeyGatherForTests || keyColumn == nullptr
+        || (batch = keyColumn->keyBatch()) == nullptr) {
       for (int32_t doc : docs) {
         collect(segment, doc, 0.0f);
       }
@@ -985,10 +1019,16 @@ private:
         int32_t slot = (int32_t)pq.size();
         ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
         batch->slotKeys[slot] = keys[i];
-        pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+        segdoc doc(segment, docs[i]);
+        if (tiedTail) {
+          positionTail(docs[i]);
+          copyTail(slot, doc);  // the heap's compares read the slot
+        }
+        pq.insert(SortDoc(doc, 0.0f, slot));
         recordAdmission(docs.size(), i);
         i++;
       }
+      if (tiedTail && i != 0 && pq.size() == (size_t)topCount) setBottom();
       if (i == docs.size()) return;
 
       int64_t bottomKey = batch->slotKeys[pq.top().slot];
@@ -996,17 +1036,53 @@ private:
         int64_t key = keys[i];
         segdoc doc(segment, docs[i]);
         if (key > bottomKey) continue;
-        if (key == bottomKey && doc >= pq.top().doc) continue;
+        if (key == bottomKey
+            && (tiedTail ? !beatsBottomOnTail(doc) : doc >= pq.top().doc)) {
+          continue;
+        }
 
         SortDoc& bottom = pq.top();
         int32_t slot = bottom.slot;
         batch->slotKeys[slot] = key;
+        if (tiedTail) {
+          positionTail(docs[i]);
+          copyTail(slot, doc);
+        }
         bottom = SortDoc(doc, 0.0f, slot);
         pq.updateTop();
+        if (tiedTail) setBottom();
         bottomKey = batch->slotKeys[pq.top().slot];
         recordAdmission(docs.size(), i);
       }
     }
+  }
+
+  // Tail clause state is keyed by the doc last read in this segment.
+  void positionTail(int32_t doc) {
+    if (doc < tailDoc) {
+      for (size_t i = 1; i < clauses.size(); i++) {
+        if (clauses[i].comparator != nullptr) clauses[i].comparator->rewind();
+      }
+    }
+    tailDoc = doc;
+  }
+
+  void copyTail(int32_t slot, segdoc doc) {
+    for (size_t i = 1; i < clauses.size(); i++) {
+      RuntimeClause& clause = clauses[i];
+      if (clause.comparator != nullptr) clause.comparator->copy(slot, doc);
+      else if (clause.descriptor.getKind() == SortClause::EXPR) {
+        clause.copyCurrent(slot, doc, 0.0f);
+      }
+    }
+  }
+
+  // A doc whose primary key ties the bottom: whether it outranks the bottom
+  // on the remaining clauses, then segdoc (the full sort order).
+  LUXIR_NOINLINE bool beatsBottomOnTail(segdoc doc) {
+    positionTail(doc.docId());
+    SortDoc candidate(doc, 0.0f, -1);
+    return compare(pq.top(), candidate, CompareSource::CURRENT_DOC, nullptr, 1) > 0;
   }
 
   // Attribution only: the gathered-doc index of this heap change, doc-precise

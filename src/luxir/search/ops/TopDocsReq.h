@@ -274,10 +274,18 @@ public:
     return result;
   }
 
-  static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan) {
-    if (sortPlan.clauses.size() != 1
-        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+  // The exact-domain driver can serve the sort: a numeric primary column, and
+  // any later clause resolvable without scores (FieldCollector::keyColumn).
+  // Collapse keeps the group admission protocol on sole-clause sorts.
+  static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan,
+                                             bool collapsed = false) {
+    if (sortPlan.clauses.empty()
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN
+        || (sortPlan.clauses.size() > 1 && collapsed)) {
       return false;
+    }
+    for (size_t i = 1; i < sortPlan.clauses.size(); i++) {
+      if (sortPlan.clauses[i].getKind() == SortClause::SCORE) return false;
     }
     return FieldType::sortsByIntColumn(const_cast<FieldType&>(
         sortPlan.clauses[0].getSortField().getFieldType()).type());
@@ -365,7 +373,7 @@ public:
   static void plannedVisitFloors(
       std::span<const std::optional<SegmentKeys>> keys,
       std::span<const int32_t> order, std::span<const int64_t> cards,
-      int64_t topCount, std::span<int64_t> floors) {
+      int64_t topCount, bool tieSkips, std::span<int64_t> floors) {
     int64_t heapSize = 0;
     int64_t bottom = 0;
     for (int32_t s : order) {
@@ -380,7 +388,7 @@ public:
           *segmentKeys, card, topCount, heapSize, bottom);
       floors[(size_t)s] = predicted.has_value()
           ? FieldSortCollector::visitFloorAt(*segmentKeys, *predicted, card,
-                                             topCount)
+                                             topCount, tieSkips)
           : segmentKeys->leafCount();
       if (heapSize + card >= topCount) {
         bottom = predicted.value_or(segmentKeys->keyAt(1));
@@ -411,7 +419,7 @@ public:
         keys,
         fieldSortVisitOrder(keys, topCount,
                             fieldSortMissingFirst(sortPlan, envelope)),
-        cards, topCount, floors);
+        cards, topCount, sortPlan.clauses.size() == 1, floors);
     int64_t visited = 0;
     int64_t leaves = 0;
     for (size_t s = 0; s < keys.size(); s++) {
@@ -474,9 +482,9 @@ public:
   static bool planFieldSortWholeMembershipRoutes(
       Query& query, Query::Weight& weight, IndexReader& reader,
       const SortPlan& sortPlan, int64_t topCount,
-      std::span<uint8_t> routes) {
+      std::span<uint8_t> routes, bool collapsed) {
     assert(routes.size() == reader.segments().size());
-    bool canUseBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
+    bool canUseBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan, collapsed);
     if (!canUseBestFirst) {
       bool routed = membershipVerificationWork(query)
           == Query::VerificationWork::PRESENT;
@@ -2230,7 +2238,6 @@ public:
               if (maySkipNoncompetitiveDocs
                   && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                   && !fieldCollector->needsScores
-                  && !fieldCollector->hasExpr
                   && fieldCollector->topCount > 0) {
                 DocSet* domainSet = nullptr;
                 bool allDocs = false;
@@ -2260,6 +2267,13 @@ public:
                   auto exactDomain = planExactDomainSort(
                       *fieldCollector, card, firstDoc, lastDoc);
                   if (exactDomain.available()) {
+                    // Expressions can break primary ties here; their cursors
+                    // tolerate the driver's out-of-order leaf visits.
+                    std::optional<typename ActiveFieldCollector::ExpressionBindings> expressionBindings;
+                    if (fieldCollector->hasExpr) {
+                      expressionBindings.emplace(
+                          *fieldCollector, poolGuard.pool(), seg);
+                    }
                     if (!allDocs && domainSet->type == DocSet::ARRAY) {
                       collectTopKArrayDomain(
                           segnum, ((ArrDocSet*)domainSet)->docs(),
@@ -2337,7 +2351,6 @@ public:
                   && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
                   && !disableFieldSortBulk && !requiresWholeIndexPrepare
                   && !fieldCollector->needsScores
-                  && !fieldCollector->hasExpr
                   && fieldCollector->topCount > 0) {
                 auto plan = fieldCollector->maskedKeyBlockPlan();
                 if (plan.batch != nullptr && plan.blockCount > 0
@@ -2383,6 +2396,11 @@ public:
                         && !bulkPlan.hasConstantCount()) {
                       auto* bulk = supplier->buildBulk(poolGuard.pool(), bulkPlan);
                       if (bulk != nullptr) {
+                        std::optional<typename ActiveFieldCollector::ExpressionBindings> expressionBindings;
+                        if (fieldCollector->hasExpr) {
+                          expressionBindings.emplace(
+                              *fieldCollector, poolGuard.pool(), seg);
+                        }
                         if (fieldSortSeedBudgetPerMilleForTests > 0) {
                           seedBudget = std::max<int64_t>(
                               1, seedBudget

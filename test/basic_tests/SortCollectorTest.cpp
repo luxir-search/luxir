@@ -25,6 +25,7 @@
 #include <charconv>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -3288,8 +3289,8 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     EXPECT_EQ(0, cost.activations);
     EXPECT_EQ(1, cost.walks);
   }
-  // Secondary clause: no sole column, no masked plan.
-  EXPECT_EQ(run(FORCED, false, true, tiesThenRand, 9, false).activations, 0);
+  // A secondary clause keeps the masked plan and breaks primary ties.
+  EXPECT_GT(run(FORCED, false, true, tiesThenRand, 9, false).activations, 0);
   // Exact count keeps every pruning route off and stays exact.
   {
     auto exact = run(FORCED, false, true, randAsc, 9, true);
@@ -3351,6 +3352,110 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
 // The exact-domain economics on the 5M benchgame geometry (9829 leaves):
 // the plan over a whole segment, bound order's reading at a checkpoint, and
 // the one re-decision rule over the rest.
+// A sort leading with a numeric column keeps the key-gather and bound-order
+// routes when later clauses only break ties: every route agrees with the
+// exhaustive clause walk, across tail kinds, column shapes, deletes, and the
+// range and keyset (search-after) filters a paged request sends.
+TEST_F(SortCollectorTest, multiClauseSortMatchesExhaustiveAcrossRoutes) {
+  CollectionHelper helper("multi_key_sort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  auto seed = rng();
+  Rng r(seed);
+  constexpr int32_t kDocsPerSeg = 4000;
+  int32_t nDocs = 0;
+  std::vector<std::string> deletes;
+  for (int32_t seg = 0; seg < 3; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++, nDocs++) {
+      std::string id = std::format("{:05}", nDocs);
+      Doc doc = flatdoc("id_s", id, "ties_i", (int64_t)r.rint(0, 15),
+                        "rand_i", (int64_t)r.rint(0, 100000),
+                        "mono_i", (int64_t)nDocs,
+                        "mv_is", vec_i(r.rint(0, 9), r.rint(10, 19)),
+                        "body_w", r.rint(0, 3) == 0 ? "other" : "alpha");
+      if (r.rint(0, 9) < 7) doc.push_back(NameVal{"sparse_i", (int64_t)r.rint(0, 3)});
+      if (r.rint(0, 9) < 6) doc.push_back(NameVal{"tail_i", (int64_t)r.rint(0, 2)});
+      if (r.rint(0, 9) > 0) doc.push_back(NameVal{"tag_s", std::string(1, (char)('a' + r.rint(0, 4)))});
+      if (r.rint(0, 9) < 8) doc.push_back(NameVal{"note_sc", std::to_string(r.rint(0, 40))});
+      helper.index(doc, UpdateMessage::NO_COMMIT);
+      if (r.rint(0, 40) == 0) deletes.push_back(id);
+    }
+    helper.commit();
+  }
+  helper.deleteByIds(std::span<const std::string>(deletes));
+
+  using Spec = std::pair<std::string_view, qb::SortDir>;
+  std::vector<std::vector<Spec>> tails = {
+    {{"id_s", qb::ASC}},
+    {{"id_s", qb::DESC}},
+    {{"tag_s", qb::DESC}, {"id_s", qb::ASC}},
+    {{"note_sc", qb::ASC}, {"id_s", qb::DESC}},
+    {{"tail_i", qb::ASC}, {"id_s", qb::ASC}},
+    {{"tail_i", qb::DESC}, {"_docid_", qb::DESC}},
+    {{"_docid_", qb::ASC}},
+    {{"abs(sub(tail_i, 1))", qb::ASC}, {"id_s", qb::ASC}},
+  };
+  std::vector<std::string_view> primaries = {"ties_i", "rand_i", "mono_i",
+                                             "sparse_i", "mv_is"};
+  enum class Filter { NONE, TERM, RANGE, KEYSET };
+  using enum Filter;
+  enum class Route { EXHAUSTIVE, LADDER, COST, FORCED, SEEDED };
+  using enum Route;
+
+  auto run = [&](Route route, std::string_view primary, qb::SortDir primaryDir,
+                 const std::vector<Spec>& tail, Filter filter, int32_t limit,
+                 int64_t pivot) {
+    BestFirstGuard bfGuard(route == EXHAUSTIVE || route == LADDER, route == FORCED);
+    SortPruningGuard pruningGuard(route == EXHAUSTIVE);
+    KeyGatherGuard keyGuard(route == EXHAUSTIVE);
+    SeededGuard seedGuard(route != SEEDED, route == SEEDED);
+    WholeMembershipPlanGuard wholeGuard(true);
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("multi_key_sort");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery();
+    auto& mr = cur.mr();
+    if (filter == TERM) {
+      cur.filter(qb::match(mr, "body_w", "alpha"));
+    } else if (filter == RANGE || filter == KEYSET) {
+      auto* val = qb::valI64(mr, pivot);
+      bool desc = primaryDir == qb::DESC;
+      auto before = qb::range(mr, primary, nullptr, desc ? nullptr : val,
+                              nullptr, desc ? val : nullptr);
+      if (filter == RANGE) {
+        cur.filter(before);
+      } else {
+        // [primary, id_s asc] resuming after (pivot, "02000").
+        auto tied = qb::boolean(mr, {qb::range(mr, primary, val, nullptr, val, nullptr),
+                                     qb::range(mr, "id_s", nullptr, qb::valStr(mr, "02000"), nullptr, nullptr)});
+        cur.filter(qb::boolean(mr, {}, {before, tied}));
+      }
+    }
+    qb::sort(cur, primary, primaryDir);
+    for (const auto& [f, dir] : tail) qb::sort(cur, f, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+
+  int32_t iterations = (int32_t)LuxirTest::scaleTestWork(120);
+  for (int32_t iter = 0; iter < iterations; iter++) {
+    auto primary = primaries[(size_t)r.rint(0, (int)primaries.size() - 1)];
+    auto dir = r.rint(0, 1) == 0 ? qb::ASC : qb::DESC;
+    const auto& tail = tails[(size_t)r.rint(0, (int)tails.size() - 1)];
+    auto filter = (Filter)r.rint(0, 3);
+    int32_t limit = std::array{1, 17, 300, 2000}[(size_t)r.rint(0, 3)];
+    int64_t pivot = primary == "mono_i" ? r.rint(0, nDocs)
+        : primary == "rand_i" ? r.rint(0, 100000) : r.rint(0, 15);
+    auto expected = run(EXHAUSTIVE, primary, dir, tail, filter, limit, pivot);
+    for (Route route : {LADDER, COST, FORCED, SEEDED}) {
+      EXPECT_EQ(expected, run(route, primary, dir, tail, filter, limit, pivot))
+          << "seed=" << seed << " primary=" << primary << " dir=" << (int)dir
+          << " tailFirst=" << tail[0].first << " filter=" << (int)filter
+          << " limit=" << limit << " pivot=" << pivot << " route=" << (int)route;
+    }
+  }
+}
+
 TEST_F(SortCollectorTest, exactDomainSortCostsDecide) {
   using Costs = ExactDomainSortCosts;
   using Phase = ExactDomainSortPhase;
@@ -4620,10 +4725,10 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     }
   }
 
-  // Route engagement, proven by the activation counter; multi-clause sorts
-  // have no sole column and must decline.
+  // Route engagement, proven by the activation counter; a later clause only
+  // breaks ties, so a multi-clause sort seeds too.
   EXPECT_GT(run(true, false, randAsc, 9, false).activations, 0);
-  EXPECT_EQ(run(true, false, tiesThenRand, 9, false).activations, 0);
+  EXPECT_GT(run(true, false, tiesThenRand, 9, false).activations, 0);
   // Without the force override the two-block corpus can never clear the
   // materiality gate.
   EXPECT_EQ(run(false, false, randAsc, 9, false).activations, 0);
