@@ -90,7 +90,7 @@ TEST(FSProcessTest, writerTakeover) {
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   FSDirFactory factory(path);
   TenantCatalog::initialize(factory, true);
-  TenantCatalog catalog(factory);
+  TenantCatalog catalog(factory, "t0", "test");
   auto id = catalog.reserve("main", "10000000000");
   TestProcess first(path, "first");
   ASSERT_EQ('o', first.receive());

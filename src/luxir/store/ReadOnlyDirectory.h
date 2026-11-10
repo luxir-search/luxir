@@ -97,6 +97,7 @@ class ReadOnlyDirFactory : public DirectoryFactory {
 public:
   explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> inner) : delegate(std::move(inner)) {}
   std::string describe() const override { return "read_only(" + delegate->describe() + ")"; }
+  bool exclusive() const override { return delegate->exclusive(); }
   std::string diskPath() const override { return delegate->diskPath(); }
   DirectoryFactory* inner() override { return delegate.get(); }
   std::shared_ptr<StorageMemory> memory() override { return delegate->memory(); }

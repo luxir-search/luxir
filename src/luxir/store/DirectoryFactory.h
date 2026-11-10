@@ -18,6 +18,8 @@ public:
   struct ViewOptions { std::shared_ptr<StorageMemory> account; };
   struct Child { std::string name; bool directory; };
   virtual ~DirectoryFactory() = default;
+  // True only when this process owns the whole authoritative store.
+  virtual bool exclusive() const { return false; }
   // Opening a view creates no namespace entries. Paths are relative to the root.
   virtual std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) = 0;
   virtual std::vector<Child> children(StorageRoot root, std::string_view path) = 0;
@@ -63,6 +65,7 @@ public:
   explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
       : account(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
   std::string describe() const override { return "ram"; }
+  bool exclusive() const override { return true; }
   std::shared_ptr<StorageMemory> memory() override { return account; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));
@@ -146,6 +149,7 @@ public:
     }
   }
   std::string describe() const override { return "fs:" + basePath.string(); }
+  bool exclusive() const override { return lock.has_value(); }
   std::string diskPath() const override { return basePath.string(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view relative, ViewOptions options = {}) override {
     auto path = pathOf(root, relative);

@@ -144,6 +144,7 @@ class IndexWriter {
 
 public:
 
+  std::function<void()> onSuperseded; // Diagnostic only; failures cannot mask the fencing error.
   // The node's and the collection's counters; set by the collection that opens
   // this writer.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
@@ -584,10 +585,11 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
+  // A supplied claim was established by the caller after checking its catalog.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr);
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {});
   ~IndexWriter();
   void close();
 

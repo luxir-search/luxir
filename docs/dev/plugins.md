@@ -413,9 +413,17 @@ A backend must either honor `ctx.config.read_only` by opening without a lock,
 namespace creation or cleanup, or reject it. The read-only wrapper cannot undo
 side effects inside the maker; the built-in RAM maker rejects read-only.
 
+`exclusive()` defaults to false. Return true only while this process owns the
+whole authoritative store (private RAM, or FS with its store write lock). An
+exclusive startup adopts every catalog entry and cleans up abandoned trees.
+`DelegatingDirFactory` does not forward this method: a layer must explicitly
+forward it only if it preserves that guarantee. Incorrectly returning true can
+delete another node's data; returning false only costs availability. The core
+wrappers and the example `counting` layer forward it; `counting_ram` is exclusive.
+
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
 `directory()` to hand out `DelegatingDirectory` subclasses. Both
-bases forward every virtual, including `createFile` with options, `expectSynced`,
+bases forward their other virtuals, including `createFile` with options, `expectSynced`,
 `publishFile`, `readPublished`, `deleteDurably`, `deletePrefix`, `sync`,
 `underlying`, `linkFile`, `openChecksum` and `capabilities`.
 Core wrappers that refuse or track mutations implement the bare interface;

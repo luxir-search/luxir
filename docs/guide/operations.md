@@ -18,6 +18,7 @@ at their defaults until you have a reason to change them.
 gRPC listener. Without a usable hostname or positive port, it generates a random
 UUID for this node's lifetime. The id is resolved once when the node is constructed.
 Set it explicitly when hostnames and ports do not uniquely identify your nodes.
+Shared storage requires a stable id and refuses the random UUID fallback.
 
 An id must be 1 to 255 bytes of printable ASCII, contain neither `/` nor `\`, and
 must not be `.` or `..`.

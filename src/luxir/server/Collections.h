@@ -138,7 +138,8 @@ private:
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false, std::optional<std::string> reserved = {});
   // A writer whose newest root is invalid continues from the newest valid one
   // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected);
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected,
+                            const Manifest& manifest, IncarnationState& claimed);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;

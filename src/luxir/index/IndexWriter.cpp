@@ -149,14 +149,14 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena)
+                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  writerState = IncarnationState::claim(dir);
+  writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
   writerEpoch = writerState.value.epoch;
   auto manifest = Manifest::load(dir, &writerState);
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
@@ -2497,7 +2497,10 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     snapshots.publish(snapshot);
   } catch (...) {
     if (durable || stateAttempted) {
-      try { throw; } catch (const WriterSupersededError&) { failure = std::move(superseded); } catch (...) {}
+      try { throw; } catch (const WriterSupersededError&) {
+        failure = std::move(superseded);
+        try { if (onSuperseded) onSuperseded(); } catch (...) {}
+      } catch (...) {}
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
       snapshots.fail();

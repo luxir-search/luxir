@@ -902,7 +902,9 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
     std::string target;
     {
       FSDirFactory factory(followerConfig.store.data_dir);
-      target = TenantCatalog(factory).reserve("main");
+      TenantCatalog catalog(factory, "t0", "test");
+      catalog.adopt();
+      target = catalog.reserve("main");
     }
     state.collection(CollectionId::of("main")).promoted = target;
     state.write(metadata);
@@ -1943,7 +1945,8 @@ TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacem
   stopSource();
   {
     FSDirFactory factory(sourceConfig.store.data_dir);
-    TenantCatalog storage(factory);
+    TenantCatalog storage(factory, "t0", "test");
+    storage.adopt();
     auto selected = *storage.current("main");
     storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
   }
@@ -2263,7 +2266,8 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   std::string selected, target, root;
   {
     FSDirFactory factory(followerConfig.store.data_dir);
-    TenantCatalog catalog(factory, "t0");
+    TenantCatalog catalog(factory, "t0", "test");
+    catalog.adopt();
     selected = catalog.current("main").value();
     target = copySnapshot(catalog, "main", selected, Manifest::load(*catalog.directory(selected)));
     auto directory = catalog.directory(target);

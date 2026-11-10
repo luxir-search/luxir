@@ -48,9 +48,10 @@ public:
 };
 
 
-/// A DirectoryFactory that forwards every virtual to another one. Layer
+/// A DirectoryFactory that forwards virtuals except exclusive(). Layer
 /// factories derive from it, override what they change (usually directory(),
-/// to wrap the views they hand out) and inherit the rest.
+/// to wrap the views they hand out) and inherit the rest. Forward exclusive()
+/// explicitly only when the layer preserves ownership of the whole store.
 class DelegatingDirFactory : public DirectoryFactory {
 protected:
   std::unique_ptr<DirectoryFactory> delegate;

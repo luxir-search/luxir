@@ -69,7 +69,7 @@ TEST(DirLockTest, unownedFactoryOpensAlongsideTheWriter) {
   TempDir tempDir;
   FSDirFactory writer(tempDir.path());
   TenantCatalog::initialize(writer, true);
-  TenantCatalog(writer).reserve("main");
+  TenantCatalog(writer, "t0", "test").reserve("main");
 
   FSDirFactory reader(tempDir.path(), /*unowned=*/true);
   EXPECT_EQ(TenantCatalog::collections(reader), std::vector<CollectionId>{CollectionId::of("main")});

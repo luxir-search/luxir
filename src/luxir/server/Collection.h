@@ -47,6 +47,12 @@ public:
     : CollectionResolutionError(ErrorKind::UNAVAILABLE, "collection_unavailable", message) {}
 };
 
+class CollectionServedByError : public CollectionUnavailableError {
+public:
+  explicit CollectionServedByError(std::string_view node)
+    : CollectionUnavailableError("served by " + std::string(node.empty() ? "(unassigned)" : node)) {}
+};
+
 class CollectionExistsError : public ApiError {
 public:
   explicit CollectionExistsError(const std::string& message)

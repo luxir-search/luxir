@@ -99,10 +99,13 @@ void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
 
 // host:port of the listener, so a restarted node keeps its identity (and a
 // follower its acknowledgment rows). Without a fixed port, a per-process id.
-static std::string defaultNodeId(const ServerConfig& server) {
+static std::string defaultNodeId(const ServerConfig& server, bool& random) {
   int port = server.http.enabled ? server.http.port : server.grpc.port;
   char host[256] = {};
-  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) return newUuid();
+  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) {
+    random = true;
+    return newUuid();
+  }
   return std::string(host) + ":" + std::to_string(port);
 }
 
@@ -112,7 +115,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
     indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
-  if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server);
+  if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
   this->config.node.validate();
   ensureWorkerPool(workers + 1);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");

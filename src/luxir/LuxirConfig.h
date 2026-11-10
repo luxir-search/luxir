@@ -17,6 +17,7 @@ namespace luxir {
 
 struct NodeConfig {
   std::string id; // empty: derive at LuxirNode construction
+  bool random = false; // id was derived without a stable hostname:port
   void validate() const;
 };
 
