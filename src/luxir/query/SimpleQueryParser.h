@@ -430,15 +430,7 @@ private:
   // degrade to text.  Requires column storage - the match scan reads the column,
   // so a numeric field without it is not targetable and degrades to text.
   static bool numericQueryable(FieldType& fieldType) {
-    switch (fieldType.type()) {
-      case FieldType::Type::INT:
-      case FieldType::Type::FLOAT:
-      case FieldType::Type::DOUBLE:
-      case FieldType::Type::DATE:
-        return fieldType.hasColumn();
-      default:
-        return false;
-    }
+    return FieldType::isNumericColumn(fieldType.type()) && fieldType.hasColumn();
   }
 
   static bool existsQueryable(FieldType& fieldType) {
@@ -461,11 +453,8 @@ private:
     api::Val v;
     v.kind = value;
     try {
-      if (fieldType.type() == FieldType::DATE) {
-        return ((DateFieldType&)fieldType).tryCoerceDateRange(v, opts.coerceContext).has_value();
-      }
-      fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
-      return true;
+      return fieldType.tryCoerceIntWindow(v, FieldType::LiteralUse::MATCH,
+                                           fieldType.name(), opts.coerceContext).has_value();
     } catch (const std::exception&) {
       return false;
     }

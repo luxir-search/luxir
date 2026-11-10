@@ -22,6 +22,8 @@ using namespace std;
 using namespace luxir;
 using namespace luxir::test;
 
+using LiteralUse = FieldType::LiteralUse;
+
 using ResponseStatus = luxir::api::UpdateResponse_::Status;
 
 class ValCoerceTest : public LuxirTest {
@@ -148,32 +150,93 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
 
 TEST_F(ValCoerceTest, baseTryColumnCoercion) {
   IntFieldType integer("int");
-  // Call the base fallback while retaining virtual dispatch to the real coercer.
   EXPECT_EQ(7, integer.FieldType::tryCoerceColInt64(sval("7"), "f"));
-  EXPECT_FALSE(integer.FieldType::tryCoerceColInt64(sval("bad"), "f"));
+  EXPECT_FALSE(integer.FieldType::tryCoerceColInt64(sval("dune"), "f"));
   FieldType unsupported("none", FieldType::NONE, 0);
   EXPECT_THROW(unsupported.tryCoerceColInt64(sval("7"), "f"), RequestError);
 }
 
-TEST_F(ValCoerceTest, tryColumnCoercion) {
+TEST_F(ValCoerceTest, intWindows) {
   IntFieldType integer("_i");
   FloatFieldType floating("_f");
   DoubleFieldType number("_d");
   DateFieldType date("_dt");
+  struct Case {
+    const FieldType* type;
+    api::Val value;
+    int64_t lo, hi;
+  };
+  for (const auto& c : {
+      Case{&integer, sval("7"), 7, 7},
+      Case{&floating, sval("1.5"), floatToSortableInt32(1.5f), floatToSortableInt32(1.5f)},
+      Case{&number, sval("-2.5"), doubleToSortableInt64(-2.5), doubleToSortableInt64(-2.5)},
+      Case{&date, sval("1970-01-01"), 0, 86400000 - 1}}) {
+    SCOPED_TRACE(c.type->name_);
+    auto check = [&](LiteralUse use, int64_t lo, int64_t hi) {
+      auto window = c.type->coerceIntWindow(c.value, use, "f");
+      EXPECT_EQ(lo, window.lo);
+      EXPECT_EQ(hi, window.hi);
+      auto probe = c.type->tryCoerceIntWindow(c.value, use, "f");
+      ASSERT_TRUE(probe);
+      EXPECT_EQ(lo, probe->lo);
+      EXPECT_EQ(hi, probe->hi);
+    };
+    check(LiteralUse::MATCH, c.lo, c.hi);
+    check(LiteralUse::MEMBER, c.lo, c.lo);
+    check(LiteralUse::GTE, c.lo, INT64_MAX);
+    check(LiteralUse::GT, c.hi + 1, INT64_MAX);
+    check(LiteralUse::LTE, INT64_MIN, c.hi);
+    check(LiteralUse::LT, INT64_MIN, c.lo - 1);
+    EXPECT_FALSE(c.type->tryCoerceIntWindow(sval("bad"), LiteralUse::MATCH, "f"));
+  }
+  const FieldType* integral[] = {&integer, &date};
+  for (const auto* type : integral) {
+    EXPECT_TRUE(type->coerceIntWindow(coerce::scalarVal(INT64_MAX), LiteralUse::GT, "f").empty());
+    EXPECT_TRUE(type->coerceIntWindow(coerce::scalarVal(INT64_MIN), LiteralUse::LT, "f").empty());
+  }
+  FieldType unsupported("none", FieldType::NONE, 0);
+  EXPECT_THROW(unsupported.tryCoerceIntWindow(sval("7"), LiteralUse::MATCH, "f"), RequestError);
+}
+
+TEST_F(ValCoerceTest, dateWindowDiagnostics) {
+  DateFieldType date("_dt");
+  CoerceContext context;
+  context.dateMathNowEpochMillis = 123;
+  auto zone = resolveTimeZone("Pacific/Apia");
+  ASSERT_TRUE(zone);
+  context.timeZone = *zone;
+  for (auto use : {LiteralUse::MATCH, LiteralUse::GTE, LiteralUse::GT, LiteralUse::LTE, LiteralUse::LT}) {
+    EXPECT_TRUE(date.coerceIntWindow(sval("NOW"), use, "f", context).unroundedNow);
+    EXPECT_FALSE(date.coerceIntWindow(sval("NOW/DAY"), use, "f", context).unroundedNow);
+    EXPECT_TRUE(date.coerceIntWindow(sval("2011-12-30"), use, "f", context).granuleSkipped);
+  }
+}
+
+TEST_F(ValCoerceTest, tryIntWindow) {
+  IntFieldType integer("_i");
+  FloatFieldType floating("_f");
+  DoubleFieldType number("_d");
+  DateFieldType date("_dt");
+  EXPECT_FALSE(integer.tryCoerceColInt64(sval("dune"), "f"));
+  EXPECT_FALSE(floating.tryCoerceColInt64(sval("dune"), "f"));
+  EXPECT_FALSE(number.tryCoerceColInt64(sval("dune"), "f"));
+  EXPECT_FALSE(date.tryCoerceIntWindow(sval("dune"), LiteralUse::MEMBER, "f"));
   const FieldType* types[] = {&integer, &floating, &number, &date};
   for (const auto* type : types) {
-    EXPECT_FALSE(type->tryCoerceColInt64(sval("dune"), "f"));
+    EXPECT_FALSE(type->tryCoerceIntWindow(sval("dune"), LiteralUse::MATCH, "f"));
     for (auto text : {"7", "-7", "0"}) {
-      EXPECT_EQ(type->coerceColInt64(sval(text), "f"), type->tryCoerceColInt64(sval(text), "f"));
+      auto window = type->tryCoerceIntWindow(sval(text), LiteralUse::MATCH, "f");
+      ASSERT_TRUE(window);
+      EXPECT_EQ(type->coerceColInt64(sval(text), "f"), window->lo);
     }
   }
-  EXPECT_EQ(7, integer.tryCoerceColInt64(sval("7.0"), "f"));
-  EXPECT_EQ(1000, integer.tryCoerceColInt64(sval("1e3"), "f"));
+  EXPECT_EQ(7, integer.coerceIntWindow(sval("7.0"), LiteralUse::MATCH, "f").lo);
+  EXPECT_EQ(1000, integer.coerceIntWindow(sval("1e3"), LiteralUse::MATCH, "f").lo);
   for (auto text : {"1.5", "1e100", "nan", "inf"}) {
-    EXPECT_FALSE(integer.tryCoerceColInt64(sval(text), "f"));
+    EXPECT_FALSE(integer.tryCoerceIntWindow(sval(text), LiteralUse::MATCH, "f"));
   }
   StrFieldType string("_s");
-  EXPECT_THROW(string.tryCoerceColInt64(sval("7"), "f"), std::runtime_error);
+  EXPECT_THROW(string.tryCoerceIntWindow(sval("7"), LiteralUse::MATCH, "f"), std::runtime_error);
 }
 
 TEST_F(ValCoerceTest, dateFractionsHaveTheSameIngestAndQueryPrecision) {
@@ -188,15 +251,15 @@ TEST_F(ValCoerceTest, dateFractionsHaveTheSameIngestAndQueryPrecision) {
     SCOPED_TRACE(text);
     api::Val value = sval(text);
     EXPECT_EQ(expected, date.coerceColInt64(value, "f", context));
-    EXPECT_EQ(expected, date.tryCoerceColInt64(value, "f", context));
-    auto range = date.tryCoerceDateRange(value, context);
+    EXPECT_EQ(expected, date.coerceIntWindow(value, LiteralUse::MEMBER, "f", context).lo);
+    auto range = date.tryCoerceIntWindow(value, LiteralUse::MATCH, "f", context);
     ASSERT_TRUE(range);
     EXPECT_EQ(expected, range->lo);
     EXPECT_EQ(expected, range->hi);
-    EXPECT_EQ(range->hi, date.coerceDateRange(value, "f", context).hi);
+    EXPECT_EQ(range->hi, date.coerceIntWindow(value, LiteralUse::MATCH, "f", context).hi);
   }
-  EXPECT_FALSE(date.tryCoerceDateRange(sval("1970-01-01T00:00:00.Z"), context));
-  EXPECT_THROW(date.coerceDateRange(sval("1970-01-01T00:00:00.Z"), "f", context), RequestError);
+  EXPECT_FALSE(date.tryCoerceIntWindow(sval("1970-01-01T00:00:00.Z"), LiteralUse::MATCH, "f", context));
+  EXPECT_THROW(date.coerceIntWindow(sval("1970-01-01T00:00:00.Z"), LiteralUse::MATCH, "f", context), RequestError);
 }
 
 TEST_F(ValCoerceTest, dateQueryBoundsAndInputUnitConversion) {
@@ -205,29 +268,29 @@ TEST_F(ValCoerceTest, dateQueryBoundsAndInputUnitConversion) {
     for (int64_t value : {INT64_MIN, (int64_t)-1, (int64_t)0, INT64_MAX}) {
       auto text = std::to_string(value);
       for (const auto& literal : {coerce::scalarVal(value), sval(text)}) {
-        auto range = date.coerceDateRange(literal, "f");
+        auto range = date.coerceIntWindow(literal, LiteralUse::MATCH, "f");
         EXPECT_EQ(value, range.lo);
         EXPECT_EQ(value, range.hi);
       }
     }
     CoerceContext context;
     context.dateInputUnit = unit == DateUnit::MILLIS ? DateUnit::NANOS : DateUnit::MILLIS;
-    auto range = date.coerceDateRange(sval("-1"), "f", context);
+    auto range = date.coerceIntWindow(sval("-1"), LiteralUse::MATCH, "f", context);
     EXPECT_EQ(unit == DateUnit::MILLIS ? -1 : -1000000, range.lo);
     EXPECT_EQ(-1, range.hi);
-    EXPECT_EQ(range.lo, date.coerceDateInstant(sval("-1"), "f", context));
+    EXPECT_EQ(range.lo, date.coerceIntWindow(sval("-1"), LiteralUse::MEMBER, "f", context).lo);
   }
   DateFieldType ns("ns", FieldType::COLUMN_STORED, DateUnit::NANOS);
-  auto math = ns.coerceDateRange(sval("-1||+1MILLI"), "f");
+  auto math = ns.coerceIntWindow(sval("-1||+1MILLI"), LiteralUse::MATCH, "f");
   EXPECT_EQ(999999, math.lo);
   EXPECT_EQ(math.lo, math.hi);
-  auto millisecond = ns.coerceDateRange(sval("1970-01-01T00:00:00.001Z"), "f");
+  auto millisecond = ns.coerceIntWindow(sval("1970-01-01T00:00:00.001Z"), LiteralUse::MATCH, "f");
   EXPECT_EQ(1000000, millisecond.lo);
   EXPECT_EQ(1999999, millisecond.hi);
   for (auto text : {"1500-01-01", "3000-01-01", "-9223372036854775808", "9223372036854775807"}) {
-    EXPECT_FALSE(ns.coerceDateInstant(sval(text), "f"));
+    EXPECT_TRUE(ns.coerceIntWindow(sval(text), LiteralUse::MEMBER, "f").empty());
   }
-  EXPECT_THROW(ns.coerceDateInstant(sval("bad"), "f"), RequestError);
+  EXPECT_THROW(ns.coerceIntWindow(sval("bad"), LiteralUse::MEMBER, "f"), RequestError);
 }
 
 TEST_F(ValCoerceTest, nanosecondCoercionUsesNativeNumbersAndRejectsExtrema) {
@@ -241,17 +304,17 @@ TEST_F(ValCoerceTest, nanosecondCoercionUsesNativeNumbersAndRejectsExtrema) {
       std::pair{"1677-09-21T00:12:43.145224193Z", INT64_MIN + 1},
       std::pair{"2262-04-11T23:47:16.854775806Z", INT64_MAX - 1}}) {
     SCOPED_TRACE(text);
-    EXPECT_EQ(expected, date.tryCoerceColInt64(sval(text), "f", context));
+    EXPECT_EQ(expected, date.coerceIntWindow(sval(text), LiteralUse::MEMBER, "f", context).lo);
     EXPECT_EQ(expected, date.coerceColInt64(sval(text), "f", context));
     EXPECT_EQ(expected, date.coerceColInt64(coerce::scalarVal(expected), "f", context));
   }
   for (auto text : {"1677-09-21T00:12:43.145224192Z", "2262-04-11T23:47:16.854775807Z",
       "1500-01-01", "3000-01-01", "9223372036854775807", "-9223372036854775808"}) {
-    EXPECT_FALSE(date.tryCoerceColInt64(sval(text), "f", context));
+    EXPECT_TRUE(date.coerceIntWindow(sval(text), LiteralUse::MEMBER, "f", context).empty());
     EXPECT_THROW(date.coerceColInt64(sval(text), "f", context), RequestError);
   }
   for (int64_t value : {INT64_MIN, INT64_MAX}) {
-    EXPECT_FALSE(date.tryCoerceColInt64(coerce::scalarVal(value), "f", context));
+    EXPECT_TRUE(date.coerceIntWindow(coerce::scalarVal(value), LiteralUse::MEMBER, "f", context).empty());
     EXPECT_THROW(date.coerceColInt64(coerce::scalarVal(value), "f", context), RequestError);
   }
 }

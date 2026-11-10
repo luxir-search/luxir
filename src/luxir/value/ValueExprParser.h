@@ -304,8 +304,7 @@ private:
     if (field->type() == FieldType::TEXT) {
       fail(pos, fmt::format("field '{}' is TEXT and has no value column; use a string variant", name));
     }
-    bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
-                   field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
+    bool numeric = FieldType::isNumericColumn(field->type());
     bool stringSortable = FieldType::storage(field->type()) == FieldType::Storage::TERMS;
     bool geo = field->type() == FieldType::GEO_POINT;
     if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));

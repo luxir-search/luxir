@@ -69,7 +69,7 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         if (!found) break;
         const SegFieldInfo& info = *found;
         auto type = const_cast<FieldType&>(field.getFieldType()).type();
-        if (FieldType::sortsByIntColumn(type)) {
+        if (FieldType::isNumericColumn(type)) {
           IntColReader column(segment.postingsReader(), info);
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;

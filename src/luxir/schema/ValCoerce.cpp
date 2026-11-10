@@ -30,6 +30,46 @@ std::optional<int64_t> FieldType::tryCoerceColInt64(
   }
 }
 
+namespace {
+
+FieldType::IntWindow literalWindow(FieldType::IntWindow window, FieldType::LiteralUse use) {
+  using Use = FieldType::LiteralUse;
+  switch (use) {
+    case Use::MATCH: case Use::MEMBER: return window;
+    case Use::GTE: window.hi = INT64_MAX; break;
+    case Use::GT:
+      if (window.hi == INT64_MAX) return {1, 0, window.granuleSkipped, window.unroundedNow};
+      window.lo = window.hi + 1;
+      window.hi = INT64_MAX;
+      break;
+    case Use::LTE: window.lo = INT64_MIN; break;
+    case Use::LT:
+      if (window.lo == INT64_MIN) return {1, 0, window.granuleSkipped, window.unroundedNow};
+      window.hi = window.lo - 1;
+      window.lo = INT64_MIN;
+      break;
+  }
+  return window;
+}
+
+} // namespace
+
+FieldType::IntWindow FieldType::coerceIntWindow(
+    const api::Val& val, LiteralUse use, std::string_view fieldName,
+    const CoerceContext& context) const {
+  int64_t value = coerceColInt64(val, fieldName, context);
+  return literalWindow({value, value}, use);
+}
+
+std::optional<FieldType::IntWindow> FieldType::tryCoerceIntWindow(
+    const api::Val& val, LiteralUse use, std::string_view fieldName,
+    const CoerceContext& context) const {
+  if (auto value = tryCoerceColInt64(val, fieldName, context)) {
+    return literalWindow({*value, *value}, use);
+  }
+  return std::nullopt;
+}
+
 std::string_view FieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
                                        std::span<char> buf) const {
   unused(buf);
@@ -126,12 +166,6 @@ DateColumnCoercion tryDateColumn(const api::Val& val, DateUnit unit, const Coerc
 
 } // namespace
 
-std::optional<int64_t> DateFieldType::tryCoerceColInt64(
-    const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
-  unused(fieldName);
-  return tryDateColumn(val, unit, context).value;
-}
-
 int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
                                       const CoerceContext& context) const {
   auto parsed = tryDateColumn(val, unit, context);
@@ -139,15 +173,10 @@ int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fiel
   throwDateCoerce(val, fieldName, unit, parsed.outsideRange);
 }
 
-std::optional<int64_t> DateFieldType::coerceDateInstant(
-    const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
-  auto parsed = tryDateColumn(val, unit, context);
-  if (parsed.value || parsed.outsideRange) return parsed.value;
-  throwDateCoerce(val, fieldName, unit);
-}
+namespace {
 
-std::optional<DateFieldType::QueryRange> DateFieldType::tryCoerceDateRange(
-    const api::Val& val, const CoerceContext& context) const {
+std::optional<FieldType::IntWindow> tryDateWindow(
+    const api::Val& val, DateUnit unit, const CoerceContext& context) {
   auto inputUnit = context.dateInputUnit.value_or(unit);
   std::optional<int64_t> integer;
   if (auto i = std::get_if<int64_t>(&val.kind)) integer = *i;
@@ -157,13 +186,13 @@ std::optional<DateFieldType::QueryRange> DateFieldType::tryCoerceDateRange(
     // A coarser numeric input names its entire input tick. Native numbers
     // are exact: no exclusive i+1 endpoint is constructed.
     int64_t width = dateUnitNanos(inputUnit) / dateUnitNanos(unit);
-    return QueryRange{clampDateUnits(lo), clampDateUnits(lo + std::max(width, (int64_t)1) - 1)};
+    return FieldType::IntWindow{clampDateUnits(lo), clampDateUnits(lo + std::max(width, (int64_t)1) - 1)};
   }
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());
     if (auto parsed = parseDateRange(*s, now, context.timeZone, inputUnit)) {
       int64_t tick = dateUnitNanos(unit);
-      return QueryRange{
+      return FieldType::IntWindow{
           clampDateUnits(datetime_detail::toUnits128(parsed->lo, parsed->loNanos, tick, false)),
           clampDateUnits(datetime_detail::toUnits128(parsed->hiExclusive, parsed->hiNanos, tick, true) - 1),
           parsed->granuleSkipped, parsed->unroundedNow};
@@ -172,10 +201,27 @@ std::optional<DateFieldType::QueryRange> DateFieldType::tryCoerceDateRange(
   return std::nullopt;
 }
 
-DateFieldType::QueryRange DateFieldType::coerceDateRange(const api::Val& val,
-    std::string_view fieldName, const CoerceContext& context) const {
-  if (auto parsed = tryCoerceDateRange(val, context)) return *parsed;
-  throwDateCoerce(val, fieldName, context.dateInputUnit.value_or(unit));
+} // namespace
+
+FieldType::IntWindow DateFieldType::coerceIntWindow(
+    const api::Val& val, LiteralUse use, std::string_view fieldName,
+    const CoerceContext& context) const {
+  if (auto window = tryCoerceIntWindow(val, use, fieldName, context)) return *window;
+  throwDateCoerce(val, fieldName, use == LiteralUse::MEMBER ? unit : context.dateInputUnit.value_or(unit));
+}
+
+std::optional<FieldType::IntWindow> DateFieldType::tryCoerceIntWindow(
+    const api::Val& val, LiteralUse use, std::string_view fieldName,
+    const CoerceContext& context) const {
+  unused(fieldName);
+  if (use == LiteralUse::MEMBER) {
+    auto parsed = tryDateColumn(val, unit, context);
+    if (parsed.value) return IntWindow{*parsed.value, *parsed.value};
+    if (parsed.outsideRange) return IntWindow{1, 0};
+    return std::nullopt;
+  }
+  if (auto window = tryDateWindow(val, unit, context)) return literalWindow(*window, use);
+  return std::nullopt;
 }
 
 std::string_view TextFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,

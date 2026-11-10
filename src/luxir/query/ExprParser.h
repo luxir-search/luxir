@@ -241,7 +241,7 @@ private:
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
 
   static bool numericQueryable(FieldType& ft) {
-    return QueryBuilder::isNumericColumnType(ft.type()) && ft.hasColumn();
+    return FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
   }
 
   FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {

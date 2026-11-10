@@ -57,7 +57,7 @@ public:
   // persist zones, so planning skips the per-leaf extrema pass and nothing
   // accumulates (monotonic sidecars are the large writers on this path).
   // writeSketch persists a value sketch with the zones; it is for the
-  // columns field-sort planning reads (FieldType::sortsByIntColumn, single
+  // columns field-sort planning reads (FieldType::isNumericColumn, single
   // valued). Every other zone-bearing column (geo points, multi-valued
   // columns, a query-time OrdMap's internal columns) writes an empty one
   // and skips the sketcher: two tail-buffer passes per value and up to

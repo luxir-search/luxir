@@ -724,7 +724,7 @@ private:
   }
 
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
-    return FieldType::usesOneDimensionalPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
+    return FieldType::isNumericColumn(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static bool hasGeoPoints(FieldType::Type type, int32_t flags) {
@@ -2277,7 +2277,7 @@ private:
     auto outputPtr = postingsWriter.getOutputStream();
     auto intColWriter = pool.make_unique_align<IntColWriter>(
         8, *outputPtr,
-        FieldType::sortsByIntColumn(outputFieldInfo.type)
+        FieldType::isNumericColumn(outputFieldInfo.type)
             && !(outputFieldInfo.flags & FieldType::MULTI_VALUED));
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
