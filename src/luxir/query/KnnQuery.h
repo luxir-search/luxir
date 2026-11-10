@@ -161,6 +161,9 @@ public:
     // codesVisited counts physical list entries, including depth rescans.
     std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0}, codesVisited{0};
     std::atomic<int64_t> retainedPeak{0}, retainedTerminal{0}, seedReads{0}, remainingReads{0};
+    // One diagnostic per final query-wide interval floor, across all rounds
+    // and segments. Shortfall counts missing distinct exact supporting units.
+    std::atomic<int64_t> unsupportedFloors{0}, unsupportedFloorShortfall{0};
     // Flat search work; excludes metadata counting and terminal rereads.
     std::atomic<int64_t> domainDocsVisited{0}, domainProbes{0}, vectorsScored{0};
     std::atomic<int64_t> slotsBuilt{0}, faissIndexCalls{0};
@@ -1631,7 +1634,13 @@ public:
       rescoreAndCollapseCandidates<Groups>(candidateHits, intervals, reader, segInfos, v2dSpan,
           segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
           selectedLimit, docHits, ctx.parallel, workBySeg, query.groups);
+      // If terminal T exceeds the witness floor, k distinct exact seeds
+      // already support it. Per-unit skips also have a better exact member.
+      // Thus valid intervals must leave k exact units at or above the floor.
+      int64_t floorShortfall = intervalEngine ? intervals.unsupportedFloorShortfall(docHits) : 0;
       if (statsForTests) {
+        statsForTests->unsupportedFloors += floorShortfall > 0;
+        statsForTests->unsupportedFloorShortfall += floorShortfall;
         statsForTests->coveredFraction += coveredFraction;
         for (const auto& work : workBySeg) statsForTests->addWork(work);
         statsForTests->switches += (int64_t)completions.size();
@@ -1657,6 +1666,7 @@ public:
           statsForTests->modeledActualCost += tuning.plannerCosts.requestCost;
         }
         bool ivfRequestPending = true;
+        bool floorDiagnosticPending = intervalEngine;
         for (size_t i = 0; i < numSegs; i++) {
           const auto& input = planSegments[i];
           const auto& work = workBySeg[i];
@@ -1679,6 +1689,11 @@ public:
             piece.wire.max_doc = reader.segments()[i].maxDoc();
             piece.wire.strategy = plan.ivf[i] ? "ivf" : "exact";
             piece.wire.cardinality = input.eligibleDocs; piece.wire.domain_size = input.domainSize;
+            // Shared query state is reported once, on the first active piece.
+            if (std::exchange(floorDiagnosticPending, false)) {
+              piece.details.push_back(std::format("query_unsupported_floors={}; query_unsupported_floor_shortfall={}",
+                  floorShortfall > 0 ? 1 : 0, floorShortfall));
+            }
             piece.details.push_back(std::format("reason={}; eligible_vectors={}{}; exact_cost={}; ivf_scan_cost_at_predicted_coverage={}; ivf_linear={}; ivf_fixed={}",
                 reasons[i], input.eligibleVectors, input.vectorsEstimated ? " (estimated)" : "",
                 plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
