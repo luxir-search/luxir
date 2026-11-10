@@ -110,14 +110,16 @@ public:
         + ((size() + VersionRuns::BLOCK_SIZE - 1) / VersionRuns::BLOCK_SIZE) * sizeof(VersionBlockDirectory);
   }
 
-  void add(uint32_t start, uint64_t version) {
+  // split keeps a later start as its own run even when its version equals
+  // the previous run's (a merge writing one run per doc).
+  void add(uint32_t start, uint64_t version, bool split = false) {
     VersionRun last = tail.empty() ? sealedLast : tail.back();
     if (start < last.firstDocId) throw std::runtime_error("Request-version runs must increase");
     if (start == last.firstDocId) {
       assert(!tail.empty()); // Sealing requires a later, nonempty boundary.
       tail.back().version = version;
       if (size() > 1 && (tail.size() > 1 ? tail[tail.size() - 2].version : sealedLast.version) == version) tail.pop_back();
-    } else if (last.version != version) {
+    } else if (last.version != version || split) {
       if (tail.size() == VersionRuns::BLOCK_SIZE) seal();
       tail.push_back({start, version});
       if (tail.size() > 1) tailDense &= start == tail.front().firstDocId + tail.size() - 1;

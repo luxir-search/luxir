@@ -47,6 +47,9 @@ public:
   Directory& underlying() override { return delegate->underlying(); }
   Capabilities capabilities() const override { return delegate->capabilities(); }
 
+  // No writes reach the backend's disk, scratch included.
+  std::string scratchPath() const override { return {}; }
+
   std::unique_ptr<File> createFile(std::string_view name) override {
     reject(std::string("createFile(") + std::string(name) + ")");
   }
