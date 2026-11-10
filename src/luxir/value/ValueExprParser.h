@@ -301,13 +301,13 @@ private:
       fail(pos, e.what());
     }
     FieldType* field = target.fieldType;
-    if (field->type() == FieldType::TEXT) {
-      fail(pos, fmt::format("field '{}' is TEXT and has no value column; use a string variant", name));
+    try {
+      field->requireCapability(FieldType::VALUE_EXPR, "value expression", name);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
     }
     bool numeric = FieldType::isNumericColumn(field->type());
-    bool stringSortable = FieldType::storage(field->type()) == FieldType::Storage::TERMS;
     bool geo = field->type() == FieldType::GEO_POINT;
-    if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));
     if (!field->hasColumn()) {
       fail(pos, fmt::format("field '{}' has no column values", name));
     }

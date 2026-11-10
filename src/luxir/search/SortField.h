@@ -52,10 +52,7 @@ public:
           stringSortMode(stringSortMode) {
         assert(stringSortMode != StringSortMode::DEFAULT);
         auto& type = const_cast<FieldType&>(fieldType);
-        if (type.type() == FieldType::TEXT) {
-            throw std::runtime_error("Sort field '" + fieldName +
-                "' is TEXT and has no value column; use a string variant");
-        }
+        type.requireCapability(FieldType::SORT, "sort", fieldName);
         if (!type.hasColumn()) {
             throw std::runtime_error("Sort field '" + fieldName + "' has no value column");
         }
@@ -142,8 +139,7 @@ public:
             }
 
             default:
-                throw std::runtime_error("Unknown field type for sorting: " + 
-                    std::to_string((int)const_cast<FieldType*>(fieldType)->type()));
+                throw std::logic_error("Unhandled sort storage");
         }
     }
 };

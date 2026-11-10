@@ -3,6 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/server/JsonRequest.h"
+#include "luxir/search/SortField.h"
+#include "luxir/value/ValueExprParser.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/search/IndexReader.h"
@@ -30,6 +34,105 @@ IndexResult forceMerge(CollectionHelper& helper) {
 } // namespace
 
 class FieldTypeContractTest : public LuxirTest {};
+
+TEST_F(FieldTypeContractTest, operationCapabilities) {
+  using F = FieldType;
+  const uint32_t terms = F::MATCH | F::ANY_OF | F::PREFIX | F::PATTERN | F::FUZZY | F::FREE_TEXT
+      | F::TERM_FILTER | F::RANGE | F::SORT | F::FIELD_FACET | F::COLLAPSE | F::VALUE_EXPR;
+  const uint32_t text = F::MATCH | F::ANY_OF | F::PREFIX | F::PATTERN | F::FUZZY | F::FREE_TEXT | F::RANGE | F::FIELD_FACET;
+  const uint32_t numeric = F::MATCH | F::ANY_OF | F::RANGE | F::SORT | F::FIELD_FACET | F::RANGE_FACET | F::VALUE_EXPR;
+  struct Case { std::shared_ptr<FieldType> type; uint32_t expected; };
+  const Case cases[] = {
+      {std::make_shared<FieldType>("none", F::NONE, 0), 0},
+      {std::make_shared<StrFieldType>("string"), terms},
+      {std::make_shared<TextFieldType>("text"), text},
+      {std::make_shared<StoredFieldType>("bin"), 0},
+      {std::make_shared<IntFieldType>("int"), numeric | F::COLLAPSE},
+      {std::make_shared<FloatFieldType>("float"), numeric},
+      {std::make_shared<DoubleFieldType>("double"), numeric},
+      {std::make_shared<IdFieldType>("id"), terms},
+      {std::make_shared<VectorFieldType>("vector", 3), 0},
+      {std::make_shared<DateFieldType>("date"), numeric | F::COLLAPSE},
+      {std::make_shared<GeoPointFieldType>("geo"), F::VALUE_EXPR}};
+  CollectionHelper helper;
+  auto schema = Schema::createDefaultSchema();
+  for (const auto& c : cases) schema->fieldTypeMap[c.type->name_] = c.type;
+  helper.collection().setSchema(schema);
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.type->name_);
+    EXPECT_EQ(c.expected, c.type->capabilities());
+    auto flags = c.type->flags_;
+    c.type->flags_ ^= F::INDEX_DOCS | F::COLUMN_STORED;
+    EXPECT_EQ(c.expected, c.type->capabilities());
+    c.type->flags_ = flags;
+    auto catalog = schema->searchableFields();
+    EXPECT_EQ((c.expected & F::FREE_TEXT) != 0, std::ranges::contains(catalog, c.type->name_));
+    for (auto capability : {F::MATCH, F::ANY_OF, F::PREFIX, F::PATTERN, F::FUZZY, F::RANGE,
+                           F::SORT, F::FIELD_FACET, F::RANGE_FACET, F::COLLAPSE, F::VALUE_EXPR, F::TERM_FILTER}) {
+      SCOPED_TRACE(capability);
+      bool expected = (c.expected & capability) != 0;
+      EXPECT_EQ(expected, c.type->supports(capability));
+      try {
+        MemPool pool;
+        QueryBuilder builder(pool, *schema, CoerceContext{});
+        auto name = c.type->name_;
+        api::Val value = coerce::scalarVal(std::string_view("7"));
+        std::string op;
+        switch (capability) {
+          case F::MATCH: builder.createMatchQuery(name, value); break;
+          case F::ANY_OF: {
+            int64_t seven = 7;
+            api::Val values;
+            values.kind.emplace<api::ArrInt>().v = {&seven, 1};
+            builder.createAnyOfQuery(builder.canonicalizeFieldValues(name, ValueSequence(values, "values")));
+            break;
+          }
+          case F::PREFIX: builder.createPrefixQuery(name, "7"); break;
+          case F::PATTERN:
+            builder.createWildcardQuery(name, "7*");
+            builder.createRegexQuery(name, "7.*");
+            break;
+          case F::FUZZY: builder.createFuzzyQuery(name, "7"); break;
+          case F::RANGE: builder.createRangeQuery(name, &value, nullptr, nullptr, nullptr); break;
+          case F::SORT: { SortField field(name, *c.type); break; }
+          case F::VALUE_EXPR: {
+            google::protobuf::Arena arena;
+            ValueExprParser(ValueExprOptions{schema.get(), {}}, arena).parse("count(" + name + ")");
+            break;
+          }
+          case F::FIELD_FACET: op = R"({"field_facet":{"field":")" + name + R"("}})"; break;
+          case F::RANGE_FACET: op = R"({"range_facet":{"field":")" + name + R"(","start":0,"end":10,"gap":1}})"; break;
+          case F::TERM_FILTER: op = R"({"field_facet":{"field":")" + name + R"(","term_filter":{"prefix":"7"}}})"; break;
+          case F::COLLAPSE: op = R"({"top_docs":{"query":"*:*","limit":0,"collapse":{"field":[")" + name + R"("]}}})"; break;
+          default: FAIL() << "unhandled capability";
+        }
+        if (!op.empty()) {
+          auto req = localReq(helper.getSearchEngine());
+          parseQueryRequest(R"({"ops":{"q":)" + op + "}}", req->rawRequest(), req->mr);
+          req->execute(false);
+          EXPECT_EQ(expected, req->ok()) << req->errorMsg();
+        } else EXPECT_TRUE(expected);
+      } catch (const std::exception& error) {
+        EXPECT_FALSE(expected) << error.what();
+      }
+    }
+  }
+}
+
+TEST_F(FieldTypeContractTest, textCapabilityRemedies) {
+  TextFieldType text("text");
+  for (auto capability : {FieldType::SORT, FieldType::VALUE_EXPR, FieldType::COLLAPSE, FieldType::RANGE_FACET}) {
+    SCOPED_TRACE(capability);
+    try {
+      text.requireCapability(capability, "operation", "title");
+      FAIL() << "expected unsupported operation";
+    } catch (const RequestError& error) {
+      EXPECT_EQ("operation is not supported on text field 'title'; use a string variant", std::string(error.what()));
+    }
+  }
+  EXPECT_TRUE(text.capabilityRemedy(FieldType::TERM_FILTER).empty());
+  EXPECT_TRUE(IntFieldType("int").capabilityRemedy(FieldType::PREFIX).empty());
+}
 
 TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
   CollectionHelper helper;

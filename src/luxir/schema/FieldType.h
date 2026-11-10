@@ -84,6 +84,21 @@ public:
   static uint32_t typeParameters(Type type, uint32_t typeFlags);
   static std::string describeType(Type type, uint32_t typeFlags);
 
+  enum Capability : uint32_t {
+    MATCH = 1u << 0, ANY_OF = 1u << 1, PREFIX = 1u << 2,
+    PATTERN = 1u << 3, FUZZY = 1u << 4, FREE_TEXT = 1u << 5,
+    TERM_FILTER = 1u << 6, RANGE = 1u << 7, SORT = 1u << 8,
+    FIELD_FACET = 1u << 9, RANGE_FACET = 1u << 10,
+    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12
+  };
+
+  // Type support only; callers validate indexing and column configuration.
+  virtual uint32_t capabilities() const;
+  virtual std::string_view capabilityRemedy(uint32_t required) const { return {}; }
+  bool supports(uint32_t required) const { return (capabilities() & required) == required; }
+  void requireCapability(uint32_t required, std::string_view operation,
+                         std::string_view fieldName) const;
+
   using flag_type = int32_t;
 
   static constexpr flag_type INDEX_DOCS = (1 << 0);
@@ -267,6 +282,10 @@ public:
   TextFieldType(std::string_view name, int flags = INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {});
 
+  std::string_view capabilityRemedy(uint32_t required) const override {
+    return (required & (SORT | VALUE_EXPR | COLLAPSE | RANGE_FACET)) ? "use a string variant" : "";
+  }
+
   // Create a new non-thread-safe analyzer chain for this text field type
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
@@ -315,6 +334,8 @@ public:
   FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
   }
 
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
+
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
@@ -328,6 +349,8 @@ class DoubleFieldType : public FieldType {
 public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
   }
+
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
@@ -384,6 +407,7 @@ public:
   }
 
   ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
+  uint32_t capabilities() const override { return VALUE_EXPR; }
 };
 
 // Unique id field

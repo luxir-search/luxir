@@ -1173,8 +1173,7 @@ std::vector<std::string> Schema::searchableFields(
   for (const auto& [name, type] : fieldTypeMap) addRoot(name);
   for (auto name : physicalNames) addRoot(name);
   auto termTarget = [](FieldType& type) {
-    return type.indexed() && (type.type() == FieldType::TEXT
-        || type.type() == FieldType::STRING || type.type() == FieldType::ID);
+    return type.indexed() && type.supports(FieldType::FREE_TEXT);
   };
   std::vector<std::string> names;
   for (auto root : roots) {

@@ -584,6 +584,7 @@ public:
       if (!resolved.insert(field.physicalName).second) {
         throw RequestError("duplicate resolved collapse field: " + std::string(name));
       }
+      type.requireCapability(FieldType::COLLAPSE, "collapse", name);
       using Type = luxir::api::GroupComponent_::Type;
       Type wireType;
       switch (type.type()) {
@@ -591,7 +592,7 @@ public:
         case FieldType::ID: wireType = Type::ID; break;
         case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
         case FieldType::DATE: wireType = Type::DATE; break;
-        default: throw RequestError("unsupported collapse key type: " + std::string(name));
+        default: throw std::logic_error("Unhandled collapse key wire type");
       }
       bool ordinal = FieldType::storage(type.type()) == FieldType::Storage::TERMS;
       if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
@@ -743,6 +744,11 @@ public:
     // Resolve everything that could throw here in the parser and pass the
     // results into the op ctors (see TopDocsReq's ctor comment).
     auto* ftype = target.fieldType;
+    ftype->requireCapability(FieldType::FIELD_FACET, "field_facet", facetField);
+    if (facetReq.term_filter.has_value()) {
+      ftype->requireCapability(FieldType::TERM_FILTER,
+                               std::format("facet '{}': term_filter", facetName), facetField);
+    }
 
     std::span<const int64_t> selectedInts;
     std::span<const std::string_view> selectedStrings;
@@ -764,28 +770,17 @@ public:
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
       if (FieldType::isNumericColumn(ftype->type())) {
         selectedInts = preparedSelected->numericsInInputOrder();
-      } else if (ftype->type() == FieldType::Type::ID
-                 || ftype->type() == FieldType::Type::STRING
-                 || ftype->type() == FieldType::Type::TEXT) {
+      } else {
         selectedStrings = preparedSelected->termsInInputOrder();
       }
     }
 
-    if (facetReq.term_filter.has_value() && ftype->type() != FieldType::Type::ID
-        && ftype->type() != FieldType::Type::STRING) {
-      throw RequestError("facet '" + std::string(facetName)
-          + "': term_filter is supported only on STRING and ID fields");
-    }
-
     FieldFacetReq* facet = nullptr;
-    switch (ftype->type()) {
+    switch (FieldType::storage(ftype->type())) {
       // Numeric columns hold raw integers, date ticks, or sortable floating
       // bits. Field facets count distinct encoded values for all of them;
       // date-histogram bucketing is a range facet, not a terms facet.
-      case FieldType::Type::FLOAT:
-      case FieldType::Type::DOUBLE:
-      case FieldType::Type::DATE:
-      case FieldType::Type::INT: {
+      case FieldType::Storage::INT64: {
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
@@ -793,8 +788,7 @@ public:
             facetField, facetName, limit, minCount, missing, selectedInts);
         break;
       }
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING: {
+      case FieldType::Storage::TERMS: {
         // A string facet counts term ordinals, so it needs the term dictionary
         // the ord column indexes into. A column-only field (IndexMode::NONE)
         // stores values with nothing to take ordinals from; without this the
@@ -817,7 +811,7 @@ public:
             std::move(ordMap), selectedStrings, std::move(termFilter));
         break;
       }
-      case FieldType::Type::TEXT:
+      case FieldType::Storage::TEXT:
         if (measure != nullptr) throw RequestError("TEXT field_facet distinct counts are not supported yet");
         facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedStrings);
@@ -825,7 +819,7 @@ public:
       default: ;
     }
     if (facet == nullptr) {
-      throw std::runtime_error("Unknown facet field type: " + std::string(facetField));
+      throw std::logic_error("Unhandled field facet storage");
     }
     configureMeasure(*facet, measure);
     return facet;
@@ -863,10 +857,8 @@ public:
           + "': range gap or calendar_gap is required");
     }
     auto* fieldType = target.fieldType;
-    if (!FieldType::isNumericColumn(fieldType->type())) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range facets require an INT, DATE, FLOAT, or DOUBLE field");
-    }
+    fieldType->requireCapability(FieldType::RANGE_FACET,
+        "range_facet", facetField);
 
     bool calendar = std::holds_alternative<api::CalendarGap>(facetReq.gap_kind);
     if (fieldType->type() != FieldType::Type::DATE

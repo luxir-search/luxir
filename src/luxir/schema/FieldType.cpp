@@ -19,6 +19,29 @@ std::string_view FieldType::typeName(Type type) {
   return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
 }
 
+uint32_t FieldType::capabilities() const {
+  switch (storage(type_)) {
+    case Storage::TERMS:
+      return MATCH | ANY_OF | PREFIX | PATTERN | FUZZY | FREE_TEXT | TERM_FILTER
+          | RANGE | SORT | FIELD_FACET | COLLAPSE | VALUE_EXPR;
+    case Storage::TEXT:
+      return MATCH | ANY_OF | PREFIX | PATTERN | FUZZY | FREE_TEXT | RANGE | FIELD_FACET;
+    case Storage::INT64:
+      return MATCH | ANY_OF | RANGE | SORT | FIELD_FACET | RANGE_FACET | COLLAPSE | VALUE_EXPR;
+    default: return 0;
+  }
+}
+
+void FieldType::requireCapability(uint32_t required, std::string_view operation,
+                                   std::string_view fieldName) const {
+  if (!supports(required)) {
+    auto message = std::format("{} is not supported on {} field '{}'", operation, typeName(type_), fieldName);
+    auto remedy = capabilityRemedy(required);
+    if (!remedy.empty()) message.append("; ").append(remedy);
+    throw RequestError(message);
+  }
+}
+
 uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
   switch (type) {
     case DATE:
