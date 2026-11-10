@@ -216,13 +216,13 @@ TEST_F(EstimatedCountTest, multiTermSamplesLazily) {
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 65536; doc++) {
     docs.push_back(flatdoc("id", "d" + std::to_string(doc),
-                           "tag_s", "t" + std::to_string(doc % 4)));
+                           "tag_w", "t" + std::to_string(doc % 4)));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   auto run = [&](int64_t countLimit) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    req->topDocs("q").prefixQuery("tag_s", "t").fields({"id"}).limit(10).countLimit(countLimit);
+    req->topDocs("q").prefixQuery("tag_w", "t").fields({"id"}).limit(10).countLimit(countLimit);
     SkipStatsScope stats;
     req->execute(false);
     return std::pair(resultOf(*req), SkipStats::docBlocksDecoded);
@@ -239,6 +239,25 @@ TEST_F(EstimatedCountTest, multiTermSamplesLazily) {
   // a fraction of what an exact count, or a materialized union, does.
   EXPECT_LT(estimateBlocks - rankedBlocks, (exactBlocks - rankedBlocks) / 2)
       << rankedBlocks << " " << estimateBlocks << " " << exactBlocks;
+}
+
+// With one term per document the accepted terms' docFreqs sum to the exact
+// count, so there is nothing to sample.
+TEST_F(EstimatedCountTest, multiTermOnOneTermPerDocumentFieldIsExact) {
+  constexpr std::string_view collection = "estimate_prefix_exact";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 65536; doc++) {
+    docs.push_back(flatdoc("id", "d" + std::to_string(doc),
+                           "tag_s", "t" + std::to_string(doc % 16)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection(collection);
+  req->topDocs("q").prefixQuery("tag_s", "t1").fields({"id"}).limit(10).countLimit(-2);
+  req->execute(false);
+  // t1 and t10..t15.
+  expectExact(resultOf(*req), 7 * 4096);
 }
 
 TEST_F(EstimatedCountTest, positiveLimitWithFlagKeepsAtLeastN) {

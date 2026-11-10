@@ -1220,7 +1220,7 @@ TEST_F(MultiTermScorerModesTest, releaseAllBudgetsPreservesSpillAndEmptyExpansio
   EXPECT_EQ(0, emptySupplier->cost());
   emptyWeight->releaseSegmentState(segment);
   EXPECT_EQ(Query::MatchState::UNKNOWN, emptySupplier->describeScorer(large).matchState);
-  EXPECT_EQ(segment.maxDoc(), emptySupplier->cost());
+  EXPECT_EQ(0, emptySupplier->cost());
   EXPECT_TRUE(emptySupplier->fillExpansionMemo(large));
   EXPECT_EQ(1u, emptyWeight->expansionRefillsForTests());
   EXPECT_EQ(nullptr, emptySupplier->resolve(scratch, large)->build(scratch));

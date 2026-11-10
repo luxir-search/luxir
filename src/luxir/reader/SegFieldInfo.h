@@ -110,6 +110,15 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // Every indexed STRING/ID document contributes at least one distinct term.
+  // Equality makes different terms' postings disjoint, even for repeated ARRAY
+  // values. This does not imply one column value per document.
+  bool hasDisjointTermPostings() const {
+    return (flags & FieldType::INDEX_DOCS) != 0
+        && (type == FieldType::STRING || type == FieldType::ID)
+        && sumDocFreq == docsWithField;
+  }
+
   void requireCompatibleType(const SegFieldInfo& other) const {
     if (type != other.type || FieldType::typeParameters(type, typeFlags)
         != FieldType::typeParameters(other.type, other.typeFlags)) {
