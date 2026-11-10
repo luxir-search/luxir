@@ -42,7 +42,7 @@
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
@@ -323,7 +323,9 @@ inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
 // floating point value.  encodeVal/decodeEnc map client-facing values to
 // the order-preserving int64 space pickMissingVal searches in (identity
 // for ints, sortable bits for floats/doubles).
-struct IntColEmit {
+template <typename T> struct ColEmit;
+
+template <> struct ColEmit<int64_t> {
   using value_type = int64_t;
   using arr_type = luxir::api::ArrInt;
   static constexpr bool foldZeros = false;
@@ -336,7 +338,7 @@ struct IntColEmit {
   static int64_t encHi() { return std::numeric_limits<int64_t>::max(); }
 };
 
-struct FloatColEmit {
+template <> struct ColEmit<float> {
   using value_type = float;
   using arr_type = luxir::api::ArrFloat;
   static constexpr bool foldZeros = true;
@@ -349,7 +351,7 @@ struct FloatColEmit {
   static int64_t encHi() { return (int64_t)floatToSortableInt32(std::numeric_limits<float>::infinity()); }
 };
 
-struct DoubleColEmit {
+template <> struct ColEmit<double> {
   using value_type = double;
   using arr_type = luxir::api::ArrDouble;
   static constexpr bool foldZeros = true;
@@ -362,7 +364,7 @@ struct DoubleColEmit {
   static int64_t encHi() { return doubleToSortableInt64(std::numeric_limits<double>::infinity()); }
 };
 
-struct DateStrColEmit {
+template <> struct ColEmit<std::string_view> {
   using value_type = std::string_view;
   using arr_type = luxir::api::ArrStr;
 };
@@ -493,7 +495,7 @@ inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs,
   auto& pending = pendingCols.emplace_back();
   pending.present.assign(segDocs.size(), 1);
   pending.finish = [&col](std::span<const uint8_t> present) {
-    col.missing_val = pickMissingVal<IntColEmit>(col.v, present);
+    col.missing_val = pickMissingVal<ColEmit<int64_t>>(col.v, present);
   };
   addFieldLoader(loaders, runs, [&req, segDocs, target](std::span<RowIndex> indices) {
     auto segment = segDocs[indices[0]].segment();
@@ -1233,35 +1235,29 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         group.reqs.push_back({field, &fieldType, rf.infos, fieldType.multiValued(), starget, mtarget, present});
       };
 
-      switch (fieldType.type()) {
-        case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+      switch (FieldType::storage(fieldType.type())) {
+        case FieldType::Storage::INT64: {
+          if (fieldType.type() == FieldType::FLOAT) {
+            loadNumCol<ColEmit<float>>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          } else if (fieldType.type() == FieldType::DOUBLE) {
+            loadNumCol<ColEmit<double>>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          } else if (fieldType.type() == FieldType::GEO_POINT) {
+            loadGeoCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
+          } else {
+            withNatureOutput(fieldType.valueNature(), flags, mr, [field] { return field; }, [&](auto output) {
+              using Emit = ColEmit<decltype(output(int64_t{}))>;
+              if constexpr (std::is_same_v<decltype(output), NativeValueOutput>) {
+                loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
+                                 pendingLoaders, pendingCols, mr);
+              } else {
+                loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
+                                 pendingLoaders, pendingCols, mr, output);
+              }
+            });
+          }
           break;
         }
-        case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          break;
-        }
-        case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          break;
-        }
-        case FieldType::Type::DATE: {
-          auto nature = dateValueNature(DateFieldType::unitOf(fieldType));
-          withDateOutput(nature, flags, mr, [field] { return field; }, [&](auto output) {
-            using Emit = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
-                                            DateStrColEmit, IntColEmit>;
-            loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
-                             pendingLoaders, pendingCols, mr, output);
-          });
-          break;
-        }
-        case FieldType::Type::GEO_POINT: {
-          loadGeoCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
-          break;
-        }
-        case FieldType::Type::ID:
-        case FieldType::Type::STRING: {
+        case FieldType::Storage::TERMS: {
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           } else if (fieldType.hasColumn() && columnSize != 0) {
@@ -1269,13 +1265,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           }
           break;
         }
-        case FieldType::Type::TEXT: {
+        case FieldType::Storage::TEXT: {
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           }
           break;
         }
-        case FieldType::Type::VECTOR: {
+        case FieldType::Storage::VECTOR: {
           if (columnSize != 0) {
             loadVectorCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
           }

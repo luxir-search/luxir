@@ -130,6 +130,17 @@ TEST_F(ValCoerceTest, toTextRendersCanonically) {
 
 // ---- FieldType virtuals: the per-type encodings ----
 
+TEST_F(ValCoerceTest, fieldValueNatures) {
+  IntFieldType integer("_i");
+  DateFieldType millis("_dt");
+  DateFieldType nanos("ns", FieldType::COLUMN_STORED, DateUnit::NANOS);
+  GeoPointFieldType geo("_p");
+  EXPECT_EQ(ValueNature::NUMBER, integer.valueNature());
+  EXPECT_EQ(ValueNature::DATE_MS, millis.valueNature());
+  EXPECT_EQ(ValueNature::DATE_NS, nanos.valueNature());
+  EXPECT_EQ(ValueNature::GEO_POINT, geo.valueNature());
+}
+
 TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   IntFieldType it("_i");
   FloatFieldType ft("_f");

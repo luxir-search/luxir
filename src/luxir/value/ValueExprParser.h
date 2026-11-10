@@ -324,9 +324,7 @@ private:
       node.type = field->multiValued()
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
-      node.nature = field->type() == FieldType::DATE
-          ? dateValueNature(DateFieldType::unitOf(*field))
-          : geo ? ValueNature::GEO_POINT : ValueNature::NUMBER;
+      node.nature = field->valueNature();
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);

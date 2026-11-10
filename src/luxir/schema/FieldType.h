@@ -7,6 +7,7 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/value/ValueTypes.h"
 
 #include <cassert>
 #include <cstdint>
@@ -221,6 +222,8 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
+  virtual ValueNature valueNature() const { return ValueNature::NUMBER; }
+
   enum class LiteralUse : uint8_t { MATCH, MEMBER, GTE, GT, LTE, LT };
   struct IntWindow {
     int64_t lo = INT64_MIN, hi = INT64_MAX;
@@ -351,6 +354,7 @@ public:
   static DateUnit unitFromTypeFlags(uint32_t typeFlags);
   // The unit of a field type whose type() is DATE.
   static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
+  ValueNature valueNature() const override { return dateValueNature(unit); }
   uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
 
   int64_t coerceColInt64(
@@ -378,6 +382,8 @@ public:
     : FieldType(name, FieldType::GEO_POINT, flags),
       ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
+
+  ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
 };
 
 // Unique id field
