@@ -349,31 +349,30 @@ no amplitude section.
 The builder computes these in the encoding row pipeline from the rotated
 original, assigned centroid and actual code. SigmaB is the residual
 reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
-for squared L2. Sigma1 removes FAISS's fixed 1.9 confidence multiplier from
-its error factor. These amplitudes support empirical confidence intervals;
-they are not deterministic error bounds. The reader exposes a mmap view.
-
-The same step corrects near-centroid sign factors. Below a squared residual of
-`FLT_EPSILON`, FAISS 1.14.3 substitutes 1 for `1 / ||r||` while still
-multiplying by the real `||r||`, so `dp_multiplier` is about `1 / cos(angle)`
-instead of `||r|| / cos(angle)`. The code then scores as if its residual had
-unit length, with an error term near zero. That happens to a vector that almost
-equals its centroid (duplicates, singleton lists, rounding of a normalized
-centroid), and to every code in a list when the data itself has a small
-magnitude under L2. An interval built from such a code is a false witness: it
-can lift the floor above true neighbors and prune them, at any probe count.
-`VectorIndexBuilder::finishRaBitQCode` overwrites these codes with the
-unguarded formula, `||r||^2 * sqrt(D) / sum(|r_i|)`, plus f_error for multi-bit
-codes. That equals the FAISS value at and above the threshold, so the estimator
-has no discontinuity there and the codes keep the same empirical error rate as
-any other. Their error scale is recomputed the same way, because the FAISS
-f_error is zero when `sum(|r_i|)` is below `2 * FLT_EPSILON`. The extra-bit
-factors have no such defect: they zero out only below a norm of 1e-10, so at
-multiple bits the bad factor could only affect the 1-bit gate.
-The reader validates finite, non-negative amplitudes once at open and exposes
-per-list spans for sequential, unchecked scan loads. Metadata and footer
+for squared L2. Sigma1 is computed from the sign reconstruction error before
+the fixed 1.9 confidence multiplier. These amplitudes support empirical
+confidence intervals; they are not deterministic error bounds. The reader
+exposes a mmap view, validates finite, non-negative amplitudes once at open and
+exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
 version 3 validate the component count and file size;
 older formats fail on open and must be rebuilt.
+
+`VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
+code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
+zero), sigma1, and upward-rounded `f_error = sigma1 * 1.9` for multi-bit codes.
+FAISS still writes the sign bits, `or_minus_c_l2sqr`, and extra-bit codes and
+factors. This avoids FAISS 1.14.3's small-norm guards: below a squared residual
+of `FLT_EPSILON`, its multiplier scores the residual as if it had unit length,
+and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor becomes zero. Such
+codes arise near centroids (duplicates, singleton lists, normalized-centroid
+rounding) and throughout small-magnitude L2 data. A false-high 1-bit interval
+can raise the witness floor and prune true neighbors at any probe count.
+The corrected factors preserve residual length and direction across scales,
+but the intervals remain empirical: for IP, float cancellation in FAISS's
+1-bit estimator leaves errors around 1e-7 even at zero amplitude, so they are
+not arithmetic-exact. The extra-bit factors have no such defect; in multi-bit
+search a bad 1-bit factor causes false gate rejections (a lost neighbor) or
+wasted extra-bit work, not false witnesses.
 
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
