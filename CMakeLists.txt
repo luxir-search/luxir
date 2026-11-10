@@ -317,6 +317,11 @@ find_package(zstd CONFIG REQUIRED)
 # locate OpenMP before find_package(faiss).
 find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
+# FAISS's BLAS: OpenBLAS everywhere but macOS, which uses Accelerate. KernelInfo
+# reports the OpenBLAS core.
+if(NOT APPLE)
+  find_package(OpenBLAS CONFIG REQUIRED)
+endif()
 # protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
 # luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
@@ -558,6 +563,9 @@ target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
 target_link_libraries(luxir_lib PRIVATE zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
+if(NOT APPLE)
+  target_link_libraries(luxir_lib PRIVATE OpenBLAS::OpenBLAS)
+endif()
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).
 target_link_libraries(luxir_lib PRIVATE uni_algo)

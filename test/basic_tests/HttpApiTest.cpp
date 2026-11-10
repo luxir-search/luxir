@@ -31,6 +31,7 @@
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/util/Signal.h"
 
 namespace luxir::test {
@@ -311,18 +312,27 @@ TEST_F(HttpApiTest, buildInfo) {
     EXPECT_EQ(buildInfo().version, root["version"].get_string());
     EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
     EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+    EXPECT_EQ(kernelInfo().faissSimd, root["faiss_simd"].get_string());
+    EXPECT_EQ(kernelInfo().blasCore, root["blas_core"].get_string());
   }
+  // OpenBLAS reports "Unknown" when read before its load-time core selection.
+  EXPECT_FALSE(kernelInfo().faissSimd.empty());
+  EXPECT_NE("Unknown", kernelInfo().blasCore);
   auto res = httpRequest(port(), http::verb::post, "/");
   EXPECT_EQ(405, res.result_int());
   EXPECT_EQ("GET", res[http::field::allow]);
 
-  // _stats (shared with gRPC) and Prometheus report the same commit.
+  // _stats (shared with gRPC) and Prometheus report the same commit and kernels.
   auto stats = httpRequest(port(), http::verb::get, "/_stats");
   glz::generic_i64 statsJson;
   ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
   EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  EXPECT_EQ(kernelInfo().faissSimd, statsJson["service"]["faiss_simd"].get_string());
+  EXPECT_EQ(kernelInfo().blasCore, statsJson["service"]["blas_core"].get_string());
   auto metrics = httpRequest(port(), http::verb::get, "/metrics");
   EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("faiss_simd=\"" + kernelInfo().faissSimd + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("blas_core=\"" + kernelInfo().blasCore + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {

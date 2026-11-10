@@ -476,7 +476,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
 | `luxir_scrub_*_total`, `luxir_scrub_last_pass_end_timestamp_seconds` | Checksum scrub passes, files, read bytes, mismatches, and other check errors, and when the last pass ended. Present only while scrubbing is enabled; the timestamp is absent before the first pass. |
 | `luxir_multiterm_expansion_refills_total` | Process-wide multi-term expansion refills. |
-| `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target and source commit, and read-only configuration. |
+| `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target, source commit, and the FAISS SIMD level and BLAS core selected at startup; read-only configuration. |
 | `luxir_stats_duration_seconds` | Time gathering the response, excluding serialization. |
 
 With `collections=true`:

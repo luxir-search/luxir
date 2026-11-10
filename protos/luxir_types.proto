@@ -1678,6 +1678,12 @@ message ServiceStats {
   string cpu_target = 20;
   // The full Git commit the binary was built from, or "unknown".
   string source_commit = 23;
+  // The SIMD level FAISS selected for this CPU at startup: NONE, AVX2,
+  // AVX512, AVX512_SPR, ARM_NEON or ARM_SVE. FAISS_SIMD_LEVEL overrides it.
+  string faiss_simd = 24;
+  // The BLAS kernels selected for this CPU at startup: the OpenBLAS core name,
+  // or "Accelerate" on macOS.
+  string blas_core = 25;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.

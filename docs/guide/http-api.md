@@ -56,14 +56,17 @@ The gRPC equivalents are `luxir.Admin/RenameCollection` and
 
 ## Build information
 
-`GET /` returns metadata compiled into the running binary, without collecting
-statistics or accessing Git at runtime:
+`GET /` returns metadata compiled into the running binary, and the vector
+kernels selected for this CPU at startup, without collecting statistics or
+accessing Git at runtime:
 
 ```json
 {
   "version": "0.1.0",
   "source_commit": "0123456789abcdef0123456789abcdef01234567",
-  "cpu_target": "x86-64-v2"
+  "cpu_target": "x86-64-v2",
+  "faiss_simd": "AVX2",
+  "blas_core": "Haswell"
 }
 ```
 
@@ -72,6 +75,13 @@ uncommitted edits. It is `"unknown"` for source archives built without an explic
 commit hash, or when the build could not read the checkout's Git repository. `luxir --version` and the startup banner report the same version,
 commit, and CPU target. The root endpoint defaults to pretty JSON; use
 `/?pretty=false` for compact output.
+
+`cpu_target` covers Luxir's own code. FAISS and OpenBLAS pick their kernels at
+runtime: `faiss_simd` is the FAISS SIMD level (`NONE`, `AVX2`, `AVX512`,
+`AVX512_SPR`, `ARM_NEON` or `ARM_SVE`; the `FAISS_SIMD_LEVEL` environment
+variable overrides it), and `blas_core` is the OpenBLAS core, or `Accelerate` on
+macOS. The startup banner, `_stats`, and the `luxir_build_info` metric report the
+same values.
 
 ## Content types and framing
 

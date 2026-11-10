@@ -16,6 +16,7 @@
 
 #include "LuxirNode.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/Postings.h"
@@ -142,6 +143,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.version = build.version;
   dst.cpu_target = build.cpuTarget;
   dst.source_commit = build.sourceCommit;
+  dst.faiss_simd = kernelInfo().faissSimd;
+  dst.blas_core = kernelInfo().blasCore;
   dst.read_only = node.readOnly();
   dst.request_duration_bounds = requestBounds;
   dst.background_duration_bounds = backgroundBounds;
