@@ -475,6 +475,54 @@ the whole file through `getInputStream()` (or `read()`). `RecordingDirectory` (`
 a directory and records the ranges read through it, which lets a test assert what
 a read path touches.
 
+### The request I/O context
+
+A read done for a search can see that search through `luxir::IoContext`
+(`src/luxir/util/IoContext.h`): `IoContext::current()` returns it, or null
+when the read is not done for a request (merges, startup, verification,
+replication). It is visible in a backend's store reads and in every
+`DelegatingDirectory` / `InputFile` method called on a query thread, including
+segment-parallel tasks, since core carries it into the tasks it spawns.
+
+```cpp
+void S3Store::readRange(std::string_view key, uint64_t offset, std::span<char> out) {
+  const luxir::IoContext* io = luxir::IoContext::current();
+  bool hedge = io && io->remaining() < hedgeBudget;  // deadline: hedge a slow GET early
+  bool admit = !io || io->fillCache;                 // a scan: do not admit into a cache
+  ...
+}
+```
+
+The fields are the query id and `request_id` (for correlating a layer's logs),
+the deadline (`hasDeadline()`, `remaining()`), the `fillCache` hint and the
+request's `IoCounters`. The deadline and the hint are advice: a read must return
+the same bytes, and core never fails a read on them.
+
+Core reads nothing over a network, so the counts come from the backend. A
+backend's lazy files are expected to count into `IoContext::current()`:
+
+- `io->countFetch(bytes, requests, rounds)` for every store request they issue
+  (`countFetch(bytes)` is one request and one round), counting a wave of
+  concurrent requests as one round;
+- `io->countTouch(length)` for every range a reader resolves (`rangeStream`,
+  `read()`), resident or not;
+- `io->countWholeFileRead()` for `read()` and `getInputStream()`, the reads
+  that need the whole file.
+
+Reads the backend does of its own while serving a request (the hotcache, a
+checksum stream) count with `countFetch` too, and so does a layer that issues
+requests of its own (a hedge, a split read, a cache miss behind a cache hit).
+Counts appear in the search profile (`io_*`) and in the node's `search_io_*`
+totals; on a backend that counts nothing they stay zero.
+
+Work handed to a thread or pool of the plugin's own runs without a context
+unless it is wrapped: `pool.submit(luxir::bindIoContext(task))` copies the
+current context into the task and restores the pool thread's own afterwards.
+`IoScope` is the underlying guard; `IoScope scope(nullptr)` detaches work from
+the enclosing request. The counters belong to the request and outlive its
+tasks, but not the request: work still running after the request ends must
+not count.
+
 ### The example plugin
 
 `test/plugins/example` registers a `counting_ram` backend (RAM storage counting

@@ -1384,7 +1384,12 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           break;
         case SearchRequest::ReplyStatus::PAUSE:
           streamPauseCount++;
-          req.resumeWhenDrained([this] { produce(); });
+          // The resume runs on a transport or arena thread: carry the
+          // request's I/O context there. The request outlives the emitter.
+          req.resumeWhenDrained([this] {
+            IoScope io(&req.io);
+            produce();
+          });
           return false;  // paused: the stream is NOT over; resume re-enters produce()
         case SearchRequest::ReplyStatus::CANCEL:
           batchStart = numCollected;  // client is gone; skip the remaining batches

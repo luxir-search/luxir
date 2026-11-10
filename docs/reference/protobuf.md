@@ -947,6 +947,11 @@ Execution details for instrumented operations. STRING/ID field facets provide pr
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.executionprofile.ops"></a>[`ops`](#field-luxir.executionprofile.ops) | 1 | [`ExecutionProfileOp`](#message-luxir.executionprofileop) | repeated |  |
+| <a id="field-luxir.executionprofile.io_requests"></a>[`io_requests`](#field-luxir.executionprofile.io_requests) | 10 | `uint64` | singular | Storage I/O of the whole request, counted on lazily read storage (an object-store backend) and by storage plugins; zero on local files. io\_requests: ranged requests issued to the store. |
+| <a id="field-luxir.executionprofile.io_rounds"></a>[`io_rounds`](#field-luxir.executionprofile.io_rounds) | 11 | `uint64` | singular | Sequential waits on the store: requests awaited together count once. |
+| <a id="field-luxir.executionprofile.io_fetched_bytes"></a>[`io_fetched_bytes`](#field-luxir.executionprofile.io_fetched_bytes) | 12 | `uint64` | singular | Bytes those requests returned. |
+| <a id="field-luxir.executionprofile.io_touched_bytes"></a>[`io_touched_bytes`](#field-luxir.executionprofile.io_touched_bytes) | 13 | `uint64` | singular | Bytes of lazily read files the search resolved, already resident or not. Ranges a reader resolved before (at open, or for an earlier search) and keeps are read again without counting. |
+| <a id="field-luxir.executionprofile.io_whole_file_reads"></a>[`io_whole_file_reads`](#field-luxir.executionprofile.io_whole_file_reads) | 14 | `uint64` | singular | Reads that needed a whole lazily read file at once. |
 
 <a id="message-luxir.executionprofileop"></a>
 
@@ -2308,6 +2313,10 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.search_execution"></a>[`search_execution`](#field-luxir.servicestats.search_execution) | 7 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Search body execution, excluding scheduler waits and streaming drains. |
 | <a id="field-luxir.servicestats.search_resource_exhausted"></a>[`search_resource_exhausted`](#field-luxir.servicestats.search_resource_exhausted) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_warnings"></a>[`search_warnings`](#field-luxir.servicestats.search_warnings) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_requests"></a>[`search_io_requests`](#field-luxir.servicestats.search_io_requests) | 28 | `uint64` | singular | Storage I/O of finished searches, summed over their ExecutionProfile io\_\* counts (counted whether or not a search asked for a profile). |
+| <a id="field-luxir.servicestats.search_io_rounds"></a>[`search_io_rounds`](#field-luxir.servicestats.search_io_rounds) | 29 | `uint64` | singular | requests awaited together count once |
+| <a id="field-luxir.servicestats.search_io_fetched_bytes"></a>[`search_io_fetched_bytes`](#field-luxir.servicestats.search_io_fetched_bytes) | 30 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_whole_file_reads"></a>[`search_io_whole_file_reads`](#field-luxir.servicestats.search_io_whole_file_reads) | 31 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.index_batches"></a>[`index_batches`](#field-luxir.servicestats.index_batches) | 10 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.documents_accepted"></a>[`documents_accepted`](#field-luxir.servicestats.documents_accepted) | 11 | `uint64` | singular | Accepted into indexing (not durably acknowledged) or rejected/rolled back. |
 | <a id="field-luxir.servicestats.documents_rejected"></a>[`documents_rejected`](#field-luxir.servicestats.documents_rejected) | 12 | `uint64` | singular |  |

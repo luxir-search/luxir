@@ -1188,6 +1188,24 @@ engine, so do not build tooling on it. Serial execution (the default, or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
 
+On lazily read storage (an object-store backend, see
+[storage tiers](../design/storage-tiers.md)) the profile also counts the
+whole request's storage I/O, across all of its threads and streamed batches:
+
+| Field | Meaning |
+| --- | --- |
+| `io_requests` | Ranged requests issued to the object store. |
+| `io_rounds` | Sequential waits on the store; requests awaited together count once. |
+| `io_fetched_bytes` | Bytes those requests returned. |
+| `io_touched_bytes` | Bytes of lazily read files the search resolved, already resident or not. Ranges a reader resolved earlier and keeps are not counted again. |
+| `io_whole_file_reads` | Reads that needed a whole lazily read file at once. |
+
+A search whose files are resident issues no requests. Reads done
+to build state that later searches share count for the search that builds it.
+The storage backend does the counting: on local files, and on a backend that
+counts nothing, every field is zero. Node-wide totals are in `_stats`
+(`service.search_io_*`, see [operations](operations.md)).
+
 ## Streaming HTTP responses
 
 The normal HTTP response is chunked NDJSON. Each line is a complete response

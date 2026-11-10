@@ -76,6 +76,10 @@ void service(Renderer& r, const api::ServiceStats& s) {
               s.request_duration_bounds, s.search_execution);
   r.counter("luxir_search_resource_exhausted_total", "Searches rejected by resource limits, including the request memory breaker.", (double)s.search_resource_exhausted);
   r.counter("luxir_search_warnings_total", "Searches completing with at least one declared degradation warning.", (double)s.search_warnings);
+  r.counter("luxir_search_io_requests_total", "Object-store requests issued for searches.", (double)s.search_io_requests);
+  r.counter("luxir_search_io_rounds_total", "Sequential object-store waits of searches; requests awaited together count once.", (double)s.search_io_rounds);
+  r.counter("luxir_search_io_fetched_bytes_total", "Bytes object-store requests returned to searches.", (double)s.search_io_fetched_bytes);
+  r.counter("luxir_search_io_whole_file_reads_total", "Search reads that needed a whole lazily read file at once.", (double)s.search_io_whole_file_reads);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");
