@@ -100,6 +100,8 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }

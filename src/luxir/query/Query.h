@@ -36,6 +36,8 @@
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/Similarity.h"
+#include "QueryVisitor.h"
+
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
@@ -704,7 +706,20 @@ public:
   void validateLogical(
       PlanningContext& context, float multiplier = 1.0f) const;
 
+  // Serial planning only, like createWeight. May cache dictionary expansion,
+  // charged once to the request multi-term budget and shared with execution.
+  // Visitor views borrow query/context storage. Plugin queries may override
+  // visitImpl; the default reports an opaque leaf.
+  void visit(QueryVisitor& visitor, Context& context, float boost = 1.0f) const {
+    visitImpl(visitor, context, boost);
+  }
+
 protected:
+  virtual void visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+    unused(context, boost);
+    visitor.leaf(*this);
+  }
+
   virtual void validateLogicalImpl(
       PlanningContext& context, float multiplier) const {
     unused(context);

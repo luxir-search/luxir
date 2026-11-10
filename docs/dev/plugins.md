@@ -461,8 +461,8 @@ layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 ## Result decorators
 
 `Registries::hitDecorators` registers a maker receiving a `DecoratorContext`
-(request, query parse/planning context, and original ranking queries) and a
-`ParamReader`. Return a shared `HitDecorator` with a unique output column name.
+(request, query parse context, and original ranking queries with execution
+contexts) and a `ParamReader`. Return a shared `HitDecorator` with a unique output column name.
 Register during startup; the registry is frozen with the other registries.
 
 TopDocs and Fusion accept `decorate: {"registered_name": {params...}}` on the
@@ -484,3 +484,33 @@ plans may be shared with synchronization during initialization. Decorators canno
 change membership, order or scores. The output name must not collide with another
 extra column. Decorators are also invoked for nested top-doc lists, collapsed
 heads, and diversified lists.
+
+### Inspecting the ranking queries
+
+In the maker, call `source.query->visit(visitor, source.context)` for each entry
+in `DecoratorContext::queries`; a null query means browse. `QueryVisitor`
+(`luxir/query/QueryVisitor.h`) reports indexed bytes through `term(field, text,
+boost)`. `sub(occur, parent)` chooses the visitor for a composite's children or
+returns null to skip them; the default skips MUST_NOT. Inspectors interested only
+in ranking terms should also skip FILTER. `leaf(query)` means the term picture
+is incomplete. Plugin queries can override the protected `Query::visitImpl`
+to participate without exposing their concrete tree.
+
+Inspection runs only during serial planning, in the maker. It may expand fuzzy
+terms, cache the expansion shared with execution, and throw the request's
+multi-term budget errors. Never call visit from concurrent `decorate()` calls.
+Term views borrow query/context storage; copy what decorate needs into the
+decorator. The example `ranking_terms` decorator does this (it lists request
+ranking terms, not the terms matched by each hit).
+
+Traversal preserves raw Boolean occurrences and authored dis_max disjuncts.
+Boosts mirror logical validation and execution: filter children reset the
+multiplier; rescore and min_score inspect their matching child at multiplier 1.
+Rescore value expressions are not term queries and are not inspected. Combined
+field weights multiply term frequency before BM25 saturation; the reported
+path/field/term product is not a linear final-score contribution. Phrase terms
+omit positions. Explicit TermInSet terms are enumerable in query-size time.
+ALL and NONE report no terms and no leaf. Other opaque queries report leaf.
+Case-insensitive MATCH shows execution's representation: leaf until a scored
+weight has populated the shared case-variant rewrite, then its variant terms.
+Inspection never forces that rewrite or changes later unscored execution.

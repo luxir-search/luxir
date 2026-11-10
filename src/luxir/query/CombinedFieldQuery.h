@@ -497,6 +497,8 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   bool recoverableAsPredicate() const noexcept override { return true; }
 };
 
