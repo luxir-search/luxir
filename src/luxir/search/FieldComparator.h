@@ -365,6 +365,70 @@ public:
     return OrdIntervalStatus::UNSUPPORTED;
   }
 
+  // Optional competitive doc source for comparators whose competitive docs
+  // come from an index walk rather than an ord interval or key bounds (a
+  // plugin sort kind reading a points index). Like competitiveOrdInterval it
+  // derives from the heap bottom, and the collector consults it only for the
+  // primary clause once the heap is full. READY yields [begin, end), the
+  // first run of docs at or after `from` that may still enter the heap
+  // (begin == END: none can); docs between from and begin cannot. Set both,
+  // with from <= begin < end: the collector clamps a run that is not, so an
+  // empty or backward run cannot stall the query or repeat docs. The bottom
+  // comes as its slot only, without its segdoc, so a doc tied with the bottom
+  // may still enter (on secondary clauses or doc order) and the run must
+  // include it. `sourceDocs` estimates the docs the collection source still
+  // produces from `from` on, the work a source must undercut. PENDING means
+  // no usable source yet (no bound, or one not worth building); an `end`
+  // past `from` asks to be consulted again there, else the collector waits
+  // its own probe interval. UNSUPPORTED means this comparator or segment
+  // never provides one.
+  enum class CompetitiveDocStatus { UNSUPPORTED, PENDING, READY };
+  virtual bool offersCompetitiveDocs() const { return false; }
+  virtual CompetitiveDocStatus competitiveDocs(int32_t bottomSlot, int32_t from,
+                                               int64_t sourceDocs, int32_t& begin,
+                                               int32_t& end) {
+    unused(bottomSlot, from, sourceDocs, begin, end);
+    return CompetitiveDocStatus::UNSUPPORTED;
+  }
+
+  // Optional seed windows for a primary comparator that knows where a
+  // segment's best keys lie but not which docs the query matches (a plugin
+  // sort kind reading a points index). Before a plain sweep of the segment
+  // the collector asks for a few doc runs [begin, end) likely to hold the
+  // best keys and runs the query over them first, so the heap fills with
+  // real matches only; then it sweeps the segment from its start, through
+  // competitiveDocs, without the docs it already collected. Seeding changes
+  // only the visit order, so any answer is sound: the collector sorts and
+  // merges the runs, clamps them to the segment and drops empty ones. A
+  // comparator that offers windows reads docs out of order (the runs, then
+  // the sweep from doc 0). `matches` is the heap's depth and `sourceDocs`
+  // estimates the docs the query produces in the segment, so about
+  // matches * maxDoc / sourceDocs docs hold the matches the heap needs.
+  // `bottomSlot` is the heap bottom when earlier segments filled it, else -1.
+  // Leave `out` empty to sweep unseeded. sourceDocs is an estimate, and the
+  // query may be much sparser near the best keys than overall, so when a
+  // round's windows leave the heap short the collector asks again, with
+  // `round` counting up from 0 and `collected` the docs the heap holds; a
+  // later round should offer the next ring beyond what it offered before
+  // (say twice as far, or scaled by matches / collected). Runs already
+  // visited are dropped from a later answer, and an empty answer (or one
+  // with nothing new) ends the seeding. offersSeedWindows is asked after
+  // setSegment, so it may answer per segment. The collector seeds only a
+  // query-driven windowed sweep it can reposition: the exact-domain and
+  // column-seeded routes need a column's KeyBatch, and a pull scorer cannot
+  // rewind.
+  struct SeedRequest {
+    int64_t matches = 0;
+    int64_t sourceDocs = 0;
+    int32_t bottomSlot = -1;
+    int32_t round = 0;
+    int64_t collected = 0;
+  };
+  virtual bool offersSeedWindows() const { return false; }
+  virtual void seedWindows(const SeedRequest& request, std::vector<SeedWindow>& out) {
+    unused(request, out);
+  }
+
   enum MissingValue {
     MISSING_FIRST,
     MISSING_LAST
