@@ -15,7 +15,7 @@
 #include <fmt/format.h>
 
 #include "luxir/search/SearchOverrides.h"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/ops/FacetExecution.h"
@@ -82,14 +82,14 @@ class ExprStatsOp : public SearchOp {
 
   template <typename Output>
   static void writeOutputValue(api::Val& target, const BucketScalar& value, const Output& output) {
-    if constexpr (std::is_same_v<Output, NativeDateOutput>) {
+    if constexpr (std::is_same_v<Output, NativeValueOutput>) {
       writeAggregateValue(target, value);
     } else if (!value.valid) {
-      if constexpr (std::is_same_v<Output, IsoDateOutput>) {
+      if constexpr (std::is_same_v<Output, IsoValueOutput>) {
         if (value.failure == AggregateFailure::NON_FINITE_SUM
             || value.failure == AggregateFailure::NON_FINITE_AVERAGE
             || value.failure == AggregateFailure::NON_FINITE_EXPRESSION) {
-          throw RequestError("date_iso output for " + output.source + " is non-finite");
+          throw RequestError("date_iso output for " + output.context.source + " is non-finite");
         }
       }
       target.kind = google::protobuf::NullValue::NULL_VALUE;
@@ -112,9 +112,13 @@ public:
               AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
       : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
 
+  bool nativeOutput(uint64_t outputFlags) const {
+    return nativeValueOutput(aggregate.root().nature, outputFlags);
+  }
+
   template <typename Emit>
   void withOutput(uint64_t outputFlags, std::pmr::memory_resource& mr, Emit emit) const {
-    withDateOutput(aggregate.root().nature, outputFlags, mr, [this] {
+    withNatureOutput(aggregate.root().nature, outputFlags, mr, [this] {
       std::string sources;
       for (const auto& producer : aggregate.producers) {
         auto description = producer.input->describeDateSources(producer.input->rootNode);

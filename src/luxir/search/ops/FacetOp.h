@@ -97,7 +97,7 @@ public:
         emit([](int64_t value) { return sortableInt64ToDouble(value); });
         break;
       default:
-        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        withNatureOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
         break;
     }
   }
@@ -124,9 +124,7 @@ public:
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
       valueType = type.type();
-      if (type.type() == FieldType::DATE) {
-        outputNature = dateValueNature(DateFieldType::unitOf(type));
-      }
+      outputNature = type.valueNature();
     }
   }
 

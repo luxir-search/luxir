@@ -269,12 +269,14 @@ int64_t MetricGroupData::totalHits() const { return impl->hits; }
 int64_t MetricGroupData::totalGroups() const { return (int64_t)impl->table.size(); }
 void MetricGroupData::renderRanks(std::span<const api::ArrVal> ranks, uint64_t flags,
                                  std::pmr::memory_resource& mr) const {
-  if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+  if (std::ranges::all_of(impl->calcs, [&](auto* calc) {
+        return ((ExprStatsOp&)calc->getOp()).nativeOutput(flags);
+      })) return;
   for (size_t i = 0; i < impl->calcs.size(); i++) {
     auto& metric = (ExprStatsOp&)impl->calcs[i]->getOp();
     metric.withOutput(flags, mr, [&](auto output) {
-      if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
-        for (const auto& rank : ranks) renderDateValue(const_cast<api::Val&>(rank.v[i]), output);
+      if constexpr (!std::is_same_v<decltype(output), NativeValueOutput>) {
+        for (const auto& rank : ranks) renderValue(const_cast<api::Val&>(rank.v[i]), output);
       }
     });
   }

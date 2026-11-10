@@ -599,9 +599,7 @@ public:
       }
       collapse->fields.push_back({field.physicalName, wireType,
           ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
-          req.reader->field(field.physicalName), type.type() == FieldType::DATE
-              ? dateValueNature(DateFieldType::unitOf(type))
-              : ValueNature::NUMBER});
+          req.reader->field(field.physicalName), type.valueNature()});
     }
     return collapse;
   }

@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "SearchOp.h"  // build:: alias + luxir::api types (via SearchRequest.h)
 
 namespace luxir {
@@ -240,7 +240,7 @@ template <> struct FacetOutputTypes<std::string_view> {
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING
 // FacetResult.  The bucket count is known up front (buckets.size()), so each
 // span is allocArray'd once into the response arena `mr` and index-filled.
-template <typename Output = NativeDateOutput>
+template <typename Output = NativeValueOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<int64_t, int64_t>>& buckets,
                         std::pmr::memory_resource& mr, Output output = {}) {

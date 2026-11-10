@@ -12,7 +12,7 @@
 
 #include "luxir/api/build.h"
 #include "luxir/search/IndexReader.h"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/OrdMapStr.h"
@@ -101,10 +101,12 @@ struct CollapsePlan {
 
   void renderKeys(std::span<const api::GroupKey> keys, uint64_t flags,
                   std::pmr::memory_resource& mr) const {
-    if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+    if (std::ranges::all_of(fields, [&](const auto& field) {
+          return nativeValueOutput(field.nature, flags);
+        })) return;
     for (size_t i = 0; i < fields.size(); i++) {
-      withDateOutput(fields[i].nature, flags, mr, [&] { return fields[i].name; }, [&](auto output) {
-        if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
+      withNatureOutput(fields[i].nature, flags, mr, [&] { return fields[i].name; }, [&](auto output) {
+        if constexpr (!std::is_same_v<decltype(output), NativeValueOutput>) {
           for (const auto& key : keys) {
             if (key.singleton) continue;
             auto& component = const_cast<api::GroupComponent&>(key.component[i]);
