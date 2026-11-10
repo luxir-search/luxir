@@ -222,6 +222,7 @@ struct SkipStats {
   static inline int64_t conjPlanUnknownIslandNumericGeo = 0;
   static inline int64_t conjPlanUnknownIslandOther = 0;
   static inline int64_t multitermExpansions = 0;
+  static inline int64_t multitermUnionBuilds = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -559,6 +560,7 @@ struct SkipStats {
     conjPlanUnknownIslandNumericGeo = 0;
     conjPlanUnknownIslandOther = 0;
     multitermExpansions = 0;
+    multitermUnionBuilds = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;

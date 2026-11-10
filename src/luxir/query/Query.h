@@ -1754,8 +1754,11 @@ public:
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
     /// Metadata-only: no supplier, index walks, locks or cardinality counts.
-    /// METADATA is exact; SUPPLIER resolves at supplier construction;
-    /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
+    /// Levels name the work a count still needs; within a request a level only
+    /// gets cheaper. METADATA is exact from header totals or facts the request
+    /// already computed; SUPPLIER resolves at supplier construction;
+    /// INDEX_WALK walks index structure (crossing leaves, term dictionaries),
+    /// so probes stop before it; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
     virtual CountShortcut countShortcut(IndexReader::Segment& segment,
