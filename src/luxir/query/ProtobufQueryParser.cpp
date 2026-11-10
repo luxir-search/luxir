@@ -276,7 +276,8 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
 
 luxir::Query* ProtobufQueryParser::parseNested(const api::NestedQuery& spec) {
   if (context.childScope || context.nestedScope) throw RequestError("nested queries cannot be nested inside a child scope");
-  if (!context.reader || !schema.nested.contains(spec.path)) throw RequestError("unknown nested path: " + std::string(spec.path));
+  if (!context.reader) throw RequestError("nested queries require a searcher");
+  if (!schema.nested.contains(spec.path)) throw RequestError("unknown nested path: " + std::string(spec.path));
   if (!spec.score_mode.empty() && spec.score_mode != "avg" && spec.score_mode != "max" && spec.score_mode != "none"
       && spec.score_mode != "min" && spec.score_mode != "sum") throw RequestError("invalid nested score_mode");
   if (spec.inner_hits && (spec.inner_hits->name.empty() || spec.inner_hits->limit.value_or(1) < 0 || spec.inner_hits->limit.value_or(1) > 1000))

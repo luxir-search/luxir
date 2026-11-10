@@ -38,7 +38,9 @@ void emitInnerHits(IndexReader& reader, std::span<Query::SegmentSource* const> s
         int32_t root = blocks->rootOf(hit.doc);
         auto& pathBits = blocks->paths.find(entry.relation)->second;
         int32_t ordinal = 0;
-        for (int32_t doc = blocks->blockStart(root); doc < hit.doc; ++doc) ordinal += pathBits.get(doc);
+        auto* live = reader.segments()[hit.segment].liveDocSet();
+        for (int32_t doc = blocks->blockStart(root); doc < hit.doc; ++doc)
+          ordinal += pathBits.get(doc) && (!live || live->get(doc));
         auto rootJson = RelationReader::strings(reader, hit.segment, entry.relation, std::span(&root, 1));
         api::Val stored;
         if (rootJson[0].empty() || !api::read_json(stored, api::build::arenaStr(mr, rootJson[0]), mr)) throw std::runtime_error("invalid stored nested source");

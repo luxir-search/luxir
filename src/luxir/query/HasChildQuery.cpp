@@ -222,8 +222,11 @@ public:
     auto* live = segment.liveDocSet();
     auto& bits = found->second;
     for (int32_t doc = bits.nextSetBit(0); doc < segment.maxDoc(); doc = bits.nextSetBit(doc + 1)) {
+      // Dead children can sit in front of a later live block: a block that failed
+      // partway has no root of its own. Test the child, then resolve its root.
+      if (live && !live->get(doc)) continue;
       int32_t root = nested->rootOf(doc);
-      if ((!live || live->get(root)) && (!allowed || allowed->get(root))) builder.add(doc);
+      if (!allowed || allowed->get(root)) builder.add(doc);
     }
     return builder.build();
   }

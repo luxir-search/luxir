@@ -187,3 +187,27 @@ TEST_F(NestedTest, nestedScoreModesAndInnerHits) {
   ASSERT_EQ(1u, list->docs.size());
   EXPECT_EQ("y", list->docs[0].fields.at("user")->asString());
 }
+
+// A block that fails partway leaves dead children with no root; they must not
+// attach to the next root, and a trailing failed block must be harmless.
+TEST_F(NestedTest, deadChildrenOfFailedBlocksStayInvisible) {
+  CollectionHelper helper(*luxirNode);
+  schema(helper);
+  auto first = update(helper, R"("docs":[
+    {"id":"bad","answers":[{"user":"b"},{"user":"c","score":"not a number"}]},
+    {"id":"good","answers":[{"user":"d","score":1}]},
+    {"id":"tail","answers":[{"user":"e"},{"user":"f","score":"not a number"}]}
+  ])");
+  ASSERT_EQ(2u, first.errors.size());
+  EXPECT_EQ(1, count());
+  auto matches = [&](std::string_view user) {
+    return search("\"query\":{\"nested\":{\"path\":\"answers\",\"query\":{\"match\":{\"field\":\"answers.user\",\"val\":\""
+        + std::string(user) + "\"}},\"inner_hits\":{\"name\":\"h\"}}},\"fields\":[\"id\"]");
+  };
+  EXPECT_TRUE(matches("b")->docList()->docs.empty());
+  EXPECT_TRUE(matches("e")->docList()->docs.empty());
+  auto good = matches("d");
+  ASSERT_EQ(1u, good->docList()->docs.size());
+  EXPECT_EQ("good", good->docList()->docs[0].fields.at("id")->asString());
+  EXPECT_EQ("d", good->docList()->matches[0].fields.at("h")->docList()->docs[0].fields.at("user")->asString());
+}

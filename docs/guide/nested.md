@@ -81,4 +81,5 @@ across different children:
 `score_mode` is `avg` (default), `max`, `min`, `sum`, or `none`. `filter` adds
 non-scoring child clauses. `inner_hits` returns the matching children's original
 objects in `DocList.matches`, as with relations. A `nested` query cannot contain
-another `nested` or `has_child`, or `knn`.
+another `nested` or `has_child`, or `knn`. Clauses inside one match child
+documents only; a clause on a root field matches nothing.
