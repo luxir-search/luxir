@@ -581,6 +581,74 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   removed(key);
 }
 
+void Collections::detach(const CollectionId& key) {
+  validate(key);
+  Transition transition(*this, key);
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key.label() + "' has a staged replacement");
+  }
+  auto collection = map.get(key);
+  if (!collection) throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  auto detaching = Collection::placeholder(key, "being detached");
+  if (!map.replace(key, collection, detaching)) {
+    throw CollectionUnavailableError("collection '" + key.label() + "' changed while detaching started");
+  }
+  registered(key, detaching);
+  // The writer may be closed already: the collection is unavailable here
+  // until a restart opens it again, and its storage is untouched.
+  auto fail = [&](std::string reason) {
+    auto failed = Collection::placeholder(key, "detach failed: " + reason);
+    if (map.replace(key, detaching, failed)) registered(key, failed);
+  };
+  try {
+    if (auto shard = collection->getShard()) {
+      if (shard->iw) {
+        shard->iw->commit();
+        shard->iw->close();
+      }
+      shard->snapshots->close();
+    }
+  } catch (const std::exception& e) {
+    fail(e.what());
+    throw;
+  } catch (...) {
+    fail("unknown non-standard exception");
+    throw;
+  }
+  {
+    std::lock_guard lock(slotsMutex);
+    slots[key].retained.clear();
+  }
+  if (!map.erase(key, detaching)) {
+    throw std::runtime_error("collection '" + key.label() + "' placeholder disappeared while detaching");
+  }
+  removed(key);
+  LOG_INFO("Detached collection: {}", key.label());
+}
+
+std::shared_ptr<Collection> Collections::attach(const CollectionId& key) {
+  validate(key);
+  Transition transition(*this, key);
+  if (map.get(key)) throw CollectionExistsError("collection '" + key.label() + "' already exists");
+  auto selected = catalog(key.tenant).current(key.name);
+  if (!selected) throw CollectionNotFoundError("collection '" + key.label() + "' has no active incarnation in storage");
+  if (!CommitId::validIncarnation(*selected)) throw std::runtime_error("catalog selects an invalid incarnation");
+  auto collection = openCollection(key, Role::WRITER, selected);
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(key, collection);
+    if (!map.insert(key, collection)) {
+      collection->getShard()->iw->close();
+      throw CollectionExistsError("collection '" + key.label() + "' already exists");
+    }
+    listCollection(key, collection);
+  }
+  events.registered(key, collection, revision(key.tenant));
+  LOG_INFO("Attached collection: {}", key.label());
+  return collection;
+}
+
 uint64_t Collections::revision(std::string_view tenant) {
   try { return catalog(tenant).read().rev; }
   catch (...) { return 0; } // An unreadable catalog still announces an unavailable collection.

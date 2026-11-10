@@ -106,6 +106,10 @@ public:
   void renameCollection(const CollectionId& from, const CollectionId& to);
   void swapCollections(const CollectionId& a, const CollectionId& b);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
+  // Hand a collection's storage to another node, or take one over: see
+  // Collections::detach and attach. Writers only (ReadOnlyError otherwise).
+  void detachCollection(const CollectionId& id);
+  std::shared_ptr<Collection> attachCollection(const CollectionId& id);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;
