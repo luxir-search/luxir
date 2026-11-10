@@ -1131,74 +1131,86 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
-    // Register with one hold for every merge already submitted but not tailed.
-    // A later merge submission adds its own hold before entering the graph.
-    if (msg.waitForMerges) {
-      waitingForMerges.push_back(&msg);
-      commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
-    }
-
-    // first look at any flushing inverters that are not marked for a commit yet
-    // and mark them if necessary.
-    for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+    // Everything below hands pointers into msg to inverters and to the merge
+    // waiter list.  The caller completes msg when this throws, which frees
+    // commitInfo, so a failure must take those pointers back first: an
+    // inverter already flushing then finishes as a plain flush, and the
+    // waiter list no longer names a freed message.
+    try {
+      // Register with one hold for every merge already submitted but not tailed.
+      // A later merge submission adds its own hold before entering the graph.
+      if (msg.waitForMerges) {
+        waitingForMerges.push_back(&msg);
+        commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
       }
-    }
 
-    // now look at all idle inverters and initiate a flush if necessary.
-    for (auto it = idleInverters.begin(); it != idleInverters.end();) {
-      auto current = it++;
-      if (current->second->minVersion <= msg.updateVersion) {
-        if (current->second->commitInfo == nullptr) {
-          INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      *current->second.get());
-          current->second->commitInfo = &commitInfo;
+      // first look at any flushing inverters that are not marked for a commit yet
+      // and mark them if necessary.
+      for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
-        else {
-          // this would be a bug since we should never have an idle inverter that is part of a commit.
-          LOG_ERROR("Idle inverter is part of another commit.");
-        }
+      }
 
-        if (!startIdleFlushLocked(*current->second, false)) {
-          throw std::runtime_error("Segment flush node rejected a commit inverter");
+      // now look at all idle inverters and initiate a flush if necessary.
+      for (auto it = idleInverters.begin(); it != idleInverters.end();) {
+        auto current = it++;
+        if (current->second->minVersion <= msg.updateVersion) {
+          if (current->second->commitInfo == nullptr) {
+            INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
+                        *current->second.get());
+            current->second->commitInfo = &commitInfo;
+            commitInfo.leftToFlush++;
+          }
+          else {
+            // this would be a bug since we should never have an idle inverter that is part of a commit.
+            LOG_ERROR("Idle inverter is part of another commit.");
+          }
+
+          if (!startIdleFlushLocked(*current->second, false)) {
+            throw std::runtime_error("Segment flush node rejected a commit inverter");
+          }
         }
       }
-    }
 
-    // Any inverters that are busy should be marked so that when they are released they can be flushed.
-    for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+      // Any inverters that are busy should be marked so that when they are released they can be flushed.
+      for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
+        }
       }
-    }
 
-    INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
-    // updateFinishNode is serial and segment-flush completion needs indexMutex,
-    // so this is the commit's single admission point.  No ordinal is consumed
-    // until all state above is installed.  An immediate commit increments the
-    // counter only after the sequencer accepts it.
-    msg.commitNum = commitNumber;
-    if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
-    // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
-    // we need to kick it off here.
-    if (commitInfo.leftToFlush == 0) {
-      try {
+      // updateFinishNode is serial and segment-flush completion needs indexMutex,
+      // so this is the commit's single admission point.  No ordinal is consumed
+      // until all state above is installed.  An immediate commit increments the
+      // counter only after the sequencer accepts it.
+      msg.commitNum = commitNumber;
+      if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
+      // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
+      // we need to kick it off here.
+      if (commitInfo.leftToFlush == 0) {
         _releaseToCommitSequencer(&msg);
-      } catch (...) {
-        if (msg.waitForMerges) {
-          std::erase(waitingForMerges, &msg);
-        }
-        throw;
       }
+    } catch (...) {
+      auto disown = [&](auto& inverters) {
+        for (auto& entry : inverters) {
+          if (entry.second->commitInfo == &commitInfo) entry.second->commitInfo = nullptr;
+        }
+      };
+      disown(flushingInverters);
+      disown(idleInverters);
+      disown(busyInverters);
+      std::erase(waitingForMerges, &msg);
+      msg.commitInfo.reset();
+      throw;
     }
     commitNumber++;
     // Flushes this commit started complete under indexMutex, so none can
@@ -1485,9 +1497,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       if (segInfo) deletes->sourceSegId = segInfo->segId;
       // An adopting commit retires the packet unless it holds a newer request,
       // and must not race a pass for it. No commit adopts the inverter once it
-      // leaves flushingInverters below. If initiateCommit throws after adopting
-      // inverters, nothing completes that commit, so their packets keep the
-      // claim until a later commit completes: a delay only.
+      // leaves flushingInverters below, and a commit that fails to start
+      // disowns its inverters before it completes.
       if (auto* commit = inverter.commitInfo) {
         uint64_t version = commit->updateMessage->updateVersion;
         if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
