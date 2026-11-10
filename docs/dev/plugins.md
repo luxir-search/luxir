@@ -448,6 +448,9 @@ that state through the core wrappers. `find<T>()` checks each factory with
 Repeated layers return the outermost matching type. The pointer is borrowed for
 the factory's lifetime; process-wide plugin objects must not retain it.
 
+Placement plugins call the engine hooks `LuxirNode::detachCollection(id, target)`
+and `LuxirNode::attachCollection(id, force)` to hand off writers or force a takeover.
+
 ### Capabilities
 
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`

@@ -232,4 +232,12 @@ void LuxirNode::deleteCollection(const CollectionId& id) {
   else collections_->remove(id);
 }
 
+void LuxirNode::detachCollection(const CollectionId& id, std::string_view target) {
+  collections_->detach(id, target);
+}
+
+std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, bool force) {
+  return collections_->attach(id, force);
+}
+
 } // namespace luxir

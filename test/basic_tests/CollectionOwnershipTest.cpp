@@ -3,6 +3,7 @@
 #include "test/CollectionHelper.h"
 #include "test/TestUtils.h"
 #include "luxir/store/StorageRegistry.h"
+#include "luxir/server/ReplicationSource.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 
@@ -77,6 +78,189 @@ TEST_F(CollectionOwnershipTest, otherNodeServesPlaceholdersWithoutChangingTheSto
   before = catalogBytes();
   servedBy([&] { b->getOrCreateCollection("late"); });
   EXPECT_EQ(before, catalogBytes());
+}
+
+TEST_F(CollectionOwnershipTest, detachCommitsBufferedDocumentsAndAttachOpensThem) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  startB();
+  ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
+  auto incarnation = *a->collections().catalog().current("c");
+  a->detachCollection("c", "B");
+  EXPECT_TRUE(c.getIndexWriter()->isClosed());
+  servedBy([&] { a->getCollection("c"); }, "B");
+  auto rejected = c.index(flatdoc("id", "late")); // A request retaining the old collection.
+  EXPECT_FALSE(rejected.success);
+  EXPECT_EQ(ErrorKind::UNAVAILABLE, rejected.error_kind);
+  std::pmr::monotonic_buffer_resource arena;
+  auto advertised = a->getReplication().catalog(arena);
+  auto row = std::ranges::find_if(advertised.collections, [](const auto& row) { return row.collection == "c"; });
+  ASSERT_NE(advertised.collections.end(), row); // Unavailable is not a deletion to followers.
+  EXPECT_FALSE(row->available);
+  EXPECT_EQ(2, b->attachCollection("c")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(incarnation, b->collections().catalog().current("c"));
+  CollectionHelper writing(*b, "c");
+  ASSERT_TRUE(writing.index(flatdoc("id", "third"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(3, writing.collection().getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(CollectionOwnershipTest, forceAttachTakesOverTheLastCommitOfAStoppedNode) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success); }
+  startB();
+  auto before = catalogBytes();
+  auto placeholder = b->collections().get(CollectionId::of("c"));
+  servedBy([&] { b->attachCollection("c"); });
+  EXPECT_EQ(before, catalogBytes());
+  EXPECT_EQ(placeholder, b->collections().get(CollectionId::of("c")));
+  a.reset();
+  EXPECT_EQ(1, b->attachCollection("c", true)->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ("B", b->collections().catalog().find("c")->node);
+}
+
+TEST_F(CollectionOwnershipTest, failedFinalCommitStillClosesAndHandsOff) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
+  startB();
+  auto writer = c.getIndexWriter();
+  Signal::listen("commitDataSync", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) throw std::runtime_error("injected final commit failure");
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("commitDataSync"); });
+  EXPECT_THROW(a->detachCollection("c", "B"), std::runtime_error);
+  EXPECT_TRUE(writer->isClosed());
+  EXPECT_EQ("B", b->collections().catalog().find("c")->node);
+  servedBy([&] { a->getCollection("c"); }, "B");
+  EXPECT_EQ(1, b->attachCollection("c")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(CollectionOwnershipTest, attachAndDetachValidateTheirTargetsAndLoadedState) {
+  startA(); a->createCollection("c"); startB();
+  EXPECT_THROW(a->attachCollection("missing"), CollectionNotFoundError);
+  EXPECT_THROW(a->attachCollection("missing", true), CollectionNotFoundError);
+  EXPECT_THROW(a->attachCollection("c"), CollectionExistsError);
+  EXPECT_THROW(a->attachCollection("c", true), CollectionExistsError);
+  EXPECT_THROW(a->detachCollection("missing", "B"), CollectionNotFoundError);
+  servedBy([&] { b->detachCollection("c", "A"); });
+  auto before = catalogBytes();
+  for (auto target : {"A", "", ".", "../B", "B\\C"}) EXPECT_THROW(a->detachCollection("c", target), std::invalid_argument);
+  EXPECT_EQ(before, catalogBytes());
+}
+
+TEST_F(CollectionOwnershipTest, detachRefusesAStagedReplacement) {
+  startA(); auto collection = a->createCollection("c");
+  auto candidate = a->collections().stage(CollectionId::of("c"), "00000000001");
+  auto before = catalogBytes();
+  EXPECT_THROW(a->detachCollection("c", "B"), CollectionUnavailableError);
+  EXPECT_FALSE(collection->getShard()->getIndexWriter()->isClosed());
+  EXPECT_EQ(before, catalogBytes());
+  a->collections().discard(candidate);
+}
+
+TEST_F(CollectionOwnershipTest, failedAssignmentUnloadsToTheCurrentOwner) {
+  startA(); auto collection = a->createCollection("c");
+  auto& catalog = a->collections().catalog();
+  auto incarnation = *catalog.current("c");
+  Signal::listen("catalogRead", [&](void* source, void*, void*) -> void* {
+    if (source == &catalog) {
+      EXPECT_TRUE(collection->getShard()->getIndexWriter()->isClosed());
+      TenantCatalog other(shared, "t0", "A");
+      EXPECT_TRUE(other.assign(incarnation, "A", "C"));
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("catalogRead"); });
+  EXPECT_THROW(a->detachCollection("c", "B"), CollectionUnavailableError);
+  servedBy([&] { a->getCollection("c"); }, "C");
+  EXPECT_EQ("C", catalog.find("c")->node);
+}
+
+TEST_F(CollectionOwnershipTest, assignmentIoFailureStillUnloadsTheClosedWriter) {
+  startA(); auto collection = a->createCollection("c");
+  auto& catalog = a->collections().catalog();
+  Signal::listen("catalogRead", [&](void* source, void*, void*) -> void* {
+    if (source == &catalog) throw FileIOException("injected assignment failure");
+    return nullptr;
+  });
+  EXPECT_THROW(a->detachCollection("c", "B"), FileIOException);
+  Signal::unlisten("catalogRead");
+  EXPECT_TRUE(collection->getShard()->getIndexWriter()->isClosed());
+  servedBy([&] { a->getCollection("c"); });
+  EXPECT_NE(collection, a->attachCollection("c"));
+}
+
+TEST_F(CollectionOwnershipTest, deletionAfterForceAssignmentCannotBecomeAnAutoCreate) {
+  startA(); a->createCollection("c"); startB(); a.reset();
+  auto& catalog = b->collections().catalog();
+  auto placeholder = b->collections().get(CollectionId::of("c"));
+  Signal::listen("catalogPublished", [&](void* source, void*, void*) -> void* {
+    if (source == &catalog) {
+      TenantCatalog owner(shared, "t0", "B");
+      owner.remove("c");
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("catalogPublished"); });
+  EXPECT_THROW(b->attachCollection("c", true), CollectionUnavailableError);
+  EXPECT_FALSE(catalog.find("c"));
+  EXPECT_EQ(placeholder, b->collections().get(CollectionId::of("c")));
+}
+
+TEST_F(CollectionOwnershipTest, failedAttachKeepsThePlaceholderAndUpdatesItsReason) {
+  startA(); a->createCollection("c"); startB();
+  a->detachCollection("c", "B");
+  auto placeholder = b->collections().get(CollectionId::of("c"));
+  Signal::listen("collectionInitialized", [](void*, void*, void*) -> void* { throw std::runtime_error("injected open failure"); });
+  EXPECT_THROW(b->attachCollection("c"), std::runtime_error);
+  Signal::unlisten("collectionInitialized");
+  EXPECT_EQ(placeholder, b->collections().get(CollectionId::of("c")));
+  EXPECT_NE(std::string::npos, placeholder->getUnavailableReason().find("injected open failure"));
+  EXPECT_NE(placeholder, b->attachCollection("c"));
+}
+
+TEST_F(CollectionOwnershipTest, detachAndReattachPreserveTheCachePolicy) {
+  startA(); a->createCollection("c");
+  a->collections().setCacheBytes("", "c", 4096);
+  auto incarnation = *a->collections().catalog().current("c");
+  a->detachCollection("c", "B");
+  auto collection = a->attachCollection("c", true);
+  EXPECT_EQ(4096u, collection->getReaderManager().filterCache->configuration().maxBytes);
+  EXPECT_EQ(incarnation, a->collections().catalog().current("c"));
+}
+
+TEST_F(CollectionOwnershipTest, detachKeepsTheFilesystemCollectionForTheTarget) {
+  auto cfg = config("A");
+  cfg.store.backend = "fs";
+  auto path = std::filesystem::temp_directory_path() / ("luxir-detach-" + newUuid());
+  auto cleanup = scope_guard([&] { b.reset(); a.reset(); std::filesystem::remove_all(path); });
+  cfg.store.data_dir = path.string();
+  a = std::make_unique<LuxirNode>(cfg);
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success); }
+  {
+    auto readOnly = cfg; readOnly.read_only = true;
+    LuxirNode reader(readOnly);
+    EXPECT_THROW(reader.detachCollection("c", "B"), ReadOnlyError);
+    EXPECT_THROW(reader.attachCollection("c", true), ReadOnlyError);
+  }
+  auto incarnation = *a->collections().catalog().current("c");
+  a->detachCollection("c", "B"); a.reset();
+  cfg.node.id = "B";
+  b = std::make_unique<LuxirNode>(cfg);
+  EXPECT_EQ(incarnation, b->collections().catalog().current("c"));
+  EXPECT_EQ(1, b->getCollection("c")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(CollectionOwnershipTest, followerRefusesWriterHandoffHooks) {
+  LuxirConfig cfg;
+  cfg.node.id = "follower";
+  cfg.replication.source = "http://127.0.0.1:1";
+  LuxirNode follower(cfg, LuxirNode::Mode::PULL);
+  EXPECT_THROW(follower.detachCollection("main", "B"), ReadOnlyError);
+  EXPECT_THROW(follower.attachCollection("main", true), ReadOnlyError);
 }
 
 TEST_F(CollectionOwnershipTest, startupLeavesAnotherNodesReservation) {

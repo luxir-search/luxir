@@ -168,6 +168,22 @@ For a continuously refreshed copy with its own storage, use
 Followers own their local data directory and install verified snapshots without
 constructing an index writer.
 
+## Moving a collection
+
+Placement code moves a writer between nodes sharing one store with
+`source.detachCollection(id, targetNodeId)` followed by
+`target.attachCollection(id)`. Detach writes a final commit, closes the writer,
+and changes the catalog assignment. It does not delete the collection or change
+its incarnation. Uncommitted concurrent updates may be lost. A failed final
+commit is reported after the handoff, so the target can still attach.
+
+The source then answers "served by <target>"; the target serves the collection
+after attach succeeds. Followers keep their copies, and the source keeps its
+session cache policy for a later re-attach. If the old owner is dead, use
+`target.attachCollection(id, true)` to take over its assignment and fence its
+writer. Without force, attach requires the assignment to name this node.
+These are writer-node engine hooks; read-only nodes and followers refuse them.
+
 ## Collection lifecycle
 
 Create and delete collections with `POST /collections/_create` and

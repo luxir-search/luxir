@@ -126,7 +126,8 @@ public:
   std::string getUnavailableReason() const;
   // The one way a collection becomes unavailable while registered: a
   // placeholder's reason, or a failure found while serving (a scrub mismatch).
-  // The first reason sticks. On a writer the IndexWriter fails too, so nothing
+  // A placeholder can update its reason after a failed open. On a writer the
+  // first reason sticks and the IndexWriter fails too, so nothing
   // more is read from or published over its files.
   void fail(const std::string& reason);
   bool isFailed() const { return failed.load(std::memory_order_acquire); }
