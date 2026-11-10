@@ -361,12 +361,17 @@ and `optional` kNN clauses: a required kNN beside `prohibited: [X]` returns
 (`range`, `prefix`, `wildcard`, `regex`, `exists`, geo, and `any_of`) act like
 `filter` clauses: a required kNN beside them returns `k` neighbors that match
 them, and an `optional` kNN beside them picks its neighbors among their
-matches. Required clauses that score, including a `match` on one term,
-intersect with the kNN's top `k` after the vector search, and so does any
-clause wrapped in `constant_score`, which is how to ask for that behavior. To
-constrain the vector search by a term, use `any_of` or put it in `filter`.
-Optional clauses made a constraint through `min_match` also intersect
-afterwards.
+matches. Grouping does not matter: the `filter`, `prohibited`, and non-scoring
+required clauses of a boolean nested under `required` or `filter` (also inside
+`boost` or `constant_score`) constrain the kNN the same way. Clauses inside an
+`optional` group do not, even when `min_match` makes the group necessary.
+
+Required clauses that score, including a `match` on one term, intersect with
+the kNN's top `k` after the vector search. Wrapping a constraint itself in
+`constant_score` asks for this post-filter behavior; wrapping a nested boolean
+does not hide the constraints inside it. To constrain the vector search by a
+term, use `any_of` or put it in `filter`. Optional clauses made a constraint
+through `min_match` also intersect afterwards.
 
 ## Hybrid search
 

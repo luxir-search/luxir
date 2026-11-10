@@ -10,6 +10,7 @@
 #include <typeindex>
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
 #include "AllQuery.h"
@@ -157,9 +158,107 @@ private:
     }
   }
 
-  NormalizedBoolean effectiveRoles() const {
+  static void deduplicateMembership(ClauseList& clauses) {
+    if (clauses.size() < 2) return;
+    boost::unordered_flat_set<Query*> pointers;
+    boost::unordered_flat_set<FilterKey, FilterKeyHash> keys;
+    auto end = std::remove_if(clauses.begin(), clauses.end(), [&](Query* clause) {
+      if (!pointers.insert(clause).second) return true;
+      FilterKeyBuilder builder;
+      auto scope = clause->appendFilterKey(builder, {});
+      if (scope == FilterKeyScope::UNCACHEABLE) return false;
+      return !keys.insert(std::move(builder).finishStructural(scope, {})).second;
+    });
+    clauses.erase(end, clauses.end());
+  }
+
+  static Query* requiredConstraintRoles(Query* clause, MemPool& pool,
+                                        NormalizedBoolean& parent) {
+    Query* child;
+    switch (clause->getKind()) {
+      case QueryKind::BOOST:
+        child = static_cast<BoostQuery*>(clause)->getChild();
+        break;
+      case QueryKind::CONSTANT_SCORE:
+        child = static_cast<ConstantScoreQuery*>(clause)->getChild();
+        break;
+      case QueryKind::FORCE_PREPARE:
+        child = static_cast<ForcePrepareQuery*>(clause)->getChild();
+        break;
+      case QueryKind::BOOLEAN: {
+        const auto& inner = *static_cast<BooleanQuery*>(clause);
+        auto roles = inner.effectiveRoles(pool, /*requiredChain=*/true);
+        auto extractableFilter = [](Query* query) {
+          return !luxir::logicalConsumesDomain(*query)
+              && !luxir::exactDomainIdentity(*query);
+        };
+        auto extractableProhibited = [](Query* query) {
+          return !luxir::logicalConsumesDomain(*query);
+        };
+        for (auto* filter : roles.filter) {
+          if (extractableFilter(filter)) parent.filter.push_back(filter);
+        }
+        for (auto* prohibited : roles.prohibited) {
+          if (extractableProhibited(prohibited)) parent.prohibited.push_back(prohibited);
+        }
+        // Keep a required carrier so optional clauses never become required.
+        size_t required = roles.mandatory.size() + roles.filter.size();
+        auto end = std::remove_if(roles.filter.begin(), roles.filter.end(),
+            [&](Query* query) {
+              if (required <= 1 || !extractableFilter(query)) return false;
+              required--;
+              return true;
+            });
+        roles.filter.erase(end, roles.filter.end());
+        if (required != 0) {
+          auto end = std::remove_if(roles.prohibited.begin(), roles.prohibited.end(),
+              extractableProhibited);
+          roles.prohibited.erase(end, roles.prohibited.end());
+        }
+        parent.ruleMask |= roles.ruleMask;
+        auto same = [](const ClauseList& a, std::span<Query*> b) {
+          return std::ranges::equal(a, b);
+        };
+        if (same(roles.mandatory, inner.mandatory)
+            && same(roles.filter, inner.filter)
+            && same(roles.prohibited, inner.prohibited)) return clause;
+
+        // Preserve boundaries and optional matching while sharing leaf uses.
+        auto* projected = pool.make<BooleanQuery>(
+            persistClauses(pool, roles.mandatory), inner.optional,
+            persistClauses(pool, roles.prohibited),
+            persistClauses(pool, roles.filter), inner.minShouldMatch);
+        projected->markPlannerGenerated();
+        return projected;
+      }
+      default:
+        return clause;
+    }
+    auto* projectedChild = requiredConstraintRoles(child, pool, parent);
+    if (projectedChild == child) return clause;
+    Query* projected;
+    switch (clause->getKind()) {
+      case QueryKind::BOOST:
+        projected = pool.make<BoostQuery>(projectedChild,
+            static_cast<BoostQuery*>(clause)->getBoost());
+        break;
+      case QueryKind::CONSTANT_SCORE:
+        projected = pool.make<ConstantScoreQuery>(projectedChild,
+            static_cast<ConstantScoreQuery*>(clause)->getScoreProfile());
+        break;
+      case QueryKind::FORCE_PREPARE:
+        projected = pool.make<ForcePrepareQuery>(projectedChild);
+        break;
+      default:
+        std::unreachable();
+    }
+    projected->markPlannerGenerated();
+    return projected;
+  }
+
+  NormalizedBoolean effectiveRoles(MemPool& pool, bool requiredChain = false) const {
     NormalizedBoolean roles(*this);
-    bool consumes = false;
+    bool consumes = requiredChain;
     for (auto clauses : {mandatory, optional}) {
       for (const auto* clause : clauses) {
         consumes |= luxir::logicalConsumesDomain(*clause);
@@ -168,14 +267,22 @@ private:
     if (!consumes) return roles;
 
     roles.mandatory.clear();
+    roles.filter.clear();
+    // Walk only authored required clauses; extracted references need no walk.
     for (auto* clause : mandatory) {
       if (isImplicitConstraintLeaf(*clause)) {
         roles.filter.push_back(clause);
         roles.ruleMask |= R6_REQUIRED_FILTER_PROMOTE;
       } else {
-        roles.mandatory.push_back(clause);
+        roles.mandatory.push_back(requiredConstraintRoles(clause, pool, roles));
       }
     }
+    for (auto* clause : filter) {
+      auto* projected = requiredConstraintRoles(clause, pool, roles);
+      roles.filter.push_back(projected);
+    }
+    deduplicateMembership(roles.filter);
+    deduplicateMembership(roles.prohibited);
     return roles;
   }
 
@@ -278,7 +385,7 @@ private:
       }
 
       // Inlining must retain roles already established inside the child.
-      auto innerRoles = inner->effectiveRoles();
+      auto innerRoles = inner->effectiveRoles(pool);
       ClauseList replacement;
       if (parentIsFilter) {
         replacement.insert(replacement.end(), innerRoles.mandatory.begin(), innerRoles.mandatory.end());
@@ -358,10 +465,12 @@ private:
   }
 
   NormalizedBoolean normalize(MemPool& pool) const {
-    auto plan = effectiveRoles();
+    auto plan = effectiveRoles(pool);
 
     normalizeRequiredList(plan, plan.mandatory, /*parentIsFilter=*/false, pool);
     normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
+    deduplicateMembership(plan.filter);
+    deduplicateMembership(plan.prohibited);
     eliminateMatchAll(plan);
     flattenDisjunctions(plan, pool);
 
@@ -546,18 +655,10 @@ private:
 
   static std::span<Query*> dropDuplicateMembershipClauses(
       luxir::MemPool& pool, std::span<Query*> clauses) {
-    DuplicateGroups duplicates = findDuplicateGroups(pool, clauses, false);
-    if (duplicates.duplicateSlots == 0) return clauses;
-    boost::container::small_vector<Query*, 16> out;
-    for (size_t i = 0; i < clauses.size(); i++) {
-      int32_t group = duplicates.byClause[i];
-      if (group >= 0
-          && i != duplicates.slots[(size_t) group].representative) continue;
-      out.push_back(clauses[i]);
-    }
-    auto* kept = pool.make_arr<Query*>(out.size());
-    std::copy(out.begin(), out.end(), kept);
-    return {kept, out.size()};
+    ClauseList kept(clauses.begin(), clauses.end());
+    deduplicateMembership(kept);
+    if (kept.size() == clauses.size()) return clauses;
+    return persistClauses(pool, kept);
   }
 
   static std::span<Query*> persistClauses(
@@ -1075,7 +1176,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
-    auto roles = effectiveRoles();
+    MemPool pool;
+    auto roles = effectiveRoles(pool);
     out.appendKind(kind);
     out.appendInt32(minShouldMatch);
     FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;

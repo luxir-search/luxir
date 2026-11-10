@@ -23,6 +23,7 @@
 #include "luxir/query/VectorEngine.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
@@ -1384,7 +1385,9 @@ protected:
 
   enum class Shape {
     RANGE, CONSTANT_RANGE, ANY_OF, TERM, MATCH,
-    NESTED_RANGE, NESTED_CONSTANT_RANGE, CONSUMING_CHILD, CONSTANT_CONSUMING_CHILD
+    NESTED_RANGE, NESTED_CONSTANT_RANGE, CONSUMING_CHILD, CONSTANT_CONSUMING_CHILD,
+    NEGATIVE, NESTED_FILTER, NESTED_REQUIRED, WRAPPED_REQUIRED, BOOSTED_REQUIRED,
+    FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH
   };
   enum class Caller { SCORED, COUNT, FIELD_SORT, CONSTANT_SCORE, RESCORE, FACET };
   struct Result {
@@ -1404,13 +1407,15 @@ protected:
     helper.getIndexWriter()->snapshots.readers.filterCache = cache;
     for (int i = 0; i < 4; i++) {
       helper.index(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i,
-          "cat_s", i < 2 ? "y" : "x", "foo_w", i < 2 ? "orange" : "apple",
+          "cat_s", i < 2 ? "y" : "x", "all_s", "t",
+          "foo_w", i < 2 ? "orange" : "apple",
           "body_v", std::vector<float>{(float)i, 0}));
     }
     helper.commit({"*"});
   }
 
-  static api::Query query(std::pmr::memory_resource& mr, Shape shape, bool optional = false) {
+  static api::Query query(std::pmr::memory_resource& mr, Shape shape,
+                          bool optional = false, bool rankOnly = false) {
     auto constraint = qb::range(mr, "rank_i", qb::valI64(mr, 2), nullptr, nullptr, nullptr);
     if (shape == Shape::CONSTANT_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
       constraint = qb::constantScore(mr, constraint);
@@ -1426,23 +1431,48 @@ protected:
                              shape == Shape::TERM ? "x" : "apple");
     }
     auto knn = qb::knn(mr, "body_v", {0, 0}, optional ? 1 : 2, 0, true);
-    if (shape == Shape::NESTED_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
-      constraint = qb::boolean(mr, {constraint});
-    } else if (shape == Shape::CONSUMING_CHILD || shape == Shape::CONSTANT_CONSUMING_CHILD) {
+    if (shape == Shape::CONSUMING_CHILD || shape == Shape::CONSTANT_CONSUMING_CHILD) {
       auto child = qb::boolean(mr, {knn, constraint});
       if (shape == Shape::CONSTANT_CONSUMING_CHILD) child = qb::constantScore(mr, child);
       return qb::boolean(mr, {child});
+    }
+    auto term = qb::match(mr, "all_s", "t");
+    std::vector<api::Query> ranks;
+    if (rankOnly) ranks.push_back(qb::match(mr, "id", "2"));
+    if (shape == Shape::NESTED_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
+      constraint = qb::boolean(mr, std::array{constraint}, ranks);
+    } else if (shape == Shape::NEGATIVE) {
+      std::vector<api::Query> carrier;
+      if (rankOnly) carrier.push_back(qb::all());
+      constraint = qb::boolean(mr, carrier, ranks,
+          std::array{qb::match(mr, "cat_s", "y")});
+    } else if (shape == Shape::NESTED_FILTER) {
+      constraint = qb::boolean(mr, std::array{term}, ranks, {}, std::array{constraint});
+    } else if (shape == Shape::NESTED_REQUIRED || shape == Shape::WRAPPED_REQUIRED
+               || shape == Shape::BOOSTED_REQUIRED || shape == Shape::FILTER_CHAIN
+               || shape == Shape::NESTED_MIN_MATCH) {
+      constraint = qb::boolean(mr, std::array{term, constraint}, ranks);
+      if (shape == Shape::WRAPPED_REQUIRED) constraint = qb::constantScore(mr, constraint);
+      if (shape == Shape::BOOSTED_REQUIRED) constraint = qb::boost(mr, constraint, 2);
+      if (shape == Shape::FILTER_CHAIN) constraint = qb::boolean(mr, {}, {}, {}, {constraint});
+      if (shape == Shape::NESTED_MIN_MATCH) {
+        constraint = qb::boolean(mr, {constraint}, {qb::match(mr, "foo_w", "apple")}, {}, {}, 1);
+      }
+    } else if (shape == Shape::OPTIONAL_GROUP) {
+      auto group = qb::boolean(mr, {term, constraint});
+      return qb::boolean(mr, {knn}, {group}, {}, {}, 1);
     }
     return optional ? qb::boolean(mr, {constraint}, {knn})
                     : qb::boolean(mr, {knn, constraint});
   }
 
-  Result run(Shape shape, Caller caller = Caller::SCORED, bool optional = false) {
+  Result run(Shape shape, Caller caller = Caller::SCORED, bool optional = false,
+             bool rankOnly = false) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->topDocs("q").countLimit().limit(caller == Caller::COUNT ? 0 : 10)
                    .fields({"id"});
     auto& mr = cur.mr();
-    auto q = query(mr, shape, optional);
+    auto q = query(mr, shape, optional, rankOnly);
     if (caller == Caller::SCORED) cur.getScores();
     if (caller == Caller::FIELD_SORT) qb::sort(cur, "rank_i", qb::ASC);
     if (caller == Caller::CONSTANT_SCORE) q = qb::constantScore(mr, q);
@@ -1470,9 +1500,9 @@ protected:
     return result;
   }
 
-  void expect(Shape shape, Caller caller, int count) {
-    SCOPED_TRACE(::testing::Message() << (int)shape << ":" << (int)caller);
-    auto result = run(shape, caller);
+  void expect(Shape shape, Caller caller, int count, bool rankOnly = false) {
+    SCOPED_TRACE(::testing::Message() << (int)shape << ":" << (int)caller << ":" << rankOnly);
+    auto result = run(shape, caller, false, rankOnly);
     EXPECT_EQ(count, result.count);
     if (caller != Caller::COUNT && caller != Caller::FACET) {
       EXPECT_EQ(count == 0 ? std::vector<std::string>{}
@@ -1516,7 +1546,8 @@ TEST_F(KnnBooleanDomainTest, membershipIsIndependentOfCallerAndCache) {
 
 TEST_F(KnnBooleanDomainTest, membershipKeysSeparateSelectionDomains) {
   for (auto pair : {std::pair{Shape::RANGE, Shape::CONSTANT_RANGE},
-                    std::pair{Shape::ANY_OF, Shape::TERM}}) {
+                    std::pair{Shape::ANY_OF, Shape::TERM},
+                    std::pair{Shape::NESTED_RANGE, Shape::NESTED_CONSTANT_RANGE}}) {
     for (bool reverse : {false, true}) {
       cache->clear();
       auto first = reverse ? pair.second : pair.first;
@@ -1533,14 +1564,121 @@ TEST_F(KnnBooleanDomainTest, membershipKeysSeparateSelectionDomains) {
   }
 }
 
-TEST_F(KnnBooleanDomainTest, inliningPreservesAuthoredPromotion) {
-  for (auto shape : {Shape::NESTED_RANGE, Shape::NESTED_CONSTANT_RANGE}) {
+TEST_F(KnnBooleanDomainTest, requiredClosureIsIndependentOfInlining) {
+  for (auto shape : {Shape::NEGATIVE, Shape::NESTED_FILTER, Shape::NESTED_REQUIRED,
+                     Shape::WRAPPED_REQUIRED, Shape::BOOSTED_REQUIRED, Shape::FILTER_CHAIN,
+                     Shape::NESTED_MIN_MATCH, Shape::NESTED_RANGE}) {
+    for (bool rankOnly : {false, true}) {
+      for (auto caller : {Caller::SCORED, Caller::COUNT, Caller::FIELD_SORT,
+                          Caller::CONSTANT_SCORE, Caller::RESCORE, Caller::FACET}) {
+        cache->clear();
+        expect(shape, caller, 2, rankOnly);
+        expect(shape, caller, 2, rankOnly);
+      }
+    }
+  }
+  for (auto shape : {Shape::NESTED_RANGE, Shape::CONSUMING_CHILD,
+                     Shape::CONSTANT_CONSUMING_CHILD}) {
+    expect(shape, Caller::COUNT, 2);
+    expect(shape, Caller::SCORED, 2);
+  }
+  for (auto shape : {Shape::NESTED_CONSTANT_RANGE, Shape::OPTIONAL_GROUP}) {
     expect(shape, Caller::COUNT, 0);
     expect(shape, Caller::SCORED, 0);
   }
-  for (auto shape : {Shape::CONSUMING_CHILD, Shape::CONSTANT_CONSUMING_CHILD}) {
-    expect(shape, Caller::COUNT, 2);
-    expect(shape, Caller::SCORED, 2);
+}
+
+TEST_F(KnnBooleanDomainTest, extractedExclusionHonorsFoldOverride) {
+  SearchOverridesGuard guard(QueryPrep::disableProhibitedDomainFoldForTests);
+  QueryPrep::disableProhibitedDomainFoldForTests = true;
+  for (bool rankOnly : {false, true}) {
+    expect(Shape::NEGATIVE, Caller::SCORED, 0, rankOnly);
+  }
+}
+
+TEST_F(KnnBooleanDomainTest, extractedLeafSharesRequestMaterialization) {
+  SearchOverridesGuard guard(SkipStats::enabled);
+  SkipStats::enabled = true;
+  for (bool noCache : {false, true}) for (bool exclusion : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << noCache << ":" << exclusion);
+    FilterCacheConfig config;
+    config.minSegmentDocs = 0;
+    config.admissionThreshold = 1000;
+    auto rejected = noCache ? nullptr : std::make_shared<FilterCache>(config);
+    IndexReader reader(*helper.collection().getShard()->getDirectory(), nullptr, rejected);
+    EXPECT_EQ(rejected.get(), reader.filterCache());
+    const auto& type = (const VectorFieldType&)*reader.schema()->getFieldTypePtr("body_v");
+    std::vector<float> vector{0, 0};
+    KnnQuery knn("body_v", type, vector, 2);
+    NumericPredicateQuery range("rank_i", 2, 3), same("rank_i", 2, 3), blocked("rank_i", 0, 1);
+    BoostQuery boosted(&same, 2);
+    TermQuery rank("id", "2");
+    Query* required[]{&range};
+    Query* optional[]{&rank};
+    Query* prohibited[]{&blocked};
+    if (exclusion) optional[0] = &knn;
+    BooleanQuery inner(exclusion ? std::span<Query*>{} : std::span<Query*>(required),
+        optional, exclusion ? std::span<Query*>(prohibited) : std::span<Query*>{}, {});
+    ForcePrepareQuery forced(&inner);
+    Query* outer[]{&knn, &forced, &boosted};
+    BooleanQuery query(std::span<Query*>(outer, exclusion ? 2 : 3), {}, {}, {});
+    MemPool pool;
+    Query::Context context(pool, reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    SkipStats::reset();
+    Query::Weight::PrepareContext prepare(reader, {}, false, nullptr);
+    auto prepared = weight->prepare(prepare);
+    std::vector<int> docs;
+    for (auto& segment : reader.segments()) {
+      auto* scorer = prepared->createScorer(pool, segment);
+      if (scorer) for (int doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        docs.push_back(doc);
+      }
+    }
+    EXPECT_EQ((std::vector<int>{2, 3}), docs);
+    EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+    EXPECT_GT(SkipStats::ownedFilterServes, 1);
+    if (rejected) {
+      EXPECT_EQ(0u, rejected->counters().builds);
+      EXPECT_EQ(0u, rejected->entryCountForTest());
+    }
+  }
+  SkipStats::reset();
+}
+
+TEST_F(KnnBooleanDomainTest, projectionKeepsAuthoredQueriesReusable) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{0, 0};
+  KnnQuery knn("body_v", type, vector, 2);
+  NumericPredicateQuery range("rank_i", 2, 3);
+  Query* required[]{&range};
+  BooleanQuery inner(required, {}, {}, {});
+  ForcePrepareQuery forced(&inner);
+  Query* outer[]{&knn, &forced};
+  BooleanQuery query(outer, {}, {}, {});
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto before = inner.compiledPlanForTest(context);
+  auto originalKey = key(inner);
+  EXPECT_EQ(1u, query.compiledPlanForTest(context).filter.size());
+  auto after = inner.compiledPlanForTest(context);
+  EXPECT_EQ(before.identity, after.identity);
+  EXPECT_EQ(1u, after.mandatory.size());
+  EXPECT_TRUE(after.filter.empty());
+  EXPECT_EQ(originalKey, key(inner));
+
+  Query* consumer[]{&knn};
+  for (bool prohibited : {false, true}) {
+    std::span<Query*> exclusions = prohibited ? consumer : std::span<Query*>{};
+    std::span<Query*> filters = prohibited ? std::span<Query*>{} : consumer;
+    BooleanQuery nested({}, {}, exclusions, filters);
+    ForcePrepareQuery forced(&nested);
+    Query* required[]{&knn, &forced};
+    BooleanQuery query(required, {}, {}, {});
+    auto view = query.normalizationForTest(pool);
+    EXPECT_EQ(0u, view.filterCount);
+    EXPECT_EQ(0u, view.prohibitedCount);
   }
 }
 
@@ -1589,8 +1727,8 @@ TEST_F(KnnBooleanDomainTest, normalizerAndKeysUseEffectiveRoles) {
     BooleanQuery query(required, {}, {}, {});
     MemPool pool;
     auto view = query.normalizationForTest(pool);
-    EXPECT_EQ(0u, view.filterCount);
-    EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
+    EXPECT_EQ(1u, view.filterCount);
+    EXPECT_NE(0u, view.ruleMask & BooleanQuery::R6_REQUIRED_FILTER_PROMOTE);
   }
   AllQuery all;
   BoostQuery boostedAll(&all, 2);
