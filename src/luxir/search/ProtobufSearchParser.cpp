@@ -764,7 +764,7 @@ public:
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
-      if (QueryBuilder::isNumericColumnType(ftype->type())) {
+      if (FieldType::isNumericColumn(ftype->type())) {
         selectedInts = preparedSelected->numericsInInputOrder();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
@@ -865,10 +865,7 @@ public:
           + "': range gap or calendar_gap is required");
     }
     auto* fieldType = target.fieldType;
-    if (fieldType->type() != FieldType::Type::INT
-        && fieldType->type() != FieldType::Type::DATE
-        && fieldType->type() != FieldType::Type::FLOAT
-        && fieldType->type() != FieldType::Type::DOUBLE) {
+    if (!FieldType::isNumericColumn(fieldType->type())) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range facets require an INT, DATE, FLOAT, or DOUBLE field");
     }
@@ -961,9 +958,8 @@ public:
       return selected;
     };
 
-    auto dateBound = [&](const api::Val& value) {
-      auto& dateType = (DateFieldType&)*fieldType;
-      auto range = dateType.coerceDateRange(value, facetField, context);
+    auto boundFence = [&](const api::Val& value, FieldType::LiteralUse use) {
+      auto range = fieldType->coerceIntWindow(value, use, facetField, context);
       if (range.granuleSkipped) {
         const auto* text = std::get_if<std::string_view>(&value.kind);
         if (text != nullptr) {
@@ -973,7 +969,11 @@ public:
               + "' skipped: no such local granule in " + zone.name());
         }
       }
-      return range.lo;
+      if (use == FieldType::LiteralUse::GTE) return range.lo;
+      // LT MIN is empty; otherwise undo the inclusive upper edge. A fence
+      // beyond the encoded domain saturates rather than overflowing.
+      if (range.empty()) return INT64_MIN;
+      return range.hi == INT64_MAX ? INT64_MAX : range.hi + 1;
     };
 
     bool floating = fieldType->type() == FieldType::Type::FLOAT
@@ -1033,14 +1033,9 @@ public:
       return facet;
     }
 
-    auto intBound = [&](const api::Val& value) {
-      return fieldType->type() == FieldType::Type::DATE
-          ? dateBound(value)
-          : fieldType->coerceColInt64(value, facetField, context);
-    };
     std::optional<int64_t> givenStart, givenEnd;
-    if (facetReq.start.has_value()) givenStart = intBound(*facetReq.start);
-    if (facetReq.end.has_value()) givenEnd = intBound(*facetReq.end);
+    if (facetReq.start.has_value()) givenStart = boundFence(*facetReq.start, FieldType::LiteralUse::GTE);
+    if (facetReq.end.has_value()) givenEnd = boundFence(*facetReq.end, FieldType::LiteralUse::LT);
     if (givenStart && givenEnd && *givenStart >= *givenEnd) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range start must be less than end");
@@ -1082,7 +1077,7 @@ public:
     auto parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
 
     auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
-      return intBound(value);
+      return boundFence(value, FieldType::LiteralUse::GTE);
     });
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(

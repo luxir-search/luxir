@@ -279,7 +279,7 @@ public:
         || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
       return false;
     }
-    return FieldType::sortsByIntColumn(const_cast<FieldType&>(
+    return FieldType::isNumericColumn(const_cast<FieldType&>(
         sortPlan.clauses[0].getSortField().getFieldType()).type());
   }
 

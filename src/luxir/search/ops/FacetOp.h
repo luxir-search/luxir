@@ -174,7 +174,7 @@ public:
   // The points format here is the same one-dimensional numeric format used
   // by range counts. Other points shapes must use the column predicate.
   static bool numericIdentityPoints(const SegFieldInfo& info) {
-    return info.pointsMetaOff != 0 && FieldType::usesOneDimensionalPoints(info.type);
+    return info.pointsMetaOff != 0 && FieldType::isNumericColumn(info.type);
   }
 
   // Value counts are document counts when every present doc has one value,
@@ -2202,7 +2202,7 @@ public:
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (auto* info = rangeOp().fieldInfo(segnum)) {
           const auto& segFieldInfo = *info;
-          bool oneDimensionalNumeric = FieldType::usesOneDimensionalPoints(segFieldInfo.type);
+          bool oneDimensionalNumeric = FieldType::isNumericColumn(segFieldInfo.type);
           if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric
               && valuesAreDocuments(segFieldInfo)) {
             IntColReader column(segment.postingsReader(), segFieldInfo);

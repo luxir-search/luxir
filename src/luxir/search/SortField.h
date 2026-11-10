@@ -105,7 +105,7 @@ public:
         auto fields = reader.field(fieldName);
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
-        if (FieldType::sortsByIntColumn(type)) {
+        if (FieldType::isNumericColumn(type)) {
             // INT and DATE (epoch millis) sort on the raw column values.
             // FLOAT/DOUBLE columns store sortable bits whose int64 order
             // matches the floating point order, so the int comparator

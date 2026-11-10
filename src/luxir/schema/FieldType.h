@@ -69,7 +69,9 @@ public:
     throw std::invalid_argument("Unknown field storage type");
   }
 
-  static constexpr bool usesOneDimensionalPoints(Type type) {
+  // Ordered scalar values in the shared int64 column: numeric queries,
+  // field sorts and one-dimensional points all use this storage family.
+  static constexpr bool isNumericColumn(Type type) {
     return storage(type) == Storage::INT64 && type != GEO_POINT;
   }
 
@@ -189,15 +191,6 @@ public:
   bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
   static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
-  // Whether a sort on a field of this type orders by its int64 column
-  // values: raw integers for INT, epoch units for DATE, sortable bits for
-  // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
-  // of these types are the ones field-sort planning reads, so only they
-  // persist a value sketch (NumColumnWriter).
-  static bool sortsByIntColumn(Type type) {
-    return type == INT || type == DATE || type == FLOAT || type == DOUBLE;
-  }
-
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
@@ -223,10 +216,28 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
-  // Same conversion, returning nullopt only for an uncoercible value.
-  // Unsupported column types still throw.
+  // Fallback for point types without a cheaper non-throwing coercer.
   virtual std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  enum class LiteralUse : uint8_t { MATCH, MEMBER, GTE, GT, LTE, LT };
+  struct IntWindow {
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    bool granuleSkipped = false;
+    bool unroundedNow = false;
+    bool empty() const { return lo > hi; }
+  };
+
+  // Inclusive encoded values admitted by a query literal. MEMBER returns a
+  // point or empty; bounds return half-lines. Ingest still uses coerceColInt64.
+  virtual IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  // Only invalid_value is an uncoercible literal; other errors still throw.
+  virtual std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
@@ -329,11 +340,6 @@ public:
 // field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
 class DateFieldType : public FieldType {
 public:
-  struct QueryRange {
-    int64_t lo, hi; // inclusive, in field units; out-of-domain bounds saturate
-    bool granuleSkipped = false;
-    bool unroundedNow = false;
-  };
   DateUnit unit;
 
   DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
@@ -351,23 +357,13 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  std::optional<int64_t> tryCoerceColInt64(
-      const api::Val& val, std::string_view fieldName,
+  IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  // Exact set membership uses the literal's floored start. Out-of-domain
-  // members are omitted; malformed values remain request errors.
-  std::optional<int64_t> coerceDateInstant(
-      const api::Val& val, std::string_view fieldName,
-      const CoerceContext& context = {}) const;
-
-  // Match/range use the literal's granularity, expressed in column units.
-  QueryRange coerceDateRange(
-      const api::Val& val, std::string_view fieldName,
-      const CoerceContext& context = {}) const;
-
-  std::optional<QueryRange> tryCoerceDateRange(
-      const api::Val& val, const CoerceContext& context = {}) const;
+  std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class GeoPointFieldType : public FieldType {

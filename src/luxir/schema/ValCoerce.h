@@ -94,7 +94,7 @@ inline api::Val scalarVal(auto value) {
 
 // Typed scalar entry points let homogeneous array consumers select the Val arm
 // once, outside their element loop. They intentionally mirror the Val coercion
-// contract below; scalarVal is only called on a failing typed-coercion path.
+// contract below; scalarVal also feeds the field-specific query hooks.
 template<typename T>
 inline std::optional<int64_t> tryToInt64Scalar(T value) {
   using V = std::remove_cvref_t<T>;
