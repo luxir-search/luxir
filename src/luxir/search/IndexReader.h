@@ -285,6 +285,9 @@ private:
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
     uint64_t coreGeneration = 0;
+    // Commit time of the publication that produced this physical state. A
+    // later publication that reuses the core (a schema-only one) keeps it.
+    uint64_t commitTime = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
     // A segment's physical identity, which decides what a reopen reuses: the
@@ -363,6 +366,15 @@ public:
   }
 
   uint64_t commitId() const noexcept { return snapshotGen; }
+
+  // The commit time of the publication that produced this reader's physical
+  // state (segments, live docs, overlays).  A reader that reuses the previous
+  // core, as a schema-only publication does, reports the previous value, so
+  // reader-stable caches can build and hit values after that publication.
+  // Filter keys still include schemaGen, so new-schema requests build new values.
+  uint64_t coreCommitTime() const noexcept {
+    return core->commitTime;
+  }
   std::string_view incarnation() const noexcept { return core->incarnation; }
 
   std::span<Segment> segments() noexcept {

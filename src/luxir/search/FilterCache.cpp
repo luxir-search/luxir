@@ -465,7 +465,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
     IndexReader& reader, std::span<DocSet* const> domainPerSeg) {
   if (cache == nullptr || !cache->enabled()
       || scope_ != FilterKeyScope::READER_STABLE
-      || reader.commitTime() != readerVersion
+      || reader.coreCommitTime() != readerVersion
       || reader.segments().size() != readerSegments.size()) {
     return {};
   }
@@ -742,7 +742,7 @@ DocSet* FilterCache::Use::effectiveDocSet(
       value = readerPin;
     }
     if (value == nullptr || value->readerVersion() != readerVersion
-        || reader.commitTime() != readerVersion) {
+        || reader.coreCommitTime() != readerVersion) {
       return nullptr;
     }
     return value->docSet(segmentOrd, readerSegments[segmentOrd]);
@@ -817,7 +817,7 @@ FilterCache::UseRegistry::UseRegistry(
 }
 
 FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader)
-  : UseRegistry(cache, reader.coreGen(), reader.commitTime(),
+  : UseRegistry(cache, reader.coreGen(), reader.coreCommitTime(),
                 readerIdentities(reader)) {
 }
 
@@ -833,7 +833,7 @@ FilterCache::UseRegistry::UseRegistry(
   : UseRegistry(&cache, readerCoreGen, readerVersion, segments) {}
 
 FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
-  : UseRegistry(&cache, reader.coreGen(), reader.commitTime(),
+  : UseRegistry(&cache, reader.coreGen(), reader.coreCommitTime(),
                 readerIdentities(reader)) {
 }
 
@@ -1693,7 +1693,7 @@ bool FilterCache::onReaderPublished(
 
 bool FilterCache::onReaderPublished(IndexReader& reader) {
   auto identities = readerIdentities(reader);
-  return onReaderPublished(reader.coreGen(), reader.commitTime(), identities);
+  return onReaderPublished(reader.coreGen(), reader.coreCommitTime(), identities);
 }
 
 void FilterCache::maybeSweep() {
