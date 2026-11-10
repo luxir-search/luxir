@@ -58,6 +58,8 @@ class Shard {
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
   std::unique_ptr<CommitSnapshotRegistry> snapshots;
   std::shared_ptr<IndexWriter> iw; // absent on read-only collections
+  // Set by Collections::demote: the writer is closed, the collection serves reads only.
+  std::atomic<bool> readOnly{false};
 
 public:
   explicit Shard(Collection& collection) : collection(collection) {
@@ -79,9 +81,12 @@ public:
   ReaderManager& getReaderManager() const { return snapshots->readers; }
   CommitSnapshotRegistry& getSnapshots() const { return *snapshots; }
   std::shared_ptr<IndexWriter> requireIndexWriter() {
-    if (!iw) throw ReadOnlyError("collection has no index writer");
+    if (!iw || readOnly.load(std::memory_order_acquire)) throw ReadOnlyError("collection has no index writer");
     return iw;
   }
+  // A demoted writer (Collections::demote): its writer is committed and
+  // closed, searches go on, updates are refused as read-only.
+  bool isReadOnly() const { return !iw || readOnly.load(std::memory_order_acquire); }
 
   std::shared_ptr<Directory> getDirectory() {
     return dir;
