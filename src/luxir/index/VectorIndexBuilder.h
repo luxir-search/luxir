@@ -19,6 +19,8 @@
 
 namespace luxir {
 
+class IndexRamBudget;
+
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
 /// Flat kNN is served directly from the vector column.  Aux builds produce an
@@ -108,9 +110,10 @@ public:
   /// (getSegmentOverlayFileName), so gen only has to distinguish rebuilds for
   /// the same live segment and field.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t overlayGen, uint64_t writerEpoch)
+                     const Schema& schema, uint64_t overlayGen, uint64_t writerEpoch,
+                     IndexRamBudget* indexRamBudget = nullptr)
     : dir_(dir), segments_(segments), schema_(schema),
-      overlayGen_(overlayGen), writerEpoch_(writerEpoch) {}
+      overlayGen_(overlayGen), writerEpoch_(writerEpoch), indexRamBudget(indexRamBudget) {}
 
   /// Expand selectors to concrete eligible overlay names present in this
   /// builder's segment inputs.  This applies schema and field eligibility but
@@ -137,6 +140,7 @@ private:
   const Schema& schema_;
   uint64_t overlayGen_;
   uint64_t writerEpoch_;
+  IndexRamBudget* indexRamBudget;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);
