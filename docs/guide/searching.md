@@ -112,10 +112,12 @@ when only a few documents are returned. An exact count visits every match,
 which costs far more than finding the top documents for common terms.
 
 `count_limit: -2` asks for a count that may be estimated, and costs little at
-any scale. `found` is still exact when that is cheap: from index statistics (an
-unfiltered term, or a prefix, wildcard, regex or term range query on a `string`
-or `id` field holding one value per document, on a segment without deletions),
+any scale. `found` is still exact when that is cheap: from index statistics,
 when ranking visited every match, or when the matches are few enough to count.
+For unfiltered prefix, wildcard, regex, term range and terms-in-set queries,
+each segment without deletions also supplies an exact count when its indexed
+`string` or `id` field has at most one distinct term per document. The count
+reuses the accepted terms' document frequencies computed during ranking.
 Otherwise each segment that ranking pruned counts a sample spread across its
 documents and scales it up, within the bounds index statistics prove, and
 `found_estimated: true` marks the result, which can be above or below the exact
