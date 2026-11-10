@@ -1046,6 +1046,15 @@ public:
     return scope;
   }
 
+  bool shapeConsumesDomain() const {
+    for (auto clauses : {mandatory, optional, prohibited, filter}) {
+      for (const auto* clause : clauses) {
+        if (luxir::logicalConsumesDomain(*clause)) return true;
+      }
+    }
+    return false;
+  }
+
   ScoreProfile shapeScoreProfile() const {
     float sum = 0.0f;
     bool explicitScore = false;

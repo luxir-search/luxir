@@ -18,10 +18,12 @@
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/query/VectorEngine.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -1322,6 +1324,56 @@ TEST_F(KnnQueryTest, booleanProhibitedMatchAllOrNothingWithKnn) {
     EXPECT_TRUE(run(optional, true).empty());
     EXPECT_EQ(run(optional, false), (Ids{"d0", "d1", "d2"}));
   }
+}
+
+TEST_F(KnnQueryTest, logicalDomainConsumption) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "foo_w", "apple",
+                  "body_v", std::vector<float>{1, 0}), UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{1, 0};
+  KnnQuery knn("body_v", type, vector, 1);
+  TermQuery term("foo_w", "apple");
+  google::protobuf::Arena arena;
+  auto* program = ValueExprParser({reader->schema().get(), {}}, arena).parse("score");
+  Query* children[]{&term, &knn};
+  for (Query* child : children) {
+    bool expected = child == &knn;
+    BoostQuery boost(child, 2);
+    ConstantScoreQuery constant(child);
+    ForcePrepareQuery force(child);
+    MinScoreQuery minimum(child, 0);
+    RescoreQuery rescore(child, program);
+    Query* disjuncts[]{&term, child};
+    MemPool queryPool;
+    auto* dismax = DisMaxQuery::make(queryPool, disjuncts, 0.5f);
+    Query* wrappers[]{child, &boost, &constant, &force, &minimum, &rescore, dismax};
+    for (Query* query : wrappers) {
+      EXPECT_EQ(expected, logicalConsumesDomain(*query));
+      for (int flags : {0, Query::NEED_SCORES}) {
+        MemPool pool;
+        Query::Context context(pool, *reader);
+        EXPECT_EQ(expected, query->createWeight(context, flags)->consumesDomain());
+      }
+    }
+  }
+  std::array<Query*, 1> consumer{&knn};
+  for (int role = 0; role < 4; role++) {
+    std::array<std::span<Query*>, 4> clauses{};
+    clauses[role] = consumer;
+    BooleanQuery boolean(clauses[0], clauses[1], clauses[2], clauses[3]);
+    EXPECT_TRUE(logicalConsumesDomain(boolean));
+  }
+  Query* required[]{&term};
+  BooleanQuery predicate(required, {}, {}, {});
+  EXPECT_FALSE(logicalConsumesDomain(predicate));
+  BooleanQuery mandOpt(required, consumer, {}, {});
+  EXPECT_TRUE(logicalConsumesDomain(mandOpt));
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  EXPECT_FALSE(mandOpt.createWeight(context, 0)->consumesDomain());
 }
 
 // A constant-scoring required sibling is a pure constraint, so it narrows the

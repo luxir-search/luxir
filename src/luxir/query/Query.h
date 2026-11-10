@@ -1628,6 +1628,10 @@ public:
     // Execution traits computed at construction. Default 0 is conservative:
     // no prepare pass and no constant-scoring fast path.
     int32_t traits = 0;
+#ifndef NDEBUG
+    const Query& owner;
+    void assertLogicalDomainConsumption() const;
+#endif
   public:
     enum class SparseFilteredTopKFamily {
       CONJUNCTION,
@@ -1635,7 +1639,11 @@ public:
     };
 
     Weight(Query::Context& context, const Query& query, int32_t inputFlags)
-      : context(context), inputFlags(inputFlags) {
+      : context(context), inputFlags(inputFlags)
+#ifndef NDEBUG
+      , owner(query)
+#endif
+    {
 #ifndef NDEBUG
       context.assertLogicalValidation(query);
 #else
@@ -1718,7 +1726,13 @@ public:
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
 
-    bool consumesDomain() const noexcept { return (traits & CONSUMES_DOMAIN) != 0; }
+    bool consumesDomain() const noexcept {
+      bool consumes = (traits & CONSUMES_DOMAIN) != 0;
+#ifndef NDEBUG
+      if (consumes) assertLogicalDomainConsumption();
+#endif
+      return consumes;
+    }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
@@ -2272,6 +2286,7 @@ Query* peelBoost(Query* query, float& boost);
 bool sameScoringClause(const Query* a, const Query* b);
 uint64_t scoringClauseHash(const Query* query);
 Query::ScoreProfile scoreProfile(const Query& query);
+bool logicalConsumesDomain(const Query& query);
 bool canOmitWeightForCacheFirstMembership(const Query& query);
 bool exactDomainIdentity(const Query& query);
 bool directCountAvailable(const Query& query, IndexReader& reader);

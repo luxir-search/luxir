@@ -549,7 +549,8 @@ public:
     auto terms = values.terms();
     if (terms.size() == 1) {
       Query* term = pool.make<TermQuery>(field, terms[0]);
-      return pool.make<ConstantScoreQuery>(term);
+      return pool.make<ConstantScoreQuery>(
+          term, Query::ScoreProfile::automatic(1.0f));
     }
     return pool.make<TermInSetQuery>(field, terms);
   }
