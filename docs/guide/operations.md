@@ -53,7 +53,8 @@ Do not restore a raw directory copy over an existing writer identity.
 
 The portable tree is `LAYOUT` and `t/`. Copy each file's bytes under the same
 relative key; do not copy `node/`, which contains the local `write.lock`,
-replication state and other node-private state. The destination needs a compatible
+replication state and other node-private state. Omit `.luxir-publish.lock` files,
+which are local publication locks. The destination needs a compatible
 Luxir build and the plugins referenced by the stored schemas. Hard links can
 become independent objects: link counts, inode numbers, timestamps, permissions
 and empty directories carry no index identity. Publication versions are computed
@@ -76,8 +77,8 @@ collection deletion or replacement as well. A coherent filesystem snapshot can
 provide the frozen source; otherwise use `luxir pull`, which pins snapshots.
 Plain recursive copying of a running writer provides none of those protections.
 
-Readers ignore publication scratch files (`.luxir-publish-*`), unfinished data
-files (`*.tmp`) and unrelated names, even if a raw copy included them. These are
+Readers ignore publication lock files, unfinished data files (`*.tmp`) and
+unrelated names, even if a raw copy included them. These are
 not dependencies and may be omitted. Corruption markers are portable diagnostic
 metadata and should be preserved. A new writer over the copied namespace claims
 a new epoch there; it does not fence the original namespace. Do not combine the
@@ -86,13 +87,13 @@ restore should start a new lineage.
 
 ### Backends, layers and options
 
-`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
+`--store.backend` names the storage backend: `ram`, `fs` and `shared_fs` are built in, and a
 plugin build may add more (an unknown name fails startup with the list of
 registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
 backend in layers a plugin provides, such as a cache.
 `--store.option COMPONENT.KEY=VALUE` (repeatable) passes settings to the named
 backend or layer; the plugin documents its keys. Unknown keys and components
-that are not configured fail startup. The built-in `ram` and `fs` take no options.
+that are not configured fail startup. The built-in backends take no component options.
 
 ```bash
 ./luxir --store.backend=s3 --store.option s3.bucket=search-data --store.layer=cache --store.option cache.bytes=10G
@@ -109,16 +110,36 @@ default. Readers on other nodes must refresh within this window minus a margin
 for clock skew. This does not delay deletion of a whole incarnation on delete or
 replacement, and follower pins keep their existing limits.
 
+## Shared filesystem
+
+Use `shared_fs` when several nodes share one filesystem. Set the same data root
+and a distinct, stable node id on each node:
+
+```bash
+./luxir --store.backend=shared_fs --store.data-dir=/srv/luxir/shared --node.id=search-a
+```
+
+Each node writes only its assigned collections and owns `node/<id>/` for private
+state and publication temps. `write.lock`, `tmp`, `replication.json` and
+`.luxir-publish.lock` are reserved node ids. The backend refuses followers and
+private roots containing `replication.json`. It excludes `fs` writers on the same
+root and refuses a second writer with the same node id. Run one `shared_fs` node
+per process: NFS locks are process-scoped.
+
+NFS requires NFSv4 with working server-side locks: no `nolock` or
+`local_lock=flock|all`. A node stalled past its NFSv4 lease between compare and
+rename can lose its lock and overwrite a newer STATE. Files stay intact, but
+acknowledged commits can drop out of STATE. Reads use mmap; set retention X
+larger than any query, with a margin for clock skew. Whole-incarnation deletion
+and replacement still remove their trees immediately.
+
 ## Read-only nodes
 
-A data directory has exactly one writer, which holds `node/write.lock` from startup
-until exit. This is node admission policy. Conditional file publication uses a
-separate directory `flock`, so Match is an atomic compare-and-swap among processes
-on a local filesystem, including processes that bypass `write.lock`. All publish
-modes take that lock only for the check and install; file and directory fsyncs
-run outside it. The kernel releases the lock when the process dies. This
-guarantee does not extend to network filesystems, whose server may revoke a
-stalled client's lock.
+An `fs` writer holds `node/write.lock` exclusively until exit. A `shared_fs`
+writer holds it shared plus an exclusive `node/<id>/write.lock`. These are
+admission locks. Publication and deletion serialize through a process-local
+mutex and `flock` on `.luxir-publish.lock` in the publication directory. The
+check and install hold the lock; file and directory fsyncs run outside it.
 
 `--read-only` opens an existing data directory without that lock:
 
@@ -271,14 +292,12 @@ with matching sizes, and copies the recovered snapshot into a new incarnation.
 By default startup does not hash data files (see
 [file integrity checks](#file-integrity-checks)).
 
-Once the new tip is durable, obsolete manifests and unreferenced data are
-removed. Writer startup sweeps unreferenced index files from fenced, older
-epochs; it leaves files of newer epochs alone. These local cleanup rules and
-process-local pins are not a retention protocol for shared remote readers.
-Catalog reservation/orphan cleanup also assumes startup has exclusive authority
-to decide what was abandoned, and collection transitions use process-local
-leases. Cross-process CAS protects catalog updates and writer fencing; it does
-not turn those cleanup policies into a multi-node retention coordinator.
+Once the new tip is durable, obsolete manifests and unreferenced data become
+eligible for removal after their retention window and any follower pins expire.
+Writer startup reconstructs retention from the manifests and sweeps unreferenced
+index files from fenced, older epochs; it leaves files of newer epochs alone.
+Exclusive startup adopts the catalog and cleans up abandoned trees. Shared
+startup cleans up only this node's entries and logs uncataloged trees.
 Removal durably deletes `STATE` first, fencing existing writers, then removes
 the incarnation directory and its catalog entry. Only catalog reservation can
 create STATE; claiming a writer or installing a snapshot requires it to exist.
@@ -290,12 +309,10 @@ Replication pin counters are described in the
 a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
 HTTP responses have no write deadline.
 
-Publication scratch files use the reserved `.luxir-publish-` prefix and are
-hidden from index listings. An owned filesystem view removes scratch files from
-processes confirmed dead on the same host when it opens. Live or inaccessible
-processes' files are left alone. Copied scratch names are harmless even when a
-PID cannot be checked or has been reused. Unfinished `*.tmp` data files are also
-ignored by readers.
+Publication temps live in the node-private `tmp/` directory. A writable factory
+empties only that directory after taking its admission locks; read-only opens
+leave it alone. Publication lock files are reserved and hidden from listings.
+Unfinished `*.tmp` data files are ignored by readers.
 
 Retirement removals are not directory-synced: a crash may restore obsolete
 names, but the durable tip does not reference them. A failed candidate is

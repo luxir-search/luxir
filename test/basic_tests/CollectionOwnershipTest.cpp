@@ -255,6 +255,38 @@ TEST_F(CollectionOwnershipTest, newOwnerRetainsThePreviousOwnersSnapshots) {
   EXPECT_EQ(3, c.collection().getReaderManager().getReader()->liveDocs());
 }
 
+TEST_F(CollectionOwnershipTest, sharedFilesystemReopensOnlyTheAssignedCollections) {
+  auto cfg = config("A");
+  cfg.store.backend = "shared_fs";
+  auto path = std::filesystem::temp_directory_path() / ("luxir-shared-fs-" + newUuid());
+  auto cleanup = scope_guard([&] { b.reset(); a.reset(); std::filesystem::remove_all(path); });
+  cfg.store.data_dir = path.string();
+  a = std::make_unique<LuxirNode>(cfg);
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success); }
+  cfg.node.id = "B";
+  b = std::make_unique<LuxirNode>(cfg);
+  EXPECT_FALSE(b->collections().storage().exclusive());
+  servedBy([&] { b->getCollection("c"); });
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "second"), UpdateMessage::COMMIT).success); }
+  auto incarnation = *a->collections().catalog().current("c");
+  ASSERT_TRUE(a->collections().catalog().assign(incarnation, "A", "B"));
+  a.reset(); b.reset();
+  b = std::make_unique<LuxirNode>(cfg);
+  EXPECT_EQ(incarnation, b->collections().catalog().current("c"));
+  EXPECT_EQ(2, b->getCollection("c")->getReaderManager().getReader()->liveDocs());
+  { CollectionHelper c(*b, "c"); ASSERT_TRUE(c.index(flatdoc("id", "third"), UpdateMessage::COMMIT).success); }
+  cfg.node.id = "A";
+  a = std::make_unique<LuxirNode>(cfg);
+  servedBy([&] { a->getCollection("c"); }, "B");
+}
+
+TEST_F(CollectionOwnershipTest, sharedFilesystemRefusesToFollow) {
+  auto cfg = config("A");
+  cfg.store.backend = "shared_fs";
+  cfg.replication.source = "http://127.0.0.1:1";
+  EXPECT_THROW(LuxirNode node(cfg), std::invalid_argument);
+}
+
 TEST_F(CollectionOwnershipTest, exclusiveStartupAdoptsAllEntriesInOneMutation) {
   auto cfg = config("A");
   cfg.store.backend = "fs";

@@ -21,6 +21,7 @@ Tree authoritativeBytes(const std::filesystem::path& path) {
   Tree bytes;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
     if (!entry.is_regular_file()) continue;
+    if (entry.path().filename() == FSDirectory::kPublicationLock) continue;
     auto name = entry.path().lexically_relative(path).generic_string();
     if (name != "LAYOUT" && !name.starts_with("t/")) continue;
     std::ifstream input(entry.path(), std::ios::binary);
@@ -74,10 +75,9 @@ TEST(StoragePortabilityTest, authoritativeBytesOpenOnAnotherBackend) {
   TenantCatalog catalog(source);
   auto incarnation = catalog.current("main").value();
   auto files = path / "t/t0/i" / incarnation;
-  for (auto name : {"STATE.tmp", "commit_999.1.tmp", "s01.1_00.tmp", ".luxir-publish-0-9", "corrupted_ignored.tmp", "README"}) {
+  for (auto name : {"STATE.tmp", "commit_999.1.tmp", "s01.1_00.tmp", "corrupted_ignored.tmp", "README"}) {
     std::ofstream(files / name) << "ignored";
   }
-  std::ofstream(path / "t/t0/.luxir-publish-0-8") << "partial catalog";
   std::filesystem::create_directories(files / "empty");
   std::filesystem::create_directories(path / "t/.notes");
   std::ofstream(path / "t/.notes/README") << "unrelated";
@@ -128,7 +128,7 @@ TEST(StoragePortabilityTest, authoritativeBytesOpenOnAnotherBackend) {
 
 TEST(StoragePortabilityTest, copiedScratchAndUnknownFilesAreNotAnIndex) {
   RAMDir dir;
-  for (auto name : {"STATE.tmp", "commit_999.1.tmp", "commit_3.tmp", "s01.1_00.tmp", ".luxir-publish-0-9", "corrupted_ignored.tmp", "commit_x", "s01.1_unknown"}) {
+  for (auto name : {"STATE.tmp", "commit_999.1.tmp", "commit_3.tmp", "s01.1_00.tmp", "corrupted_ignored.tmp", "commit_x", "s01.1_unknown"}) {
     ASSERT_TRUE(dir.publishFile(name, {}, Directory::PublishMode::CREATE_ONLY));
     EXPECT_FALSE(Manifest::indexFile(name));
   }

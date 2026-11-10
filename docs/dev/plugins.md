@@ -353,7 +353,7 @@ always run.
 ## Storage backends and layers
 
 `Registries::storage` (`src/luxir/store/StorageRegistry.h`) holds named storage
-backends and layers. `ram` and `fs` are built in and registered before plugins.
+backends and layers. `ram`, `fs` and `shared_fs` are built in and registered before plugins.
 
 - A **backend** builds the root `DirectoryFactory` from the node configuration. It
   is selected by `--store.backend NAME`.
@@ -408,7 +408,8 @@ logic over these views, not backend primitives.
 receives its opaque accounting scope in `ViewOptions::account`, and reopening
 must not charge the same bytes twice. `describe()` supplies one line for the
 startup log; `diskPath()` supplies a local path for disk statistics, or empty.
-FS uses `node/` for its node-private root and reserves it from authoritative views.
+FS reserves `node/` from authoritative views. The private root is `node/` for
+`fs` and `node/<id>/` for `shared_fs`.
 A backend must either honor `ctx.config.read_only` by opening without a lock,
 namespace creation or cleanup, or reject it. The read-only wrapper cannot undo
 side effects inside the maker; the built-in RAM maker rejects read-only.

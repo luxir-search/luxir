@@ -584,7 +584,11 @@ TEST_F(DirectoryTest, publicationFailureBeforeInstallKeepsOriginal) {
     auto unlisten = scope_guard([&] { Signal::unlisten(signal); });
     EXPECT_THROW(dir.publishFile("root", {}, Directory::PublishMode::REPLACE), FileIOException);
     EXPECT_EQ("original", dir.openFile("root")->read());
-    for (const auto& entry : std::filesystem::directory_iterator(path)) EXPECT_EQ("root", entry.path().filename());
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);
+    ASSERT_EQ(1u, files.size());
+    EXPECT_EQ("root", files[0].name);
+    EXPECT_TRUE(std::filesystem::is_empty(path / "node/tmp"));
   }
 }
 
@@ -614,7 +618,11 @@ TEST_F(DirectoryTest, concurrentPublicationsHaveOneWinner) {
     EXPECT_NE(won, b.get().has_value());
     EXPECT_EQ(won ? "first" : "second", first->openFile("root")->read());
     if (fs) {
-      for (const auto& entry : std::filesystem::directory_iterator(path)) EXPECT_EQ("root", entry.path().filename());
+      EXPECT_TRUE(std::filesystem::is_empty(path / "node/tmp"));
+      std::vector<Directory::FileInfo> files;
+      first->listFiles(files);
+      ASSERT_EQ(1u, files.size());
+      EXPECT_EQ("root", files[0].name);
     }
   }
 }
@@ -707,21 +715,23 @@ TEST_F(DirectoryTest, publicationFailureAfterInstallNeedsSync) {
   EXPECT_NE(nullptr, dir.openFile("root", true));
 }
 
-TEST_F(DirectoryTest, publicationTempsAreHiddenAndLeftAlone) {
+TEST_F(DirectoryTest, publicationLockIsHiddenAndSurvivesErase) {
   auto path = getTempDir();
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
-  std::filesystem::create_directories(path);
-  auto temp = path / ".luxir-publish-0-0";
-  std::ofstream(temp) << "interrupted publication";
   FSDirectory dir(path);
   std::vector<Directory::FileInfo> files;
-  dir.listFiles(files);
-  EXPECT_TRUE(files.empty());
-  EXPECT_TRUE(std::filesystem::exists(temp));
   EXPECT_TRUE(dir.publishFile("root", {}, Directory::PublishMode::CREATE_ONLY));
   dir.listFiles(files);
   ASSERT_EQ(1, files.size());
   EXPECT_EQ("root", files[0].name);
+  dir.deletePrefix("");
+  EXPECT_TRUE(std::filesystem::exists(path / FSDirectory::kPublicationLock));
+  EXPECT_TRUE(dir.publishFile("root", {}, Directory::PublishMode::CREATE_ONLY));
+  dir.clear();
+  EXPECT_TRUE(std::filesystem::exists(path / FSDirectory::kPublicationLock));
+  files.clear(); dir.listFiles(files);
+  EXPECT_TRUE(files.empty());
+  EXPECT_THROW(dir.publishFile(FSDirectory::kPublicationLock, {}, Directory::PublishMode::REPLACE), std::invalid_argument);
 }
 
 TEST_F(DirectoryTest, publicationPersistsNewAncestors) {

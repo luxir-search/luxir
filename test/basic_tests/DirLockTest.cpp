@@ -11,6 +11,7 @@
 
 #include "luxir/server/TenantCatalog.h"
 #include "luxir/store/ReadOnlyDirectory.h"
+#include "luxir/util/Signal.h"
 
 using namespace luxir;
 
@@ -149,15 +150,74 @@ TEST(DirLockTest, refusesDataFromAnotherLayout) {
 
 TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
   TempDir tempDir;
-  auto temp = tempDir.path() / ".luxir-publish-0-0";
+  auto temp = tempDir.path() / "node/tmp/interrupted";
+  std::filesystem::create_directories(temp.parent_path());
   std::ofstream(temp) << "partial";
-  auto live = tempDir.path() / (".luxir-publish-" + std::to_string(getpid()) + "-0");
-  std::ofstream(live) << "active";
   FSDirFactory writer(tempDir.path());
   TenantCatalog::initialize(writer, true);
   EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "LAYOUT"));
   EXPECT_FALSE(std::filesystem::exists(temp));
-  EXPECT_TRUE(std::filesystem::exists(live));
+}
+
+TEST(DirLockTest, exclusiveAndSharedAdmissionExcludeEachOther) {
+  TempDir tempDir;
+  {
+    FSDirFactory exclusive(tempDir.path());
+    EXPECT_THROW(FSDirFactory(tempDir.path(), false, FSDirFactory::Mode::SHARED, "A"), std::runtime_error);
+  }
+  auto diagnosticSize = std::filesystem::file_size(tempDir.path() / "node/write.lock");
+  {
+    FSDirFactory first(tempDir.path(), false, FSDirFactory::Mode::SHARED, "A");
+    FSDirFactory second(tempDir.path(), false, FSDirFactory::Mode::SHARED, "B");
+    EXPECT_FALSE(first.exclusive());
+    EXPECT_FALSE(second.exclusive());
+    EXPECT_THROW(FSDirFactory(tempDir.path()), std::runtime_error);
+    EXPECT_THROW(FSDirFactory(tempDir.path(), false, FSDirFactory::Mode::SHARED, "A"), std::runtime_error);
+    EXPECT_NO_THROW(FSDirFactory(tempDir.path(), true, FSDirFactory::Mode::SHARED, "A"));
+    EXPECT_EQ(diagnosticSize, std::filesystem::file_size(tempDir.path() / "node/write.lock"));
+    EXPECT_GT(std::filesystem::file_size(tempDir.path() / "node/A/write.lock"), 0u);
+  }
+  EXPECT_NO_THROW(FSDirFactory(tempDir.path()));
+}
+
+TEST(DirLockTest, sharedAdmissionRefusesReservedIdsAndFollowerPrivateState) {
+  TempDir tempDir;
+  for (auto id : {"write.lock", "tmp", "replication.json", ".luxir-publish.lock"}) {
+    EXPECT_THROW(FSDirFactory(tempDir.path(), false, FSDirFactory::Mode::SHARED, id), std::invalid_argument);
+  }
+  std::filesystem::create_directories(tempDir.path() / "node/A");
+  std::ofstream(tempDir.path() / "node/A/replication.json") << "follower";
+  EXPECT_THROW(FSDirFactory(tempDir.path(), false, FSDirFactory::Mode::SHARED, "A"), std::invalid_argument);
+  EXPECT_THROW(FSDirFactory(tempDir.path(), true, FSDirFactory::Mode::SHARED, "A"), std::invalid_argument);
+}
+
+TEST(DirLockTest, publicationTempsBelongToOnlyOneNode) {
+  TempDir tempDir;
+  FSDirFactory first(tempDir.path(), false, FSDirFactory::Mode::SHARED, "A");
+  TenantCatalog::initialize(first, true);
+  EXPECT_TRUE(TenantCatalog::empty(first)); // The publication lock is not store data.
+  auto privateTemp = tempDir.path() / "node/A/tmp";
+  auto stale = tempDir.path() / "node/B/tmp/interrupted";
+  std::filesystem::create_directories(stale.parent_path());
+  std::ofstream(stale) << "partial";
+  auto dir = first.directory(StorageRoot::AUTHORITATIVE, "data");
+  Signal::listen("publishOpened", [&](void*, void*, void*) -> void* {
+    EXPECT_EQ(1, std::distance(std::filesystem::directory_iterator(privateTemp), std::filesystem::directory_iterator{}));
+    EXPECT_TRUE(std::filesystem::is_empty(tempDir.path() / "data"));
+    FSDirFactory reader(tempDir.path(), true, FSDirFactory::Mode::SHARED, "A");
+    EXPECT_FALSE(std::filesystem::is_empty(privateTemp));
+    FSDirFactory second(tempDir.path(), false, FSDirFactory::Mode::SHARED, "B");
+    EXPECT_FALSE(std::filesystem::exists(stale));
+    EXPECT_FALSE(std::filesystem::is_empty(privateTemp));
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishOpened"); });
+  EXPECT_TRUE(dir->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY));
+  EXPECT_TRUE(std::filesystem::is_empty(privateTemp));
+  std::vector<Directory::FileInfo> files;
+  dir->listFiles(files);
+  ASSERT_EQ(1u, files.size());
+  EXPECT_EQ("root", files[0].name);
 }
 
 TEST(DirLockTest, refusesTheEarlierCollectionsDirectory) {
