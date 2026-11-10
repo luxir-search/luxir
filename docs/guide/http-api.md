@@ -160,6 +160,13 @@ errors. Canonical echo and both explain modes emit names, including an explicit
 in the named unit. This applies to documents, facets, groups, sort values and
 DATE metrics; the same output types are used over gRPC.
 
+`decimal_scaled` is available at request and operation level. Decimal field
+literals use raw scaled integer units, and decimal results use raw integers
+instead of doubles; averages and percentiles remain doubles in raw units.
+Ingest and value-expression constants are unaffected. Combine
+it with `int64_str` to quote large raw integers and send those strings back
+as exact filters. See [Decimals](schema.md#decimals).
+
 `estimate_count` lets every list in its scope that leaves `count_limit` unset
 estimate `found`; see [counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded).
 

@@ -102,6 +102,7 @@ public:
   ValueBounds constantBounds(uint32_t index) const;
   bool structurallyEqual(const ValueProgram& other) const;
   std::string describeDateSources(uint32_t node) const;
+  uint32_t numericNode(uint32_t node);
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
                           ValueFieldInfos fields) const;
 };

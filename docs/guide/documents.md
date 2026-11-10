@@ -237,6 +237,8 @@ a field at ingest can be used to match or bound that field later.
 - Integer fields accept JSON integers, integral floating-point numbers, and
   strings that parse to an integer within the signed 64-bit range.
 - Float and double fields accept JSON numbers and numeric strings.
+- Decimal fields accept numbers and numeric strings, rounding half away from zero
+  to their declared scale; see [Decimals](schema.md#decimals).
 - Boolean fields accept JSON `true`/`false` or the strings `"true"`/`"false"`.
   Numbers, including 0 and 1, are rejected.
 - Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and

@@ -502,6 +502,9 @@ The typing rules:
   `cardinality` and `percentile_rank` return plain numbers. `sum` requires numeric values.
   Multiplication, division, unary minus, and unary math turn a date into a
   plain number.
+- Decimal `avg` and `percentile` keep their scale, like `min`, `max`, and
+  `sum`. Their results are doubles, in raw units under `decimal_scaled`.
+  `percentile_rank` uses a value-unit bound and returns a percentage in either mode.
 - For a bare FLOAT column, `percentile_rank` rounds its bound to FLOAT,
   matching range queries. Expression inputs use a double bound.
 
@@ -793,9 +796,11 @@ a span; one widening bound alone cannot define an empty histogram.
 
 The grid is independent of the matching minimum:
 
-- For INT, FLOAT and DOUBLE fixed gaps, fences are `origin + k * gap` for a
+- For INT, DECIMAL, FLOAT and DOUBLE fixed gaps, fences are `origin + k * gap` for a
   global integer `k`; default `origin` is 0. Floating fences use the field's
   encoded representation, so rounding does not shift the grid with the query.
+  Decimal gaps and origins must be exact at the field's scale; `decimal_scaled`
+  interprets them in raw integer units.
 - For DATE fixed gaps, `origin` is a wall-clock phase in the facet zone,
   expressed in integer field units (`ms` or `ns`). For an ms field,
   `gap: 86400000` and `origin: 21600000` start days at 06:00 local, including DST days. Luxir

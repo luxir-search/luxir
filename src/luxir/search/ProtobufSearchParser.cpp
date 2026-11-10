@@ -240,7 +240,8 @@ public:
   }
 
   CoerceContext coerceContext(const TimeZone& zone) const {
-    return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags)};
+    return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags),
+            (options.flags & RequestFlags::DECIMAL_SCALED) != 0};
   }
 
   RootOp* parse() {
@@ -593,6 +594,7 @@ public:
         case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
         case FieldType::DATE: wireType = Type::DATE; break;
         case FieldType::BOOLEAN: wireType = Type::BOOLEAN; break;
+        case FieldType::DECIMAL: wireType = Type::DECIMAL; break;
         default: throw std::logic_error("Unhandled collapse key wire type");
       }
       bool ordinal = FieldType::storage(type.type()) == FieldType::Storage::TERMS;
@@ -960,7 +962,12 @@ public:
               + "' skipped: no such local granule in " + zone.name());
         }
       }
-      if (use == FieldType::LiteralUse::GTE) return range.lo;
+      if (use == FieldType::LiteralUse::MEMBER) {
+        if (range.empty()) throw RequestError(fmt::format("facet '{}': selected value is outside the field's value domain", facetName));
+        if (range.lo != range.hi) throw std::logic_error("MEMBER coercion did not produce a point");
+        return range.lo;
+      }
+      if (use == FieldType::LiteralUse::GTE) return range.empty() ? INT64_MAX : range.lo;
       // LT MIN is empty; otherwise undo the inclusive upper edge. A fence
       // beyond the encoded domain saturates rather than overflowing.
       if (range.empty()) return INT64_MIN;
@@ -1040,13 +1047,11 @@ public:
             dataBounds ? std::nullopt : givenStart, dateUnit);
       }
       auto integer = [&](const api::Val& value, std::string_view name) -> __int128 {
-        if (!date) return fieldType->coerceColInt64(value, facetField, context);
-        const auto* number = std::get_if<int64_t>(&value.kind);
-        if (!number) {
-          throw RequestError(std::format("facet '{}': a DATE {} must be integer {}",
-              facetName, name, dateUnitName(context.dateInputUnit.value_or(dateUnit))));
+        try {
+          return fieldType->coerceGridValue(value, facetField, name, context);
+        } catch (const RequestError& e) {
+          throw RequestError(std::format("facet '{}': {}", facetName, e.what()), e.code);
         }
-        return convertDateUnits(*number, context.dateInputUnit.value_or(dateUnit), dateUnit);
       };
       auto convertedGap = integer(std::get<api::Val>(facetReq.gap_kind), "fixed gap");
       if (convertedGap <= 0 || convertedGap > INT64_MAX) {
@@ -1068,7 +1073,7 @@ public:
     auto parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
 
     auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
-      return boundFence(value, FieldType::LiteralUse::GTE);
+      return boundFence(value, FieldType::LiteralUse::MEMBER);
     });
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
@@ -1174,6 +1179,7 @@ public:
       if (!child.domain.has_value()) continue;
       auto inheritedCoercion = parseContext.coerceContext;
       parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(childOptions.flags);
+      parseContext.coerceContext.decimalScaled = (childOptions.flags & RequestFlags::DECIMAL_SCALED) != 0;
       auto restoreCoercion = scope_guard([&]() noexcept {
         parseContext.coerceContext = inheritedCoercion;
       });
@@ -1440,6 +1446,7 @@ public:
       options = inherited.child(child, key);
       auto inheritedCoercion = parseContext.coerceContext;
       parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(options.flags);
+      parseContext.coerceContext.decimalScaled = (options.flags & RequestFlags::DECIMAL_SCALED) != 0;
       auto restoreOptions = scope_guard([&]() noexcept {
         options = inherited;
         parseContext.coerceContext = inheritedCoercion;

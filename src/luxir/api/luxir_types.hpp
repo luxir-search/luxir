@@ -109,7 +109,7 @@ namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
-namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3, BOOLEAN = 4 }; }
+namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3, BOOLEAN = 4, DECIMAL = 5 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 // Enums an expr callable takes as an argument also describe the values it
 // accepts (ExprFunctions.h); keep each list beside its enum.
@@ -127,11 +127,11 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
-enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3, DECIMAL_SCALED_BIT = 4 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11, DECIMAL = 13 };
 enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
@@ -304,6 +304,7 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<std::int32_t> scale;
   std::optional<DateUnit> unit;                                // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
@@ -996,7 +997,7 @@ struct SearchRequest {
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct GroupComponent {
-  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t, bool> value;
+  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t, bool, double> value;
   GroupComponent_::Type type = GroupComponent_::Type::STRING;
 };
 struct GroupKey {

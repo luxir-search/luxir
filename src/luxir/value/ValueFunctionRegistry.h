@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -17,6 +18,7 @@ namespace luxir {
 class BoundValueProgram;
 struct BucketScalar;
 struct ValueNode;
+namespace api { struct Val; }
 
 enum class ValueOpcode : uint8_t {
   NONE,
@@ -93,6 +95,16 @@ struct ValueFunction {
   std::array<Operand, VALUE_MAX_ARITY> operands{};
   EvalBucketScalar evalBucketScalar = nullptr;
   Prepare prepare = nullptr;
+  NaturePolicy natures = NaturePolicy::NUMBER;
+  uint8_t natureStart = 0;
+
+  std::array<bool, VALUE_MAX_ARITY> natureConversions(std::span<const ResolvedValue> args) const {
+    std::array<bool, VALUE_MAX_ARITY> convert{};
+    for (size_t i = 0; i < args.size(); i++) {
+      convert[i] = operands[i].kind != Kind::ANY && convertValueNature(natures, args, i, natureStart);
+    }
+    return convert;
+  }
 
   // Strict failures propagate before the bucket kernel selects lazy operands.
   BucketScalar bucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) const;
@@ -123,9 +135,16 @@ struct ValueFunction {
 
 class ValueFunctionRegistry {
 public:
+  struct DecimalComparison {
+    const ValueFunction* function;
+    int64_t bound;
+  };
   static const ValueFunction* find(std::string_view name);
   static std::span<const ValueFunction> entries();
   static std::string arrayReducerNames();
+  static const ValueFunction* decimalDecoder();
+  static std::optional<DecimalComparison> decimalComparison(const ValueFunction* function,
+      int scale, const api::Val& literal, bool reverse);
 };
 
 } // namespace luxir

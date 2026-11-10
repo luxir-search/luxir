@@ -439,6 +439,7 @@ private:
       case FieldType::Type::INT: return "integer";
       case FieldType::Type::DATE: return "date";
       case FieldType::Type::BOOLEAN: return "boolean";
+      case FieldType::Type::DECIMAL: return "decimal";
       default: return "number";  // FLOAT / DOUBLE
     }
   }

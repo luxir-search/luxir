@@ -795,7 +795,7 @@ ResolvedAggregate resolveAvg(
   assert(input != nullptr);
   assert(trailingArguments.empty());
   bool floating = input->type == ValueType::DOUBLE;
-  return {BucketValueType::DOUBLE, input->nature == ValueNature::BOOLEAN ? ValueNature::NUMBER : input->nature,
+  return {BucketValueType::DOUBLE, input->nature,
           floating ? doubleSumOps(true) : intSumOps(true),
           floating ? nullptr : &DENSE_FACET_INT_AVG};
 }
@@ -810,7 +810,7 @@ ResolvedAggregate resolveSum(
   }
   bool floating = input->type == ValueType::DOUBLE;
   return {floating ? BucketValueType::DOUBLE : BucketValueType::INT128,
-          ValueNature::NUMBER,
+          input->nature,
           floating ? doubleSumOps(false) : intSumOps(false)};
 }
 
@@ -1359,7 +1359,7 @@ ResolvedAggregate resolvePercentile(
   ops.destroy = destroySketch<TDigest>;
   ops.inlineCapable = false;
   ops.orderSensitive = true;
-  return {BucketValueType::DOUBLE, input->nature == ValueNature::BOOLEAN ? ValueNature::NUMBER : input->nature, ops};
+  return {BucketValueType::DOUBLE, input->nature, ops};
 }
 
 AggregateConstant canonicalCardinalityArgument(
@@ -1375,13 +1375,13 @@ AggregateConstant canonicalPercentileArgument(
 }
 
 constexpr AggregateFunction FUNCTIONS[] = {
-    {"avg", 1, 1, resolveAvg},
-    {"sum", 1, 1, resolveSum},
-    {"min", 1, 1, resolveMin},
-    {"max", 1, 1, resolveMax},
-    {"cardinality", 1, 2, resolveCardinality, true, 0, canonicalCardinalityArgument},
+    {"avg", 1, 1, resolveAvg, false, 0, nullptr, NaturePolicy::DECIMAL},
+    {"sum", 1, 1, resolveSum, false, 0, nullptr, NaturePolicy::DECIMAL},
+    {"min", 1, 1, resolveMin, false, 0, nullptr, NaturePolicy::SAME},
+    {"max", 1, 1, resolveMax, false, 0, nullptr, NaturePolicy::SAME},
+    {"cardinality", 1, 2, resolveCardinality, true, 0, canonicalCardinalityArgument, NaturePolicy::RAW},
     {"percentile_rank", 2, 2, resolveRank},
-    {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument},
+    {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument, NaturePolicy::DECIMAL},
 };
 
 } // namespace

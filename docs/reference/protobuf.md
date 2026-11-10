@@ -1059,6 +1059,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
@@ -1321,6 +1322,7 @@ Typed collapse identity. Component types follow the resolved schema fields.
 | <a id="field-luxir.groupcomponent.s"></a>[`s`](#field-luxir.groupcomponent.s) | 3 | `string` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 | <a id="field-luxir.groupcomponent.i"></a>[`i`](#field-luxir.groupcomponent.i) | 4 | `sint64` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 | <a id="field-luxir.groupcomponent.b"></a>[`b`](#field-luxir.groupcomponent.b) | 5 | `bool` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+| <a id="field-luxir.groupcomponent.d"></a>[`d`](#field-luxir.groupcomponent.d) | 6 | `double` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 
 <a id="message-luxir.groupkey"></a>
 
@@ -2879,6 +2881,7 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
 | <a id="value-luxir.fielddef.fieldclass.boolean"></a>[`BOOLEAN`](#value-luxir.fielddef.fieldclass.boolean) | 11 | true/false, stored as 0/1 in the int column |
+| <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
@@ -2947,6 +2950,7 @@ SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts an
 | <a id="value-luxir.groupcomponent.type.int"></a>[`INT`](#value-luxir.groupcomponent.type.int) | 2 |  |
 | <a id="value-luxir.groupcomponent.type.date"></a>[`DATE`](#value-luxir.groupcomponent.type.date) | 3 |  |
 | <a id="value-luxir.groupcomponent.type.boolean"></a>[`BOOLEAN`](#value-luxir.groupcomponent.type.boolean) | 4 |  |
+| <a id="value-luxir.groupcomponent.type.decimal"></a>[`DECIMAL`](#value-luxir.groupcomponent.type.decimal) | 5 |  |
 
 <a id="enum-luxir.linearfusion.normalization"></a>
 
@@ -3035,6 +3039,7 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 | <a id="value-luxir.requestflagbit.date_mode_high_bit"></a>[`DATE_MODE_HIGH_BIT`](#value-luxir.requestflagbit.date_mode_high_bit) | 1 |  |
 | <a id="value-luxir.requestflagbit.int64_str_bit"></a>[`INT64_STR_BIT`](#value-luxir.requestflagbit.int64_str_bit) | 2 | request-only: quote JSON integers outside the safe range |
 | <a id="value-luxir.requestflagbit.estimate_count_bit"></a>[`ESTIMATE_COUNT_BIT`](#value-luxir.requestflagbit.estimate_count_bit) | 3 | lists with an unset or positive count\_limit may estimate found |
+| <a id="value-luxir.requestflagbit.decimal_scaled_bit"></a>[`DECIMAL_SCALED_BIT`](#value-luxir.requestflagbit.decimal_scaled_bit) | 4 | decimal literals and results use raw scaled integers |
 
 <a id="enum-luxir.responseformat"></a>
 

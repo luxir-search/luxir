@@ -346,6 +346,7 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
         if (const auto* str = std::get_if<std::string_view>(&value)) appendJsonString(out, *str);
         else if (const auto* number = std::get_if<int64_t>(&value)) appendInt<Int64Str>(out, *number);
         else if (const auto* boolean = std::get_if<bool>(&value)) out += *boolean ? "true" : "false";
+        else if (const auto* number = std::get_if<double>(&value)) appendFloating(out, *number);
         else out += "null";
       }
       if (tuple) out += ']';
