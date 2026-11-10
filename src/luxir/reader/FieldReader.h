@@ -17,7 +17,7 @@ class FieldReader {
   int32_t nFields;
   int32_t currField = -1;
   const uint32_t* fieldOffsets;  // the array of field offsets, written by PostingsWriter::writeFieldIndex()
-  int64_t fieldOffsetsLoc; // location in the file of the above array
+  int64_t fieldOffsetsLoc; // location of the above array, relative to the start of fieldIS
 
   PackedTerm fieldname{nullptr};
   bool fieldInfoRead = false;      // has field metadata been read for this field?
@@ -25,12 +25,14 @@ class FieldReader {
   // TODO: field number?
 public:
   explicit FieldReader(PostingsReader& postingsReader) {
-    // Field metadata ends where the offsets table begins; reads are checked against that bound.
-    auto file = postingsReader.getInputStream(0);
-    fieldIS = InputStream(file.ptr(0), file.ptr(postingsReader.fieldOffsetsLoc));
+    // Field metadata lives in the catalog tail of file 0, which open fetched;
+    // the rest of file 0 is not touched here. Metadata ends where the offsets
+    // table begins; reads are checked against that bound.
+    const auto& catalog = postingsReader.catalog;
+    fieldIS = InputStream(catalog.ptr(0), catalog.ptr(postingsReader.fieldOffsetsLoc - postingsReader.catalogStart));
     nFields = postingsReader.nFields;
     fieldOffsets = postingsReader.fieldOffsets;
-    fieldOffsetsLoc = postingsReader.fieldOffsetsLoc;
+    fieldOffsetsLoc = postingsReader.fieldOffsetsLoc - postingsReader.catalogStart;
   }
 
   FieldReader(PostingsReader& reader, int32_t ordinal) : FieldReader(reader) {
