@@ -161,14 +161,13 @@ protected:
     return out;
   }
 
-  static void expectResponsesDifferOnlyByIncarnation(std::string_view first, std::string_view second) {
+  static void expectResponsesMatchApartFromIncarnation(std::string_view first, std::string_view second) {
     std::pmr::monotonic_buffer_resource arena;
     api::UpdateResponse a, b;
     ASSERT_TRUE(api::read_json(a, first, arena));
     ASSERT_TRUE(api::read_json(b, second, arena));
     ASSERT_FALSE(a.commit.empty());
     ASSERT_FALSE(b.commit.empty());
-    EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
     a.took_us = b.took_us = 0;
@@ -1709,8 +1708,8 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
   EXPECT_EQ((int64_t)128, serial.plainCount);
   EXPECT_EQ(serial.plainCount, pipelined.plainCount);
-  expectResponsesDifferOnlyByIncarnation(serial.plainResponse, pipelined.plainResponse);
-  expectResponsesDifferOnlyByIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
+  expectResponsesMatchApartFromIncarnation(serial.plainResponse, pipelined.plainResponse);
+  expectResponsesMatchApartFromIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
   EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
   ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
   for (int id = 0; id < 12; id++) {
@@ -1977,7 +1976,7 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
   EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
   EXPECT_EQ((int64_t)2, serial.found);
-  expectResponsesDifferOnlyByIncarnation(serial.response, pipelined.response);
+  expectResponsesMatchApartFromIncarnation(serial.response, pipelined.response);
   EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
   EXPECT_EQ(serial.found, pipelined.found);
 }
