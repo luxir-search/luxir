@@ -369,6 +369,11 @@ template <> struct ColEmit<std::string_view> {
   using arr_type = luxir::api::ArrStr;
 };
 
+template <> struct ColEmit<bool> {
+  using value_type = api::Val;
+  using arr_type = api::ArrVal;
+};
+
 template <typename Emit>
 struct ColumnDecode {
   auto operator()(int64_t raw) const { return Emit::decode(raw); }
@@ -390,7 +395,13 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     return;
   }
 
-  if constexpr (std::is_same_v<typename Emit::value_type, std::string_view>) {
+  if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+    auto& col = fieldCol.kind.emplace<api::ColVal>();
+    starget = {build::allocArray(col.v, columnSize, mr), columnSize};
+    if (fieldType.multiValued()) {
+      for (auto& value : starget) value.kind.template emplace<api::ArrVal>();
+    }
+  } else if constexpr (std::is_same_v<typename Emit::value_type, std::string_view>) {
     present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                 starget, mtarget, pendingCols, mr);
   } else if (!fieldType.multiValued()) {
@@ -427,18 +438,28 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     if (!fieldType.multiValued()) {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        starget[idxSpan[idx]] = decode(val);
-        present[idxSpan[idx]] = 1;
+        if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+          starget[idxSpan[idx]].kind = decode(val);
+        } else {
+          starget[idxSpan[idx]] = decode(val);
+          present[idxSpan[idx]] = 1;
+        }
       };
       IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        typename Emit::arr_type& target = mtarget[idxSpan[idx]];
+        typename Emit::arr_type& target = [&]() -> typename Emit::arr_type& {
+          if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+            return std::get<api::ArrVal>(starget[idxSpan[idx]].kind);
+          } else return mtarget[idxSpan[idx]];
+        }();
         if (valIdx == 0) {
           build::allocArray(target.v, numVals, mr);
         }
-        const_cast<typename Emit::value_type*>(target.v.data())[valIdx] = decode(val);
+        auto& value = const_cast<typename Emit::value_type*>(target.v.data())[valIdx];
+        if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) value.kind = decode(val);
+        else value = decode(val);
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }

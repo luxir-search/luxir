@@ -53,7 +53,8 @@ public:
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
     DATE,     // timestamp; column-stored as int64 epoch units (default ms)
-    GEO_POINT // latitude/longitude point; packed into one int64 column value
+    GEO_POINT, // latitude/longitude point; packed into one int64 column value
+    BOOLEAN   // true/false; column-stored as 0/1
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
@@ -64,7 +65,7 @@ public:
       case STRING: case ID: return Storage::TERMS;
       case TEXT: return Storage::TEXT;
       case BIN: return Storage::BIN;
-      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: return Storage::INT64;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: return Storage::INT64;
       case VECTOR: return Storage::VECTOR;
     }
     throw std::invalid_argument("Unknown field storage type");
@@ -320,6 +321,23 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+};
+
+// BOOLEAN stores 0 (false) or 1 (true) in the standard int column.
+class BoolFieldType : public FieldType {
+public:
+  BoolFieldType(std::string_view name, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::BOOLEAN, flags) {}
+
+  ValueNature valueNature() const override { return ValueNature::BOOLEAN; }
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~RANGE_FACET; }
+
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
   std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;

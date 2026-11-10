@@ -2155,9 +2155,18 @@ public:
       int64_t* counts = build::allocArray(result.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
         size_t bucket = emitted[i];
-        auto* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = decode(layout[bucket]);
-        bounds[1] = decode(layout[bucket + 1]);
+        auto& pair = [&]() -> auto& {
+          if constexpr (std::is_same_v<Outer, api::ColVal>) return pairs[i].kind.template emplace<api::ArrVal>();
+          else return pairs[i];
+        }();
+        auto* bounds = build::allocArray(pair.v, 2, mr);
+        if constexpr (std::is_same_v<Outer, api::ColVal>) {
+          bounds[0].kind = decode(layout[bucket]);
+          bounds[1].kind = decode(layout[bucket + 1]);
+        } else {
+          bounds[0] = decode(layout[bucket]);
+          bounds[1] = decode(layout[bucket + 1]);
+        }
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
     });

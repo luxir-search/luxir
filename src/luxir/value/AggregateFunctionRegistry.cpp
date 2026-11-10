@@ -795,7 +795,7 @@ ResolvedAggregate resolveAvg(
   assert(input != nullptr);
   assert(trailingArguments.empty());
   bool floating = input->type == ValueType::DOUBLE;
-  return {BucketValueType::DOUBLE, input->nature,
+  return {BucketValueType::DOUBLE, input->nature == ValueNature::BOOLEAN ? ValueNature::NUMBER : input->nature,
           floating ? doubleSumOps(true) : intSumOps(true),
           floating ? nullptr : &DENSE_FACET_INT_AVG};
 }
@@ -1359,7 +1359,7 @@ ResolvedAggregate resolvePercentile(
   ops.destroy = destroySketch<TDigest>;
   ops.inlineCapable = false;
   ops.orderSensitive = true;
-  return {BucketValueType::DOUBLE, input->nature, ops};
+  return {BucketValueType::DOUBLE, input->nature == ValueNature::BOOLEAN ? ValueNature::NUMBER : input->nature, ops};
 }
 
 AggregateConstant canonicalCardinalityArgument(

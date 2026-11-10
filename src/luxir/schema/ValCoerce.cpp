@@ -83,6 +83,23 @@ int64_t IntFieldType::coerceColInt64(const api::Val& val, std::string_view field
   return coerce::toInt64(val, fieldName);
 }
 
+int64_t BoolFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
+                                      const CoerceContext& context) const {
+  if (auto value = tryCoerceColInt64(val, fieldName, context)) return *value;
+  coerce::throwCoerce(fieldName, val, "a boolean (true or false)");
+}
+
+std::optional<int64_t> BoolFieldType::tryCoerceColInt64(
+    const api::Val& val, std::string_view fieldName, const CoerceContext& context) const {
+  unused(fieldName, context);
+  if (auto b = std::get_if<bool>(&val.kind)) return *b ? 1 : 0;
+  if (auto s = std::get_if<std::string_view>(&val.kind)) {
+    if (*s == "true") return 1;
+    if (*s == "false") return 0;
+  }
+  return std::nullopt;
+}
+
 int64_t FloatFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
                                        const CoerceContext& context) const {
   unused(context);

@@ -15,6 +15,10 @@ struct NativeValueOutput {
   template <typename T> T operator()(T value) const { return value; }
 };
 
+struct BooleanValueOutput {
+  template <typename T> bool operator()(T value) const { return value != 0; }
+};
+
 struct ValueOutputContext {
   std::string source;
   std::pmr::memory_resource& mr;
@@ -40,6 +44,9 @@ struct IsoValueOutput {
 template <typename Emit>
 void selectValueOutput(ValueNature nature, uint64_t flags, Emit emit) {
   switch (nature) {
+    case ValueNature::BOOLEAN:
+      emit.template operator()<BooleanValueOutput>();
+      return;
     case ValueNature::DATE_MS:
     case ValueNature::DATE_NS: {
       auto mode = RequestFlags::dateMode(flags);
@@ -74,7 +81,7 @@ template <typename Source, typename Emit>
 void withNatureOutput(ValueNature nature, uint64_t flags,
                       std::pmr::memory_resource& mr, Source source, Emit emit) {
   selectValueOutput(nature, flags, [&]<typename Output>(auto... parameters) {
-    if constexpr (std::is_same_v<Output, NativeValueOutput>) emit(Output{});
+    if constexpr (std::is_constructible_v<Output, decltype(parameters)...>) emit(Output{parameters...});
     else emit(Output{parameters..., ValueOutputContext{std::string(source()), mr}});
   });
 }

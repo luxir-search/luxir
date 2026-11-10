@@ -294,8 +294,7 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    // int64 -> any int-column type never throws, so the lazy transform is safe
-    // under the validate-before-mutate contract.
+    // indexMulti materializes every coerced value before appending any of them.
     indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
       return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
                                        inverter.coerceContext);

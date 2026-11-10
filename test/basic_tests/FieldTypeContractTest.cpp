@@ -175,7 +175,7 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
 }
 
 TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
-  for (int type = FieldType::NONE; type <= FieldType::GEO_POINT; type++) {
+  for (int type = FieldType::NONE; type <= FieldType::BOOLEAN; type++) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
     PostingsWriter writer(dir, 1, 1, 0);

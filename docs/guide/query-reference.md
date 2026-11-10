@@ -160,7 +160,7 @@ POST /collections/authors/_search
 | `field` | Field to query through its value binding, or an explicit selector. Required. |
 | `values` | Exact values; any matching value admits the document. |
 
-STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
+STRING, TEXT, and ID exact membership requires indexed terms. Numeric, boolean, and date
 representations can use their columns. DATE members are exact instants in
 the field's unit: an ISO member uses its floored start, even for a partial
 date. Members outside the stored date domain are dropped. Match/range date

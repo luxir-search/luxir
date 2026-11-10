@@ -232,6 +232,11 @@ template <> struct FacetOutputTypes<double> {
   using ArrayColumn = api::ArrArrDouble;
 };
 
+template <> struct FacetOutputTypes<bool> {
+  using Column = api::ColVal;
+  using ArrayColumn = api::ColVal;
+};
+
 template <> struct FacetOutputTypes<std::string_view> {
   using Column = api::ColStr;
   using ArrayColumn = api::ArrArrStr;
@@ -250,7 +255,8 @@ inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
   auto* ids = build::allocArray(bucketIds.v, n, mr);
   int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
   for (size_t i = 0; i < n; i++) {
-    ids[i] = output(buckets[i].first);
+    if constexpr (std::is_same_v<Column, api::ColVal>) ids[i].kind = output(buckets[i].first);
+    else ids[i] = output(buckets[i].first);
     counts[i] = buckets[i].second;
   }
 }

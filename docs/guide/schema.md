@@ -16,10 +16,29 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
+| `boolean` | `true` or `false`: flags and on/off attributes. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### Booleans
+
+`boolean` accepts JSON `true`/`false` and the strings `"true"`/`"false"`;
+other values, including numbers 0 and 1, reject the document. Query literals
+use the same rules: `flag:true`, `{"match": {"flag": false}}`.
+
+Values are stored as 0/1 in the integer column. Sorting puts `false` before
+`true`; field facet bucket values and collapse keys are JSON booleans.
+Range queries accept boolean bounds, but range facets are not supported.
+The default is `index: "none"`, as for `int`; `index: "range"` and
+`index: "match"` add the corresponding numeric indexes.
+
+Retrieved values are JSON booleans. Document columns have no boolean kind,
+so gRPC returns a `col_val` column holding one boolean value (or array) per
+document. Value expressions preserve booleans through selection (`min`,
+`max`, and choices between booleans); arithmetic, `sum`, and `avg` produce
+numbers. Summing a boolean counts true values.
 
 ### `text` versus `string`
 
@@ -120,6 +139,7 @@ The built-in templates are:
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
 | `_i`, `_is` | Integer column, single- or multi-valued. |
+| `_b`, `_bs` | Boolean column, single- or multi-valued. |
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
@@ -268,7 +288,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `boolean`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
@@ -312,7 +332,7 @@ Validation includes inherited ANN settings and variants.
 ### Multi-valued modes
 
 `multi` is inherited when omitted and defaults to `false` (one value).
-`true` selects the type's default: set for INT, FLOAT, DOUBLE, DATE, and
+`true` selects the type's default: set for INT, FLOAT, DOUBLE, BOOLEAN, DATE, and
 STRING; array for TEXT, VECTOR, and GEO_POINT. Explicit `"set"` and `"array"`
 select a mode. Array-only primary types reject `"set"`; ID is reserved for
 the single-valued `id` field.
@@ -640,7 +660,7 @@ The primary and every variant must use types from the same group:
 
 | Group | Allowed types |
 |---|---|
-| Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
+| Scalar | `text`, `string`, `int`, `float`, `double`, `boolean`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 

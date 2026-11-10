@@ -373,6 +373,12 @@ private:
       }
       doc.push_back({std::string(name), std::move(vals)});
     } else if (const auto* av = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+      if (!av->v.empty() && std::holds_alternative<bool>(av->v[0].kind)) {
+        std::vector<bool> vals;
+        for (const auto& elem : av->v) vals.push_back(std::get<bool>(elem.kind));
+        doc.push_back({std::string(name), std::move(vals)});
+        return;
+      }
       // A list of double arrays (multi-valued GEO_POINT); other lists are not read.
       std::vector<std::vector<double>> vals;
       for (const auto& elem : av->v) {
