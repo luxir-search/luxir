@@ -4,5 +4,5 @@
 luxir_add_plugin(NAME example
                  SOURCES ExamplePlugin.cpp
                  TEST_SOURCES PluginExtensionTest.cpp StorageExampleTest.cpp TokenAttributesExampleTest.cpp
-                              CollationExampleTest.cpp
+                              CollationExampleTest.cpp FieldTypeExampleTest.cpp
                  TEST_ONLY)

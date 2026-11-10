@@ -260,7 +260,7 @@ r.http.add("POST", "/collections/{collection}/_sample",
 `luxir_test` only). It registers `doc_ids` (lowering to built-ins), `field_value`
 (two concrete PLUGIN query classes), an alias to test registered-name identity,
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
-It also registers a `sample_docs` search op
+It also registers field types (see [Field types](#field-types)) and a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
 its documents), two HTTP routes and a per-node state with query, op and route
 counters. The makers and handlers reach that state through their contexts.
@@ -442,6 +442,125 @@ the node keeps serving its other collections.
 The example plugin registers `example_ci` (ASCII case-insensitive order, `strength` of
 `primary` or `tertiary`); `CollationExampleTest` covers sorting, params, signatures,
 persistence and the missing-collation failure.
+
+## Field types
+
+`Registries::fieldTypes` (`src/luxir/schema/FieldTypeRegistry.h`) maps names to makers of
+field types. A plugin field type maps one authored field to a set of *derived* built-in
+fields, so it needs no on-disk format of its own: indexing, merges, deletes, codecs and
+replication of the derived fields are those of ordinary fields.
+
+```cpp
+class PairType : public luxir::PluginFieldType {
+public:
+  PairType() {
+    fields = {{.suffix = "a", .kind = luxir::DerivedField::Kind::INT},
+              {.suffix = "b", .kind = luxir::DerivedField::Kind::INT},
+              {.suffix = "key", .kind = luxir::DerivedField::Kind::STRING},
+              {.suffix = "packed", .kind = luxir::DerivedField::Kind::STRING, .index = false,
+               .opaque = true}};
+  }
+  void index(const luxir::api::Val& value, luxir::DerivedSink& sink) const override {
+    // value is the raw document value: an object here. Throw
+    // std::invalid_argument for one the type cannot read.
+    sink.integer(0, a);
+    sink.integer(1, b);
+    sink.string(2, key);
+    sink.string(3, packedBytes);
+  }
+  bool projects() const override { return true; }
+  void project(const luxir::DerivedValues& values, luxir::api::Val& out,
+               std::pmr::memory_resource& mr) const override {
+    // rebuild {"a": ..., "b": ...} from values.get(3), allocating in mr
+  }
+};
+
+void registerComponents(luxir::Registries& r) override {
+  r.fieldTypes.add("pair", [](const luxir::ParamReader& params) -> std::unique_ptr<const luxir::PluginFieldType> {
+    auto separator = params.getString("separator", ":");  // unread params are refused afterwards
+    return std::make_unique<PairType>(/* ... */);
+  });
+}
+```
+
+A schema names the type in place of a built-in one, with its settings in `params`:
+
+```json
+{"fields": {"pt": {"type": "pair", "params": {"separator": "/"}, "ignore_malformed": true}}}
+```
+
+A type name that is not built in reads as `plugin_type` (`FieldDef.plugin_type`, a name
+and params), which is the canonical form the schema echoes:
+`{"plugin_type": {"name": "pair", "params": {"separator": "/"}}}`. Only `parent` and
+`ignore_malformed` combine with it, authored or inherited (a parent with built-in settings
+is refused); the type declares everything else. Templates work
+(`"templates": {"_pair": "pair"}` makes `x_pair$a` for a document key `x_pair`); variants
+and defaults do not.
+
+- **Registration.** Names are `[a-z0-9_]+`, not a built-in type name and not `plugin`; a
+  duplicate or an add after the freeze throws. The maker reads its params through
+  `ParamReader` (errors name the type and the parameter), and any param it did not read is
+  refused after it returns. Makers throw `std::invalid_argument` or `RequestError` with a
+  message that teaches; the schema adds the field name.
+- **Derived fields.** `PluginFieldType::fields` declares each `DerivedField`: a `suffix`
+  (`[a-z0-9_]+`, at most 32 bytes), a `kind` (`INT`, `DATE` with a `unit`, `STRING`, `TEXT`
+  with an optional registered `analyzer`, `GEO_POINT`), `multi`, `index` (the term index
+  for STRING and TEXT, the points index for the others), `column` and `opaque`. They are
+  compiled as built-in fields named `<field>$<suffix>`: hidden from catalogs, default
+  retrieval and field patterns, never document keys (a field name cannot contain `$`), but
+  queried, sorted, faceted, used in expressions (`pt$a:>=2`, `sort: "pt$b asc"`) and
+  retrieved by that name. Opaque bytes go in a column-only STRING (`index = false`), like a
+  collation key; mark it `opaque` and retrieving it by name fails, pointing at the field.
+  The authored field itself only retrieves: searching, sorting or faceting it fails with a
+  message naming its derived fields.
+- **Multi-valued derived fields are independent sets.** Each multi INT, DATE or STRING
+  field keeps a sorted set of its document's values (repeats dropped), TEXT and GEO_POINT
+  keep theirs in order, and nothing ties the i-th value of one derived field to the i-th
+  of another. A query on `ps$a` and `ps$b` matches a document whose pairs have those
+  values in any combination, and `project()` sees each field's set, not the order or
+  repeats `index()` emitted. Keep whatever must stay together in one value (the example's
+  `key` and `packed`).
+- **Ingest.** `index(value, sink)` receives the raw value of the document's field, whatever
+  arm it is (object, array, string, number; null is no value and skips the call). It emits
+  per derived field, addressed by its index in `fields`: `string()` (a term and/or column
+  value), `text()` (analyzed by the field's analyzer), `token(term, position)` (an analyzed
+  token, positions non-decreasing), `integer()` (INT, or DATE in its unit) and `point()`.
+  A single-valued derived field takes one value per document. The values reach the index
+  only after `index` returns, so a throw leaves nothing behind: `std::invalid_argument`
+  (or `DocumentError`, whose code the error keeps) rejects the document with "Field 'pt':
+  cannot read pair value: ...", or with `ignore_malformed` skips the field and indexes the
+  rest. Any other exception (a misuse of the sink, a bug) fails the document with "field
+  type 'x' failed to index the value", whatever `ignore_malformed` says. The sink applies
+  the built-in limits as values arrive (one value for a single-valued field, a point's
+  range), so they are malformed values too. A STRING or TEXT term over 255 bytes is not
+  an error: it is fitted (a prefix plus a hash, `long_terms: hash128`), as a built-in
+  string field's is, and a query for the same value fits it the same way.
+- **Retrieval.** When `projects()` is true, retrieving the field (explicitly, by an empty
+  field list, or by a pattern) loads the derived fields' columns and calls `project` with
+  a document's values (`DerivedValues::get(i)`: an int64, a string, or an `ArrInt` /
+  `ArrStr` when multi; TEXT and GEO_POINT fields and fields without a column are absent).
+  It is called only when some value is present and builds `out` in `mr`. An indexed
+  STRING's column holds the indexed term, so a value over 255 bytes comes back fitted;
+  `DerivedValues::exact(i)` is false when it may be. Decode from column-only fields, which
+  hold their bytes exactly, and treat bytes as untrusted (check their length). A type that
+  does not project is not retrievable as a whole; its non-opaque derived fields still are.
+- **Persistence.** The authored definition is in the persisted schema, and its canonical
+  form (the name, the params, sorted, and `version()` when not 0) is part of every derived
+  field's signature (`plugin_type`). A changed definition is reported as a new
+  representation of the derived fields in the resolved schema; segments written before
+  keep their derived data, which is still read under the new definition, so a type must
+  keep reading what older params wrote or the collection must be reindexed. Two hooks keep
+  the signature honest: `canonicalParams()` returns the effective params as a JSON object
+  (defaults filled in), so `{}` and `{"separator": ":"}` are one definition, and
+  `version()` (default 0) marks a change in what `index()` writes for the same params. A
+  collection whose schema names a type this binary lacks fails to load with "unknown field
+  type 'x'; valid types: ...; plugin types: ..."; the node keeps serving the rest.
+
+The example plugin registers `pair` (above, with `separator` and `multi` params and their
+`canonicalParams()`; `project` decodes the opaque packed column) and `spot` (a GEO_POINT,
+an analyzed TEXT and a pre-analyzed TEXT; not retrievable). `FieldTypeExampleTest` covers validation, HTTP and gRPC ingest,
+queries, sorts and facets on derived fields, projection, templates, malformed values,
+merges with deletes, persistence and the missing-type failure.
 
 ## Storage backends and layers
 
