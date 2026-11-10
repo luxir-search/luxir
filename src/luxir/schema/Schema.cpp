@@ -570,7 +570,8 @@ struct FieldCompiler {
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
-                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
+                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
+                        r.type == FieldClass::BOOLEAN;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -660,6 +661,9 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        break;
+      case FieldClass::BOOLEAN:
+        ft = std::make_shared<BoolFieldType>(name, flags);
         break;
       case FieldClass::FLOAT:
         ft = std::make_shared<FloatFieldType>(name, flags);
@@ -1245,6 +1249,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   }
   add(templates, "_i", FieldClass::INT);
   add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_b", FieldClass::BOOLEAN);
+  add(templates, "_bs", FieldClass::BOOLEAN).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_f", FieldClass::FLOAT);
   add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);

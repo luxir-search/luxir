@@ -1114,12 +1114,13 @@ message SearchResponse {
 
 // Typed collapse identity. Component types follow the resolved schema fields.
 message GroupComponent {
-  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; } // INT carries signed int64 values.
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; } // INT carries signed int64 values.
   Type type = 1;
   oneof value {
     google.protobuf.NullValue null = 2;
     string s = 3;
     sint64 i = 4;
+    bool b = 5;
   }
 }
 message GroupKey {
@@ -2431,6 +2432,7 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
+    BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
   }
   optional FieldClass type = 2; // required unless inherited from parent
 

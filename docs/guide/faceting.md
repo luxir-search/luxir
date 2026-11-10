@@ -227,7 +227,7 @@ Distinct counting uses the request memory budget. Exceeding the budget fails
 the request; counts never become estimates or document counts. Use
 `count_unit: "docs"` when document counts are the intended measure.
 
-Distinct counting supports STRING/ID and numeric/date field facets, numeric/date
+Distinct counting supports STRING/ID and numeric/boolean/date field facets, numeric/date
 range facets, and query facets, including overlapping query buckets and nested
 operations. TEXT field facets and metric sorts with distinct counts remain
 unsupported. FLOAT/DOUBLE can be facet fields, but cannot be distinct key fields;
@@ -302,14 +302,16 @@ document counts in either [multi-valued mode](schema.md#multi-valued-modes).
 matches in the current result set, which keeps a sidebar stable while the user
 narrows a search.
 
-Integer, floating-point, and date fields facet on each distinct column value.
+Integer, floating-point, boolean, and date fields facet on each distinct column value.
+Boolean bucket ids are JSON `false` and `true`, also accepted in `selected`;
+boolean fields do not support range facets.
 FLOAT/DOUBLE keep `-0.0` and `0.0` in separate buckets, matching exact query
 equality; all NaNs share one bucket. HTTP JSON renders NaN and infinities as
 `null`, so those bucket labels cannot be sent back as selections.
 
 Text fields facet on analyzed terms, not on the stored text: a facet on
 `body_t` returns indexed words, while a facet on `category_s` returns whole
-category values. Text facets also accept `mincount: 0`, while numeric and date
+category values. Text facets also accept `mincount: 0`, while numeric, boolean, and date
 field facets require a positive value when set. Use a range facet when numbers
 should be bucketed rather than enumerated.
 
@@ -366,7 +368,7 @@ The filter changes only the ordinary buckets:
 - `selected` buckets are always returned, whether or not they pass the filter.
 - Sub-operations and nested facets run on the buckets that pass.
 
-`term_filter` is rejected on numeric, date, and text fields.
+`term_filter` is rejected on numeric, boolean, date, and text fields.
 
 ## Expression metrics
 
@@ -382,7 +384,7 @@ The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
 [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
 `sum(count(field))` counts values, like Elasticsearch `value_count`, for
-numeric, date, STRING, ID and GEO_POINT fields alike.
+numeric, boolean, date, STRING, ID and GEO_POINT fields alike.
 A composite metric is a single expression:
 
 ```json
@@ -478,7 +480,7 @@ bucket whose metric is missing or failed sorts last either way. See
 
 The typing rules:
 
-- `cardinality` accepts numeric or date expressions and indexed STRING/ID
+- `cardinality` accepts numeric, boolean, or date expressions and indexed STRING/ID
   columns, and flattens multi-valued inputs.
 - Other aggregates require one scalar per document. Reduce multi-valued
   columns first: `avg(avg(prices_fs))` averages each document's prices,

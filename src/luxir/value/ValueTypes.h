@@ -25,8 +25,8 @@ enum class ValueType : uint8_t {
   COLUMN_ONLY,
 };
 
-// Logical meaning carried independently of the physical numeric lane. DATE
-// values use the INT64/DOUBLE lanes but retain enough type information for
+// Logical meaning carried independently of the physical numeric lane. BOOLEAN
+// uses INT64, while DATE values use INT64/DOUBLE and retain type information for
 // expression and aggregate validation, including the date unit. Encoding the
 // unit in the nature keeps node metadata and numeric transports the same size.
 enum class ValueNature : uint8_t {
@@ -34,11 +34,13 @@ enum class ValueNature : uint8_t {
   DATE_MS,
   DATE_NS,
   GEO_POINT,
+  BOOLEAN,
 };
 
 inline std::string_view valueNatureName(ValueNature nature) {
   switch (nature) {
     case ValueNature::NUMBER: return "number";
+    case ValueNature::BOOLEAN: return "boolean";
     case ValueNature::GEO_POINT: return "GEO_POINT";
     case ValueNature::DATE_MS: return "DATE unit 'ms'";
     case ValueNature::DATE_NS: return "DATE unit 'ns'";

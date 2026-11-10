@@ -592,6 +592,7 @@ public:
         case FieldType::ID: wireType = Type::ID; break;
         case FieldType::INT: wireType = Type::INT; break; // Luxir integers are signed int64.
         case FieldType::DATE: wireType = Type::DATE; break;
+        case FieldType::BOOLEAN: wireType = Type::BOOLEAN; break;
         default: throw std::logic_error("Unhandled collapse key wire type");
       }
       bool ordinal = FieldType::storage(type.type()) == FieldType::Storage::TERMS;

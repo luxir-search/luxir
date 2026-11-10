@@ -457,7 +457,7 @@ members. A request using only `collapse` performs no enrichment pass. Each
 streaming batch includes complete group metadata and operation results for its rows.
 
 A key field uses value binding and must be single-valued. Supported types
-are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
+are STRING or ID with an index and column, INT (signed 64-bit), BOOLEAN, and DATE with
 a column. Use an object to group by a tuple of fields:
 
 ```json
@@ -976,8 +976,9 @@ by the field's cardinality; see [Geo search](geo-search.md#return-points).
 
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
-column when requested. A field type with no typed column arm, such as a geo
-point, is a `col_val` column.
+column when requested. A field type with no typed column arm, such as a boolean
+or geo point, is a `col_val` column. BOOLEAN collapse components carry a boolean
+value in the `b` arm of `GroupComponent`.
 
 ## Full request form
 
@@ -1317,7 +1318,7 @@ preparation without collecting results. See
   [Multi-match](query-reference.md#multi-match) for field types and phrase options.
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Per-group `collapse.ops` uses the page's matching member domains.
-  Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
+  Distinct facet counts support STRING/ID and INT/BOOLEAN/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets and metric facet sorts with
   distinct counts are unsupported.
 - Document-unit kNN selects `k` documents before collapse, so repeated keys

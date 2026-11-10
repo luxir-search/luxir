@@ -420,7 +420,7 @@ private:
 
   // ---- schema consultation (arm selection only; text stays uninterpreted) ----
 
-  // Column-numeric field types (INT/FLOAT/DOUBLE/DATE, stored in the shared int
+  // Column-numeric field types (INT/FLOAT/DOUBLE/DATE/BOOLEAN, stored in the shared int
   // column).  field: syntax targets these with an exact-match arm only
   // (field:value or a quoted value); wildcard/fuzzy have no numeric meaning and
   // degrade to text.  Requires column storage - the match scan reads the column,
@@ -438,6 +438,7 @@ private:
     switch (t) {
       case FieldType::Type::INT: return "integer";
       case FieldType::Type::DATE: return "date";
+      case FieldType::Type::BOOLEAN: return "boolean";
       default: return "number";  // FLOAT / DOUBLE
     }
   }

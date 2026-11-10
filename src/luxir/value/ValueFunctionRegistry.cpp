@@ -97,12 +97,12 @@ ResolvedValue addResolve(std::span<const ResolvedValue> args) {
 ResolvedValue subResolve(std::span<const ResolvedValue> args) {
   commonDateNature(args);
   ValueType type = binaryNumericType(args);
-  if (args[0].nature == ValueNature::NUMBER
+  if (!valueDate(args[0].nature)
       && valueDate(args[1].nature)) {
     throw std::runtime_error("cannot subtract a DATE from a number");
   }
   if (valueDate(args[0].nature)
-      && args[1].nature == ValueNature::NUMBER) {
+      && !valueDate(args[1].nature)) {
     return {type, args[0].nature};
   }
   return {type, ValueNature::NUMBER};
@@ -127,7 +127,7 @@ ResolvedValue defResolve(std::span<const ResolvedValue> args) {
   ValueType type = valueArray(args[0].type)
       ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
       : (floating ? ValueType::DOUBLE : ValueType::INT64);
-  ValueNature nature = commonDateNature(args);
+  ValueNature nature = args[0].nature == args[1].nature ? args[0].nature : commonDateNature(args);
   return {type, nature};
 }
 
@@ -140,11 +140,11 @@ ResolvedValue minMaxResolve(std::span<const ResolvedValue> args) {
     }
     return {valueScalarType(args[0].type), args[0].nature};
   }
-  if (args[0].nature != args[1].nature) {
+  if (args[0].nature != args[1].nature && (valueDate(args[0].nature) || valueDate(args[1].nature))) {
     throw std::runtime_error(
         "cannot compare a DATE and a number with min() or max()");
   }
-  return {binaryNumericType(args), args[0].nature};
+  return {binaryNumericType(args), args[0].nature == args[1].nature ? args[0].nature : ValueNature::NUMBER};
 }
 
 ResolvedValue avgResolve(std::span<const ResolvedValue> args) {
@@ -152,7 +152,7 @@ ResolvedValue avgResolve(std::span<const ResolvedValue> args) {
   if (!valueArray(args[0].type)) {
     throw std::runtime_error("avg() requires a numeric array");
   }
-  return {ValueType::DOUBLE, args[0].nature};
+  return {ValueType::DOUBLE, args[0].nature == ValueNature::BOOLEAN ? ValueNature::NUMBER : args[0].nature};
 }
 
 ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
@@ -199,12 +199,13 @@ ResolvedValue powResolve(std::span<const ResolvedValue> args) {
 ResolvedValue ifResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   requireScalars(args);
-  if (args[1].nature != args[2].nature) {
+  if (args[1].nature != args[2].nature && (valueDate(args[1].nature) || valueDate(args[2].nature))) {
     throw std::runtime_error(
         "both branches must be DATE values or both must be numbers");
   }
   bool floating = valueDouble(args[1].type) || valueDouble(args[2].type);
-  return {floating ? ValueType::DOUBLE : ValueType::INT64, args[1].nature};
+  return {floating ? ValueType::DOUBLE : ValueType::INT64,
+          args[1].nature == args[2].nature ? args[1].nature : ValueNature::NUMBER};
 }
 
 ResolvedValue randomResolve(std::span<const ResolvedValue> args) {

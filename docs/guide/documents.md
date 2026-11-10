@@ -237,6 +237,8 @@ a field at ingest can be used to match or bound that field later.
 - Integer fields accept JSON integers, integral floating-point numbers, and
   strings that parse to an integer within the signed 64-bit range.
 - Float and double fields accept JSON numbers and numeric strings.
+- Boolean fields accept JSON `true`/`false` or the strings `"true"`/`"false"`.
+  Numbers, including 0 and 1, are rejected.
 - Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
   date math. Update messages interpret offset-less date text in UTC; search
   requests may supply a query time zone. See [Dates](dates.md).

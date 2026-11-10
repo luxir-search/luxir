@@ -103,10 +103,10 @@ public:
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
         if (FieldType::isNumericColumn(type)) {
-            // INT and DATE (epoch millis) sort on the raw column values.
+            // INT, BOOLEAN and DATE sort on the raw column values.
             // FLOAT/DOUBLE columns store sortable bits whose int64 order
             // matches the floating point order, so the int comparator
-            // works on the encoded values as-is for all four.
+            // works on the encoded values as-is.
             return std::make_unique<SimpleNumericFieldComparator>(
                 isReversed(), missingValue, fields
             );
