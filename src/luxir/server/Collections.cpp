@@ -49,7 +49,15 @@ std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api:
                                                  luxir::api::SchemaRequest_::Mode mode) {
   if (!shard->iw) throw ReadOnlyError("collection has no writer");
   return shard->iw->updateSchema([&](const Schema* current) {
-    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+    bool replace = mode != api::SchemaRequest_::Mode::SET;
+    auto schema = Schema::fromProto(def, replace ? nullptr : current);
+    // REPLACE_ALL rebuilds the schema from the request alone, so leaving out
+    // index_sort clears it: say so rather than silently changing merge order.
+    if (replace && current != nullptr && !current->indexSortField.empty() && !def.index_sort) {
+      schema->updateWarnings.emplace_back("index_sort_cleared",
+          "REPLACE_ALL without index_sort cleared the index sort; future merges keep arrival order");
+    }
+    return schema;
   });
 }
 
