@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/search/ReaderManager.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/store/Manifest.h"
 #include <glaze/glaze.hpp>
 
@@ -45,6 +46,9 @@ std::string ReaderManager::resolvedSchema() {
     if (auto* geo = dynamic_cast<const GeoPointFieldType*>(type)) {
       rep["ignore_malformed"] = geo->ignoreMalformed;
       rep["ignore_z_value"] = geo->ignoreZValue;
+    }
+    if (auto* composite = dynamic_cast<const CompositeFieldType*>(type)) {
+      rep["ignore_malformed"] = composite->ignoreMalformed;
     }
     // The analyzer property is always the expanded definition; a named analyzer
     // additionally reports the name it came from.

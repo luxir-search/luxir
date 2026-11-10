@@ -43,7 +43,10 @@
 //   shows the wrapper rather than the sibling sugar.
 // - FieldDef reads accept a bare STRING as type-only sugar: {"year": "int"} ==
 //   {"year": {"type": "int"}} in fields, templates, and variants. Writes stay
-//   canonical (the object form).
+//   canonical (the object form). A type name that is not built in names a
+//   plugin field type, with an optional "params" sibling: {"type": "pair",
+//   "params": {...}} == {"plugin_type": {"name": "pair", "params": {...}}},
+//   which is what writes produce.
 // - FieldVariants and NormalizerDef flatten their presence wrappers to a plain
 //   label map and filter array. Empty containers retain presence on the wire.
 // - AnalyzerComponent (an AnalyzerDef tokenizer or filter) reads accept a bare
@@ -876,8 +879,47 @@ struct to<JSON, luxir::api::FieldDef::MultiMode> {
 };
 
 // ----- FieldDef: canonical object, or a bare string (type-only sugar) -----
+// A type string that is not a built-in type names a plugin field type:
+// {"type": "pair", "params": {...}} == {"plugin_type": {"name": "pair", "params": {...}}}.
 template <>
 struct from<JSON, luxir::api::FieldDef> {
+  // The built-in type names (FieldClass JSON names).
+  static std::optional<luxir::api::FieldDef::FieldClass> builtinType(std::string_view name) {
+    using C = luxir::api::FieldDef::FieldClass;
+    static constexpr std::pair<std::string_view, C> names[] = {
+        {"string", C::STRING}, {"text", C::TEXT}, {"int", C::INT}, {"float", C::FLOAT}, {"double", C::DOUBLE},
+        {"id", C::ID}, {"vector", C::VECTOR}, {"date", C::DATE}, {"geo_point", C::GEO_POINT}};
+    for (const auto& [n, c] : names) {
+      if (n == name) return c;
+    }
+    return std::nullopt;
+  }
+
+  // A type value: a built-in name or an enum number into type, any other
+  // [a-z0-9_]+ name into plugin_type. Returns whether it named a plugin type.
+  template <auto Opts>
+  static bool readType(luxir::api::FieldDef &value, auto &ctx, auto &it, auto &end) {
+    if ((char)*it != '"') {
+      util::from_json<Opts>(value.type, ctx, it, end);
+      return false;
+    }
+    std::string_view name;
+    util::from_json<Opts>(name, ctx, it, end);
+    if (ctx.error != error_code::none) return false;
+    bool pluginName = !name.empty() && std::ranges::all_of(name, [](char c) {
+      return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    });
+    if (auto builtin = builtinType(name)) {
+      value.type = *builtin;
+    } else if (pluginName) {
+      value.plugin_type.emplace().name = name;
+      return true;
+    } else {
+      ctx.error = error_code::unexpected_enum;
+    }
+    return false;
+  }
+
   template <auto Opts>
   static void op(luxir::api::FieldDef &value, hpp_proto::concepts::is_non_owning_context auto &ctx,
                  auto &it, auto &end) {
@@ -888,19 +930,31 @@ struct from<JSON, luxir::api::FieldDef> {
     }
     static constexpr auto O = ws_handled<Opts>();
     if ((char)*it == '"') {
-      util::from_json<O>(value.type.emplace(), ctx, it, end);
+      readType<O>(value, ctx, it, end);
       return;
     }
     static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
     std::string_view key;
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    // "type": "<plugin name>" and "params" may come in either order, and
+    // neither combines with "plugin_type".
+    bool pluginTypeKey = false, paramsKey = false;
+    bool typedPlugin = false;  // "type" named a plugin type
+    decltype(luxir::api::AnalyzerComponent::params) params;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "parent") {
             util::from_json<V>(value.parent, ctx, vit, vend);
           } else if (key == "type") {
-            util::from_json<V>(value.type, ctx, vit, vend);
+            typedPlugin = readType<V>(value, ctx, vit, vend) || typedPlugin;
+          } else if (key == "plugin_type") {
+            pluginTypeKey = true;
+            util::from_json<V>(value.plugin_type, ctx, vit, vend);
+          } else if (key == "params") {
+            paramsKey = true;
+            decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, params);
+            glz::util::parse_repeated<V>(true, target, ctx, vit, vend);
           } else if (key == "index") {
             util::from_json<V>(value.index, ctx, vit, vend);
           } else if (key == "long_terms") {
@@ -950,6 +1004,19 @@ struct from<JSON, luxir::api::FieldDef> {
           return bool(ctx.error);
         },
         [](auto &, auto &) {});
+    if (ctx.error != error_code::none) return;
+    // "params" belongs to a plugin type named by "type"; "plugin_type" carries its own.
+    if (typedPlugin && pluginTypeKey) {
+      ctx.error = error_code::syntax_error;
+      ctx.custom_error_message = "a field takes type or plugin_type, not both";
+      return;
+    }
+    if (paramsKey && !typedPlugin) {
+      ctx.error = error_code::syntax_error;
+      ctx.custom_error_message = "params belongs to a plugin field type named by type";
+      return;
+    }
+    if (paramsKey) value.plugin_type->params = params;
   }
 };
 
