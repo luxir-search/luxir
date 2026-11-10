@@ -9,6 +9,7 @@
 #include <utility>
 #include <tbb/task_arena.h>
 #include <tbb/task_group.h>
+#include "IoContext.h"
 #include "Signal.h"
 
 namespace luxir {
@@ -17,6 +18,9 @@ namespace luxir {
 // request's deadline or charge request-scoped memory: everyone takes the
 // builder's outcome. The deferred handle holds the wait open until the builder
 // runs it itself; spawning could strand it behind critical tasks or in another arena.
+// For the same reason the build runs under IoContext::shared(): its reads count
+// for the builder's request, but that request's deadline and fill hint do not
+// apply to a value every waiter takes.
 template <typename Value>
 class SharedLazyBuild {
   using Pointer = std::shared_ptr<Value>;
@@ -55,7 +59,10 @@ class SharedLazyBuild {
 public:
   template <typename CreateFunc>
   tbb::task_handle defer(CreateFunc&& createFunc) {
-    return group.defer([this, create = std::forward<CreateFunc>(createFunc)] {
+    auto io = captureIoContext();
+    if (io) io = io->shared();
+    return group.defer([this, io, create = std::forward<CreateFunc>(createFunc)] {
+      IoScope scope(io ? &*io : nullptr);
       try {
         // A nested wait must not steal a task that joins this suspended build.
         value = tbb::this_task_arena::isolate([&] {

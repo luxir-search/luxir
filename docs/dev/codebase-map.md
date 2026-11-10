@@ -154,6 +154,10 @@ locations, browse `src/luxir/<area>/`.
      contract of backends that fetch byte ranges on first touch (`REMOTE` directories, from plugins);
      `Directory::knownFiles`: the committed files and sizes of a loaded manifest. See
      [../design/storage-tiers.md](../design/storage-tiers.md)
+   - `IoContext` / `IoScope` / `IoCounters` (`util/IoContext.h`): the thread-local request I/O
+     context (query id, deadline, fill hint, per-request I/O counters) that storage layers and
+     backends read and count into; `SearchRequest::io` is installed by `submitBody`, carried into
+     tasks by `task_group_fanout` / `TaskGroupRunner` (`bindIoContext`), and reported in the profile
    - `Hotcache` (`reader/Hotcache.h`): the `s<seg>__hot` file listing the ranges opening a segment reads,
      written by `PostingsWriter::finish` for `REMOTE` directories; `RecordingDirectory` records them.
      `PostingsReader` opens through ranges (header, file 0 tail, versions, field catalog) and creates

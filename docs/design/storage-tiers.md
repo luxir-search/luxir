@@ -106,6 +106,48 @@ segment listed without an `s<seg>__hot` has no hotcache, so its open need not
 probe for one. Committed names are never rewritten with other bytes; a directory
 that remembers them forgets a name it deletes, writes, publishes or links over.
 
+## The request I/O context
+
+A lazy read happens deep below the search that needs it, often on a worker
+thread, so the storage layer cannot be handed the request through its
+interfaces. Instead the search installs an `IoContext`
+(`src/luxir/util/IoContext.h`) in a thread-local slot, and storage code reads
+it with `IoContext::current()`. It carries the request's query id and
+`request_id`, its deadline (the gRPC client deadline; none over HTTP), a fill
+hint (`fillCache`: false for reads that should not displace cached data, such
+as a scan) and the request's `IoCounters`.
+
+The slot is set by an `IoScope`, a guard that restores the previous value when
+it ends, also on unwind:
+
+- `SearchEngine::submitBody` sets it for the request body, on whichever thread
+  runs it (an HTTP io shard, an arena worker, a gRPC worker).
+- `task_group_fanout` and `TaskGroupRunner::run` wrap each task they publish
+  with `bindIoContext`: the task copies the spawner's context and installs it
+  on the thread that runs it, then restores that thread's own. A worker that
+  steals a task while waiting nests correctly, and a context never outlives
+  its task.
+- A streaming emitter resumed after backpressure installs the request's
+  context again on the thread that resumes it.
+- A `SharedLazyBuild` runs under `IoContext::shared()`: the reads count for the
+  request that builds, but its deadline and fill hint do not decide a value
+  other requests take.
+
+A context is a small value; only its counters point at request-owned state,
+which outlives every task and stream of the request. Reads with no context
+(merges, startup, verification, replication) see null and behave as before;
+the cost on the read path is one thread-local load.
+
+Core carries the context but reads nothing over a network, so the counting is
+the backend's: its lazy files count each store request and the bytes it
+returned (`countFetch`), the bytes readers resolve (`countTouch`) and the
+reads that need a whole file (`countWholeFileRead`), and its own reads for a
+request (the hotcache, checksum streaming) count as requests too. The totals
+appear in the request's profile and in the `search_io_*` service counters.
+Core never hedges, gives up early or skips a cache on the deadline or the fill
+hint either; acting on them is for a storage layer. Nothing in core sets
+`fillCache` to false yet.
+
 ## What a remote backend provides
 
 A backend plugin that sets `REMOTE` is expected to:
@@ -117,6 +159,8 @@ A backend plugin that sets `REMOTE` is expected to:
   returns null for an absent name, as on every directory; a lazy fetch that
   later finds the object gone throws `std::filesystem::filesystem_error`;
 - use the hotcache and `knownFiles` as above;
+- count the store requests, fetched and touched bytes and whole-file reads it
+  does for a request into `IoContext::current()`, as above;
 - keep an object readable while a reader holds it: on a filesystem a merged-away
   segment stays readable for the queries that still hold it, because the unlink
   leaves the inode, so a delete of an object a reader holds should hide the name
