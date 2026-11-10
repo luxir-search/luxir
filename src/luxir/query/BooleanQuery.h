@@ -1133,6 +1133,8 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   // A scored disjunction with its own logical owner. Preserve the original
   // clauses, including duplicates, rather than normalizing a BooleanQuery.
   static Query::Weight* makeDisjunctionWeight(

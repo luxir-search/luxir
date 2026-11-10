@@ -2205,11 +2205,11 @@ public:
     qr->estimateCount = estimateCount && qr->boundedCount;
     qr->headSort = std::move(headSort);
     qr->resultQuery = resultQuery;
-    if (placement != TopDocsPlacement::FUSION_SOURCE) {
-      DecoratorContext::QuerySource source{qr->resultQuery, qr->planning};
-      DecoratorContext dc{req, parseContext, qr->planning, {&source, 1}};
+    if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
+      DecoratorContext::QuerySource source{qr->resultQuery, decoratorQueryContext(*qr)};
+      DecoratorContext dc{req, parseContext, {&source, 1}};
       qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc);
-    } else if (!topDocsReq.decorate.empty()) {
+    } else if (placement == TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       throw RequestError("fusion sources cannot decorate; put decorate on fusion");
     }
     if (firstQuery == nullptr) {
@@ -2256,6 +2256,14 @@ public:
       }
     }
     return out;
+  }
+
+  Query::Context& decoratorQueryContext(TopDocsReq& source) {
+    if (source.weightContext == nullptr) {
+      source.weightContext = Query::Context::create(&req.arena, source.planning);
+      skipCount(SkipStats::queryContextsCreated);
+    }
+    return *source.weightContext;
   }
 
   // The parser side of a plugin op: query parsing, a planning context of its
@@ -2485,10 +2493,14 @@ public:
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
-    std::vector<DecoratorContext::QuerySource> resultQueries;
-    for (auto* source : fusion->sources) resultQueries.push_back({source->resultQuery, source->planning});
-    DecoratorContext dc{req, parseContext, fusion->sources.front()->planning, resultQueries};
-    fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc);
+    if (!fusionProto.decorate.empty()) {
+      std::vector<DecoratorContext::QuerySource> resultQueries;
+      for (auto* source : fusion->sources) {
+        resultQueries.push_back({source->resultQuery, decoratorQueryContext(*source)});
+      }
+      DecoratorContext dc{req, parseContext, resultQueries};
+      fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc);
+    }
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
         [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });
 

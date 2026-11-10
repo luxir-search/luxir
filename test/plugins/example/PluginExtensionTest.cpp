@@ -465,3 +465,21 @@ TEST(PluginQueryTest, nodeConstructorRethrowsStateCreationFailure) {
   LuxirNode node;
   EXPECT_NE(nullptr, node.pluginState<example::NodeState>("example"));
 }
+
+TEST_F(PluginExtensionTest, decoratorInspectsFuzzyRankingTerms) {
+  auto res = search(R"({"ops":{"q":{"top_docs":{"query":{"fuzzy":{"field":"id","term":"d1","max_edits":1,"prefix_length":1}},"sort":"score desc","fields":["id"],"decorate":{"ranking_terms":{}}}}}})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find(R"("ranking_terms":"id:d1,id:d2,id:d3,id:d4")")) << res.body();
+}
+
+TEST_F(PluginExtensionTest, decoratorInspectsBrowseNestedAndFusionSources) {
+  const std::pair<std::string_view, std::string_view> cases[] = {
+      {R"({"ops":{"q":{"top_docs":{"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", ""},
+      {R"({"ops":{"cats":{"field_facet":{"field":"cat_s","ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],"decorate":{"ranking_terms":{}}}}}}}}})", "id:d1"},
+      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
+  for (const auto& [request, terms] : cases) {
+    auto res = search(std::string(request));
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_NE(std::string::npos, res.body().find("\"ranking_terms\":\"" + std::string(terms) + "\"")) << res.body();
+  }
+}

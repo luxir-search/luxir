@@ -28,12 +28,16 @@ public:
                         std::span<api::Val> out, std::pmr::memory_resource& mr) const = 0;
 };
 
+// Makers run during serial request parsing, after ranking weight construction
+// when execution needs a weight. Inspect queries here and copy borrowed views
+// needed later. Concurrent decorate() calls must never call Query::visit.
 struct DecoratorContext {
   SearchRequest& req;
   ParseContext& parse;
-  Query::PlanningContext& planning;
   // Original ranking queries, before separately supplied filters are folded in.
-  struct QuerySource { Query* query; Query::PlanningContext& planning; };
+  // Null query means browse. Context is the source's execution context;
+  // resident sources get one on demand from the same planning state.
+  struct QuerySource { const Query* query; Query::Context& context; };
   std::span<const QuerySource> queries;
 };
 

@@ -184,6 +184,7 @@ private:
   // on-by-default typo handling because misspellings are rare; blending makes
   // edit-distance damp the intended separator. (Stats and damped boosts only
   // matter when the request needs scores; the clause set is the same either way.)
+  Query& logicalRewrite(Context& context) const;
   Query* rewriteToDisjunction(Context& context) const;
 
 public:
@@ -191,6 +192,8 @@ public:
   // decides only whether the kept clauses score, never which docs match.
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 };
 
 } // namespace luxir
