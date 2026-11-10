@@ -532,6 +532,14 @@ that state through the core wrappers. `find<T>()` checks each factory with
 Repeated layers return the outermost matching type. The pointer is borrowed for
 the factory's lifetime; process-wide plugin objects must not retain it.
 
+`LuxirNode::detachCollection` stops serving a collection without removing its storage
+(the writer commits what it holds and closes), and `attachCollection` opens one that
+the tenant catalog in storage selects but the node has not opened, as startup does.
+Together they let a plugin hand a collection's storage from one node to another.
+Storage is not touched, including the catalog entry, so a layer that writes in the
+background settles its own directories after the detach, and it must stop exposing a
+detached collection's catalog entry, or the next startup opens it again.
+
 ### Capabilities
 
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
