@@ -15,6 +15,7 @@
 #include "AllQuery.h"
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
+#include "ForcePrepareQuery.h"
 #include "TermQuery.h"
 #include "QueryPrep.h"
 
@@ -52,6 +53,7 @@ public:
     R3_REQUIRED_DISJUNCTION_HOIST = 1u << 2,
     R4_SINGLE_CLAUSE_UNWRAP = 1u << 3,
     R5_MATCH_ALL_ELIMINATE = 1u << 4,
+    R6_REQUIRED_FILTER_PROMOTE = 1u << 5,
   };
 
   // Snapshot of the query-pointer plan immediately before duplicate removal
@@ -130,6 +132,52 @@ private:
     BooleanQuery* query = nullptr;
     float boost = 1.0f;
   };
+
+  static bool isImplicitConstraintLeaf(const Query& clause) {
+    if (luxir::scoreProfile(clause).kind != ScoreProfile::Kind::AUTO_UNIFORM
+        || luxir::logicalConsumesDomain(clause)
+        || luxir::exactDomainIdentity(clause)) {
+      return false;
+    }
+    const Query* leaf = &clause;
+    for (;;) {
+      switch (leaf->getKind()) {
+        case QueryKind::BOOST:
+          leaf = static_cast<const BoostQuery*>(leaf)->getChild();
+          break;
+        case QueryKind::CONSTANT_SCORE:
+          leaf = static_cast<const ConstantScoreQuery*>(leaf)->getChild();
+          break;
+        case QueryKind::FORCE_PREPARE:
+          leaf = static_cast<const ForcePrepareQuery*>(leaf)->getChild();
+          break;
+        default:
+          return leaf->getKind() != QueryKind::BOOLEAN;
+      }
+    }
+  }
+
+  NormalizedBoolean effectiveRoles() const {
+    NormalizedBoolean roles(*this);
+    bool consumes = false;
+    for (auto clauses : {mandatory, optional}) {
+      for (const auto* clause : clauses) {
+        consumes |= luxir::logicalConsumesDomain(*clause);
+      }
+    }
+    if (!consumes) return roles;
+
+    roles.mandatory.clear();
+    for (auto* clause : mandatory) {
+      if (isImplicitConstraintLeaf(*clause)) {
+        roles.filter.push_back(clause);
+        roles.ruleMask |= R6_REQUIRED_FILTER_PROMOTE;
+      } else {
+        roles.mandatory.push_back(clause);
+      }
+    }
+    return roles;
+  }
 
   static TransparentBoolean transparentBoolean(Query* query,
                                                 bool allowConstantScore) {
@@ -229,12 +277,14 @@ private:
         continue;
       }
 
+      // Inlining must retain roles already established inside the child.
+      auto innerRoles = inner->effectiveRoles();
       ClauseList replacement;
       if (parentIsFilter) {
-        replacement.insert(replacement.end(), inner->mandatory.begin(), inner->mandatory.end());
-        replacement.insert(replacement.end(), inner->filter.begin(), inner->filter.end());
+        replacement.insert(replacement.end(), innerRoles.mandatory.begin(), innerRoles.mandatory.end());
+        replacement.insert(replacement.end(), innerRoles.filter.begin(), innerRoles.filter.end());
       } else {
-        for (Query* query : inner->mandatory) {
+        for (Query* query : innerRoles.mandatory) {
           replacement.push_back(scoringClause(pool, query, child.boost));
         }
         if (liftRankOnlyOptionals) {
@@ -243,15 +293,15 @@ private:
                 scoringClause(pool, query, child.boost));
           }
         }
-        plan.filter.insert(plan.filter.end(), inner->filter.begin(), inner->filter.end());
+        plan.filter.insert(plan.filter.end(), innerRoles.filter.begin(), innerRoles.filter.end());
       }
-      plan.prohibited.insert(plan.prohibited.end(), inner->prohibited.begin(),
-                             inner->prohibited.end());
+      plan.prohibited.insert(plan.prohibited.end(), innerRoles.prohibited.begin(),
+                             innerRoles.prohibited.end());
 
       parents.erase(parents.begin() + (ptrdiff_t) i);
       parents.insert(parents.begin() + (ptrdiff_t) i,
                      replacement.begin(), replacement.end());
-      plan.ruleMask |= R1_REQUIRED_INLINE;
+      plan.ruleMask |= R1_REQUIRED_INLINE | innerRoles.ruleMask;
       // Re-examine the replacement (or the clause shifted into this slot).
     }
   }
@@ -308,7 +358,7 @@ private:
   }
 
   NormalizedBoolean normalize(MemPool& pool) const {
-    NormalizedBoolean plan(*this);
+    auto plan = effectiveRoles();
 
     normalizeRequiredList(plan, plan.mandatory, /*parentIsFilter=*/false, pool);
     normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
@@ -1025,6 +1075,7 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    auto roles = effectiveRoles();
     out.appendKind(kind);
     out.appendInt32(minShouldMatch);
     FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;
@@ -1036,13 +1087,13 @@ public:
             scope, clause->appendFilterKey(out, ctx));
       }
     };
-    appendRole(FilterKeyTag::BOOLEAN_MANDATORY, mandatory);
-    bool dropOptional = (!mandatory.empty() || !filter.empty())
+    appendRole(FilterKeyTag::BOOLEAN_MANDATORY, roles.mandatory);
+    bool dropOptional = (!roles.mandatory.empty() || !roles.filter.empty())
         && minShouldMatch < 1;
     appendRole(FilterKeyTag::BOOLEAN_OPTIONAL,
-               dropOptional ? std::span<Query*>{} : optional);
-    appendRole(FilterKeyTag::BOOLEAN_PROHIBITED, prohibited);
-    appendRole(FilterKeyTag::BOOLEAN_FILTER, filter);
+               dropOptional ? std::span<Query*>{} : std::span<Query*>(roles.optional));
+    appendRole(FilterKeyTag::BOOLEAN_PROHIBITED, roles.prohibited);
+    appendRole(FilterKeyTag::BOOLEAN_FILTER, roles.filter);
     return scope;
   }
 

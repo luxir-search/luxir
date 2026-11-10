@@ -357,11 +357,16 @@ one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket. A boolean's `filter` and
 `prohibited` clauses both apply inside the vector search of its `required`
 and `optional` kNN clauses: a required kNN beside `prohibited: [X]` returns
-`k` neighbors that do not match `X`. A constant-scoring `required` clause
-(for example a range wrapped in `constant_score`) also applies inside the
-search. Other scoring clauses beside the kNN (another `required` clause, or
-`optional` clauses made a constraint through `min_match`) still intersect with
-its top `k` afterwards; put pure constraints in `filter`.
+`k` neighbors that do not match `X`. Required clauses that add no score
+(`range`, `prefix`, `wildcard`, `regex`, `exists`, geo, and `any_of`) act like
+`filter` clauses: a required kNN beside them returns `k` neighbors that match
+them, and an `optional` kNN beside them picks its neighbors among their
+matches. Required clauses that score, including a `match` on one term,
+intersect with the kNN's top `k` after the vector search, and so does any
+clause wrapped in `constant_score`, which is how to ask for that behavior. To
+constrain the vector search by a term, use `any_of` or put it in `filter`.
+Optional clauses made a constraint through `min_match` also intersect
+afterwards.
 
 ## Hybrid search
 

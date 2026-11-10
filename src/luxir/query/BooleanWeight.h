@@ -12936,26 +12936,6 @@ public:
         && !QueryPrep::disableProhibitedDomainFoldForTests
         && (QueryPrep::anyConsumesDomain(mandatoryWeights)
             || QueryPrep::anyConsumesDomain(optionalWeights));
-    // Constant-scoring mandatory siblings are pure constraints, so they
-    // narrow a domain-consuming child like a filter clause does: kNN then
-    // returns k neighbors that match them instead of the k nearest cut
-    // down afterwards. The clauses stay mandatory (matching and scores are
-    // unchanged); only the child domain shrinks. Scoring siblings are not
-    // folded, and neither are clauses that prepare themselves.
-    if (QueryPrep::anyConsumesDomain(mandatoryWeights)
-        || QueryPrep::anyConsumesDomain(optionalWeights)) {
-      std::vector<Query::Weight*> constraints;
-      for (auto* weight : mandatoryWeights) {
-        if (weight != nullptr && weight->isConstantScoring()
-            && !weight->needsPrepare() && !weight->consumesDomain()) {
-          constraints.push_back(weight);
-        }
-      }
-      for (auto& source : QueryPrep::prepareFilterSources(
-               constraints, {}, ctx)) {
-        filterSources.emplace_back(std::move(source));
-      }
-    }
     if (!filterSources.empty() || foldProhibited) {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];

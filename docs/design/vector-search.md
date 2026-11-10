@@ -364,10 +364,13 @@ nested), its `prohibited` (must_not) clauses into the domain it hands its
 children (outer AND filters AND NOT prohibited). The folded domain then
 replaces the boolean's prohibited scorers as its required domain supplier, so
 each exclusion is materialized once, through the same filter cache uses as a
-filter clause. Constant-scoring `required` siblings (a range or constant-score clause) fold
-into the domain too, since they are pure constraints; they stay required, so
-matching and scores are unchanged. Scoring siblings are not folded: they
-intersect with the kNN's top-k after it ran. FAISS ids are segment-local vector value ranks, so the
+filter clause. Normalization gives required siblings with an automatic uniform
+score profile (ranges, prefixes, automata, exists, geo, term sets including
+`any_of`) the filter role, since they add no score; the same effective roles
+key membership caching, so the role never depends on execution flags. A
+required or optional kNN then selects within them. Scoring siblings, including
+terms and explicit `constant_score(...)`, intersect with the kNN's top-k
+afterwards. FAISS ids are segment-local vector value ranks, so the
 query path maps each returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
