@@ -113,6 +113,12 @@ public:
   void detachCollection(std::string_view name, std::string_view target) { detachCollection(CollectionId::of(name), target); }
   std::shared_ptr<Collection> attachCollection(const CollectionId& id, bool force = false);
   std::shared_ptr<Collection> attachCollection(std::string_view name, bool force = false) { return attachCollection(CollectionId::of(name), force); }
+  // READ_ONLY attaches are allowed on a read-only node too; a writer attach
+  // needs a writer node.
+  std::shared_ptr<Collection> attachCollection(const CollectionId& id, Collections::Role role, bool force = false);
+  // Commits and closes the collection's writer and keeps serving it
+  // read-only (the first half of a writer handoff).
+  void demoteCollection(const CollectionId& id);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;

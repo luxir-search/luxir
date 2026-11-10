@@ -572,6 +572,13 @@ the factory's lifetime; process-wide plugin objects must not retain it.
 
 Placement plugins call the engine hooks `LuxirNode::detachCollection(id, target)`
 and `LuxirNode::attachCollection(id, force)` to hand off writers or force a takeover.
+`LuxirNode::demoteCollection(id)` commits and closes a collection's writer while it
+keeps serving its last snapshot (updates get `ReadOnlyError`), the first half of a
+handoff. `attachCollection(id, Collections::Role::READ_ONLY)` opens the selected
+snapshot without a writer and without touching the assignment, also on a read-only
+node; a publisher such as a replica refresher advances it with stage, prepare and
+install. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
+a collection, so such a publisher can fetch at once instead of on its next interval.
 
 ### Capabilities
 

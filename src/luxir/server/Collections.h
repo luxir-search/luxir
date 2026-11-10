@@ -204,8 +204,17 @@ public:
   // Final commit (best effort), close, and hand off the existing incarnation.
   // A commit failure is thrown after the handoff; assignment failures also unload.
   void detach(const CollectionId& id, std::string_view target);
-  // Open an active catalog entry, optionally taking its assignment first.
-  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
+  // Closes the writer of a registered collection after a commit and keeps
+  // serving its last snapshot read-only (updates get ReadOnlyError). The
+  // first half of a writer handoff. Idempotent.
+  void demote(const CollectionId& id);
+  // Open an active catalog entry. As WRITER, optionally taking its assignment
+  // first. As READ_ONLY the selected snapshot is served without a writer and
+  // without touching the assignment, so a publisher other than a writer (a
+  // replica refresher) can advance it with stage/prepare/install; this is
+  // also allowed on a read-only node.
+  std::shared_ptr<Collection> attach(const CollectionId& id, Role role, bool force = false);
+  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false) { return attach(id, Role::WRITER, force); }
 
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }

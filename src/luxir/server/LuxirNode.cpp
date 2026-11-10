@@ -252,4 +252,13 @@ std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, 
   return collections_->attach(id, force);
 }
 
+std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, Collections::Role role, bool force) {
+  return collections_->attach(id, role, force);
+}
+
+void LuxirNode::demoteCollection(const CollectionId& id) {
+  if (following()) throw ReadOnlyError("a follower node has no writers to demote");
+  collections_->demote(id);
+}
+
 } // namespace luxir

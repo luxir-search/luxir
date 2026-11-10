@@ -691,7 +691,8 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   auto snapshot = shard->snapshots->snapshot();
   if (!snapshot || snapshot->id.incarnation != entry->id) throw CollectionUnavailableError("loaded incarnation is no longer selected");
   std::exception_ptr commitFailure;
-  try { shard->iw->commit(); }
+  // A demoted writer committed and closed already.
+  try { if (!shard->readOnly.load(std::memory_order_acquire)) shard->iw->commit(); }
   catch (...) { commitFailure = std::current_exception(); }
   try { shard->iw->close(); }
   catch (...) { if (!commitFailure) commitFailure = std::current_exception(); }
@@ -716,8 +717,31 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   if (commitFailure) std::rethrow_exception(commitFailure);
 }
 
-std::shared_ptr<Collection> Collections::attach(const CollectionId& key, bool force) {
-  if (config.read_only || !config.replication.source.empty()) throw ReadOnlyError("cannot attach collections on a read-only node or follower");
+void Collections::demote(const CollectionId& key) {
+  validate(key);
+  Transition transition(*this, key);
+  auto collection = map.get(key);
+  if (!collection) throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  auto shard = collection->getShard();
+  if (!shard || !shard->iw || shard->readOnly.load(std::memory_order_acquire)) return;
+  // Refuse new updates first, then make what was accepted durable, then
+  // let the writer go. The registry and its readers stay: searches go on.
+  shard->readOnly.store(true, std::memory_order_release);
+  try {
+    shard->iw->commit();
+    shard->iw->close();
+  } catch (...) {
+    shard->readOnly.store(false, std::memory_order_release);
+    throw;
+  }
+  LOG_INFO("Demoted collection to read-only: {}", key.label());
+}
+
+std::shared_ptr<Collection> Collections::attach(const CollectionId& key, Role role, bool force) {
+  if (role == Role::FOLLOWER) throw std::invalid_argument("attach opens a writer or a read-only collection");
+  if (!config.replication.source.empty() || (config.read_only && role == Role::WRITER)) {
+    throw ReadOnlyError("cannot attach collections on a read-only node or follower");
+  }
   validate(key);
   Transition transition(*this, key);
   auto& storage = catalog(key.tenant);
@@ -725,12 +749,12 @@ std::shared_ptr<Collection> Collections::attach(const CollectionId& key, bool fo
   if (!entry || entry->state != "active") throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
   auto expected = map.get(key);
   if (expected && expected->getShard()) throw CollectionExistsError("collection '" + key.label() + "' is already loaded");
-  if (entry->node != config.node.id) {
+  if (role == Role::WRITER && entry->node != config.node.id) {
     if (!force) throw CollectionServedByError(entry->node);
     if (!storage.assign(entry->id, entry->node, config.node.id)) throw CollectionUnavailableError("collection assignment changed before attach");
   }
   Opened row{key, nullptr, entry->id, {}};
-  openOne(row, Role::WRITER, expected);
+  openOne(row, role, expected);
   return row.collection;
 }
 

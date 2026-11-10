@@ -193,6 +193,9 @@ session cache policy for a later re-attach. If the old owner is dead, use
 `target.attachCollection(id, true)` to take over its assignment and fence its
 writer. Without force, attach requires the assignment to name this node.
 These are writer-node engine hooks; read-only nodes and followers refuse them.
+`demoteCollection(id)` instead stops only the writer: it commits, closes, and keeps
+serving reads. `attachCollection(id, Collections::Role::READ_ONLY)` serves a
+collection without a writer or an assignment and is allowed on read-only nodes.
 
 ## Collection lifecycle
 
