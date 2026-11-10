@@ -1387,7 +1387,9 @@ protected:
     RANGE, CONSTANT_RANGE, ANY_OF, TERM, MATCH,
     NESTED_RANGE, NESTED_CONSTANT_RANGE, CONSUMING_CHILD, CONSTANT_CONSUMING_CHILD,
     NEGATIVE, NESTED_FILTER, NESTED_REQUIRED, WRAPPED_REQUIRED, BOOSTED_REQUIRED,
-    FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH
+    FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH,
+    REQUIRED_FILTER_CONSUMER, REQUIRED_PROHIBITED_CONSUMER, FILTER_REQUIRED_CONSUMER,
+    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER
   };
   enum class Caller { SCORED, COUNT, FIELD_SORT, CONSTANT_SCORE, RESCORE, FACET };
   struct Result {
@@ -1437,6 +1439,29 @@ protected:
       return qb::boolean(mr, {child});
     }
     auto term = qb::match(mr, "all_s", "t");
+    if (shape == Shape::REQUIRED_FILTER_CONSUMER) {
+      auto inner = qb::boolean(mr, {term}, {}, {}, {knn});
+      return qb::boolean(mr, {term, inner}, {}, {}, {constraint});
+    }
+    if (shape == Shape::REQUIRED_PROHIBITED_CONSUMER) {
+      auto excluded = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {}, {}, {excluded});
+      return qb::boolean(mr, {term, inner}, {}, {}, {constraint});
+    }
+    if (shape == Shape::FILTER_REQUIRED_CONSUMER) {
+      auto inner = qb::boolean(mr, {knn}, {}, {}, {constraint});
+      return qb::boolean(mr, {}, {}, {}, {inner});
+    }
+    if (shape == Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER) {
+      auto selected = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {}, {}, {selected});
+      return qb::boolean(mr, {}, {selected}, {}, {inner});
+    }
+    if (shape == Shape::LIFTED_OPTIONAL_CONSUMER) {
+      auto ranking = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
+      auto inner = qb::boolean(mr, {term}, {ranking}, {}, {constraint});
+      return qb::boolean(mr, {inner});
+    }
     std::vector<api::Query> ranks;
     if (rankOnly) ranks.push_back(qb::match(mr, "id", "2"));
     if (shape == Shape::NESTED_RANGE || shape == Shape::NESTED_CONSTANT_RANGE) {
@@ -1510,12 +1535,90 @@ protected:
     }
   }
 
+  void expect(Shape shape, std::initializer_list<std::string> ids) {
+    for (auto caller : {Caller::SCORED, Caller::COUNT, Caller::FIELD_SORT,
+                        Caller::CONSTANT_SCORE, Caller::RESCORE, Caller::FACET}) {
+      SCOPED_TRACE(::testing::Message() << (int)shape << ":" << (int)caller);
+      cache->clear();
+      for (int repeat = 0; repeat < 2; repeat++) {
+        auto result = run(shape, caller);
+        EXPECT_EQ(ids.size(), result.count);
+        if (caller != Caller::COUNT && caller != Caller::FACET) {
+          EXPECT_EQ(std::vector<std::string>(ids), result.ids);
+        }
+      }
+    }
+  }
+
   static FilterKey key(const Query& query) {
     FilterKeyBuilder builder;
     FilterKeyScope scope = query.appendFilterKey(builder, {});
     return std::move(builder).finishStructural(scope, {});
   }
 };
+
+TEST_F(KnnBooleanDomainTest, requiredFilterConsumerKeepsOuterDomain) {
+  expect(Shape::REQUIRED_FILTER_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, requiredProhibitedConsumerKeepsOuterDomain) {
+  expect(Shape::REQUIRED_PROHIBITED_CONSUMER, {"3"});
+}
+
+TEST_F(KnnBooleanDomainTest, filterRequiredConsumerKeepsInnerDomain) {
+  expect(Shape::FILTER_REQUIRED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, negativeMergeKeepsOptionalConsumerOptional) {
+  expect(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER, {"1", "2", "3"});
+  auto result = run(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER);
+  EXPECT_FLOAT_EQ(0, result.scores.at("3"));
+}
+
+TEST_F(KnnBooleanDomainTest, optionalConsumerCanStillLift) {
+  expect(Shape::LIFTED_OPTIONAL_CONSUMER, {"2", "3"});
+  auto result = run(Shape::LIFTED_OPTIONAL_CONSUMER);
+  EXPECT_GT(result.scores.at("2"), result.scores.at("3"));
+}
+
+TEST_F(KnnBooleanDomainTest, inliningKeepsEquivalentPrepareStages) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr("body_v");
+  std::vector<float> vector{0, 0};
+  KnnQuery knn("body_v", type, vector, 2);
+  TermQuery term("all_s", "t");
+  NumericPredicateQuery range("rank_i", 2, 3);
+  Query* scalar[]{&term};
+  Query* consumer[]{&knn};
+  Query* filter[]{&range};
+  for (bool filterParent : {false, true}) {
+    for (int role = 0; role < 3; role++) {
+      SCOPED_TRACE(::testing::Message() << filterParent << ":" << role);
+      std::span<Query*> required = role == 0 ? std::span<Query*>(consumer) : scalar;
+      std::span<Query*> prohibited = role == 2 ? std::span<Query*>(consumer) : std::span<Query*>{};
+      std::span<Query*> filters = role == 1 ? std::span<Query*>(consumer) : std::span<Query*>{};
+      BooleanQuery inner(required, {}, prohibited, filters);
+      BoostQuery wrapped(&inner, 2);
+      Query* mandatory[]{&term, &wrapped};
+      Query* parentFilters[]{&range, &wrapped};
+      BooleanQuery query(filterParent ? std::span<Query*>(scalar) : mandatory, {}, {},
+          filterParent ? std::span<Query*>(parentFilters) : filter);
+      MemPool pool;
+      auto view = query.normalizationForTest(pool);
+      bool safe = filterParent ? role != 0 : role == 0;
+      EXPECT_EQ(safe, (view.ruleMask & BooleanQuery::R1_REQUIRED_INLINE) != 0);
+    }
+  }
+  Query* required[]{&term};
+  Query* optional[]{&knn};
+  BooleanQuery inner(required, optional, {}, filter);
+  Query* sole[]{&inner};
+  BooleanQuery query(sole, {}, {}, {});
+  MemPool pool;
+  auto view = query.normalizationForTest(pool);
+  EXPECT_NE(0u, view.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
+  EXPECT_EQ(1u, view.optionalCount);
+}
 
 TEST_F(KnnBooleanDomainTest, requiredConstraintsSelectMatchingNeighbors) {
   for (auto shape : {Shape::RANGE, Shape::ANY_OF}) expect(shape, Caller::SCORED, 2);

@@ -384,7 +384,8 @@ optionals never become requirements, and a retained copy shares the extracted
 one's query-owned filter use, which is request-owned when the shared cache
 rejects admission or is absent. Scoring siblings, including terms and
 constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
-afterwards.
+afterwards. Required-clause inlining never moves a domain consumer to a
+different prepare stage.
 
 FAISS ids are segment-local vector value ranks, so the query path maps each
 returned value rank back through that segment's vector
