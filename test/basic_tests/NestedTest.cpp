@@ -235,6 +235,7 @@ TEST_F(NestedTest, nestedSortByChildField) {
             ids(R"({"expr":"answers.score","dir":"asc","nested":{"path":"answers","mode":"min"}})")); // 1, 3, missing
   EXPECT_EQ((std::vector<std::string>{"b", "a", "c"}),
             ids(R"({"expr":"answers.score","dir":"asc","nested":{"path":"answers","mode":"max"}})")); // 3, 5
+}
 
 // A block that fails partway leaves dead children with no root; they must not
 // attach to the next root, and a trailing failed block must be harmless.
