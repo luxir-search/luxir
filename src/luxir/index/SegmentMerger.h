@@ -1230,6 +1230,7 @@ private:
     int64_t totalLive = root.maxDoc;
     // Peak: the keyed entries plus newToOld.
     reorderGuard = ramBudget.forceAcquire(MergeCostModel::indexSortPlanBytes(totalLive));
+    bool hilbert = schema.indexSortOrder == api::SchemaDef::IndexSort::Order::HILBERT;
 
     // One entry per live doc: keyed docs fill from the front, docs without a
     // key from the back (reversed below into concatenation order).
@@ -1240,14 +1241,16 @@ private:
       const LiveDocs* liveDocs = root.liveDocs[(size_t)seg.ord];
       const FixedBitSet* live = liveDocs ? &liveDocs->bitset() : nullptr;
       int32_t maxDoc = seg.postingsReader->maxDoc();
-      // Sources where the field has no int/date column (never set, or an
-      // older generation typed it differently) contribute no keys.
+      // Sources where the field has no int/date (geo_point for hilbert)
+      // column (never set, or an older generation typed it differently)
+      // contribute no keys.
       const auto* info = seg.postingsReader->fieldInfo(field);
       std::optional<IntColReader> reader;
       std::optional<IntColReader::Iterator> docs;
       int32_t next = IntColReader::ENDDOC;
-      if (info != nullptr && (info->type == FieldType::INT || info->type == FieldType::DATE)
-          && (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
+      bool keyed = info != nullptr && (hilbert ? info->type == FieldType::GEO_POINT
+                                               : info->type == FieldType::INT || info->type == FieldType::DATE);
+      if (keyed && (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
         reader.emplace(*seg.postingsReader, *info);
         docs.emplace(*reader);
         next = docs->next();
@@ -1256,11 +1259,19 @@ private:
         bool has = next == local;
         uint64_t key = 0;
         if (has) {
-          int64_t value = reader->multiValued()
-              ? reader->selectedValue(docs->rank(), descending, docs->values())
-              : docs->value();
-          key = (uint64_t)value ^ (1ULL << 63);
-          if (descending) key = ~key;
+          if (hilbert) {
+            // The minimum key over the document's points.
+            auto [start, end] = reader->multiValued() ? reader->getStartEndValueRank(docs->rank())
+                : std::pair<int64_t, int64_t>(docs->rank(), docs->rank() + 1);
+            key = UINT64_MAX;
+            for (int64_t r = start; r < end; r++) key = std::min(key, geo::hilbertKey(docs->values().valueAt(r)));
+          } else {
+            int64_t value = reader->multiValued()
+                ? reader->selectedValue(docs->rank(), descending, docs->values())
+                : docs->value();
+            key = (uint64_t)value ^ (1ULL << 63);
+            if (descending) key = ~key;
+          }
           next = docs->next();
         }
         if (live != nullptr && !live->get(local)) continue;

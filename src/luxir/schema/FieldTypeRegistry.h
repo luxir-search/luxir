@@ -98,6 +98,12 @@ public:
   // Whether retrieving the authored field calls project().
   virtual bool projects() const { return false; }
 
+  // The suffix of the derived field that stands in for the authored field
+  // when a schema's index_sort names it, for example a shape's centroid
+  // GEO_POINT for {"field": "shape", "order": "hilbert"}. Empty: the field
+  // cannot be an index sort.
+  virtual std::string_view sortProxy() const { return {}; }
+
   // The derived data's encoding version, part of every derived field's
   // signature. Raise it when index() starts writing different values for the
   // same params, so segments written before are a different representation.
