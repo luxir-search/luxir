@@ -996,14 +996,9 @@ public:
                               int64_t seen) {
       auto& weight = *thisOp().weight;
       auto bounds = weight.countShortcut(seg, nullptr);
-      if (collectorFilter == nullptr) {
-        auto count = QueryPrep::resolveCount(bounds, [&](Query::Weight& resolver) {
-          return resolver.scorerSupplier(pool, seg);
-        });
-        if (count) {
-          collector.estimatedHits += *count;
-          return;
-        }
+      if (collectorFilter == nullptr && bounds.how == Query::CountHow::METADATA) {
+        collector.estimatedHits += bounds.maxMatches;
+        return;
       }
       // Clamp to the bounds; minMatches ignores a collector filter.
       int64_t floor = collectorFilter == nullptr
