@@ -187,6 +187,17 @@ public:
   size_t unitCount() const { return units.size(); }
   std::pmr::vector<Record>& retained() { return records; }
 
+  // After terminal scoring, before similarity filtering. exactTopK contains
+  // the best exact scores of distinct units (documents or canonical groups).
+  // Its top k suffice: discarded exact units cannot repair a shortfall here.
+  // No floor exists until k distinct witnesses have been seen.
+  int64_t unsupportedFloorShortfall(const auto& exactTopK) const {
+    float floor = floorScore();
+    if (floor == NO_FLOOR) return 0;
+    int64_t supported = std::ranges::count_if(exactTopK, [floor](const auto& hit) { return hit.score >= floor; });
+    return std::max((int64_t)0, k - supported);
+  }
+
   void offer(Batch& batch) {
     std::lock_guard lock(mutex);
     for (auto& pending : batch) {

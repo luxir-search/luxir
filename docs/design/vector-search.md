@@ -605,6 +605,10 @@ remaining interval values by `upper >= T`. A value whose upper score is below
 its unit's best known exact score is also skipped. Both stages read in segment
 and value-rank order, with disjoint column reads and a shared exact-score cache.
 Final unit collapse and similarity filtering use exact scores.
+Before similarity filtering, a diagnostic reports an unsupported floor and
+its distinct-unit shortfall when fewer than k exact units reach the final
+witness floor; it changes no selection behavior and does not detect every
+invalid interval.
 
 There is no interval retention cap. `RequestMemResource` charges records,
 canonical unit keys, witness heaps, pending batches and terminal selection

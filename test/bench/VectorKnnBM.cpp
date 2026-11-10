@@ -1217,6 +1217,10 @@ void BM_VectorAnnDataset(benchmark::State& state) {
 
   std::vector<std::vector<float>> queries;
   for (int32_t q = 0; q < ds->nQueries; q++) queries.push_back(ds->query(q));
+  KnnQuery::Stats stats;
+  std::optional<SearchOverridesGuard<KnnQuery::Stats*>> statsGuard;
+  statsGuard.emplace(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
   double recallSum = 0;
   for (int32_t q = 0; q < ds->nQueries; q++) {
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)q], k,
@@ -1234,6 +1238,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
     for (const auto& id : ids) hits += std::ranges::count(truth[(size_t)q], id) > 0 ? 1 : 0;
     recallSum += (double)hits / (double)truth[(size_t)q].size();
   }
+  statsGuard.reset();
 
   int32_t queryOrd = 0;
   for (auto _ : state) {
@@ -1254,6 +1259,8 @@ void BM_VectorAnnDataset(benchmark::State& state) {
 
   state.SetLabel(benchCodecName(codec));
   state.counters["recall"] = recallSum / (double)ds->nQueries;
+  state.counters["unsupported_floors"] = (double)stats.unsupportedFloors.load();
+  state.counters["unsupported_floor_shortfall"] = (double)stats.unsupportedFloorShortfall.load();
   state.counters["buildSecs"] = buildSecs;
   state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
   state.counters["overlaySegs"] = (double)overlaySegments;

@@ -3212,6 +3212,45 @@ TEST_F(KnnQueryTest, l2Scores) {
   req->done();
 }
 
+TEST(KnnIntervalCollectorTest, finalFloorSupport) {
+  auto check = []<bool Groups>() {
+    RequestMemTracker tracker(0);
+    KnnIntervalCollector<Groups> collector(2, tracker, "v");
+    auto key = [](uint64_t value) {
+      if constexpr (Groups) return CollapseKey{.singleton = std::nullopt, .components = {{true, (int64_t)value}}};
+      else return value;
+    };
+    typename KnnIntervalCollector<Groups>::Batch batch(collector.memoryResource());
+    // One unit with several values cannot establish a floor, even across
+    // segments in Groups mode. BREADTH keeps these witnesses for the next round.
+    batch.emplace_back(VectorEngineHit{12, 0, 0}, 10, 14, key(1), collector.memoryResource());
+    batch.emplace_back(VectorEngineHit{13, Groups ? 1 : 0, 1}, 11, 15, key(1), collector.memoryResource());
+    collector.offer(batch);
+    std::vector<VectorEngineHit> exact;
+    EXPECT_EQ(0, collector.unsupportedFloorShortfall(exact));
+    batch.emplace_back(VectorEngineHit{14, 1, 2}, 12, 16, key(2), collector.memoryResource());
+    collector.offer(batch);
+    collector.compact();
+    ASSERT_EQ(11, collector.floorScore());
+    exact = {{12, 1, 2}, {10, 0, 0}};
+    EXPECT_EQ(1, collector.unsupportedFloorShortfall(exact));
+    exact[1].score = 11; // Equality supports the floor.
+    EXPECT_EQ(0, collector.unsupportedFloorShortfall(exact));
+    exact = {{9, 1, 2}, {8, 0, 0}};
+    EXPECT_EQ(2, collector.unsupportedFloorShortfall(exact));
+    // Exact witnesses and mandatory exact records can support T > the old
+    // interval floor without rescoring the old witnesses below T.
+    collector.offerExact({20, 1, 3}, key(3));
+    collector.mandatory({21, 0, 4}, key(4), true);
+    collector.compact();
+    exact = {{21, 0, 4}, {20, 1, 3}};
+    EXPECT_EQ(20, collector.floorScore());
+    EXPECT_EQ(0, collector.unsupportedFloorShortfall(exact));
+  };
+  check.operator()<false>();
+  check.operator()<true>();
+}
+
 TEST_F(KnnQueryTest, intervalWitnessesCountDocumentsNotValues) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf;
@@ -3244,6 +3283,8 @@ TEST_F(KnnQueryTest, intervalWitnessesCountDocumentsNotValues) {
       EXPECT_OK(req);
       EXPECT_EQ(resultIds(*req), resultIds(*exact));
       EXPECT_EQ(stats.scanned.load(), 179);
+      EXPECT_EQ(0, stats.unsupportedFloors.load());
+      EXPECT_EQ(0, stats.unsupportedFloorShortfall.load());
     }
   }
 }
@@ -3267,6 +3308,7 @@ TEST_F(KnnQueryTest, intervalBreadthCarriesWitnessesWithoutRescanningLists) {
     EngineWrapperGuard wrapper([&](VectorEngine& engine) { return std::make_unique<RecordingVectorEngine>(engine, rounds); });
     KnnQuery::statsForTests = &stats;
     auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile();
     auto& cur = req->collection("main").topDocs("q");
     configKnn(cur, "emb_vs", {0, 0, 0, 0}, 3);
     addMatchFilter(cur, "eligible_s", "yes");
@@ -3288,6 +3330,14 @@ TEST_F(KnnQueryTest, intervalBreadthCarriesWitnessesWithoutRescanningLists) {
     EXPECT_LE(stats.scanned.load(), 32);
     EXPECT_EQ(stats.seedReads.load(), 3);
     EXPECT_LE(stats.seedReads.load() + stats.remainingReads.load(), stats.retainedTerminal.load());
+    EXPECT_EQ(0, stats.unsupportedFloors.load());
+    EXPECT_EQ(0, stats.unsupportedFloorShortfall.load());
+    ASSERT_TRUE(req->responses.back()->proto.profile.has_value());
+    int diagnostics = 0;
+    for (const auto& op : req->responses.back()->proto.profile->ops) for (const auto& piece : op.pieces)
+      for (auto note : piece.details)
+        diagnostics += note == "query_unsupported_floors=0; query_unsupported_floor_shortfall=0";
+    EXPECT_EQ(1, diagnostics);
   }
 }
 
