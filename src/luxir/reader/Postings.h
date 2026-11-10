@@ -146,6 +146,21 @@ public:
     return s;
   }
 
+  /// Whether `name` is a segment overlay file (getSegmentOverlayFileName). Live
+  /// docs ("__L<gen>"), the source map ("__S<gen>") and the hotcache ("__hot")
+  /// have no underscore after the marker. A rebuild writes a new generation, so
+  /// the name never holds other bytes and the file can be read by range.
+  static bool isSegmentOverlayFile(std::string_view name) {
+    if (!name.starts_with(PREFIX_FNAME)) return false;
+    size_t marker = name.find("__");
+    if (marker == std::string_view::npos || marker == PREFIX_FNAME.size()) return false;
+    std::string_view tail = name.substr(marker + 2);
+    size_t fnum = tail.rfind('_');
+    if (fnum == std::string_view::npos || fnum == 0 || fnum + 1 == tail.size()) return false;
+    size_t gen = tail.rfind('_', fnum - 1);
+    return gen != std::string_view::npos && gen > 0 && gen + 1 < fnum;
+  }
+
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
   static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen, uint64_t writerEpoch) {
     std::string s = std::string(PREFIX_FNAME).append(gen);
