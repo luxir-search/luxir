@@ -2133,7 +2133,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
 
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          schema, overlayGen, writerEpoch);
+                          schema, overlayGen, writerEpoch, indexRamBudget);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);

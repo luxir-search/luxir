@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "VectorIndexBuilder.h"
+#include "IndexRamBudget.h"
 #include "luxir/util/thread.h"
 
 #include <oneapi/tbb/parallel_for.h>
@@ -308,7 +309,7 @@ int64_t VectorIndexBuilder::ivfBuildThresholdScanCost = 1'000'000;
 std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
 int64_t VectorIndexBuilder::ivfTrainingPointsPerCentroid = 100;
-size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)4 * 1024 * 1024 * 1024;
+size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)2560 * 1024 * 1024;
 std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
@@ -496,6 +497,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int64_t byteCap = (int64_t)(ivfTrainingSampleMaxBytes / bytesPerVec);
   int64_t sampleCap = std::min<int64_t>(ntotal, std::max<int64_t>(requiredTraining,
       std::min<int64_t>(ivfTrainingPointsPerCentroid * centroids, byteCap)));
+  // Builds add pressure but must never wait for RAM on a task worker.
+  auto trainingRam = indexRamBudget ? indexRamBudget->forceAcquire(sampleCap * (int64_t)bytesPerVec)
+                                   : IndexRamBudget::Guard{};
   std::vector<float> training;
   training.reserve((size_t)sampleCap * (size_t)dims);
 
@@ -572,9 +576,21 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // controls that warning (not the clustering itself), so drop it to 1 on
   // the coarse quantizer (and the PQ, above) to keep that policy decision ours.
   index->cp.min_points_per_centroid = 1;
-  index->train(ntrain, training.data());
-  training.clear();
-  training.shrink_to_fit();
+  if (rabitq) {
+    // RaBitQuantizer::train is a no-op. IndexIVF::train would first assign
+    // every sample row and allocate an equally large, unused residual copy.
+    index->train_q1(ntrain, training.data(), index->verbose, metric);
+    index->is_trained = true;
+  } else {
+    // PQ bounds residual training at 256 * ksub rows, but at high dimensions
+    // its residual and optional subsample copies still merit a soft charge.
+    int64_t pqRows = std::min(ntrain, (int64_t)index->train_encoder_num_vectors());
+    int64_t copies = ntrain > pqRows ? 2 : 1;
+    if (trainingRam) trainingRam.forceResize(trainingRam.size() + copies * pqRows * (int64_t)bytesPerVec);
+    index->train(ntrain, training.data());
+  }
+  std::vector<float>().swap(training);
+  trainingRam.release();
 
   // Each slice owns its entire row pipeline. Append serially to preserve
   // input order within each inverted list for every codec.
