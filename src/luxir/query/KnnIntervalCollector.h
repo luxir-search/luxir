@@ -7,10 +7,12 @@
 #include <atomic>
 #include <cassert>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <memory_resource>
 #include <mutex>
 #include <ranges>
+#include <span>
 #include <unordered_map>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -219,6 +221,51 @@ public:
   }
   void observeBounded(const KeyView& key) { unitFor(key).bounded = true; }
   void compact() { prune(); }
+  // Round boundary: a completed segment's exact scan supersedes its records.
+  // Witnesses stay, since their lower bounds remain true for the query.
+  void dropSegments(std::span<const size_t> segments) {
+    std::erase_if(records, [&](const Record& record) {
+      bool drop = !record.mandatory && !record.exact
+          && std::ranges::find(segments, (size_t)record.hit.segOrd) != segments.end();
+      if (drop) record.unit->references--;
+      return drop;
+    });
+  }
+  // Records the terminal pass is expected to read, per segment. The pass
+  // narrows on the k-th exact seed; before any read, each unit's best estimate
+  // stands in for its exact score.
+  void likelyReads(std::span<int64_t> reads) {
+    for (auto& record : records) record.unit->seed = NO_SLOT;
+    for (size_t i = 0; i < records.size(); i++) {
+      size_t& best = records[i].unit->seed;
+      if (best == NO_SLOT || records[i].hit.score > records[best].hit.score) best = i;
+    }
+    std::pmr::vector<std::pair<float, float>> top(&resource); // (score, interval half-width)
+    for (size_t i = 0; i < records.size(); i++) {
+      if (records[i].unit->seed != i) continue;
+      std::pair<float, float> entry{records[i].hit.score, records[i].exact ? 0.0f : records[i].upper - records[i].hit.score};
+      if ((int64_t)top.size() < k) { top.push_back(entry); std::push_heap(top.begin(), top.end(), std::greater<>{}); }
+      else if (entry > top.front()) {
+        std::pop_heap(top.begin(), top.end(), std::greater<>{});
+        top.back() = entry;
+        std::push_heap(top.begin(), top.end(), std::greater<>{});
+      }
+    }
+    float floor = floorScore();
+    if ((int64_t)top.size() == k) {
+      // The top-k estimates are biased up by selection, so back the exact
+      // floor off by their mean interval half-width (matched measured reads
+      // within 1.3x on real and uniform-random queries at 20k and 100k).
+      double halfWidth = 0;
+      for (const auto& entry : top) halfWidth += entry.second;
+      floor = std::max(floor, top.front().first - (float)(halfWidth / (double)top.size()));
+    }
+    for (const auto& record : records) {
+      if (!record.exact && record.upper >= std::max(floor, record.unit->exact.load(std::memory_order_relaxed)))
+        reads[(size_t)record.hit.segOrd]++;
+      record.unit->seed = NO_SLOT;
+    }
+  }
   void mandatory(VectorEngineHit hit, const KeyView& key, bool exact) {
     Unit& unit = unitFor(key);
     if (exact) {
