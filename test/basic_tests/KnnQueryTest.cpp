@@ -2718,7 +2718,7 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
 
 // Unfiltered queries on a segment with deletes use the rank-space liveness
 // bitmap as the whole FAISS selector, built ONCE per liveDocs generation and
-// cached on the aux reader: a second query must not rebuild it, and a commit
+// cached on LiveDocs: a second query must not rebuild it, and a commit
 // with new deletes must.  Results stay correct against the exact contract in
 // both generations (the bitmap IS the eligibility filtering here - a stale
 // or mis-keyed cache would surface deleted docs).
@@ -2779,6 +2779,99 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+}
+
+TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  h.deleteByIds({"d40"}, UpdateMessage::COMMIT);
+
+  // Build and cache the rank-live bitmap, which borrows the live docs bits.
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  req->done();
+
+  std::weak_ptr<LiveDocs> superseded;
+  std::shared_ptr<AuxReader> aux;
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    superseded = reader->segments()[0].liveDocsShared();
+    aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+    ASSERT_NE(aux, nullptr);
+  }
+  ASSERT_FALSE(superseded.expired());
+
+  // A delete commit replaces the live docs but reuses the vector aux reader.
+  h.deleteByIds({"d41"}, UpdateMessage::COMMIT);
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    EXPECT_EQ(aux.get(), reader->segments()[0].getAuxReader("vec.embedding_v").get());
+    EXPECT_NE(reader->segments()[0].liveDocsShared(), superseded.lock());
+  }
+  EXPECT_TRUE(superseded.expired())
+      << "the cached rank-live bitmap pins the previous live docs";
+}
+
+TEST_F(KnnQueryTest, unchangedLiveDocsKeepSparseRankBitmapAcrossReopen) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  // PQ needs at least 39 * 4 vectors even with the test training floor.
+  for (int i = 0; i < 320; i++) {
+    auto doc = flatdoc("id", "d" + std::to_string(i));
+    if (i % 2 == 0) doc.emplace_back("embedding_v", std::vector<float>{(float)i, 0, 0, 0});
+    h.index(doc);
+  }
+  h.commit({"*"});
+  h.deleteByIds({"d40"}, UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  ASSERT_NE(nullptr, reader->segments()[0].getAuxReader("vec.embedding_v"));
+  auto live = reader->segments()[0].liveDocsShared();
+  reader.reset();
+  ASSERT_NE(live, nullptr);
+
+  auto run = [&] {
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0, 0, 0}, 5,
+                           /*nprobe=*/0, /*refineCandidates=*/200,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->execute();
+    auto ids = resultIds(*req);
+    EXPECT_EQ(5u, ids.size());
+    for (const auto& id : ids) EXPECT_NE("d40", id);
+    req->done();
+    return KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  };
+  auto before = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(before + 1, run());
+
+  // A new physical core with another segment must reuse the old segment's fold.
+  h.index(flatdoc("id", "extra"));
+  h.commit();
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(2u, reader->segments().size());
+    ASSERT_EQ(live, reader->segments()[0].liveDocsShared());
+  }
+  EXPECT_EQ(before + 1, run());
+
+  h.deleteByIds({"d42"}, UpdateMessage::COMMIT);
+  EXPECT_NE(live, h.getIndexWriter()->snapshots.readers.getReader()->segments()[0].liveDocsShared());
+  EXPECT_EQ(before + 2, run());
 }
 
 // Filtered query on an IVF segment with deletes: the domain is filter

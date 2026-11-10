@@ -15,6 +15,7 @@
 #include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/RankLiveBitmap.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
@@ -35,6 +36,8 @@ class LiveDocs {
 private:
   BitDocSet docSet;                                   // The actual bitset (memory mapped)
   std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
+  mutable std::mutex rankLiveMutex;
+  mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
 
 public:
   LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
@@ -50,6 +53,21 @@ public:
   // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
   static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
   
+  // Field names identify immutable physical columns across ANN overlay replacements.
+  // Callers must retain this LiveDocs and alias its shared_ptr to the returned
+  // record. The record must never own this LiveDocs, which would form a cycle.
+  // Holding the lock during build prevents concurrent first callers folding twice.
+  template <typename Build>
+  const RankLiveBitmap& rankLiveBitmap(std::string_view field, Build&& build) const {
+    std::lock_guard lock(rankLiveMutex);
+    for (const auto& [name, view] : rankLiveViews) {
+      if (name == field) return *view;
+    }
+    auto made = std::make_unique<const RankLiveBitmap>(build());
+    rankLiveViews.emplace_back(field, std::move(made));
+    return *rankLiveViews.back().second;
+  }
+
   // Get the underlying FixedBitSet for direct access
   const screaming::FixedBitSet& bitset() const {
     return docSet.bits();
