@@ -93,7 +93,7 @@ std::shared_ptr<Schema> Schema::fromStored(const api::SchemaInfo& info, SchemaBi
   if (!api::decode(def, api::copyToPaddedInput(info.source_def, arena), arena)) {
     throw std::runtime_error("Cannot decode stored schema definition");
   }
-  auto schema = compile(def, nullptr, InvalidStopWords::WARN_AND_DROP);
+  auto schema = compile(def, nullptr, true);
   schema->binding = std::move(binding);
   schema->gen_ = schema->binding.generation();
   for (const auto& [name, gen] : info.introduced) schema->introducedGen.emplace(name, gen);
