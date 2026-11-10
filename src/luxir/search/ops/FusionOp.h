@@ -534,7 +534,7 @@ public:
         op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission);
+        emission, {}, false, false, {}, op.decorators);
     }
   };
 

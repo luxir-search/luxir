@@ -593,6 +593,7 @@ public:
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::PlanningContext& planning;
   Query::Context* weightContext;
+  Query* resultQuery = nullptr;
   Query* query;
   Query::Weight* weight;
   Query::Weight* variantMembershipWeight;
