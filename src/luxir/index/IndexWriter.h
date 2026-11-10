@@ -444,11 +444,15 @@ public:
   std::optional<MergeFailureInfo> lastMergeFailure;
 
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
-  // activated in this writer lifetime or were seeded from durable manifest
+  // activated by commits or materialized merge outputs, or seeded from manifest
   // overlays at startup.  Intent-only activation is process-local; startup
   // seeds only from overlays that actually exist in the manifest.  Protected by
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
+  // Vector selectors of the commit now in finishCommitBody, set under the same
+  // indexMutex hold that captures its segments.  A merge output swapped in after
+  // that capture misses the commit's build, so it must see this intent.
+  std::vector<std::string> inFlightVectorSelectors;
 
   // Registered atomically with flushed segments and snapshotted with them.
   // A batch survives until a covering commit or a delete pass retires it.
@@ -852,7 +856,12 @@ private:
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
-  std::vector<std::string> snapshotActiveVectorOverlayNames();
+  // Builds outstanding active names and matches new in-flight selectors on the
+  // private output. Failed names are attempted only once per merge.
+  void prepareMergedVectorOverlays(SegInfo& output,
+                                   boost::unordered_flat_set<std::string>& attempted,
+                                   boost::unordered_flat_set<std::string>& matchedSelectors,
+                                   const char*& phase);
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,

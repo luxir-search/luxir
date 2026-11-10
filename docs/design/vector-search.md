@@ -39,11 +39,13 @@ time.
 
 Explicit vector selectors also activate those concrete overlay names in the
 writer. That activation is process-local unless it produced a durable overlay
-entry. A commit that fails mid-build has no side effects: staged overlay files
-are deleted, no overlay entries are published, and no names are activated -
-the caller sees the error and decides whether to retry. Startup seeds active
-names only from overlays already present in the commit manifest, so Luxir never treats
-intent-only state as a boot-time "must build" queue.
+entry. A commit whose vector build fails deletes its staged files, attaches
+nothing to its captured segments, and activates nothing itself. Attachment and
+activation on success precede data sync and manifest publication; the failure
+rule applies to the build. A selecting commit records its selectors when it
+captures its segments (see [Merging](#merging)). Startup seeds active names
+only from overlays already present in the commit manifest, so Luxir never
+treats intent-only state as a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the
 whole selected commit. If any requested vector build fails, staged overlay
@@ -349,7 +351,24 @@ publishes the merged segment publishes its overlay entries atomically with the
 segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
-explicit build succeeds.
+explicit build succeeds or the segment merges again.
+
+A merge finishing during a selecting commit's build builds the selected
+overlays on its private output without waiting. The `*` selector matches the
+output's own eligible fields. At swap, the merge prepares again only for an
+active name it has not attempted or an in-flight selector it has not matched.
+Failed names are not retried by that merge.
+
+Every vector overlay installed with a merge output makes its name active for
+later merges. Thus a merge may retain a valid overlay even if the selecting
+commit's build fails; that commit still attaches nothing and activates nothing
+itself. This agrees with startup seeding from materialized manifest overlays.
+A merge swapping before the commit captures its segments gets its overlay
+from the commit.
+
+Source segments that the commit captured still get overlays from it even when
+a merge is replacing them, because that commit publishes them. Those builds are
+discarded once the merged output publishes.
 
 ## Query Execution
 
