@@ -231,6 +231,30 @@ TEST_F(CollectionOwnershipTest, sameIdRestartReopensItsCollections) {
   EXPECT_EQ(1, a->getCollection("c")->getReaderManager().getReader()->liveDocs());
 }
 
+TEST_F(CollectionOwnershipTest, newOwnerRetainsThePreviousOwnersSnapshots) {
+  startA();
+  std::shared_ptr<const CommitSnapshot> old;
+  std::shared_ptr<Directory> dir;
+  std::string incarnation;
+  {
+    CollectionHelper c(*a, "c");
+    ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+    old = c.collection().getShard()->getSnapshots().snapshot();
+    dir = c.collection().getShard()->getDirectory();
+    ASSERT_TRUE(c.index(flatdoc("id", "second"), UpdateMessage::COMMIT, false, 1).success);
+    incarnation = *a->collections().catalog().current("c");
+  }
+  ASSERT_TRUE(a->collections().catalog().assign(incarnation, "A", "B"));
+  a.reset(); startB();
+  ASSERT_TRUE(dir->openFile(old->manifestName()));
+  CollectionHelper c(*b, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "third"), UpdateMessage::COMMIT, false, 1).success);
+  EXPECT_TRUE(dir->openFile(old->manifestName()));
+  for (const auto& file : old->files) EXPECT_TRUE(dir->openFile(file.name));
+  EXPECT_EQ(1, IndexReader(*dir, *old).liveDocs());
+  EXPECT_EQ(3, c.collection().getReaderManager().getReader()->liveDocs());
+}
+
 TEST_F(CollectionOwnershipTest, exclusiveStartupAdoptsAllEntriesInOneMutation) {
   auto cfg = config("A");
   cfg.store.backend = "fs";

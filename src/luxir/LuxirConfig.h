@@ -89,6 +89,8 @@ struct StoreConfig {
   std::map<std::string, std::map<std::string, std::string>> options;
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Superseded commits, in milliseconds. -1: 0 on exclusive stores, 5 minutes on shared stores.
+  int64_t retention_ms = -1;
   // Before a collection serves at startup: none trusts the manifest footer and
   // file sizes; full also reads every file the committed snapshot lists and
   // checks its size and xxh3, failing only that collection on a mismatch.

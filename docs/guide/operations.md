@@ -102,6 +102,13 @@ Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
 outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
 
+`--store.retention-ms` keeps superseded commits and their files for that many
+milliseconds after the commit that superseded them. It defaults to 0 on exclusive
+stores and 300000 (5 minutes) on shared stores; an explicit value overrides either
+default. Readers on other nodes must refresh within this window minus a margin
+for clock skew. This does not delay deletion of a whole incarnation on delete or
+replacement, and follower pins keep their existing limits.
+
 ## Read-only nodes
 
 A data directory has exactly one writer, which holds `node/write.lock` from startup

@@ -18,9 +18,66 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::resolve(CommitSnap
 
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
-  // No pin lock: a large acquire or slow file open cannot stall publication.
+  if (retention.count()) {
+    auto previous = this->snapshot();
+    if (previous && previous->manifestName() != snapshot->manifestName()) {
+      if (auto until = retentionUntil(snapshot->commitTime)) retain(*previous, *until);
+    }
+  }
+  // With retention disabled, publication takes no pin lock.
   readers.publish(std::move(snapshot), std::move(opened));
   notifyChange();
+  // Publication also ends expired holds: the periodic expiry runs only with HTTP.
+  if (retention.count()) expire();
+}
+
+std::optional<CommitSnapshotRegistry::Clock::time_point> CommitSnapshotRegistry::retentionUntil(uint64_t successorTime) {
+  if (!retention.count()) return {};
+  uint64_t duration = (uint64_t)retention.count() * 1000;
+  uint64_t expiry = successorTime > UINT64_MAX - duration ? UINT64_MAX : successorTime + duration;
+  auto wall = std::chrono::duration_cast<std::chrono::microseconds>(wallNow().time_since_epoch()).count();
+  uint64_t current = (uint64_t)std::max((int64_t)0, (int64_t)wall);
+  if (expiry <= current) return {};
+  auto time = now();
+  auto maximum = std::chrono::duration_cast<std::chrono::microseconds>(Clock::time_point::max() - time).count();
+  if (expiry - current >= (uint64_t)maximum) return Clock::time_point::max();
+  return time + std::chrono::microseconds(expiry - current);
+}
+
+void CommitSnapshotRegistry::retain(const CommitSnapshot& snapshot, Clock::time_point until) {
+  std::lock_guard lock(mutex);
+  if (closed) return;
+  auto hold = [&](const std::string& name, uint64_t size) {
+    auto& ref = files.try_emplace(name, FileRef{size}).first->second;
+    if (!ref.until && ref.retired && ref.pins) counters.retainedBytes -= ref.size;
+    ref.until = std::max(ref.until.value_or(until), until);
+  };
+  for (const auto& file : snapshot.files) hold(file.name, file.size);
+  hold(snapshot.manifestName(), snapshot.bytes->size() + 16);
+}
+
+void CommitSnapshotRegistry::retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current) {
+  if (!retention.count()) return;
+  std::vector<std::shared_ptr<const CommitSnapshot>> history;
+  for (const auto& file : listing) {
+    auto [generation, epoch] = Manifest::candidate(file.name);
+    if (!generation || generation >= current.id.index_gen) continue;
+    if (auto bytes = Manifest::read(dir, generation, epoch)) history.push_back(CommitSnapshot::fromBytes(std::move(bytes)));
+  }
+  std::ranges::sort(history, std::greater<>(), [](const auto& snapshot) { return snapshot->id.index_gen; });
+  uint64_t successorTime = current.commitTime;
+  for (size_t i = 0; i < history.size();) {
+    size_t end = i + 1;
+    while (end < history.size() && history[end]->id.index_gen == history[i]->id.index_gen) end++;
+    auto until = retentionUntil(successorTime);
+    successorTime = 0;
+    for (; i < end; i++) {
+      if (until) retain(*history[i], *until);
+      // Competing candidates of one generation are indistinguishable from
+      // the listing. The latest timestamp conservatively bounds their hold.
+      successorTime = std::max(successorTime, history[i]->commitTime);
+    }
+  }
 }
 
 void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
@@ -109,6 +166,7 @@ void CommitSnapshotRegistry::sweepOrphans() {
 void CommitSnapshotRegistry::retireUnreferenced(std::span<const Directory::FileInfo> listing) {
   boost::unordered_flat_set<std::string> retained;
   auto installed = snapshot();
+  retainHistory(listing, *installed);
   retained.insert(installed->manifestName());
   for (const auto& file : installed->files) retained.insert(file.name);
   std::vector<std::string> obsolete;
@@ -160,7 +218,7 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
   } catch (...) {
     for (size_t i = 0; i < added; i++) {
       auto it = files.find(commit->files[i].name);
-      if (--it->second.pins == 0) files.erase(it);
+      if (--it->second.pins == 0 && !it->second.until) files.erase(it);
     }
     throw;
   }
@@ -245,6 +303,7 @@ void CommitSnapshotRegistry::releaseLocked(const CommitId& id, std::vector<std::
     auto it = files.find(file.name);
     auto& ref = it->second;
     if (--ref.pins == 0) {
+      if (ref.until) continue;
       if (ref.retired) {
         counters.retainedBytes -= ref.size;
         retired.push_back(std::move(files.extract(it).key()));
@@ -273,7 +332,7 @@ auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(pins)::iterat
     if (oldest != pins.end() && pin.created >= oldest->second.created) continue;
     for (const auto& file : pin.snapshot->files) {
       auto ref = files.find(file.name);
-      if (ref != files.end() && ref->second.retired && ref->second.size) {
+      if (ref != files.end() && ref->second.retired && !ref->second.until && ref->second.size) {
         oldest = it;
         break;
       }
@@ -317,8 +376,20 @@ bool CommitSnapshotRegistry::testEvictOldest() {
 }
 
 void CommitSnapshotRegistry::expireLocked(std::vector<std::string>& retired) {
-  if (closed || pins.empty()) return;
+  if (closed) return;
   auto time = now();
+  for (auto it = files.begin(); retention.count() && it != files.end();) {
+    auto& ref = it->second;
+    if (!ref.until || *ref.until > time) { ++it; continue; }
+    ref.until.reset();
+    if (ref.pins) {
+      if (ref.retired) counters.retainedBytes += ref.size;
+      ++it;
+    } else {
+      if (ref.retired) retired.push_back(it->first);
+      it = files.erase(it);
+    }
+  }
   for (auto it = pins.begin(); it != pins.end();) {
     auto pin = it++;
     if (time - pin->second.lastRead >= policy.idleTimeout) {
@@ -326,6 +397,7 @@ void CommitSnapshotRegistry::expireLocked(std::vector<std::string>& retired) {
       counters.idleDrops++;
     }
   }
+  if (retention.count()) enforceBudgetLocked(retired);
 }
 
 void CommitSnapshotRegistry::expire() {
@@ -376,7 +448,7 @@ void CommitSnapshotRegistry::retire(std::span<const std::string> names) {
       if (it == files.end()) retired.push_back(name);
       else if (!it->second.retired) {
         it->second.retired = true;
-        counters.retainedBytes += it->second.size;
+        if (!it->second.until && it->second.pins) counters.retainedBytes += it->second.size;
       }
     }
     enforceBudgetLocked(retired);
@@ -401,7 +473,7 @@ void CommitSnapshotRegistry::retirePrefix(std::string_view prefix) {
     {
       std::lock_guard lock(mutex);
       if (closed) return;
-      unpinned = pins.empty();
+      unpinned = pins.empty() && files.empty();
     }
     // New pins can only acquire current, which cannot contain this dead
     // segment. Preserve the backend's cheap prefix erase with no pins.
@@ -461,7 +533,7 @@ void CommitSnapshotRegistry::detach() noexcept {
     // Keep its immutable current snapshot until the owner is destroyed.
   }
   for (const auto& [name, ref] : retired) {
-    if (ref.retired) unlinkFiles({&name, 1});
+    if (ref.retired && !ref.until) unlinkFiles({&name, 1});
   }
 }
 

@@ -59,11 +59,11 @@ durability.
 
 ## Remote readers and retention
 
-A node that reads a snapshot from the store holds a lease on it, with a
-bounded lifetime that the node renews while it uses the snapshot. Garbage
-collection removes an object only when neither HEAD nor a live lease
-references it. A lapsed lease means the snapshot expired, as it does for a
-follower's pin today.
+Superseded commits and their files are kept for X after the commit that
+superseded them, using its `commit_time`. Readers on other nodes must refresh
+their view within X minus a margin for clock skew. `--store.retention-ms`
+sets X: by default 0 on exclusive stores and 5 minutes on shared stores.
+A new writer reconstructs these holds from the manifests; nothing new is stored.
 
 ## Reading from the store
 

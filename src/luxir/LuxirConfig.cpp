@@ -217,6 +217,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Startup check of committed files: none, or full (size and xxh3 of every file)")
       ->default_val(store.verify_on_open)
       ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.retention-ms", store.retention_ms,
+                 "Keep superseded commits for this many milliseconds (0 disables retention)")
+      ->check(CLI::Range((int64_t)0, INT64_MAX / 1000))
+      ->default_str("0 on exclusive stores, 300000 on shared stores");
   app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
                  "Seconds between background checksum scrubs of published snapshots (0 = off)")
       ->default_val(store.scrub_interval_s);

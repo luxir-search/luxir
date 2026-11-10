@@ -20,6 +20,75 @@ using namespace std::chrono_literals;
 
 class CommitSnapshotTest : public LuxirTest {};
 
+TEST_F(CommitSnapshotTest, retentionUsesTheLastReferenceAndSurvivesPinLimits) {
+  RAMDir dir;
+  auto time = CommitSnapshotRegistry::Clock::now(), start = time;
+  auto wall = CommitSnapshotRegistry::WallClock::now();
+  auto wallMicros = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(wall.time_since_epoch()).count();
+  CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, [&] { return time; }, {}, "t0", 100ms, [&] { return wall; });
+  IndexWriter writer(snapshots);
+  auto first = snapshots.acquire();
+  writer.commit();
+  auto second = snapshots.snapshot();
+  ASSERT_GT(second->id.index_gen, first->id.index_gen);
+  ASSERT_EQ(first->files, second->files);
+  writer.setSchema(Schema::createDefaultSchema());
+  auto third = snapshots.snapshot();
+  snapshots.setPolicy({1ms, 0});
+  EXPECT_EQ(0u, snapshots.stats().budgetDrops);
+  EXPECT_FALSE(snapshots.reclaimOldestPin());
+  auto firstExpiry = start + std::chrono::microseconds(second->commitTime - wallMicros) + 100ms;
+  auto secondExpiry = start + std::chrono::microseconds(third->commitTime - wallMicros) + 100ms;
+  time = firstExpiry;
+  snapshots.expire();
+  EXPECT_EQ(0u, snapshots.stats().pins);
+  EXPECT_FALSE(dir.openFile(first->manifestName()));
+  EXPECT_TRUE(dir.openFile(second->manifestName()));
+  for (const auto& file : first->files) EXPECT_TRUE(dir.openFile(file.name));
+  auto old = snapshots.resolve(first->bytes); // Its schema still opens after pin expiry.
+  EXPECT_EQ(0, IndexReader(dir, *old).liveDocs());
+  time = secondExpiry - 1us;
+  snapshots.expire();
+  for (const auto& file : second->files) EXPECT_TRUE(dir.openFile(file.name));
+  time = secondExpiry;
+  snapshots.expire();
+  EXPECT_FALSE(dir.openFile(second->manifestName()));
+  for (const auto& file : second->files) EXPECT_FALSE(dir.openFile(file.name));
+  for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
+}
+
+TEST_F(CommitSnapshotTest, startupRebuildsRetentionAndSweepsExpiredSnapshots) {
+  RAMDir dir;
+  std::shared_ptr<const CommitSnapshot> first, second, third;
+  {
+    CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, CommitSnapshotRegistry::Clock::now, {}, "t0", 1h);
+    IndexWriter writer(snapshots);
+    first = snapshots.snapshot();
+    writer.setSchema(Schema::createDefaultSchema());
+    second = snapshots.snapshot();
+    writer.setSchema(Schema::createDefaultSchema());
+    third = snapshots.snapshot();
+  }
+  ASSERT_TRUE(dir.openFile(first->manifestName())); // Closing preserves time holds.
+  auto time = CommitSnapshotRegistry::Clock::now(), start = time;
+  auto wall = CommitSnapshotRegistry::WallClock::time_point(std::chrono::microseconds(second->commitTime)) + 100ms;
+  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; }, {}, "t0", 100ms, [&] { return wall; });
+  IndexWriter reopened(snapshots);
+  EXPECT_FALSE(dir.openFile(first->manifestName()));
+  for (const auto& file : first->files) EXPECT_FALSE(dir.openFile(file.name));
+  EXPECT_TRUE(dir.openFile(second->manifestName()));
+  for (const auto& file : second->files) EXPECT_TRUE(dir.openFile(file.name));
+  auto expiry = start + std::chrono::microseconds(third->commitTime - second->commitTime);
+  time = expiry - 1us;
+  snapshots.expire();
+  EXPECT_TRUE(dir.openFile(second->manifestName()));
+  time = expiry;
+  snapshots.expire();
+  EXPECT_FALSE(dir.openFile(second->manifestName()));
+  for (const auto& file : second->files) EXPECT_FALSE(dir.openFile(file.name));
+  for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
+}
+
 TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   auto path = std::filesystem::temp_directory_path() / "luxir-snapshot-transfer";
   std::filesystem::remove_all(path);

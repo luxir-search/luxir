@@ -27,6 +27,8 @@ class CommitSnapshotRegistry {
 public:
   using Clock = std::chrono::steady_clock;
   using Now = std::function<Clock::time_point()>;
+  using WallClock = std::chrono::system_clock;
+  using WallNow = std::function<WallClock::time_point()>;
   struct Policy {
     std::chrono::milliseconds idleTimeout{60'000};
     uint64_t retainedBytes = 1024ULL * 1024 * 1024;
@@ -53,12 +55,17 @@ private:
     uint64_t size;
     uint64_t pins = 0;
     bool retired = false;
+    // Latest expiry among superseded snapshots referencing this name. These
+    // holds neither consume the follower-pin budget nor expire on pin idle.
+    std::optional<Clock::time_point> until = {};
   };
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;
   Stats counters;
   Now now;
+  const std::chrono::milliseconds retention;
+  WallNow wallNow;
   bool closed = false;
   std::map<CommitId, Pin> pins;
   // The current snapshot's descriptors by name, rebuilt once per publication
@@ -83,12 +90,19 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
+  std::optional<Clock::time_point> retentionUntil(uint64_t successorTime);
+  void retain(const CommitSnapshot& snapshot, Clock::time_point until);
+  void retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current);
   void requireHeld(const FileDescriptor& descriptor);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now,
-                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0")
-      : now(std::move(now)), schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
-        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {}
+                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0",
+                                  std::chrono::milliseconds retention = {}, WallNow wallNow = WallClock::now)
+      : now(std::move(now)), retention(retention), wallNow(std::move(wallNow)),
+        schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
+        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {
+    if (retention.count() < 0 || retention.count() > INT64_MAX / 1000) throw std::invalid_argument("snapshot retention is out of range");
+  }
   std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes, Directory& source);
   std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes) { return resolve(std::move(bytes), dir); }
   ~CommitSnapshotRegistry() { close(); }

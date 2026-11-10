@@ -119,6 +119,7 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
   // Outermost, so a mutation is refused before any wrapper does bookkeeping for it.
   if (config.read_only) factory = std::make_unique<ReadOnlyDirFactory>(std::move(factory));
   if (!config.read_only && !factory->exclusive() && config.node.random) throw std::invalid_argument("shared storage requires a stable node.id; random UUID fallback is not allowed");
+  if (config.store.retention_ms < -1 || config.store.retention_ms > INT64_MAX / 1000) throw std::invalid_argument("store.retention-ms is out of range");
   TenantCatalog::initialize(*factory, !config.read_only);
   LOG_INFO("storage: {}", factory->describe());
 }
@@ -305,7 +306,8 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
     bytes = cacheBytes(name);
   }
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
-      FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant);
+      FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant,
+      std::chrono::milliseconds(config.store.retention_ms < 0 ? (factory->exclusive() ? 0 : 300'000) : config.store.retention_ms));
   col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
