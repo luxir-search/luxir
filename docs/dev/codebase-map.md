@@ -150,6 +150,14 @@ locations, browse `src/luxir/<area>/`.
      delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `InputFile::rangeStream` / `prefetchRanges` / `lazy()` (`OutputStream.h`): the reader-side
+     contract of backends that fetch byte ranges on first touch (`REMOTE` directories, from plugins);
+     `Directory::knownFiles`: the committed files and sizes of a loaded manifest. See
+     [../design/storage-tiers.md](../design/storage-tiers.md)
+   - `Hotcache` (`reader/Hotcache.h`): the `s<seg>__hot` file listing the ranges opening a segment reads,
+     written by `PostingsWriter::finish` for `REMOTE` directories; `RecordingDirectory` records them.
+     `PostingsReader` opens through ranges (header, file 0 tail, versions, field catalog) and creates
+     each file's whole-file stream on first use
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
