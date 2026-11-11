@@ -821,9 +821,15 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
   return false;
 }
 
-// Caller holds indexMutex. Largest-relief-first avoids flushing retained RAM; the
-// budget-side claim prevents broadcasts to multiple writers from over-shedding
-// once the global pressure target is met.
+// Caller holds indexMutex. Largest-relief-first sheds inverters whose flush frees
+// RAM at once before any whose RAM is mostly delete bytes, which outlive the
+// flush as a packet. Pressure implies a finite budget, which runs delete passes,
+// so that packet is retired once the frontier passes it. When no inverter offers
+// immediate relief, the oldest at the floor is shed for that deferred relief: it
+// pins the frontier, so a younger one's packet would wait for it anyway. Without
+// this an id-heavy inverter grows to its own cap. The budget-side claim prevents
+// broadcasts to multiple writers from over-shedding once the global pressure
+// target is met.
 //
 // Pressure that only merge demand creates sheds an inverter only once it holds
 // a fair share of half the pool (budget / (2 * this writer's active
@@ -838,17 +844,27 @@ void IndexWriter::pressureShedIdleLocked() {
   }
   for (;;) {
     Inverter* victim = nullptr;
-    size_t largestRelief = 0;
+    Inverter* deferred = nullptr;
+    size_t largestRelief = 0, deferredSize = 0;
     for (auto& entry : idleInverters) {
-      size_t retained = entry.first->retainedDeleteBytes();
-      assert(entry.first->memSize() >= retained);
-      size_t relief = entry.first->memSize() - retained;
-      if (relief == 0 || relief < floor) continue;
-      if (relief > largestRelief) {
-        victim = entry.first;
-        largestRelief = relief;
+      Inverter* inverter = entry.first;
+      size_t size = inverter->memSize();
+      size_t retained = inverter->retainedDeleteBytes();
+      assert(size >= retained);
+      size_t relief = size - retained;
+      if (relief != 0 && relief >= floor) {
+        if (relief > largestRelief) {
+          victim = inverter;
+          largestRelief = relief;
+        }
+      } else if (retained != 0 && size >= floor
+                 && (!deferred || inverter->minDocVersion < deferred->minDocVersion
+                     || (inverter->minDocVersion == deferred->minDocVersion && size > deferredSize))) {
+        deferred = inverter;
+        deferredSize = size;
       }
     }
+    if (victim == nullptr) victim = deferred;
     if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
     INDEX_DEBUG("indexing RAM pressure, flushing idle inverter={}", *victim);
   }
