@@ -53,6 +53,12 @@ public:
     : CollectionUnavailableError("served by " + std::string(node.empty() ? "(unassigned)" : node)) {}
 };
 
+class NodeSupersededError : public CollectionUnavailableError {
+public:
+  explicit NodeSupersededError(std::string_view node)
+    : CollectionUnavailableError("process for node '" + std::string(node) + "' was superseded") {}
+};
+
 class CollectionExistsError : public ApiError {
 public:
   explicit CollectionExistsError(const std::string& message)

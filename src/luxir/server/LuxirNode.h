@@ -53,6 +53,7 @@ public:
 
   const LuxirConfig& getConfig() const { return config; }
   const std::string& nodeId() const { return config.node.id; }
+  const std::string& nodeLifetime() const { return lifetime; }
   Mode getMode() const { return mode; }
   // Null for a missing state or a different concrete state type.
   template <class T>
@@ -158,6 +159,7 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  std::string lifetime;
   const Mode mode;
   Now clock;
 

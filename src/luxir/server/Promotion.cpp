@@ -88,13 +88,14 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
   FSDirFactory factory(dataDir);
   TenantCatalog::initialize(factory, true);
   auto node = newUuid();
-  TenantCatalog::recover(factory, true, node);
+  auto lifetime = newUuid();
+  TenantCatalog::recover(factory, true, node, lifetime);
   auto metadata = factory.directory(StorageRoot::NODE_PRIVATE, "");
   auto state = ReplicationState::read(*metadata->openFile("replication.json"));
   size_t promotedCount = 0, failed = 0;
   for (const auto& id : TenantCatalog::collections(factory)) {
     try {
-      TenantCatalog storage(factory, id.tenant, node);
+      TenantCatalog storage(factory, id.tenant, node, lifetime);
       auto selected = storage.current(id.name);
       if (!selected) continue;
       auto& history = state.tenants[id.tenant].incarnations;

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 #include <future>
+#include <glaze/glaze.hpp>
 #include "luxir/server/TenantCatalog.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/util/Uuid.h"
@@ -13,6 +14,7 @@ using namespace std::chrono_literals;
 
 class TenantCatalogTest : public LuxirTest, public testing::WithParamInterface<bool> {
 protected:
+  std::string lifetime = newUuid();
   std::filesystem::path path;
   std::unique_ptr<DirectoryFactory> factory;
   void SetUp() override {
@@ -34,7 +36,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, TenantCatalogTest, testing::Bool());
 TEST_P(TenantCatalogTest, deletionRetainsPublishedTreeAndAllowsNameReuse) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto old = catalog.reserve("main");
   populate(catalog, old); catalog.activate("main", old);
   auto dir = catalog.directory(old);
@@ -62,7 +64,7 @@ TEST_P(TenantCatalogTest, deletionRetainsPublishedTreeAndAllowsNameReuse) {
 TEST_P(TenantCatalogTest, replacementAndApplyRetainTheirPreviousTrees) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto first = catalog.reserve("main");
   populate(catalog, first); catalog.activate("main", first);
   auto second = catalog.reserve("main");
@@ -84,12 +86,12 @@ TEST_P(TenantCatalogTest, replacementAndApplyRetainTheirPreviousTrees) {
 TEST_P(TenantCatalogTest, startupKeepsDeadlineAndImmediatelyRemovesAbandonedReservations) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto old = catalog.reserve("main");
   populate(catalog, old); catalog.activate("main", old); catalog.remove("main");
   auto abandoned = catalog.reserve("abandoned");
   time += 20ms;
-  TenantCatalog restarted(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog restarted(*factory, "t0", "test", lifetime, [&] { return time; });
   restarted.cleanup(false);
   EXPECT_EQ(1000, restarted.owned(old).retired_ms);
   EXPECT_TRUE(restarted.directory(old)->readPublished("STATE"));
@@ -102,7 +104,7 @@ TEST_P(TenantCatalogTest, startupKeepsDeadlineAndImmediatelyRemovesAbandonedRese
 TEST_P(TenantCatalogTest, retirementStallDoesNotConsumeRetention) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto id = catalog.reserve("main");
   populate(catalog, id); catalog.activate("main", id);
   bool stalled = false;
@@ -123,7 +125,7 @@ TEST_P(TenantCatalogTest, retirementStallDoesNotConsumeRetention) {
 TEST_P(TenantCatalogTest, startupFinishesAnInterruptedRetirementTimestamp) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto id = catalog.reserve("main");
   populate(catalog, id); catalog.activate("main", id);
   Signal::listen("catalogRead", [&](void* source, void*, void*) -> void* {
@@ -134,7 +136,7 @@ TEST_P(TenantCatalogTest, startupFinishesAnInterruptedRetirementTimestamp) {
   EXPECT_THROW(catalog.remove("main"), FileIOException);
   EXPECT_EQ(0, catalog.owned(id).retired_ms);
   time += 1h;
-  TenantCatalog restarted(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog restarted(*factory, "t0", "test", lifetime, [&] { return time; });
   restarted.cleanup(false);
   EXPECT_TRUE(restarted.directory(id)->readPublished("STATE"));
   time += 100ms; restarted.expire();
@@ -144,7 +146,7 @@ TEST_P(TenantCatalogTest, startupFinishesAnInterruptedRetirementTimestamp) {
 TEST_P(TenantCatalogTest, renamesAndAssignmentCarryRetirementHistory) {
   factory->retention = 100ms;
   auto time = TenantCatalog::Clock::time_point(1000ms);
-  TenantCatalog catalog(*factory, "t0", "test", [&] { return time; });
+  TenantCatalog catalog(*factory, "t0", "test", lifetime, [&] { return time; });
   auto old = catalog.reserve("a");
   populate(catalog, old); catalog.activate("a", old);
   auto next = catalog.reserve("a");
@@ -155,14 +157,14 @@ TEST_P(TenantCatalogTest, renamesAndAssignmentCarryRetirementHistory) {
   ASSERT_TRUE(catalog.assign(next, "test", "target"));
   time += 100ms; catalog.expire();
   EXPECT_TRUE(catalog.directory(old)->readPublished("STATE"));
-  TenantCatalog target(*factory, "t0", "target", [&] { return time; });
+  TenantCatalog target(*factory, "t0", "target", lifetime, [&] { return time; });
   target.expire();
   EXPECT_FALSE(target.directory(old)->readPublished("STATE"));
   EXPECT_EQ(next, target.current("b"));
 }
 
 TEST_P(TenantCatalogTest, createReplaceAndRemove) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto first = catalog.reserve("main", {}, true);
   EXPECT_EQ("reserved", catalog.read().entries.front().state);
   populate(catalog, first);
@@ -173,7 +175,7 @@ TEST_P(TenantCatalogTest, createReplaceAndRemove) {
   populate(catalog, next);
   catalog.activate("main", next);
   EXPECT_EQ("retiring", catalog.read().entries.front().state);
-  TenantCatalog reopened(*factory, "t0", "test");
+  TenantCatalog reopened(*factory, "t0", "test", lifetime);
   reopened.cleanup(false);
   EXPECT_EQ(std::vector<std::string>{next}, reopened.incarnations("main"));
   EXPECT_FALSE(reopened.directory(first)->openFile("commit_1.1"));
@@ -192,20 +194,20 @@ TEST_P(TenantCatalogTest, createReplaceAndRemove) {
 }
 
 TEST_P(TenantCatalogTest, startupKeepsFollowerReservationsAndFinishesRetirement) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto old = catalog.reserve("main");
   populate(catalog, old);
   catalog.activate("main", old);
   auto pending = catalog.reserve("main");
   populate(catalog, pending);
-  TenantCatalog follower(*factory, "t0", "test");
+  TenantCatalog follower(*factory, "t0", "test", lifetime);
   follower.cleanup(true);
   EXPECT_EQ(pending, follower.reserve("main", pending));
   EXPECT_TRUE(follower.directory(pending)->openFile("commit_1.1"));
   follower.activate("main", pending); // crash before deleting the old directory
   auto abandoned = follower.reserve("other");
   populate(follower, abandoned);
-  TenantCatalog restarted(*factory, "t0", "test");
+  TenantCatalog restarted(*factory, "t0", "test", lifetime);
   restarted.cleanup(true);
   EXPECT_FALSE(restarted.directory(old)->openFile("commit_1.1"));
   EXPECT_TRUE(restarted.directory(abandoned)->openFile("commit_1.1"));
@@ -216,7 +218,7 @@ TEST_P(TenantCatalogTest, startupKeepsFollowerReservationsAndFinishesRetirement)
 }
 
 TEST_P(TenantCatalogTest, removalLeavesOtherNamesRetiringIncarnationsAlone) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto retained = catalog.reserve("retained");
   populate(catalog, retained); catalog.activate("retained", retained);
   catalog.retire("retained"); // Its caller still holds this incarnation.
@@ -229,7 +231,7 @@ TEST_P(TenantCatalogTest, removalLeavesOtherNamesRetiringIncarnationsAlone) {
 }
 
 TEST_P(TenantCatalogTest, staleMutationIsReevaluated) {
-  TenantCatalog first(*factory, "t0", "test"), second(*factory, "t0", "test");
+  TenantCatalog first(*factory, "t0", "test", lifetime), second(*factory, "t0", "test", lifetime);
   first.reserve("seed");
   std::promise<void> read, resume;
   auto resumed = resume.get_future().share();
@@ -257,7 +259,7 @@ TEST_P(TenantCatalogTest, clockBehindHighAndOrphansCannotReuseIds) {
   auto tenant = factory->directory(StorageRoot::AUTHORITATIVE, "t/t0");
   std::string bytes = R"({"rev":1,"high":8796093022207,"entries":[]})";
   tenant->publishFile("CATALOG", std::as_bytes(std::span(bytes)), Directory::PublishMode::CREATE_ONLY);
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto first = catalog.reserve("first");
   EXPECT_EQ("80000000000", first);
   catalog.remove("first");
@@ -271,7 +273,7 @@ TEST_P(TenantCatalogTest, clockBehindHighAndOrphansCannotReuseIds) {
 }
 
 TEST_P(TenantCatalogTest, lostPublicationReplyIsReconciled) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   Signal::listen("catalogPublished", [](void*, void*, void*) -> void* { throw FileIOException("lost reply"); });
   auto unlisten = scope_guard([] { Signal::unlisten("catalogPublished"); });
   auto id = catalog.reserve("main");
@@ -283,7 +285,7 @@ TEST_P(TenantCatalogTest, lostPublicationReplyIsReconciled) {
 }
 
 TEST_P(TenantCatalogTest, renameAndSwapAreSingleMutations) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto a = catalog.reserve("a"), b = catalog.reserve("b");
   catalog.activate("a", a); catalog.activate("b", b);
   auto rev = catalog.read().rev;
@@ -299,7 +301,7 @@ TEST_P(TenantCatalogTest, renameAndSwapAreSingleMutations) {
 }
 
 TEST_P(TenantCatalogTest, renameReevaluatesAfterAConflict) {
-  TenantCatalog first(*factory, "t0", "test"), second(*factory, "t0", "test");
+  TenantCatalog first(*factory, "t0", "test", lifetime), second(*factory, "t0", "test", lifetime);
   auto a = first.reserve("a"); first.activate("a", a);
   std::promise<void> read, resume;
   auto resumed = resume.get_future().share();
@@ -317,7 +319,7 @@ TEST_P(TenantCatalogTest, renameReevaluatesAfterAConflict) {
 }
 
 TEST_P(TenantCatalogTest, reservationCreatesStateAndResumesMissingInitialization) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto id = catalog.reserve("main");
   auto dir = catalog.directory(id);
   auto first = IncarnationState::read(*dir).value();
@@ -334,7 +336,7 @@ TEST_P(TenantCatalogTest, reservationCreatesStateAndResumesMissingInitialization
 }
 
 TEST_P(TenantCatalogTest, removalFencesAnOpenWriter) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto id = catalog.reserve("main");
   auto dir = catalog.directory(id);
   CommitSnapshotRegistry snapshots(*dir);
@@ -351,7 +353,7 @@ TEST_P(TenantCatalogTest, removalFencesAnOpenWriter) {
 }
 
 TEST_P(TenantCatalogTest, startupCompletesRemovalAfterStateDeletion) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   auto id = catalog.reserve("main");
   populate(catalog, id);
   catalog.activate("main", id);
@@ -364,7 +366,7 @@ TEST_P(TenantCatalogTest, startupCompletesRemovalAfterStateDeletion) {
   EXPECT_THROW(Manifest::load(*dir), WriterSupersededError);
   EXPECT_EQ("retiring", catalog.read().entries.front().state);
   Signal::unlisten("incarnationStateRemoved");
-  TenantCatalog reopened(*factory, "t0", "test");
+  TenantCatalog reopened(*factory, "t0", "test", lifetime);
   reopened.cleanup(false);
   EXPECT_TRUE(reopened.read().entries.empty());
   EXPECT_TRUE(factory->children(StorageRoot::AUTHORITATIVE, "t/t0/i").empty());
@@ -372,28 +374,40 @@ TEST_P(TenantCatalogTest, startupCompletesRemovalAfterStateDeletion) {
 }
 
 TEST_P(TenantCatalogTest, startupDoesNotRevisitDeletedIncarnations) {
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   for (int i = 0; i < 32; i++) { catalog.reserve("main"); catalog.remove("main"); }
   EXPECT_TRUE(factory->children(StorageRoot::AUTHORITATIVE, "t/t0/i").empty());
-  unsigned reads = 0, syncs = 0;
-  Signal::listen("catalogRead", [&](void*, void*, void*) -> void* { reads++; return nullptr; });
-  Signal::listen("fsSynced", [&](void*, void*, void*) -> void* { syncs++; return nullptr; });
-  auto unlisten = scope_guard([] { Signal::unlisten("catalogRead"); Signal::unlisten("fsSynced"); });
-  TenantCatalog reopened(*factory, "t0", "test");
+  auto revision = catalog.read().rev;
+  unsigned removed = 0;
+  Signal::listen("incarnationStateRemoved", [&](void*, void*, void*) -> void* { removed++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("incarnationStateRemoved"); });
+  TenantCatalog reopened(*factory, "t0", "test", lifetime);
   reopened.cleanup(false);
-  EXPECT_EQ(0u, reads);
-  EXPECT_EQ(0u, syncs);
+  EXPECT_EQ(0u, removed);
+  EXPECT_EQ(revision, reopened.read().rev);
 }
 
 TEST_P(TenantCatalogTest, acceptsLegacyEntriesAndAdoptsOnlyWhenNeeded) {
   auto dir = factory->directory(StorageRoot::AUTHORITATIVE, "t/t0");
   std::string bytes = R"({"rev":1,"high":1,"entries":[{"id":"00000000001","name":"main","state":"reserved"}]})";
   dir->publishFile("CATALOG", std::as_bytes(std::span(bytes)), Directory::PublishMode::CREATE_ONLY);
-  TenantCatalog catalog(*factory, "t0", "test");
+  TenantCatalog catalog(*factory, "t0", "test", lifetime);
   EXPECT_TRUE(catalog.read().entries[0].node.empty());
   catalog.adopt();
   EXPECT_EQ("test", catalog.read().entries[0].node);
   EXPECT_EQ(2u, catalog.read().rev);
   catalog.adopt();
   EXPECT_EQ(2u, catalog.read().rev);
+}
+
+TEST_P(TenantCatalogTest, validatesNodeIdsAndLifetimes) {
+  auto dir = factory->directory(StorageRoot::AUTHORITATIVE, "t/t0");
+  for (auto invalid : {std::pair{std::string("../bad"), lifetime}, std::pair{std::string("test"), std::string("not-a-uuid")}}) {
+    TenantCatalog::State state;
+    state.nodes.emplace(invalid);
+    auto bytes = glz::write_json(state).value();
+    dir->publishFile("CATALOG", std::as_bytes(std::span(bytes)), Directory::PublishMode::REPLACE);
+    TenantCatalog catalog(*factory, "t0", "test", lifetime);
+    EXPECT_THROW(catalog.read(), std::exception);
+  }
 }

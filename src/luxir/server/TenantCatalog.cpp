@@ -13,6 +13,9 @@ namespace luxir {
 namespace {
 constexpr auto authoritative = StorageRoot::AUTHORITATIVE;
 constexpr std::string_view layout = "tenant/catalog/incarnation 2\n";
+void logSuperseded(std::atomic<bool>& logged, std::string_view tenant, std::string_view node) {
+  if (!logged.exchange(true, std::memory_order_relaxed)) LOG_WARN("Tenant {}: another process took over node id {}", tenant, node);
+}
 std::vector<std::string> catalogTenants(DirectoryFactory& factory) {
   std::vector<std::string> names;
   for (const auto& child : factory.children(authoritative, "t")) if (child.directory) {
@@ -24,9 +27,11 @@ std::vector<std::string> catalogTenants(DirectoryFactory& factory) {
 }
 }
 
-TenantCatalog::TenantCatalog(DirectoryFactory& factory, std::string_view tenant, std::string_view node, Now now)
-    : factory(factory), tenant(tenant), node(node), path("t/" + std::string(tenant)), now(std::move(now)) {
+TenantCatalog::TenantCatalog(DirectoryFactory& factory, std::string_view tenant, std::string_view node, std::string_view lifetime, Now now)
+    : factory(factory), tenant(tenant), node(node), lifetime(lifetime), path("t/" + std::string(tenant)), now(std::move(now)) {
   Collections::validateName(tenant, "tenant");
+  if (!node.empty()) NodeConfig{std::string(node)}.validate();
+  if (!lifetime.empty() && !isUuid(lifetime)) throw std::invalid_argument("node lifetime must be a UUID");
   if (auto memory = factory.memory()) tenantAccount = memory->child(std::string(tenant));
 }
 
@@ -59,6 +64,10 @@ TenantCatalog::Snapshot TenantCatalog::snapshot() {
   if (!result.publication) return result;
   if (glz::read_json(result.state, result.publication->bytes)) throw std::runtime_error("invalid tenant CATALOG: " + tenant);
   if (result.state.high > 0xfffffffffffULL) throw std::runtime_error("invalid catalog high-water");
+  for (const auto& [id, lifetime] : result.state.nodes) {
+    NodeConfig{id}.validate();
+    if (!isUuid(lifetime)) throw std::runtime_error("invalid catalog node lifetime");
+  }
   std::set<std::string> ids, active;
   for (const auto& entry : result.state.entries) {
     if (incarnationNumber(entry.id) > result.state.high || !ids.insert(entry.id).second) throw std::runtime_error("invalid catalog incarnation");
@@ -76,6 +85,8 @@ TenantCatalog::Snapshot TenantCatalog::snapshot() {
 TenantCatalog::State TenantCatalog::read() { return snapshot().state; }
 
 bool TenantCatalog::hasRetirements(const State& state) const {
+  auto current = state.nodes.find(node);
+  if (current != state.nodes.end() && current->second != lifetime) return false;
   return std::ranges::any_of(state.entries, [&](const auto& entry) { return entry.node == node && entry.state == "retiring"; });
 }
 
@@ -87,10 +98,23 @@ void TenantCatalog::requireOwner(const Entry& entry) const {
   if (entry.node != node) throw CollectionServedByError(entry.node);
 }
 
+void TenantCatalog::requireLifetime(const State& state) {
+  if (node.empty() || lifetime.empty()) throw std::logic_error("catalog mutation requires a node id and lifetime");
+  auto current = state.nodes.find(node);
+  if (current != state.nodes.end() && current->second != lifetime) {
+    pendingRetirements.store(0, std::memory_order_relaxed);
+    logSuperseded(*supersededLogged, tenant, node);
+    throw NodeSupersededError(node);
+  }
+}
+
 void TenantCatalog::adopt() {
   if (!factory.exclusive()) throw std::logic_error("catalog adoption requires exclusive storage");
-  mutate([&](State& state) {
-    bool changed = false;
+  if (node.empty() || lifetime.empty()) throw std::logic_error("catalog adoption requires a node id and lifetime");
+  std::lock_guard lock(mutex);
+  update([&](State& state) {
+    bool changed = state.nodes != std::map<std::string, std::string>{{node, lifetime}};
+    state.nodes = {{node, lifetime}};
     for (auto& entry : state.entries) if (entry.node != node) { entry.node = node; changed = true; }
     return changed;
   });
@@ -121,12 +145,18 @@ std::optional<TenantCatalog::Entry> TenantCatalog::find(std::string_view name) {
 }
 
 TenantCatalog::Entry TenantCatalog::owned(std::string_view id) {
-  for (const auto& entry : read().entries) if (entry.id == id) { requireOwner(entry); return entry; }
+  auto state = read();
+  requireLifetime(state);
+  if (!state.nodes.contains(node)) state = mutate([](State&) { return false; });
+  for (const auto& entry : state.entries) if (entry.id == id) { requireOwner(entry); return entry; }
   throw CollectionUnavailableError("incarnation is no longer in the catalog");
 }
 
 IncarnationState TenantCatalog::claim(std::string_view name, std::string_view id, std::string_view state) {
   auto dir = directory(id);
+  // Read STATE before checking the catalog lifetime. Startup stamps before
+  // opening: an old process can claim first, but the new claim fences it;
+  // if the new claim wins, the old retry sees the new lifetime.
   for (;;) {
     auto before = IncarnationState::read(*dir);
     auto entry = owned(id);
@@ -134,16 +164,19 @@ IncarnationState TenantCatalog::claim(std::string_view name, std::string_view id
     if (!before) throw WriterSupersededError();
     Signal::emit("collectionClaimChecked", this, (void*)&entry);
     if (auto claimed = IncarnationState::claim(*dir, *before)) return *claimed;
-    // Re-read STATE and re-confirm assignment before every attempt, including
-    // conflicts with another lifetime of the same node id.
   }
 }
 
 std::function<void()> TenantCatalog::supersededLogger(std::string id) {
-  return [dir = factory.directory(authoritative, path), node = node, id = std::move(id)] {
+  return [dir = factory.directory(authoritative, path), node = node, lifetime = lifetime, tenant = tenant,
+          logged = supersededLogged, id = std::move(id)] {
     auto publication = dir->readPublished("CATALOG");
     State state;
     if (!publication || glz::read_json(state, publication->bytes)) return;
+    if (auto current = state.nodes.find(node); current != state.nodes.end() && current->second != lifetime) {
+      logSuperseded(*logged, tenant, node);
+      return;
+    }
     auto entry = std::ranges::find(state.entries, id, &Entry::id);
     auto assigned = entry == state.entries.end() ? std::string{} : entry->node;
     if (assigned == node) LOG_WARN("Incarnation {}: another instance with node id {} took over", id, node);
@@ -152,13 +185,19 @@ std::function<void()> TenantCatalog::supersededLogger(std::string id) {
 }
 
 TenantCatalog::State TenantCatalog::mutate(const std::function<bool(State&)>& mutation) {
-  if (node.empty()) throw std::logic_error("catalog mutation requires a node id");
   std::lock_guard lock(mutex);
-  auto state = update(mutation);
+  auto apply = [&](const std::function<bool(State&)>& change) {
+    return update([&](State& state) {
+      requireLifetime(state);
+      bool stamped = state.nodes.try_emplace(node, lifetime).second;
+      return change(state) || stamped;
+    });
+  };
+  auto state = apply(mutation);
   if (factory.retention.count() && std::ranges::any_of(state.entries, [&](const auto& e) { return e.node == node && e.retired_ms == 0; })) {
     // Stamp after the retiring catalog is visible, so a stalled publication
     // cannot consume retention. A crash leaves zero for the next owner to stamp.
-    state = update([&](State& next) {
+    state = apply([&](State& next) {
       bool changed = false;
       auto time = std::max((int64_t)1, (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now().time_since_epoch()).count());
       for (auto& entry : next.entries) if (entry.node == node && entry.retired_ms == 0) {
@@ -442,6 +481,7 @@ void TenantCatalog::remove(std::string_view name) {
 
 // Startup runs before admitting creators. Followers preserve their download reservations.
 void TenantCatalog::cleanup(bool follower) {
+  mutate([](State&) { return false; });
   for (const auto& entry : read().entries) {
     if (entry.node != node) continue;
     if (entry.state == "retiring" || (!follower && entry.state == "reserved")) {
@@ -477,14 +517,25 @@ std::vector<CollectionId> TenantCatalog::collections(DirectoryFactory& factory) 
   }
   return {names.begin(), names.end()};
 }
-void TenantCatalog::recover(DirectoryFactory& factory, bool follower, std::string_view node) {
+void TenantCatalog::recover(DirectoryFactory& factory, bool follower, std::string_view node, std::string_view lifetime) {
   for (const auto& tenant : catalogTenants(factory)) {
-    TenantCatalog catalog(factory, tenant, node);
+    TenantCatalog catalog(factory, tenant, node, lifetime);
     catalog.recover(follower);
   }
 }
 void TenantCatalog::recover(bool follower) {
   if (factory.exclusive()) adopt();
+  else {
+    if (node.empty() || lifetime.empty()) throw std::logic_error("catalog recovery requires a node id and lifetime");
+    std::lock_guard lock(mutex);
+    auto state = update([&](State& state) {
+      bool mentioned = state.nodes.contains(node) || std::ranges::any_of(state.entries, [&](const auto& entry) { return entry.node == node; });
+      if (!mentioned || (state.nodes.contains(node) && state.nodes.at(node) == lifetime)) return false;
+      state.nodes[node] = lifetime;
+      return true;
+    });
+    if (!state.nodes.contains(node)) return;
+  }
   cleanup(follower);
 }
 std::vector<std::string> TenantCatalog::tenants(DirectoryFactory& factory) { return catalogTenants(factory); }

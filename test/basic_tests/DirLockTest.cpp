@@ -12,6 +12,7 @@
 #include "luxir/server/TenantCatalog.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 
 using namespace luxir;
 
@@ -70,7 +71,7 @@ TEST(DirLockTest, unownedFactoryOpensAlongsideTheWriter) {
   TempDir tempDir;
   FSDirFactory writer(tempDir.path());
   TenantCatalog::initialize(writer, true);
-  TenantCatalog(writer, "t0", "test").reserve("main");
+  TenantCatalog(writer, "t0", "test", newUuid()).reserve("main");
 
   FSDirFactory reader(tempDir.path(), /*unowned=*/true);
   EXPECT_EQ(TenantCatalog::collections(reader), std::vector<CollectionId>{CollectionId::of("main")});

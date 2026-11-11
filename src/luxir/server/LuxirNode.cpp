@@ -117,6 +117,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
   if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
   this->config.node.validate();
+  if (!this->config.read_only) lifetime = newUuid();
   ensureWorkerPool(workers + 1);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
@@ -153,7 +154,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena, metrics);
+  collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.

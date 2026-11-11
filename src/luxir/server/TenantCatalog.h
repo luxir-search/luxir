@@ -26,12 +26,15 @@ public:
     uint64_t rev = 0;
     uint64_t high = 0;
     std::string op; // distinguishes identical competing mutations after an unknown outcome
+    std::map<std::string, std::string> nodes;
     std::vector<Entry> entries;
   };
 private:
   DirectoryFactory& factory;
   std::string tenant;
   std::string node;
+  std::string lifetime;
+  std::shared_ptr<std::atomic<bool>> supersededLogged = std::make_shared<std::atomic<bool>>(false);
   std::mutex mutex;
   std::recursive_mutex lifecycle;
   std::shared_ptr<StorageMemory> tenantAccount;
@@ -50,12 +53,13 @@ private:
   bool removalDue(const Entry& entry);
   std::shared_ptr<StorageMemory> account(std::string_view id);
   void requireOwner(const Entry& entry) const;
+  void requireLifetime(const State& state);
 public:
   TenantCatalog(DirectoryFactory& factory, std::string_view tenant = CollectionId::kDefaultTenant,
-                std::string_view node = {}, Now now = Clock::now);
+                std::string_view node = {}, std::string_view lifetime = {}, Now now = Clock::now);
   static void initialize(DirectoryFactory& factory, bool writable);
   static std::vector<CollectionId> collections(DirectoryFactory& factory);
-  static void recover(DirectoryFactory& factory, bool follower, std::string_view node);
+  static void recover(DirectoryFactory& factory, bool follower, std::string_view node, std::string_view lifetime);
   static std::vector<std::string> tenants(DirectoryFactory& factory);
   static bool empty(DirectoryFactory& factory);
   static uint64_t incarnationNumber(std::string_view id);

@@ -115,6 +115,7 @@ private:
   std::shared_ptr<SchemaCache> schemas = std::make_shared<SchemaCache>();
   std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
+  const std::string lifetime;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
@@ -163,7 +164,7 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+  Collections(const LuxirConfig& config, std::string lifetime, CollectionEvents& events, IndexRamBudget& indexRamBudget,
               oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 

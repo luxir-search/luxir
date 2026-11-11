@@ -23,6 +23,14 @@ Shared storage requires a stable id and refuses the random UUID fallback.
 An id must be 1 to 255 bytes of printable ASCII, contain neither `/` nor `\`, and
 must not be `.` or `..`.
 
+Each writable instance has a fresh process-lifetime UUID. On a store without a
+node lock, starting another process with the same id replaces that id's lifetime
+in every tenant CATALOG that already mentions it, before cleanup or STATE claims.
+The older process's catalog mutations and claims then fail with
+`collection_unavailable` (HTTP 503); it logs the takeover once per tenant and
+keeps running. The map is per tenant: a zombie that first touches a tenant the
+replacement never touched holds it until the replacement restarts.
+
 ## Persistent storage
 
 The default backend is in-memory and loses every collection when the process

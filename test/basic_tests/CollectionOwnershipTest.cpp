@@ -173,7 +173,7 @@ TEST_F(CollectionOwnershipTest, failedAssignmentUnloadsToTheCurrentOwner) {
   Signal::listen("catalogRead", [&](void* source, void*, void*) -> void* {
     if (source == &catalog) {
       EXPECT_TRUE(collection->getShard()->getIndexWriter()->isClosed());
-      TenantCatalog other(shared, "t0", "A");
+      TenantCatalog other(shared, "t0", "A", a->nodeLifetime());
       EXPECT_TRUE(other.assign(incarnation, "A", "C"));
     }
     return nullptr;
@@ -204,7 +204,7 @@ TEST_F(CollectionOwnershipTest, deletionAfterForceAssignmentCannotBecomeAnAutoCr
   auto placeholder = b->collections().get(CollectionId::of("c"));
   Signal::listen("catalogPublished", [&](void* source, void*, void*) -> void* {
     if (source == &catalog) {
-      TenantCatalog owner(shared, "t0", "B");
+      TenantCatalog owner(shared, "t0", "B", b->nodeLifetime());
       owner.remove("c");
     }
     return nullptr;
@@ -304,8 +304,9 @@ TEST_F(CollectionOwnershipTest, conditionalClaimCannotFenceTheNewlyAssignedWrite
   startA();
   { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success); }
   auto id = *a->collections().catalog().current("c");
+  auto lifetime = a->nodeLifetime();
   a.reset();
-  TenantCatalog catalog(shared, "t0", "A");
+  TenantCatalog catalog(shared, "t0", "A", lifetime);
   ASSERT_TRUE(catalog.assign(id, "A", "B"));
   auto epoch = IncarnationState::read(*catalog.directory(id))->value.epoch;
   bool raced = false;
@@ -353,7 +354,7 @@ TEST_F(CollectionOwnershipTest, sharedCleanupKeepsOtherNodesEntriesAndOrphanTree
   auto pending = catalog.reserve("pending_a");
   auto retiring = catalog.reserve("retiring_a");
   catalog.retire("retiring_a");
-  TenantCatalog other(a->collections().storage(), "t0", "B");
+  TenantCatalog other(a->collections().storage(), "t0", "B", newUuid());
   auto removed = other.reserve("pending_b");
   auto orphan = shared.directory(StorageRoot::AUTHORITATIVE, "t/t0/i/ffffffffffe");
   orphan->publishFile("data", {}, Directory::PublishMode::CREATE_ONLY);
@@ -412,12 +413,23 @@ TEST_F(CollectionOwnershipTest, mutationRechecksAssignmentAfterAConflict) {
 TEST_F(CollectionOwnershipTest, sameIdRestartReopensItsCollections) {
   startA();
   { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success); }
-  auto before = catalogBytes();
+  a->createCollection(CollectionId{"other", "c"});
+  auto& empty = a->collections().catalog("empty");
+  empty.reserve("unused"); empty.remove("unused");
+  ASSERT_TRUE(empty.read().entries.empty());
+  auto previous = a->nodeLifetime();
   auto id = *a->collections().catalog().current("c");
   a.reset(); startA();
-  EXPECT_EQ(before, catalogBytes());
+  EXPECT_NE(previous, a->nodeLifetime());
+  for (auto tenant : {"t0", "other", "empty"}) EXPECT_EQ(a->nodeLifetime(), a->collections().catalog(tenant).read().nodes.at("A"));
+  EXPECT_TRUE(a->collections().catalog("empty").read().entries.empty());
+  a->createCollection(CollectionId{"empty", "new"});
   EXPECT_EQ(id, a->collections().catalog().current("c"));
   EXPECT_EQ(1, a->getCollection("c")->getReaderManager().getReader()->liveDocs());
+  for (const auto& name : {CollectionId::of("c"), CollectionId{"other", "c"}, CollectionId{"empty", "new"}}) {
+    CollectionHelper c(*a, name);
+    EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
+  }
 }
 
 TEST_F(CollectionOwnershipTest, newOwnerRetainsThePreviousOwnersSnapshots) {
@@ -489,6 +501,7 @@ TEST_F(CollectionOwnershipTest, exclusiveStartupAdoptsAllEntriesInOneMutation) {
   a.reset(); cfg.node.id = "B";
   b = std::make_unique<LuxirNode>(cfg);
   EXPECT_TRUE(b->collections().storage().exclusive());
+  EXPECT_EQ((std::map<std::string, std::string>{{"B", b->nodeLifetime()}}), b->collections().catalog().read().nodes);
   EXPECT_EQ(rev + 1, b->collections().catalog().read().rev);
   for (const auto& entry : b->collections().catalog().read().entries) EXPECT_EQ("B", entry.node);
   EXPECT_EQ(id, b->collections().catalog().current("c"));
@@ -515,12 +528,12 @@ TEST_F(CollectionOwnershipTest, handoffMovesPendingRetirementsToTheTarget) {
   auto time = TenantCatalog::Clock::time_point(std::chrono::milliseconds(*catalog.owned(old).retired_ms + 1000));
   cfg.node.id = "B"; b = std::make_unique<LuxirNode>(cfg);
   a->detachCollection("c", "B");
-  TenantCatalog previous(a->collections().storage(), "t0", "A", [&] { return time; });
+  TenantCatalog previous(a->collections().storage(), "t0", "A", a->nodeLifetime(), [&] { return time; });
   previous.expire();
   EXPECT_TRUE(catalog.directory(old)->readPublished("STATE"));
   b->attachCollection("c");
   EXPECT_TRUE(b->collections().catalog().hasPendingRetirements());
-  TenantCatalog target(b->collections().storage(), "t0", "B", [&] { return time; });
+  TenantCatalog target(b->collections().storage(), "t0", "B", b->nodeLifetime(), [&] { return time; });
   target.expire();
   EXPECT_FALSE(target.directory(old)->readPublished("STATE"));
   EXPECT_TRUE(target.current("c"));
@@ -538,7 +551,7 @@ TEST_F(CollectionOwnershipTest, forceAttachMovesTheDeadOwnersPendingRetirements)
   cfg.node.id = "B"; b = std::make_unique<LuxirNode>(cfg);
   b->attachCollection("c", true);
   EXPECT_TRUE(b->collections().catalog().hasPendingRetirements());
-  TenantCatalog target(b->collections().storage(), "t0", "B", [&] { return time; });
+  TenantCatalog target(b->collections().storage(), "t0", "B", b->nodeLifetime(), [&] { return time; });
   target.expire();
   EXPECT_FALSE(target.directory(old)->readPublished("STATE"));
   EXPECT_TRUE(target.current("c"));
@@ -579,4 +592,70 @@ TEST_F(CollectionOwnershipTest, expiryDoesNoStoreAccessWithoutPendingRetirements
   before = operations.load();
   a->collections().expireRetirements();
   EXPECT_EQ(before, operations.load());
+}
+
+TEST_F(CollectionOwnershipTest, sameIdReplacementFencesCatalogMutationsEvenAfterAConflict) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success); }
+  auto& catalog = a->collections().catalog();
+  bool restarted = false;
+  Signal::listen("catalogRead", [&](void* source, void*, void*) -> void* {
+    if (source == &catalog && !restarted) { restarted = true; b = std::make_unique<LuxirNode>(config("A")); }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("catalogRead"); });
+  EXPECT_THROW(a->createCollection("new"), NodeSupersededError);
+  ASSERT_TRUE(restarted);
+  Signal::unlisten("catalogRead");
+  EXPECT_NE(a->nodeLifetime(), b->nodeLifetime());
+  auto before = catalogBytes();
+  EXPECT_THROW(a->renameCollection(CollectionId::of("c"), CollectionId::of("renamed")), NodeSupersededError);
+  EXPECT_THROW(a->detachCollection("c", "B"), NodeSupersededError);
+  EXPECT_THROW(a->deleteCollection("c"), NodeSupersededError);
+  EXPECT_THROW(catalog.cleanup(false), NodeSupersededError);
+  EXPECT_EQ(before, catalogBytes());
+  CollectionHelper c(*b, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "second"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(2, c.collection().getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(ErrorKind::UNAVAILABLE, classifyException(NodeSupersededError("A"), ErrorKind::INTERNAL).kind);
+}
+
+TEST_F(CollectionOwnershipTest, supersededAttachCannotClaimState) {
+  startA(); a->createCollection("c");
+  a->detachCollection("c", "B");
+  b = std::make_unique<LuxirNode>(config("A"));
+  auto collection = b->attachCollection("c", true);
+  auto dir = collection->getShard()->getDirectory();
+  auto before = IncarnationState::read(*dir);
+  EXPECT_THROW(a->attachCollection("c", true), NodeSupersededError);
+  EXPECT_EQ(before->version, IncarnationState::read(*dir)->version);
+  CollectionHelper c(*b, "c");
+  EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
+}
+
+TEST_F(CollectionOwnershipTest, claimRetryChecksTheReplacementLifetime) {
+  startA(); a->createCollection("c");
+  auto id = *a->collections().catalog().current("c");
+  bool restarted = false;
+  Signal::listen("collectionClaimChecked", [&](void*, void* value, void*) -> void* {
+    if (((TenantCatalog::Entry*)value)->id == id && !restarted) {
+      restarted = true;
+      b = std::make_unique<LuxirNode>(config("A"));
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("collectionClaimChecked"); });
+  EXPECT_THROW(a->collections().catalog().claim("c", id, "active"), NodeSupersededError);
+  ASSERT_TRUE(restarted);
+  CollectionHelper c(*b, "c");
+  EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
+}
+
+TEST_F(CollectionOwnershipTest, untouchedTenantBelongsToItsFirstProcessUntilRestart) {
+  startA(); b = std::make_unique<LuxirNode>(config("A"));
+  a->createCollection(CollectionId{"late", "c"});
+  EXPECT_THROW(b->createCollection((CollectionId{"late", "other"})), NodeSupersededError);
+  b.reset(); b = std::make_unique<LuxirNode>(config("A"));
+  CollectionHelper c(*b, CollectionId{"late", "c"});
+  EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
 }

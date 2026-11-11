@@ -42,6 +42,17 @@ Remote durability is reported separately from local visibility. Flushes and
 commits do not wait for the store. A commit request can ask to wait until
 HEAD covers it.
 
+## Catalog ownership
+
+Each tenant's CATALOG records `nodes`, a map from node id to process-lifetime
+UUID. If two processes use one id on a store without a node lock, the newer
+process replaces its lifetime at startup in every tenant that already mentions
+the id, before cleanup or opening writers. The older process's mutations and
+STATE claims fail with UNAVAILABLE, and it logs the takeover once per tenant.
+A tenant not mentioning the id is stamped lazily: a zombie that first touches a
+tenant the replacement never touched holds it until the replacement restarts.
+Exclusive startup resets the map to just its current node and lifetime.
+
 ## Local storage and the cache
 
 Once a file is published, its local copy is a cache entry and can be

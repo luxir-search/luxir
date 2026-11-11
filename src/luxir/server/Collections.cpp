@@ -88,9 +88,9 @@ void Collections::validate(const CollectionId& id) {
   validateName(id.name);
 }
 
-Collections::Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+Collections::Collections(const LuxirConfig& config, std::string lifetime, CollectionEvents& events, IndexRamBudget& indexRamBudget,
                          oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics)
-    : metrics(std::move(metrics)), config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
+    : metrics(std::move(metrics)), config(config), lifetime(std::move(lifetime)), events(events), indexRamBudget(indexRamBudget), arena(arena),
       verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   // Backend, then plugin layers (innermost first), then the core wrappers below.
@@ -148,7 +148,7 @@ void Collections::expireRetirements() {
 TenantCatalog& Collections::catalog(std::string_view tenant) {
   std::lock_guard lock(catalogsMutex);
   auto it = catalogs.find(tenant);
-  if (it == catalogs.end()) it = catalogs.emplace(std::string(tenant), std::make_unique<TenantCatalog>(*factory, tenant, config.node.id)).first;
+  if (it == catalogs.end()) it = catalogs.emplace(std::string(tenant), std::make_unique<TenantCatalog>(*factory, tenant, config.node.id, lifetime)).first;
   return *it->second;
 }
 
