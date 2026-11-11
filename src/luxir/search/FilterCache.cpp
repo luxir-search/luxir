@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -61,7 +62,7 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
   : docs(std::move(docs)),
     charge((uint32_t) this->docs->ramBytesUsed()),
     buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
-    priority(0)
+    touchClock(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
     #endif
@@ -76,7 +77,7 @@ FilterCache::ReaderValue::ReaderValue(
     uint64_t buildCostNanos, bool claimedBuild)
   : readerVersion_(readerVersion), charge(0),
     buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
-    priority(0) {
+    touchClock(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
         "reader-stable DocSets must align with reader segments");
@@ -948,6 +949,35 @@ void FilterCache::AdmissionRing::reset() {
   filled = 0;
 }
 
+std::vector<uint64_t> FilterCache::AdmissionRing::snapshotSortedHistory() {
+  // The history capacity is fixed. Allocate before locking so record() waits
+  // only for a contiguous copy, never for allocation or sorting.
+  std::vector<uint64_t> snapshot(history.size());
+  size_t size;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    size = filled;
+    std::copy_n(history.begin(), size, snapshot.begin());
+  }
+  snapshot.resize(size);
+  std::sort(snapshot.begin(), snapshot.end());
+  return snapshot;
+}
+
+uint32_t FilterCache::RecentUses::count(uint64_t fingerprint) const {
+  auto countIn = [fingerprint](const std::vector<uint64_t>& history) {
+    auto [first, last] = std::equal_range(
+        history.begin(), history.end(), fingerprint);
+    return (uint32_t)(last - first);
+  };
+  return std::max(countIn(clause), countIn(whole));
+}
+
+FilterCache::RecentUses FilterCache::snapshotRecentUses() {
+  return {clauseAdmission.snapshotSortedHistory(),
+          wholeAdmission.snapshotSortedHistory()};
+}
+
 FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
   return lane == AdmissionLane::CLAUSE
       ? clauseAdmission : wholeAdmission;
@@ -1480,8 +1510,8 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
         // Density is written once before release-publication; touches only
         // combine this frozen value with the current inflation clock.
         local->density = (double) local->buildCostNanos / effectiveBytes;
-        local->priority.store(
-            evictionClock.load(std::memory_order_relaxed) + local->density,
+        local->touchClock.store(
+            evictionClock.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         // Charge before visibility. Eviction detaches with a value CAS and
         // subtracts this exact immutable charge once; readers can pin the
@@ -1560,9 +1590,8 @@ FilterCache::publishReaderValue(
             *localEntry, local->ramBytesUsed(), valueCount);
         mutableLocal->density =
             (double) mutableLocal->buildCostNanos / effectiveBytes;
-        mutableLocal->priority.store(
-            evictionClock.load(std::memory_order_relaxed)
-                + mutableLocal->density,
+        mutableLocal->touchClock.store(
+            evictionClock.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         // Charge before visibility. The exchange is the one detach event for
         // any prior whole-reader value; its immutable charge is then retired
@@ -1743,24 +1772,30 @@ void FilterCache::sweep() {
       SweepGuard guard{sweeping};
       while (residentBytes.load(std::memory_order_relaxed)
              > lowWatermarkBytes(budgetBytes())) {
-        std::vector<std::shared_ptr<FilterEntry>> entrySnapshot;
+        // Copy each lane under its mutex, then release both before walking
+        // entries. Every value of a key gets the same weight this iteration.
+        auto counts = config.recentDemandEviction
+            ? snapshotRecentUses() : RecentUses{};
+        std::vector<std::pair<std::shared_ptr<FilterEntry>, uint32_t>> entrySnapshot;
         entrySnapshot.reserve(entries.size());
         entries.cvisit_all([&](const auto& item) {
-          entrySnapshot.push_back(item.second);
+          uint32_t count = counts.count(item.first.hash());
+          entrySnapshot.emplace_back(item.second,
+              std::bit_width(std::max<uint32_t>(count, 1)));
         });
         std::vector<Candidate> candidates;
-        for (const auto& entry : entrySnapshot) {
+        for (const auto& [entry, weight] : entrySnapshot) {
           auto readerValue = entry->readerValue.load(std::memory_order_acquire);
           if (readerValue != nullptr) {
             candidates.push_back({nullptr, entry, nullptr, readerValue,
-                                  readerValue->evictionPriority()});
+                                  readerValue->evictionPriority(weight)});
           }
           auto slots = entry->slots.load(std::memory_order_acquire);
           for (const auto& slot : *slots) {
             auto value = slot->value.load(std::memory_order_acquire);
             if (value != nullptr) {
               candidates.push_back({slot, nullptr, value, nullptr,
-                                    value->evictionPriority()});
+                                    value->evictionPriority(weight)});
             }
           }
         }
@@ -1992,6 +2027,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
                                                       size_t* totalResident) {
   std::vector<EntryDump> rows;
   size_t resident = 0;
+  auto counts = snapshotRecentUses();
   entries.cvisit_all([&](const auto& item) {
     const FilterKey& key = item.first;
     const std::shared_ptr<FilterEntry>& entry = item.second;
@@ -2015,6 +2051,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
     if (row.bytes == 0) return;
     resident++;
     row.keyHash = key.hash();
+    row.recentUses = counts.count(row.keyHash);
     row.keyBytes = key.bytes().size();
     row.scope = entry->scope;
     row.lastUsed = entry->lastUsed.load(std::memory_order_relaxed);

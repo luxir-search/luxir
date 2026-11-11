@@ -469,6 +469,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
       out.build_us = row.buildNanos / 1000;
+      out.recent_uses = row.recentUses;
     }
   }
 }

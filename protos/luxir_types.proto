@@ -2278,6 +2278,8 @@ message CacheEntryDump {
   uint64 last_used_epoch = 9;
   // Summed build time of this entry's resident values, in microseconds.
   uint64 build_us = 10;
+  // Current key uses in the admission window, taking the max of the two lanes.
+  uint32 recent_uses = 11;
 }
 
 message ShardCacheControl {

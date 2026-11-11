@@ -748,18 +748,21 @@ Search has its own limits:
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
-  disables it). Cached filters are evicted by rebuild cost per byte, so under
-  pressure the cache keeps expensive compound filters and drops cheap ones
-  first. Cache counters appear in `_stats?collections=true`
-  (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
-  `NOW` bound are never cached; see [Dates](dates.md#date-math).
+  disables it). Filters are ranked by rebuild cost per byte, weighted by how
+  often the filter was used recently, including uses that missed the cache.
+  The weight grows logarithmically, so a newly hot filter catches up quickly
+  and an idle one ages out.
+  Cache counters appear in `_stats?collections=true` (and on the collection
+  and tenant `_stats` routes). Date ranges with an unrounded `NOW` bound are
+  never cached; see [Dates](dates.md#date-math).
   Stats report claimed build time in `build_us`, build time served by shared
   hits in `served_build_us`, and zero-hit eviction build time in `dead_build_us`.
   Their Prometheus equivalents are `luxir_filter_cache_build_seconds_total`,
   `luxir_filter_cache_served_build_seconds_total`, and
   `luxir_filter_cache_dead_build_seconds_total`, respectively. Served build time
   is an upper bound on time saved. Claimed time includes rejected publications
-  and excludes byproducts; cache-control dumps report resident build time.
+  and excludes byproducts; cache-control dumps report resident build time
+  and recent use counts.
   The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
   changes the budget at runtime: a shrink evicts down to the new budget, a
   grow evicts nothing, and `0` disables the cache and drops its entries.
