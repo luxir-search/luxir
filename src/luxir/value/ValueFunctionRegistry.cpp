@@ -888,6 +888,12 @@ void prepareGeoDistance(ValueNode&, std::span<const ValueNode* const> args) {
   geo::checkLongitude(constantNumber(*args[2]));
 }
 
+double geoMetersFrom(const geo::HaversinOrigin& origin, int64_t packed) {
+  return geo::haversinMeters(geo::haversinSortKey(
+      origin, geo::decodeLatitude(geo::unpackLatitude(packed)),
+      geo::decodeLongitude(geo::unpackLongitude(packed))));
+}
+
 double geoMeters(BoundValueProgram& program, const ValueNode& node, int64_t packed) {
   const auto& nodes = program.program.nodes;
   return geo::haversinMeters(
@@ -2193,6 +2199,288 @@ ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float sco
 
 ValueResult BoundValueProgram::evalPoint(int32_t docid, float score) {
   return evalNode(program.rootNode, docid, score);
+}
+
+bool BoundValueProgram::compileFused(uint32_t index, std::span<uint8_t> seen,
+                                     uint32_t& count) {
+  if (seen[index]) return true;
+  seen[index] = 1;
+  const ValueNode& node = program.nodes[index];
+  auto scalarColumn = [&](uint32_t child) {
+    const ValueNode& column = program.nodes[child];
+    return column.kind == ValueNodeKind::COLUMN && !valueArray(column.type)
+        && column.type != ValueType::COLUMN_ONLY && nodes[child].column.has_value();
+  };
+  auto anyColumn = [&](uint32_t child) {
+    const ValueNode& column = program.nodes[child];
+    return column.kind == ValueNodeKind::COLUMN
+        && column.type != ValueType::COLUMN_ONLY && nodes[child].column.has_value();
+  };
+  auto scalarConstant = [&](uint32_t child) {
+    const ValueNode& constant = program.nodes[child];
+    return (constant.kind == ValueNodeKind::CONSTANT
+            || constant.kind == ValueNodeKind::VARIABLE)
+        && !valueArray(constant.type);
+  };
+  auto add = [&](FusedValueStep::Kind kind) -> FusedValueStep& {
+    FusedValueStep& step = fusedSteps[count++];
+    step.kind = kind;
+    step.opcode = node.opcode;
+    step.node = index;
+    return step;
+  };
+  auto geoOrigin = [&](const ValueNode& distance) {
+    return geo::HaversinOrigin(constantNumber(program.nodes[distance.children[1]]),
+                               constantNumber(program.nodes[distance.children[2]]));
+  };
+  auto decayParams = [&](FusedValueStep& step) {
+    const ValueNode& origin = program.nodes[node.children[1]];
+    step.decayOrigin = origin.type == ValueType::INT64
+        ? ValueResult::integer(origin.intValue)
+        : ValueResult::floating(origin.doubleValue);
+    step.scale = constantNumber(program.nodes[node.children[2]]);
+    step.offset = node.childCount > 3
+        ? constantNumber(program.nodes[node.children[3]]) : 0.0;
+  };
+  switch (node.kind) {
+    case ValueNodeKind::CONSTANT:
+    case ValueNodeKind::VARIABLE:
+      if (valueArray(node.type)) return false;
+      fusedRegisters[index] = constantNumber(node);
+      return true;
+    case ValueNodeKind::SCORE:
+      add(FusedValueStep::Kind::SCORE);
+      return true;
+    case ValueNodeKind::COLUMN:
+      if (!scalarColumn(index)) return false;
+      add(FusedValueStep::Kind::COLUMN);
+      return true;
+    case ValueNodeKind::DOCID:
+      return false;
+    case ValueNodeKind::FUNCTION:
+      break;
+  }
+  switch (node.opcode) {
+    case ValueOpcode::DEF: {
+      if (node.childCount != 2 || valueArray(node.type)
+          || !scalarColumn(node.children[0]) || !scalarConstant(node.children[1])) {
+        return false;
+      }
+      compileFused(node.children[1], seen, count);
+      FusedValueStep& step = add(FusedValueStep::Kind::DEF_COLUMN);
+      step.a = node.children[0];
+      step.b = node.children[1];
+      return true;
+    }
+    case ValueOpcode::NEG:
+    case ValueOpcode::ABS:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::EXP: {
+      if (node.type != ValueType::DOUBLE || node.childCount != 1
+          || !compileFused(node.children[0], seen, count)) {
+        return false;
+      }
+      add(FusedValueStep::Kind::UNARY).a = node.children[0];
+      return true;
+    }
+    case ValueOpcode::ADD:
+    case ValueOpcode::SUB:
+    case ValueOpcode::MUL:
+    case ValueOpcode::DIV:
+    case ValueOpcode::MIN:
+    case ValueOpcode::MAX:
+    case ValueOpcode::POW: {
+      if (node.type != ValueType::DOUBLE || node.childCount != 2
+          || !compileFused(node.children[0], seen, count)
+          || !compileFused(node.children[1], seen, count)) {
+        return false;
+      }
+      FusedValueStep& step = add(FusedValueStep::Kind::BINARY);
+      step.a = node.children[0];
+      step.b = node.children[1];
+      return true;
+    }
+    case ValueOpcode::GEO_DISTANCE: {
+      if (valueArray(node.type) || !scalarColumn(node.children[0])) return false;
+      FusedValueStep& step = add(FusedValueStep::Kind::GEO_DISTANCE);
+      step.a = node.children[0];
+      step.origin = geoOrigin(node);
+      return true;
+    }
+    case ValueOpcode::DECAY: {
+      const ValueNode& input = program.nodes[node.children[0]];
+      if (input.kind == ValueNodeKind::FUNCTION
+          && input.opcode == ValueOpcode::GEO_DISTANCE
+          && anyColumn(input.children[0])) {
+        FusedValueStep& step = add(FusedValueStep::Kind::GEO_DECAY);
+        step.a = input.children[0];
+        step.origin = geoOrigin(input);
+        decayParams(step);
+        return true;
+      }
+      if (valueArray(input.type) || !compileFused(node.children[0], seen, count)) {
+        return false;
+      }
+      bool integerInput = input.type == ValueType::INT64;
+      if (integerInput && input.kind != ValueNodeKind::COLUMN) return false;
+      FusedValueStep& step = add(FusedValueStep::Kind::DECAY);
+      step.a = node.children[0];
+      step.integerInput = integerInput;
+      decayParams(step);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool BoundValueProgram::prepareFused(MemPool& pool, bool sequential) {
+  if (disableFusedForTests || program.root().type != ValueType::DOUBLE) return false;
+  fusedSteps = pool.make_span<FusedValueStep>(program.nodes.size());
+  fusedRegisters = pool.make_span<double>(program.nodes.size());
+  fusedRaw = pool.make_span<int64_t>(program.nodes.size());
+  auto seen = pool.make_span<uint8_t>(program.nodes.size());
+  std::fill(seen.begin(), seen.end(), (uint8_t)0);
+  uint32_t count = 0;
+  if (!compileFused(program.rootNode, seen, count)) {
+    fusedSteps = {};
+    return false;
+  }
+  fusedSteps = fusedSteps.first(count);
+  fusedSequential = sequential;
+  return true;
+}
+
+bool BoundValueProgram::positionFused(uint32_t index, int32_t docid,
+                                      int64_t& start, int64_t& end) {
+  const ValueNode& node = program.nodes[index];
+  BoundValueNode& bound = nodes[index];
+  auto seek = [&](auto& iterator) {
+    if (iterator->docId() > docid) {
+      iterator.reset();
+      iterator.emplace(*bound.column);
+    }
+    int32_t found = iterator->docId();
+    if (found < docid) found = iterator->advance(docid);
+    if (found != docid) return false;
+    if (node.columnMultiValued && bound.column->multiValued()) {
+      auto range = bound.column->getStartEndValueRank(iterator->rank());
+      start = range.first;
+      end = range.second;
+    } else {
+      start = iterator->rank();
+      end = start + 1;
+    }
+    return true;
+  };
+  return fusedSequential ? seek(bound.bulkIterator) : seek(bound.iterator);
+}
+
+int64_t BoundValueProgram::fusedValueAt(uint32_t index, int64_t rank) {
+  BoundValueNode& bound = nodes[index];
+  return fusedSequential ? bound.bulkIterator->values().valueAt(rank)
+                         : bound.iterator->values().valueAt(rank);
+}
+
+bool BoundValueProgram::evalFused(int32_t docid, float score, double& out) {
+  double* registers = fusedRegisters.data();
+  auto readColumn = [&](uint32_t column, double& value) {
+    int64_t start;
+    int64_t end;
+    if (!positionFused(column, docid, start, end)) return false;
+    int64_t raw = fusedValueAt(column, start);
+    ValueResult decoded = decodeScalarColumnValue(program.nodes[column], raw);
+    if (!decoded.valid) return false;
+    fusedRaw[column] = raw;
+    value = decoded.type == ValueType::DOUBLE ? decoded.doubleValue : (double)decoded.intValue;
+    return true;
+  };
+  for (const FusedValueStep& step : fusedSteps) {
+    double value = 0.0;
+    switch (step.kind) {
+      case FusedValueStep::Kind::SCORE:
+        value = (double)score;
+        break;
+      case FusedValueStep::Kind::COLUMN:
+        if (!readColumn(step.node, value)) return false;
+        break;
+      case FusedValueStep::Kind::DEF_COLUMN:
+        if (!readColumn(step.a, value)) value = registers[step.b];
+        break;
+      case FusedValueStep::Kind::UNARY: {
+        double input = registers[step.a];
+        switch (step.opcode) {
+          case ValueOpcode::NEG: value = -input; break;
+          case ValueOpcode::ABS: value = std::abs(input); break;
+          case ValueOpcode::SQRT: value = std::sqrt(input); break;
+          case ValueOpcode::LOG: value = std::log(input); break;
+          case ValueOpcode::LOG1P: value = std::log1p(input); break;
+          case ValueOpcode::FLOOR: value = std::floor(input); break;
+          case ValueOpcode::EXP: value = std::exp(input); break;
+          default: std::unreachable();
+        }
+        if (!std::isfinite(value)) return false;
+        break;
+      }
+      case FusedValueStep::Kind::BINARY: {
+        double a = registers[step.a];
+        double b = registers[step.b];
+        switch (step.opcode) {
+          case ValueOpcode::ADD: value = a + b; break;
+          case ValueOpcode::SUB: value = a - b; break;
+          case ValueOpcode::MUL: value = a * b; break;
+          case ValueOpcode::DIV:
+            if (b == 0.0) return false;
+            value = a / b;
+            break;
+          case ValueOpcode::MIN: value = std::min(a, b); break;
+          case ValueOpcode::MAX: value = std::max(a, b); break;
+          case ValueOpcode::POW: value = std::pow(a, b); break;
+          default: std::unreachable();
+        }
+        if (!std::isfinite(value)) return false;
+        break;
+      }
+      case FusedValueStep::Kind::GEO_DISTANCE: {
+        int64_t start;
+        int64_t end;
+        if (!positionFused(step.a, docid, start, end)) return false;
+        value = geoMetersFrom(step.origin, fusedValueAt(step.a, start));
+        break;
+      }
+      case FusedValueStep::Kind::GEO_DECAY: {
+        int64_t start;
+        int64_t end;
+        if (!positionFused(step.a, docid, start, end) || start == end) {
+          value = 1.0;
+          break;
+        }
+        double closest = std::numeric_limits<double>::infinity();
+        for (int64_t rank = start; rank < end; rank++) {
+          closest = std::min(closest, decayDistance(
+              ValueResult::floating(geoMetersFrom(step.origin, fusedValueAt(step.a, rank))),
+              step.decayOrigin, step.offset));
+        }
+        value = decayScore(program.nodes[step.node], closest, step.scale);
+        break;
+      }
+      case FusedValueStep::Kind::DECAY: {
+        ValueResult input = step.integerInput
+            ? ValueResult::integer(fusedRaw[step.a])
+            : ValueResult::floating(registers[step.a]);
+        value = decayScore(program.nodes[step.node],
+                           decayDistance(input, step.decayOrigin, step.offset),
+                           step.scale);
+        break;
+      }
+    }
+    registers[step.node] = value;
+  }
+  out = registers[program.rootNode];
+  return true;
 }
 
 ValueResult BoundValueProgram::evalColumnSequential(
