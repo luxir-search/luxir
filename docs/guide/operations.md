@@ -104,11 +104,12 @@ outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
 
 `--store.retention-ms` keeps superseded commits and their files for that many
-milliseconds after the commit that superseded them. It defaults to 0 on exclusive
-stores and 300000 (5 minutes) on shared stores; an explicit value overrides either
-default. Readers on other nodes must refresh within this window minus a margin
-for clock skew. This does not delay deletion of a whole incarnation on delete or
-replacement, and follower pins keep their existing limits.
+milliseconds after their successor is published. After a restart, every older
+commit gets a full window. It defaults to 0 on exclusive stores and 300000
+(5 minutes) on shared stores; an explicit value overrides either default. Readers
+on other nodes must refresh more often than this window. This does not delay
+deletion of a whole incarnation on delete or replacement, and follower pins keep
+their existing limits.
 
 ## Shared filesystem
 
@@ -130,8 +131,8 @@ NFS requires NFSv4 with working server-side locks: no `nolock` or
 `local_lock=flock|all`. A node stalled past its NFSv4 lease between compare and
 rename can lose its lock and overwrite a newer STATE. Files stay intact, but
 acknowledged commits can drop out of STATE. Reads use mmap; set retention X
-larger than any query, with a margin for clock skew. Whole-incarnation deletion
-and replacement still remove their trees immediately.
+larger than any query, with a margin for reader refreshes. Whole-incarnation
+deletion and replacement still remove their trees immediately.
 
 ## Read-only nodes
 
@@ -310,8 +311,9 @@ By default startup does not hash data files (see
 
 Once the new tip is durable, obsolete manifests and unreferenced data become
 eligible for removal after their retention window and any follower pins expire.
-Writer startup reconstructs retention from the manifests and sweeps unreferenced
-index files from fenced, older epochs; it leaves files of newer epochs alone.
+Writer startup holds older manifests and their files for a full retention window
+and sweeps unreferenced index files from fenced, older epochs; it leaves files of
+newer epochs alone.
 Exclusive startup adopts the catalog and cleans up abandoned trees. Shared
 startup cleans up only this node's entries and logs uncataloged trees.
 Removal durably deletes `STATE` first, fencing existing writers, then removes

@@ -59,11 +59,13 @@ durability.
 
 ## Remote readers and retention
 
-Superseded commits and their files are kept for X after the commit that
-superseded them, using its `commit_time`. Readers on other nodes must refresh
-their view within X minus a margin for clock skew. `--store.retention-ms`
+Superseded commits and their files are kept for X from local publication of
+their successor, after its STATE tip is installed. Holds use a steady clock;
+commit timestamps and publication stalls do not shorten the window. Readers on
+other nodes must refresh their view more often than X. `--store.retention-ms`
 sets X: by default 0 on exclusive stores and 5 minutes on shared stores.
-A new writer reconstructs these holds from the manifests; nothing new is stored.
+A new writer holds every older manifest and its files for a full X from startup,
+since their supersession times are unknown. Nothing new is stored.
 
 ## Reading from the store
 

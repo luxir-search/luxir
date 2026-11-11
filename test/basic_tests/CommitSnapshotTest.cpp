@@ -23,22 +23,21 @@ class CommitSnapshotTest : public LuxirTest {};
 TEST_F(CommitSnapshotTest, retentionUsesTheLastReferenceAndSurvivesPinLimits) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now(), start = time;
-  auto wall = CommitSnapshotRegistry::WallClock::now();
-  auto wallMicros = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(wall.time_since_epoch()).count();
-  CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, [&] { return time; }, {}, "t0", 100ms, [&] { return wall; });
+  CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, [&] { return time; }, {}, "t0", 100ms);
   IndexWriter writer(snapshots);
   auto first = snapshots.acquire();
   writer.commit();
   auto second = snapshots.snapshot();
   ASSERT_GT(second->id.index_gen, first->id.index_gen);
   ASSERT_EQ(first->files, second->files);
+  time += 10ms;
   writer.setSchema(Schema::createDefaultSchema());
   auto third = snapshots.snapshot();
   snapshots.setPolicy({1ms, 0});
   EXPECT_EQ(0u, snapshots.stats().budgetDrops);
   EXPECT_FALSE(snapshots.reclaimOldestPin());
-  auto firstExpiry = start + std::chrono::microseconds(second->commitTime - wallMicros) + 100ms;
-  auto secondExpiry = start + std::chrono::microseconds(third->commitTime - wallMicros) + 100ms;
+  auto firstExpiry = start + 100ms;
+  auto secondExpiry = start + 110ms;
   time = firstExpiry;
   snapshots.expire();
   EXPECT_EQ(0u, snapshots.stats().pins);
@@ -57,7 +56,7 @@ TEST_F(CommitSnapshotTest, retentionUsesTheLastReferenceAndSurvivesPinLimits) {
   for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
 }
 
-TEST_F(CommitSnapshotTest, startupRebuildsRetentionAndSweepsExpiredSnapshots) {
+TEST_F(CommitSnapshotTest, startupRetainsAllHistoryForAFullWindow) {
   RAMDir dir;
   std::shared_ptr<const CommitSnapshot> first, second, third;
   {
@@ -71,22 +70,51 @@ TEST_F(CommitSnapshotTest, startupRebuildsRetentionAndSweepsExpiredSnapshots) {
   }
   ASSERT_TRUE(dir.openFile(first->manifestName())); // Closing preserves time holds.
   auto time = CommitSnapshotRegistry::Clock::now(), start = time;
-  auto wall = CommitSnapshotRegistry::WallClock::time_point(std::chrono::microseconds(second->commitTime)) + 100ms;
-  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; }, {}, "t0", 100ms, [&] { return wall; });
+  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; }, {}, "t0", 100ms);
   IndexWriter reopened(snapshots);
-  EXPECT_FALSE(dir.openFile(first->manifestName()));
-  for (const auto& file : first->files) EXPECT_FALSE(dir.openFile(file.name));
-  EXPECT_TRUE(dir.openFile(second->manifestName()));
-  for (const auto& file : second->files) EXPECT_TRUE(dir.openFile(file.name));
-  auto expiry = start + std::chrono::microseconds(third->commitTime - second->commitTime);
-  time = expiry - 1us;
+  time = start + 100ms - 1us;
   snapshots.expire();
-  EXPECT_TRUE(dir.openFile(second->manifestName()));
-  time = expiry;
+  for (const auto& old : {first, second}) {
+    EXPECT_TRUE(dir.openFile(old->manifestName()));
+    for (const auto& file : old->files) EXPECT_TRUE(dir.openFile(file.name));
+  }
+  time = start + 100ms;
   snapshots.expire();
-  EXPECT_FALSE(dir.openFile(second->manifestName()));
-  for (const auto& file : second->files) EXPECT_FALSE(dir.openFile(file.name));
+  for (const auto& old : {first, second}) {
+    EXPECT_FALSE(dir.openFile(old->manifestName()));
+    for (const auto& file : old->files) EXPECT_FALSE(dir.openFile(file.name));
+  }
+  EXPECT_TRUE(dir.openFile(third->manifestName()));
   for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
+}
+
+TEST_F(CommitSnapshotTest, stalledStatePublicationDoesNotConsumeRetention) {
+  auto path = std::filesystem::temp_directory_path() / "luxir-retention-publication";
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirFactory factory(path);
+  auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "index");
+  auto time = CommitSnapshotRegistry::Clock::now();
+  CommitSnapshotRegistry snapshots(reserveIncarnation(*dir), {}, [&] { return time; }, {}, "t0", 20ms);
+  IndexWriter writer(snapshots);
+  auto previous = snapshots.snapshot();
+  bool stalled = false;
+  Signal::listen("publishSynced", [&](void*, void* value, void*) -> void* {
+    if (*(std::string_view*)value == "STATE") {
+      stalled = true;
+      std::this_thread::sleep_for(60ms);
+      time += 60ms;
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishSynced"); });
+  writer.commit();
+  ASSERT_TRUE(stalled);
+  time += 20ms - 1us;
+  snapshots.expire();
+  EXPECT_TRUE(dir->openFile(previous->manifestName()));
+  time += 1us;
+  snapshots.expire();
+  EXPECT_FALSE(dir->openFile(previous->manifestName()));
 }
 
 TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {

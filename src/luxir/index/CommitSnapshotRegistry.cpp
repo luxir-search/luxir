@@ -21,7 +21,7 @@ void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snaps
   if (retention.count()) {
     auto previous = this->snapshot();
     if (previous && previous->manifestName() != snapshot->manifestName()) {
-      if (auto until = retentionUntil(snapshot->commitTime)) retain(*previous, *until);
+      retain(*previous, retentionDeadline());
     }
   }
   // With retention disabled, publication takes no pin lock.
@@ -31,17 +31,10 @@ void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snaps
   if (retention.count()) expire();
 }
 
-std::optional<CommitSnapshotRegistry::Clock::time_point> CommitSnapshotRegistry::retentionUntil(uint64_t successorTime) {
-  if (!retention.count()) return {};
-  uint64_t duration = (uint64_t)retention.count() * 1000;
-  uint64_t expiry = successorTime > UINT64_MAX - duration ? UINT64_MAX : successorTime + duration;
-  auto wall = std::chrono::duration_cast<std::chrono::microseconds>(wallNow().time_since_epoch()).count();
-  uint64_t current = (uint64_t)std::max((int64_t)0, (int64_t)wall);
-  if (expiry <= current) return {};
+auto CommitSnapshotRegistry::retentionDeadline() -> Clock::time_point {
   auto time = now();
-  auto maximum = std::chrono::duration_cast<std::chrono::microseconds>(Clock::time_point::max() - time).count();
-  if (expiry - current >= (uint64_t)maximum) return Clock::time_point::max();
-  return time + std::chrono::microseconds(expiry - current);
+  auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - time);
+  return retention >= maximum ? Clock::time_point::max() : time + retention;
 }
 
 void CommitSnapshotRegistry::retain(const CommitSnapshot& snapshot, Clock::time_point until) {
@@ -58,25 +51,12 @@ void CommitSnapshotRegistry::retain(const CommitSnapshot& snapshot, Clock::time_
 
 void CommitSnapshotRegistry::retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current) {
   if (!retention.count()) return;
-  std::vector<std::shared_ptr<const CommitSnapshot>> history;
+  // Publication times are unknown after restart. Give all history a full window.
+  auto until = retentionDeadline();
   for (const auto& file : listing) {
     auto [generation, epoch] = Manifest::candidate(file.name);
     if (!generation || generation >= current.id.index_gen) continue;
-    if (auto bytes = Manifest::read(dir, generation, epoch)) history.push_back(CommitSnapshot::fromBytes(std::move(bytes)));
-  }
-  std::ranges::sort(history, std::greater<>(), [](const auto& snapshot) { return snapshot->id.index_gen; });
-  uint64_t successorTime = current.commitTime;
-  for (size_t i = 0; i < history.size();) {
-    size_t end = i + 1;
-    while (end < history.size() && history[end]->id.index_gen == history[i]->id.index_gen) end++;
-    auto until = retentionUntil(successorTime);
-    successorTime = 0;
-    for (; i < end; i++) {
-      if (until) retain(*history[i], *until);
-      // Competing candidates of one generation are indistinguishable from
-      // the listing. The latest timestamp conservatively bounds their hold.
-      successorTime = std::max(successorTime, history[i]->commitTime);
-    }
+    if (auto bytes = Manifest::read(dir, generation, epoch)) retain(*CommitSnapshot::fromBytes(std::move(bytes)), until);
   }
 }
 

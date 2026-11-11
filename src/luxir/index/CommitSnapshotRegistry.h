@@ -27,8 +27,6 @@ class CommitSnapshotRegistry {
 public:
   using Clock = std::chrono::steady_clock;
   using Now = std::function<Clock::time_point()>;
-  using WallClock = std::chrono::system_clock;
-  using WallNow = std::function<WallClock::time_point()>;
   struct Policy {
     std::chrono::milliseconds idleTimeout{60'000};
     uint64_t retainedBytes = 1024ULL * 1024 * 1024;
@@ -65,7 +63,6 @@ private:
   Stats counters;
   Now now;
   const std::chrono::milliseconds retention;
-  WallNow wallNow;
   bool closed = false;
   std::map<CommitId, Pin> pins;
   // The current snapshot's descriptors by name, rebuilt once per publication
@@ -90,15 +87,15 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
-  std::optional<Clock::time_point> retentionUntil(uint64_t successorTime);
+  Clock::time_point retentionDeadline();
   void retain(const CommitSnapshot& snapshot, Clock::time_point until);
   void retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current);
   void requireHeld(const FileDescriptor& descriptor);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now,
                                   std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0",
-                                  std::chrono::milliseconds retention = {}, WallNow wallNow = WallClock::now)
-      : now(std::move(now)), retention(retention), wallNow(std::move(wallNow)),
+                                  std::chrono::milliseconds retention = {})
+      : now(std::move(now)), retention(retention),
         schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
         schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {
     if (retention.count() < 0 || retention.count() > INT64_MAX / 1000) throw std::invalid_argument("snapshot retention is out of range");
@@ -111,6 +108,7 @@ public:
   void fail() noexcept;
   // Stop pins and join retirement while admitted searches retain readers.
   void detach() noexcept;
+  // The snapshot's STATE tip must already be installed before publication.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   // Installers other than the writer: make `snapshot`'s root durable, publish it
   // with the prepared reader, then retire the previous root and the files only
