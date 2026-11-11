@@ -2182,6 +2182,15 @@ message QueryCacheStats {
   uint64 thrash_build_skips = 19;
   uint64 reader_dead_builds = 20;
   uint64 reader_thrash_build_skips = 21;
+  // Build time of claimed cache builds, including rejected publications,
+  // in microseconds. Excludes byproducts.
+  uint64 build_us = 22;
+  // Build time of values served as shared hits, in microseconds.
+  // An upper bound on time saved, not measured savings.
+  uint64 served_build_us = 23;
+  // Build time of zero-hit capacity evictions that install bypass debt,
+  // in microseconds.
+  uint64 dead_build_us = 24;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2267,6 +2276,8 @@ message CacheEntryDump {
   uint32 segments_resident = 7;
   uint64 hits = 8;
   uint64 last_used_epoch = 9;
+  // Summed build time of this entry's resident values, in microseconds.
+  uint64 build_us = 10;
 }
 
 message ShardCacheControl {

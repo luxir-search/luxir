@@ -148,6 +148,9 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
       {"reader_stable_hits", c.reader_stable_hits}, {"reader_stable_refreshes", c.reader_stable_refreshes},
       {"reader_stable_retires", c.reader_stable_retires}})
     r.counter(std::string("luxir_filter_cache_") + name + "_total", "Filter-cache events; reset by cache-control reset_counters.", (double)value, labels);
+  r.counter("luxir_filter_cache_build_seconds_total", "Build time of claimed cache builds, including rejected publications; excludes byproducts. Reset by cache-control reset_counters.", (double)c.build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_served_build_seconds_total", "Build time of values served as shared hits; an upper bound on time saved. Reset by cache-control reset_counters.", (double)c.served_build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_dead_build_seconds_total", "Build time of zero-hit capacity evictions that install bypass debt. Reset by cache-control reset_counters.", (double)c.dead_build_us / 1e6, labels);
 }
 
 void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, const std::string& labels) {

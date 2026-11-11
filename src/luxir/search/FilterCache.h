@@ -111,6 +111,9 @@ public:
     uint64_t admissions = 0;
     uint64_t buildAttempts = 0;
     uint64_t builds = 0;
+    uint64_t buildNanos = 0;
+    uint64_t servedBuildNanos = 0;
+    uint64_t deadBuildNanos = 0;
     uint64_t byproductInserts = 0;
     uint64_t publishRejects = 0;
     uint64_t evictions = 0;
@@ -127,11 +130,11 @@ public:
     size_t metadataBytes = 0;
   };
 
-  // GDSF priority is the inflation clock plus a frozen density. The clock
+  // GDS priority is the inflation clock plus a frozen density. The clock
   // only moves forward, so a hit changes the priority only after a sweep has
   // advanced it; skip the store otherwise to keep hot values' cache lines
   // shared across cores. Concurrent relaxed touches may still overwrite one
-  // another; that race is a benign approximation in GDSF.
+  // another; that race is a benign approximation in GDS.
   static void touchPriority(std::atomic<double>& priority, double next) {
     if (priority.load(std::memory_order_relaxed) != next) {
       priority.store(next, std::memory_order_relaxed);
@@ -154,7 +157,7 @@ public:
     // DocSet payload charge only - key bytes are deliberately excluded
     // (entry-lifetime metadataBytes budget, not value lifetime).
     uint32_t charge;
-    uint32_t buildCostMicros;
+    uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
     // Set once capacity eviction has detached this value from its slot.
@@ -167,7 +170,7 @@ public:
 
   public:
     SegmentValue(std::unique_ptr<DocSet> docs,
-                 SegmentIdentity identityForTest, uint32_t buildCostMicros,
+                 SegmentIdentity identityForTest, uint64_t buildCostNanos,
                  bool claimedBuild);
 
     DocSet* docSet() const { return docs.get(); }
@@ -201,7 +204,7 @@ public:
     uint64_t readerVersion_;
     std::vector<SegmentDocs> segments;
     size_t charge;
-    uint32_t buildCostMicros;
+    uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
     double density = 0;
@@ -210,7 +213,7 @@ public:
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
                 std::vector<std::unique_ptr<DocSet>> docs,
-                uint32_t buildCostMicros, bool claimedBuild);
+                uint64_t buildCostNanos, bool claimedBuild);
 
   public:
     uint64_t readerVersion() const { return readerVersion_; }
@@ -401,16 +404,16 @@ public:
     // effectiveDocSet / effectiveDomain seam.
     std::shared_ptr<const SegmentValue> publishRaw(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const SegmentValue> publishRawByproduct(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const SegmentValue> offerRaw(
         size_t segmentOrd, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const ReaderValue> publishReaderStable(
         ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
 
     DocSet* adoptOwnedRaw(size_t segmentOrd, Probe& probe,
                           std::unique_ptr<DocSet> raw);
@@ -592,6 +595,11 @@ private:
     // Bumped on every segment probe by every search thread.
     StripedCounter hits;
     StripedCounter misses;
+    // Build time served is an upper bound on savings: uncached evaluation may
+    // avoid materializing a DocSet. Keep nanoseconds until API conversion.
+    StripedCounter servedBuildNanos;
+    std::atomic<uint64_t> buildNanos{0};
+    std::atomic<uint64_t> deadBuildNanos{0};
     std::atomic<uint64_t> admissions{0};
     std::atomic<uint64_t> buildAttempts{0};
     std::atomic<uint64_t> builds{0};
@@ -637,7 +645,7 @@ private:
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
   std::atomic<uint64_t> epoch{1};
-  // Only the elected sweeper advances the GDSF inflation clock.
+  // Only the elected sweeper advances the GDS inflation clock.
   std::atomic<double> evictionClock{0};
   std::atomic<uint64_t> publishedCoreGen{0};
   std::atomic<uint64_t> publishedReaderVersion{0};
@@ -695,11 +703,11 @@ private:
       const std::shared_ptr<const ReaderValue>& value);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-      bool byproduct, uint32_t buildCostMicros);
+      bool byproduct, uint64_t buildCostNanos);
   std::shared_ptr<const ReaderValue> publishReaderValue(
       Use& use, ReaderProbe& probe,
       std::vector<std::unique_ptr<DocSet>> liveExact,
-      uint32_t buildCostMicros);
+      uint64_t buildCostNanos);
   size_t budgetBytes() const { return budget.load(std::memory_order_relaxed); }
   size_t lowWatermarkBytes(size_t bytes) const;
   size_t maxEntryBytes(size_t bytes) const;
@@ -757,6 +765,7 @@ public:
     uint32_t segmentsResident = 0;
     uint64_t hits = 0;
     uint64_t lastUsed = 0;
+    uint64_t buildNanos = 0;
   };
   std::vector<EntryDump> dump(size_t limit, size_t* totalResident);
 
