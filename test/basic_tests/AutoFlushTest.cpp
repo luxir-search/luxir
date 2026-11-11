@@ -319,6 +319,29 @@ TEST_F(AutoFlushTest, pressureCountsPacketLeftBehind) {
   budget.setTotalBytes(0);
 }
 
+// Unique ids with overwrite on and no commit: no id collides, but every flush
+// leaves a packet holding the inverter's whole id hash. Delete passes retire
+// them, so the bytes held stay a small fraction of those fed.
+TEST_F(AutoFlushTest, uniqueOverwritesRetireWithoutCommit) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  iw->perInverterRamBytes = 1; // every batch flushes
+  int64_t peak = 0;
+  std::vector<Doc> batch(500, flatdoc("id", std::string()));
+  for (int64_t done = 0; done < scaleTestWork(25'000); done += (int64_t)batch.size()) {
+    for (size_t i = 0; i < batch.size(); i++) std::get<std::string>(batch[i][0].val) = std::to_string(done + (int64_t)i);
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT, true).success);
+    peak = std::max(peak, budget.retainedDeleteBytesCount());
+  }
+  iw->updateGraph->wait_for_all();
+  auto stats = iw->stats(false, false);
+  EXPECT_GT(stats.deletePassCount, 0);
+  EXPECT_GT((int64_t)stats.deletePassRetiredBytes, 8 * peak);
+  helper.commit();
+}
+
 // Waits for the budget's reservations to drain back to at most `bound` (the
 // last inverter is destroyed shortly AFTER its flush is observable, so a
 // post-commit check must poll).
