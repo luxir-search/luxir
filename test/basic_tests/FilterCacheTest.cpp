@@ -556,7 +556,7 @@ struct FilterFoldGuard {
 FilterCache::Probe::Kind servePolicyValue(
     FilterCache& cache,
     std::span<const FilterCache::SegmentIdentity> segments,
-    const FilterKey& key, int32_t expectedDoc, uint32_t buildCostMicros,
+    const FilterKey& key, int32_t expectedDoc, uint64_t buildCostNanos,
     int* claimedBuilds = nullptr, bool* sharedHit = nullptr,
     uint64_t readerCoreGen = 1) {
   FilterCache::UseRegistry request(cache, readerCoreGen, segments);
@@ -571,7 +571,7 @@ FilterCache::Probe::Kind servePolicyValue(
   } else if (kind == FilterCache::Probe::Kind::BUILD) {
     if (claimedBuilds != nullptr) (*claimedBuilds)++;
     auto value = use->publishRaw(
-        0, probe, bitDocs(4096, expectedDoc), buildCostMicros);
+        0, probe, bitDocs(4096, expectedDoc), buildCostNanos);
     served = value->docSet();
   } else {
     fallback = bitDocs(4096, expectedDoc);
@@ -643,6 +643,9 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
   EXPECT_EQ(1u, rows[0].segmentsResident);
   EXPECT_GT(rows[0].bytes, 0u);
   EXPECT_GT(rows[0].hits, 0u);
+  EXPECT_EQ(10u, rows[0].buildNanos);
+  EXPECT_EQ(10u, cache.counters().buildNanos);
+  EXPECT_EQ(10u, cache.counters().servedBuildNanos);
 
   // Hot hits keep recording sightings while cold keys roll the ring past the
   // key's first two.
@@ -652,6 +655,8 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
     EXPECT_FALSE(cold.get(FilterKey("flushposture:cold" + std::to_string(i)))
                      ->wasAdmitted());
   }
+
+  EXPECT_EQ(410u, cache.counters().servedBuildNanos);
 
   // Refill posture: values gone, sightings kept, so the next probe claims a
   // build immediately rather than restarting the ladder.
@@ -674,6 +679,9 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
   EXPECT_EQ(0u, counters.misses);
   EXPECT_EQ(0u, counters.builds);
   EXPECT_EQ(0u, counters.admissions);
+  EXPECT_EQ(0u, counters.buildNanos);
+  EXPECT_EQ(0u, counters.servedBuildNanos);
+  EXPECT_EQ(0u, counters.deadBuildNanos);
 }
 
 // resize() rederives the budgets the config left at zero and keeps explicit
@@ -1746,17 +1754,37 @@ TEST(FilterCacheTest, fullBytesDefeatMapHashCollision) {
   EXPECT_TRUE(secondHit.docSet()->get(2));
 }
 
+TEST(FilterCacheTest, zeroBuildCostStaysZero) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("zero-cost");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, key, 1, 0));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            servePolicyValue(cache, segments, key, 1, 0));
+  auto rows = cache.dump(10, nullptr);
+  ASSERT_EQ(1u, rows.size());
+  EXPECT_EQ(0u, rows[0].buildNanos);
+  EXPECT_EQ(0u, cache.counters().buildNanos);
+  EXPECT_EQ(0u, cache.counters().servedBuildNanos);
+}
+
 TEST(FilterCacheTest, entryCapRejectsAndMatchAllDoesNotPopulate) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
-  config.maxEntryBytes = 1;
+  config.maxEntryBytes = FilterKey("large").bytes().size();
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 100}};
   cache.onReaderPublished(1, segments);
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* tooLarge = request.get(FilterKey("large"));
   auto tooLargeProbe = tooLarge->probe(0);
-  tooLarge->publishRaw(0, tooLargeProbe, docs(100, {1}), 1);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, tooLargeProbe.kind());
+  tooLarge->publishRaw(0, tooLargeProbe, docs(100, {1}), 123);
+  EXPECT_EQ(123u, cache.counters().buildNanos);
   EXPECT_EQ(0u, cache.bytesUsed());
 
   config.maxEntryBytes = 1024 * 1024;
@@ -1776,6 +1804,7 @@ TEST(FilterCacheTest, entryCapRejectsAndMatchAllDoesNotPopulate) {
   FilterCache::UseRegistry tinyRequest(tinyCache, 1, segments);
   tinyRequest.get(FilterKey("tiny"))->offerRaw(0, docs(100, {1, 2}), 1);
   EXPECT_EQ(0u, tinyCache.bytesUsed());
+  EXPECT_EQ(0u, tinyCache.counters().buildNanos);
 }
 
 TEST(FilterCacheTest, evictsLowerBenefitDensityAndPinsRetiredValue) {
@@ -1893,6 +1922,7 @@ TEST(FilterCacheTest, evictionBackoffRecoversAndHitResetsDebt) {
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             servePolicyValue(cache, segments, recovering, 2, 1));
   EXPECT_EQ(1u, cache.counters().capacityDeadBuilds);
+  EXPECT_EQ(1u, cache.counters().deadBuildNanos);
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
             servePolicyValue(cache, segments, recovering, 2, 1));
 
@@ -1934,6 +1964,8 @@ TEST(FilterCacheTest, byproductEvictionDoesNotAccrueDeadBuildDebt) {
             servePolicyValue(
                 cache, segments, FilterKey("byproduct-winner"), 2, 100'000));
   EXPECT_EQ(0u, cache.counters().capacityDeadBuilds);
+  EXPECT_EQ(0u, cache.counters().deadBuildNanos);
+  EXPECT_EQ(100'000u, cache.counters().buildNanos);
   EXPECT_EQ(0u, cache.counters().thrashBuildSkips);
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             servePolicyValue(cache, segments, byproduct, 1, 1));
@@ -4416,23 +4448,23 @@ TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
   auto domains = canonicalDomains(*reader);
 
   auto publishReader = [&](FilterCache& cache, const FilterKey& key,
-                           uint32_t buildCostMicros) {
+                           uint64_t buildCostNanos) {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key, FilterKeyScope::READER_STABLE);
     auto probe = use->probeReaderStable(*reader, domains);
     EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
     return use->publishReaderStable(
-        probe, oneDocPerSegment(*reader), buildCostMicros);
+        probe, oneDocPerSegment(*reader), buildCostNanos);
   };
   auto publishSegment = [&](FilterCache& cache, const FilterKey& key,
-                            uint32_t buildCostMicros) {
+                            uint64_t buildCostNanos) {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key);
     auto probe = use->probe(0);
     EXPECT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
     return use->publishRaw(
         0, probe, bitDocs(reader->segments()[0].maxDoc(), 0),
-        buildCostMicros);
+        buildCostNanos);
   };
 
   FilterCacheConfig sizingConfig = testConfig();
@@ -4523,6 +4555,9 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
   publish(*reader, victim, 1);
   publish(*reader, keeper, std::numeric_limits<uint32_t>::max());
   ASSERT_EQ(1u, cache->counters().readerDeadBuilds);
+  EXPECT_EQ(1u, cache->counters().deadBuildNanos);
+  EXPECT_EQ(1ULL + std::numeric_limits<uint32_t>::max(),
+            cache->counters().buildNanos);
 
   for (int bypass = 0; bypass < 2; bypass++) {
     FilterCache::UseRegistry request(*cache, *reader);
@@ -4546,6 +4581,12 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
         ->probeReaderStable(*nextReader, nextDomains);
     ASSERT_EQ(FilterCache::ReaderProbe::Kind::HIT, hit.kind());
   }
+
+  EXPECT_EQ(1u, cache->counters().servedBuildNanos);
+  size_t resident = 0;
+  auto rows = cache->dump(10, &resident);
+  ASSERT_EQ(1u, rows.size());
+  EXPECT_EQ(1u, rows[0].buildNanos);
 
   publish(*nextReader, FilterKey("reader-evictor"),
           std::numeric_limits<uint32_t>::max());

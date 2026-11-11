@@ -56,11 +56,11 @@ void clearIfSet(std::atomic<uint32_t>& value) {
 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
                                         SegmentIdentity identityForTest,
-                                        uint32_t buildCostMicros,
+                                        uint64_t buildCostNanos,
                                         bool claimedBuild)
   : docs(std::move(docs)),
     charge((uint32_t) this->docs->ramBytesUsed()),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
     priority(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
@@ -73,9 +73,9 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
 FilterCache::ReaderValue::ReaderValue(
     uint64_t readerVersion, std::span<const SegmentIdentity> identities,
     std::vector<std::unique_ptr<DocSet>> docs,
-    uint32_t buildCostMicros, bool claimedBuild)
+    uint64_t buildCostNanos, bool claimedBuild)
   : readerVersion_(readerVersion), charge(0),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
     priority(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
@@ -305,6 +305,7 @@ void FilterCache::acceptSharedHit(
     clearIfSet(slot->deadBuildStreak);
     clearIfSet(slot->buildBypassesRemaining);
   }
+  counter.servedBuildNanos.add(value->buildCostNanos);
   value->touch(evictionClock.load(std::memory_order_relaxed));
   touchEpoch(use.entry->lastUsed, use.epoch);
   use.pinValue(segmentOrd, std::move(value));
@@ -325,6 +326,7 @@ void FilterCache::acceptReaderSharedHit(
     clearIfSet(entry->readerDeadBuildStreak);
     clearIfSet(entry->readerBuildBypassesRemaining);
   }
+  counter.servedBuildNanos.add(value->buildCostNanos);
   value->touch(evictionClock.load(std::memory_order_relaxed));
   touchEpoch(entry->lastUsed, use.epoch);
   use.pinReaderValue(value);
@@ -592,9 +594,9 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRaw(size_t segmentOrd, Probe& probe,
                              std::unique_ptr<DocSet> raw,
-                             uint32_t buildCostMicros) {
+                             uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, &probe, std::move(raw), false,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 DocSet* FilterCache::Use::adoptOwnedRaw(
@@ -637,24 +639,24 @@ DocSet* FilterCache::Use::adoptOwnedRaw(
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRawByproduct(size_t segmentOrd, Probe& probe,
                                       std::unique_ptr<DocSet> raw,
-                                      uint32_t buildCostMicros) {
+                                      uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, &probe, std::move(raw), true,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::offerRaw(size_t segmentOrd, std::unique_ptr<DocSet> raw,
-                           uint32_t buildCostMicros) {
+                           uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, nullptr, std::move(raw), true,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::Use::publishReaderStable(
     ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
-    uint32_t buildCostMicros) {
+    uint64_t buildCostNanos) {
   auto value = cache->publishReaderValue(
-      *this, probe, std::move(liveExact), buildCostMicros);
+      *this, probe, std::move(liveExact), buildCostNanos);
   return value;
 }
 
@@ -1051,6 +1053,7 @@ void FilterCache::recordCapacityEviction(
   slot->buildBypassesRemaining.store(bypasses,
                                      std::memory_order_relaxed);
   counter.capacityDeadBuilds.fetch_add(1, std::memory_order_relaxed);
+  counter.deadBuildNanos.fetch_add(value->buildCostNanos, std::memory_order_relaxed);
 }
 
 void FilterCache::recordReaderCapacityEviction(
@@ -1068,6 +1071,7 @@ void FilterCache::recordReaderCapacityEviction(
   entry->readerBuildBypassesRemaining.store(
       bypasses, std::memory_order_relaxed);
   counter.readerDeadBuilds.fetch_add(1, std::memory_order_relaxed);
+  counter.deadBuildNanos.fetch_add(value->buildCostNanos, std::memory_order_relaxed);
 }
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
@@ -1419,7 +1423,7 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
 
 std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-    bool byproduct, uint32_t buildCostMicros) {
+    bool byproduct, uint64_t buildCostNanos) {
   if (use.scope_ == FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
@@ -1429,8 +1433,13 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
   SegmentIdentity identity = segmentOrd < use.readerSegments.size()
       ? use.readerSegments[segmentOrd] : SegmentIdentity{};
   bool claimed = probe != nullptr && probe->ownsClaim;
+  // Count claimed work even if publication rejects it. offerRaw and other
+  // byproducts were materialized for the query, not at the cache's request.
+  if (claimed && !byproduct) {
+    counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
+  }
   auto local = std::make_shared<SegmentValue>(
-      std::move(raw), identity, buildCostMicros,
+      std::move(raw), identity, buildCostNanos,
       claimed && !byproduct);
 
   bool attempted = enabled() && use.entry != nullptr
@@ -1470,7 +1479,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
             *use.entry, local->ramBytesUsed(), valueCount);
         // Density is written once before release-publication; touches only
         // combine this frozen value with the current inflation clock.
-        local->density = (double) local->buildCostMicros / effectiveBytes;
+        local->density = (double) local->buildCostNanos / effectiveBytes;
         local->priority.store(
             evictionClock.load(std::memory_order_relaxed) + local->density,
             std::memory_order_relaxed);
@@ -1505,15 +1514,18 @@ std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::publishReaderValue(
     Use& use, ReaderProbe& probe,
     std::vector<std::unique_ptr<DocSet>> liveExact,
-    uint32_t buildCostMicros) {
+    uint64_t buildCostNanos) {
   if (use.scope_ != FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
         "whole-reader publication requires READER_STABLE scope");
   }
+  if (probe.ownsClaim) {
+    counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
+  }
   auto mutableLocal = std::shared_ptr<ReaderValue>(new ReaderValue(
       use.readerVersion, use.readerSegments, std::move(liveExact),
-      buildCostMicros, probe.ownsClaim));
+      buildCostNanos, probe.ownsClaim));
   std::shared_ptr<const ReaderValue> local = mutableLocal;
   auto localEntry = probe.entry;
   bool inserted = false;
@@ -1547,7 +1559,7 @@ FilterCache::publishReaderValue(
         double effectiveBytes = effectiveValueBytes(
             *localEntry, local->ramBytesUsed(), valueCount);
         mutableLocal->density =
-            (double) mutableLocal->buildCostMicros / effectiveBytes;
+            (double) mutableLocal->buildCostNanos / effectiveBytes;
         mutableLocal->priority.store(
             evictionClock.load(std::memory_order_relaxed)
                 + mutableLocal->density,
@@ -1952,6 +1964,9 @@ void FilterCache::resetAdmission() {
 void FilterCache::resetCounters() {
   counter.hits.reset();
   counter.misses.reset();
+  counter.buildNanos.store(0, std::memory_order_relaxed);
+  counter.servedBuildNanos.reset();
+  counter.deadBuildNanos.store(0, std::memory_order_relaxed);
   counter.admissions.store(0, std::memory_order_relaxed);
   counter.buildAttempts.store(0, std::memory_order_relaxed);
   counter.builds.store(0, std::memory_order_relaxed);
@@ -1987,6 +2002,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
     if (readerValue != nullptr) {
       row.readerValue = true;
       row.bytes += readerValue->ramBytesUsed();
+      row.buildNanos += readerValue->buildCostNanos;
       row.hits += readerValue->cacheHits.load(std::memory_order_relaxed);
     }
     auto slots = entry->slots.load(std::memory_order_acquire);
@@ -1995,6 +2011,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       if (value == nullptr) continue;
       row.segmentsResident++;
       row.bytes += value->ramBytesUsed();
+      row.buildNanos += value->buildCostNanos;
       row.hits += value->cacheHits.load(std::memory_order_relaxed);
     }
     if (row.bytes == 0) return;
@@ -2042,6 +2059,9 @@ FilterCache::CounterValues FilterCache::counters() const {
       .admissions = counter.admissions.load(std::memory_order_relaxed),
       .buildAttempts = counter.buildAttempts.load(std::memory_order_relaxed),
       .builds = counter.builds.load(std::memory_order_relaxed),
+      .buildNanos = counter.buildNanos.load(std::memory_order_relaxed),
+      .servedBuildNanos = counter.servedBuildNanos.load(),
+      .deadBuildNanos = counter.deadBuildNanos.load(std::memory_order_relaxed),
       .byproductInserts = counter.byproductInserts.load(std::memory_order_relaxed),
       .publishRejects = counter.publishRejects.load(std::memory_order_relaxed),
       .evictions = counter.evictions.load(std::memory_order_relaxed),

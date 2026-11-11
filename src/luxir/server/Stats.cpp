@@ -223,6 +223,9 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
   dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
   dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
+  dst.build_us = src.filterCacheCounters.buildNanos / 1000;
+  dst.served_build_us = src.filterCacheCounters.servedBuildNanos / 1000;
+  dst.dead_build_us = src.filterCacheCounters.deadBuildNanos / 1000;
 }
 
 template<class Stats>
@@ -465,6 +468,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.segments_resident = row.segmentsResident;
       out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
+      out.build_us = row.buildNanos / 1000;
     }
   }
 }
