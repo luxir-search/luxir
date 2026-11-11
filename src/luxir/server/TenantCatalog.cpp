@@ -7,15 +7,26 @@
 #include "luxir/util/Uuid.h"
 #include <charconv>
 #include <chrono>
+#include <format>
 #include <glaze/glaze.hpp>
 
 namespace luxir {
 namespace {
 constexpr auto authoritative = StorageRoot::AUTHORITATIVE;
 constexpr std::string_view layout = "tenant/catalog/incarnation 2\n";
+constexpr std::string_view layoutName = layout.substr(0, layout.size() - 1);
 void logSuperseded(std::atomic<bool>& logged, std::string_view tenant, std::string_view node) {
   if (!logged.exchange(true, std::memory_order_relaxed)) LOG_WARN("Tenant {}: another process took over node id {}", tenant, node);
 }
+
+// Marker text and entry names come from an unknown writer.
+std::string describeBytes(std::string_view bytes) {
+  if (bytes.empty()) return "<empty>";
+  bool printable = bytes.size() <= 64
+      && std::ranges::all_of(bytes, [](unsigned char c) { return c >= 0x20 && c < 0x7f; });
+  return printable ? std::string(bytes) : std::format("<{} bytes>", bytes.size());
+}
+
 std::vector<std::string> catalogTenants(DirectoryFactory& factory) {
   std::vector<std::string> names;
   for (const auto& child : factory.children(authoritative, "t")) if (child.directory) {
@@ -39,12 +50,29 @@ void TenantCatalog::initialize(DirectoryFactory& factory, bool writable) {
   auto root = factory.directory(authoritative, "");
   auto marker = root->openFile("LAYOUT");
   if (!marker) {
-    if (!factory.children(authoritative, "").empty()) throw std::runtime_error("expected an empty data directory or a supported layout; reindex it");
-    if (!writable) throw ReadOnlyError("data directory has no layout marker; reindex it");
+    auto children = factory.children(authoritative, "");
+    if (!children.empty()) {
+      std::string entries;
+      for (size_t i = 0; i < std::min(children.size(), (size_t)3); i++) {
+        if (i > 0) entries += ", ";
+        entries += std::format("\"{}\"", describeBytes(children[i].name));
+      }
+      throw std::runtime_error(std::format("data directory {}: no LAYOUT marker but is not empty (first entries: {}); "
+          "expected an empty directory or a Luxir data directory with a LAYOUT marker; check the path or finish an interrupted copy",
+          factory.describe(), entries));
+    }
+    if (!writable) throw ReadOnlyError(std::format("data directory {}: no LAYOUT marker and this node is read-only; "
+        "start a writer once to create it", factory.describe()));
     root->publishFile("LAYOUT", std::as_bytes(std::span(layout)), Directory::PublishMode::CREATE_ONLY);
     marker = root->openFile("LAYOUT");
   }
-  if (!marker || marker->read() != layout) throw std::runtime_error("unsupported data directory layout; reindex it");
+  auto found = marker ? marker->read() : std::string_view();
+  if (found != layout) {
+    if (found.ends_with('\n')) found.remove_suffix(1);
+    throw std::runtime_error(std::format("data directory {}: unsupported layout \"{}\" (this build reads \"{}\"); "
+        "reindex into an empty directory or use luxir pull from a node running this build",
+        factory.describe(), describeBytes(found), layoutName));
+  }
 }
 
 uint64_t TenantCatalog::incarnationNumber(std::string_view id) {

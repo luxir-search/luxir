@@ -1307,8 +1307,11 @@ TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
   auto sentinel = std::filesystem::path(followerConfig.store.data_dir) / "unrelated";
   { std::ofstream file(sentinel); file << "keep me"; }
   auto unrelated = pull();
-  EXPECT_NE(0, unrelated.first);
-  EXPECT_NE(std::string::npos, unrelated.second.find("empty data directory"));
+  EXPECT_EQ(1, unrelated.first);
+  EXPECT_NE(std::string::npos, unrelated.second.find("Pull failed: data directory fs:" + followerConfig.store.data_dir + ": "));
+  EXPECT_NE(std::string::npos, unrelated.second.find("no LAYOUT marker but is not empty (first entries: \"unrelated\")"));
+  EXPECT_NE(std::string::npos, unrelated.second.find("check the path or finish an interrupted copy"));
+  EXPECT_EQ(std::string::npos, unrelated.second.find("reindex"));
   EXPECT_TRUE(std::filesystem::exists(sentinel));
   followerConfig.store.data_dir = (path / "offline").string();
   stopSource();
@@ -2291,5 +2294,19 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   auto base = path / "follower";
   EXPECT_TRUE(std::filesystem::exists(base / "t" / "t0" / "i" / target / root));
   EXPECT_TRUE(std::filesystem::exists(base / "node" / "replication.json"));
+}
+
+TEST_F(ReplicationFollowerTest, promoteRefusesAnUnreadableDirectory) {
+  auto older = path / "older-layout";
+  std::filesystem::create_directories(older / "t");
+  std::filesystem::create_directories(older / "node");
+  std::ofstream(older / "node" / "replication.json") << "{}";
+  std::ofstream(older / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
+  auto refused = promote(older.string());
+  EXPECT_EQ(1, refused.first);
+  EXPECT_NE(std::string::npos, refused.second.find("Promote failed: data directory fs:" + older.string() + ": ")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("no LAYOUT marker but is not empty (first entries: \"t\")")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("check the path or finish an interrupted copy")) << refused.second;
+  EXPECT_EQ(std::string::npos, refused.second.find("reindex"));
 }
 }
