@@ -26,6 +26,7 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/StoredPhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermPattern.h"
@@ -247,14 +248,46 @@ private:
     return (TextFieldType&)fieldType;
   }
 
-  TextFieldType& positionalTextFieldType(const ResolvedFieldHandle& target) {
+  // The logical field's stored source, which a phrase on a text field
+  // indexed without positions verifies against; null when nothing is stored.
+  static FieldType* storedPhraseSource(const ResolvedFieldHandle& target) {
+    FieldType* primary = target.owner ? target.owner->primary.get() : target.fieldType;
+    bool storedText = primary->isStored() && (primary->type() == FieldType::Type::TEXT
+        || primary->type() == FieldType::Type::STRING || primary->type() == FieldType::Type::ID);
+    return storedText ? primary : nullptr;
+  }
+
+  TextFieldType& phraseTextFieldType(const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     TextFieldType& fieldType = textFieldType(target);
-    if (!fieldType.hasPositions()) {
+    if (!fieldType.hasPositions() && storedPhraseSource(target) == nullptr) {
       throw std::runtime_error(std::format(
-          "Phrase query requires indexed positions on field: {}", field));
+          "Phrase query requires indexed positions or a stored source on field: {}", field));
     }
     return fieldType;
+  }
+
+  // A phrase verified against the stored source: candidates come from the
+  // conjunction of its distinct terms.
+  Query* buildStoredPhrase(const ResolvedFieldHandle& target, std::string_view field,
+                           std::span<std::string_view> terms, std::span<int32_t> positions,
+                           int32_t slop) {
+    std::vector<Query*> clauses;
+    for (size_t i = 0; i < terms.size(); i++) {
+      if (std::find(terms.begin(), terms.begin() + (ptrdiff_t) i, terms[i])
+          != terms.begin() + (ptrdiff_t) i) {
+        continue;
+      }
+      clauses.push_back(pool.make<TermQuery>(field, terms[i]));
+    }
+    Query* conjunction = clauses.size() == 1
+        ? clauses[0]
+        : pool.make<BooleanQuery>(pool.copy_span(std::span<Query*>(clauses)),
+                                  std::span<Query*>{}, std::span<Query*>{}, std::span<Query*>{});
+    FieldType* source = storedPhraseSource(target);
+    return pool.make<StoredPhraseQuery>(
+        conjunction, &textFieldType(target), field, poolCopy(target.logicalName),
+        poolCopy(source->storedResource_), terms, positions, slop);
   }
 
   static void validatePositions(std::span<const int32_t> positions,
@@ -328,7 +361,7 @@ private:
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    positionalTextFieldType(target);
+    phraseTextFieldType(target);
     if (inputTerms.size() != inputPositions.size()) {
       throw std::runtime_error("Phrase query internal term/position size mismatch");
     }
@@ -364,11 +397,11 @@ private:
     if (terms.size() == 1) {
       return pool.make<TermQuery>(field, terms[0], boost);
     }
-    auto* phrase = pool.make<PhraseQuery>(
-        field,
-        pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
-        pool.copy_span(std::span<int32_t>(positions.data(), positions.size())),
-        slop);
+    auto termSpan = pool.copy_span(std::span<std::string_view>(terms.data(), terms.size()));
+    auto positionSpan = pool.copy_span(std::span<int32_t>(positions.data(), positions.size()));
+    Query* phrase = textFieldType(target).hasPositions()
+        ? static_cast<Query*>(pool.make<PhraseQuery>(field, termSpan, positionSpan, slop))
+        : buildStoredPhrase(target, field, termSpan, positionSpan, slop);
     if (boost == 1.0f) return phrase;
     return pool.make<BoostQuery>(phrase, boost);
   }
@@ -1320,7 +1353,7 @@ public:
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    positionalTextFieldType(target);
+    phraseTextFieldType(target);
     auto* chain = fields.chain(target);
     TokenChain& tc = *chain;
     Token& tok = tc.getToken();
@@ -1385,7 +1418,7 @@ public:
 
   Query* createPhraseFromTerms(const ResolvedFieldHandle& target, std::span<std::string_view> terms,
                                std::span<const int32_t> positions, int32_t slop = 0) {
-    positionalTextFieldType(target);
+    phraseTextFieldType(target);
     validatePositions(positions, terms.size(), "terms");
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");

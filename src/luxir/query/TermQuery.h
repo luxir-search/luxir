@@ -113,6 +113,7 @@ public:
     luxir::CachedFieldInfo* cachedFieldInfo = nullptr;
     luxir::CachedTermInfo* cachedTermInfo = nullptr;
     luxir::Similarity::BM25Scorer* simScorer = nullptr;
+    luxir::Similarity::BM25Scorer* normFreeScorer = nullptr;  // segments without norms
     float boost;
   public:
     Weight(Context& context, TermQuery& query, int32_t flags, float multiplier)
@@ -147,6 +148,12 @@ public:
                   hasNorms));
           if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
         }
+        // Built for every query, not only when a segment has no norms: finding
+        // that out would open every segment.
+        luxir::Similarity similarity;
+        normFreeScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
+            similarity.getNormFreeScorer(1.0f, similarity.idf(
+                cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo))));
       }
     }
 
@@ -172,7 +179,10 @@ public:
 
       auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
-      if (FieldType::storage(segFieldInfo->type) == FieldType::Storage::TEXT) {
+      if (CachedFieldInfo::normFree(*segFieldInfo)) {
+        return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normFreeScorer, boost,
+                                                  query.shouldUseFrontierBound());
+      } else if (FieldType::storage(segFieldInfo->type) == FieldType::Storage::TEXT) {
         normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *segFieldInfo);
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
@@ -329,6 +339,8 @@ public:
     // simScorer is absent when scores are not needed; score() is then 0.
     std::optional<luxir::NormsReader::Iterator> normsIter;
     const uint8_t* flatNormsBase = nullptr;
+    // Text segment without norms: simScorer ignores the norm, so every doc reads 0.
+    bool normFree = false;
     luxir::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
@@ -373,6 +385,16 @@ public:
            luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
+      buildImpacts(pool, useFrontierBound);
+    }
+
+    // Norm-free text segment; normFreeScorer comes from Similarity::getNormFreeScorer.
+    // Impacts come from the block max tf alone.
+    Scorer(luxir::MemPool& pool, luxir::DocsFreqEnum& docsEnum,
+           luxir::Similarity::BM25Scorer* normFreeScorer, float boost, bool useFrontierBound)
+            : docsEnum(docsEnum), normFree(true), simScorer(normFreeScorer), boost(boost) {
+      assert(normFreeScorer != nullptr);
+      competitiveBound = std::numeric_limits<float>::infinity();
       buildImpacts(pool, useFrontierBound);
     }
 
@@ -742,6 +764,11 @@ public:
           int32_t doc = blockDocs[(size_t) i];
           normBuf[i] = flatNormsBase[doc];
         }
+        simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
+        return;
+      }
+      if (normFree) {
+        uint8_t normBuf[Postings::DOCS_BLOCK_SIZE] = {};
         simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
         return;
       }
