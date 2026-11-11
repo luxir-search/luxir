@@ -4388,6 +4388,7 @@ void HttpServer::armReplicationExpiry() {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
         }
         node.getReplication().expire();
+        node.collections().expireRetirements();
         Signal::emit("replicationExpiryTick");
       } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
       net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });

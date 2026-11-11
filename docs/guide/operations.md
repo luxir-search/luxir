@@ -107,9 +107,10 @@ outside the layers. The effective stack is logged at startup as
 milliseconds after their successor is published. After a restart, every older
 commit gets a full window. It defaults to 0 on exclusive stores and 300000
 (5 minutes) on shared stores; an explicit value overrides either default. Readers
-on other nodes must refresh more often than this window. This does not delay
-deletion of a whole incarnation on delete or replacement, and follower pins keep
-their existing limits.
+on other nodes must refresh more often than this window. The same window covers
+retired incarnation trees on delete or replacement; their catalog timestamps
+survive restart. Allow a margin for clock skew between nodes for these wall-time
+deadlines. Follower pins keep their existing limits.
 
 ## Shared filesystem
 
@@ -131,8 +132,8 @@ NFS requires NFSv4 with working server-side locks: no `nolock` or
 `local_lock=flock|all`. A node stalled past its NFSv4 lease between compare and
 rename can lose its lock and overwrite a newer STATE. Files stay intact, but
 acknowledged commits can drop out of STATE. Reads use mmap; set retention X
-larger than any query, with a margin for reader refreshes. Whole-incarnation
-deletion and replacement still remove their trees immediately.
+larger than any query, with a margin for reader refreshes and clock skew.
+Deletion and replacement keep retired incarnation trees for the same window.
 
 ## Read-only nodes
 
@@ -232,10 +233,17 @@ Each commit records its index format version. A collection written with another
 version is listed as failed to load, with both versions in the error, and must
 be deleted and reindexed.
 
-Deletion marks the incarnation retiring in the catalog before removing its
-directory, then removes its entry. Writer startup finishes interrupted retirements
-and discards abandoned reservations; followers preserve reserved downloads. If
-deletion fails partway (for example an I/O error), the name stays unavailable
+Deletion removes the name from the active catalog and marks the incarnation
+retiring. A previously active incarnation keeps STATE and its tree for the
+retention window, timed in the catalog after retirement becomes visible. Once
+due, its assigned node deletes STATE, then the tree, then the catalog entry.
+Handoff transfers pending retirements with the live incarnation. The name can
+be re-created immediately with a new incarnation id. Never-active reservations
+are discarded immediately; followers preserve reserved downloads.
+
+Startup and the HTTP periodic expiry tick finish due retirements. Without HTTP,
+trees wait for the next startup. If deletion fails partway (for example an I/O
+error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
 its broken on-disk state.
@@ -316,8 +324,9 @@ and sweeps unreferenced index files from fenced, older epochs; it leaves files o
 newer epochs alone.
 Exclusive startup adopts the catalog and cleans up abandoned trees. Shared
 startup cleans up only this node's entries and logs uncataloged trees.
-Removal durably deletes `STATE` first, fencing existing writers, then removes
-the incarnation directory and its catalog entry. Only catalog reservation can
+Once retention is due, removal durably deletes `STATE` first, fencing existing
+writers, then removes the incarnation directory and its catalog entry. Only
+catalog reservation can
 create STATE; claiming a writer or installing a snapshot requires it to exist.
 Writer incarnation ids are never reused. A follower can reserve a deleted source id again;
 its fresh STATE owner distinguishes that lifetime from earlier publications.

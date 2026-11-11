@@ -120,11 +120,30 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
   if (config.read_only) factory = std::make_unique<ReadOnlyDirFactory>(std::move(factory));
   if (!config.read_only && !factory->exclusive() && config.node.random) throw std::invalid_argument("shared storage requires a stable node.id; random UUID fallback is not allowed");
   if (config.store.retention_ms < -1 || config.store.retention_ms > INT64_MAX / 1000) throw std::invalid_argument("store.retention-ms is out of range");
+  factory->retention = std::chrono::milliseconds(config.store.retention_ms < 0 ? (factory->exclusive() ? 0 : 300'000) : config.store.retention_ms);
   TenantCatalog::initialize(*factory, !config.read_only);
   LOG_INFO("storage: {}", factory->describe());
 }
 
 Collections::~Collections() = default;
+
+void Collections::expireRetirements() {
+  if (config.read_only) return;
+  std::vector<std::pair<std::string, TenantCatalog*>> pending;
+  {
+    std::lock_guard guard(catalogsMutex);
+    for (const auto& [tenant, storage] : catalogs) if (storage->hasPendingRetirements()) pending.emplace_back(tenant, storage.get());
+  }
+  for (const auto& [tenant, catalog] : pending) {
+    auto& storage = *catalog;
+    auto lock = storage.transition();
+    storage.expire([&](const auto& entry) {
+      std::lock_guard guard(slotsMutex);
+      auto slot = slots.find({tenant, *entry.name});
+      return slot == slots.end() || (!slot->second.leased.contains(entry.id) && !slot->second.retained.contains(entry.id));
+    });
+  }
+}
 
 TenantCatalog& Collections::catalog(std::string_view tenant) {
   std::lock_guard lock(catalogsMutex);
@@ -307,7 +326,7 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
   }
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
       FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant,
-      std::chrono::milliseconds(config.store.retention_ms < 0 ? (factory->exclusive() ? 0 : 300'000) : config.store.retention_ms));
+      factory->retention);
   col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
@@ -457,7 +476,9 @@ void Collections::openOne(Opened& row, Role role, const std::shared_ptr<Collecti
 }
 
 std::vector<Collections::Opened> Collections::open(Role role) {
-  if (role != Role::READ_ONLY) TenantCatalog::recover(*factory, role == Role::FOLLOWER, config.node.id);
+  if (role != Role::READ_ONLY) {
+    for (const auto& tenant : TenantCatalog::tenants(*factory)) catalog(tenant).recover(role == Role::FOLLOWER);
+  }
   auto names = TenantCatalog::collections(*factory);
   if (names.empty() && role != Role::FOLLOWER) names.push_back(CollectionId::of(kDefaultCollectionName));
   std::vector<Opened> rows;

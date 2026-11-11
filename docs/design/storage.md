@@ -65,7 +65,14 @@ commit timestamps and publication stalls do not shorten the window. Readers on
 other nodes must refresh their view more often than X. `--store.retention-ms`
 sets X: by default 0 on exclusive stores and 5 minutes on shared stores.
 A new writer holds every older manifest and its files for a full X from startup,
-since their supersession times are unknown. Nothing new is stored.
+since their supersession times are unknown. Snapshot holds need no new metadata.
+
+A previously active incarnation also keeps its tree for X after retirement.
+The catalog records its retirement wall time after retirement is visible, so
+the deadline survives restart and handoff; allow a margin for node clock skew.
+Never-active reservations are removed immediately. The assigned node sweeps due
+trees at startup and on the HTTP expiry tick. Without HTTP, pending trees wait
+for the next startup.
 
 ## Reading from the store
 

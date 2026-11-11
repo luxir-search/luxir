@@ -172,6 +172,7 @@ public:
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
   TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
+  void expireRetirements();
   uint64_t storageBytes(const CollectionId& id);
   uint64_t storageBytes(const Collection& collection);
 

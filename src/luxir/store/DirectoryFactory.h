@@ -3,6 +3,7 @@
 #pragma once
 
 #include <map>
+#include <chrono>
 #include <mutex>
 #include "Directory.h"
 #include "FileLock.h"
@@ -14,6 +15,8 @@ enum class StorageRoot { AUTHORITATIVE, NODE_PRIVATE };
 
 class DirectoryFactory {
 public:
+  // Resolved once on the configured store, shared by catalogs and snapshots.
+  std::chrono::milliseconds retention{};
   struct ViewOptions { std::shared_ptr<StorageMemory> account; };
   struct Child { std::string name; bool directory; };
   virtual ~DirectoryFactory() = default;

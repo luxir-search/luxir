@@ -6,6 +6,7 @@
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
+#include <atomic>
 
 using namespace luxir;
 using namespace luxir::test;
@@ -14,6 +15,9 @@ namespace {
 RAMDirFactory* sharedStore = nullptr;
 
 class SharedRAM : public DirectoryFactory {
+public:
+  std::atomic<uint64_t> operations{0};
+private:
   RAMDirFactory& shared;
   RAMDirFactory local;
   DirectoryFactory& root(StorageRoot root) { return root == StorageRoot::AUTHORITATIVE ? shared : local; }
@@ -22,10 +26,11 @@ public:
   std::string describe() const override { return "ownership_test"; }
   std::shared_ptr<StorageMemory> memory() override { return shared.memory(); }
   std::shared_ptr<Directory> directory(StorageRoot r, std::string_view path, ViewOptions options = {}) override {
+    operations++;
     return root(r).directory(r, path, std::move(options));
   }
-  std::vector<Child> children(StorageRoot r, std::string_view path) override { return root(r).children(r, path); }
-  void removeTree(StorageRoot r, std::string_view path) override { root(r).removeTree(r, path); }
+  std::vector<Child> children(StorageRoot r, std::string_view path) override { operations++; return root(r).children(r, path); }
+  void removeTree(StorageRoot r, std::string_view path) override { operations++; root(r).removeTree(r, path); }
 };
 
 const bool registered = [] {
@@ -383,7 +388,7 @@ TEST_F(CollectionOwnershipTest, failedCreateRollsBackOnlyItsOwnIncarnation) {
   ASSERT_TRUE(entry);
   EXPECT_EQ("B", entry->node);
   EXPECT_EQ("active", entry->state);
-  EXPECT_EQ(1u, b->collections().catalog().incarnations("d").size());
+  EXPECT_EQ(2u, b->collections().catalog().incarnations("d").size()); // The retired first create keeps its reader window.
   EXPECT_EQ(1, b->getCollection("d")->getReaderManager().getReader()->liveDocs());
 }
 
@@ -496,4 +501,82 @@ TEST_F(CollectionOwnershipTest, sharedStoreRefusesOnlyTheRandomFallback) {
   a = std::make_unique<LuxirNode>(config(newUuid()));
   EXPECT_FALSE(a->getConfig().node.random);
   EXPECT_FALSE(a->collections().storage().exclusive());
+}
+
+TEST_F(CollectionOwnershipTest, handoffMovesPendingRetirementsToTheTarget) {
+  auto cfg = config("A"); cfg.store.retention_ms = 1000;
+  a = std::make_unique<LuxirNode>(cfg);
+  a->createCollection("c");
+  auto& catalog = a->collections().catalog();
+  auto old = *catalog.current("c");
+  catalog.retire("c", old);
+  a->deleteCollection("c");
+  a->createCollection("c");
+  auto time = TenantCatalog::Clock::time_point(std::chrono::milliseconds(*catalog.owned(old).retired_ms + 1000));
+  cfg.node.id = "B"; b = std::make_unique<LuxirNode>(cfg);
+  a->detachCollection("c", "B");
+  TenantCatalog previous(a->collections().storage(), "t0", "A", [&] { return time; });
+  previous.expire();
+  EXPECT_TRUE(catalog.directory(old)->readPublished("STATE"));
+  b->attachCollection("c");
+  EXPECT_TRUE(b->collections().catalog().hasPendingRetirements());
+  TenantCatalog target(b->collections().storage(), "t0", "B", [&] { return time; });
+  target.expire();
+  EXPECT_FALSE(target.directory(old)->readPublished("STATE"));
+  EXPECT_TRUE(target.current("c"));
+}
+
+TEST_F(CollectionOwnershipTest, forceAttachMovesTheDeadOwnersPendingRetirements) {
+  auto cfg = config("A"); cfg.store.retention_ms = 1000;
+  a = std::make_unique<LuxirNode>(cfg);
+  a->createCollection("c");
+  auto& catalog = a->collections().catalog();
+  auto old = *catalog.current("c");
+  catalog.retire("c", old); a->deleteCollection("c"); a->createCollection("c");
+  auto time = TenantCatalog::Clock::time_point(std::chrono::milliseconds(*catalog.owned(old).retired_ms + 1000));
+  a.reset();
+  cfg.node.id = "B"; b = std::make_unique<LuxirNode>(cfg);
+  b->attachCollection("c", true);
+  EXPECT_TRUE(b->collections().catalog().hasPendingRetirements());
+  TenantCatalog target(b->collections().storage(), "t0", "B", [&] { return time; });
+  target.expire();
+  EXPECT_FALSE(target.directory(old)->readPublished("STATE"));
+  EXPECT_TRUE(target.current("c"));
+}
+
+TEST_F(CollectionOwnershipTest, startupCachesRetiredOnlyTenantsForExpiry) {
+  startA();
+  auto& retired = a->collections().catalog("old");
+  auto id = retired.reserve("c"); retired.activate("c", id); retired.retire("c");
+  a.reset(); startA(); startB();
+  auto& recovered = a->collections().catalog("old");
+  EXPECT_TRUE(recovered.hasPendingRetirements());
+  EXPECT_FALSE(b->collections().catalog("old").hasPendingRetirements());
+  auto& otherOperations = b->collections().storage().find<SharedRAM>()->operations;
+  auto before = otherOperations.load();
+  b->collections().expireRetirements();
+  EXPECT_EQ(before, otherOperations.load());
+  auto& operations = a->collections().storage().find<SharedRAM>()->operations;
+  before = operations.load();
+  a->collections().expireRetirements();
+  EXPECT_GT(operations.load(), before);
+  EXPECT_TRUE(recovered.hasPendingRetirements());
+  EXPECT_TRUE(recovered.directory(id)->readPublished("STATE"));
+}
+
+TEST_F(CollectionOwnershipTest, expiryDoesNoStoreAccessWithoutPendingRetirements) {
+  startA();
+  auto& operations = a->collections().storage().find<SharedRAM>()->operations;
+  auto before = operations.load();
+  a->collections().expireRetirements();
+  EXPECT_EQ(before, operations.load());
+  auto& catalog = a->collections().catalog("old");
+  auto id = catalog.reserve("abandoned"); catalog.retire("abandoned");
+  EXPECT_TRUE(catalog.hasPendingRetirements());
+  a->collections().expireRetirements();
+  EXPECT_FALSE(catalog.hasPendingRetirements());
+  EXPECT_FALSE(catalog.directory(id)->readPublished("STATE"));
+  before = operations.load();
+  a->collections().expireRetirements();
+  EXPECT_EQ(before, operations.load());
 }

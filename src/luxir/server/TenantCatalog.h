@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include "luxir/store/DirectoryFactory.h"
 #include "luxir/store/CollectionId.h"
 #include "luxir/store/IncarnationState.h"
@@ -11,11 +12,15 @@ namespace luxir {
 // Engine-owned names and incarnation lifecycles. A factory owns only paths.
 class TenantCatalog {
 public:
+  using Clock = std::chrono::system_clock;
+  using Now = std::function<Clock::time_point()>;
   struct Entry {
     std::string id;
     std::optional<std::string> name;
     std::string state;
     std::string node;
+    // Absent: never active. Zero: retirement visible, timestamp not yet finalized.
+    std::optional<int64_t> retired_ms = {};
   };
   struct State {
     uint64_t rev = 0;
@@ -31,23 +36,34 @@ private:
   std::recursive_mutex lifecycle;
   std::shared_ptr<StorageMemory> tenantAccount;
   std::string path;
+  Now now;
+  // Nonzero means pending. Count observations so a sweep cannot clear a new one.
+  std::atomic<uint64_t> pendingRetirements{0};
   struct Snapshot { State state; std::optional<Directory::Publication> publication; };
 
   Snapshot snapshot();
-  uint64_t mutate(const std::function<bool(State&)>& mutation);
+  State mutate(const std::function<bool(State&)>& mutation);
+  State update(const std::function<bool(State&)>& mutation);
+  bool hasRetirements(const State& state) const;
+  void observe(const State& state);
+  static void retiring(Entry& entry);
+  bool removalDue(const Entry& entry);
   std::shared_ptr<StorageMemory> account(std::string_view id);
   void requireOwner(const Entry& entry) const;
 public:
   TenantCatalog(DirectoryFactory& factory, std::string_view tenant = CollectionId::kDefaultTenant,
-                std::string_view node = {});
+                std::string_view node = {}, Now now = Clock::now);
   static void initialize(DirectoryFactory& factory, bool writable);
   static std::vector<CollectionId> collections(DirectoryFactory& factory);
   static void recover(DirectoryFactory& factory, bool follower, std::string_view node);
+  static std::vector<std::string> tenants(DirectoryFactory& factory);
   static bool empty(DirectoryFactory& factory);
   static uint64_t incarnationNumber(std::string_view id);
 
   std::unique_lock<std::recursive_mutex> transition() { return std::unique_lock(lifecycle); }
   State read();
+  bool hasPendingRetirements() const { return pendingRetirements.load(std::memory_order_relaxed) != 0; }
+  void recover(bool follower);
   void adopt();
   bool assign(std::string_view id, std::string_view expectedNode, std::string_view node);
   std::optional<Entry> find(std::string_view name);
@@ -69,6 +85,7 @@ public:
   void retire(std::string_view name, std::string_view id = {});
   void remove(std::string_view name);
   void removeIncarnation(std::string_view id);
+  void expire(const std::function<bool(const Entry&)>& canRemove = {});
   void cleanup(bool follower);
   std::shared_ptr<Directory> directory(std::string_view id);
   uint64_t bytes(std::string_view id);
