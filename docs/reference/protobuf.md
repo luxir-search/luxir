@@ -501,6 +501,7 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.cacheentrydump.hits"></a>[`hits`](#field-luxir.cacheentrydump.hits) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.last_used_epoch"></a>[`last_used_epoch`](#field-luxir.cacheentrydump.last_used_epoch) | 9 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.build_us"></a>[`build_us`](#field-luxir.cacheentrydump.build_us) | 10 | `uint64` | singular | Summed build time of this entry's resident values, in microseconds. |
+| <a id="field-luxir.cacheentrydump.recent_uses"></a>[`recent_uses`](#field-luxir.cacheentrydump.recent_uses) | 11 | `uint32` | singular | Current key uses in the admission window, taking the max of the two lanes. |
 
 <a id="message-luxir.calendargap"></a>
 

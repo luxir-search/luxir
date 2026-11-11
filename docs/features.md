@@ -130,8 +130,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
-- **Cost-aware filter cache:** Favors filters that are expensive to rebuild
-  relative to their size, saving more computation per byte of cache.
+- **Cost-aware filter cache:** Ranks filters by rebuild cost per byte,
+  weighted by how often the filter has been used recently.
 - **Arena allocation:** Indexing runs on rollback-capable memory pools, and
   requests decode into arena-backed message objects with no per-field heap
   allocation on the way in.

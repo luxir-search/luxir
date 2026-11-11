@@ -790,6 +790,7 @@ struct CacheEntryDump {
   std::string_view scope;
   uint32_t key_bytes = 0;
   uint32_t segments_resident = 0;
+  uint32_t recent_uses = 0;
   bool reader_value = false;
 };
 struct ShardCacheControl {                                      // needs QueryCacheStats,CacheEntryDump
