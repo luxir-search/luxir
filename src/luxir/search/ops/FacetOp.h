@@ -40,6 +40,11 @@ namespace luxir {
 
 class FacetReq : public SearchOp {
 public:
+  double consumeUnits(IndexReader::Segment& segment, int64_t matches) override {
+    return work::FACET_SEGMENT + (double)matches * work::FACET_DOC
+        + subOpsConsumeUnits(segment, matches);
+  }
+
   bool needsCompleteBucketInput() const override {
     // Facets open result children after their last segment feed. A nested
     // reset must still be able to recover its ancestors on earlier segments.

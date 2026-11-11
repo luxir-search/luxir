@@ -463,6 +463,8 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_searches_total`, `luxir_searches_in_flight`, `luxir_search_duration_seconds` | Searches the engine accepted, by `outcome`, from submission to the final response. A gRPC `Search` call can carry many searches, so this is its per-search view; `cancelled` means the search ended without a final response. |
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
+| `luxir_search_lanes_total{lane}`, `luxir_search_lane_escalations_total` | Lane choices for `max_parallel: 0` searches, and probing searches that fanned out. |
+| `luxir_search_active`, `luxir_search_ns_per_work_unit` | Searches executing now, and the lane policy's calibrated speed. |
 | `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
@@ -721,12 +723,21 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
-- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
-  request across segments in parallel, like `-1`, when its lists and
-  operations visit at least that many documents by index metadata. Counts that
-  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
-  serial. Parallel runs cost more CPU in exchange for latency, so set it only
-  where large requests are common.
+- `search.auto-parallel-min-saving-us` lets `max_parallel: 0`, the default, run
+  a request across segments in parallel, like `-1`, when that is predicted to
+  save at least this many microseconds. `0` (the default) keeps
+  `max_parallel: 0` serial. The prediction prices each request from index
+  metadata, is limited by its largest segment and by the workers other searches
+  are not using, and so backs off under load. A ranking whose cost depends on
+  pruning starts serially and fans out its remaining segments only if it
+  outlasts the budget. On a shared node, `1000` starts fanning out at about
+  2 ms of serial work on 2 to 4 cores; below that, a fan-out costs more CPU
+  than the time it saves is worth.
+- `search.auto-parallel-ns-per-unit` pins the speed behind that prediction. `0`
+  (the default) calibrates it from observed requests, so lane choices can vary
+  between runs; results do not.
+- `search.lane-policy` selects what makes this decision: `cost` (the default),
+  `always`, or a [plugin's policy](../dev/plugins.md#lane-policies).
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

@@ -77,6 +77,14 @@ void service(Renderer& r, const api::ServiceStats& s) {
               s.request_duration_bounds, s.search_execution);
   r.counter("luxir_search_resource_exhausted_total", "Searches rejected by resource limits, including the request memory breaker.", (double)s.search_resource_exhausted);
   r.counter("luxir_search_warnings_total", "Searches completing with at least one declared degradation warning.", (double)s.search_warnings);
+  constexpr std::string_view lanes = "Lane choices for max_parallel 0 searches the lane policy priced.";
+  r.counter("luxir_search_lanes_total", lanes, (double)s.search_lane_serial, "lane=\"serial\"");
+  r.counter("luxir_search_lanes_total", lanes, (double)s.search_lane_serial_busy, "lane=\"serial_busy\"");
+  r.counter("luxir_search_lanes_total", lanes, (double)s.search_lane_parallel, "lane=\"parallel\"");
+  r.counter("luxir_search_lanes_total", lanes, (double)s.search_lane_probe, "lane=\"probe\"");
+  r.counter("luxir_search_lane_escalations_total", "Probing searches that outlasted their budget and fanned out.", (double)s.search_lane_escalated);
+  r.gauge("luxir_search_active", "Searches currently executing.", (double)s.search_active);
+  r.gauge("luxir_search_ns_per_work_unit", "The lane policy's nanoseconds per work unit; zero when not applicable.", s.search_ns_per_work_unit);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");

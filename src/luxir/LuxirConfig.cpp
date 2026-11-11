@@ -271,11 +271,20 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
-  app.add_option("--search.auto-parallel-min-work",
-                 search.auto_parallel_min_work,
-                 "Operator opt-in: run a max_parallel 0 request in parallel when its "
-                 "lists visit at least this many documents by index metadata (0 = off, default)")
-      ->default_val(search.auto_parallel_min_work)
+  app.add_option("--search.lane-policy", search.lane_policy,
+                 "Chooses serial or parallel execution of max_parallel 0 requests: "
+                 "cost, always, or a plugin's policy")
+      ->default_val(search.lane_policy);
+  app.add_option("--search.auto-parallel-min-saving-us",
+                 search.auto_parallel_min_saving_us,
+                 "Operator opt-in: run a max_parallel 0 request in parallel when that is "
+                 "predicted to save at least this many microseconds (0 = off, default)")
+      ->default_val(search.auto_parallel_min_saving_us)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.auto-parallel-ns-per-unit",
+                 search.auto_parallel_ns_per_unit,
+                 "Nanoseconds per work unit for the cost lane policy (0 = calibrate, default)")
+      ->default_val(search.auto_parallel_ns_per_unit)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,

@@ -105,10 +105,9 @@ public:
 
   bool ownsMatchDomain() const override { return true; }
 
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
-    return total;
+  void quoteWork(WorkQuote& quote) override {
+    SearchOp::quoteWork(quote);
+    for (auto* source : sources) source->quoteWork(quote);
   }
 
   bool needsCount() const {

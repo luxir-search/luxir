@@ -562,6 +562,13 @@ struct ServiceStats {
   HistogramStats search_execution;
   uint64_t search_resource_exhausted = 0;
   uint64_t search_warnings = 0;
+  uint64_t search_lane_serial = 0;
+  uint64_t search_lane_serial_busy = 0;
+  uint64_t search_lane_parallel = 0;
+  uint64_t search_lane_probe = 0;
+  uint64_t search_lane_escalated = 0;
+  uint64_t search_active = 0;
+  double search_ns_per_work_unit = 0;
   ActivityStats index_batches;
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;

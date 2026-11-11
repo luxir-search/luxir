@@ -85,8 +85,8 @@ One request contains:
 - `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
   for unlimited (shared workers join in across segments and operations).
   `0` (the default) lets the engine decide: serial, unless the operator has set
-  `search.auto-parallel-min-work` and the request visits at least that many
-  documents, in which case it runs like `-1`. Over gRPC
+  `search.auto-parallel-min-saving-us` and the engine predicts a large enough
+  saving, in which case it runs like `-1`. Over gRPC
   every search runs on the shared worker pool, never on the completion-queue
   thread that received it: gRPC offers a connection's new calls to its
   preferred completion queue first, so running queries there would

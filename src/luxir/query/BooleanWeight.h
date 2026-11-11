@@ -12929,6 +12929,30 @@ public:
     return bound;
   }
 
+  // A conjunction walks its rarest required clause and checks the rest at
+  // each document; a disjunction reads every clause.
+  double workUnits(IndexReader::Segment& segment) override {
+    size_t required = mandatoryWeights.size() + filterWeights.size();
+    if (required == 1 && optionalWeights.empty()) {
+      auto* child = mandatoryWeights.empty() ? filterWeights.front() : mandatoryWeights.front();
+      return child ? child->workUnits(segment) : 0.0;
+    }
+    if (required > 0) {
+      int64_t lead = segment.maxDoc();
+      for (auto weights : {mandatoryWeights, filterWeights}) {
+        for (auto* child : weights) {
+          if (child) lead = std::min(lead, child->countShortcut(segment, nullptr).maxMatches);
+        }
+      }
+      return (double)lead * work::CLAUSE * (double)required;
+    }
+    double total = 0;
+    for (auto* child : optionalWeights) {
+      if (child) total += child->workUnits(segment);
+    }
+    return total;
+  }
+
   std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);

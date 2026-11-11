@@ -1133,8 +1133,8 @@ beside `ops` in the full form:
 - `max_parallel` chooses where and how the request runs. `0`, the default,
   lets the engine decide: it executes serially on the HTTP io thread that
   received it, with no scheduler handoff, unless the operator has set
-  [`search.auto-parallel-min-work`](operations.md#indexing-memory-and-request-limits) and the request visits at
-  least that many documents, in which case it runs like `-1`. `1` moves the request onto the
+  [`search.auto-parallel-min-saving-us`](operations.md#indexing-memory-and-request-limits)
+  and the engine predicts a large enough saving, in which case it runs like `-1`. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
   not occupy its connection thread. `-1` removes the cap: the request starts
   on the receiving thread and shared workers join in, parallelizing across

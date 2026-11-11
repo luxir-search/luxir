@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
+#include "LanePolicy.h"
 #include "SearchRequest.h"
 #include "luxir/server/LuxirNode.h"
 
@@ -16,8 +20,14 @@ struct SearchConfig;
 //
 class SearchEngine {
   LuxirNode& node;
+  std::unique_ptr<LanePolicy> lanePolicy;
+  // Searches between planning and the end of execution, on any lane.
+  std::atomic<int32_t> activeSearches{0};
 
   void submitBody(SearchRequest& req);
+  // Chooses the lane of a max_parallel 0 request. Returns its facts when the
+  // policy asked to observe the outcome.
+  std::optional<LaneFacts> chooseLane(SearchRequest& req, RootOp& root, LaneDecision& decision);
   // Runs submit() on an arena worker; -1's waits stay within the request.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
   RootOp* prepare(SearchRequest& req);
@@ -26,8 +36,14 @@ class SearchEngine {
   void getResources(SearchRequest& req);
 
 public:
-  SearchEngine(LuxirNode& node): node(node) {
-  }
+  explicit SearchEngine(LuxirNode& node);
+  ~SearchEngine();
+
+  int32_t getActiveSearches() const { return activeSearches.load(std::memory_order_relaxed); }
+  // Workers no other running search has claimed, as seen by one that has.
+  int spareWorkers() const;
+  double nsPerWorkUnit() const { return lanePolicy->nsPerUnit(); }
+  bool shouldEscalate(SearchRequest& req);
 
   const SearchConfig& searchConfig() const;
   LuxirNode& getNode() const { return node; }

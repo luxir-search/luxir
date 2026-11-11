@@ -350,6 +350,10 @@ public:
       return childWeight->countShortcut(segment, domain);
     }
 
+    double workUnits(IndexReader::Segment& segment) override {
+      return childWeight->workUnits(segment);
+    }
+
   };
 };
 

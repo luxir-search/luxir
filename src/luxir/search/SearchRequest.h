@@ -114,6 +114,14 @@ public:
   // transports resume paused production inside the arena, as for -1.
   bool autoParallel = false;
   bool parallelLane() const noexcept { return maxParallel == -1 || autoParallel; }
+  // The PROBE lane: serial until laneProbeDeadline, then fan out what remains.
+  bool laneProbing = false;
+  bool laneEscalated = false;
+  std::chrono::steady_clock::time_point laneProbeDeadline;
+  // Whether a probing request should fan out its remaining segments now.
+  bool laneShouldEscalate();
+  // Runs f inside the task arena, where it may spawn tasks.
+  void runInArena(const std::function<void()>& f);
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);
