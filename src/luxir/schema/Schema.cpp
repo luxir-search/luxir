@@ -1271,16 +1271,22 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_ip", FieldClass::IP);
   add(templates, "_ips", FieldClass::IP).multi = api::FieldDef::MultiMode::DEFAULT;
-  add(templates, "_b", FieldClass::BOOLEAN);
-  add(templates, "_bs", FieldClass::BOOLEAN).multi = api::FieldDef::MultiMode::DEFAULT;
+  // Booleans build the points index: their bitset leaves make the fastest
+  // matches and filters of any index mode.
+  add(templates, "_b", FieldClass::BOOLEAN).index = IndexMode::RANGE;
+  {
+    auto& f = add(templates, "_bs", FieldClass::BOOLEAN);
+    f.index = IndexMode::RANGE;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
+  }
   add(templates, "_f", FieldClass::FLOAT);
   add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
-  // Geo points: unlike the numeric suffixes these build the points index,
-  // since geo queries are their only use.
+  // Geo points also build the points index, since geo queries are their
+  // only use.
   add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
   {
     auto& f = add(templates, "_ps", FieldClass::GEO_POINT);

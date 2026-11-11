@@ -106,7 +106,8 @@ Values are stored as 0/1 in the integer column. Sorting puts `false` before
 `true`; field facet bucket values and collapse keys are JSON booleans.
 Range queries accept boolean bounds, but range facets are not supported.
 The default is `index: "none"`, as for `int`; `index: "range"` and
-`index: "match"` add the corresponding numeric indexes.
+`index: "match"` add the corresponding numeric indexes. For filtering on a
+boolean, `range` is the faster of the two, and the `_b`/`_bs` templates use it.
 
 Retrieved values are JSON booleans. Document columns have no boolean kind,
 so gRPC returns a `col_val` column holding one boolean value (or array) per
@@ -213,7 +214,7 @@ The built-in templates are:
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
 | `_i`, `_is` | Integer column, single- or multi-valued. |
-| `_b`, `_bs` | Boolean column, single- or multi-valued. |
+| `_b`, `_bs` | Boolean column with a points index (`index: "range"`), single- or multi-valued. |
 | `_ip`, `_ips` | IP address terms, single- or multi-valued. |
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
