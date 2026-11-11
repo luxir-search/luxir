@@ -44,7 +44,10 @@ std::string layoutError(const std::filesystem::path& path, bool writable) {
   try {
     TenantCatalog::initialize(factory, writable);
   } catch (const std::runtime_error& error) {
-    return error.what();
+    std::string message = error.what();
+    EXPECT_TRUE(message.starts_with("data directory " + factory.describe() + ": ")) << message;
+    EXPECT_NE(message.find(path.string()), std::string::npos) << message;
+    return message;
   }
   ADD_FAILURE() << "layout was accepted";
   return {};
@@ -103,7 +106,8 @@ TEST(DirLockTest, unownedFactoryRequiresAnExistingDataDir) {
   // Layout validation belongs to the engine.
   FSDirFactory reader(tempDir.path(), true);
   EXPECT_THROW(TenantCatalog::initialize(reader, false), ReadOnlyError);
-  EXPECT_NE(layoutError(tempDir.path(), false).find("read-only"), std::string::npos);
+  auto message = layoutError(tempDir.path(), false);
+  EXPECT_NE(message.find("read-only; start a writer once to create it"), std::string::npos);
 }
 
 // The decorator is the enforcement point, so it must reject every mutator on the
@@ -163,7 +167,10 @@ TEST(DirLockTest, refusesDataFromAnotherLayout) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "t");
   std::ofstream(tempDir.path() / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
-  expectLayoutError(tempDir.path(), {"older layout \"tenant/collection/incarnation 1\"", "\"tenant/catalog/incarnation 2\""});
+  auto temp = tempDir.path() / "t" / ".luxir-publish-0-0";
+  std::ofstream(temp) << "partial";
+  expectLayoutError(tempDir.path(), {"no LAYOUT marker but is not empty (first entries: \"t\")"});
+  EXPECT_TRUE(std::filesystem::exists(temp)); // Refusal must not open and clean t/.
 }
 
 TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
@@ -241,23 +248,46 @@ TEST(DirLockTest, publicationTempsBelongToOnlyOneNode) {
 TEST(DirLockTest, refusesTheEarlierCollectionsDirectory) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "c" / "default" / "main");
-  expectLayoutError(tempDir.path(), {"pre-layout collections tree"});
+  expectLayoutError(tempDir.path(), {"no LAYOUT marker but is not empty (first entries: \"c\")"});
 }
 
 TEST(DirLockTest, refusesAnUnknownRootMarker) {
   TempDir tempDir;
   std::ofstream(tempDir.path() / "LAYOUT") << "something/else 7\n";
-  expectLayoutError(tempDir.path(), {"unsupported data directory layout \"something/else 7\"", "\"tenant/catalog/incarnation 2\""});
+  expectLayoutError(tempDir.path(), {"unsupported layout \"something/else 7\"", "\"tenant/catalog/incarnation 2\"",
+      "reindex into an empty directory or use luxir pull from a node running this build"});
 }
 
 TEST(DirLockTest, summarizesAnUnprintableRootMarker) {
   TempDir tempDir;
   std::ofstream(tempDir.path() / "LAYOUT") << std::string(100, 'x');
-  expectLayoutError(tempDir.path(), {"unsupported data directory layout \"<100 bytes>\""});
+  expectLayoutError(tempDir.path(), {"unsupported layout \"<100 bytes>\""});
+  std::ofstream(tempDir.path() / "LAYOUT") << "bad\tmarker";
+  expectLayoutError(tempDir.path(), {"unsupported layout \"<10 bytes>\""});
+}
+
+TEST(DirLockTest, describesAnEmptyRootMarker) {
+  TempDir tempDir;
+  std::ofstream(tempDir.path() / "LAYOUT");
+  expectLayoutError(tempDir.path(), {"unsupported layout \"<empty>\""});
+}
+
+TEST(DirLockTest, sanitizesUnrecognizedEntryNames) {
+  TempDir tempDir;
+  for (const auto& name : {std::string("bad\n"), std::string(100, 'x')}) {
+    std::filesystem::create_directories(tempDir.path() / name);
+  }
+  expectLayoutError(tempDir.path(), {"first entries: \"<4 bytes>\", \"<100 bytes>\""});
 }
 
 TEST(DirLockTest, refusesAnUnrecognizedNonEmptyDirectory) {
   TempDir tempDir;
   std::filesystem::create_directories(tempDir.path() / "stray");
-  expectLayoutError(tempDir.path(), {"no LAYOUT marker but is not empty", "stray"});
+  expectLayoutError(tempDir.path(), {"no LAYOUT marker but is not empty (first entries: \"stray\")",
+      "expected an empty directory or a Luxir data directory with a LAYOUT marker",
+      "check the path or finish an interrupted copy"});
+  for (bool writable : {true, false}) {
+    auto message = layoutError(tempDir.path(), writable);
+    EXPECT_EQ(message.find("reindex"), std::string::npos) << message;
+  }
 }

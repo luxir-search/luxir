@@ -235,12 +235,14 @@ A tenant's `CATALOG` maps collection names to active incarnations and records
 reservations and retirements. Single-tenant deployments use tenant `t0`.
 Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
 monotonically by the catalog. The root `LAYOUT` marker identifies this format.
-A directory with another marker, with the older `t/LAYOUT` marker, or with a
-pre-marker `c/` tree is refused at startup (`Startup failed: ... data directory
-layout ...`, exit status 1; `luxir promote` reports `Promote failed:`) and the
-message names what was found. There is no in-place migration: start the node on
-an empty directory and reindex from the source of truth, or `luxir pull` from a
-node that already runs this build. Node-private state,
+A refused directory reports `data directory <storage description>: ...`, naming
+the storage and the unsupported marker or first few root entries. Startup,
+`luxir promote` and `luxir pull` exit with status 1, reporting `Startup failed:`,
+`Promote failed:` and `Pull failed:` respectively. For another layout marker,
+reindex into an empty directory or `luxir pull` from a node running this build.
+For a non-empty directory without a marker, check the path or finish an
+interrupted copy; an empty read-only directory needs a writer started once to
+create the marker. Node-private state,
 including `write.lock` and `replication.json`, lives under `node/`.
 Each commit records its index format version. A collection written with another
 version is listed as failed to load, with both versions in the error, and must
