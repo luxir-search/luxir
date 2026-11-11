@@ -1785,8 +1785,7 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.readerValue->ramBytesUsed(),
                   std::memory_order_relaxed);
-              advanceEvictionClock(
-                  candidate.readerValue->evictionPriority());
+              advanceEvictionClock(candidate.priority);
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
@@ -1801,8 +1800,7 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.segmentValue->ramBytesUsed(),
                   std::memory_order_relaxed);
-              advanceEvictionClock(
-                  candidate.segmentValue->evictionPriority());
+              advanceEvictionClock(candidate.priority);
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
