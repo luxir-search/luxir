@@ -2621,6 +2621,77 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   }
 }
 
+// Chunked flat scans must equal the whole-segment scan: ties break on
+// (score, segment, rank) regardless of which chunk found them, and a doc's
+// vector run is never split.  Grain 8 forces many chunks per segment.
+TEST_F(KnnQueryTest, flatScanChunksMatchSerial) {
+  ScanGrainGuard grains(/*scanGrainVectors=*/8, /*rescoreGrainCandidates=*/1);
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto vector = [&](const char* name, bool multi) {
+    auto& f = b.templ(name);
+    f.type = api::FieldDef::FieldClass::VECTOR;
+    f.column = true;
+    f.metric = api::VectorMetric::L2;
+    if (multi) f.multi = api::FieldDef::MultiMode::DEFAULT;
+  };
+  vector("_v", false);
+  vector("_vs", true);
+  b.set(h.collection());
+  // Coordinates repeat every 7 docs so ties cross chunk boundaries.
+  auto add = [&](int i) {
+    float x = (float)(i % 7);
+    auto doc = flatdoc("id", std::to_string(i), "dense_v", std::vector<float>{x, 1, 0, 0},
+                       "multi_vs", std::vector<std::vector<float>>{{x, 0, 0, 0}, {x + 3, 0, 0, 0}, {x, 2, 0, 0}},
+                       "keep_s", i % 10 < 8 ? "most" : "few", "half_s", i % 2 ? "odd" : "even");
+    if (i % 3 == 0) doc = flatdoc("id", std::to_string(i), "sparse_v", std::vector<float>{x, 0, 1, 0},
+                                  "dense_v", std::vector<float>{x, 1, 0, 0},
+                                  "multi_vs", std::vector<std::vector<float>>{{x, 0, 0, 0}},
+                                  "keep_s", i % 10 < 8 ? "most" : "few", "half_s", i % 2 ? "odd" : "even");
+    h.index(doc);
+  };
+  for (int i = 0; i < 150; i++) add(i);
+  h.commit();
+  for (int i = 150; i < 260; i++) add(i);
+  h.commit();
+  h.deleteByIds({"4", "11", "155"}, UpdateMessage::COMMIT);
+
+  auto run = [&](std::string_view field, const char* filter, const char* value, bool groups, int parallel) {
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, field, {1.25f, 0, 0, 0}, 10, 0, 0, /*exact=*/true);
+    if (filter) addMatchFilter(cur, filter, value);
+    if (groups) {
+      std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";
+      auto* collapse = new (cur.mr().allocate(sizeof(api::Collapse), alignof(api::Collapse))) api::Collapse();
+      api::build::allocArray(collapse->field, 1, cur.mr())[0] = "half_s";
+      std::get<api::TopDocs>(cur.rawOp().kind).collapse = collapse;
+    }
+    req->execute(parallel);
+    EXPECT_OK(req);
+    return std::pair{resultIds(*req), resultScores(*req)};
+  };
+  int64_t spawned = KnnQuery::parallelScanRoundsForTests.load(std::memory_order_relaxed);
+  for (std::string_view field : {"dense_v", "sparse_v", "multi_vs"}) {
+    // No filter walks ranks; the 80% filter probes ranks (sequential); the
+    // 50% filter walks members (domain walk), a shape chunked on doc ids.
+    for (auto [filter, value] : {std::pair<const char*, const char*>{nullptr, nullptr},
+                                 {"keep_s", "most"}, {"half_s", "odd"}}) {
+      auto serial = run(field, filter, value, false, 1);
+      auto parallel = run(field, filter, value, false, -1);
+      EXPECT_EQ(serial.first.size(), 10u) << field;
+      EXPECT_EQ(serial.first, parallel.first) << field;
+      EXPECT_EQ(serial.second, parallel.second) << field;
+    }
+    // Group collapse takes one top-k per chunk, then the union cuts.
+    auto serial = run(field, nullptr, nullptr, true, 1);
+    auto parallel = run(field, nullptr, nullptr, true, -1);
+    EXPECT_EQ(serial.first, parallel.first) << field;
+    EXPECT_EQ(serial.second, parallel.second) << field;
+  }
+  EXPECT_GT(KnnQuery::parallelScanRoundsForTests.load(std::memory_order_relaxed), spawned);
+}
+
 // Same parallel == serial identity for multi-valued fields, where the
 // candidate cut, cross-segment merge, doc collapse, and per-segment rescore
 // buckets all interact.  A small refine_candidates pin makes the bounded
@@ -4370,7 +4441,7 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
         for (int64_t grain : {1, 1000}) {
           SCOPED_TRACE(::testing::Message() << segments << " units, parallel=" << parallel
                        << ", approximate=" << approximate << ", grain=" << grain);
-          ScanGrainGuard grains(1, grain);
+          ScanGrainGuard grains(1 << 20, grain);
           EngineWrapperGuard wrapper([](VectorEngine& engine) {
             return std::make_unique<QuantizingEngine>(engine);
           });
@@ -4827,6 +4898,7 @@ TEST_F(KnnQueryTest, completionRecoversUnpooledMaximumBeyondCandidateCap) {
 TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
+  ScanGrainGuard grains(/*scanGrainVectors=*/4, /*rescoreGrainCandidates=*/1);
   SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
   for (auto ann : {pqAnn(8, 2, 2), rabitqAnn(8), rabitqAnn(8, 4)}) for (bool multi : {false, true}) {
     CollectionHelper h("main");

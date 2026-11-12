@@ -415,6 +415,46 @@ void BM_VectorKnnFlatDomain(benchmark::State& state) {
   state.counters["dims"] = dims;
 }
 
+// Exact kNN over one flat segment. mode 0 is serial, 1 parallel with the scan
+// split into scanTaskGrainVectors chunks, 2 parallel with the segment left as
+// one task. The fingerprint pins identical results between the modes.
+void BM_VectorKnnExactFlat(benchmark::State& state) {
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(1024) : state.range(0);
+  int32_t dims = luxir::unit_tests ? 16 : (int32_t)state.range(1);
+  int mode = (int)state.range(2);
+  CollectionHelper helper("main");
+  static int32_t builtDims = 0;
+  if (std::exchange(builtDims, dims) != dims) {
+    helper.clear();
+    installVectorBenchSchema(helper.collection(), dims);
+    indexVectorBatch(helper, 0, nDocs, dims, 1, false);
+    helper.commit();
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  if (reader->segments().size() != 1) { state.SkipWithError("expected one flat segment"); return; }
+  SearchOverridesGuard saved(KnnQuery::scanTaskGrainVectors);
+  if (luxir::unit_tests) KnnQuery::scanTaskGrainVectors = 64;
+  if (mode == 2) KnnQuery::scanTaskGrainVectors = std::numeric_limits<int64_t>::max() / 2;
+  auto query = makeQueryVector(dims);
+  auto run = [&](bool mode) {
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", query, 10, 0, 0, /*exact=*/true);
+    req->execute(mode ? -1 : 0);
+    std::string error;
+    uint64_t fp = 0;
+    bool ok = fingerprint(*req, fp, error);
+    req->done();
+    if (!ok) throw std::runtime_error(error);
+    return fp;
+  };
+  uint64_t expected = run(false);
+  if (run(true) != expected) { state.SkipWithError("exact flat fingerprint differs across modes"); return; }
+  for (auto _ : state) benchmark::DoNotOptimize(run(mode != 0));
+  state.counters["nDocs"] = (double)nDocs;
+  state.counters["dims"] = dims;
+  state.counters["mode"] = mode;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
 // ---------------------------------------------------------------------------
 // IVF+PQ recall benchmark.
 //
@@ -1337,6 +1377,10 @@ LUXIR_BENCHMARK(BM_VectorKnnFlatDomain)->ArgNames({"shape", "basis_points", "arm
       for (int shape : {0, 1, 2}) for (int density : {1, 10, 100, 1000, 5000, 10000})
         for (int arm : {0, 1}) b->Args({shape, density, arm});
     });
+
+LUXIR_BENCHMARK(BM_VectorKnnExactFlat)->ArgNames({"nDocs", "dims", "mode"})
+    ->Args({100'000, 128, 0})->Args({100'000, 128, 1})->Args({100'000, 1024, 0})
+    ->Args({100'000, 1024, 1})->Args({100'000, 1024, 2});
 
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivf, false, true)->Arg(50'000);

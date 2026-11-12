@@ -896,10 +896,19 @@ public:
     };
 
     template <bool Groups> class SegmentIvfScanner;
+    template <bool Groups> class SegmentFlatColumnVectorEngine;
+
+    // Half-open chunk of a flat segment scan: value ranks for a sequential
+    // scan (a multi-valued document's run belongs to the chunk holding its
+    // first rank, so it is never split), doc ids for a domain walk.
+    struct FlatScanRange {
+      int64_t begin = 0, end = std::numeric_limits<int64_t>::max();
+      bool whole() const { return begin == 0 && end == std::numeric_limits<int64_t>::max(); }
+    };
 
     template <bool Groups> struct EngineSlot {
       int32_t segOrd;
-      std::unique_ptr<VectorEngine> engine;
+      std::unique_ptr<SegmentFlatColumnVectorEngine<Groups>> engine;
       int64_t vectorCount = 0;
       int64_t liveVectorCount = 0;
       std::unique_ptr<SegmentIvfScanner<Groups>> ivfEngine;
@@ -1069,7 +1078,9 @@ public:
             : std::max((int64_t)query.getK(), boundedDefaultCandidates(query.getK(), planCap)),
         .nprobe = query.getNProbe(), .referenceBreadth = defaultIvfNList(liveNTotal),
         .minScanFraction = query.getMinScanFraction(), .dimFactor = defaultAnnBreadthDimFactor(dims),
-        .alpha = tuning.filteredCoverageAlpha, .flatDensity = tuning.flatDomainDensityThreshold, .selector = tuning.selector};
+        .alpha = tuning.filteredCoverageAlpha, .flatDensity = tuning.flatDomainDensityThreshold, .selector = tuning.selector,
+        .scanWidth = ctx.parallel ? computeWidth(oneapi::tbb::this_task_arena::max_concurrency()) : 1,
+        .scanGrain = scanTaskGrainVectors};
       auto plan = KnnPlanner::choose(planSegments, planRequest, tuning.plannerCosts,
                                     query.getExact() ? Routing::FORCE_EXACT : tuning.routing);
       ExecutionProfileRun* profile = context.planningContext().profiles
@@ -1404,7 +1415,9 @@ public:
               && (input.unfiltered || KnnPlanner::borrowDomain(input)))
             marginal += ((input.vectors + 63) / 64) * tuning.plannerCosts.units[KnnPlanner::FOLD_WORD];
           double cumulative = tuning.plannerCosts.price(KnnPlanner::actualWork(input, spent));
-          double exact = plan.prices[i].exactCost;
+          // Compare work with work: the marginal IVF round is not discounted
+          // for parallelism, so the exact arm must not be either.
+          double exact = plan.prices[i].exactWork;
           if (!force && cumulative + marginal <= exact) continue;
           completions.push_back({(int32_t)i, roundNumber, force ? "forced" : marginal > exact ? "marginal" : "cumulative",
               exact, marginal, cumulative, spent.physicalEntries, spent.ivfRounds});
@@ -2220,14 +2233,35 @@ public:
       }
       template <bool Multi, bool Sparse, class Emit>
       LUXIR_NOINLINE VectorSearchWork scanDomain(VectorReader& vr, const VectorSearchRequest& request,
-                                                std::span<const uint8_t> elig, Emit emit) {
+                                                std::span<const uint8_t> elig, Emit emit, FlatScanRange range) {
         auto& col = vr.strColReader();
         RowReadAhead::Gate gate;
         int64_t count = domain->card(), vectorsScored = 0, sparseMaps = 0, multiMaps = 0;
-        if (!count) return {};
         const auto* bits = domain->type == DocSet::BITSET ? &((const BitDocSet*)domain)->bits() : nullptr;
         std::span<const int32_t> docs = domain->type == DocSet::ARRAY
             ? ((const ArrDocSet*)domain)->docs() : std::span<const int32_t>{};
+        // A chunk walks only its members; bitset chunk bounds are word-aligned.
+        int32_t firstWord = 0, numWords = bits ? (int32_t)screaming::FixedBitSet::sizeInWords(bits->size()) : 0;
+        if (!range.whole()) {
+          if (bits) {
+            firstWord = (int32_t)(range.begin >> 6);
+            numWords = (int32_t)(std::min<int64_t>(range.end, (int64_t)numWords << 6) >> 6) - firstWord;
+            count = 0;
+            for (int32_t w = 0; w < numWords; w++) count += std::popcount(bits->words[firstWord + w]);
+          } else {
+            auto first = std::lower_bound(docs.begin(), docs.end(), range.begin);
+            auto last = std::lower_bound(first, docs.end(), range.end);
+            docs = std::span<const int32_t>(first, last);
+            count = (int64_t)docs.size();
+          }
+        }
+        if (!count) return {};
+        auto visitDocs = [&](auto&& visit) LUXIR_INLINE {
+          if (range.whole()) domain->forEach(visit);
+          else if (bits) screaming::FixedBitSet::visitOnes(bits->words + firstWord, numWords,
+              [&, base = firstWord << 6](int32_t doc) LUXIR_INLINE { visit(base + doc); });
+          else for (int32_t doc : docs) visit(doc);
+        };
         screaming::BitSet::Iterator fieldDocs(col.docsReader().bitset()), aheadFieldDocs(col.docsReader().bitset());
         int32_t fieldDoc = -1, aheadFieldDoc = -1, aheadBase = 0;
         uint64_t aheadWord = 0;
@@ -2239,7 +2273,7 @@ public:
         };
         std::optional<MonoReader::BulkValues> ranges;
         if constexpr (Multi) {
-          if ((double)count / vr.docsWithValue() >= FLAT_RANGE_POINT_DENSITY)
+          if ((double)domain->card() / vr.docsWithValue() >= FLAT_RANGE_POINT_DENSITY)
             ranges.emplace(*col.getEndValueRankReader());
         }
         auto valueRange = [&](int64_t rank) LUXIR_INLINE {
@@ -2257,7 +2291,7 @@ public:
         // Probe at most two domain members once, then let the gate
         // observe faults. Probing must not move the read-ahead cursor.
         screaming::BitSet::Iterator probeFieldDocs(col.docsReader().bitset());
-        int32_t probeFieldDoc = -1, probeWord = 0;
+        int32_t probeFieldDoc = -1, probeWord = firstWord;
         int64_t probeBase = 0;
         auto probeRank = [&](int fraction) -> int64_t {
           int64_t target = count * fraction / 4;
@@ -2282,7 +2316,7 @@ public:
         int64_t first = probeRank(1), second = probeRank(3);
         ahead.probe({first, second});
         int64_t pos = 0;
-        domain->forEach([&](int32_t doc) LUXIR_INLINE {
+        visitDocs([&](int32_t doc) LUXIR_INLINE {
           if constexpr (Sparse) sparseMaps++;
           ahead.sparseAt(pos, count, [&](int64_t p) {
             int32_t aheadDoc;
@@ -2330,9 +2364,10 @@ public:
       }
       template <bool Filtered, bool Multi, bool Sparse, class Emit>
       LUXIR_NOINLINE VectorSearchWork scanSequential(VectorReader& vr, const VectorSearchRequest& request,
-                                                    std::span<const uint8_t> elig, Emit emit) {
+                                                    std::span<const uint8_t> elig, Emit emit, FlatScanRange range) {
         auto& col = vr.strColReader();
         int64_t numVals = vr.numVectors(), vectorsScored = 0, domainProbes = 0, sparseMaps = 0, multiMaps = 0;
+        int64_t firstRank = range.begin, lastRank = std::min(range.end, numVals), rankVisits = 0;
         RowReadAhead::Gate gate;
         // The dense arm walks ranks sequentially. Independent forward
         // probes keep array domains linear for both scoring and read-ahead.
@@ -2360,9 +2395,16 @@ public:
         };
         if constexpr (Multi) {
           MonoReader::BulkValues valDoc(*v2d.mono);
-          valDoc.next();
-          int64_t rank = 0;
-          while (rank < numVals) {
+          int64_t rank = firstRank;
+          if (rank == 0) valDoc.next();
+          else if (rank < numVals) {
+            // Runs starting before this chunk stay with their own chunk.
+            valDoc.advance(rank - 1);
+            int32_t previous = (int32_t)valDoc.value();
+            valDoc.next();
+            while (rank < numVals && (int32_t)valDoc.value() == previous) { rank++; valDoc.next(); }
+          }
+          while (rank < lastRank) {
             int32_t doc = (int32_t)valDoc.value();
             int64_t end = rank;
             do {
@@ -2372,12 +2414,14 @@ public:
             } while (end < numVals && (int32_t)valDoc.value() == doc);
             readAhead(rank);
             if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, rank, end);
+            rankVisits += end - rank;
             rank = end;
           }
         } else {
           // Single-valued ranks are one-vector runs. Exclude pooled ranks
           // before paying for the sparse rank-to-doc select.
-          for (int64_t rank = 0; rank < numVals; rank++) {
+          rankVisits = std::max<int64_t>(0, lastRank - firstRank);
+          for (int64_t rank = firstRank; rank < lastRank; rank++) {
             readAhead(rank);
             if (pooledInRun(elig, rank, rank + 1)) continue;
             if constexpr (Sparse) sparseMaps++;
@@ -2386,16 +2430,20 @@ public:
           }
         }
         VectorSearchWork work;
-        work.rankVisits = numVals; work.exactVectors = vectorsScored; work.domainProbes = domainProbes;
+        work.rankVisits = rankVisits; work.exactVectors = vectorsScored; work.domainProbes = domainProbes;
         work.sparseMaps = sparseMaps; work.multiMaps = multiMaps;
         return work;
       }
       template <bool Multi, bool Sparse, class Emit>
       VectorSearchWork scan(VectorReader& vr, const VectorSearchRequest& request,
-                            std::span<const uint8_t> elig, bool walk, Emit emit) {
-        if (walk) return scanDomain<Multi, Sparse>(vr, request, elig, emit);
-        if (domain) return scanSequential<true, Multi, Sparse>(vr, request, elig, emit);
-        return scanSequential<false, Multi, Sparse>(vr, request, elig, emit);
+                            std::span<const uint8_t> elig, bool walk, Emit emit, FlatScanRange range) {
+        if (walk) return scanDomain<Multi, Sparse>(vr, request, elig, emit, range);
+        if (domain) return scanSequential<true, Multi, Sparse>(vr, request, elig, emit, range);
+        return scanSequential<false, Multi, Sparse>(vr, request, elig, emit, range);
+      }
+      bool walksDomain(VectorReader& vr) const {
+        return KnnPlanner::walkDomain(domain != nullptr, vr.strColReader().docsReader().hasBitset(), vr.isMultiValued(),
+            domain ? domain->card() : 0, vr.docsWithValue(), tuning.flatDomainDensityThreshold);
       }
 
     public:
@@ -2417,7 +2465,60 @@ public:
           metric(metric),
           normalizeColumnOnCosineRescore(normalizeColumnOnCosineRescore) {}
 
+      /// Parallel-scan chunks of about grain vectors covering this segment's
+      /// scan exactly once. A segment under two grains stays one whole chunk.
+      std::vector<FlatScanRange> chunks(int64_t grain) const {
+        std::vector<FlatScanRange> ranges{FlatScanRange{}};
+        if (segInfo == nullptr) return ranges;
+        VectorReader vr(seg.postingsReader(), *segInfo);
+        int64_t numVals = vr.numVectors();
+        grain = std::max<int64_t>(1, grain);
+        if (!walksDomain(vr)) {
+          int64_t count = numVals / grain;
+          if (count < 2) return ranges;
+          int64_t step = numVals / count;
+          ranges.resize((size_t)count);
+          for (int64_t i = 0; i < count; i++) ranges[(size_t)i] = {i * step, (i + 1) * step};
+          ranges.back().end = std::numeric_limits<int64_t>::max();
+          return ranges;
+        }
+        int64_t docs = domain->card();
+        int64_t grainDocs = std::max<int64_t>(1, grain * std::max<int64_t>(1, vr.docsWithValue()) / std::max<int64_t>(1, numVals));
+        if (docs < 2 * grainDocs) return ranges;
+        ranges.clear();
+        int64_t begin = 0, inChunk = 0;
+        auto cut = [&](int64_t end) {
+          if (inChunk < grainDocs) return;
+          ranges.push_back({begin, end});
+          begin = end;
+          inChunk = 0;
+        };
+        if (domain->type == DocSet::ARRAY) {
+          auto ids = ((const ArrDocSet*)domain)->docs();
+          for (size_t i = 0; i < ids.size(); i++) {
+            if (i > 0) cut(ids[i]);
+            inChunk++;
+          }
+        } else {
+          const auto& bits = ((const BitDocSet*)domain)->bits();
+          int64_t words = screaming::FixedBitSet::sizeInWords(bits.size());
+          for (int64_t w = 0; w < words; w++) {
+            inChunk += std::popcount(bits.words[w]);
+            if (w + 1 < words) cut((w + 1) << 6);
+          }
+        }
+        // The last chunk runs to the end, absorbing an under-grain remainder.
+        if (ranges.empty()) ranges.push_back({});
+        else if (inChunk == 0 || inChunk < grainDocs) ranges.back().end = std::numeric_limits<int64_t>::max();
+        else ranges.push_back({begin, std::numeric_limits<int64_t>::max()});
+        return ranges;
+      }
+
       VectorSearchResult search(const VectorSearchRequest& request) override {
+        return searchRange(request, FlatScanRange{});
+      }
+
+      VectorSearchResult searchRange(const VectorSearchRequest& request, FlatScanRange range) {
         assert(request.query != nullptr);
         assert(request.dims == dims);
 
@@ -2450,15 +2551,14 @@ public:
         std::span<const uint8_t> elig = (size_t)segOrd < request.eligible.size()
             ? request.eligible[(size_t)segOrd] : std::span<const uint8_t>{};
         bool sparse = vr.strColReader().docsReader().hasBitset();
-        bool walk = KnnPlanner::walkDomain(domain != nullptr, sparse, vr.isMultiValued(),
-            domain ? domain->card() : 0, vr.docsWithValue(), tuning.flatDomainDensityThreshold);
+        bool walk = walksDomain(vr);
         auto dispatch = [&](auto emit) {
           if (vr.isMultiValued()) {
-            if (sparse) return scan<true, true>(vr, request, elig, walk, emit);
-            return scan<true, false>(vr, request, elig, walk, emit);
+            if (sparse) return scan<true, true>(vr, request, elig, walk, emit, range);
+            return scan<true, false>(vr, request, elig, walk, emit, range);
           }
-          if (sparse) return scan<false, true>(vr, request, elig, walk, emit);
-          return scan<false, false>(vr, request, elig, walk, emit);
+          if (sparse) return scan<false, true>(vr, request, elig, walk, emit, range);
+          return scan<false, false>(vr, request, elig, walk, emit, range);
         };
         if constexpr (Groups) {
           CollapseKeyReader keys(*groupPlan);
@@ -2654,32 +2754,36 @@ public:
       }
 
       /// One scan task: a contiguous range of one IVF slot's selected lists
-      /// (chunked to at least scanTaskGrainVectors live vectors), or a whole
-      /// non-IVF slot (listBegin == listEnd == 0).
+      /// (chunked to at least scanTaskGrainVectors live vectors), or one
+      /// chunk of a non-IVF slot (listBegin == listEnd == 0).
       struct ScanUnit {
         int32_t slotOrd;
         size_t listBegin;
         size_t listEnd;
         int64_t live;
+        FlatScanRange flat{};
       };
 
       VectorSearchWork scanUnit(const ScanUnit& unit, const VectorSearchRequest& request,
-                                BoundedScanCut<Groups>& cut) const {
+                                BoundedScanCut<Groups>& cut, VectorSearchResult& part) const {
         const auto& slot = slots[(size_t)unit.slotOrd];
         if (slot.ivfEngine == nullptr) {
           VectorSearchRequest subReq = request;
           subReq.candidates = std::min(kDocs, slot.vectorCount);
           if (slot.completing) subReq.eligible = {}; // Full-domain max-sim, even for previously pooled docs.
-          auto part = slot.engine->search(subReq);
+          part = slot.engine->searchRange(subReq, unit.flat);
           if (part.scoresAreExact) {
+            // Publish witnesses as chunks finish, so concurrent interval
+            // scans prune against them. The terminal pass re-registers
+            // every kept hit; a chunk may skip hits below the floor.
             UnitKeyReader<Groups> keyReader(groupPlan);
             for (const auto& hit : part.hits) {
+              if (!unit.flat.whole() && hit.score < intervals.floorScore()) continue;
               int32_t doc = groupV2d[(size_t)hit.segOrd].resolve(hit.valueRank);
               const auto* key = keyReader.read(hit.segOrd, doc);
               if (key) intervals.offerExact(hit, *key);
             }
           }
-          cut.foldPart(part);
           return part.work;
         }
         assert(selectedListIds[(size_t)unit.slotOrd].size()
@@ -2742,7 +2846,7 @@ public:
         return work;
       }
 
-      void complete(int32_t segOrd, std::unique_ptr<VectorEngine> exact) {
+      void complete(int32_t segOrd, std::unique_ptr<SegmentFlatColumnVectorEngine<Groups>> exact) {
         for (auto& slot : slots) if (slot.segOrd == segOrd) {
           assert(slot.ivfEngine);
           ivfLiveTotal -= slot.liveVectorCount;
@@ -2809,7 +2913,11 @@ public:
             }
           } else if (slot.flatPending) {
             slot.flatPending = false;
-            units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount});
+            // A serial request keeps the single whole-segment scan.
+            if (parallel) {
+              for (auto range : slot.engine->chunks(scanTaskGrainVectors))
+                units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount, range});
+            } else units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount});
           }
         }
 
@@ -2820,11 +2928,34 @@ public:
           bool spawnTasks = parallel && units.size() > 1;
           if (spawnTasks) parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           std::vector<VectorSearchWork> work(units.size());
+          std::vector<VectorSearchResult> parts(units.size());
           TaskGroupRunner runner;
           task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(), [&](size_t i) {
-            return [&, i]() { work[i] = scanUnit(units[i], request, cut); };
+            return [&, i]() { work[i] = scanUnit(units[i], request, cut, parts[i]); };
           });
           runner.join();
+          // One top-k per chunk; their union holds the segment's top-k under
+          // the total hit order. Fold each flat slot into the cut once, so
+          // chunking is invisible to the terminal pass.
+          for (size_t i = 0; i < units.size();) {
+            size_t end = i + 1;
+            while (end < units.size() && units[end].slotOrd == units[i].slotOrd) end++;
+            auto& slot = slots[(size_t)units[i].slotOrd];
+            if (slot.ivfEngine == nullptr) {
+              if (end - i == 1) cut.foldPart(parts[i]);
+              else {
+                BoundedHits<Groups, VectorEngineHit, betterHit> slotHits(
+                    std::min(kDocs, slot.vectorCount), groupPlan, groupV2d);
+                for (size_t p = i; p < end; p++) for (const auto& hit : parts[p].hits) slotHits.offer(hit);
+                VectorSearchResult part;
+                part.scoresAreExact = part.breadthExhausted = true;
+                part.boundedSelection = VectorSelection::COMPLETE;
+                part.hits = slotHits.take();
+                cut.foldPart(part);
+              }
+            }
+            i = end;
+          }
           merged = cut.take();
           for (size_t i = 0; i < units.size(); i++) {
             if (i == 0 || units[i].slotOrd != units[i - 1].slotOrd) {
