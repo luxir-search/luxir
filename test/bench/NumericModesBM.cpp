@@ -32,17 +32,18 @@ using namespace luxir::test;
 namespace {
 
 constexpr std::array<const char*, 3> MODES{"none", "range", "match"};
-constexpr std::array<const char*, 3> LEADS{"alone", "l1", "l10"};
+constexpr std::array<const char*, 4> LEADS{"alone", "l1", "l10", "l100"};
 constexpr int64_t EPOCH_MS = 1'700'000'000'000;
 
 struct FieldSpec {
   bool date;
   bool shuffled;
   int32_t density;
+  bool sorted = false;
 
   std::string name() const {
     return fmt::format("{}/{}{}", date ? "date" : "bool",
-        shuffled ? "shuffled" : date ? "near" : "clustered",
+        sorted ? "sorted" : shuffled ? "shuffled" : date ? "near" : "clustered",
         date ? "" : fmt::format("/d{}", density));
   }
 };
@@ -61,10 +62,10 @@ const std::vector<uint8_t>& leadFlags() {
     std::vector<int32_t> order((size_t)size);
     std::iota(order.begin(), order.end(), 0);
     SplitMix64 rng(0x1ead);
-    for (int lead = 1; lead <= 2; lead++) {
+    for (int lead = 1; lead <= 3; lead++) {
       shuffle<int32_t>(order, rng);
-      int32_t count = size / (lead == 1 ? 100 : 10);
-      for (int32_t i = 0; i < count; i++) result[(size_t)order[(size_t)i]] |= lead;
+      int32_t count = lead == 3 ? std::min(size, 100) : size / (lead == 1 ? 100 : 10);
+      for (int32_t i = 0; i < count; i++) result[(size_t)order[(size_t)i]] |= 1 << (lead - 1);
     }
     return result;
   }();
@@ -85,13 +86,13 @@ struct Corpus {
     SplitMix64 rng(0x5eed + (uint64_t)spec.density);
     if (spec.shuffled) {
       shuffle<int64_t>(values, rng);
-    } else if (spec.date) {
+    } else if (spec.date && !spec.sorted) {
       // Unique millisecond timestamps, displaced by at most 255 ingest slots.
       for (size_t begin = 0; begin < values.size(); begin += 256) {
         shuffle<int64_t>(std::span(values).subspan(
             begin, std::min((size_t)256, values.size() - begin)), rng);
       }
-    } else {
+    } else if (!spec.date) {
       // Shuffle whole runs, retaining exact density and long constant zones.
       // Small runs still span a column leaf, so zone forcing is available.
       int32_t run = unit_tests ? 512 : 4096;
@@ -104,7 +105,8 @@ struct Corpus {
       }
     }
     // Exercise a nonempty equality under both leads even on the small corpus.
-    auto both = std::find(leadFlags().begin(), leadFlags().end(), 3);
+    auto both = std::find_if(leadFlags().begin(), leadFlags().end(),
+        [](uint8_t flags) { return (flags & 3) == 3; });
     if (both == leadFlags().end()) throw std::logic_error("numeric bench leads do not overlap");
     equality = spec.date ? values[(size_t)(both - leadFlags().begin())] : 1;
   }
@@ -152,7 +154,9 @@ struct NumericIndex {
   }
 
   double ingest() {
-    static constexpr std::array<const char*, 4> TEXT{"all", "all l1", "all l10", "all l1 l10"};
+    static constexpr std::array<const char*, 8> TEXT{
+      "all", "all l1", "all l10", "all l1 l10",
+      "all l100", "all l1 l100", "all l10 l100", "all l1 l10 l100"};
     auto writer = helper->getIndexWriter();
     auto start = std::chrono::steady_clock::now();
     auto& inverter = writer->obtainInverter();
@@ -213,7 +217,7 @@ Predicate predicateFor(const Corpus& data, bool date, int perMille) {
 int64_t expectedCount(const Corpus& data, Predicate predicate, int lead) {
   int64_t count = 0;
   for (size_t doc = 0; doc < data.values.size(); doc++) {
-    if ((lead == 0 || (leadFlags()[doc] & lead) != 0)
+    if ((lead == 0 || (leadFlags()[doc] & (1 << (lead - 1))) != 0)
         && predicate.lo <= data.values[doc] && data.values[doc] <= predicate.hi) count++;
   }
   return count;
@@ -264,6 +268,7 @@ void queryBench(benchmark::State& state, FieldSpec spec, int perMille,
     state.SkipWithError("numeric predicate differs after timed iterations");
     return;
   }
+  state.counters["terms"] = (double)SkipStats::numericPredicatePostingsTerms;
   state.counters["result"] = (double)expected;
   state.counters["docs"] = (double)index.data.values.size();
   struct Counter { Arm arm; const char* name; int64_t count; };
@@ -318,11 +323,17 @@ void registerQuery(FieldSpec spec, int perMille, int lead, int mode, std::option
   for (Arm arm : {Arm::POINTS, Arm::SPARSE_VERIFY}) {
     registerQuery({false, true, 50}, 0, 1, 1, arm);
   }
+  // A fixed 100-doc lead makes the verify-side planning budget visible.
+  for (int mode = 0; mode < 3; mode++) registerQuery({true, true, 0}, 500, 3, mode, std::nullopt);
+  for (Arm arm : {Arm::POINTS, Arm::COMPLEMENT, Arm::SPARSE_VERIFY, Arm::SCAN}) {
+    registerQuery({true, true, 0}, 500, 3, 1, arm);
+  }
   for (bool date : {false, true}) {
-    for (bool shuffled : {true, false}) {
+    for (int layout = 0; layout < (date ? 3 : 2); layout++) {
+      bool shuffled = layout == 0;
       for (int density : {1, 10, 50, 90}) {
         if (date && density != 1) continue;
-        FieldSpec spec{date, shuffled, date ? 0 : density};
+        FieldSpec spec{date, shuffled, date ? 0 : density, layout == 2};
         for (int perMille : {0, 1, 10, 100, 500}) {
           if (!date && perMille != 0) continue;
           for (int lead = 0; lead < 3; lead++) {
@@ -333,7 +344,7 @@ void registerQuery(FieldSpec spec, int perMille, int lead, int mode, std::option
                             Arm::ZONE_MAP, Arm::SCAN}) {
               if (arm == Arm::POSTINGS && perMille != 0) continue;
               if (arm == Arm::ZONE_MAP && shuffled) continue;
-              if (arm == Arm::COMPLEMENT && (date || density != 90)) continue;
+              if (arm == Arm::COMPLEMENT && (date ? !spec.sorted : density != 90)) continue;
               if (!date && shuffled && density == 50 && lead == 1
                   && (arm == Arm::POINTS || arm == Arm::SPARSE_VERIFY)) continue;
               registerQuery(spec, perMille, lead, arm == Arm::POSTINGS ? 2 : 1, arm);
