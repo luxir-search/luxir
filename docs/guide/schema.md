@@ -218,7 +218,7 @@ The built-in templates are:
 | `_ip`, `_ips` | IP address terms, single- or multi-valued. |
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
-| `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_dt`, `_dts` | Date column with a points index (`index: "range"`), single- or multi-valued. |
 | `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |

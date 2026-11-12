@@ -6185,6 +6185,12 @@ TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
   luxir::test::CollectionHelper helper(node, collection);
   auto cache = std::make_shared<FilterCache>(testConfig());
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  // Column only: a points index would answer the count without a filter.
+  SchemaBuilder schema;
+  auto& when = schema.field("when_dt");
+  when.type = api::FieldDef_::FieldClass::DATE;
+  when.index = api::FieldDef_::IndexMode::NONE;
+  schema.set(helper.collection());
 
   constexpr int64_t minute = 60000;
   int64_t base = *parseDateToEpochMillis("2026-07-22T08:00:00Z");

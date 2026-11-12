@@ -1283,8 +1283,14 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
-  add(templates, "_dt", FieldClass::DATE);
-  add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
+  // Dates build the points index: range filters are their common use, and
+  // timestamps not in ingest order leave column zones nothing to prune.
+  add(templates, "_dt", FieldClass::DATE).index = IndexMode::RANGE;
+  {
+    auto& f = add(templates, "_dts", FieldClass::DATE);
+    f.index = IndexMode::RANGE;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
+  }
   // Geo points also build the points index, since geo queries are their
   // only use.
   add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
