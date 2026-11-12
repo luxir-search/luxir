@@ -185,6 +185,23 @@ TEST(ReadAheadTest, faultsTurnSparseAdviceOnAndResidentBatchesOff) {
   EXPECT_FALSE(hot.active());
 }
 
+// A sequence too short to reach the gate's fault check: a cold probe alone
+// starts the advice, at the next step.
+TEST(ReadAheadTest, coldProbeAdvisesAtTheNextSparseStep) {
+  ColdFile cold(8 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  RowReadAhead::Gate gate;
+  RowReadAhead ahead(gate, cold.file.get(), 0, 1, 8 << 20);
+  auto queue = [&](int64_t k) { ahead.queueRows(k * (1 << 20), (k + 1) * (1 << 20)); };
+  ahead.sparseAt(0, 8, queue);
+  EXPECT_FALSE(ahead.active());
+  EXPECT_EQ(cold.resident(0, 1 << 20), 0u);
+  ahead.probe({(4 << 20) + 100});
+  EXPECT_TRUE(ahead.active());
+  ahead.sparseAt(1, 8, queue);
+  EXPECT_TRUE(cold.waitResident(1 << 20, 1 << 20));
+}
+
 TEST(ReadAheadTest, scanAdvisesAWindowAheadOfTheCursor) {
   ColdFile cold(32 << 20);
   if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";

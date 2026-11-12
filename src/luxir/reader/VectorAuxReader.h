@@ -14,6 +14,7 @@
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -231,10 +232,39 @@ static_assert(sizeof(faiss::rabitq_utils::SignBitFactorsWithError) == RABITQ_F_E
 struct RaBitQAmplitudes {
   const float* values = nullptr;
   std::span<const size_t> offsets;
+  std::atomic<uint8_t>* checked = nullptr;  // per list; the reader owns it
 
   std::span<const float> list(size_t listNo) const noexcept {
     return {values + offsets[listNo], offsets[listNo + 1] - offsets[listNo]};
   }
+
+  /// The list's amplitudes, validated on the list's first use.  A scan reads
+  /// these bytes anyway, so validation adds no I/O, where validating at open
+  /// would fault in 4 bytes per vector of the segment.  Racing scans may both
+  /// validate; the result is the same.
+  std::span<const float> checkedList(size_t listNo) const {
+    auto span = list(listNo);
+    if (checked[listNo].load(std::memory_order_relaxed)) return span;
+    for (float value : span) {
+      if (!std::isfinite(value) || value < 0) {
+        throw std::runtime_error("VectorAuxReader: invalid RaBitQ amplitude");
+      }
+    }
+    checked[listNo].store(1, std::memory_order_relaxed);
+    return span;
+  }
+};
+
+/// Where a list's runs lie in the overlay file: rows offsets[l] to
+/// offsets[l + 1] of each section.  amplitudes is 0 when the codec has none.
+struct IvfListLayout {
+  InputFile* file = nullptr;
+  size_t fileSize = 0;
+  size_t ids = 0;
+  size_t codes = 0;
+  size_t amplitudes = 0;
+  size_t codeSize = 0;
+  std::span<const size_t> offsets;
 };
 
 /// Read-only faiss::InvertedLists serving codes + ids directly out of the aux
@@ -298,6 +328,7 @@ class VectorAuxReader : public AuxReader {
   // (shared across overlays by internVectorRotation); null otherwise.
   mutable std::shared_ptr<const VectorRotation> rotation;
   mutable RaBitQAmplitudes amplitudes;
+  mutable std::unique_ptr<std::atomic<uint8_t>[]> amplitudesChecked;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
 
@@ -333,15 +364,6 @@ public:
       remaining -= sizes[i];
     }
     if (remaining != 0) throw std::runtime_error("VectorAuxReader: list sizes do not match ntotal");
-    // Validate once on open; list scans use unchecked, sequential float loads.
-    if (isRaBitQ()) {
-      const float* values = (const float*)(base + footer.amplitudesOffset());
-      for (int64_t i = 0; i < footer.ntotal; i++) {
-        if (!std::isfinite(values[i]) || values[i] < 0) {
-          throw std::runtime_error("VectorAuxReader: invalid RaBitQ amplitude");
-        }
-      }
-    }
   }
 
   std::string_view getKind() const override { return KIND; }
@@ -364,6 +386,12 @@ public:
   /// (ENGINE_IVFRABITQ), or null.  Valid after getFaissIndex().
   const VectorRotation* getRotation() const noexcept { return rotation.get(); }
   const RaBitQAmplitudes& getAmplitudes() const { getFaissIndex(); return amplitudes; }
+  IvfListLayout getListLayout() const {
+    getFaissIndex();
+    return {file.get(), file->size(), footer.idsOffset(), footer.codesOffset(),
+            isRaBitQ() ? footer.amplitudesOffset() : 0, (size_t)footer.codeSize,
+            mmapLists->listOffsets()};
+  }
 
   // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
   // behind the rotation; see getRotation).  Decode is lazy and once-only;
@@ -454,8 +482,9 @@ public:
       mmapLists = std::move(lists);
       faissIndex = std::move(idx);
       rotation = std::move(rot);
+      if (isRaBitQ()) amplitudesChecked = std::make_unique<std::atomic<uint8_t>[]>((size_t)footer.nlist);
       amplitudes = {(const float*)(base + footer.amplitudesOffset()),
-                    mmapLists->listOffsets()};
+                    mmapLists->listOffsets(), amplitudesChecked.get()};
     });
     return faissIndex.get();
   }

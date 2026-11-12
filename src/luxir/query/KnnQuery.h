@@ -1168,7 +1168,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getAmplitudes(), vaux->getListLayout(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1794,6 +1794,7 @@ public:
     template <bool Groups> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
       RaBitQAmplitudes amplitudes;
+      IvfListLayout listLayout;
       KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
@@ -2003,8 +2004,9 @@ public:
                         IndexReader::Segment& seg, const SegV2D& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
-          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+                        RaBitQAmplitudes amplitudes, IvfListLayout listLayout,
+                        KnnIntervalCollector<Groups>* intervals)
+          : groupPlan(groupPlan), amplitudes(amplitudes), listLayout(listLayout), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
@@ -2077,6 +2079,8 @@ public:
         return selector.withProbe(ivf.ntotal, scan);
       }
 
+      static constexpr size_t LIST_PROBE_INTERVAL = 8;
+
       template <bool Interval, class Probe>
       LUXIR_NOINLINE VectorSearchWork scanListsWithProbe(const VectorSearchRequest& request,
                                std::span<const faiss::idx_t> listIds,
@@ -2098,9 +2102,30 @@ public:
         int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
         bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
+        // Cold lists fault page by page, each a blocking device read, so a
+        // round reads its lists ahead.  A round is shorter than the gate's
+        // fault checks, so a sampled page of the codes turns advice on.
+        RowReadAhead::Gate gate;
+        RowReadAhead ahead(gate, listLayout.file, 0, 1, (int64_t)listLayout.fileSize);
+        auto queueList = [&](int64_t k) {
+          if (listIds[(size_t)k] < 0) return;
+          auto section = [&](size_t base, size_t stride) {
+            size_t row = listLayout.offsets[(size_t)listIds[(size_t)k]];
+            size_t end = listLayout.offsets[(size_t)listIds[(size_t)k] + 1];
+            ahead.queueRows((int64_t)(base + row * stride), (int64_t)(base + end * stride));
+          };
+          section(listLayout.ids, sizeof(faiss::idx_t));
+          section(listLayout.codes, listLayout.codeSize);
+          if constexpr (Interval) section(listLayout.amplitudes, sizeof(float));
+        };
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
+          if (list % LIST_PROBE_INTERVAL == 0 && !ahead.active() && listLayout.offsets[(size_t)id + 1] > listLayout.offsets[(size_t)id]) {
+            size_t middle = (listLayout.offsets[(size_t)id] + listLayout.offsets[(size_t)id + 1]) / 2;
+            ahead.probe({(int64_t)(listLayout.codes + middle * listLayout.codeSize)});
+          }
+          ahead.sparseAt((int64_t)list, (int64_t)listIds.size(), queueList);
           faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
           faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
           size_t count = ivf.invlists->list_size((size_t)id);
@@ -2116,7 +2141,7 @@ public:
             assert(dc != nullptr);
           } else pqScanner->set_list(id, centroidDists[list]);
           const float* listAmplitudes = nullptr;
-          if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
+          if constexpr (Interval) listAmplitudes = amplitudes.checkedList((size_t)id).data();
           double gateScale = dc ? (double)dc->g_error * (RABITQ_GATE_EPSILON / 1.9f) : 0;
           double selectionScale = dc ? (double)dc->g_error * RABITQ_SELECTION_EPSILON : 0;
 
