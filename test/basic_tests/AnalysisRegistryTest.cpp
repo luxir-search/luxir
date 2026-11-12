@@ -145,6 +145,37 @@ TEST_F(AnalysisRegistryTest, unknownNamesListValidOnesSorted) {
   EXPECT_NE(std::string::npos, compileError(registry, R"({"filters":[{"params":{}}]})").find("has no name"));
 }
 
+TEST_F(AnalysisRegistryTest, duplicateStopParametersRejected) {
+  AnalysisRegistry registry;
+  std::string_view a[] = {"a"}, b[] = {"b"};
+  api::Val first{api::ArrStr{a}}, second{api::ArrStr{b}};
+  std::pair<std::string_view, hpp_proto::indirect_view<api::Val>> params[] = {
+      {"words", &first}, {"words", &second}};
+  auto stop = component("stop");
+  stop.params = params;
+  api::AnalyzerDef def;
+  def.filters = {&stop, 1};
+  try {
+    Analyzer::compile(def, registry);
+    FAIL() << "duplicate stop parameters accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_STREQ("filter 'stop': duplicate parameter 'words'; parameter names must be unique", e.what());
+  }
+}
+
+TEST_F(AnalysisRegistryTest, duplicateNestedParametersRejected) {
+  AnalysisRegistry registry;
+  for (auto [definition, expected] : {
+      std::pair{R"({"tokenizer":{"name":"whitespace","params":{"nested":{"key":1,"key":2}}}})",
+                "tokenizer 'whitespace': duplicate parameter 'key'; parameter names must be unique"},
+      {R"({"filters":[{"name":"stop","params":{"words":[{"key":1,"key":2}]}}]})",
+       "filter 'stop': duplicate parameter 'key'; parameter names must be unique"},
+      {R"({"char_filters":[{"name":"mapping","params":{"mappings":[{"key":1,"key":2}]}}]})",
+       "char filter 'mapping': duplicate parameter 'key'; parameter names must be unique"}}) {
+    EXPECT_EQ(expected, compileError(registry, definition));
+  }
+}
+
 TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
   AnalysisRegistry registry;
   auto named = compileWith(registry, R"({"name":"english"})");

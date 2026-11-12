@@ -497,7 +497,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
   }
 }
 
-// Pass 3 compiles each effective analysis definition once and creates physical
+// Pass 3 caches compiled analysis by authored definition and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
 static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declared,
     FieldClass type, bool isPrimary, std::string_view name) {
