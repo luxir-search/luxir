@@ -53,12 +53,16 @@ private:
     uint64_t size;
     uint64_t pins = 0;
     bool retired = false;
+    // Latest expiry among superseded snapshots referencing this name. These
+    // holds neither consume the follower-pin budget nor expire on pin idle.
+    std::optional<Clock::time_point> until = {};
   };
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;
   Stats counters;
   Now now;
+  const std::chrono::milliseconds retention;
   bool closed = false;
   std::map<CommitId, Pin> pins;
   // The current snapshot's descriptors by name, rebuilt once per publication
@@ -83,12 +87,19 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
+  Clock::time_point retentionDeadline();
+  void retain(const CommitSnapshot& snapshot, Clock::time_point until);
+  void retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current);
   void requireHeld(const FileDescriptor& descriptor);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now,
-                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0")
-      : now(std::move(now)), schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
-        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {}
+                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0",
+                                  std::chrono::milliseconds retention = {})
+      : now(std::move(now)), retention(retention),
+        schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
+        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {
+    if (retention.count() < 0 || retention.count() > INT64_MAX / 1000) throw std::invalid_argument("snapshot retention is out of range");
+  }
   std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes, Directory& source);
   std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes) { return resolve(std::move(bytes), dir); }
   ~CommitSnapshotRegistry() { close(); }
@@ -97,6 +108,7 @@ public:
   void fail() noexcept;
   // Stop pins and join retirement while admitted searches retain readers.
   void detach() noexcept;
+  // The snapshot's STATE tip must already be installed before publication.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   // Installers other than the writer: make `snapshot`'s root durable, publish it
   // with the prepared reader, then retire the previous root and the files only

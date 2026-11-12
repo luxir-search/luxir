@@ -500,6 +500,8 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.cacheentrydump.segments_resident"></a>[`segments_resident`](#field-luxir.cacheentrydump.segments_resident) | 7 | `uint32` | singular |  |
 | <a id="field-luxir.cacheentrydump.hits"></a>[`hits`](#field-luxir.cacheentrydump.hits) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.last_used_epoch"></a>[`last_used_epoch`](#field-luxir.cacheentrydump.last_used_epoch) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.cacheentrydump.build_us"></a>[`build_us`](#field-luxir.cacheentrydump.build_us) | 10 | `uint64` | singular | Summed build time of this entry's resident values, in microseconds. |
+| <a id="field-luxir.cacheentrydump.recent_uses"></a>[`recent_uses`](#field-luxir.cacheentrydump.recent_uses) | 11 | `uint32` | singular | Current key uses in the admission window, taking the max of the two lanes. |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -895,8 +897,9 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
-| <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound; false means the count is exact. |
+| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero or the estimate\_count flag applies. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
+| <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound. Neither this nor found\_estimated means the count is exact. |
+| <a id="field-luxir.doclist.found_estimated"></a>[`found_estimated`](#field-luxir.doclist.found_estimated) | 16 | `bool` | singular | True when found was extrapolated from a sample of the index; it may be above or below the exact count, within what index statistics allow. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when count\_limit is nonzero, after missing=drop. |
 | <a id="field-luxir.doclist.found_groups"></a>[`found_groups`](#field-luxir.doclist.found_groups) | 8 | `sint64` | optional | Diversify only, with nonzero count\_limit: distinct eligible keys. |
 | <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
@@ -1056,6 +1059,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
@@ -1185,13 +1189,14 @@ Required fusion method: exactly one.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.fusion.decorate"></a>[`decorate`](#field-luxir.fusion.decorate) | 27 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.fusion.sources"></a>[`sources`](#field-luxir.fusion.sources) | 1 | map&lt;`string`, [`TopDocs`](#message-luxir.topdocs)&gt; | map | Named source queries. At least one source is required. |
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |
 | <a id="field-luxir.fusion.limit"></a>[`limit`](#field-luxir.fusion.limit) | 3 | `sint64` | optional | Maximum fused rows (groups with collapse) to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused row; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
-| <a id="field-luxir.fusion.count_limit"></a>[`count_limit`](#field-luxir.fusion.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 requests exact; positive N permits a lower bound. Fusion always supplies an exact count, also valid for N. Counts eligible groups with collapse, otherwise source-union documents. Must be &gt;= -1. |
+| <a id="field-luxir.fusion.count_limit"></a>[`count_limit`](#field-luxir.fusion.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 requests exact; -2 permits an estimate; positive N permits a lower bound. Fusion always supplies an exact count, which is valid for -2, N and an unset count\_limit under the estimate\_count flag. Counts eligible groups with collapse, otherwise source-union documents. Must be &gt;= -2. |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
@@ -1316,6 +1321,8 @@ Typed collapse identity. Component types follow the resolved schema fields.
 | <a id="field-luxir.groupcomponent.null"></a>[`null`](#field-luxir.groupcomponent.null) | 2 | [`google.protobuf.NullValue`](#enum-google.protobuf.nullvalue) | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 | <a id="field-luxir.groupcomponent.s"></a>[`s`](#field-luxir.groupcomponent.s) | 3 | `string` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 | <a id="field-luxir.groupcomponent.i"></a>[`i`](#field-luxir.groupcomponent.i) | 4 | `sint64` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+| <a id="field-luxir.groupcomponent.b"></a>[`b`](#field-luxir.groupcomponent.b) | 5 | `bool` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
+| <a id="field-luxir.groupcomponent.d"></a>[`d`](#field-luxir.groupcomponent.d) | 6 | `double` | oneof [`value`](#oneof-luxir.groupcomponent.value) |  |
 
 <a id="message-luxir.groupkey"></a>
 
@@ -1896,6 +1903,9 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.thrash_build_skips"></a>[`thrash_build_skips`](#field-luxir.querycachestats.thrash_build_skips) | 19 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_dead_builds"></a>[`reader_dead_builds`](#field-luxir.querycachestats.reader_dead_builds) | 20 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_thrash_build_skips"></a>[`reader_thrash_build_skips`](#field-luxir.querycachestats.reader_thrash_build_skips) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.build_us"></a>[`build_us`](#field-luxir.querycachestats.build_us) | 22 | `uint64` | singular | Build time of claimed cache builds, including rejected publications, in microseconds. Excludes byproducts. |
+| <a id="field-luxir.querycachestats.served_build_us"></a>[`served_build_us`](#field-luxir.querycachestats.served_build_us) | 23 | `uint64` | singular | Build time of values served as shared hits, in microseconds. An upper bound on time saved, not measured savings. |
+| <a id="field-luxir.querycachestats.dead_build_us"></a>[`dead_build_us`](#field-luxir.querycachestats.dead_build_us) | 24 | `uint64` | singular | Build time of zero-hit capacity evictions that install bypass debt, in microseconds. |
 
 <a id="message-luxir.queryfacet"></a>
 
@@ -2235,7 +2245,7 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.time_zone"></a>[`time_zone`](#field-luxir.searchrequest.time_zone) | 5 | `string` | singular | Time zone for date math and date literals without an offset. Empty is UTC; accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name. |
 | <a id="field-luxir.searchrequest.response_format"></a>[`response_format`](#field-luxir.searchrequest.response_format) | 6 | [`ResponseFormat`](#enum-luxir.responseformat) | singular | HTTP response framing. ENVELOPE (default): one JSON envelope per batch. DOCS: one document per line, with optional \_header\_ metadata records. The HTTP ?format=docs parameter also selects DOCS. gRPC rejects DOCS. See docs/guide/http-api.md for the NDJSON formats. |
 | <a id="field-luxir.searchrequest.profile"></a>[`profile`](#field-luxir.searchrequest.profile) | 7 | `bool` | singular | Return execution details for instrumented operations; see ExecutionProfile. |
-| <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose, today serial: over HTTP normally inline on the receiving thread, over gRPC on the shared executor. 1 runs serially on the shared executor; -1 permits unlimited parallelism, with shared workers joining in (starting on the receiving HTTP thread, or on the shared executor over gRPC). Other values are rejected. |
+| <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose: serial (over HTTP normally inline on the receiving thread, over gRPC on the shared executor) unless the operator's search.auto-parallel-min-work admits it. 1 runs serially on the shared executor; -1 permits unlimited parallelism, with shared workers joining in (starting on the receiving HTTP thread, or on the shared executor over gRPC). Other values are rejected. |
 | <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). Writers reject a different incarnation immediately; followers wait for a switch. |
 | <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
 | <a id="field-luxir.searchrequest.flags"></a>[`flags`](#field-luxir.searchrequest.flags) | 11 | `uint64` | singular | Packed request options. Effective = (inherited &amp; ~flags\_set) \| (flags &amp; flags\_set); the request inherits 0. JSON uses lowercase names, e.g. "flags": \["date\_ms"\], rather than numeric flags/flags\_set. Date modes control numeric date literal units: ms or ns overrides the field unit; native and iso use the field unit. Value arithmetic is unchanged. |
@@ -2298,6 +2308,8 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.version"></a>[`version`](#field-luxir.servicestats.version) | 1 | `string` | singular |  |
 | <a id="field-luxir.servicestats.cpu_target"></a>[`cpu_target`](#field-luxir.servicestats.cpu_target) | 20 | `string` | singular | The CPU target the binary was built for. |
 | <a id="field-luxir.servicestats.source_commit"></a>[`source_commit`](#field-luxir.servicestats.source_commit) | 23 | `string` | singular | The full Git commit the binary was built from, or "unknown". |
+| <a id="field-luxir.servicestats.faiss_simd"></a>[`faiss_simd`](#field-luxir.servicestats.faiss_simd) | 24 | `string` | singular | The SIMD level FAISS selected for this CPU at startup: NONE, AVX2, AVX512, AVX512\_SPR, ARM\_NEON or ARM\_SVE. FAISS\_SIMD\_LEVEL overrides it. |
+| <a id="field-luxir.servicestats.blas_core"></a>[`blas_core`](#field-luxir.servicestats.blas_core) | 25 | `string` | singular | The BLAS kernels selected for this CPU at startup: the OpenBLAS core name, or "Accelerate" on macOS. |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
 | <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
 | <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, delete pass, merge, vector build and reader refresh histograms. |
@@ -2537,11 +2549,12 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.topdocs.decorate"></a>[`decorate`](#field-luxir.topdocs.decorate) | 25 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.topdocs.query"></a>[`query`](#field-luxir.topdocs.query) | 1 | [`Query`](#message-luxir.query) | singular | unset selects all documents (browse / filter-only search) |
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
 | <a id="field-luxir.topdocs.offset"></a>[`offset`](#field-luxir.topdocs.offset) | 3 | `int64` | singular | Zero-based rank of the first returned document; must be &gt;= 0. Skip this many ranked matches, then return up to limit (-1: all remaining; 0: none). Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. Ignored as a Fusion source. |
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
-| <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte. An exact count is also valid for N. Must be &gt;= -1. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
+| <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte; -2 asks for an estimate, like the estimate\_count flag but for this list alone. The flag applies to an unset or positive count\_limit, never to an explicit 0 or -1. An exact count is valid for every nonzero value. Must be &gt;= -2. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
 | <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
@@ -2867,12 +2880,15 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.boolean"></a>[`BOOLEAN`](#value-luxir.fielddef.fieldclass.boolean) | 11 | true/false, stored as 0/1 in the int column |
+| <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
+| <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
 ### luxir.FieldDef.IndexMode
 
-Index acceleration. Numeric Match/Range and geographic predicates can scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH; STRING columns alone do not provide term-query support.
+Index acceleration. Numeric Match/Range and geographic predicates can scan a column with NONE. Term queries on STRING/TEXT/ID/IP require MATCH; STRING columns alone do not provide term-query support.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2934,6 +2950,9 @@ SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts an
 | <a id="value-luxir.groupcomponent.type.id"></a>[`ID`](#value-luxir.groupcomponent.type.id) | 1 |  |
 | <a id="value-luxir.groupcomponent.type.int"></a>[`INT`](#value-luxir.groupcomponent.type.int) | 2 |  |
 | <a id="value-luxir.groupcomponent.type.date"></a>[`DATE`](#value-luxir.groupcomponent.type.date) | 3 |  |
+| <a id="value-luxir.groupcomponent.type.boolean"></a>[`BOOLEAN`](#value-luxir.groupcomponent.type.boolean) | 4 |  |
+| <a id="value-luxir.groupcomponent.type.decimal"></a>[`DECIMAL`](#value-luxir.groupcomponent.type.decimal) | 5 |  |
+| <a id="value-luxir.groupcomponent.type.ip"></a>[`IP`](#value-luxir.groupcomponent.type.ip) | 6 |  |
 
 <a id="enum-luxir.linearfusion.normalization"></a>
 
@@ -3021,6 +3040,8 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 | <a id="value-luxir.requestflagbit.date_mode_low_bit"></a>[`DATE_MODE_LOW_BIT`](#value-luxir.requestflagbit.date_mode_low_bit) | 0 |  |
 | <a id="value-luxir.requestflagbit.date_mode_high_bit"></a>[`DATE_MODE_HIGH_BIT`](#value-luxir.requestflagbit.date_mode_high_bit) | 1 |  |
 | <a id="value-luxir.requestflagbit.int64_str_bit"></a>[`INT64_STR_BIT`](#value-luxir.requestflagbit.int64_str_bit) | 2 | request-only: quote JSON integers outside the safe range |
+| <a id="value-luxir.requestflagbit.estimate_count_bit"></a>[`ESTIMATE_COUNT_BIT`](#value-luxir.requestflagbit.estimate_count_bit) | 3 | lists with an unset or positive count\_limit may estimate found |
+| <a id="value-luxir.requestflagbit.decimal_scaled_bit"></a>[`DECIMAL_SCALED_BIT`](#value-luxir.requestflagbit.decimal_scaled_bit) | 4 | decimal literals and results use raw scaled integers |
 
 <a id="enum-luxir.responseformat"></a>
 

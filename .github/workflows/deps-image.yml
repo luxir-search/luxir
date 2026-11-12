@@ -12,6 +12,7 @@ on:
       - 'deps/triplets/**'
       - 'test/blas_lapack_test.cpp'
       - 'tools/benchmarks/deps-key.py'
+      - 'tools/deps-image'
       - '.github/workflows/deps-image.yml'
 
 permissions:
@@ -21,52 +22,58 @@ concurrency:
   group: dependency-image
   cancel-in-progress: false
 
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
+
+# A cold build of both dependency variants exceeds one hosted job's six hours,
+# so each variant gets its own job. The first publishes its stage as
+# <key>-normal; the second builds the ASan variant and the dev image on it.
+#
+# No Actions cache: other workflows in this repository build and run
+# untrusted refs and can write cache entries, so every published image
+# comes from a cold build. Hosted runners count two cores; use all CPUs.
 jobs:
-  publish:
+  normal:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
       packages: write
-    env:
-      REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
-      DOCKER_CONFIG: /tmp/deps-docker-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      exists: ${{ steps.image.outputs.exists }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Test key contract
         run: python3 -m unittest discover -s tools/benchmarks -p 'test_deps_key.py'
-      - name: Sign in to registry
+      - name: Compute key and check existing tags
+        id: image
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      - name: Compute key and check existing tag
-        id: image
-        run: |
-          set -euo pipefail
-          key=$(python3 tools/benchmarks/deps-key.py .)
-          image="${REGISTRY,,}:$key"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          if timeout 60 docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo 'exists=true' >> "$GITHUB_OUTPUT"
-          fi
-          printf 'Source: %s\nDependency image: %s\n' "$(git rev-parse HEAD)" "$image" >> "$GITHUB_STEP_SUMMARY"
-      # No Actions cache: other workflows in this repository build and run
-      # untrusted refs and can write cache entries, so every published image
-      # comes from a cold build. Hosted runners count two cores; use all CPUs.
-      - name: Build and publish development image
-        if: steps.image.outputs.exists != 'true'
+        run: tools/deps-image plan
+      - name: Build and publish normal dependencies
+        if: steps.image.outputs.exists != 'true' && steps.image.outputs.normal_exists != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ steps.image.outputs.image }}
-        run: |
-          docker build --progress=plain -f .devcontainer/Dockerfile \
-            --target dev --build-arg "BUILD_JOBS=$(nproc)" \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            -t "$IMAGE" .
-          docker push "$IMAGE"
-      - name: Remove registry credentials
-        if: always()
-        run: rm -rf -- "$DOCKER_CONFIG"
+        run: tools/deps-image build normal-dependencies "$IMAGE-normal"
+
+  publish:
+    needs: normal
+    if: needs.normal.outputs.exists != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build and publish development image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.normal.outputs.image }}
+        run: tools/deps-image build dev "$IMAGE" --build-arg "NORMAL_DEPENDENCIES=$IMAGE-normal"

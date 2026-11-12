@@ -3,8 +3,8 @@
 #pragma once
 
 #include <map>
+#include <chrono>
 #include <mutex>
-#include <set>
 #include "Directory.h"
 #include "FileLock.h"
 #include "FSDirectory.h"
@@ -15,9 +15,13 @@ enum class StorageRoot { AUTHORITATIVE, NODE_PRIVATE };
 
 class DirectoryFactory {
 public:
+  // Resolved once on the configured store, shared by catalogs and snapshots.
+  std::chrono::milliseconds retention{};
   struct ViewOptions { std::shared_ptr<StorageMemory> account; };
   struct Child { std::string name; bool directory; };
   virtual ~DirectoryFactory() = default;
+  // True only when this process owns the whole authoritative store.
+  virtual bool exclusive() const { return false; }
   // Opening a view creates no namespace entries. Paths are relative to the root.
   virtual std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) = 0;
   virtual std::vector<Child> children(StorageRoot root, std::string_view path) = 0;
@@ -63,6 +67,7 @@ public:
   explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
       : account(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
   std::string describe() const override { return "ram"; }
+  bool exclusive() const override { return true; }
   std::shared_ptr<StorageMemory> memory() override { return account; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));
@@ -103,14 +108,20 @@ public:
   }
 };
 
-// Both roots use the configured data directory: node/ is exclusively node-private.
+// Both modes share the authoritative root; each shared node owns node/<id>/.
 // An unowned open creates nothing and takes no lock. ReadOnlyDirFactory rejects writes.
 class FSDirFactory : public DirectoryFactory {
+public:
+  enum class Mode { EXCLUSIVE, SHARED };
+private:
   std::filesystem::path basePath;
+  std::filesystem::path privatePath;
+  std::filesystem::path publishTemps;
   std::optional<FileLock> lock;
+  std::optional<FileLock> nodeLock;
   bool unowned;
+  Mode mode;
   std::mutex mutex;
-  std::set<std::filesystem::path> cleaned;
   std::map<std::filesystem::path, std::shared_ptr<FSDirectory::ParentSync>> parentSync;
 
   std::shared_ptr<FSDirectory::ParentSync> parentsOf(const std::filesystem::path& path) {
@@ -121,7 +132,7 @@ class FSDirFactory : public DirectoryFactory {
   }
 
   std::filesystem::path rootPath(StorageRoot root) const {
-    return root == StorageRoot::AUTHORITATIVE ? basePath : basePath / "node";
+    return root == StorageRoot::AUTHORITATIVE ? basePath : privatePath;
   }
   std::filesystem::path pathOf(StorageRoot root, std::string_view relative) const {
     auto base = rootPath(root);
@@ -135,25 +146,47 @@ class FSDirFactory : public DirectoryFactory {
     return path; // removeTree must unlink a final symlink, not remove its target.
   }
 public:
-  explicit FSDirFactory(std::filesystem::path path, bool unowned = false)
-      : basePath(std::filesystem::weakly_canonical(std::filesystem::absolute(path))), unowned(unowned) {
+  explicit FSDirFactory(std::filesystem::path path, bool unowned = false, Mode mode = Mode::EXCLUSIVE,
+                        std::string_view node = {})
+      : basePath(std::filesystem::weakly_canonical(std::filesystem::absolute(path))),
+        privatePath(basePath / "node"), unowned(unowned), mode(mode) {
+    if (mode == Mode::SHARED) {
+      checkedPath(StorageRoot::NODE_PRIVATE, node);
+      if (node.empty() || node.find('/') != std::string_view::npos || node == "write.lock" || node == "tmp"
+          || node == "replication.json" || node == FSDirectory::kPublicationLock) {
+        throw std::invalid_argument("invalid or reserved shared_fs node id: " + std::string(node));
+      }
+      privatePath /= node;
+    }
+    publishTemps = privatePath / "tmp";
     if (unowned) {
       if (!std::filesystem::is_directory(basePath)) throw ReadOnlyError("data directory does not exist: " + basePath.string());
     } else {
       if (std::filesystem::is_symlink(basePath / "node")) throw std::invalid_argument("node-private root must not be a symlink");
       FSDirectory(basePath / "node", {}, parentsOf(basePath / "node")).sync({});
-      lock.emplace(basePath / "node" / "write.lock");
+      lock.emplace(basePath / "node/write.lock", mode == Mode::SHARED ? FileLock::Mode::SHARED : FileLock::Mode::EXCLUSIVE);
+      if (mode == Mode::SHARED) {
+        if (std::filesystem::is_symlink(privatePath)) throw std::invalid_argument("node-private root must not be a symlink");
+        FSDirectory(privatePath, basePath, parentsOf(privatePath)).sync({});
+        nodeLock.emplace(privatePath / "write.lock");
+      }
+    }
+    if (mode == Mode::SHARED && std::filesystem::exists(privatePath / "replication.json")) {
+      throw std::invalid_argument("shared_fs refuses a follower private root containing replication.json: " + privatePath.string());
+    }
+    if (!unowned) {
+      if (std::filesystem::is_symlink(publishTemps)) throw std::invalid_argument("publication temp directory must not be a symlink");
+      std::filesystem::create_directories(publishTemps);
+      for (const auto& entry : std::filesystem::directory_iterator(publishTemps)) std::filesystem::remove_all(entry.path());
+      FSDirectory(publishTemps, basePath, parentsOf(publishTemps)).sync({});
     }
   }
-  std::string describe() const override { return "fs:" + basePath.string(); }
+  std::string describe() const override { return (mode == Mode::SHARED ? "shared_fs:" : "fs:") + basePath.string(); }
+  bool exclusive() const override { return mode == Mode::EXCLUSIVE && lock.has_value(); }
   std::string diskPath() const override { return basePath.string(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view relative, ViewOptions options = {}) override {
     auto path = pathOf(root, relative);
-    if (!unowned && std::filesystem::is_directory(path)) {
-      std::lock_guard guard(mutex);
-      if (cleaned.insert(path).second) FSDirectory::cleanPublicationTemps(path);
-    }
-    return std::make_shared<FSDirectory>(path, basePath, parentsOf(path));
+    return std::make_shared<FSDirectory>(path, basePath, parentsOf(path), publishTemps);
   }
   std::vector<Child> children(StorageRoot root, std::string_view relative) override {
     auto path = pathOf(root, relative);
@@ -161,7 +194,8 @@ public:
     std::vector<Child> result;
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
       auto name = entry.path().filename().string();
-      if (FSDirectory::isPublishTemp(name) || (root == StorageRoot::AUTHORITATIVE && relative.empty() && name == "node")) continue;
+      if (name == FSDirectory::kPublicationLock || (relative.empty()
+          && ((root == StorageRoot::AUTHORITATIVE && name == "node") || (root == StorageRoot::NODE_PRIVATE && name == "tmp")))) continue;
       result.push_back({name, entry.symlink_status().type() == std::filesystem::file_type::directory});
     }
     std::ranges::sort(result, {}, &Child::name);
@@ -174,7 +208,6 @@ public:
     {
       std::lock_guard guard(mutex);
       auto removed = [&](const auto& item) { return item == path || item.string().starts_with(path.string() + '/'); };
-      std::erase_if(cleaned, removed);
       std::erase_if(parentSync, [&](const auto& entry) {
         if (!removed(entry.first)) return false;
         forgotten.push_back(entry.second);

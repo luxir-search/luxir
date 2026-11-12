@@ -46,12 +46,11 @@ inline std::optional<int64_t> resolveCount(
   return supplierCount(supplierFor(*shortcut.resolver));
 }
 
-inline uint32_t elapsedBuildMicros(
+inline uint64_t elapsedBuildNanos(
     std::chrono::steady_clock::time_point start) {
-  auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+  auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - start).count();
-  return (uint32_t) std::min<int64_t>(
-      elapsed, std::numeric_limits<uint32_t>::max());
+  return (uint64_t) elapsed;
 }
 
 // Convenience path for callers that just need a scorer and are not doing
@@ -786,9 +785,9 @@ inline std::vector<PreparedSource> prepareFilterSources(
           liveExact.push_back(materialize(
               segmentSource, ctx.reader.segments()[segmentOrd], canonical));
         }
-        uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+        uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
         value = use->publishReaderStable(
-            probe, std::move(liveExact), buildCostMicros);
+            probe, std::move(liveExact), buildCostNanos);
       }
       if (value != nullptr) {
         source.setPrepared(std::make_unique<ReaderStablePreparedWeight>(
@@ -872,9 +871,9 @@ inline Query::ScorerSupplier* prohibitedSupplier(
       auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(
           *source.weight, source.prepared.get(), segment);
-      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
       use->publishRaw(
-          (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+          (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
       DocSet* docs = executionMode
               == Query::SupplierExecutionMode::RAW_MEMBERSHIP
           ? use->rawDocSet((size_t) segment.ord)
@@ -1114,9 +1113,9 @@ public:
       }
       auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(*weight, nullptr, segment);
-      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
       cacheUse->publishRaw(
-          (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+          (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
       DomainHandle docs = cacheUse->effectiveDomain(
           (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
       if (docs.get() == nullptr) return {};
@@ -1242,9 +1241,9 @@ inline Query::ScorerSupplier* filterSupplier(
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
-    uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
     use->publishRaw(
-        (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+        (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
   } else {
     if (mode == FilterSupplierMode::SPARSE_BATCH
         && !disableSparseBatchPostingsFeedForTests) {
@@ -1433,8 +1432,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocs() == nullptr
-          ? nullptr : &segment.liveDocs()->docset();
+      DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));
     }
@@ -1447,9 +1445,9 @@ inline DomainHandle materializeEffectiveFilter(
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
-    uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
     use->publishRawByproduct(
-        (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+        (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
   } else {
     // A non-folded raw materialization is free by-product population. A
     // domain-composed set must never enter the raw cache.
@@ -1458,9 +1456,9 @@ inline DomainHandle materializeEffectiveFilter(
         && !weight.needsScores() && !weight.allowsPruning()) {
       auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(weight, prepared, segment);
-      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
       use->offerRaw(
-          (size_t) segment.ord, std::move(raw), buildCostMicros);
+          (size_t) segment.ord, std::move(raw), buildCostNanos);
       DocSet* docs = use->effectiveDocSet((size_t) segment.ord, reader);
       return DomainHandle::borrowed(docs);
     }
@@ -1539,7 +1537,7 @@ inline DomainHandle materializeEffectiveExclusion(
     std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DomainHandle domain) {
   DocSet* base = domain.get();
-  assert(base != nullptr || segment.liveDocs() == nullptr);
+  assert(base != nullptr || !segment.hasDeletes());
   std::vector<DomainHandle> excluded;
   std::vector<DocSet*> ptrs;
   excluded.reserve(sources.size());

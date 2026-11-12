@@ -237,6 +237,20 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
   }
 }
 
+TEST_F(BooleanNormalizeTest, forcePreparePreservesScoreProfile) {
+  ExistsQuery exists("body_w");
+  ConstantScoreQuery constant(&exists, 3.0f);
+  TermQuery term("body_w", "a");
+  Query* children[]{&exists, &constant, &term};
+  for (Query* child : children) {
+    ForcePrepareQuery force(child);
+    auto expected = scoreProfile(*child);
+    auto actual = scoreProfile(force);
+    EXPECT_EQ(expected.kind, actual.kind);
+    EXPECT_FLOAT_EQ(expected.value, actual.value);
+  }
+}
+
 TEST_F(BooleanNormalizeTest, requiredComplementFormInlinesUnderBothOccurs) {
   TestIndex testIndex;
   const std::string_view bodies[] = {"a", "a b", "b", "c"};

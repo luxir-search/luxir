@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+# Steps of deps-image.yml. REGISTRY names the image repository; GH_TOKEN signs in.
+#   deps-image plan                              key, image name, existing tags
+#   deps-image build TARGET IMAGE [build options]  build one stage and push it
+set -euo pipefail
+cd "$(dirname "$0")/.."
+: "${REGISTRY:?image repository required}"
+
+# Registry credentials live only in a per-invocation directory.
+DOCKER_CONFIG=$(mktemp -d)
+export DOCKER_CONFIG
+trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+printf '%s' "${GH_TOKEN:?registry token required}" |
+  docker login ghcr.io -u "${GITHUB_ACTOR:?}" --password-stdin
+
+case "${1:-}" in
+  plan)
+    key=$(python3 tools/benchmarks/deps-key.py .)
+    image="${REGISTRY,,}:$key"
+    echo "image=$image" >> "$GITHUB_OUTPUT"
+    if timeout 60 docker manifest inspect "$image" >/dev/null 2>&1; then
+      echo 'exists=true' >> "$GITHUB_OUTPUT"
+    elif timeout 60 docker manifest inspect "$image-normal" >/dev/null 2>&1; then
+      echo 'normal_exists=true' >> "$GITHUB_OUTPUT"
+    fi
+    printf 'Source: %s\nDependency image: %s\n' "$(git rev-parse HEAD)" "$image" >> "$GITHUB_STEP_SUMMARY"
+    ;;
+  build)
+    target=${2:?stage required} image=${3:?image required}
+    shift 3
+    docker build --progress=plain -f .devcontainer/Dockerfile \
+      --target "$target" --build-arg "BUILD_JOBS=$(nproc)" "$@" \
+      --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY:?}" \
+      -t "$image" .
+    docker push "$image"
+    ;;
+  *)
+    echo "Usage: deps-image plan | build TARGET IMAGE [docker build options]" >&2
+    exit 2
+    ;;
+esac

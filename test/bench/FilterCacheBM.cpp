@@ -228,7 +228,7 @@ void BM_FilterCacheEffectiveDocSet(benchmark::State& state, bool deletes) {
   auto& fixture = effectiveFixture();
   auto reader = deletes ? fixture.withDeletes : fixture.withoutDeletes;
   if (reader->segments().size() != 1
-      || (reader->segments()[0].liveDocs() != nullptr) != deletes) {
+      || reader->segments()[0].hasDeletes() != deletes) {
     state.SkipWithError("unexpected effectiveDocSet benchmark segment shape");
     return;
   }

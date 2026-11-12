@@ -36,6 +36,8 @@
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/Similarity.h"
+#include "QueryVisitor.h"
+
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
@@ -708,7 +710,20 @@ public:
   void validateLogical(
       PlanningContext& context, float multiplier = 1.0f) const;
 
+  // Serial planning only, like createWeight. May cache dictionary expansion,
+  // charged once to the request multi-term budget and shared with execution.
+  // Visitor views borrow query/context storage. Plugin queries may override
+  // visitImpl; the default reports an opaque leaf.
+  void visit(QueryVisitor& visitor, Context& context, float boost = 1.0f) const {
+    visitImpl(visitor, context, boost);
+  }
+
 protected:
+  virtual void visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+    unused(context, boost);
+    visitor.leaf(*this);
+  }
+
   virtual void validateLogicalImpl(
       PlanningContext& context, float multiplier) const {
     unused(context);
@@ -817,7 +832,7 @@ public:
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
         ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    if (domain || segment.hasDeletes()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 
@@ -888,6 +903,9 @@ public:
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
       BulkAnswer statelessReposition = BulkAnswer::NO;
+      // For EXACT_CANDIDATE_SCORING, with no bulk: one scorer produces every
+      // score, so a pruned ranking pass needs no rescoring of its survivors.
+      BulkAnswer rankingScoresExact = BulkAnswer::NO;
 
       [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
         if (buildState == nullptr) return statelessReposition;
@@ -1629,6 +1647,10 @@ public:
     // Execution traits computed at construction. Default 0 is conservative:
     // no prepare pass and no constant-scoring fast path.
     int32_t traits = 0;
+#ifndef NDEBUG
+    const Query& owner;
+    void assertLogicalDomainConsumption() const;
+#endif
   public:
     enum class SparseFilteredTopKFamily {
       CONJUNCTION,
@@ -1636,7 +1658,11 @@ public:
     };
 
     Weight(Query::Context& context, const Query& query, int32_t inputFlags)
-      : context(context), inputFlags(inputFlags) {
+      : context(context), inputFlags(inputFlags)
+#ifndef NDEBUG
+      , owner(query)
+#endif
+    {
 #ifndef NDEBUG
       context.assertLogicalValidation(query);
 #else
@@ -1719,7 +1745,13 @@ public:
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
 
-    bool consumesDomain() const noexcept { return (traits & CONSUMES_DOMAIN) != 0; }
+    bool consumesDomain() const noexcept {
+      bool consumes = (traits & CONSUMES_DOMAIN) != 0;
+#ifndef NDEBUG
+      if (consumes) assertLogicalDomainConsumption();
+#endif
+      return consumes;
+    }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
@@ -1755,8 +1787,11 @@ public:
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
     /// Metadata-only: no supplier, index walks, locks or cardinality counts.
-    /// METADATA is exact; SUPPLIER resolves at supplier construction;
-    /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
+    /// Levels name the work a count still needs; within a request a level only
+    /// gets cheaper. METADATA is exact from header totals or facts the request
+    /// already computed; SUPPLIER resolves at supplier construction;
+    /// INDEX_WALK walks index structure (crossing leaves, term dictionaries),
+    /// so probes stop before it; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
     virtual CountShortcut countShortcut(IndexReader::Segment& segment,
@@ -2053,12 +2088,16 @@ public:
     // This protocol composes with fillWindowBits. After prepareMembership it
     // can drain an exhaustive scored prefix; scoring resumes only after reset. A
     // composite retains ownership of externally driven aliases while draining.
-    // Verification-bearing scorers and composites override
-    // this single-phase default; ordinary next()/advance() remain unchanged.
+    // The default walks the private approximation and verifies only inside the
+    // span, which for a single-phase scorer is exact advance(). Composites
+    // with their own verification order override it; ordinary next()/advance()
+    // remain unchanged.
     virtual int32_t advanceWindow(int32_t min, int32_t max) {
       if (min >= max) return max;
-      int32_t doc = docId();
-      return doc < min ? advance(min) : doc;
+      int32_t doc = approximationDocId();
+      if (doc < min) doc = approximationAdvance(min);
+      while (doc < max && !matches()) doc = approximationNext();
+      return doc;
     }
 
     // Bounded private approximation for membership conjunctions. An exact
@@ -2327,6 +2366,7 @@ Query* peelBoost(Query* query, float& boost);
 bool sameScoringClause(const Query* a, const Query* b);
 uint64_t scoringClauseHash(const Query* query);
 Query::ScoreProfile scoreProfile(const Query& query);
+bool logicalConsumesDomain(const Query& query);
 bool canOmitWeightForCacheFirstMembership(const Query& query);
 bool exactDomainIdentity(const Query& query);
 bool directCountAvailable(const Query& query, IndexReader& reader);

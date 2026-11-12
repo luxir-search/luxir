@@ -72,7 +72,7 @@ public:
     : metadata(fieldInfo.stored.get()),
       maxDoc_(postingsReader.maxDoc())
   {
-    assert(fieldInfo.type == FieldType::BIN);
+    assert(FieldType::storage(fieldInfo.type) == FieldType::Storage::BIN);
     assert(fieldInfo.numValues > 0);
     assert(metadata != nullptr);
 
@@ -280,7 +280,7 @@ public:
   // chunk offset readers; it only peeks at the stored-fields metadata header.
   static int64_t peekMaxChunkBytes(PostingsReader& postingsReader,
                                    const SegFieldInfo& fieldInfo) {
-    assert(fieldInfo.type == FieldType::BIN);
+    assert(FieldType::storage(fieldInfo.type) == FieldType::Storage::BIN);
     InputStream chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
     int64_t metadataOffset = (int64_t)fieldInfo.columnLoc.offset() + fieldInfo.columnMetaOff;
     const char* metaPtr = chunkIS.ptr(metadataOffset);

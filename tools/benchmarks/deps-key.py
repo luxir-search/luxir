@@ -14,7 +14,9 @@ def deps_key(root):
     stages = re.findall(r'^FROM (.+)$', dockerfile, re.M)
     if (len(stages) != 4 or not stages[0].endswith(' AS toolchain')
             or stages[1:] != ['toolchain AS normal-dependencies',
-                              'normal-dependencies AS dependencies', 'toolchain AS dev']):
+                              '${NORMAL_DEPENDENCIES} AS dependencies', 'toolchain AS dev']
+            or re.findall(r'^ARG NORMAL_DEPENDENCIES\b.*$', dockerfile, re.M)
+            != ['ARG NORMAL_DEPENDENCIES=normal-dependencies']):
         raise ValueError('Dockerfile stage graph changed; review deps-key.py')
     stage = dockerfile
     copies = re.findall(r'^[ \t]*COPY[ \t]+(.+)$', stage, re.M | re.I)

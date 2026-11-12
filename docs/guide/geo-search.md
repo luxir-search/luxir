@@ -130,7 +130,7 @@ POST /collections/places/_search
     }
   },
   "fields": ["id","name_s"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 
@@ -171,7 +171,7 @@ POST /collections/places/_search
     }
   },
   "fields":["id","name_s"],
-  "count_limit":-1
+  "count_limit":-2
 }
 ```
 

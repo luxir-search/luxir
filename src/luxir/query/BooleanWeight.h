@@ -7031,6 +7031,24 @@ public:
     return true;
   }
 
+  // An exhaustive pure disjunction keeps every clause essential, so each
+  // window adds clause scores in `scorers` order. Rescoring in that order
+  // reproduces its sums exactly.
+  bool supportsExactCandidateScoring() const override {
+    return exclusionScorers.empty() && requiredScorers.empty();
+  }
+
+  void scoreCandidatesExact(std::span<int32_t> docs,
+                            std::span<float> scores) override {
+    assert(docs.size() == scores.size());
+    assert(supportsExactCandidateScoring());
+    std::fill(scores.begin(), scores.end(), 0.0f);
+    for (auto* scorer : scorers) {
+      scorer->applyToCandidates(
+          docs.data(), scores.data(), (int32_t) docs.size(), false);
+    }
+  }
+
   bool attachWindowFilter(WindowFilter* filter) override {
     assert(!filter->probes());
     if (filter->probes()) return false;
@@ -7816,6 +7834,13 @@ class BooleanQuery::Weight final : public Query::Weight {
   bool sparseFilteredTopKEligible = false;
   SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
       SparseFilteredTopKFamily::CONJUNCTION;
+
+  bool foldsProhibitedDomain() const {
+    return !prohibitedWeights.empty()
+        && !QueryPrep::disableProhibitedDomainFoldForTests
+        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
+            || QueryPrep::anyConsumesDomain(optionalWeights));
+  }
 
   static bool sparseFilteredTopKMandatory(Query* query) {
     while (query->getKind() == QueryKind::BOOST) {
@@ -11551,7 +11576,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (!needsScores && !disableDisjunctionCountIdentityForTests) {
-        if (segment.liveDocs() != nullptr) {
+        if (segment.hasDeletes()) {
           state->identityFallback =
               DisjunctionIdentityFallback::DELETES;
         } else {
@@ -11615,6 +11640,12 @@ class BooleanQuery::Weight final : public Query::Weight {
       BulkPlan plan = matchWindowBulkPlan();
       plan.buildState = state;
       plan.windowFilterConsumption = WindowFilterConsumption::FILL;
+      // A pure scored disjunction rescores candidates exactly, which the
+      // exact-count composition needs from its scoring bulk.
+      if (needsScores && use == BulkUse::EXACT_CANDIDATE_SCORING
+          && prohibited.empty() && mandatorySources.empty()) {
+        plan.supportsExactCandidateScoring = BulkAnswer::YES;
+      }
       return plan;
     }
 
@@ -12831,18 +12862,26 @@ public:
     auto* filterCache = context.topReader.filterCache();
     prohibitedCacheEnabled = !QueryPrep::disableProhibitedCacheForTests
         && filterCache != nullptr && filterCache->enabled();
-    if (prohibitedCacheEnabled && !prohibitedWeights.empty()) {
+    bool foldProhibited = foldsProhibitedDomain();
+    if ((prohibitedCacheEnabled || foldProhibited) && !prohibitedWeights.empty()) {
       size_t segmentCount = context.topReader.segments().size();
       prohibitedUses = context.pool.make_span<FilterCache::Use*>(
           prohibitedWeights.size());
       std::fill(prohibitedUses.begin(), prohibitedUses.end(), nullptr);
-      prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
-          prohibitedWeights.size() * segmentCount);
-      std::fill(
-          prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      if (!foldProhibited) {
+        prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
+            prohibitedWeights.size() * segmentCount);
+        std::fill(
+            prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      }
 
       MemPool routePool;
       for (size_t clause = 0; clause < prohibitedWeights.size(); clause++) {
+        if (foldProhibited) {
+          // Folding shares request-owned values even without a shared cache.
+          prohibitedUses[clause] = context.getFilterUse(*prohibitedClauses[clause]);
+          continue;
+        }
         Query::Weight* prohibitedWeight = prohibitedWeights[clause];
         if (prohibitedWeight->matchesAllDocs()) continue;
         Query::VerificationWork verificationWork =
@@ -12904,8 +12943,7 @@ public:
         QueryPrep::anyNeedsPrepare(filterWeights)) {
       traits |= NEEDS_PREPARE;
     }
-    // Every child prepares inside the domain this boolean is given, so a
-    // consumer under any clause makes this boolean one.
+    // A consumer in either prepare stage makes this boolean one.
     if (QueryPrep::anyConsumesDomain(mandatoryWeights) ||
         QueryPrep::anyConsumesDomain(optionalWeights) ||
         QueryPrep::anyConsumesDomain(prohibitedWeights) ||
@@ -12930,13 +12968,21 @@ public:
         && query.filter[0]->getKind() == QueryKind::TERM) {
       traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
     }
-    bool directTermUnion = mandatoryClauses.empty()
+    // A match needs one optional clause. An unset minShouldMatch (0) means that
+    // only when no filter makes the optional clauses pure score adds.
+    bool pureDisjunction = minShouldMatch == 1
+        || (minShouldMatch == 0 && filterClauses.empty());
+    bool directUnion = mandatoryClauses.empty()
         && prohibitedClauses.empty() && optionalClauses.size() >= 2
-        && filterClauses.size() <= 1 && minShouldMatch == 1
+        && filterClauses.size() <= 1 && pureDisjunction
         && std::all_of(
             optionalClauses.begin(), optionalClauses.end(),
             [](Query* clause) {
-              return clause->getKind() == QueryKind::TERM;
+              // A repeated multi_match term arrives boosted (duplicate merge).
+              float boost = 1.0f;
+              return clause->getKind() == QueryKind::TERM
+                  || luxir::peelBoost(clause, boost)->getKind()
+                      == QueryKind::COMBINED_FIELDS;
             });
     bool unfilteredConstantComplement = constant
         && filterWeights.empty() && optionalWeights.empty()
@@ -12944,7 +12990,7 @@ public:
         && mandatoryWeights[0]->matchesAllDocs()
         && !prohibitedWeights.empty();
     if (scorePolicy.kind == ScorePolicy::SUM
-        && (directTermUnion || unfilteredConstantComplement)) {
+        && (directUnion || unfilteredConstantComplement)) {
       traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
     }
     bool sparseFilteredTopKConjunction = !filterWeights.empty()
@@ -12953,6 +12999,12 @@ public:
         && std::all_of(
             mandatoryClauses.begin(), mandatoryClauses.end(),
             sparseFilteredTopKMandatory);
+    bool directTermUnion = directUnion
+        && std::all_of(
+            optionalClauses.begin(), optionalClauses.end(),
+            [](Query* clause) {
+              return clause->getKind() == QueryKind::TERM;
+            });
     sparseFilteredTopKEligible = scorePolicy.kind == ScorePolicy::SUM
         && (sparseFilteredTopKConjunction
             || (directTermUnion && !filterWeights.empty()));
@@ -13037,12 +13089,8 @@ public:
     // child consumes the domain, fold the prohibited clauses into it: the
     // domain becomes outer AND filters AND NOT prohibited, and it replaces
     // the prohibited scorers as the required domain supplier, so each
-    // exclusion is evaluated once. Excluded docs can never match this
-    // boolean, so narrowing the domain changes no other child's result.
-    bool foldProhibited = !prohibitedSources.empty()
-        && !QueryPrep::disableProhibitedDomainFoldForTests
-        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
-            || QueryPrep::anyConsumesDomain(optionalWeights));
+    // exclusion is evaluated once.
+    bool foldProhibited = foldsProhibitedDomain();
     if (!filterSources.empty() || foldProhibited) {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+# Run one leg locally or on a hosted runner. Outputs stay under build/nightly/.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+preset=${1:?container preset required}
+case "$preset" in
+  container-release|container-release-v3|container-release-v4|container-debug|container-asan) ;;
+  *) echo "Unsupported nightly preset: $preset" >&2; exit 2 ;;
+esac
+: "${LUXIR_DEV_IMAGE:?keyed dependency image required}"
+output="build/nightly/$preset"
+[[ ! -e $output ]] || { echo "Use a fresh output directory: $output" >&2; exit 2; }
+mkdir -p "$output"
+./deps/fetch_sources.sh
+docker pull "$LUXIR_DEV_IMAGE"
+LUXIR_DEV_IMAGE=$(docker image inspect "$LUXIR_DEV_IMAGE" --format '{{.Id}}')
+export LUXIR_DEV_IMAGE
+jobs=${BUILD_JOBS:-$(nproc)}
+if ! ./tools/dev-container cmake --preset "$preset" -DLUXIR_COMPILE_JOBS="$jobs" \
+    > "$output/configure.log" 2>&1; then
+  tail -100 "$output/configure.log"
+  exit 1
+fi
+build_status=0
+./tools/dev-container cmake --build --preset "$preset" > "$output/build.log" 2>&1 || build_status=$?
+grep -n 'warning:' "$output/configure.log" "$output/build.log" || true
+if (( build_status != 0 )); then
+  tail -100 "$output/build.log"
+  exit "$build_status"
+fi
+# Test failures are data. Infrastructure/reporting failures still fail the leg.
+./tools/dev-container python3 tools/nightly.py test "$preset" "$output" "$LUXIR_DEV_IMAGE"
+if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+  cat "$output/tests.md" >> "$GITHUB_STEP_SUMMARY"
+fi
+./tools/dev-container tools/package-release "build/$preset" \
+  --output "$output/assets" --builder-image "$LUXIR_DEV_IMAGE"

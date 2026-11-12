@@ -16,6 +16,7 @@
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermQuery.h"
+#include "luxir/query/TermInSetQuery.h"
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -110,7 +111,7 @@ protected:
     if (!scorer) return 0;
     int64_t count = 0;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
-      if (segment.liveDocs() && !segment.liveDocs()->docset().get(doc)) continue;
+      if (segment.hasDeletes() && !segment.liveDocSet()->get(doc)) continue;
       if (!domain || domain->get(doc)) ++count;
     }
     return count;
@@ -125,27 +126,27 @@ protected:
         DocSetBuilder selected(segment.maxDoc()), unfiltered(segment.maxDoc()), empty(segment.maxDoc());
         for (int doc = 0; doc < segment.maxDoc(); doc += 3) {
           unfiltered.add(std::min(doc + 2, segment.maxDoc() - 1));
-          if (!segment.liveDocs() || segment.liveDocs()->docset().get(doc)) selected.add(doc);
+          if (!segment.hasDeletes() || segment.liveDocSet()->get(doc)) selected.add(doc);
         }
         auto domain = selected.build();
         auto rawDomain = unfiltered.build();
         auto noDocs = empty.build();
         for (DocSet* eligibility : { (DocSet*)nullptr, domain.get(), rawDomain.get(), noDocs.get() }) {
           auto shortcut = weight->countShortcut(segment, eligibility);
-          if (!eligibility && !segment.liveDocs() && shortcut.maxMatches != 0) {
+          if (!eligibility && !segment.hasDeletes() && shortcut.maxMatches != 0) {
             EXPECT_EQ(unrestricted, shortcut.how);
           }
           auto* supplier = weight->scorerSupplier(pool, segment);
           auto resolved = QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
             return &resolver == weight ? supplier : resolver.scorerSupplier(pool, segment);
           }, Query::CountHow::INDEX_WALK);
-          auto executorCount = eligibility || segment.liveDocs()
+          auto executorCount = eligibility || segment.hasDeletes()
               ? std::nullopt : QueryPrep::supplierCount(supplier);
           int64_t count = iterated(supplier, pool, segment, eligibility);
           EXPECT_GE(shortcut.maxMatches, count);
           if (shortcut.how != Query::CountHow::ITERATE) { EXPECT_TRUE(resolved.has_value()); }
           if (resolved) { EXPECT_EQ(count, *resolved); }
-          if (!eligibility && !segment.liveDocs() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
+          if (!eligibility && !segment.hasDeletes() && query.getKind() == QueryKind::NUMERIC_PREDICATE) {
             EXPECT_TRUE(executorCount.has_value());
           }
           if (executorCount) { EXPECT_EQ(count, *executorCount); }
@@ -295,6 +296,15 @@ TEST_P(CountShortcutTest, probesStopBeforeIndexWalks) {
       EXPECT_EQ(query == &numeric, count.has_value());
       QueryPrep::WholeMembershipPlan plan(*weight, nullptr, {});
       EXPECT_EQ(query == &numeric, resolveWholeMembershipForTests(plan, *reader, segment, nullptr).available);
+      if (query == &geo) {
+        QueryPrep::WholeMembershipPlan fieldSort(*weight, nullptr, {},
+            PreparedDomainDependence::QUERY_CANONICAL,
+            QueryPrep::WholeMembershipConsumer::FIELD_SORT);
+        EXPECT_FALSE(fieldSort.resolve(*reader, segment, nullptr, nullptr, [&](Query::Weight& resolver) {
+          ADD_FAILURE() << "field sort requested an index-walk count";
+          return resolver.scorerSupplier(pool, segment);
+        }).available);
+      }
     }
   }
 }
@@ -608,12 +618,198 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       auto* weight = references[kind]->createWeight(context, 0);
       int64_t expected = 0;
       for (auto& segment : reader->segments()) {
-        DocSet* domain = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
+        DocSet* domain = segment.liveDocSet();
         expected += iterated(weight->scorerSupplier(pool, segment), pool, segment, domain);
       }
       EXPECT_EQ(expected, req->getMatchCount());
     }
   }
+}
+
+// Each document holds at most one id term, so a multi-term query's accepted
+// terms count disjoint documents: the supplier resolves their docFreq sum
+// exactly. Analyzed text can repeat a document across terms and iterates.
+TEST_P(CountShortcutTest, multiTermCountsOneTermPerDocumentFields) {
+  for (bool deleted : {false, true}) {
+    if (deleted) deleteSome();
+    PrefixQuery ids("id", "1"), noIds("id", "x"), text("body_w", "a"), absent("missing_s", "a");
+    check(ids, Query::CountHow::INDEX_WALK);
+    check(noIds, Query::CountHow::INDEX_WALK);
+    check(text, Query::CountHow::ITERATE);
+    check(absent, Query::CountHow::METADATA);
+  }
+}
+
+TEST_P(CountShortcutTest, multiTermCountSurvivesPayloadRelease) {
+  CountStats stats;
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  PrefixQuery query("id", "1");
+  auto* weight = (MultiTermQuery::Weight*)query.createWeight(context, 0);
+  auto* ranking = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  for (auto& segment : reader->segments()) {
+    auto cold = weight->countShortcut(segment, nullptr);
+    EXPECT_EQ(Query::CountHow::INDEX_WALK, cold.how);
+    EXPECT_EQ(weight, cold.resolver);
+    EXPECT_FALSE(QueryPrep::resolveCount(cold, [&](Query::Weight&) {
+      ADD_FAILURE() << "probe expanded a cold query";
+      return (Query::ScorerSupplier*)nullptr;
+    }));
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto count = QueryPrep::supplierCount(supplier);
+    ASSERT_TRUE(count);
+    EXPECT_EQ(0, SkipStats::multitermUnionBuilds);
+    EXPECT_EQ(Query::CountHow::METADATA, ranking->countShortcut(segment, nullptr).how);
+    EXPECT_EQ(*count, ranking->countShortcut(segment, nullptr).minMatches);
+    EXPECT_EQ(*count, iterated(ranking->scorerSupplier(pool, segment), pool, segment, nullptr));
+    weight->releaseSegmentState(segment);
+    EXPECT_EQ(0u, weight->expansionMemoRetainedStatesForTests(segment));
+    EXPECT_EQ(*count, supplier->cost());
+    auto expansions = SkipStats::multitermExpansions;
+    EXPECT_EQ(*count, QueryPrep::supplierCount(supplier));
+    EXPECT_EQ(expansions, SkipStats::multitermExpansions);
+    EXPECT_EQ(Query::CountHow::METADATA, weight->countShortcut(segment, nullptr).how);
+  }
+}
+
+TEST_P(CountShortcutTest, multiTermSupplierCountDeclinesDeletes) {
+  deleteSome();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  PrefixQuery query("id", "1");
+  auto* weight = query.createWeight(context, 0);
+  auto& segment = reader->segments()[0];
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  EXPECT_FALSE(QueryPrep::supplierCount(supplier));
+  EXPECT_EQ(71, iterated(supplier, pool, segment, nullptr));
+  // The resident sum is still a bound after deletes, with a live-match floor.
+  auto resident = weight->countShortcut(segment, nullptr);
+  EXPECT_EQ(Query::CountHow::ITERATE, resident.how);
+  EXPECT_EQ(71, resident.maxMatches);
+  EXPECT_EQ(70, resident.minMatches);
+  EXPECT_FALSE(QueryPrep::supplierCount(supplier));
+  for (int limit : {0, 10}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main").topDocs("q").prefixQuery("id", "1").limit(limit).countLimit(-1);
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(110, req->getMatchCount()); // The matching id 162 was deleted.
+  }
+}
+
+TEST_P(CountShortcutTest, prohibitedMultiTermDoesNotExpandAtWeightConstruction) {
+  CountStats stats;
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  PrefixQuery prefix("id", "");
+  AllQuery all;
+  std::array<Query*, 1> required{&all}, prohibited{&prefix};
+  BooleanQuery query(required, {}, prohibited, {});
+  ASSERT_NE(nullptr, query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING));
+  EXPECT_EQ(0, SkipStats::multitermExpansions);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+}
+
+TEST_P(CountShortcutTest, multiTermWholeCountsProbeCacheBeforeExpansion) {
+  for (int limit : {0, 10}) {
+    for (int repeat = 0; repeat < 3; repeat++) {
+      CountStats stats;
+      auto req = localReq(luxirNode->getSearchEngine());
+      req->collection("main");
+      auto& op = req->topDocs("q").limit(limit).countLimit(-1);
+      op.rawQuery() = qb::prefix(op.mr(), "id", limit == 0 ? "1" : "2");
+      req->execute(false);
+      ASSERT_OK(req);
+      EXPECT_EQ(111, req->getMatchCount());
+      EXPECT_EQ(GetParam() && repeat == 2 ? 0 : 3, SkipStats::multitermExpansions);
+      // Only two segments have matches; the third publishes an empty set.
+      EXPECT_EQ(GetParam() && repeat == 1 ? 2 : 0, SkipStats::multitermUnionBuilds);
+      auto bypasses = limit == 0 ? SkipStats::wholeCountBypasses : SkipStats::wholeTopKCountBypasses;
+      auto builds = limit == 0 ? SkipStats::wholeCountBuilds : SkipStats::wholeTopKCountBuilds;
+      auto hits = limit == 0 ? SkipStats::wholeCountHits : SkipStats::wholeTopKCountHits;
+      EXPECT_EQ(GetParam() && repeat == 0 ? 3 : 0, bypasses);
+      EXPECT_EQ(GetParam() && repeat == 1 ? 3 : 0, builds);
+      EXPECT_EQ(GetParam() && repeat == 2 ? 3 : 0, hits);
+    }
+  }
+}
+
+TEST_P(CountShortcutTest, multiTermStringEligibilityIsPerSegment) {
+  CollectionHelper strings("count_strings");
+  strings.clear();
+  SchemaBuilder schema;
+  for (auto name : {"single", "set", "array", "column"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.multi = std::string_view(name) == "set" ? api::FieldDef::MultiMode::SET
+        : std::string_view(name) == "array" ? api::FieldDef::MultiMode::ARRAY
+        : api::FieldDef::MultiMode::SINGLE;
+    if (std::string_view(name) == "column") field.index = api::FieldDef::IndexMode::NONE;
+  }
+  schema.set(strings.collection());
+  auto writer = strings.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  for (bool overlap : {false, true}) {
+    ASSERT_TRUE(strings.indexAll(std::array{
+        flatdoc("single", "a", "set", overlap ? vecs("a", "b") : vecs("a"),
+                "array", overlap ? vecs("a", "b") : vecs("a", "a"), "column", "a"),
+        flatdoc("single", "a", "set", vecs("a"), "array", vecs("a", "a")),
+        flatdoc("single", "b", "set", vecs("b"), "array", vecs("b", "b")),
+        flatdoc("id", overlap ? "empty1" : "empty0")}, UpdateMessage::COMMIT).success);
+  }
+  for (bool merged : {false, true}) {
+    if (merged) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(strings.submit(update).success);
+    }
+    auto snapshot = writer->snapshots.readers.getReader();
+    ASSERT_EQ(merged ? 1u : 2u, snapshot->segments().size());
+    for (auto name : {"single", "set", "array", "column"}) {
+      MemPool pool;
+      Query::Context context(pool, *snapshot);
+      PrefixQuery prefix(name, ""), capped(name, "", 1);
+      std::array<std::string_view, 2> terms{"a", "b"};
+      TermInSetQuery inSet(name, terms);
+      for (Query* query : std::array<Query*, 3>{&prefix, &capped, &inSet}) {
+        auto* weight = query->createWeight(context, 0);
+        for (auto& segment : snapshot->segments()) {
+          bool indexed = std::string_view(name) != "column";
+          bool eligible = indexed && (std::string_view(name) == "single"
+              || (!merged && segment.ord == 0));
+          EXPECT_EQ(eligible, segment.postingsReader().fieldInfo(name)->hasDisjointTermPostings());
+          auto shortcut = weight->countShortcut(segment, nullptr);
+          EXPECT_EQ(eligible ? Query::CountHow::INDEX_WALK : Query::CountHow::ITERATE, shortcut.how);
+          EXPECT_EQ((merged ? 2 : 1) * (indexed ? 3 : 4), shortcut.maxMatches);
+          auto* supplier = weight->scorerSupplier(pool, segment);
+          auto count = QueryPrep::supplierCount(supplier);
+          EXPECT_EQ(eligible, count.has_value());
+          int64_t expected = query == &capped ? (merged ? 4 : 2) : (merged ? 6 : 3);
+          if (count) { EXPECT_EQ(expected, *count); }
+          EXPECT_EQ(indexed ? expected : 0, iterated(supplier, pool, segment, nullptr));
+        }
+      }
+    }
+  }
+}
+
+TEST_P(CountShortcutTest, multiTermQueryBucketCountsExactly) {
+  CountStats stats;
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  auto& facet = req->facet("queries", "id").rawOp().kind.emplace<api::QueryFacet>();
+  auto* bucket = api::build::allocArray(facet.buckets, 1, req->mr);
+  bucket->name = "prefix";
+  auto* query = api::build::allocMessage<api::Query>(req->mr);
+  *query = qb::prefix(req->mr, "id", "1");
+  bucket->query = query;
+  req->execute(false);
+  ASSERT_OK(req);
+  auto* result = req->responses[0]->proto.ops.at("queries")->facetResult();
+  ASSERT_NE(nullptr, result);
+  ASSERT_EQ(1u, result->counts.size());
+  EXPECT_EQ(111, result->counts[0]);
+  EXPECT_EQ(0, SkipStats::multitermUnionBuilds);
 }
 
 INSTANTIATE_TEST_SUITE_P(CacheModes, CountShortcutTest, ::testing::Bool());

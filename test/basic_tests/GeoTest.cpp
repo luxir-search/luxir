@@ -29,6 +29,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/search/Collector.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/util/geo.h"
@@ -620,6 +621,33 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   EXPECT_EQ(oracle(points, box), run(*reader, "geo_single", box, false));
   SkipStats::enabled = false;
   EXPECT_EQ(1, SkipStats::geoScanArms);
+}
+
+// Membership windows bound verification: a range count stops verifying at the
+// range's end instead of scanning the column for the next match.
+TEST_F(GeoBoxQueryTest, columnScanCountsOnlyInsideTheWindow) {
+  CollectionHelper helper;
+  setGeoSchema(helper, false);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  for (int32_t doc = 0; doc < 4096; doc++) {
+    inverter.startDoc();
+    if (doc == 0) handler.index(inverter, 0.0, 0.0);
+    else handler.index(inverter, 50.0, 50.0);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->snapshots.readers.getReader();
+  MemPool pool;
+  QueryState state(pool, *reader, "geo_single", Box{-1.0, 1.0, -1.0, 1.0});
+  auto* scorer = state.weight->createScanScorerForTests(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_EQ(1, countMatchesInRange(scorer, nullptr, 0, 64));
+  EXPECT_EQ(64, scorer->approximationDocId());
+  EXPECT_EQ(0, countMatchesInRange(scorer, nullptr, 1024, 1088));
+  EXPECT_EQ(1088, scorer->approximationDocId());
 }
 
 // A 64 x 64 grid of single points, latitude -80 + 2.5 * (doc % 64), with a

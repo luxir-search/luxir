@@ -124,9 +124,9 @@ static void BM_CollapseRetainedRemap(benchmark::State& state, bool remap, bool t
   }
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   CollapsePlan plan(*reader, api::Collapse_::MissingPolicy::GROUP, false);
-  plan.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"),
+  plan.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"),
                          reader->field("key_s")});
-  if (tuple) plan.fields.push_back({"key_i", api::GroupComponent_::Type::INT, {}, reader->field("key_i")});
+  if (tuple) plan.fields.push_back({"key_i", api::GroupComponent_::Type::INT, FieldType::Storage::INT64, {}, reader->field("key_i")});
   auto execute = [&]() {
     GroupScoreCollector collector(10, &plan);
     for (int32_t segment = 0; segment < 5; segment++) {

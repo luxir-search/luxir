@@ -16,7 +16,7 @@ results, and links the protobuf definitions shared by JSON and gRPC.
 ```http
 POST /collections/books/_search
 
-{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -1}
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -2}
 ```
 
 ```json
@@ -92,6 +92,13 @@ their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
 
+IP `match` literals accept an address or CIDR. Host bits are masked, so
+`10.1.2.3/8` matches `10.0.0.0/8`; `2001:db8::/32` matches that IPv6 network.
+IP `any_of` members and range bounds require single addresses. Strict and
+inclusive range bounds follow address byte order. IP fields reject
+`case_insensitive`, prefix, wildcard/regexp, and fuzzy matching. See
+[IP addresses](schema.md#ip-addresses).
+
 With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
 value matches indexed terms that differ only in simple Unicode case: `FOO`
 matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants
@@ -160,7 +167,7 @@ POST /collections/authors/_search
 | `field` | Field to query through its value binding, or an explicit selector. Required. |
 | `values` | Exact values; any matching value admits the document. |
 
-STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
+STRING, TEXT, and ID exact membership requires indexed terms. Numeric, boolean, and date
 representations can use their columns. DATE members are exact instants in
 the field's unit: an ISO member uses its floored start, even for a partial
 date. Members outside the stored date domain are dropped. Match/range date
@@ -422,7 +429,9 @@ nothing.
 
 A prefix query with `max_expansions` keeps at most that many terms per segment.
 The selected count is subject to any configured `too_many_expansions` cap, and
-its scan counts toward any configured terms-examined budget. `any_of` term
+its scan counts toward any configured terms-examined budget. The sampling pass
+behind an estimated `found` reuses the search's expansions, so it adds nothing
+to the budget. `any_of` term
 lists are not capped by term count because the request already lists every
 term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
 prefix rule. Case-insensitive matching does not shorten the measured literal.
@@ -568,19 +577,21 @@ allowed. Fields resolve through their `search` bindings, like `match`.
 Duplicate physical targets keep the larger weight, and field order does not
 affect the query.
 
-In `combined` mode, TEXT fields sharing an analyzer and `long_terms` policy
-form a group scored as one field with BM25F. Group membership is determined
-by the schema, independently of the query text. Each group analyzes the text
-once; a term found in several fields saturates once within that group.
-A weight scales its field's term frequency and document length, including
-in a group with just one field. For a term, frequency is the weighted sum of
-per-field frequencies, and length is the weighted sum of per-field lengths,
-rounded and encoded as a norm. Every field contributes length even when the
-term is absent from that field. Average length is the weighted sum of total
-term counts divided by the largest per-field document count; document
-frequency is the largest per-field document frequency. This is a BM25F
-weight, not a score multiplier; the scoring follows Lucene's
-`CombinedFieldQuery`.
+In `combined` mode, TEXT fields with the same expanded analyzer definition
+and `long_terms` policy form a group scored as one field with BM25F, whether
+the analyzer is inherited from a common parent or declared inline on each
+field.
+Group membership is determined by the schema, independently of the query text.
+Each group analyzes the text once; a term found in several fields saturates
+once within that group. A weight scales its field's term frequency and
+document length, including in a group with just one field. For a term,
+frequency is the weighted sum of per-field frequencies, and length is the
+weighted sum of per-field lengths, rounded and encoded as a norm. Every
+field contributes length even when the term is absent from that field.
+Average length is the weighted sum of total term counts divided by the
+largest per-field document count; document frequency is the largest
+per-field document frequency. This is a BM25F weight, not a score multiplier;
+the scoring follows Lucene's `CombinedFieldQuery`.
 
 STRING, ID, numeric, and date fields each form their own group with `match`
 semantics and a weight that multiplies the field's score. STRING/ID fields

@@ -492,7 +492,6 @@ public:
   }
   
   void setSegment(const IndexReader::Segment& segment) override {
-    auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
     iter.reset();
     pointValues.reset();
@@ -508,7 +507,7 @@ public:
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
-        reader.emplace(*postingsReader, fieldInfo);
+        reader.emplace(segment.postingsReader(), fieldInfo);
         iter.emplace(*reader);
         pointValues.emplace(*reader);
         multiValued = reader->multiValued();
@@ -800,7 +799,7 @@ public:
   void setSegment(const IndexReader::Segment& segment) override {
     reader.reset();
     segmentMapping = {};
-    postingsReader = &segment.postingsReader();
+    postingsReader = nullptr;
     fieldInfo = nullptr;
 
     // Get segment-to-global ordinal mapping from OrdMap
@@ -815,6 +814,7 @@ public:
         segmentMapping.numOrds = fieldInfo->nTerms;
       }
       if (fieldInfo->columnLoc.offset() > 0) {
+        postingsReader = &segment.postingsReader();
         reader.emplace(*postingsReader, *fieldInfo);
       }
     }
@@ -1018,7 +1018,7 @@ public:
     enumPool.rewind(enumPoolStart);
     fieldInfo = nullptr;
     currentSegment = segment.ord;
-    postingsReader = &segment.postingsReader();
+    postingsReader = nullptr;
 
 
     fieldInfo = fields.at(segment);
@@ -1027,6 +1027,7 @@ public:
         fieldInfo->ordFormat == SegFieldInfo::ORD_NONE) {
       return;
     }
+    postingsReader = &segment.postingsReader();
     reader.emplace(*postingsReader, *fieldInfo);
     termsEnum.emplace(enumPool, *postingsReader, *fieldInfo);
   }
@@ -1206,7 +1207,6 @@ public:
       missingCmp(missingValue == MISSING_FIRST ? -1 : 1) {}
 
   void setSegment(const IndexReader::Segment& segment) override {
-    auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
     docValues.reset();
     iter.reset();
@@ -1216,7 +1216,7 @@ public:
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
-        reader.emplace(*postingsReader, fieldInfo);
+        reader.emplace(segment.postingsReader(), fieldInfo);
         iter.emplace(*reader);
         multiValued = reader->isMultiValued();
         if (multiValued) docValues.emplace(*reader);

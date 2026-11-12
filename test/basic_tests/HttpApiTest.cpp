@@ -31,6 +31,7 @@
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/util/Signal.h"
 
 namespace luxir::test {
@@ -160,14 +161,13 @@ protected:
     return out;
   }
 
-  static void expectResponsesDifferOnlyByIncarnation(std::string_view first, std::string_view second) {
+  static void expectResponsesMatchApartFromIncarnation(std::string_view first, std::string_view second) {
     std::pmr::monotonic_buffer_resource arena;
     api::UpdateResponse a, b;
     ASSERT_TRUE(api::read_json(a, first, arena));
     ASSERT_TRUE(api::read_json(b, second, arena));
     ASSERT_FALSE(a.commit.empty());
     ASSERT_FALSE(b.commit.empty());
-    EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
     a.took_us = b.took_us = 0;
@@ -311,18 +311,27 @@ TEST_F(HttpApiTest, buildInfo) {
     EXPECT_EQ(buildInfo().version, root["version"].get_string());
     EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
     EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+    EXPECT_EQ(kernelInfo().faissSimd, root["faiss_simd"].get_string());
+    EXPECT_EQ(kernelInfo().blasCore, root["blas_core"].get_string());
   }
+  // OpenBLAS reports "Unknown" when read before its load-time core selection.
+  EXPECT_FALSE(kernelInfo().faissSimd.empty());
+  EXPECT_NE("Unknown", kernelInfo().blasCore);
   auto res = httpRequest(port(), http::verb::post, "/");
   EXPECT_EQ(405, res.result_int());
   EXPECT_EQ("GET", res[http::field::allow]);
 
-  // _stats (shared with gRPC) and Prometheus report the same commit.
+  // _stats (shared with gRPC) and Prometheus report the same commit and kernels.
   auto stats = httpRequest(port(), http::verb::get, "/_stats");
   glz::generic_i64 statsJson;
   ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
   EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  EXPECT_EQ(kernelInfo().faissSimd, statsJson["service"]["faiss_simd"].get_string());
+  EXPECT_EQ(kernelInfo().blasCore, statsJson["service"]["blas_core"].get_string());
   auto metrics = httpRequest(port(), http::verb::get, "/metrics");
   EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("faiss_simd=\"" + kernelInfo().faissSimd + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("blas_core=\"" + kernelInfo().blasCore + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {
@@ -1545,7 +1554,7 @@ TEST_F(HttpApiTest, countLimit) {
     EXPECT_EQ(200, res.result_int()) << res.body();
     return res.body();
   };
-  for (auto limit : {"-1", "5", "100"}) {
+  for (auto limit : {"-1", "-2", "5", "100"}) {
     auto exact = search(limit);
     EXPECT_NE(std::string::npos, exact.find(R"("found":30,"docs")")) << exact;
     EXPECT_EQ(std::string::npos, exact.find("found_gte")) << exact;
@@ -1557,7 +1566,7 @@ TEST_F(HttpApiTest, countLimit) {
       R"({"query":"*:*","fields":["id"],"filter":["title_w:counttoken AND title_w:keep"]})");
   ASSERT_EQ(200, bounded.result_int()) << bounded.body();
   EXPECT_NE(std::string::npos, bounded.body().find(R"("found":5,"found_gte":true)")) << bounded.body();
-  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-2");
+  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-3");
   EXPECT_EQ(400, invalid.result_int()) << invalid.body();
 }
 
@@ -1699,8 +1708,8 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
   EXPECT_EQ((int64_t)128, serial.plainCount);
   EXPECT_EQ(serial.plainCount, pipelined.plainCount);
-  expectResponsesDifferOnlyByIncarnation(serial.plainResponse, pipelined.plainResponse);
-  expectResponsesDifferOnlyByIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
+  expectResponsesMatchApartFromIncarnation(serial.plainResponse, pipelined.plainResponse);
+  expectResponsesMatchApartFromIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
   EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
   ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
   for (int id = 0; id < 12; id++) {
@@ -1967,7 +1976,7 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
   EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
   EXPECT_EQ((int64_t)2, serial.found);
-  expectResponsesDifferOnlyByIncarnation(serial.response, pipelined.response);
+  expectResponsesMatchApartFromIncarnation(serial.response, pipelined.response);
   EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
   EXPECT_EQ(serial.found, pipelined.found);
 }
@@ -4064,15 +4073,64 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 // server-side buffering.  A private server with a tiny stream buffer forces
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the response resumes it and every doc arrives.
-TEST_F(HttpApiTest, backpressurePausesEmitter) {
-  LuxirTest::clearCollection("http_bp");
-  CollectionHelper ch("http_bp");
+static void expectBackpressureDrains(HttpServer& server, const std::string& body,
+                                     size_t expectedDocs) {
+  SCOPED_TRACE(body);
+  net::io_context cioc;
+  tcp::socket sock(cioc);
+  sock.open(tcp::v4());
+  // Small receive buffer (set before connect) so the kernel absorbs little
+  // and the server's write queue backs up quickly.
+  sock.set_option(net::socket_base::receive_buffer_size(8192));
+  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                             (unsigned short)server.getPort()));
+
+  int64_t pausesBefore = streamPauseCount.load();
+
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
+  req.set(http::field::host, "127.0.0.1");
+  req.set(http::field::content_type, "application/json");
+  req.body() = body;
+  req.prepare_payload();
+  http::write(sock, req);
+
+  // Withhold reads until the connection backs up and the emitter parks.
+  bool paused = false;
+  for (int i = 0; i < 400 && !paused; i++) {
+    paused = streamPauseCount.load() > pausesBefore;
+    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_TRUE(paused);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  http::read(sock, buffer, res);
+  EXPECT_EQ(200, res.result_int());
+
+  // Every doc arrived once the client drained the stream.
+  size_t count = 0;
+  std::string_view text = res.body();
+  for (size_t pos = 0; (pos = text.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
+  EXPECT_EQ(expectedDocs, count);
+
+  beast::error_code ec;
+  sock.shutdown(tcp::socket::shutdown_both, ec);
+}
+
+static std::vector<Doc> backpressureDocs() {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad,
+                           "k_s", i % 2 ? "odd" : "even"));
   }
-  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
+  return docs;
+}
+
+TEST_F(HttpApiTest, backpressurePausesEmitter) {
+  LuxirTest::clearCollection("http_bp");
+  CollectionHelper ch("http_bp");
+  ASSERT_TRUE(ch.indexAll(backpressureDocs(), UpdateMessage::COMMIT).success);
 
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
@@ -4081,47 +4139,29 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   // resumes on the connection shard; 1 and -1 re-enqueue their resumes onto
   // the arena (HttpSearchRequest::resumeWhenDrained's arena-lane wrapper).
   for (std::string mp : {"0", "1", "-1"}) {
-    net::io_context cioc;
-    tcp::socket sock(cioc);
-    sock.open(tcp::v4());
-    // Small receive buffer (set before connect) so the kernel absorbs little
-    // and the server's write queue backs up quickly.
-    sock.set_option(net::socket_base::receive_buffer_size(8192));
-    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
-                               (unsigned short)bpServer.getPort()));
-
-    int64_t pausesBefore = streamPauseCount.load();
-
-    http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
-    req.set(http::field::host, "127.0.0.1");
-    req.set(http::field::content_type, "application/json");
-    req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" +
-        mp + R"(,"fields":["id","pad_s"]})";
-    req.prepare_payload();
-    http::write(sock, req);
-
-    // Withhold reads until the connection backs up and the emitter parks.
-    bool paused = false;
-    for (int i = 0; i < 400 && !paused; i++) {
-      paused = streamPauseCount.load() > pausesBefore;
-      if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    EXPECT_TRUE(paused) << "max_parallel=" << mp;
-
-    beast::flat_buffer buffer;
-    http::response<http::string_body> res;
-    http::read(sock, buffer, res);
-    EXPECT_EQ(200, res.result_int()) << "max_parallel=" << mp;
-
-    // Every doc arrived once the client drained the stream.
-    size_t count = 0;
-    std::string_view body = res.body();
-    for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
-    EXPECT_EQ(2000u, count) << "max_parallel=" << mp;
-
-    beast::error_code ec;
-    sock.shutdown(tcp::socket::shutdown_both, ec);
+    expectBackpressureDrains(bpServer,
+        R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" + mp
+            + R"(,"fields":["id","pad_s"]})",
+        2000);
   }
+  bpServer.shutdown();
+}
+
+// The engine's own parallel lane resumes inside the arena too.
+TEST_F(HttpApiTest, backpressurePausesAutoParallelEmitter) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_work = 1;
+  LuxirNode node(config);
+  CollectionHelper ch(node, "http_bp");
+  auto docs = backpressureDocs();
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).first(1000), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(1000), UpdateMessage::COMMIT).success);
+
+  HttpServer bpServer(node, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer.start();
+  expectBackpressureDrains(bpServer,
+      R"({"query":"k_s:odd k_s:even","limit":-1,"batch_size":100,"fields":["id","pad_s"]})",
+      2000);
   bpServer.shutdown();
 }
 

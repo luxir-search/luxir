@@ -11,6 +11,26 @@ The defaults are good for evaluation. Before you keep real data, decide on
 persistence and network isolation. The other settings on this page can stay
 at their defaults until you have a reason to change them.
 
+## Node identity
+
+`--node.id` sets this node's identity. If empty (the default), Luxir derives
+`hostname:port` from the HTTP listener when HTTP is enabled, otherwise from the
+gRPC listener. Without a usable hostname or positive port, it generates a random
+UUID for this node's lifetime. The id is resolved once when the node is constructed.
+Set it explicitly when hostnames and ports do not uniquely identify your nodes.
+Shared storage requires a stable id and refuses the random UUID fallback.
+
+An id must be 1 to 255 bytes of printable ASCII, contain neither `/` nor `\`, and
+must not be `.` or `..`.
+
+Each writable instance has a fresh process-lifetime UUID. On a store without a
+node lock, starting another process with the same id replaces that id's lifetime
+in every tenant CATALOG that already mentions it, before cleanup or STATE claims.
+The older process's catalog mutations and claims then fail with
+`collection_unavailable` (HTTP 503); it logs the takeover once per tenant and
+keeps running. The map is per tenant: a zombie that first touches a tenant the
+replacement never touched holds it until the replacement restarts.
+
 ## Persistent storage
 
 The default backend is in-memory and loses every collection when the process
@@ -41,7 +61,8 @@ Do not restore a raw directory copy over an existing writer identity.
 
 The portable tree is `LAYOUT` and `t/`. Copy each file's bytes under the same
 relative key; do not copy `node/`, which contains the local `write.lock`,
-replication state and other node-private state. The destination needs a compatible
+replication state and other node-private state. Omit `.luxir-publish.lock` files,
+which are local publication locks. The destination needs a compatible
 Luxir build and the plugins referenced by the stored schemas. Hard links can
 become independent objects: link counts, inode numbers, timestamps, permissions
 and empty directories carry no index identity. Publication versions are computed
@@ -64,8 +85,8 @@ collection deletion or replacement as well. A coherent filesystem snapshot can
 provide the frozen source; otherwise use `luxir pull`, which pins snapshots.
 Plain recursive copying of a running writer provides none of those protections.
 
-Readers ignore publication scratch files (`.luxir-publish-*`), unfinished data
-files (`*.tmp`) and unrelated names, even if a raw copy included them. These are
+Readers ignore publication lock files, unfinished data files (`*.tmp`) and
+unrelated names, even if a raw copy included them. These are
 not dependencies and may be omitted. Corruption markers are portable diagnostic
 metadata and should be preserved. A new writer over the copied namespace claims
 a new epoch there; it does not fence the original namespace. Do not combine the
@@ -74,13 +95,13 @@ restore should start a new lineage.
 
 ### Backends, layers and options
 
-`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
+`--store.backend` names the storage backend: `ram`, `fs` and `shared_fs` are built in, and a
 plugin build may add more (an unknown name fails startup with the list of
 registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
 backend in layers a plugin provides, such as a cache.
 `--store.option COMPONENT.KEY=VALUE` (repeatable) passes settings to the named
 backend or layer; the plugin documents its keys. Unknown keys and components
-that are not configured fail startup. The built-in `ram` and `fs` take no options.
+that are not configured fail startup. The built-in backends take no component options.
 
 ```bash
 ./luxir --store.backend=s3 --store.option s3.bucket=search-data --store.layer=cache --store.option cache.bytes=10G
@@ -90,16 +111,45 @@ Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
 outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
 
+`--store.retention-ms` keeps superseded commits and their files for that many
+milliseconds after their successor is published. After a restart, every older
+commit gets a full window. It defaults to 0 on exclusive stores and 300000
+(5 minutes) on shared stores; an explicit value overrides either default. Readers
+on other nodes must refresh more often than this window. The same window covers
+retired incarnation trees on delete or replacement; their catalog timestamps
+survive restart. Allow a margin for clock skew between nodes for these wall-time
+deadlines. Follower pins keep their existing limits.
+
+## Shared filesystem
+
+Use `shared_fs` when several nodes share one filesystem. Set the same data root
+and a distinct, stable node id on each node:
+
+```bash
+./luxir --store.backend=shared_fs --store.data-dir=/srv/luxir/shared --node.id=search-a
+```
+
+Each node writes only its assigned collections and owns `node/<id>/` for private
+state and publication temps. `write.lock`, `tmp`, `replication.json` and
+`.luxir-publish.lock` are reserved node ids. The backend refuses followers and
+private roots containing `replication.json`. It excludes `fs` writers on the same
+root and refuses a second writer with the same node id. Run one `shared_fs` node
+per process: NFS locks are process-scoped.
+
+NFS requires NFSv4 with working server-side locks: no `nolock` or
+`local_lock=flock|all`. A node stalled past its NFSv4 lease between compare and
+rename can lose its lock and overwrite a newer STATE. Files stay intact, but
+acknowledged commits can drop out of STATE. Reads use mmap; set retention X
+larger than any query, with a margin for reader refreshes and clock skew.
+Deletion and replacement keep retired incarnation trees for the same window.
+
 ## Read-only nodes
 
-A data directory has exactly one writer, which holds `node/write.lock` from startup
-until exit. This is node admission policy. Conditional file publication uses a
-separate directory `flock`, so Match is an atomic compare-and-swap among processes
-on a local filesystem, including processes that bypass `write.lock`. All publish
-modes take that lock only for the check and install; file and directory fsyncs
-run outside it. The kernel releases the lock when the process dies. This
-guarantee does not extend to network filesystems, whose server may revoke a
-stalled client's lock.
+An `fs` writer holds `node/write.lock` exclusively until exit. A `shared_fs`
+writer holds it shared plus an exclusive `node/<id>/write.lock`. These are
+admission locks. Publication and deletion serialize through a process-local
+mutex and `flock` on `.luxir-publish.lock` in the publication directory. The
+check and install hold the lock; file and directory fsyncs run outside it.
 
 `--read-only` opens an existing data directory without that lock:
 
@@ -127,6 +177,22 @@ For a continuously refreshed copy with its own storage, use
 [`--replicate-from http://writer:9400`](replication.md).
 Followers own their local data directory and install verified snapshots without
 constructing an index writer.
+
+## Moving a collection
+
+Placement code moves a writer between nodes sharing one store with
+`source.detachCollection(id, targetNodeId)` followed by
+`target.attachCollection(id)`. Detach writes a final commit, closes the writer,
+and changes the catalog assignment. It does not delete the collection or change
+its incarnation. Uncommitted concurrent updates may be lost. A failed final
+commit is reported after the handoff, so the target can still attach.
+
+The source then answers "served by <target>"; the target serves the collection
+after attach succeeds. Followers keep their copies, and the source keeps its
+session cache policy for a later re-attach. If the old owner is dead, use
+`target.attachCollection(id, true)` to take over its assignment and fence its
+writer. Without force, attach requires the assignment to name this node.
+These are writer-node engine hooks; read-only nodes and followers refuse them.
 
 ## Collection lifecycle
 
@@ -168,17 +234,31 @@ On the filesystem backend, incarnations live at `t/<tenant>/i/<id>/`.
 A tenant's `CATALOG` maps collection names to active incarnations and records
 reservations and retirements. Single-tenant deployments use tenant `t0`.
 Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
-monotonically by the catalog. The root `LAYOUT` marker identifies this format;
-older layouts are refused at startup and must be reindexed. Node-private state,
+monotonically by the catalog. The root `LAYOUT` marker identifies this format.
+A refused directory reports `data directory <storage description>: ...`, naming
+the storage and the unsupported marker or first few root entries. Startup,
+`luxir promote` and `luxir pull` exit with status 1, reporting `Startup failed:`,
+`Promote failed:` and `Pull failed:` respectively. For another layout marker,
+reindex into an empty directory or `luxir pull` from a node running this build.
+For a non-empty directory without a marker, check the path or finish an
+interrupted copy; an empty read-only directory needs a writer started once to
+create the marker. Node-private state,
 including `write.lock` and `replication.json`, lives under `node/`.
 Each commit records its index format version. A collection written with another
 version is listed as failed to load, with both versions in the error, and must
 be deleted and reindexed.
 
-Deletion marks the incarnation retiring in the catalog before removing its
-directory, then removes its entry. Writer startup finishes interrupted retirements
-and discards abandoned reservations; followers preserve reserved downloads. If
-deletion fails partway (for example an I/O error), the name stays unavailable
+Deletion removes the name from the active catalog and marks the incarnation
+retiring. A previously active incarnation keeps STATE and its tree for the
+retention window, timed in the catalog after retirement becomes visible. Once
+due, its assigned node deletes STATE, then the tree, then the catalog entry.
+Handoff transfers pending retirements with the live incarnation. The name can
+be re-created immediately with a new incarnation id. Never-active reservations
+are discarded immediately; followers preserve reserved downloads.
+
+Startup and the HTTP periodic expiry tick finish due retirements. Without HTTP,
+trees wait for the next startup. If deletion fails partway (for example an I/O
+error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
 its broken on-disk state.
@@ -252,16 +332,16 @@ with matching sizes, and copies the recovered snapshot into a new incarnation.
 By default startup does not hash data files (see
 [file integrity checks](#file-integrity-checks)).
 
-Once the new tip is durable, obsolete manifests and unreferenced data are
-removed. Writer startup sweeps unreferenced index files from fenced, older
-epochs; it leaves files of newer epochs alone. These local cleanup rules and
-process-local pins are not a retention protocol for shared remote readers.
-Catalog reservation/orphan cleanup also assumes startup has exclusive authority
-to decide what was abandoned, and collection transitions use process-local
-leases. Cross-process CAS protects catalog updates and writer fencing; it does
-not turn those cleanup policies into a multi-node retention coordinator.
-Removal durably deletes `STATE` first, fencing existing writers, then removes
-the incarnation directory and its catalog entry. Only catalog reservation can
+Once the new tip is durable, obsolete manifests and unreferenced data become
+eligible for removal after their retention window and any follower pins expire.
+Writer startup holds older manifests and their files for a full retention window
+and sweeps unreferenced index files from fenced, older epochs; it leaves files of
+newer epochs alone.
+Exclusive startup adopts the catalog and cleans up abandoned trees. Shared
+startup cleans up only this node's entries and logs uncataloged trees.
+Once retention is due, removal durably deletes `STATE` first, fencing existing
+writers, then removes the incarnation directory and its catalog entry. Only
+catalog reservation can
 create STATE; claiming a writer or installing a snapshot requires it to exist.
 Writer incarnation ids are never reused. A follower can reserve a deleted source id again;
 its fresh STATE owner distinguishes that lifetime from earlier publications.
@@ -271,12 +351,10 @@ Replication pin counters are described in the
 a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
 HTTP responses have no write deadline.
 
-Publication scratch files use the reserved `.luxir-publish-` prefix and are
-hidden from index listings. An owned filesystem view removes scratch files from
-processes confirmed dead on the same host when it opens. Live or inaccessible
-processes' files are left alone. Copied scratch names are harmless even when a
-PID cannot be checked or has been reused. Unfinished `*.tmp` data files are also
-ignored by readers.
+Publication temps live in the node-private `tmp/` directory. A writable factory
+empties only that directory after taking its admission locks; read-only opens
+leave it alone. Publication lock files are reserved and hidden from listings.
+Unfinished `*.tmp` data files are ignored by readers.
 
 Retirement removals are not directory-synced: a crash may restore obsolete
 names, but the durable tip does not reference them. A failed candidate is
@@ -476,7 +554,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
 | `luxir_scrub_*_total`, `luxir_scrub_last_pass_end_timestamp_seconds` | Checksum scrub passes, files, read bytes, mismatches, and other check errors, and when the last pass ended. Present only while scrubbing is enabled; the timestamp is absent before the first pass. |
 | `luxir_multiterm_expansion_refills_total` | Process-wide multi-term expansion refills. |
-| `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target and source commit, and read-only configuration. |
+| `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target, source commit, and the FAISS SIMD level and BLAS core selected at startup; read-only configuration. |
 | `luxir_stats_duration_seconds` | Time gathering the response, excluding serialization. |
 
 With `collections=true`:
@@ -494,7 +572,7 @@ With `collections=true`:
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
 | `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
-| `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
+| `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, build/served-build/dead-build time, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
 | `luxir_snapshot_pins`, `luxir_snapshot_retained_bytes`, `luxir_snapshot_pin_drops_total` | Current pins, retired files held only by pins, and pins dropped by `reason` (idle, budget). A stats request never expires pins or removes files. |
 
 Counters reset when their owner restarts. Collection cache counters also reset
@@ -721,6 +799,12 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
+  request across segments in parallel, like `-1`, when its lists and
+  operations visit at least that many documents by index metadata. Counts that
+  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
+  serial. Parallel runs cost more CPU in exchange for latency, so set it only
+  where large requests are common.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.
@@ -742,11 +826,21 @@ Search has its own limits:
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
-  disables it). Cached filters are evicted by rebuild cost per byte, so under
-  pressure the cache keeps expensive compound filters and drops cheap ones
-  first. Cache counters appear in `_stats?collections=true`
-  (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
-  `NOW` bound are never cached; see [Dates](dates.md#date-math).
+  disables it). Filters are ranked by rebuild cost per byte, weighted by how
+  often the filter was used recently, including uses that missed the cache.
+  The weight grows logarithmically, so a newly hot filter catches up quickly
+  and an idle one ages out.
+  Cache counters appear in `_stats?collections=true` (and on the collection
+  and tenant `_stats` routes). Date ranges with an unrounded `NOW` bound are
+  never cached; see [Dates](dates.md#date-math).
+  Stats report claimed build time in `build_us`, build time served by shared
+  hits in `served_build_us`, and zero-hit eviction build time in `dead_build_us`.
+  Their Prometheus equivalents are `luxir_filter_cache_build_seconds_total`,
+  `luxir_filter_cache_served_build_seconds_total`, and
+  `luxir_filter_cache_dead_build_seconds_total`, respectively. Served build time
+  is an upper bound on time saved. Claimed time includes rejected publications
+  and excludes byproducts; cache-control dumps report resident build time
+  and recent use counts.
   The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
   changes the budget at runtime: a shrink evicts down to the new budget, a
   grow evicts nothing, and `0` disables the cache and drops its entries.

@@ -52,10 +52,7 @@ public:
           stringSortMode(stringSortMode) {
         assert(stringSortMode != StringSortMode::DEFAULT);
         auto& type = const_cast<FieldType&>(fieldType);
-        if (type.type() == FieldType::TEXT) {
-            throw std::runtime_error("Sort field '" + fieldName +
-                "' is TEXT and has no value column; use a string variant");
-        }
+        type.requireCapability(FieldType::SORT, "sort", fieldName);
         if (!type.hasColumn()) {
             throw std::runtime_error("Sort field '" + fieldName + "' has no value column");
         }
@@ -105,18 +102,17 @@ public:
         auto fields = reader.field(fieldName);
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
-        if (FieldType::sortsByIntColumn(type)) {
-            // INT and DATE (epoch millis) sort on the raw column values.
+        if (FieldType::isNumericColumn(type)) {
+            // INT, BOOLEAN and DATE sort on the raw column values.
             // FLOAT/DOUBLE columns store sortable bits whose int64 order
             // matches the floating point order, so the int comparator
-            // works on the encoded values as-is for all four.
+            // works on the encoded values as-is.
             return std::make_unique<SimpleNumericFieldComparator>(
                 isReversed(), missingValue, fields
             );
         }
-        switch (type) {
-            case FieldType::Type::ID:
-            case FieldType::Type::STRING: {
+        switch (FieldType::storage(type)) {
+            case FieldType::Storage::TERMS: {
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
                     if (stringSortMode == StringSortMode::SEGMENT &&
@@ -143,8 +139,7 @@ public:
             }
 
             default:
-                throw std::runtime_error("Unknown field type for sorting: " + 
-                    std::to_string((int)const_cast<FieldType*>(fieldType)->type()));
+                throw std::logic_error("Unhandled sort storage");
         }
     }
 };

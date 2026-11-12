@@ -16,6 +16,7 @@
 
 #include "LuxirNode.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/Postings.h"
@@ -142,6 +143,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.version = build.version;
   dst.cpu_target = build.cpuTarget;
   dst.source_commit = build.sourceCommit;
+  dst.faiss_simd = kernelInfo().faissSimd;
+  dst.blas_core = kernelInfo().blasCore;
   dst.read_only = node.readOnly();
   dst.request_duration_bounds = requestBounds;
   dst.background_duration_bounds = backgroundBounds;
@@ -220,6 +223,9 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
   dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
   dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
+  dst.build_us = src.filterCacheCounters.buildNanos / 1000;
+  dst.served_build_us = src.filterCacheCounters.servedBuildNanos / 1000;
+  dst.dead_build_us = src.filterCacheCounters.deadBuildNanos / 1000;
 }
 
 template<class Stats>
@@ -462,6 +468,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.segments_resident = row.segmentsResident;
       out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
+      out.build_us = row.buildNanos / 1000;
+      out.recent_uses = row.recentUses;
     }
   }
 }

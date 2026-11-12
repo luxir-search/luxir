@@ -107,6 +107,53 @@ public:
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    // Adds a "label" column holding the configured text to every emitted hit.
+    r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
+      struct Label : HitDecorator {
+        std::string text;
+        std::string_view columnName() const override { return "label"; }
+        void decorate(std::span<const segdoc>, std::span<const uint32_t> rows,
+                      std::span<api::Val> out, std::pmr::memory_resource& mr) const override {
+          for (uint32_t row : rows) {
+            char* copy = (char*)mr.allocate(text.size(), alignof(char));
+            std::memcpy(copy, text.data(), text.size());
+            out[row].kind = std::string_view(copy, text.size());
+          }
+        }
+      };
+      auto label = std::make_shared<Label>();
+      label->text = std::string(params.requireString("text"));
+      return label;
+    });
+    // A request-wide term summary, collected once during serial planning.
+    r.hitDecorators.add("ranking_terms", [](DecoratorContext& ctx, const ParamReader&) {
+      struct Terms : HitDecorator, QueryVisitor {
+        std::string text;
+        std::string_view columnName() const override { return "ranking_terms"; }
+        QueryVisitor* sub(Occur occur, const Query&) override {
+          return occur == Occur::MUST || occur == Occur::SHOULD ? this : nullptr;
+        }
+        void term(std::string_view field, std::string_view term, float) override {
+          if (!text.empty()) text += ",";
+          text += field;
+          text += ":";
+          text += term;
+        }
+        void decorate(std::span<const segdoc>, std::span<const uint32_t> rows,
+                      std::span<api::Val> out, std::pmr::memory_resource& mr) const override {
+          for (uint32_t row : rows) {
+            char* copy = (char*)mr.allocate(text.size(), alignof(char));
+            std::memcpy(copy, text.data(), text.size());
+            out[row].kind = std::string_view(copy, text.size());
+          }
+        }
+      };
+      auto terms = std::make_shared<Terms>();
+      for (const auto& source : ctx.queries) {
+        if (source.query) source.query->visit(*terms, source.context);
+      }
+      return terms;
+    });
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");

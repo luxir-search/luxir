@@ -12,17 +12,19 @@
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
+#include "luxir/util/NumericUtils.h"
 
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <optional>
 #include <ranges>
 #include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
 
-// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
+// Numeric indexing adds this 16-byte-per-value peak outside inverter.pool, so the
 // inverter autoflush cap must leave headroom for the transient sort array.
 struct FlushPoint {
   int64_t value;
@@ -30,6 +32,54 @@ struct FlushPoint {
 };
 
 static_assert(sizeof(FlushPoint) == 16);
+
+inline std::vector<FlushPoint> collectNumericPoints(
+    Inverter& inverter, LongStream& values, DocStream& docs, int64_t count,
+    IntStream* lengths = nullptr) {
+  std::vector<FlushPoint> points;
+  points.reserve((size_t)count);
+  inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
+  values.visitValues(inverter.pool, [&](int64_t value) { points.push_back({value, 0}); });
+  std::optional<IntStream::Reader> sizes;
+  if (lengths) sizes.emplace(*lengths, inverter.pool);
+  size_t index = 0;
+  docs.forEachDoc(inverter.pool, [&](int32_t docid) {
+    int32_t length = sizes ? sizes->next() : 1;
+    assert(length >= 0);
+    for (int32_t i = 0; i < length; i++) {
+      assert(index < points.size());
+      points[index++].docid = docid;
+    }
+  });
+  assert(index == points.size());
+  assert(!sizes || sizes->eof());
+  return points;
+}
+
+inline void writeNumericPostings(PostingsWriter& postingsWriter,
+                                 PostingsWriter::IndexFieldInfo& fieldInfo,
+                                 std::vector<FlushPoint>& points) {
+  sortPointsByValueDocid(std::span<FlushPoint>(points));
+  TextWriter writer(postingsWriter);
+  writer.startField(&fieldInfo);
+  size_t begin = 0;
+  while (begin < points.size()) {
+    auto term = encodeNumericTerm(points[begin].value);
+    char packed[PackedTerm::getMemSize(8)];
+    PackedTerm::write(packed, term.data(), (uint32_t)term.size());
+    writer.startTerm(PackedTerm(packed));
+    size_t end = begin;
+    int32_t previousDoc = -1;
+    while (end < points.size() && points[end].value == points[begin].value) {
+      int32_t doc = points[end++].docid;
+      if (doc != previousDoc) writer.addDoc(doc, 1);
+      previousDoc = doc;
+    }
+    writer.endTerm(PackedTerm(packed));
+    begin = end;
+  }
+  writer.endField();
+}
 
 inline void writePoints(PostingsWriter& postingsWriter,
                         PostingsWriter::IndexFieldInfo& fieldInfo,
@@ -126,11 +176,16 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     auto full = numVals >= postingsWriter.getMaxDoc();
 
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
+
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter writer(*outputPtr,
-                          FieldType::sortsByIntColumn(fieldType->type()));
+                          FieldType::isNumericColumn(fieldType->type()));
       // When full, values are already in doc order and the column is written dense (no docs-with-field
       // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
       // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
@@ -162,18 +217,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(pointIndex < points.size());
-          points[pointIndex++].docid = docid;
-        });
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }
@@ -250,8 +294,7 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    // int64 -> any int-column type never throws, so the lazy transform is safe
-    // under the validate-before-mutate contract.
+    // indexMulti materializes every coerced value before appending any of them.
     indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
       return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
                                        inverter.coerceContext);
@@ -304,6 +347,11 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     auto full = numDocs >= postingsWriter.getMaxDoc();
 
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
+
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
@@ -336,26 +384,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-
-        IntStream::Reader lengths(lengthStream, inverter.pool);
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(!lengths.eof());
-          int32_t length = lengths.next();
-          assert(length >= 0);
-          for (int32_t i = 0; i < length; i++) {
-            assert(pointIndex < points.size());
-            points[pointIndex++].docid = docid;
-          }
-        });
-        assert(lengths.eof());
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }

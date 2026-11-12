@@ -52,6 +52,8 @@ public:
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  const std::string& nodeId() const { return config.node.id; }
+  const std::string& nodeLifetime() const { return lifetime; }
   Mode getMode() const { return mode; }
   // Null for a missing state or a different concrete state type.
   template <class T>
@@ -106,6 +108,10 @@ public:
   void renameCollection(const CollectionId& from, const CollectionId& to);
   void swapCollections(const CollectionId& a, const CollectionId& b);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
+  void detachCollection(const CollectionId& id, std::string_view target);
+  void detachCollection(std::string_view name, std::string_view target) { detachCollection(CollectionId::of(name), target); }
+  std::shared_ptr<Collection> attachCollection(const CollectionId& id, bool force = false);
+  std::shared_ptr<Collection> attachCollection(std::string_view name, bool force = false) { return attachCollection(CollectionId::of(name), force); }
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;
@@ -153,6 +159,7 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  std::string lifetime;
   const Mode mode;
   Now clock;
 

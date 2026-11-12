@@ -86,6 +86,21 @@ protected:
       catch (const CollectionUnavailableError&) { return false; }
     });
   }
+  // Serves "main" on the follower, then stops the source and republishes "main" there as a
+  // new incarnation sharing the served files. Returns the follower's copy; the source stays stopped.
+  std::shared_ptr<Collection> serveThenReplaceIncarnation() {
+    startSource(); startFollower();
+    { CollectionHelper h(*source, "main"); EXPECT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+    EXPECT_TRUE(caughtUp());
+    auto old = follower->getCollection("main");
+    stopSource();
+    FSDirFactory factory(sourceConfig.store.data_dir);
+    TenantCatalog storage(factory, "t0", "test", newUuid());
+    storage.adopt();
+    auto selected = *storage.current("main");
+    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
+    return old;
+  }
   bool caughtUp(const CollectionId& id) {
     auto target = source->getCollection(id)->getShard()->getSnapshots().snapshot()->id;
     return until([&] {
@@ -248,14 +263,16 @@ TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   char host[256] = {};
   ASSERT_EQ(0, ::gethostname(host, sizeof(host) - 1));
   EXPECT_EQ(std::string(host) + ":9500", after.follower);
+  EXPECT_EQ(follower->nodeId(), after.follower);
   EXPECT_EQ(before.follower, after.follower);
   stopFollower();
-  followerConfig.replication.follower_id = "reader-a";
+  followerConfig.node.id = "reader-a";
   startFollower();
+  EXPECT_EQ("reader-a", follower->nodeId());
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [](const auto& row) { return row.follower == "reader-a"; });
   }));
-  followerConfig.replication.follower_id.clear();
+  followerConfig.node.id.clear();
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return !source->getReplication().status().empty() && !source->getReplication().status()[0].commit.incarnation.empty(); }));
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
@@ -900,7 +917,9 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
     std::string target;
     {
       FSDirFactory factory(followerConfig.store.data_dir);
-      target = TenantCatalog(factory).reserve("main");
+      TenantCatalog catalog(factory, "t0", "test", newUuid());
+      catalog.adopt();
+      target = catalog.reserve("main");
     }
     state.collection(CollectionId::of("main")).promoted = target;
     state.write(metadata);
@@ -1303,8 +1322,11 @@ TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
   auto sentinel = std::filesystem::path(followerConfig.store.data_dir) / "unrelated";
   { std::ofstream file(sentinel); file << "keep me"; }
   auto unrelated = pull();
-  EXPECT_NE(0, unrelated.first);
-  EXPECT_NE(std::string::npos, unrelated.second.find("empty data directory"));
+  EXPECT_EQ(1, unrelated.first);
+  EXPECT_NE(std::string::npos, unrelated.second.find("Pull failed: data directory fs:" + followerConfig.store.data_dir + ": "));
+  EXPECT_NE(std::string::npos, unrelated.second.find("no LAYOUT marker but is not empty (first entries: \"unrelated\")"));
+  EXPECT_NE(std::string::npos, unrelated.second.find("check the path or finish an interrupted copy"));
+  EXPECT_EQ(std::string::npos, unrelated.second.find("reindex"));
   EXPECT_TRUE(std::filesystem::exists(sentinel));
   followerConfig.store.data_dir = (path / "offline").string();
   stopSource();
@@ -1533,6 +1555,26 @@ TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
   }));
 }
 
+
+TEST_F(ReplicationFollowerTest, nodeIdConfig) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--node.id reader-a");
+  EXPECT_EQ("reader-a", config.node.id);
+  EXPECT_NO_THROW(config.normalize());
+
+  config.node.id = std::string(250, 'n') + " :\"~!";
+  EXPECT_EQ(config.node.id, LuxirNode(config).nodeId());
+  for (const auto& id : std::vector<std::string>{".", "..", "a/b", "a\\b", "\n", "\x7f", "\x80",
+                                               std::string("a\0b", 3), std::string(256, 'n')}) {
+    config.node.id = id;
+    EXPECT_THROW(config.normalize(), std::invalid_argument);
+  }
+  EXPECT_THROW(LuxirNode{config}, std::invalid_argument); // a config assembled in code is checked too
+  config.node.id.clear();
+  EXPECT_NO_THROW(config.normalize()); // empty requests automatic resolution
+}
 
 TEST_F(ReplicationFollowerTest, tenantFilterConfig) {
   LuxirConfig config;
@@ -1913,41 +1955,57 @@ TEST_F(ReplicationFollowerTest, staleRepairLeavesUnrelatedReplacementAvailable) 
 }
 
 TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacement) {
-  startSource(); startFollower();
-  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
-  ASSERT_TRUE(caughtUp());
-  auto old = follower->getCollection("main");
+  auto old = serveThenReplaceIncarnation();
   std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
-  stopSource();
-  {
-    FSDirFactory factory(sourceConfig.store.data_dir);
-    TenantCatalog storage(factory);
-    auto selected = *storage.current("main");
-    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
-  }
-  startSource();
-  ASSERT_TRUE(caughtUp());
-  auto current = follower->getCollection("main");
-  ASSERT_NE(old, current);
-  auto snapshot = current->getShard()->getSnapshots().snapshot();
-  ASSERT_NE(snapshot->files.end(), std::ranges::find(snapshot->files, suspects[0]));
+  // The report arrives once the replacement is visible, before the follower records the switch.
+  std::atomic<bool> reported{false};
   std::atomic<unsigned> downloads{0}, otherDownloads{0};
   Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (!reported) return nullptr;
     if (((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
     else otherDownloads++;
     return nullptr;
   });
+  auto* catalog = &follower->collections().catalog("t0");
+  Signal::listen("catalogRead", [&](void* reader, void*, void*) -> void* {
+    if (reader != catalog || reported) return nullptr;
+    try { if (follower->getCollection("main") == old) return nullptr; }
+    catch (const CollectionUnavailableError&) { return nullptr; }
+    reported = true;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    return nullptr;
+  });
   auto cleanup = scope_guard([&] { stopFollower(); });
-  old->fail("late scrub result");
-  follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
-  ASSERT_TRUE(until([&] {
-    try { return follower->getCollection("main") != current; }
-    catch (const CollectionUnavailableError&) { return false; }
-  }));
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() == 1; }));
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(1u, downloads.load());
   EXPECT_EQ(0u, otherDownloads.load());
+}
+
+// A report that arrives before a mapping attempt fails still reaches the replacement on the retry.
+TEST_F(ReplicationFollowerTest, repairSurvivesFailedMappingAttempt) {
+  auto old = serveThenReplaceIncarnation();
+  std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
+  std::atomic<bool> reported{false};
+  std::atomic<unsigned> downloads{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (reported && ((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
+    return nullptr;
+  });
+  Signal::listen("replicationMappingReady", [&](void*, void*, void*) -> void* {
+    if (reported.exchange(true)) return nullptr;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    throw std::runtime_error("injected mapping failure");
+  });
+  auto cleanup = scope_guard([&] { stopFollower(); });
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() >= 1; }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
 TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
@@ -2241,7 +2299,8 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   std::string selected, target, root;
   {
     FSDirFactory factory(followerConfig.store.data_dir);
-    TenantCatalog catalog(factory, "t0");
+    TenantCatalog catalog(factory, "t0", "test", newUuid());
+    catalog.adopt();
     selected = catalog.current("main").value();
     target = copySnapshot(catalog, "main", selected, Manifest::load(*catalog.directory(selected)));
     auto directory = catalog.directory(target);
@@ -2265,5 +2324,19 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   auto base = path / "follower";
   EXPECT_TRUE(std::filesystem::exists(base / "t" / "t0" / "i" / target / root));
   EXPECT_TRUE(std::filesystem::exists(base / "node" / "replication.json"));
+}
+
+TEST_F(ReplicationFollowerTest, promoteRefusesAnUnreadableDirectory) {
+  auto older = path / "older-layout";
+  std::filesystem::create_directories(older / "t");
+  std::filesystem::create_directories(older / "node");
+  std::ofstream(older / "node" / "replication.json") << "{}";
+  std::ofstream(older / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
+  auto refused = promote(older.string());
+  EXPECT_EQ(1, refused.first);
+  EXPECT_NE(std::string::npos, refused.second.find("Promote failed: data directory fs:" + older.string() + ": ")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("no LAYOUT marker but is not empty (first entries: \"t\")")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("check the path or finish an interrupted copy")) << refused.second;
+  EXPECT_EQ(std::string::npos, refused.second.find("reindex"));
 }
 }

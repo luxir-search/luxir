@@ -54,9 +54,14 @@ if(CMAKE_CROSSCOMPILING)
   add_executable(protoc-gen-hpp IMPORTED GLOBAL)
   set_target_properties(protoc-gen-hpp PROPERTIES IMPORTED_LOCATION "${LUXIR_HOST_PROTOC_GEN_HPP}")
 else()
-  add_executable(protoc-gen-hpp "${HPP_PROTO_DIR}/src/protoc-plugin/hpp_gen.cpp")
-  target_include_directories(protoc-gen-hpp PRIVATE "${HPP_PROTO_DIR}/include")
-  target_link_libraries(protoc-gen-hpp PRIVATE is_utf8)
+  # Compiles is_utf8 itself instead of linking the library, which is built for
+  # the target CPU tier and may not run on the build machine.
+  add_executable(protoc-gen-hpp "${HPP_PROTO_DIR}/src/protoc-plugin/hpp_gen.cpp"
+                                "${IS_UTF8_DIR}/src/is_utf8.cpp")
+  target_include_directories(protoc-gen-hpp PRIVATE "${HPP_PROTO_DIR}/include"
+                                                    "${IS_UTF8_DIR}/include")
+  target_compile_options(protoc-gen-hpp PRIVATE -Wno-error=pragmas)
+  luxir_runs_during_build(protoc-gen-hpp)
   target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
   # This single TU is the head of the clean-build critical path: CMake gives every luxir_lib
   # and luxir_test object an order-only dependency on it (they link luxir_proto_concrete,

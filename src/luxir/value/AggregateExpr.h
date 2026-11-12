@@ -87,6 +87,14 @@ struct AggregateConstant {
   double doubleValue = 0.0;
 };
 
+inline BucketScalar integerAggregateOutput(BucketScalar value) {
+  if (value.valid && value.type == BucketValueType::INT128
+      && (value.intValue < INT64_MIN || value.intValue > INT64_MAX)) {
+    return BucketScalar::failed(value.type, value.nature, AggregateFailure::INT64_OUTPUT_OVERFLOW);
+  }
+  return value;
+}
+
 struct AggregateStateOps {
   using Init = void (*)(void* state,
                         std::span<const AggregateConstant> arguments,

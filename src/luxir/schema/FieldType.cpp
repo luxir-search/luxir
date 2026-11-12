@@ -9,23 +9,105 @@
 #include <bit>
 #include <cmath>
 #include <format>
+#include <glaze/glaze.hpp>
 
 namespace luxir {
 
+void FieldType::signatureProps(SignatureProps& out) const {
+  out["type"] = "\"" + std::string(typeName(type_)) + "\"";
+}
+
+static void termSignatureProps(const FieldType& type, FieldType::SignatureProps& out) {
+  switch (type.longTerms) {
+    case TermPolicy::HASH128: out["long_terms"] = "\"hash128\""; break;
+    case TermPolicy::TRUNCATE: out["long_terms"] = "\"truncate\""; break;
+    case TermPolicy::REJECT: out["long_terms"] = "\"reject\""; break;
+  }
+}
+
+void TextFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  termSignatureProps(*this, out);
+  out["analyzer"] = analyzer_->canonical;
+}
+
+void StrFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  if (flags_ & INDEX_DOCS) termSignatureProps(*this, out);
+  out["normalizer"] = "[]";
+  if (normalizer) {
+    glz::generic_sorted_u64 analyzer;
+    if (glz::read_json(analyzer, normalizer->canonical) || glz::write_json(analyzer["filters"], out["normalizer"])) {
+      throw std::runtime_error("Cannot serialize normalizer signature");
+    }
+  }
+}
+
+void IdFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  termSignatureProps(*this, out);
+}
+
+void DateFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  out["unit"] = "\"" + std::string(dateUnitName(unit)) + "\"";
+}
+
+void DecimalFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  out["scale"] = std::to_string(scale);
+}
+
+void VectorFieldType::signatureProps(SignatureProps& out) const {
+  FieldType::signatureProps(out);
+  out["dims"] = std::to_string(inputDims());
+  if (truncateDims() > 0) out["truncate_dims"] = std::to_string(truncateDims());
+  static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine"};
+  out["metric"] = "\"" + std::string(metrics[metric()]) + "\"";
+  out["normalize_on_write"] = normalizeOnWrite() ? "true" : "false";
+  out["normalized"] = metric() == METRIC_COSINE && normalized() ? "true" : "false";
+}
+
 std::string_view FieldType::typeName(Type type) {
   static constexpr std::string_view names[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip"
   };
   return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
 }
 
+uint32_t FieldType::capabilities() const {
+  switch (storage(type_)) {
+    case Storage::TERMS:
+      return MATCH | ANY_OF | PREFIX | PATTERN | FUZZY | FREE_TEXT | TERM_FILTER
+          | RANGE | SORT | FIELD_FACET | COLLAPSE | VALUE_EXPR;
+    case Storage::TEXT:
+      return MATCH | ANY_OF | PREFIX | PATTERN | FUZZY | FREE_TEXT | RANGE | FIELD_FACET;
+    case Storage::INT64:
+      return MATCH | ANY_OF | RANGE | SORT | FIELD_FACET | RANGE_FACET | COLLAPSE | VALUE_EXPR;
+    default: return 0;
+  }
+}
+
+void FieldType::requireCapability(uint32_t required, std::string_view operation,
+                                   std::string_view fieldName) const {
+  if (!supports(required)) {
+    auto message = std::format("{} is not supported on {} field '{}'", operation, typeName(type_), fieldName);
+    auto remedy = capabilityRemedy(required);
+    if (!remedy.empty()) message.append("; ").append(remedy);
+    throw RequestError(message);
+  }
+}
+
 uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
   switch (type) {
+    case DECIMAL:
+      if (typeFlags <= DecimalFieldType::MAX_SCALE) return typeFlags;
+      throw std::runtime_error(std::format("Unknown decimal scale {}", typeFlags));
     case DATE:
       DateFieldType::unitFromTypeFlags(typeFlags);
       return typeFlags;
     case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
-    case DOUBLE: case ID: case VECTOR: case GEO_POINT:
+    case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN: case IP:
       if (typeFlags == 0) return 0;
       throw std::runtime_error(std::format(
           "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
@@ -38,6 +120,7 @@ std::string FieldType::describeType(Type type, uint32_t typeFlags) {
     return std::format("type 'date' unit '{}'", dateUnitName(DateFieldType::unitFromTypeFlags(typeFlags)));
   }
   typeParameters(type, typeFlags);
+  if (type == DECIMAL) return std::format("type 'decimal' scale {}", typeFlags);
   return std::format("type '{}'", typeName(type));
 }
 
@@ -62,7 +145,7 @@ void StrFieldType::normalize(std::string& value) const {
 
 TextFieldType::TextFieldType(std::string_view name, int flags, std::string_view tokenizer,
                              std::vector<std::string> filters)
-    : FieldType(name, FieldType::TEXT, flags) {
+    : FieldType(name, FieldType::TEXT, flags, true) {
   api::AnalyzerDef def;
   def.tokenizer.emplace().name = tokenizer;
   std::vector<api::AnalyzerComponent> components(filters.size());

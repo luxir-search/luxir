@@ -12,6 +12,30 @@
 using namespace luxir;
 using namespace luxir::test;
 
+TEST(FSProcessTest, sharedAdmissionAcrossProcesses) {
+  using Mode = FSDirFactory::Mode;
+  if (auto role = TestProcess::role()) {
+    try {
+      FSDirFactory factory(TestProcess::path(), false, std::string_view(role) == "fs" ? Mode::EXCLUSIVE : Mode::SHARED, "A");
+      TestProcess::reply('o');
+    } catch (const std::runtime_error& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("admission refused"));
+      TestProcess::reply('x');
+    }
+    return;
+  }
+  auto path = std::filesystem::temp_directory_path() / ("luxir-process-admission-" + newUuid());
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirFactory first(path, false, Mode::SHARED, "A");
+  { FSDirFactory second(path, false, Mode::SHARED, "B"); }
+  for (auto role : {"fs", "same_id"}) {
+    TestProcess process(path, role);
+    EXPECT_EQ('x', process.receive());
+    EXPECT_EQ(0, process.join());
+  }
+  EXPECT_EQ(0u, std::filesystem::file_size(path / "node/write.lock"));
+}
+
 TEST(FSProcessTest, matchAcrossProcesses) {
   constexpr int rounds = 24;
   constexpr auto root = StorageRoot::AUTHORITATIVE;
@@ -52,7 +76,7 @@ TEST(FSProcessTest, matchAcrossProcesses) {
   for (int round = 0; round < rounds; round++) {
     first.send('r'); second.send('r');
     ASSERT_EQ('s', first.receive()); ASSERT_EQ('s', second.receive());
-    // Opening an owned view must not remove the other live processes' scratch files.
+    // Opening another view leaves in-flight publications alone.
     factory.directory(root, "t/t0");
     first.send('g'); second.send('g');
     EXPECT_EQ(1, (first.receive() == '1') + (second.receive() == '1'));
@@ -90,7 +114,7 @@ TEST(FSProcessTest, writerTakeover) {
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   FSDirFactory factory(path);
   TenantCatalog::initialize(factory, true);
-  TenantCatalog catalog(factory);
+  TenantCatalog catalog(factory, "t0", "test", newUuid());
   auto id = catalog.reserve("main", "10000000000");
   TestProcess first(path, "first");
   ASSERT_EQ('o', first.receive());

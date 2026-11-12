@@ -7,13 +7,16 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/value/ValueTypes.h"
 
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -28,6 +31,7 @@ struct CoerceContext {
   TimeZone timeZone = TimeZone::utc();
   // Omitted means the field's unit. Request modes may supply a different unit.
   std::optional<DateUnit> dateInputUnit = std::nullopt;
+  bool decimalScaled = false;
 };
 
 
@@ -51,14 +55,56 @@ public:
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
     DATE,     // timestamp; column-stored as int64 epoch units (default ms)
-    GEO_POINT // latitude/longitude point; packed into one int64 column value
+    GEO_POINT, // latitude/longitude point; packed into one int64 column value
+    BOOLEAN,  // true/false; column-stored as 0/1
+    DECIMAL,  // fixed-point number; scale in type flags
+    IP        // 16-byte address term
   };
+
+  enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
+
+  static constexpr Storage storage(Type type) {
+    switch (type) {
+      case NONE: return Storage::NONE;
+      case STRING: case ID: case IP: return Storage::TERMS;
+      case TEXT: return Storage::TEXT;
+      case BIN: return Storage::BIN;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: return Storage::INT64;
+      case VECTOR: return Storage::VECTOR;
+    }
+    throw std::invalid_argument("Unknown field storage type");
+  }
+
+  // Ordered scalar values in the shared int64 column: numeric queries,
+  // field sorts and one-dimensional points all use this storage family.
+  static constexpr bool isNumericColumn(Type type) {
+    return storage(type) == Storage::INT64 && type != GEO_POINT;
+  }
+
+  static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
 
   static std::string_view typeName(Type type);
   // Decode parameters using the persisted type, independently of any schema.
   // Unknown types and bits are invalid. DATE defines its unit in bit 0.
   static uint32_t typeParameters(Type type, uint32_t typeFlags);
   static std::string describeType(Type type, uint32_t typeFlags);
+  using SignatureProps = std::map<std::string, std::string>;
+  virtual void signatureProps(SignatureProps& out) const;
+
+  enum Capability : uint32_t {
+    MATCH = 1u << 0, ANY_OF = 1u << 1, PREFIX = 1u << 2,
+    PATTERN = 1u << 3, FUZZY = 1u << 4, FREE_TEXT = 1u << 5,
+    TERM_FILTER = 1u << 6, RANGE = 1u << 7, SORT = 1u << 8,
+    FIELD_FACET = 1u << 9, RANGE_FACET = 1u << 10,
+    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12
+  };
+
+  // Type support only; callers validate indexing and column configuration.
+  virtual uint32_t capabilities() const;
+  virtual std::string_view capabilityRemedy(uint32_t required) const { return {}; }
+  bool supports(uint32_t required) const { return (capabilities() & required) == required; }
+  void requireCapability(uint32_t required, std::string_view operation,
+                         std::string_view fieldName) const;
 
   using flag_type = int32_t;
 
@@ -91,9 +137,27 @@ public:
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
 
+  static_assert([] {
+    constexpr flag_type bits[] = {
+      INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
+      INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
+      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
+      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+    };
+    flag_type used = 0;
+    for (auto bit : bits) {
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      used |= bit;
+    }
+    return true;
+  }(), "Field flags must use distinct single bits");
+
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  // String and bytes arms already contain term bytes, before normalization or fitting.
+  const bool rawTextTerms;
   // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
   // When STORED is set, raw values are routed to the stored-fields resource
@@ -102,8 +166,8 @@ public:
   std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   // constructor
-  FieldType(std::string_view name, FieldType::Type type, int flags) :
-     type_(type), name_(name), flags_(flags) {
+  FieldType(std::string_view name, FieldType::Type type, int flags, bool rawTextTerms = false) :
+     type_(type), name_(name), flags_(flags), rawTextTerms(rawTextTerms) {
     if ((flags_ & MULTI_VALUED) && arrayOnly(type)) flags_ |= MULTI_ARRAY;
   }
 
@@ -152,23 +216,11 @@ public:
   bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
   static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
-  // Whether a sort on a field of this type orders by its int64 column
-  // values: raw integers for INT, epoch units for DATE, sortable bits for
-  // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
-  // of these types are the ones field-sort planning reads, so only they
-  // persist a value sketch (NumColumnWriter).
-  static bool sortsByIntColumn(Type type) {
-    return type == INT || type == DATE || type == FLOAT || type == DOUBLE;
-  }
-
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   bool isStored() { return (bool) (flags_ & STORED); }
-
-  // ID uses the indexed STRING representation in segment metadata.
-  Type persistedType() const { return type_ == ID ? STRING : type_; }
 
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce
@@ -189,11 +241,44 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
-  // Same conversion, returning nullopt only for an uncoercible value.
-  // Unsupported column types still throw.
+  // Integer-lattice gaps and origins, which must not use literal rounding.
+  virtual __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const;
+
+  // Fallback for point types without a cheaper non-throwing coercer.
   virtual std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
+
+  virtual ValueNature valueNature() const { return ValueNature::NUMBER; }
+
+  enum class LiteralUse : uint8_t { MATCH, MEMBER, GTE, GT, LTE, LT };
+  struct IntWindow {
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    bool granuleSkipped = false;
+    bool unroundedNow = false;
+    bool empty() const { return lo > hi; }
+  };
+
+  // Inclusive encoded values admitted by a query literal. MEMBER returns a
+  // point or empty; bounds return half-lines. Ingest still uses coerceColInt64.
+  virtual IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  // Only invalid_value is an uncoercible literal; other errors still throw.
+  virtual std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  struct TermWindow {
+    std::string_view lo, hi;
+    bool point() const { return lo == hi; }
+  };
+  virtual TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const;
+  virtual std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const;
 
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
@@ -206,18 +291,23 @@ public:
 
 class TextFieldType : public FieldType {
 public:
-  // The compiled chain (analysis/Analyzer.h), shared with every field that
-  // resolves to the same effective definition.
+  // The compiled plan (analysis/Analyzer.h), shared by fields inheriting the same
+  // authored definition; equal inline definitions may have separate plans.
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
-    : FieldType(name, FieldType::TEXT, flags), analyzer_(std::move(analyzer)) {}
+    : FieldType(name, FieldType::TEXT, flags, true), analyzer_(std::move(analyzer)) {}
 
   // Parameterless components by name (tests, benches, hand-built schemas);
   // throws like Analyzer::compile.  Defined in FieldType.cpp so this header
   // stays independent of the api types.
   TextFieldType(std::string_view name, int flags = INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {});
+  void signatureProps(SignatureProps& out) const override;
+
+  std::string_view capabilityRemedy(uint32_t required) const override {
+    return (required & (SORT | VALUE_EXPR | COLLAPSE | RANGE_FACET)) ? "use a string variant" : "";
+  }
 
   // Create a new non-thread-safe analyzer chain for this text field type
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
@@ -235,7 +325,8 @@ public:
 
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
                std::shared_ptr<const Analyzer> normalizer = {})
-    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)) {}
+    : FieldType(name, FieldType::STRING, flags, true), normalizer(std::move(normalizer)) {}
+  void signatureProps(SignatureProps& out) const override;
 
   // Hot paths (ingest and query literals) must retain a chain from normalizer->createChain().
   void normalize(std::string& value) const;
@@ -244,15 +335,74 @@ public:
                               std::span<char> buf) const override;
 };
 
+class IpFieldType : public FieldType {
+public:
+  IpFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED)
+    : FieldType(name, FieldType::IP, flags) {}
+  ValueNature valueNature() const override { return ValueNature::IP; }
+  uint32_t capabilities() const override {
+    return FieldType::capabilities() & ~(PREFIX | PATTERN | FUZZY | FREE_TEXT | TERM_FILTER);
+  }
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const override;
+};
+
 class IntFieldType : public FieldType {
 public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
   }
 
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+};
+
+class DecimalFieldType : public FieldType {
+public:
+  static constexpr int MAX_SCALE = 18;
+  int scale;
+
+  DecimalFieldType(std::string_view name, int scale, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::DECIMAL, flags), scale(scale) { typeParameters(DECIMAL, scale); }
+
+  ValueNature valueNature() const override { return decimalValueNature(scale); }
+  uint32_t segmentTypeFlags() const override { return scale; }
+  void signatureProps(SignatureProps& out) const override;
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+  __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const override;
+};
+
+// BOOLEAN stores 0 (false) or 1 (true) in the standard int column.
+class BoolFieldType : public FieldType {
+public:
+  BoolFieldType(std::string_view name, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::BOOLEAN, flags) {}
+
+  ValueNature valueNature() const override { return ValueNature::BOOLEAN; }
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~RANGE_FACET; }
+
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
   std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
@@ -266,6 +416,8 @@ class FloatFieldType : public FieldType {
 public:
   FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
   }
+
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
@@ -281,6 +433,8 @@ public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
   }
 
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
+
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
@@ -295,11 +449,6 @@ public:
 // field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
 class DateFieldType : public FieldType {
 public:
-  struct QueryRange {
-    int64_t lo, hi; // inclusive, in field units; out-of-domain bounds saturate
-    bool granuleSkipped = false;
-    bool unroundedNow = false;
-  };
   DateUnit unit;
 
   DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
@@ -311,29 +460,23 @@ public:
   static DateUnit unitFromTypeFlags(uint32_t typeFlags);
   // The unit of a field type whose type() is DATE.
   static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
+  ValueNature valueNature() const override { return dateValueNature(unit); }
+  void signatureProps(SignatureProps& out) const override;
   uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
+  __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const override;
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  std::optional<int64_t> tryCoerceColInt64(
-      const api::Val& val, std::string_view fieldName,
+  IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  // Exact set membership uses the literal's floored start. Out-of-domain
-  // members are omitted; malformed values remain request errors.
-  std::optional<int64_t> coerceDateInstant(
-      const api::Val& val, std::string_view fieldName,
-      const CoerceContext& context = {}) const;
-
-  // Match/range use the literal's granularity, expressed in column units.
-  QueryRange coerceDateRange(
-      const api::Val& val, std::string_view fieldName,
-      const CoerceContext& context = {}) const;
-
-  std::optional<QueryRange> tryCoerceDateRange(
-      const api::Val& val, const CoerceContext& context = {}) const;
+  std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class GeoPointFieldType : public FieldType {
@@ -348,13 +491,17 @@ public:
     : FieldType(name, FieldType::GEO_POINT, flags),
       ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
+
+  ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
+  uint32_t capabilities() const override { return VALUE_EXPR; }
 };
 
 // Unique id field
 class IdFieldType : public FieldType {
 public:
-  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
+  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags, true) {
   }
+  void signatureProps(SignatureProps& out) const override;
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
@@ -451,6 +598,7 @@ public:
 
   // Stored dimension (0 = inferred per segment).
   int32_t storedDims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
+  void signatureProps(SignatureProps& out) const override;
   int32_t inputDims() const { return inputDims_; }
   int32_t truncateDims() const { return truncateDims_; }
   Metric metric() const { return metric_; }

@@ -18,6 +18,9 @@ counts answer different questions from HTTP p50/p99 and total index size here.
 The [Dependency image workflow](../../.github/workflows/deps-image.yml) builds
 `.devcontainer/Dockerfile` through `dev`. It publishes
 `ghcr.io/<repository-owner>/luxir-dev:<key>` and skips a tag that already exists.
+A cold build of both dependency variants exceeds a hosted job's six-hour limit,
+so one job publishes the normal dependency stage as `<key>-normal` and a second
+builds the ASan dependencies and the `dev` image on it.
 The key is a SHA-256 of all four Dockerfile stages and their declared
 COPY inputs. Compiler, base image, vcpkg pins, ports, triplets, build checks,
 ASan dependencies, and final development setup therefore participate; engine

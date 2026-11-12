@@ -301,14 +301,13 @@ private:
       fail(pos, e.what());
     }
     FieldType* field = target.fieldType;
-    if (field->type() == FieldType::TEXT) {
-      fail(pos, fmt::format("field '{}' is TEXT and has no value column; use a string variant", name));
+    try {
+      field->requireCapability(FieldType::VALUE_EXPR, "value expression", name);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
     }
-    bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
-                   field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-    bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING;
+    bool numeric = FieldType::isNumericColumn(field->type());
     bool geo = field->type() == FieldType::GEO_POINT;
-    if (!numeric && !stringSortable && !geo) fail(pos, fmt::format("field '{}' is not sortable", name));
     if (!field->hasColumn()) {
       fail(pos, fmt::format("field '{}' has no column values", name));
     }
@@ -325,9 +324,7 @@ private:
       node.type = field->multiValued()
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
-      node.nature = field->type() == FieldType::DATE
-          ? dateValueNature(DateFieldType::unitOf(*field))
-          : geo ? ValueNature::GEO_POINT : ValueNature::NUMBER;
+      node.nature = field->valueNature();
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
@@ -374,6 +371,55 @@ private:
     return parseColumn(name, pos);
   }
 
+  void rewriteDecimalComparison(const ValueFunction*& function,
+      std::array<uint32_t, VALUE_MAX_ARITY>& args, uint8_t count,
+      std::array<ResolvedValue, VALUE_MAX_ARITY>& resolved) {
+    if (count != 2) return;
+    auto op = function->opcode;
+    using Op = ValueOpcode;
+    if (op != Op::LT && op != Op::LE && op != Op::GT && op != Op::GE && op != Op::EQ && op != Op::NE) return;
+    size_t field = valueDecimal(resolved[0].nature) ? 0 : 1;
+    size_t literal = 1 - field;
+    if (!valueDecimal(resolved[field].nature) || resolved[field].type != ValueType::INT64) return;
+    auto constant = constants.scalar(args[literal]);
+    if (!constant || resolved[literal].nature != ValueNature::NUMBER) return;
+    const auto* source = &program->nodes[args[literal]];
+    bool negate = false;
+    while (source->kind == ValueNodeKind::FUNCTION && source->opcode == Op::NEG) {
+      negate = !negate;
+      source = &program->nodes[source->children[0]];
+    }
+    std::string signedLiteral;
+    api::Val literalValue;
+    if (source->kind == ValueNodeKind::CONSTANT && !source->text.empty()
+        && (value::lex::digit(source->text.front()) || source->text.front() == '.'
+            || source->text.front() == '-' || source->text.front() == '+')) {
+      auto text = source->text;
+      if (negate) {
+        if (text.front() == '-') text.remove_prefix(1);
+        else {
+          if (text.front() == '+') text.remove_prefix(1);
+          signedLiteral = "-" + std::string(text);
+          text = signedLiteral;
+        }
+      }
+      literalValue.kind = text;
+    } else if (constant->type == ValueType::INT64) literalValue.kind = constant->intValue;
+    else literalValue.kind = constant->doubleValue;
+    auto comparison = ValueFunctionRegistry::decimalComparison(function, valueDecimalScale(resolved[field].nature),
+        literalValue, field == 1);
+    if (!comparison) return;
+    function = comparison->function;
+    ValueNode bound;
+    bound.nature = resolved[field].nature;
+    bound.intValue = comparison->bound;
+    uint32_t fieldNode = args[field];
+    args[0] = fieldNode;
+    args[1] = append(bound);
+    resolved[0] = {program->nodes[fieldNode].type, program->nodes[fieldNode].nature};
+    resolved[1] = {ValueType::INT64, bound.nature};
+  }
+
   uint32_t appendFunction(const ValueFunction* function, size_t pos,
                           std::array<uint32_t, VALUE_MAX_ARITY> args, uint8_t count) {
     assert(function != nullptr);
@@ -381,6 +427,15 @@ private:
     for (uint8_t i = 0; i < count; i++) {
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
+    }
+    rewriteDecimalComparison(function, args, count, resolvedArgs);
+    auto natureConversions = function->natureConversions({resolvedArgs.data(), count});
+    for (uint8_t i = 0; i < count; i++) {
+      if (!natureConversions[i]) continue;
+      size_t start = program->nodes.size();
+      args[i] = program->numericNode(args[i]);
+      for (size_t n = start; n < program->nodes.size(); n++) constants.append(program->nodes[n]);
+      resolvedArgs[i] = {program->nodes[args[i]].type, program->nodes[args[i]].nature};
     }
     for (uint8_t i = 0; i < count; i++) {
       if (function->operands[i].constant && !foldConstant(args[i])) {

@@ -386,10 +386,17 @@ class RescoreQuery final : public Query {
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (!bulkContext.requireConstantCount) {
-        return {
+        BulkPlan plan{
           BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
           BulkAnswer::NO,
         };
+        // Candidates are rescored through the child, so only a child that
+        // needs no rescoring lets the program compose with an exact count.
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING) {
+          plan.rankingScoresExact =
+              childSupplier->planBulk(use, bulkContext).rankingScoresExact;
+        }
+        return plan;
       }
       return childSupplier->planBulk(use, bulkContext);
     }
@@ -446,6 +453,8 @@ public:
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight;

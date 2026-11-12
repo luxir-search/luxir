@@ -17,6 +17,8 @@ enum RequestFlagBit {
   DATE_MODE_LOW_BIT = 0;
   DATE_MODE_HIGH_BIT = 1;
   INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
+  ESTIMATE_COUNT_BIT = 3; // lists with an unset or positive count_limit may estimate found
+  DECIMAL_SCALED_BIT = 4; // decimal literals and results use raw scaled integers
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -50,12 +52,12 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose, today
-  // serial: over HTTP normally inline on the receiving thread, over gRPC on
-  // the shared executor. 1 runs serially on the shared executor; -1 permits
-  // unlimited parallelism, with shared workers joining in (starting on the
-  // receiving HTTP thread, or on the shared executor over gRPC). Other values
-  // are rejected.
+  // Intra-request parallelism: 0 (default) lets the engine choose: serial
+  // (over HTTP normally inline on the receiving thread, over gRPC on the shared
+  // executor) unless the operator's search.auto-parallel-min-work admits it.
+  // 1 runs serially on the shared executor; -1 permits unlimited parallelism,
+  // with shared workers joining in (starting on the receiving HTTP thread, or
+  // on the shared executor over gRPC). Other values are rejected.
   int32 max_parallel = 8;
 
   // Require a local snapshot at least this new (incarnation:index_gen).
@@ -168,6 +170,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
 
@@ -180,9 +184,11 @@ message TopDocs {
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
   // Match count: unset or 0 omits found; -1 counts exactly; positive N permits
-  // stopping at N with found_gte. An exact count is also valid for N.
-  // Must be >= -1. Ops, collapse, diversify, field sorts, nested lists and
-  // limit 0 retain exact counting.
+  // stopping at N with found_gte; -2 asks for an estimate, like the
+  // estimate_count flag but for this list alone. The flag applies to an unset
+  // or positive count_limit, never to an explicit 0 or -1. An exact count is
+  // valid for every nonzero value. Must be >= -2. Ops, collapse, diversify,
+  // field sorts, nested lists and limit 0 retain exact counting.
   optional sint64 count_limit = 5;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
@@ -231,6 +237,8 @@ message TopDocs {
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 27;
   // Named source queries. At least one source is required.
   map<string, TopDocs> sources = 1;
 
@@ -254,10 +262,11 @@ message Fusion {
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  // Match count: unset or 0 omits found; -1 requests exact; positive N permits
-  // a lower bound. Fusion always supplies an exact count, also valid for N.
-  // Counts eligible groups with collapse, otherwise source-union documents.
-  // Must be >= -1.
+  // Match count: unset or 0 omits found; -1 requests exact; -2 permits an
+  // estimate; positive N permits a lower bound. Fusion always supplies an exact
+  // count, which is valid for -2, N and an unset count_limit under the
+  // estimate_count flag. Counts eligible groups with collapse, otherwise
+  // source-union documents. Must be >= -2.
   optional sint64 count_limit = 5;
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
@@ -1106,12 +1115,14 @@ message SearchResponse {
 
 // Typed collapse identity. Component types follow the resolved schema fields.
 message GroupComponent {
-  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; } // INT carries signed int64 values.
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; DECIMAL = 5; IP = 6; } // INT carries signed int64 values.
   Type type = 1;
   oneof value {
     google.protobuf.NullValue null = 2;
     string s = 3;
     sint64 i = 4;
+    bool b = 5;
+    double d = 6;
   }
 }
 message GroupKey {
@@ -1136,11 +1147,16 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Match count when count_limit is nonzero. Counts groups with
-  // collapse; otherwise Fusion counts source-union documents before paging.
+  // Match count when count_limit is nonzero or the estimate_count flag applies.
+  // Counts groups with collapse; otherwise Fusion counts source-union documents
+  // before paging.
   optional sint64 found = 1;
-  // True when found is a lower bound; false means the count is exact.
+  // True when found is a lower bound. Neither this nor found_estimated means
+  // the count is exact.
   bool found_gte = 9;
+  // True when found was extrapolated from a sample of the index; it may be
+  // above or below the exact count, within what index statistics allow.
+  bool found_estimated = 16;
   optional sint64 found_docs = 2; // Collapse only, when count_limit is nonzero, after missing=drop.
   optional sint64 found_groups = 8; // Diversify only, with nonzero count_limit: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
@@ -1665,6 +1681,12 @@ message ServiceStats {
   string cpu_target = 20;
   // The full Git commit the binary was built from, or "unknown".
   string source_commit = 23;
+  // The SIMD level FAISS selected for this CPU at startup: NONE, AVX2,
+  // AVX512, AVX512_SPR, ARM_NEON or ARM_SVE. FAISS_SIMD_LEVEL overrides it.
+  string faiss_simd = 24;
+  // The BLAS kernels selected for this CPU at startup: the OpenBLAS core name,
+  // or "Accelerate" on macOS.
+  string blas_core = 25;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
@@ -2163,6 +2185,15 @@ message QueryCacheStats {
   uint64 thrash_build_skips = 19;
   uint64 reader_dead_builds = 20;
   uint64 reader_thrash_build_skips = 21;
+  // Build time of claimed cache builds, including rejected publications,
+  // in microseconds. Excludes byproducts.
+  uint64 build_us = 22;
+  // Build time of values served as shared hits, in microseconds.
+  // An upper bound on time saved, not measured savings.
+  uint64 served_build_us = 23;
+  // Build time of zero-hit capacity evictions that install bypass debt,
+  // in microseconds.
+  uint64 dead_build_us = 24;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2248,6 +2279,10 @@ message CacheEntryDump {
   uint32 segments_resident = 7;
   uint64 hits = 8;
   uint64 last_used_epoch = 9;
+  // Summed build time of this entry's resident values, in microseconds.
+  uint64 build_us = 10;
+  // Current key uses in the admission window, taking the max of the two lanes.
+  uint32 recent_uses = 11;
 }
 
 message ShardCacheControl {
@@ -2399,11 +2434,14 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
+    BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
+    IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
+    DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
   // Index acceleration. Numeric Match/Range and geographic predicates can
-  // scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH;
+  // scan a column with NONE. Term queries on STRING/TEXT/ID/IP require MATCH;
   // STRING columns alone do not provide term-query support.
   enum IndexMode {
     NONE = 0;    // no index
@@ -2497,6 +2535,9 @@ message FieldDef {
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
 
+  // DECIMAL only, and required there: digits after the decimal point, 0 to 18.
+  // Excess fractional digits round half away from zero.
+  optional int32 scale = 25;
   // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
   // text is converted to this precision, truncating toward earlier time.
   // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.

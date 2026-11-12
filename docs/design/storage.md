@@ -42,6 +42,17 @@ Remote durability is reported separately from local visibility. Flushes and
 commits do not wait for the store. A commit request can ask to wait until
 HEAD covers it.
 
+## Catalog ownership
+
+Each tenant's CATALOG records `nodes`, a map from node id to process-lifetime
+UUID. If two processes use one id on a store without a node lock, the newer
+process replaces its lifetime at startup in every tenant that already mentions
+the id, before cleanup or opening writers. The older process's mutations and
+STATE claims fail with UNAVAILABLE, and it logs the takeover once per tenant.
+A tenant not mentioning the id is stamped lazily: a zombie that first touches a
+tenant the replacement never touched holds it until the replacement restarts.
+Exclusive startup resets the map to just its current node and lifetime.
+
 ## Local storage and the cache
 
 Once a file is published, its local copy is a cache entry and can be
@@ -59,11 +70,20 @@ durability.
 
 ## Remote readers and retention
 
-A node that reads a snapshot from the store holds a lease on it, with a
-bounded lifetime that the node renews while it uses the snapshot. Garbage
-collection removes an object only when neither HEAD nor a live lease
-references it. A lapsed lease means the snapshot expired, as it does for a
-follower's pin today.
+Superseded commits and their files are kept for X from local publication of
+their successor, after its STATE tip is installed. Holds use a steady clock;
+commit timestamps and publication stalls do not shorten the window. Readers on
+other nodes must refresh their view more often than X. `--store.retention-ms`
+sets X: by default 0 on exclusive stores and 5 minutes on shared stores.
+A new writer holds every older manifest and its files for a full X from startup,
+since their supersession times are unknown. Snapshot holds need no new metadata.
+
+A previously active incarnation also keeps its tree for X after retirement.
+The catalog records its retirement wall time after retirement is visible, so
+the deadline survives restart and handoff; allow a margin for node clock skew.
+Never-active reservations are removed immediately. The assigned node sweeps due
+trees at startup and on the HTTP expiry tick. Without HTTP, pending trees wait
+for the next startup.
 
 ## Reading from the store
 

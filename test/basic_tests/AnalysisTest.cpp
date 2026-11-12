@@ -359,6 +359,17 @@ TEST_F(AnalysisTest, unknownComponentIsRejected) {
   }
 }
 
+TEST_F(AnalysisTest, definitionEquality) {
+  auto first = Analyzer::compile({});
+  auto second = Analyzer::compile({});
+  api::AnalyzerDef different;
+  different.tokenizer.emplace().name = "keyword";
+  EXPECT_NE(first.get(), second.get());
+  EXPECT_TRUE(first->sameDefinitionAs(*first));
+  EXPECT_TRUE(first->sameDefinitionAs(*second));
+  EXPECT_FALSE(first->sameDefinitionAs(*Analyzer::compile(different)));
+}
+
 // The compiled Analyzer owns its configuration: chains stay valid after the
 // authored definition and the arena backing its views are gone.
 TEST_F(AnalysisTest, analyzerOutlivesDefinition) {

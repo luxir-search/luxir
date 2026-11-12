@@ -77,6 +77,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-fstack-protector)
 endif()
 
+# A program the build itself runs (code generator, dependency check) must run
+# on the build machine, which need not support a named LUXIR_CPU_TARGET tier:
+# an x86-64-v4 build on a CPU without AVX-512 would otherwise die generating
+# code. Later -march options win, so this replaces the tree-wide tier.
+function(luxir_runs_during_build target)
+  if(NOT CMAKE_CROSSCOMPILING AND LUXIR_CPU_TARGET MATCHES "^(x86-64-v|armv8)")
+    target_compile_options(${target} PRIVATE -march=native)
+  endif()
+endfunction()
+
 option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
 if(LUXIR_STATIC_RUNTIME)
   if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -317,6 +327,11 @@ find_package(zstd CONFIG REQUIRED)
 # locate OpenMP before find_package(faiss).
 find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
+# FAISS's BLAS: OpenBLAS everywhere but macOS, which uses Accelerate. KernelInfo
+# reports the OpenBLAS core.
+if(NOT APPLE)
+  find_package(OpenBLAS CONFIG REQUIRED)
+endif()
 # protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
 # luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
@@ -558,6 +573,9 @@ target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
 target_link_libraries(luxir_lib PRIVATE zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
+if(NOT APPLE)
+  target_link_libraries(luxir_lib PRIVATE OpenBLAS::OpenBLAS)
+endif()
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).
 target_link_libraries(luxir_lib PRIVATE uni_algo)

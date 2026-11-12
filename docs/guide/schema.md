@@ -16,10 +16,104 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
+| `decimal` | Fixed-point number with a required `scale` (0 to 18 digits after the point). See [Decimals](#decimals). |
+| `ip` | IPv4 or IPv6 address, stored as a 16-byte term. See [IP addresses](#ip-addresses). |
+| `boolean` | `true` or `false`: flags and on/off attributes. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### Decimals
+
+`decimal` stores `value * 10^scale` as a signed 64-bit integer. Set the
+required `scale` from 0 to 18; it is inherited from `parent` like other
+properties. A direct `scale` is invalid on other types; an inherited scale
+is ignored when a child changes type. There is no default decimal
+suffix. For example:
+
+```json
+{"fields":{"price":{"type":"decimal","scale":2,"index":"range"}}}
+```
+
+JSON integers, floating-point numbers and numeric strings are accepted.
+Excess fractional digits round half away from zero: `1.005` and `"1.005"`
+become 1.01 at scale 2, and -1.005 becomes -1.01. JSON floating-point inputs
+use their shortest round-trip text, rather than their binary expansion.
+Exponents and long fractions are accepted; overflow after rounding rejects
+an ingest value. Out-of-domain exact-match literals match nothing, and
+range bounds saturate to the field's value domain. Scale is persisted with the
+field type; reading or merging data under a different type or scale is rejected.
+
+Match and `any_of` literals round like ingest. Range bounds round in the
+requested direction: `gte: 10.005` starts at 10.01, while `lt: 10.005`
+includes values through 10.00. Integer field bounds also round directionally
+(`gte: 9.5` starts at 10); integer ingest and exact-match literals still
+reject non-integral values.
+
+Results are doubles by default, computed as raw divided by `10^scale`.
+This applies to documents, facet buckets and range bounds, sort values,
+collapse keys, and decimal statistics. The int64 storage is exact; doubles
+can lose distinctions at large magnitudes.
+
+The request or operation flag `decimal_scaled` instead returns raw integers
+and interprets decimal field literals as raw integers. Integral numeric
+strings, including `"1250.0"`, mean raw 1250 at every scale; non-integral
+match literals are rejected. Bounds still round directionally in raw units.
+Ingest always uses decimal values and is unaffected by the flag. Combine
+`decimal_scaled` with `int64_str` to round-trip large raw integers through
+JSON strings. Averages and percentiles remain doubles (in raw units under the flag).
+
+Range facet gaps and origins must be exact multiples of `10^-scale`; gaps
+must be positive. With `decimal_scaled` they use raw units. Selection,
+`min`, `max`, `sum`, and `avg` retain the scale when possible, aggregating
+raw values exactly (INT128 sums). Arithmetic and mixed-scale expressions
+decode to numeric values. Expression constants always mean values, independent
+of `decimal_scaled`. Same-scale comparisons use raw values; per-document
+comparisons against numeric constants use raw integer bounds when representable.
+A decimal sum wider than int64 renders as a double by default; scaled
+output emits null with an aggregate overflow warning, as integer sums do.
+
+### IP addresses
+
+`ip` accepts IPv4 and IPv6 text. IPv4 uses the IPv6 v4-mapped encoding, so
+`10.0.0.1` and `::ffff:10.0.0.1` are equal. Results use dotted IPv4 for mapped
+addresses and compressed lowercase IPv6 otherwise. Sorting follows address
+byte order. The default suffix templates are `_ip` and multi-valued `_ips`.
+
+IP fields require `index: "match"` (the default), and reject `stored: true`.
+There is no original source text to retain. Columns support retrieval, field
+facets, sorting, collapse, and column-only value expressions such as `count`.
+Facet selection and collapse identity use the encoded address.
+
+`match` accepts an address or CIDR: `10.1.2.3/8` matches the entire `10.0.0.0/8`
+network because host bits are ignored. IPv4 `/0` covers all mapped IPv4
+addresses; IPv6 `::/0` covers all addresses. `/32` for IPv4 and `/128` for
+IPv6 match one address. Range bounds and `any_of` members must be addresses;
+CIDR is rejected there. Numbers, zone ids, and text containing NUL reject.
+Prefix, wildcard/regexp, case-insensitive match, fuzzy matching, and facet
+`term_filter` are unsupported. IP fields cannot be bare-word fields in
+`simple_query`, but `addr:10.0.0.1` is an exact match. Wildcard `multi_match`
+field expansion probes each IP field and skips text it cannot parse.
+
+### Booleans
+
+`boolean` accepts JSON `true`/`false` and the strings `"true"`/`"false"`;
+other values, including numbers 0 and 1, reject the document. Query literals
+use the same rules: `flag:true`, `{"match": {"flag": false}}`.
+
+Values are stored as 0/1 in the integer column. Sorting puts `false` before
+`true`; field facet bucket values and collapse keys are JSON booleans.
+Range queries accept boolean bounds, but range facets are not supported.
+The default is `index: "none"`, as for `int`; `index: "range"` and
+`index: "match"` add the corresponding numeric indexes. For filtering on a
+boolean, `range` is the faster of the two, and the `_b`/`_bs` templates use it.
+
+Retrieved values are JSON booleans. Document columns have no boolean kind,
+so gRPC returns a `col_val` column holding one boolean value (or array) per
+document. Value expressions preserve booleans through selection (`min`,
+`max`, and choices between booleans); arithmetic, `sum`, and `avg` produce
+numbers. Summing a boolean counts true values.
 
 ### `text` versus `string`
 
@@ -120,6 +214,8 @@ The built-in templates are:
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
 | `_i`, `_is` | Integer column, single- or multi-valued. |
+| `_b`, `_bs` | Boolean column with a points index (`index: "range"`), single- or multi-valued. |
+| `_ip`, `_ips` | IP address terms, single- or multi-valued. |
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
@@ -268,7 +364,8 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`, `vector`, `geo_point`, `id` |
+| `scale` | `decimal` only, required from 0 to 18; inherited from `parent`. |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
@@ -312,7 +409,7 @@ Validation includes inherited ANN settings and variants.
 ### Multi-valued modes
 
 `multi` is inherited when omitted and defaults to `false` (one value).
-`true` selects the type's default: set for INT, FLOAT, DOUBLE, DATE, and
+`true` selects the type's default: set for INT, FLOAT, DOUBLE, DECIMAL, BOOLEAN, IP, DATE, and
 STRING; array for TEXT, VECTOR, and GEO_POINT. Explicit `"set"` and `"array"`
 select a mode. Array-only primary types reject `"set"`; ID is reserved for
 the single-valued `id` field.
@@ -640,7 +737,7 @@ The primary and every variant must use types from the same group:
 
 | Group | Allowed types |
 |---|---|
-| Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
+| Scalar | `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 

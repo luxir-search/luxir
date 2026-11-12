@@ -109,7 +109,7 @@ namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
-namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
+namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3, BOOLEAN = 4, DECIMAL = 5, IP = 6 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 // Enums an expr callable takes as an argument also describe the values it
 // accepts (ExprFunctions.h); keep each list beside its enum.
@@ -127,11 +127,11 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
-enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3, DECIMAL_SCALED_BIT = 4 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11, IP = 12, DECIMAL = 13 };
 enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
@@ -304,6 +304,7 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<std::int32_t> scale;
   std::optional<DateUnit> unit;                                // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
@@ -347,6 +348,9 @@ struct QueryCacheStats {
   uint64_t thrash_build_skips = 0;
   uint64_t reader_dead_builds = 0;
   uint64_t reader_thrash_build_skips = 0;
+  uint64_t build_us = 0;
+  uint64_t served_build_us = 0;
+  uint64_t dead_build_us = 0;
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
@@ -551,6 +555,8 @@ struct ServiceStats {
   std::string_view version;
   std::string_view cpu_target;
   std::string_view source_commit;
+  std::string_view faiss_simd;
+  std::string_view blas_core;
   std::span<const double> request_duration_bounds;
   std::span<const double> background_duration_bounds;
   TransportStats http;
@@ -780,10 +786,12 @@ struct CacheEntryDump {
   uint64_t bytes = 0;
   uint64_t hits = 0;
   uint64_t last_used_epoch = 0;
+  uint64_t build_us = 0;
   std::string_view key_text;
   std::string_view scope;
   uint32_t key_bytes = 0;
   uint32_t segments_resident = 0;
+  uint32_t recent_uses = 0;
   bool reader_value = false;
 };
 struct ShardCacheControl {                                      // needs QueryCacheStats,CacheEntryDump
@@ -908,6 +916,7 @@ struct TopDocs {                                                 // all indirect
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -923,6 +932,7 @@ struct Fusion {                                                  // needs TopDoc
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -987,7 +997,7 @@ struct SearchRequest {
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct GroupComponent {
-  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t> value;
+  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t, bool, double> value;
   GroupComponent_::Type type = GroupComponent_::Type::STRING;
 };
 struct GroupKey {
@@ -1014,6 +1024,7 @@ struct DocList {                                                // needs Column 
   int32_t row_count = 0;                                       // align 4
   bool more = false;
   bool found_gte = false;
+  bool found_estimated = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;

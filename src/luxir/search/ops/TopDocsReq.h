@@ -83,6 +83,20 @@ public:
   static inline bool
       disableExactCountTopKSparseFilterSinglePassForTests = false;
 
+  // A requested estimate. Where ranking pruned a segment, the segment counts the
+  // leading 1/64, then 1/8, of kEstimateSlices evenly spaced doc ranges until
+  // the sample holds kEstimateMinMatches matches (about 6% relative error for
+  // doc order independent of the query), and scales by the sampled fraction.
+  // That visits at most 1/8 of the segment, the estimator's whole budget: a
+  // full count runs only when the matches provably fit the same budget, and a
+  // sample too thin to scale reports the lower bound the segment can prove.
+  static constexpr int32_t kEstimateSlices = 16;
+  static constexpr int64_t kEstimateMinMatches = 256;
+  static constexpr int32_t kEstimateSampleShifts[] = {6, 3};
+  static constexpr int32_t kEstimateBudgetShift = 3;
+  // Below this, a full count costs too little to be worth sampling.
+  static constexpr int64_t kEstimateMinBudgetDocs = 8192;
+
   // Filtered MUST conjunctions can abandon competitive-score pruning when the
   // filter caps the candidate set tightly enough. The depth-specific knees
   // bracketed on the 5M Wikipedia corpus are:
@@ -265,7 +279,7 @@ public:
         || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
       return false;
     }
-    return FieldType::sortsByIntColumn(const_cast<FieldType&>(
+    return FieldType::isNumericColumn(const_cast<FieldType&>(
         sortPlan.clauses[0].getSortField().getFieldType()).type());
   }
 
@@ -480,10 +494,8 @@ public:
       routes[s] = 0;
       if (supplier != nullptr) {
         int64_t estimatedCard = supplier->cost();
-        if (segment.liveDocs() != nullptr) {
-          estimatedCard = std::min(
-              estimatedCard,
-              (int64_t)segment.liveDocs()->docset().card());
+        if (segment.hasDeletes()) {
+          estimatedCard = std::min(estimatedCard, (int64_t)segment.numLive());
         }
         cards[s] = estimatedCard;
         auto context = supplier->makePlanContext(
@@ -581,6 +593,7 @@ public:
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::PlanningContext& planning;
   Query::Context* weightContext;
+  Query* resultQuery = nullptr;
   Query* query;
   Query::Weight* weight;
   Query::Weight* variantMembershipWeight;
@@ -599,6 +612,10 @@ public:
   // The requested quantity stays in requirements; exact routes need no hold.
   bool boundedCount = false;
   bool countLimitProven = false;
+  // The request permits an estimate of this bounded count. The estimator
+  // samples through the ranking weight, scored with pruning allowed, so lazy
+  // plans stay lazy: an unscored weight would materialize a multi-term union.
+  bool estimateCount = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
@@ -612,6 +629,31 @@ public:
   // must handle that case.
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
+
+  bool ownsMatchDomain() const override { return true; }
+
+  // Counting and ranking are priced apart, each at the matches it may visit.
+  // A count that metadata answers costs nothing, and score-ordered
+  // constant-score ranking stops at the first K. Sub-ops need every match. A
+  // prepared query's work is not a document count; it adds none.
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    if (weight == nullptr || weight->needsPrepare()) return total;
+    bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
+    for (auto& segment : req.reader->segments()) {
+      auto shortcut = weight->countShortcut(segment, nullptr);
+      auto matches = (size_t) shortcut.maxMatches;
+      size_t counting = !requirements.needsCount()
+              || shortcut.how == Query::CountHow::METADATA
+          ? 0 : matches;
+      size_t ranking = !requirements.needRankedDocs ? 0
+          : firstK ? std::min(matches, (size_t) std::max<int64_t>(topCount, 0))
+          : matches;
+      size_t work = subOps.empty() ? std::max(counting, ranking) : matches;
+      total = saturatingAdd(total, work);
+    }
+    return total;
+  }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
@@ -794,8 +836,7 @@ public:
 
     DomainHandle resetBaseHandle(int32_t segment) {
       auto& seg = thisOp().req.reader->segments()[(size_t)segment];
-      DomainHandle live = DomainHandle::pinned(
-          seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, thisOp().req.reader);
+      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().req.reader);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -810,7 +851,7 @@ public:
       if constexpr (Structural) return resetBaseHandle(segment).get();
       else {
         auto& seg = op.req.reader->segments()[(size_t)segment];
-        return seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
+        return seg.liveDocSet();
       }
     }
 
@@ -948,6 +989,103 @@ public:
       return true;
     }
 
+    // Adds this segment's share of an estimated count, given the matches
+    // ranking saw before it pruned. Exact counts are never replaced by a guess,
+    // and a guess stays within the bounds index statistics prove.
+    void estimateSegmentCount(MemPool& pool, IndexReader::Segment& seg,
+                              DocSet* collectorFilter, auto& collector,
+                              int64_t seen) {
+      auto& weight = *thisOp().weight;
+      auto bounds = weight.countShortcut(seg, nullptr);
+      if (collectorFilter == nullptr && bounds.how == Query::CountHow::METADATA) {
+        collector.estimatedHits += bounds.maxMatches;
+        return;
+      }
+      // Clamp to the bounds; minMatches ignores a collector filter.
+      int64_t floor = collectorFilter == nullptr
+          ? std::max(seen, bounds.minMatches) : seen;
+      int64_t ceiling = bounds.maxMatches;
+      if (floor >= ceiling) {
+        collector.estimatedHits += floor;
+        return;
+      }
+      int32_t maxDoc = seg.maxDoc();
+
+      auto countRanges = [&](auto rangeOf) -> std::optional<int64_t> {
+        auto* supplier = weight.scorerSupplier(pool, seg);
+        if (supplier == nullptr) return std::nullopt;
+        Query::ScorerSupplier::BulkScorerContext bulkContext;
+        auto plan = supplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+        BulkScorer* bulk = nullptr;
+        Query::Scorer* scorer = nullptr;
+        if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+          bulk = supplier->buildBulk(pool, plan);
+        } else {
+          supplier->recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext, plan);
+        }
+        if (bulk == nullptr) {
+          scorer = buildPullScorer(pool, *supplier);
+          if (scorer == nullptr) return std::nullopt;
+        }
+        int64_t matches = 0;
+        for (int32_t slice = 0; slice < TopDocsReq::kEstimateSlices; slice++) {
+          auto [begin, end] = rangeOf(slice);
+          matches += bulk != nullptr
+              ? countMatchesInRange(bulk, collectorFilter, begin, end)
+              : countMatchesInRange(scorer, collectorFilter, begin, end);
+        }
+        return matches;
+      };
+
+      int64_t budget = std::max(
+          (int64_t) maxDoc >> TopDocsReq::kEstimateBudgetShift,
+          TopDocsReq::kEstimateMinBudgetDocs);
+      if (ceiling <= budget) {
+        auto matches = countRanges([&](int32_t slice) {
+          return std::pair(
+              (int32_t) ((int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices),
+              (int32_t) ((int64_t) maxDoc * (slice + 1) / TopDocsReq::kEstimateSlices));
+        });
+        collector.estimatedHits += std::max(matches.value_or(0), seen);
+        return;
+      }
+
+      // Each round counts only what the last one did not, so the walks add up
+      // to the final round's coverage.
+      auto sampleEnd = [&](int32_t slice, int32_t shift) {
+        int64_t begin = (int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices;
+        int64_t end = (int64_t) maxDoc * (slice + 1) / TopDocsReq::kEstimateSlices;
+        return (int32_t) (begin + std::max<int64_t>(1, (end - begin) >> shift));
+      };
+      int64_t matches = 0;
+      int64_t sampled = 0;
+      int32_t lastShift = -1;
+      for (int32_t shift : TopDocsReq::kEstimateSampleShifts) {
+        auto counted = countRanges([&](int32_t slice) {
+          int32_t begin = lastShift < 0
+              ? (int32_t) ((int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices)
+              : sampleEnd(slice, lastShift);
+          int32_t end = sampleEnd(slice, shift);
+          sampled += end - begin;
+          return std::pair(begin, end);
+        });
+        if (!counted) break;
+        matches += *counted;
+        lastShift = shift;
+        if (matches >= TopDocsReq::kEstimateMinMatches) {
+          int64_t scaled = std::llround(
+              (double) matches * (double) maxDoc / (double) sampled);
+          collector.estimatedHits += std::clamp(scaled, floor, ceiling);
+          collector.countEstimated = true;
+          return;
+        }
+      }
+      collector.estimatedHits += floor;
+      collector.countFloored = true;
+    }
+
     void collectKnownCountTopK(
         MemPool& pool, int32_t segnum, int64_t count,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
@@ -1001,6 +1139,37 @@ public:
           collector, maxDoc, allowPruning, exactScorer);
     }
 
+    // A single scorer ranks canonically by itself: count with the unscored
+    // weight (windowed when it can, else pulled), then rank with pruning.
+    void countThenRankWithoutRescoring(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto countPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      BulkScorer* countBulk = nullptr;
+      if (countPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+        countBulk = countSupplier.buildBulk(pool, countPlan);
+      } else {
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+      }
+      int64_t count = 0;
+      if (countBulk != nullptr) {
+        count = countMatchesWindowed(
+            countBulk, collectorFilter, nullptr, maxDoc);
+      } else if (auto* scorer = buildPullScorer(pool, countSupplier)) {
+        count = countMatchesInRange(scorer, collectorFilter, 0, maxDoc);
+      }
+      auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+          pool, thisOp().planning.topReader.segments()[segnum]);
+      collectKnownCountTopK(
+          pool, segnum, count, rankingSupplier, collectorFilter,
+          collector, maxDoc, true);
+    }
+
     bool composeVariableScoreExactCountTopK(
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& scoringSupplier,
@@ -1015,6 +1184,15 @@ public:
               != Query::ScorerSupplier::BulkAnswer::YES
           || scoringPlan.supportsExactCandidateScoring
               != Query::ScorerSupplier::BulkAnswer::YES;
+      if (scoringDeclined && scoringPlan.rankingScoresExact
+              == Query::ScorerSupplier::BulkAnswer::YES) {
+        scoringSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+            bulkContext, scoringPlan);
+        countThenRankWithoutRescoring(
+            pool, segnum, countSupplier, collectorFilter, collector, maxDoc);
+        return true;
+      }
       if (scoringDeclined) {
         auto countPlan = countSupplier.planBulk(
             Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
@@ -1732,6 +1910,20 @@ public:
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
+          // A segment ranking never pruned has its exact count already. Track
+          // pruning per segment, restoring the collector's own flag afterward.
+          int64_t hitsBeforeSegment = 0;
+          bool prunedBeforeSegment = false;
+          DocSet* estimateFilter = nullptr;
+          bool estimatorReady = false;
+          if constexpr (!Collapsed) {
+            if (op.estimateCount) {
+              hitsBeforeSegment = scoreCollector->totalHits();
+              prunedBeforeSegment = scoreCollector->countIncomplete;
+              scoreCollector->countIncomplete = false;
+            }
+          }
+
           // Field-sorted ranking is the one thing a match-all still has to
           // iterate for: it orders by column values the domain says nothing
           // about.  A count-only field sort (limit 0) reads nothing back, so it
@@ -1950,6 +2142,9 @@ public:
               sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
                 ? nullptr
                 : filter;
+            estimateFilter = collectorFilter;
+            estimatorReady = op.estimateCount && op.weight != nullptr
+                && !op.weight->needsPrepare() && !requiresWholeIndexPrepare;
             if constexpr (Collapsed) {
               if (!data->useFieldSort) {
                 int64_t sourceCost = supplier->cost();
@@ -2444,6 +2639,22 @@ public:
                         routedBaseDomain);
                   }
                 }
+              }
+            }
+          }
+          if constexpr (!Collapsed) {
+            if (op.estimateCount) {
+              int64_t seen = scoreCollector->totalHits() - hitsBeforeSegment;
+              bool pruned = scoreCollector->countIncomplete;
+              scoreCollector->countIncomplete = pruned || prunedBeforeSegment;
+              if (!pruned) {
+                scoreCollector->estimatedHits += seen;
+              } else if (estimatorReady) {
+                estimateSegmentCount(
+                    poolGuard.pool(), seg, estimateFilter, *scoreCollector, seen);
+              } else {
+                scoreCollector->estimatedHits += seen;
+                scoreCollector->countFloored = true;
               }
             }
           }

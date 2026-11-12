@@ -39,11 +39,13 @@ time.
 
 Explicit vector selectors also activate those concrete overlay names in the
 writer. That activation is process-local unless it produced a durable overlay
-entry. A commit that fails mid-build has no side effects: staged overlay files
-are deleted, no overlay entries are published, and no names are activated -
-the caller sees the error and decides whether to retry. Startup seeds active
-names only from overlays already present in the commit manifest, so Luxir never treats
-intent-only state as a boot-time "must build" queue.
+entry. A commit whose vector build fails deletes its staged files, attaches
+nothing to its captured segments, and activates nothing itself. Attachment and
+activation on success precede data sync and manifest publication; the failure
+rule applies to the build. A selecting commit records its selectors when it
+captures its segments (see [Merging](#merging)). Startup seeds active names
+only from overlays already present in the commit manifest, so Luxir never
+treats intent-only state as a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the
 whole selected commit. If any requested vector build fails, staged overlay
@@ -264,6 +266,27 @@ a prefix sample. This avoids training only on the oldest values when data
 inside a segment is time ordered. The builder normalizes vectors for FAISS
 when the field uses cosine and the stored column is raw.
 
+The sample holds `ivfTrainingPointsPerCentroid` (100) vectors per trained
+centroid: the IVF lists for RaBitQ, and the larger of the lists and the 2^bits
+codebook entries for PQ, whose codebooks train on the same rows. It is capped
+by the segment and by `ivfTrainingSampleMaxBytes` (2.5 GiB); the codec's training
+floor still wins over that ceiling. FAISS asks for at least 39 points per
+centroid and subsamples above 256, so 100 sits between the two. A byte budget
+that ignores nlist starves large segments: 64 MiB at 768 dims is 21,845
+vectors, 10 per list at 5M vectors, which produces uneven lists and lower
+recall at every probe count. K-means work is proportional to sample size times
+nlist, so at `nlist = sqrt(N)` training stays linear in N. The default nlist
+cap of 4096 bounds the sample at 409,600 vectors: 1.2 GiB at 768 dims and
+2.4 GiB at 1536, so the ceiling does not bind either size. Each merge or commit
+build holds one sample copy until training finishes, charged softly to the
+index RAM budget without waiting for capacity. RaBitQ trains only the coarse
+quantizer, avoiding FAISS's unused residual copy and assignment pass. PQ still
+trains on at most 256 residuals per codebook entry; its residual and optional
+subsample copies are also charged during training. A field with a large
+explicit `nlist` or thousands of dimensions reaches the ceiling first and gets
+fewer points per centroid. Larger samples cost build time: at 1M x 768 with an
+explicit `nlist` of 4000, the 1-bit build went from 14.0 to 42.7 s.
+
 Raw-cosine training samples are normalized in place in their owned buffer.
 RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
 Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
@@ -326,13 +349,30 @@ no amplitude section.
 The builder computes these in the encoding row pipeline from the rotated
 original, assigned centroid and actual code. SigmaB is the residual
 reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
-for squared L2. Sigma1 removes FAISS's fixed 1.9 confidence multiplier from
-its error factor. These amplitudes support empirical confidence intervals;
-they are not deterministic error bounds. The reader exposes a mmap view.
-The reader validates finite, non-negative amplitudes once at open and exposes
-per-list spans for sequential, unchecked scan loads. Metadata and footer
+for squared L2. Sigma1 is computed from the sign reconstruction error before
+the fixed 1.9 confidence multiplier. These amplitudes support empirical
+confidence intervals; they are not deterministic error bounds. The reader
+exposes a mmap view, validates finite, non-negative amplitudes once at open and
+exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
 version 3 validate the component count and file size;
 older formats fail on open and must be rebuilt.
+
+`VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
+code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
+zero), sigma1, and upward-rounded `f_error = sigma1 * 1.9` for multi-bit codes.
+FAISS still writes the sign bits, `or_minus_c_l2sqr`, and extra-bit codes and
+factors. This avoids FAISS 1.14.3's small-norm guards: below a squared residual
+of `FLT_EPSILON`, its multiplier scores the residual as if it had unit length,
+and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor becomes zero. Such
+codes arise near centroids (duplicates, singleton lists, normalized-centroid
+rounding) and throughout small-magnitude L2 data. A false-high 1-bit interval
+can raise the witness floor and prune true neighbors at any probe count.
+The corrected factors preserve residual length and direction across scales,
+but the intervals remain empirical: for IP, float cancellation in FAISS's
+1-bit estimator leaves errors around 1e-7 even at zero amplitude, so they are
+not arithmetic-exact. The extra-bit factors have no such defect; in multi-bit
+search a bad 1-bit factor causes false gate rejections (a lost neighbor) or
+wasted extra-bit work, not false witnesses.
 
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
@@ -349,7 +389,24 @@ publishes the merged segment publishes its overlay entries atomically with the
 segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
-explicit build succeeds.
+explicit build succeeds or the segment merges again.
+
+A merge finishing during a selecting commit's build builds the selected
+overlays on its private output without waiting. The `*` selector matches the
+output's own eligible fields. At swap, the merge prepares again only for an
+active name it has not attempted or an in-flight selector it has not matched.
+Failed names are not retried by that merge.
+
+Every vector overlay installed with a merge output makes its name active for
+later merges. Thus a merge may retain a valid overlay even if the selecting
+commit's build fails; that commit still attaches nothing and activates nothing
+itself. This agrees with startup seeding from materialized manifest overlays.
+A merge swapping before the commit captures its segments gets its overlay
+from the commit.
+
+Source segments that the commit captured still get overlays from it even when
+a merge is replacing them, because that commit publishes them. Those builds are
+discarded once the merged output publishes.
 
 ## Query Execution
 
@@ -364,9 +421,31 @@ nested), its `prohibited` (must_not) clauses into the domain it hands its
 children (outer AND filters AND NOT prohibited). The folded domain then
 replaces the boolean's prohibited scorers as its required domain supplier, so
 each exclusion is materialized once, through the same filter cache uses as a
-filter clause. Scoring siblings are not folded: they intersect with the kNN's
-top-k after it ran. FAISS ids are segment-local vector value ranks, so the
-query path maps each returned value rank back through that segment's vector
+filter clause.
+
+Which constraints reach a kNN is decided on the logical query, before Weight
+creation, by one effective-role projection that both normalization and
+membership keys use, so it never depends on score demand or on whether
+required-clause inlining applies. When a boolean has a domain consumer under
+`required` or `optional`, required leaves with an automatic uniform score
+profile (ranges, prefixes, automata, exists, geo, term sets including `any_of`)
+take the filter role, since they add no score. The projection also extracts,
+by reference, the necessary non-scoring constraints of booleans reached through
+chains of `required`/`filter` children (looking through boost, constant-score
+and force-prepare wrappers): their filter, prohibited, and promoted leaves.
+That makes eligibility closed under AND re-association. It never follows an
+optional group (even with min_match) or a prohibited branch, and never extracts
+a domain consumer; extracted exclusions stay prohibited. A nested copy is
+dropped only while its boolean keeps another required clause, so rank-only
+optionals never become requirements, and a retained copy shares the extracted
+one's query-owned filter use, which is request-owned when the shared cache
+rejects admission or is absent. Scoring siblings, including terms and
+constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
+afterwards. Required-clause inlining never moves a domain consumer to a
+different prepare stage.
+
+FAISS ids are segment-local vector value ranks, so the query path maps each
+returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
 IndexReader opens and pins overlay files eagerly when it opens an index
@@ -567,6 +646,10 @@ remaining interval values by `upper >= T`. A value whose upper score is below
 its unit's best known exact score is also skipped. Both stages read in segment
 and value-rank order, with disjoint column reads and a shared exact-score cache.
 Final unit collapse and similarity filtering use exact scores.
+Before similarity filtering, a diagnostic reports an unsupported floor and
+its distinct-unit shortfall when fewer than k exact units reach the final
+witness floor; it changes no selection behavior and does not detect every
+invalid interval.
 
 There is no interval retention cap. `RequestMemResource` charges records,
 canonical unit keys, witness heaps, pending batches and terminal selection

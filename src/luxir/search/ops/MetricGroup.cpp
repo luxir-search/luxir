@@ -33,13 +33,11 @@ SearchOp::Calculator* createMetricGroupCalculator(TopDocsReq& op, SearchOp::Calc
   return new TopDocsReq::Calc<false, true>(op, parent, slot, numSlots, structural);
 }
 
-api::Val ExprStatsOp::InlineCalc::finalizedValue(size_t slot) const {
-  api::Val result;
-  if (!valid(slot)) result.kind = google::protobuf::NullValue::NULL_VALUE;
-  else if (resultType == BucketValueType::DOUBLE)
-    result.kind = std::bit_cast<double>(finalizedValues[slot]);
-  else result.kind = std::bit_cast<int64_t>(finalizedValues[slot]);
-  return result;
+BucketScalar ExprStatsOp::InlineCalc::finalizedValue(size_t slot) {
+  auto nature = thisOp().aggregate.root().nature;
+  if (!valid(slot)) return BucketScalar::missing(resultType, nature);
+  if (resultType == BucketValueType::DOUBLE) return BucketScalar::floating(finalizedDoubles[slot], nature);
+  return BucketScalar::integer(finalizedValues[slot], nature);
 }
 
 namespace {
@@ -50,7 +48,7 @@ std::vector<SortClause> memberClauses(const TopDocsReq& op) {
     if (clause.getKind() != SortClause::COLUMN) continue;
     const auto& field = clause.getSortField();
     auto& type = const_cast<FieldType&>(field.getFieldType());
-    if ((type.type() == FieldType::STRING || type.type() == FieldType::ID) && type.indexed()) {
+    if ((FieldType::storage(type.type()) == FieldType::Storage::TERMS) && type.indexed()) {
       // Exhaustive folds retain all groups. Global ords bound each slot's
       // storage without retaining a copy of every best member's term.
       clause = SortClause(SortField(field.getFieldName(), type, field.getOrder(),
@@ -267,23 +265,20 @@ std::span<MetricGroupData::Rank> MetricGroupData::sort() { impl->finish(); retur
 const CollapseKey& MetricGroupData::key(size_t slot) const { return *impl->selected[slot].key; }
 int64_t MetricGroupData::totalHits() const { return impl->hits; }
 int64_t MetricGroupData::totalGroups() const { return (int64_t)impl->table.size(); }
-void MetricGroupData::renderRanks(std::span<const api::ArrVal> ranks, uint64_t flags,
+void MetricGroupData::renderRanks(std::span<const api::ArrVal> ranks, std::span<const Rank> order, uint64_t flags,
                                  std::pmr::memory_resource& mr) const {
-  if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+  for (const auto& rank : ranks) build::allocArray(const_cast<api::ArrVal&>(rank).v, impl->calcs.size(), mr);
   for (size_t i = 0; i < impl->calcs.size(); i++) {
     auto& metric = (ExprStatsOp&)impl->calcs[i]->getOp();
     metric.withOutput(flags, mr, [&](auto output) {
-      if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
-        for (const auto& rank : ranks) renderDateValue(const_cast<api::Val&>(rank.v[i]), output);
+      for (size_t r = 0; r < ranks.size(); r++) {
+        auto value = static_cast<ExprStatsOp::InlineCalc*>(impl->calcs[i])->finalizedValue(
+            impl->selected[order[r].slot].metricSlot);
+        metric.warnFailure(value, flags);
+        ExprStatsOp::writeOutputValue(const_cast<api::Val&>(ranks[r].v[i]), value, output);
       }
     });
   }
-}
-
-void MetricGroupData::emitRank(api::ArrVal& out, size_t slot, std::pmr::memory_resource& mr) const {
-  auto* values = build::allocArray(out.v, impl->calcs.size(), mr);
-  for (size_t i = 0; i < impl->calcs.size(); i++) values[i] =
-      static_cast<ExprStatsOp::InlineCalc*>(impl->calcs[i])->finalizedValue(impl->selected[slot].metricSlot);
 }
 MetricGroupState::MetricGroupState(TopDocsReq& op, SearchOp::Calculator* parent)
     : merger([&op, parent] { return new MetricGroupData(op, parent); },

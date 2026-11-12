@@ -245,7 +245,7 @@ TEST_F(SimpleQueryTest, envelopeErrors) {
     EXPECT_NE(std::string::npos, req->errorMsg().find(msgPart)) << req->errorMsg();
   };
   expectError({}, "non-empty 'fields'");
-  expectError({"popularity_i"}, "not a queryable");   // numeric column field
+  expectError({"popularity_i"}, "simple_query fields is not supported on int field");   // numeric column field
   expectError({"zzz_no_such"}, "not a queryable");    // unresolvable name
 }
 

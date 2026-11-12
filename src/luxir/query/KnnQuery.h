@@ -161,6 +161,9 @@ public:
     // codesVisited counts physical list entries, including depth rescans.
     std::atomic<int64_t> scanned{0}, extraBitEvaluations{0}, gateRejections{0}, codesVisited{0};
     std::atomic<int64_t> retainedPeak{0}, retainedTerminal{0}, seedReads{0}, remainingReads{0};
+    // One diagnostic per final query-wide interval floor, across all rounds
+    // and segments. Shortfall counts missing distinct exact supporting units.
+    std::atomic<int64_t> unsupportedFloors{0}, unsupportedFloorShortfall{0};
     // Flat search work; excludes metadata counting and terminal rereads.
     std::atomic<int64_t> domainDocsVisited{0}, domainProbes{0}, vectorsScored{0};
     std::atomic<int64_t> slotsBuilt{0}, faissIndexCalls{0};
@@ -1002,7 +1005,7 @@ public:
             input.domainSize = domain ? domain->card() : seg.maxDoc(); input.maxDoc = seg.maxDoc();
             input.dims = dims; input.l2 = metric == (int32_t)api::VectorMetric::L2; input.domain = domain != nullptr;
             input.arrayDomain = domain && domain->type == DocSet::ARRAY;
-            input.unfiltered = eligible.unfiltered; input.deletes = seg.liveDocs() != nullptr;
+            input.unfiltered = eligible.unfiltered; input.deletes = seg.hasDeletes();
             input.sparse = vr.strColReader().docsReader().hasBitset(); input.multi = vr.isMultiValued();
             if (auto* vaux = vauxPerSeg[i]) {
               if (vaux->getDims() != dims) throw std::runtime_error(std::format(
@@ -1118,7 +1121,7 @@ public:
         // is the complete eligibility predicate; null means no deletes and
         // no filters.  The engines rely on it - they never re-check
         // liveDocs.
-        assert(domain != nullptr || seg.liveDocs() == nullptr);
+        assert(domain != nullptr || !seg.hasDeletes());
         VectorAuxReader* vaux = vauxPerSeg[i];
         faiss::IndexIVF* ivf = nullptr;
         if (plan.ivf[i]) {
@@ -1130,11 +1133,13 @@ public:
                 idx->ntotal, segCount, query.getField()));
             ivf = dynamic_cast<faiss::IndexIVF*>(idx);
             if (ivf == nullptr) throw std::runtime_error("KnnQuery: vector aux is not an IVF index");
-            if (seg.liveDocs() != nullptr) {
-              rankLivePerSeg[i] = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
+            if (seg.hasDeletes()) {
+              auto live = seg.liveDocsShared();
+              const auto& bitmap = live->rankLiveBitmap(query.getField(), [&]() {
                 VectorReader vr(seg.postingsReader(), *segInfos.at(i));
                 return buildRankLiveBitmap(seg, vr, segCount);
               });
+              rankLivePerSeg[i] = std::shared_ptr<const RankLiveBitmap>(std::move(live), &bitmap);
               segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
             }
           } else {
@@ -1293,6 +1298,7 @@ public:
       auto executionEffort = planRequest;
       executionEffort.referenceBreadth = defaultIvfNList(liveNTotal);
       double initialFraction = KnnPlanner::initialScanFraction(executionEffort, selectivity);
+      const double initialNprobe = initialFraction * executionEffort.referenceBreadth;
       for (size_t i = 0; i < numSegs; i++) {
         if (activeIvf[i] && !eligibilityPerSeg[i].unfiltered
             && KnnPlanner::foldFirst(planSegments[i], initialFraction, tuning.selector, tuning.plannerCosts)) foldDomainAt(i);
@@ -1631,7 +1637,13 @@ public:
       rescoreAndCollapseCandidates<Groups>(candidateHits, intervals, reader, segInfos, v2dSpan,
           segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
           selectedLimit, docHits, ctx.parallel, workBySeg, query.groups);
+      // If terminal T exceeds the witness floor, k distinct exact seeds
+      // already support it. Per-unit skips also have a better exact member.
+      // Thus valid intervals must leave k exact units at or above the floor.
+      int64_t floorShortfall = intervalEngine ? intervals.unsupportedFloorShortfall(docHits) : 0;
       if (statsForTests) {
+        statsForTests->unsupportedFloors += floorShortfall > 0;
+        statsForTests->unsupportedFloorShortfall += floorShortfall;
         statsForTests->coveredFraction += coveredFraction;
         for (const auto& work : workBySeg) statsForTests->addWork(work);
         statsForTests->switches += (int64_t)completions.size();
@@ -1652,11 +1664,13 @@ public:
         for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i])
           selectors += KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial);
         plan.cost = KnnPlanner::totalCost(modeled, planRequest, tuning.plannerCosts, selectors);
+        auto listsProbed = profile ? baseEngine->listsProbedBySegment() : std::vector<size_t>{};
         if (statsForTests) {
           statsForTests->predictedCost += plan.cost;
           statsForTests->modeledActualCost += tuning.plannerCosts.requestCost;
         }
         bool ivfRequestPending = true;
+        bool floorDiagnosticPending = intervalEngine;
         for (size_t i = 0; i < numSegs; i++) {
           const auto& input = planSegments[i];
           const auto& work = workBySeg[i];
@@ -1664,7 +1678,8 @@ public:
           auto features = KnnPlanner::actualWork(input, work);
           // Attribute the shared request charge to the first executed IVF
           // piece for reporting, including queries that later complete exactly.
-          if (work.ivfRounds > 0 && std::exchange(ivfRequestPending, false)) features[KnnPlanner::IVF_REQUEST] = 1;
+          bool firstIvfPiece = work.ivfRounds > 0 && std::exchange(ivfRequestPending, false);
+          if (firstIvfPiece) features[KnnPlanner::IVF_REQUEST] = 1;
           if (statsForTests) {
             (plan.ivf[i] ? statsForTests->plannedIvf : statsForTests->plannedExact)++;
             statsForTests->modeledActualCost += tuning.plannerCosts.price(features);
@@ -1679,6 +1694,11 @@ public:
             piece.wire.max_doc = reader.segments()[i].maxDoc();
             piece.wire.strategy = plan.ivf[i] ? "ivf" : "exact";
             piece.wire.cardinality = input.eligibleDocs; piece.wire.domain_size = input.domainSize;
+            // Shared query state is reported once, on the first active piece.
+            if (std::exchange(floorDiagnosticPending, false)) {
+              piece.details.push_back(std::format("query_unsupported_floors={}; query_unsupported_floor_shortfall={}",
+                  floorShortfall > 0 ? 1 : 0, floorShortfall));
+            }
             piece.details.push_back(std::format("reason={}; eligible_vectors={}{}; exact_cost={}; ivf_scan_cost_at_predicted_coverage={}; ivf_linear={}; ivf_fixed={}",
                 reasons[i], input.eligibleVectors, input.vectorsEstimated ? " (estimated)" : "",
                 plan.prices[i].exactCost, effort.coverage * plan.prices[i].a + plan.prices[i].b
@@ -1690,6 +1710,11 @@ public:
                 KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k), work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
+            if (firstIvfPiece)
+              piece.details.push_back(std::format("reference_nlist={}; initial_nprobe={:.6g}",
+                  executionEffort.referenceBreadth, initialNprobe));
+            if (work.ivfRounds > 0)
+              piece.details.push_back(std::format("segment_nlist={}; lists_probed={}", input.nlist, listsProbed[i]));
             for (size_t f = 0; f < features.size(); f++)
               piece.details.push_back(std::format("{}={}", KnnPlanner::unitNames[f], features[f]));
             for (const auto& event : completions) if ((size_t)event.segment == i)
@@ -2115,7 +2140,7 @@ public:
                 // f_error is beside the sign factors, already touched by the
                 // 1-bit kernel. It includes FAISS's 1.9 and the L2 factor.
                 float fError;
-                std::memcpy(&fError, code + (ivf.d + 7) / 8 + 2 * sizeof(float), sizeof(fError));
+                std::memcpy(&fError, code + (ivf.d + 7) / 8 + RABITQ_F_ERROR_OFFSET, sizeof(fError));
                 double error = fError * gateScale;
                 double optimistic = keepMax ? (double)distance + error : (double)distance - error;
                 bool reject = keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold;
@@ -2679,6 +2704,13 @@ public:
           workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), parallel(parallel) {}
 
       double coveredFraction() const { return std::min(1.0, allocation.cost); }
+      std::vector<size_t> listsProbedBySegment() const {
+        std::vector<size_t> counts(workBySeg.size());
+        // Watermarks survive completion and count each scanned list once,
+        // independent of bounded DEPTH rescans.
+        for (size_t i = 0; i < scannedListCount.size(); i++) counts[(size_t)slots[i].segOrd] = scannedListCount[i];
+        return counts;
+      }
       bool breadthExhausted() const { return allocation.heapSize <= 0; }
       bool hasCoveredBounded() const {
         for (size_t i = 0; i < slots.size(); i++)
@@ -2972,12 +3004,12 @@ private:
 
   /// Build the RankLiveBitmap (rank-space liveness + exact live vector
   /// count) for one segment's vector field.  Run once per liveDocs
-  /// generation (cached on the VectorAuxReader), and sized by the segment's
+  /// generation (cached on LiveDocs by field), and sized by the segment's
   /// smaller of live/deleted docs rather than its vectors, using the same
   /// forward doc-to-rank fold as query domains. The engines' reverse
   /// (valueRank -> docId) map is never consulted. Dense single-valued
   /// needs no walk at all: valueRank == docId, so the liveDocs words
-  /// themselves are the bitmap (borrowed and pinned via backing) and the
+  /// themselves are the bitmap (borrowed; query handles pin LiveDocs) and the
   /// segment's cached live count is the cardinality.
   static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
                                             VectorReader& vr,
@@ -2994,10 +3026,10 @@ private:
                     "liveDocs words double as the LSB-first byte bitmap");
       assert((int64_t)live.size() == numVectors);
       return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
-              seg.liveDocsShared()};
+              nullptr};
     }
 
-    auto owned = std::make_shared<std::vector<uint8_t>>();
+    auto owned = std::make_unique<std::vector<uint8_t>>();
     VectorSearchWork work;
     int64_t liveVectors = foldDomain(vr, live.docset(), live.size(), *owned, work);
     const uint8_t* data = owned->data();
@@ -3011,11 +3043,10 @@ private:
   /// dense single-valued columns; sparse and multi-valued counts may be high.
   static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
                                       VectorReader& vr) {
-    LiveDocs* live = segment.liveDocs();
-    if (live == nullptr) return vr.numVectors();
+    if (!segment.hasDeletes()) return vr.numVectors();
     if (!vr.isMultiValued()) {
       // Each live doc holds at most one vector.
-      return std::min<int64_t>(vr.numVectors(), live->numLive());
+      return std::min<int64_t>(vr.numVectors(), segment.numLive());
     }
     return vr.numVectors();
   }

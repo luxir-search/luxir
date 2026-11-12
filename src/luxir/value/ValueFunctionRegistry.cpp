@@ -18,6 +18,8 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/geo.h"
 #include "luxir/value/AggregateExpr.h"
+#include "luxir/util/Decimal.h"
+#include "luxir/schema/ValCoerce.h"
 
 namespace luxir {
 namespace {
@@ -127,7 +129,7 @@ ResolvedValue defResolve(std::span<const ResolvedValue> args) {
   ValueType type = valueArray(args[0].type)
       ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
       : (floating ? ValueType::DOUBLE : ValueType::INT64);
-  ValueNature nature = commonDateNature(args);
+  ValueNature nature = args[0].nature == args[1].nature ? args[0].nature : commonDateNature(args);
   return {type, nature};
 }
 
@@ -163,7 +165,7 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   if (valueDate(args[0].nature)) {
     throw std::runtime_error("sum() cannot reduce a DATE array");
   }
-  return {valueScalarType(args[0].type), ValueNature::NUMBER};
+  return {valueScalarType(args[0].type), args[0].nature};
 }
 
 // count() takes any value (an ANY operand): it counts a STRING or ID
@@ -204,7 +206,8 @@ ResolvedValue ifResolve(std::span<const ResolvedValue> args) {
         "both branches must be DATE values or both must be numbers");
   }
   bool floating = valueDouble(args[1].type) || valueDouble(args[2].type);
-  return {floating ? ValueType::DOUBLE : ValueType::INT64, args[1].nature};
+  return {floating ? ValueType::DOUBLE : ValueType::INT64,
+          args[1].nature};
 }
 
 ResolvedValue randomResolve(std::span<const ResolvedValue> args) {
@@ -1685,6 +1688,47 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
 }
 
 constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+
+ValueResult decodeDecimalResult(ValueResult value, const DecimalScale& scale) {
+  if (!value.valid) return ValueResult::missing(ValueType::DOUBLE);
+  return ValueResult::floating(value.type == ValueType::DOUBLE ? scale(value.doubleValue) : scale(value.intValue));
+}
+
+ValueResult evalDecimalPoint(BoundValueProgram& program, const ValueNode& node, int32_t docid, float score) {
+  auto value = program.evalNode(node.children[0], docid, score);
+  if (valueArray(node.type)) {
+    if (!value.valid) return ValueResult::missing(node.type);
+    return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
+                                   docid, score, value.array.size);
+  }
+  return decodeDecimalResult(value, DECIMAL_SCALES[program.program.nodes[node.children[1]].intValue]);
+}
+
+ValueResult evalDecimalElement(BoundValueProgram& program, const ValueNode& node,
+    const ValueArrayRef& array, int64_t index) {
+  auto input = program.evalNode(node.children[0], array.docid, array.score);
+  return decodeDecimalResult(program.evalArrayElement(input.array, index),
+      DECIMAL_SCALES[program.program.nodes[node.children[1]].intValue]);
+}
+
+ValueBounds decimalBounds(const ValueNode& node, std::span<const ValueBounds> args) {
+  const auto& input = args[0];
+  if (!bounded(input)) return ValueBounds::unbounded(node.type, input.mayBeMissing, input.alwaysMissing);
+  auto scale = DECIMAL_SCALES[args[1].intMin];
+  auto out = ValueBounds::floating(scale(boundMinAsDouble(input)), scale(boundMaxAsDouble(input)), input.mayBeMissing);
+  out.type = node.type;
+  out.alwaysMissing = input.alwaysMissing;
+  return out;
+}
+
+BucketScalar evalDecimalBucket(std::span<const BucketScalar> args, ValueType type, ValueNature nature) {
+  unused(type, nature);
+  const auto& input = args[0];
+  if (!input.valid) return BucketScalar::failed(BucketValueType::DOUBLE, ValueNature::NUMBER, input.failure);
+  auto scale = DECIMAL_SCALES[(size_t)args[1].intValue];
+  return BucketScalar::floating(input.type == BucketValueType::DOUBLE ? scale(input.doubleValue) : scale(input.intValue));
+}
+
 constexpr ValueFunction::Operand ANY_VALUE{
     .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
 constexpr ValueFunction::Operand GEO_POINT{
@@ -1696,7 +1740,7 @@ constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, tr
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, {SHARED, LAZY_SHARED}, nullptr},
+     propagateBounds, evalFunctionElement, 2, 2, {SHARED, LAZY_SHARED}, nullptr, nullptr, NaturePolicy::SAME},
     {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::ADD, 2>},
@@ -1729,14 +1773,14 @@ constexpr ValueFunction FUNCTIONS[] = {
      evalBucketOperation<ValueOpcode::FLOOR, 1>},
     {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::MIN, 2>},
+     evalBucketOperation<ValueOpcode::MIN, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::MAX, 2>},
+     evalBucketOperation<ValueOpcode::MAX, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW}, nullptr},
+     propagateBounds, evalFunctionElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
-     sumBounds, evalSumElement, 1, 1, {RAW}, nullptr},
+     sumBounds, evalSumElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
      evalFunctionBatch, countBounds, evalCountElement, 1, 1, {ANY_VALUE}, nullptr},
     {ValueOpcode::EXP, "exp", unaryDouble, evalFunctionPoint, evalFunctionBatch,
@@ -1747,22 +1791,22 @@ constexpr ValueFunction FUNCTIONS[] = {
      evalBucketOperation<ValueOpcode::POW, 2>},
     {ValueOpcode::LT, "lt", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::LT, 2>},
+     evalBucketOperation<ValueOpcode::LT, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::LE, "lte", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::LE, 2>},
+     evalBucketOperation<ValueOpcode::LE, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::GT, "gt", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::GT, 2>},
+     evalBucketOperation<ValueOpcode::GT, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::GE, "gte", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::GE, 2>},
+     evalBucketOperation<ValueOpcode::GE, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::EQ, "eq", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::EQ, 2>},
+     evalBucketOperation<ValueOpcode::EQ, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::NE, "ne", truthResolve, evalFunctionPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
-     evalBucketOperation<ValueOpcode::NE, 2>},
+     evalBucketOperation<ValueOpcode::NE, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::AND, "and", truthResolve, evalLogicalPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, LAZY_RAW},
      evalBucketOperation<ValueOpcode::AND, 2>},
@@ -1773,7 +1817,7 @@ constexpr ValueFunction FUNCTIONS[] = {
      logicalBounds, evalScalarOnlyElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NOT, 1>},
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
-     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket},
+     ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket, nullptr, NaturePolicy::SAME, 1},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
      randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
@@ -1844,6 +1888,63 @@ static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunc
 }
 
 } // namespace
+
+const ValueFunction* ValueFunctionRegistry::decimalDecoder() {
+  static const ValueFunction decoder{ValueOpcode::NONE, "decimal_value", unaryDouble,
+      evalDecimalPoint, evalFunctionBatch, decimalBounds, evalDecimalElement,
+      2, 2, {}, evalDecimalBucket, nullptr, NaturePolicy::RAW};
+  return &decoder;
+}
+
+std::optional<ValueFunctionRegistry::DecimalComparison> ValueFunctionRegistry::decimalComparison(
+    const ValueFunction* function, int scale, const api::Val& literal, bool reverse) {
+  auto op = function->opcode;
+  using Op = ValueOpcode;
+  if (op != Op::LT && op != Op::LE && op != Op::GT && op != Op::GE && op != Op::EQ && op != Op::NE) return std::nullopt;
+  if (reverse) {
+    if (op == Op::LT) op = Op::GT;
+    else if (op == Op::LE) op = Op::GE;
+    else if (op == Op::GT) op = Op::LT;
+    else if (op == Op::GE) op = Op::LE;
+  }
+  using Rounding = coerce::DecimalRounding;
+  auto rounding = op == Op::GT || op == Op::LE ? Rounding::FLOOR
+      : op == Op::LT || op == Op::GE ? Rounding::CEIL : Rounding::EXACT;
+  coerce::DecimalError error;
+  auto bound = coerce::parseScaledDecimal(literal, scale, rounding, error);
+  if (!bound) return std::nullopt;
+  if (op == Op::GT) {
+    if (*bound == INT64_MAX) return std::nullopt;
+    ++*bound;
+  } else if (op == Op::LT) {
+    if (*bound == INT64_MIN) return std::nullopt;
+    --*bound;
+  }
+  if (op == Op::GT || op == Op::GE) return DecimalComparison{find("gte"), *bound};
+  if (op == Op::LT || op == Op::LE) return DecimalComparison{find("lte"), *bound};
+  return DecimalComparison{function, *bound};
+}
+
+uint32_t ValueProgram::numericNode(uint32_t index) {
+  ValueNode node = nodes[index];
+  if (valueDecimal(node.nature)) {
+    ValueNode scale;
+    scale.intValue = valueDecimalScale(node.nature);
+    addNode(scale);
+    auto scaleIndex = rootNode;
+    node.kind = ValueNodeKind::FUNCTION;
+    node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
+    node.function = ValueFunctionRegistry::decimalDecoder();
+    node.opcode = ValueOpcode::NONE;
+    node.children = {index, scaleIndex};
+    node.childCount = 2;
+    node.text = node.function->name;
+  }
+  node.nature = ValueNature::NUMBER;
+  addNode(node);
+  constantScalar.reset();
+  return rootNode;
+}
 
 BucketScalar ValueFunction::bucket(
     std::span<const BucketScalar> args, ValueType type, ValueNature nature) const {
@@ -2008,7 +2109,7 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
-    : program(program), segment(segment), postings(segment.postingsReader()),
+    : program(program), segment(segment),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
@@ -2018,7 +2119,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
     } else if (node.kind == ValueNodeKind::DOCID) {
-      int32_t maxDoc = postings.maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
                                 : ValueBounds::integer(segment.base,
                                                        segment.base + maxDoc - 1);
@@ -2027,14 +2128,14 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {
-        bound.stringColumn = pool.make<BoundStringColumn>(postings, *fieldInfo);
+        bound.stringColumn = pool.make<BoundStringColumn>(segment.postingsReader(), *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
-            fieldInfo->docsWithField < postings.maxDoc());
+            fieldInfo->docsWithField < segment.maxDoc());
       } else {
-        bound.column.emplace(postings, *fieldInfo);
+        bound.column.emplace(segment.postingsReader(), *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
-        bool missing = bound.column->docsWithValue() < postings.maxDoc();
+        bool missing = bound.column->docsWithValue() < segment.maxDoc();
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);

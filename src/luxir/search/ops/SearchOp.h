@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/search/HitDecorator.h"
 
 #include <algorithm>
 #include <chrono>
@@ -146,6 +147,7 @@ class SearchOp {
   std::vector<uint32_t> segmentStateRetentions;
 
 public:
+  std::vector<std::shared_ptr<HitDecorator>> decorators;
   SearchRequest& req;
   std::string_view name;
   uint64_t flags = 0; // effective packed options, set by the parser
@@ -166,6 +168,20 @@ public:
     for (auto& [name, subOp] : subOps) {
       subOp->init();
     }
+  }
+
+  // True when the op finds its own matches rather than consuming its parent's
+  // domain whole, as a list or a fusion does.
+  virtual bool ownsMatchDomain() const { return false; }
+
+  // Upper bound on the documents this op and its children visit, from index
+  // metadata alone (see SearchConfig::auto_parallel_min_work).
+  virtual size_t workEstimate() {
+    size_t total = 0;
+    for (auto& [name, subOp] : subOps) {
+      total = saturatingAdd(total, subOp->workEstimate());
+    }
+    return total;
   }
 
   // Bucket blocks execute synchronously. Segment tasks otherwise own distinct

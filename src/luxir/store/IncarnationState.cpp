@@ -49,16 +49,19 @@ std::optional<IncarnationState> IncarnationState::read(Directory& dir) {
 }
 
 IncarnationState IncarnationState::claim(Directory& dir) {
-  auto owner = newUuid();
   for (;;) {
     auto before = read(dir);
     if (!before) throw WriterSupersededError();
-    auto next = before->value;
-    increment(next.rev);
-    increment(next.epoch);
-    next.owner = owner;
-    if (auto applied = write(dir, next, Directory::PublishCondition::match(before->version))) return *applied;
+    if (auto applied = claim(dir, *before)) return *applied;
   }
+}
+
+std::optional<IncarnationState> IncarnationState::claim(Directory& dir, const IncarnationState& before) {
+  auto next = before.value;
+  increment(next.rev);
+  increment(next.epoch);
+  next.owner = newUuid();
+  return write(dir, next, Directory::PublishCondition::match(before.version));
 }
 
 void IncarnationState::advance(Directory& dir, std::string_view tip) {

@@ -25,6 +25,8 @@ struct IncarnationState {
 
   static std::optional<IncarnationState> read(Directory& dir);
   static IncarnationState claim(Directory& dir);
+  // One attempt against a version read before confirming catalog assignment.
+  static std::optional<IncarnationState> claim(Directory& dir, const IncarnationState& before);
   // After catalog reservation; an existing STATE is left intact.
   static void create(Directory& dir);
   // Follower ownership is local; source epochs occur only in the tip's name.

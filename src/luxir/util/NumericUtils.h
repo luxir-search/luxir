@@ -3,10 +3,28 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
+#include <cassert>
 #include <cstdint>
+#include <string_view>
 
 namespace luxir {
+
+// Fixed-width terms ordered like the encoded int64 column values.
+inline std::array<char, 8> encodeNumericTerm(int64_t value) {
+  uint64_t bits = (uint64_t)value ^ (1ULL << 63);
+  std::array<char, 8> term;
+  for (int i = 0; i < 8; i++) term[(size_t)i] = (char)(bits >> ((7 - i) * 8));
+  return term;
+}
+
+inline int64_t decodeNumericTerm(std::string_view term) {
+  assert(term.size() == 8);
+  uint64_t bits = 0;
+  for (unsigned char byte : term) bits = (bits << 8) | byte;
+  return (int64_t)(bits ^ (1ULL << 63));
+}
 
 // Sortable encodings for IEEE-754 values, following Lucene's NumericUtils:
 // the float/double is bit-cast to a same-width signed integer, then the

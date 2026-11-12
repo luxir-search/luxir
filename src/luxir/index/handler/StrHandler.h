@@ -23,7 +23,7 @@ namespace luxir::handler {
 template <bool Array = false>
 class StrHandler final : public Inverter::IndexHandler {
   friend Inverter;
-  StringValue stringValue;
+  StringValue<true> stringValue;
 
   // TODO: for unique fields like "id", this could be TermValHash<int32_t>
   LUXIR_UNALIGNED_START
@@ -52,51 +52,36 @@ public:
   ~StrHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    // expected kinds first, coercions last
     if (auto s = std::get_if<std::string_view>(&val.kind)) {
-      indexSingle(inverter, *s);
-      return;
-    }
-    if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) {
-      indexSingle(inverter, std::string_view((const char*)b->data(), b->size()));
-      return;
-    }
-    if (auto a = std::get_if<luxir::api::ArrStr>(&val.kind)) {
-      index(inverter, std::span<const std::string_view>(a->v.data(), a->v.size()));
+      index(inverter, *s);
       return;
     }
     if (coerce::isNull(val)) return;
-    // Numeric arms (and arrays of them) index their canonical rendering.
-    // buf is reused per element: indexSingle copies the term into the hash
-    // before the next render.
-    char buf[coerce::TEXT_BUF_SIZE];
     if (coerce::isArray(val)) {
-      checkMultiValued(inverter, [&] {
-        size_t n = 0;
-        coerce::forEachElement(val, [&](const IndexVal&) { n++; });
-        return n;
-      }());
-      coerce::forEachElement(val, [&](const IndexVal& elem) {
-        indexSingle(inverter, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
-      });
-    } else {
-      indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
-    }
+      auto account = scope_guard([&] { accountExtraRam(inverter, termsHash.memSize() + stringValue.retainedBytes()); });
+      auto values = stringValue.prepareMany(val, std::string_view(fieldName));
+      checkMultiValued(inverter, values.size());
+      for (auto term : values) appendPrepared(inverter, term);
+    } else indexSingle(inverter, val);
   }
 
   void index(Inverter& inverter, std::string_view val) override {
     indexSingle(inverter, val);
   }
 
-  void indexSingle(Inverter& inverter, std::string_view term) {
-    term = stringValue.normalize(term);
-    PackedTerm::TermBuffer scratch;
-    auto fitted = PackedTerm::fitTerm(fieldType->longTerms, term, scratch);
-    if (!fitted) {
-      throw DocumentError(fmt::format("Field '{}': string value is {} bytes after normalization; maximum is {}",
-                                      std::string_view(fieldName), term.size(), PackedTerm::MAX_LEN));
+private:
+  template <typename T>
+  void indexSingle(Inverter& inverter, const T& val) {
+    if (!stringValue.hasNormalizer()) {
+      appendPrepared(inverter, stringValue.prepare(val, std::string_view(fieldName)));
+      accountExtraRam(inverter, termsHash.memSize() + stringValue.retainedBytes());
+      return;
     }
-    term = *fitted;
+    auto account = scope_guard([&] { accountExtraRam(inverter, termsHash.memSize() + stringValue.retainedBytes()); });
+    appendPrepared(inverter, stringValue.prepare(val, std::string_view(fieldName)));
+  }
+
+  void appendPrepared(Inverter& inverter, std::string_view term) {
     // Assign this doc a field-rank the first time it contributes any value, recording
     // rank->docid in docsWithField.  All of a doc's terms then share that rank.
     int32_t doc = inverter.getDoc();
@@ -121,15 +106,14 @@ public:
     if (entry->val().getLastDoc() != rank) {
       entry->val().addDoc(termsHash.getMemPool(), rank);
     }
-    // values live in inverter.pool; only the heap table is outside-pool.
-    accountExtraRam(inverter, termsHash.memSize());
   }
 
+public:
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
+    auto account = scope_guard([&] { accountExtraRam(inverter, termsHash.memSize() + stringValue.retainedBytes()); });
     checkMultiValued(inverter, vals.size());
-    for (auto val : vals) {
-      indexSingle(inverter, val);
-    }
+    auto prepared = stringValue.prepareMany(vals, std::string_view(fieldName));
+    for (auto term : prepared) appendPrepared(inverter, term);
   }
 
 private:

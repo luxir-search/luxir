@@ -805,8 +805,7 @@ TEST_F(BooleanFuzzTest, negatedDenseCountHandlesWindowsSegmentsDeletesAndDomain)
     ASSERT_NE(bulk, nullptr);
     DocSetBuilder builder(segment.maxDoc());
     int64_t count = 0;
-    DocSet* liveDocs = segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset();
+    DocSet* liveDocs = segment.liveDocSet();
     for (int32_t cursor = 0;
          cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
       int32_t next = bulk->countNextWindow(

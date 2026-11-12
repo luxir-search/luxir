@@ -149,14 +149,14 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena)
+                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  writerState = IncarnationState::claim(dir);
+  writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
   writerEpoch = writerState.value.epoch;
   auto manifest = Manifest::load(dir, &writerState);
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
@@ -821,9 +821,15 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
   return false;
 }
 
-// Caller holds indexMutex. Largest-relief-first avoids flushing retained RAM; the
-// budget-side claim prevents broadcasts to multiple writers from over-shedding
-// once the global pressure target is met.
+// Caller holds indexMutex. Largest-relief-first sheds inverters whose flush frees
+// RAM at once before any whose RAM is mostly delete bytes, which outlive the
+// flush as a packet. Pressure implies a finite budget, which runs delete passes,
+// so that packet is retired once the frontier passes it. When no inverter offers
+// immediate relief, the oldest at the floor is shed for that deferred relief: it
+// pins the frontier, so a younger one's packet would wait for it anyway. Without
+// this an id-heavy inverter grows to its own cap. The budget-side claim prevents
+// broadcasts to multiple writers from over-shedding once the global pressure
+// target is met.
 //
 // Pressure that only merge demand creates sheds an inverter only once it holds
 // a fair share of half the pool (budget / (2 * this writer's active
@@ -838,17 +844,27 @@ void IndexWriter::pressureShedIdleLocked() {
   }
   for (;;) {
     Inverter* victim = nullptr;
-    size_t largestRelief = 0;
+    Inverter* deferred = nullptr;
+    size_t largestRelief = 0, deferredSize = 0;
     for (auto& entry : idleInverters) {
-      size_t retained = entry.first->retainedDeleteBytes();
-      assert(entry.first->memSize() >= retained);
-      size_t relief = entry.first->memSize() - retained;
-      if (relief == 0 || relief < floor) continue;
-      if (relief > largestRelief) {
-        victim = entry.first;
-        largestRelief = relief;
+      Inverter* inverter = entry.first;
+      size_t size = inverter->memSize();
+      size_t retained = inverter->retainedDeleteBytes();
+      assert(size >= retained);
+      size_t relief = size - retained;
+      if (relief != 0 && relief >= floor) {
+        if (relief > largestRelief) {
+          victim = inverter;
+          largestRelief = relief;
+        }
+      } else if (retained != 0 && size >= floor
+                 && (!deferred || inverter->minDocVersion < deferred->minDocVersion
+                     || (inverter->minDocVersion == deferred->minDocVersion && size > deferredSize))) {
+        deferred = inverter;
+        deferredSize = size;
       }
     }
+    if (victim == nullptr) victim = deferred;
     if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
     INDEX_DEBUG("indexing RAM pressure, flushing idle inverter={}", *victim);
   }
@@ -1131,74 +1147,86 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
-    // Register with one hold for every merge already submitted but not tailed.
-    // A later merge submission adds its own hold before entering the graph.
-    if (msg.waitForMerges) {
-      waitingForMerges.push_back(&msg);
-      commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
-    }
-
-    // first look at any flushing inverters that are not marked for a commit yet
-    // and mark them if necessary.
-    for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+    // Everything below hands pointers into msg to inverters and to the merge
+    // waiter list.  The caller completes msg when this throws, which frees
+    // commitInfo, so a failure must take those pointers back first: an
+    // inverter already flushing then finishes as a plain flush, and the
+    // waiter list no longer names a freed message.
+    try {
+      // Register with one hold for every merge already submitted but not tailed.
+      // A later merge submission adds its own hold before entering the graph.
+      if (msg.waitForMerges) {
+        waitingForMerges.push_back(&msg);
+        commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
       }
-    }
 
-    // now look at all idle inverters and initiate a flush if necessary.
-    for (auto it = idleInverters.begin(); it != idleInverters.end();) {
-      auto current = it++;
-      if (current->second->minVersion <= msg.updateVersion) {
-        if (current->second->commitInfo == nullptr) {
-          INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      *current->second.get());
-          current->second->commitInfo = &commitInfo;
+      // first look at any flushing inverters that are not marked for a commit yet
+      // and mark them if necessary.
+      for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
-        else {
-          // this would be a bug since we should never have an idle inverter that is part of a commit.
-          LOG_ERROR("Idle inverter is part of another commit.");
-        }
+      }
 
-        if (!startIdleFlushLocked(*current->second, false)) {
-          throw std::runtime_error("Segment flush node rejected a commit inverter");
+      // now look at all idle inverters and initiate a flush if necessary.
+      for (auto it = idleInverters.begin(); it != idleInverters.end();) {
+        auto current = it++;
+        if (current->second->minVersion <= msg.updateVersion) {
+          if (current->second->commitInfo == nullptr) {
+            INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
+                        *current->second.get());
+            current->second->commitInfo = &commitInfo;
+            commitInfo.leftToFlush++;
+          }
+          else {
+            // this would be a bug since we should never have an idle inverter that is part of a commit.
+            LOG_ERROR("Idle inverter is part of another commit.");
+          }
+
+          if (!startIdleFlushLocked(*current->second, false)) {
+            throw std::runtime_error("Segment flush node rejected a commit inverter");
+          }
         }
       }
-    }
 
-    // Any inverters that are busy should be marked so that when they are released they can be flushed.
-    for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+      // Any inverters that are busy should be marked so that when they are released they can be flushed.
+      for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
+        }
       }
-    }
 
-    INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
-    // updateFinishNode is serial and segment-flush completion needs indexMutex,
-    // so this is the commit's single admission point.  No ordinal is consumed
-    // until all state above is installed.  An immediate commit increments the
-    // counter only after the sequencer accepts it.
-    msg.commitNum = commitNumber;
-    if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
-    // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
-    // we need to kick it off here.
-    if (commitInfo.leftToFlush == 0) {
-      try {
+      // updateFinishNode is serial and segment-flush completion needs indexMutex,
+      // so this is the commit's single admission point.  No ordinal is consumed
+      // until all state above is installed.  An immediate commit increments the
+      // counter only after the sequencer accepts it.
+      msg.commitNum = commitNumber;
+      if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
+      // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
+      // we need to kick it off here.
+      if (commitInfo.leftToFlush == 0) {
         _releaseToCommitSequencer(&msg);
-      } catch (...) {
-        if (msg.waitForMerges) {
-          std::erase(waitingForMerges, &msg);
-        }
-        throw;
       }
+    } catch (...) {
+      auto disown = [&](auto& inverters) {
+        for (auto& entry : inverters) {
+          if (entry.second->commitInfo == &commitInfo) entry.second->commitInfo = nullptr;
+        }
+      };
+      disown(flushingInverters);
+      disown(idleInverters);
+      disown(busyInverters);
+      std::erase(waitingForMerges, &msg);
+      msg.commitInfo.reset();
+      throw;
     }
     commitNumber++;
     // Flushes this commit started complete under indexMutex, so none can
@@ -1485,9 +1513,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       if (segInfo) deletes->sourceSegId = segInfo->segId;
       // An adopting commit retires the packet unless it holds a newer request,
       // and must not race a pass for it. No commit adopts the inverter once it
-      // leaves flushingInverters below. If initiateCommit throws after adopting
-      // inverters, nothing completes that commit, so their packets keep the
-      // claim until a later commit completes: a delay only.
+      // leaves flushingInverters below, and a commit that fails to start
+      // disowns its inverters before it completes.
       if (auto* commit = inverter.commitInfo) {
         uint64_t version = commit->updateMessage->updateVersion;
         if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
@@ -1631,6 +1658,19 @@ uint64_t IndexWriter::retirePendingLocked(const DeleteApplication& app) {
   return bytes;
 }
 
+static std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> seen;
+  for (const auto& selector : buildAuxIndexes) {
+    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (seen.emplace(selector).second) {
+        selectors.push_back(selector);
+      }
+    }
+  }
+  return selectors;
+}
+
 // This applies deletes and writes out the new segments file.
 // called from the commitFinishNode which has concurrency==1 (single-threaded)
 bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
@@ -1651,8 +1691,18 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // diffs source liveDocs before swapping; applications finishing after that
   // swap forward their packets to its output for the next application.
   DeleteApplication app(*this);
+  // Serial node: at most one commit holds this intent, and it ends on every path.
+  auto vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
+  auto endVectorIntent = scope_guard([this, active = !vectorSelectors.empty()] {
+    if (!active) return;
+    const std::lock_guard lock(indexMutex);
+    inFlightVectorSelectors.clear();
+  });
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    if (!vectorSelectors.empty()) {
+      inFlightVectorSelectors = std::move(vectorSelectors);
+    }
     // A commit applies every pending batch and carried packet. publishOnly
     // commits retire nothing; their batches stay pending.
     for (const auto& batch : pendingDeletes.deletes) app.select(batch, true);
@@ -1979,19 +2029,6 @@ std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
 
 namespace {
 
-std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
-  std::vector<std::string> selectors;
-  boost::unordered_flat_set<std::string> seen;
-  for (const auto& selector : buildAuxIndexes) {
-    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
-      if (seen.emplace(selector).second) {
-        selectors.push_back(selector);
-      }
-    }
-  }
-  return selectors;
-}
-
 bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
   if (!overlayName.starts_with(VectorIndexBuilder::NAME_PREFIX)) return false;
   overlayName.remove_prefix(VectorIndexBuilder::NAME_PREFIX.size());
@@ -2090,17 +2127,68 @@ void IndexWriter::activateVectorOverlayNames(std::span<const std::string> names)
   }
 }
 
-std::vector<std::string> IndexWriter::snapshotActiveVectorOverlayNames() {
-  std::vector<std::string> names;
+// Matching and building use the same schema snapshot. The output is private,
+// so attachment needs no writer lock and becomes visible with the swap.
+void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
+                                             boost::unordered_flat_set<std::string>& attempted,
+                                             boost::unordered_flat_set<std::string>& matchedSelectors,
+                                             const char*& phase) {
+  Signal::emit("mergeVectorOverlayPrepare", &output);
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> wanted;
   {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    names.reserve(activeVectorOverlayNames.size());
+    std::lock_guard lock(indexMutex);
+    for (const auto& selector : inFlightVectorSelectors) {
+      if (!matchedSelectors.contains(selector)) selectors.push_back(selector);
+    }
     for (const auto& name : activeVectorOverlayNames) {
-      names.push_back(name);
+      if (!attempted.contains(name)) wanted.emplace(name);
     }
   }
+  if (wanted.empty() && selectors.empty()) return;
+  phase = "schema_snapshot";
+  auto schema = getSchema();
+  phase = "merged_postings_reader";
+  Signal::emit("mergedPostingsReader", &output);
+  auto pr = getSegmentPostingsReader(output);
+  if (!selectors.empty()) {
+    VectorIndexBuilder::SegInput input{output.segId, pr.get(), output.creatorEpoch};
+    VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                               *schema, 0, writerEpoch);
+    for (const auto& name : matcher.matchingOverlayNames(selectors)) {
+      if (!attempted.contains(name)) wanted.emplace(name);
+    }
+    matchedSelectors.insert(selectors.begin(), selectors.end());
+  }
+  if (wanted.empty()) return;
+  std::vector<std::string> names(wanted.begin(), wanted.end());
   std::sort(names.begin(), names.end());
-  return names;
+  // A failed name is not retried by this merge: the output falls back to flat.
+  attempted.insert(names.begin(), names.end());
+  std::vector<std::string> stagedOverlayFiles;
+  std::vector<AuxInfo> built;
+  try {
+    phase = "merge_vector_overlay";
+    built = buildConcreteVectorOverlays(output, *pr, names, *schema,
+                                        VectorIndexBuilder::BuildSite::MERGE,
+                                        stagedOverlayFiles);
+    output.unsyncedFiles.reserve(output.unsyncedFiles.size() + stagedOverlayFiles.size());
+    output.auxOverlays.reserve(output.auxOverlays.size() + built.size());
+  } catch (const std::exception& e) {
+    deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+    LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
+              output.name(), e.what());
+    return;
+  } catch (...) {
+    deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+    LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
+              output.name());
+    return;
+  }
+  // Reserved above, so attaching by move cannot throw: the output never holds
+  // names of deleted files or part of a build.
+  for (auto& file : stagedOverlayFiles) output.unsyncedFiles.push_back(std::move(file));
+  for (auto& info : built) output.auxOverlays.push_back(std::move(info));
 }
 
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
@@ -2133,7 +2221,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
 
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          schema, overlayGen, writerEpoch);
+                          schema, overlayGen, writerEpoch, indexRamBudget);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
@@ -2409,7 +2497,10 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     snapshots.publish(snapshot);
   } catch (...) {
     if (durable || stateAttempted) {
-      try { throw; } catch (const WriterSupersededError&) { failure = std::move(superseded); } catch (...) {}
+      try { throw; } catch (const WriterSupersededError&) {
+        failure = std::move(superseded);
+        try { if (onSuperseded) onSuperseded(); } catch (...) {}
+      } catch (...) {}
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
       snapshots.fail();
@@ -2634,7 +2725,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         while (fields.readNextField()) {
           SegFieldInfo info;
           fields.readFieldInfo(info);
-          if (info.type != FieldType::STRING ||
+          if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
               (info.flags & FieldType::INDEX_DOCS) == 0 ||
               (info.flags & FieldType::MULTI_VALUED) == 0) {
             continue;
@@ -2781,55 +2872,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
-      phase = "active_overlay_snapshot";
-      auto activeOverlayNames = snapshotActiveVectorOverlayNames();
-      if (!activeOverlayNames.empty()) {
-        phase = "schema_snapshot";
-        auto schema = getSchema();
-        // The merged segment is private until the swap below.  Building here
-        // avoids reading live source overlays and publishes segment plus
-        // overlay entries atomically at the later commit.
-        phase = "merged_postings_reader";
-        // Test hook: a listener may throw to exercise containment of a
-        // post-merge, pre-swap failure.
-        Signal::emit("mergedPostingsReader", newSegInfo.get());
-        auto pr = getSegmentPostingsReader(*newSegInfo);
-        #ifndef NDEBUG
-        {
-          std::lock_guard<std::mutex> lock(indexMutex);
-          assert(!segInfos.contains(newSegInfo->segId));
-        }
-        #endif
-        std::vector<std::string> stagedOverlayFiles;
-        try {
-          phase = "merge_vector_overlay";
-          auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
-                                                   *schema, VectorIndexBuilder::BuildSite::MERGE,
-                                                   stagedOverlayFiles);
-          for (auto& file : stagedOverlayFiles) {
-            newSegInfo->unsyncedFiles.push_back(file);
-          }
-          for (auto& info : built) {
-            newSegInfo->auxOverlays.push_back(std::move(info));
-          }
-        } catch (const std::exception& e) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
-                    newSegInfo->name(), e.what());
-        } catch (...) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
-                    newSegInfo->name());
-        }
-        phase = "after_merge_vector_overlay";
-      }
-
       std::vector<uint64_t> coveredGens;
       coveredGens.reserve(segs.size());
       for (auto* seg : segs) coveredGens.push_back(seg->mergedLiveGen);
       auto diffGuard = indexRamBudget->forceAcquire(0);
       std::unique_ptr<screaming::RAMFixedBitSet> outputLiveBits;
+      boost::unordered_flat_set<std::string> attemptedOverlays, matchedSelectors;
       for (;;) {
+        prepareMergedVectorOverlays(*newSegInfo, attemptedOverlays, matchedSelectors, phase);
         std::vector<uint64_t> currentGens;
         currentGens.reserve(segs.size());
         {
@@ -2891,11 +2941,25 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (size_t i = 0; i < segs.size(); i++) {
           if (segs[i]->liveGen != coveredGens[i]) retry = true;
         }
+        // Atomic with the swap: an output swapped from here on is covered, and
+        // one swapped before a commit's capture is in that commit's segments.
+        for (const auto& name : activeVectorOverlayNames) {
+          if (!attemptedOverlays.contains(name)) retry = true;
+        }
+        for (const auto& selector : inFlightVectorSelectors) {
+          if (!matchedSelectors.contains(selector)) retry = true;
+        }
         if (retry) continue;
         segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
         if (newSegInfo->liveDocs > 0) {
           segInfos.reserve(segInfos.size() + 1);
           mergePolicy->_prepareUpdate(newSegInfo.get());
+          // An overlay installed with the output keeps its name active for
+          // later merges, as startup seeding from the manifest would. Done
+          // here because it can allocate and the swap below must not throw.
+          for (const auto& overlay : newSegInfo->auxOverlays) {
+            if (overlay.kind == VectorIndexBuilder::KIND) activeVectorOverlayNames.emplace(overlay.name);
+          }
         }
 
         size_t personalDeleteCount = newSegInfo->personalDeletes.size();

@@ -45,6 +45,7 @@ struct ResolvedField {
   IndexMode index = IndexMode::NONE;
   std::optional<LongTerms> longTerms;
   std::optional<ApiDateUnit> dateUnit;
+  std::optional<int32_t> scale;
   bool hasColumn = false;
   bool column = false;
   // The effective analyzer, backed by source entries or AnalyzerDefinitions;
@@ -213,6 +214,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                       " (field: " + std::string(name) + "); valid: hash128, truncate, reject");
   }
 
+  r.scale = def.scale ? def.scale : parentResolved.scale;
   r.dateUnit = def.unit ? def.unit : parentResolved.dateUnit;
   if (r.dateUnit && *r.dateUnit != ApiDateUnit::MS && *r.dateUnit != ApiDateUnit::NS) {
     throw SchemaError("unknown unit value " + std::to_string((int)*r.dateUnit) +
@@ -436,6 +438,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
+  if (def.scale && r.type != FieldClass::DECIMAL) {
+    throw SchemaError("scale is only valid for decimal fields (field: " + name + ")");
+  }
   if (def.unit && r.type != FieldClass::DATE) {
     throw SchemaError("unit is only valid for date fields (field: " + name + ")");
   }
@@ -492,7 +497,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
   }
 }
 
-// Pass 3 compiles each effective analysis definition once and creates physical
+// Pass 3 caches compiled analysis by authored definition and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
 static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declared,
     FieldClass type, bool isPrimary, std::string_view name) {
@@ -534,7 +539,7 @@ struct FieldCompiler {
       // defaults by type
       switch (r.type) {
         case FieldClass::ID:     index = IndexMode::MATCH; break;
-        case FieldClass::STRING: index = IndexMode::MATCH; break;
+        case FieldClass::STRING: case FieldClass::IP: index = IndexMode::MATCH; break;
         case FieldClass::TEXT:   index = IndexMode::MATCH; break;
         case FieldClass::INT:    index = IndexMode::NONE; break;
         default: index = IndexMode::NONE; break;
@@ -570,7 +575,8 @@ struct FieldCompiler {
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
-                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
+                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
+                        r.type == FieldClass::BOOLEAN || r.type == FieldClass::DECIMAL;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -583,11 +589,10 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
+      if (numericClass && !column) {
+        throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (r.type == FieldClass::VECTOR) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
@@ -598,6 +603,10 @@ struct FieldCompiler {
       stored = (r.type == FieldClass::TEXT);
     }
 
+    if (r.type == FieldClass::IP) {
+      if (index != IndexMode::MATCH) throw SchemaError("ip requires index=match (field: " + std::string(name) + ")");
+      if (stored && !derived) throw SchemaError("stored=true is not supported for ip fields (field: " + std::string(name) + ")");
+    }
     if (geoClass && stored) {
       throw SchemaError("stored=true is not supported for geo_point fields (field: " +
                         std::string(name) + ")");
@@ -661,6 +670,18 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        break;
+      case FieldClass::IP:
+        ft = std::make_shared<IpFieldType>(name, flags);
+        break;
+      case FieldClass::DECIMAL:
+        if (!r.scale || *r.scale < 0 || *r.scale > DecimalFieldType::MAX_SCALE) {
+          throw SchemaError("decimal requires scale 0..18 (field: " + std::string(name) + ")");
+        }
+        ft = std::make_shared<DecimalFieldType>(name, *r.scale, flags);
+        break;
+      case FieldClass::BOOLEAN:
+        ft = std::make_shared<BoolFieldType>(name, flags);
         break;
       case FieldClass::FLOAT:
         ft = std::make_shared<FloatFieldType>(name, flags);
@@ -1174,8 +1195,9 @@ std::vector<std::string> Schema::searchableFields(
   for (const auto& [name, type] : fieldTypeMap) addRoot(name);
   for (auto name : physicalNames) addRoot(name);
   auto termTarget = [](FieldType& type) {
-    return type.indexed() && (type.type() == FieldType::TEXT
-        || type.type() == FieldType::STRING || type.type() == FieldType::ID);
+    auto storage = FieldType::storage(type.type());
+    return type.indexed() && type.supports(FieldType::MATCH)
+        && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT);
   };
   std::vector<std::string> names;
   for (auto root : roots) {
@@ -1247,14 +1269,24 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   }
   add(templates, "_i", FieldClass::INT);
   add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_ip", FieldClass::IP);
+  add(templates, "_ips", FieldClass::IP).multi = api::FieldDef::MultiMode::DEFAULT;
+  // Booleans build the points index: their bitset leaves make the fastest
+  // matches and filters of any index mode.
+  add(templates, "_b", FieldClass::BOOLEAN).index = IndexMode::RANGE;
+  {
+    auto& f = add(templates, "_bs", FieldClass::BOOLEAN);
+    f.index = IndexMode::RANGE;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
+  }
   add(templates, "_f", FieldClass::FLOAT);
   add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
-  // Geo points: unlike the numeric suffixes these build the points index,
-  // since geo queries are their only use.
+  // Geo points also build the points index, since geo queries are their
+  // only use.
   add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
   {
     auto& f = add(templates, "_ps", FieldClass::GEO_POINT);

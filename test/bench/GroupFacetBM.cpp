@@ -208,7 +208,7 @@ static void BM_GroupIdentityRead(benchmark::State& state, bool narrow, int32_t w
   auto helper = groupFacetCorpus(true);
   auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   CollapsePlan key(*reader, api::Collapse_::MissingPolicy::EXPAND, false);
-  key.fields.push_back({"product_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("product_s"),
+  key.fields.push_back({"product_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("product_s"),
                         reader->field("product_s")});
   std::vector<std::unique_ptr<DocSet>> domains(reader->segments().size());
   auto tags = reader->field("tag_ss");

@@ -2,19 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Promotion.h"
+#include "Collection.h"
 #include "ReplicationState.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/store/FileVerifier.h"
 #include "luxir/store/CorruptionMarker.h"
 
 namespace luxir {
 
-std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest, bool verify) {
+std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest,
+                          bool verify, IncarnationState* claimed) {
+  auto source = storage.owned(from);
+  if (source.name != name || source.state != "active") throw CollectionUnavailableError("snapshot source is no longer selected");
   auto old = storage.directory(from);
   auto incarnation = storage.reserve(name);
   auto next = storage.directory(incarnation);
-  auto state = IncarnationState::claim(*next);
+  auto state = storage.claim(name, incarnation, "reserved");
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
@@ -46,6 +51,7 @@ std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::str
   if (!api::encode(info, bytes)) throw std::runtime_error("Failed to encode copied snapshot");
   Manifest::commit(*next, info.index_gen, bytes, info.writer_epoch);
   state.advance(*next, Manifest::tip(info.index_gen, info.writer_epoch));
+  if (claimed) *claimed = std::move(state);
   return incarnation;
 }
 
@@ -81,12 +87,15 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool ve
   // Offline tool for a follower filesystem data directory, so it opens the FS backend directly.
   FSDirFactory factory(dataDir);
   TenantCatalog::initialize(factory, true);
+  auto node = newUuid();
+  auto lifetime = newUuid();
+  TenantCatalog::recover(factory, true, node, lifetime);
   auto metadata = factory.directory(StorageRoot::NODE_PRIVATE, "");
   auto state = ReplicationState::read(*metadata->openFile("replication.json"));
   size_t promotedCount = 0, failed = 0;
   for (const auto& id : TenantCatalog::collections(factory)) {
     try {
-      TenantCatalog storage(factory, id.tenant);
+      TenantCatalog storage(factory, id.tenant, node, lifetime);
       auto selected = storage.current(id.name);
       if (!selected) continue;
       auto& history = state.tenants[id.tenant].incarnations;

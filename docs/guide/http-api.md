@@ -56,14 +56,17 @@ The gRPC equivalents are `luxir.Admin/RenameCollection` and
 
 ## Build information
 
-`GET /` returns metadata compiled into the running binary, without collecting
-statistics or accessing Git at runtime:
+`GET /` returns metadata compiled into the running binary, and the vector
+kernels selected for this CPU at startup, without collecting statistics or
+accessing Git at runtime:
 
 ```json
 {
   "version": "0.1.0",
   "source_commit": "0123456789abcdef0123456789abcdef01234567",
-  "cpu_target": "x86-64-v2"
+  "cpu_target": "x86-64-v2",
+  "faiss_simd": "AVX2",
+  "blas_core": "Haswell"
 }
 ```
 
@@ -72,6 +75,13 @@ uncommitted edits. It is `"unknown"` for source archives built without an explic
 commit hash, or when the build could not read the checkout's Git repository. `luxir --version` and the startup banner report the same version,
 commit, and CPU target. The root endpoint defaults to pretty JSON; use
 `/?pretty=false` for compact output.
+
+`cpu_target` covers Luxir's own code. FAISS and OpenBLAS pick their kernels at
+runtime: `faiss_simd` is the FAISS SIMD level (`NONE`, `AVX2`, `AVX512`,
+`AVX512_SPR`, `ARM_NEON` or `ARM_SVE`; the `FAISS_SIMD_LEVEL` environment
+variable overrides it), and `blas_core` is the OpenBLAS core, or `Accelerate` on
+macOS. The startup banner, `_stats`, and the `luxir_build_info` metric report the
+same values.
 
 ## Content types and framing
 
@@ -149,6 +159,16 @@ errors. Canonical echo and both explain modes emit names, including an explicit
 `date_iso` emits UTC strings, while `date_ms` and `date_ns` emit numeric dates
 in the named unit. This applies to documents, facets, groups, sort values and
 DATE metrics; the same output types are used over gRPC.
+
+`decimal_scaled` is available at request and operation level. Decimal field
+literals use raw scaled integer units, and decimal results use raw integers
+instead of doubles; averages and percentiles remain doubles in raw units.
+Ingest and value-expression constants are unaffected. Combine
+it with `int64_str` to quote large raw integers and send those strings back
+as exact filters. See [Decimals](schema.md#decimals).
+
+`estimate_count` lets every list in its scope that leaves `count_limit` unset
+estimate `found`; see [counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded).
 
 `int64_str` is request-level only. For example, `"flags": ["date_ns",
 "int64_str"]` renders JSON int64 and uint64 values as decimal strings only

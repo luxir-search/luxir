@@ -77,7 +77,7 @@ BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReade
   AggregateAccumulator accumulator(program);
   std::vector<BoundAggregateInput> bindings =
       bindAggregateInputs(program, pool, segment, resolveAggregateFields(program, pool, reader));
-  int32_t maxDoc = segment.postingsReader().maxDoc();
+  int32_t maxDoc = segment.maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t producer = 0; producer < bindings.size(); producer++) {
       accumulator.add((uint32_t)producer, bindings[producer].evalPoint(doc));
@@ -1161,7 +1161,7 @@ TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults
     expectParseError(memory, *schema, expression, "integer in [0, 40000]");
   }
   expectParseError(memory, *schema, "cardinality(x_sc)", "indexed STRING or ID");
-  expectParseError(memory, *schema, "cardinality(x_t)", "TEXT");
+  expectParseError(memory, *schema, "cardinality(x_t)", "value expression is not supported on text field");
   expectParseError(memory, *schema, "cardinality(x_i, x_i)", "numeric constants");
   expectParseError(memory, *schema, "percentile_rank(x_is, 1)", "one scalar per document");
   expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");

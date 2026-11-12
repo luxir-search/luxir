@@ -144,6 +144,7 @@ class IndexWriter {
 
 public:
 
+  std::function<void()> onSuperseded; // Diagnostic only; failures cannot mask the fencing error.
   // The node's and the collection's counters; set by the collection that opens
   // this writer.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
@@ -444,11 +445,15 @@ public:
   std::optional<MergeFailureInfo> lastMergeFailure;
 
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
-  // activated in this writer lifetime or were seeded from durable manifest
+  // activated by commits or materialized merge outputs, or seeded from manifest
   // overlays at startup.  Intent-only activation is process-local; startup
   // seeds only from overlays that actually exist in the manifest.  Protected by
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
+  // Vector selectors of the commit now in finishCommitBody, set under the same
+  // indexMutex hold that captures its segments.  A merge output swapped in after
+  // that capture misses the commit's build, so it must see this intent.
+  std::vector<std::string> inFlightVectorSelectors;
 
   // Registered atomically with flushed segments and snapshotted with them.
   // A batch survives until a covering commit or a delete pass retires it.
@@ -580,10 +585,11 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
+  // A supplied claim was established by the caller after checking its catalog.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr);
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {});
   ~IndexWriter();
   void close();
 
@@ -852,7 +858,12 @@ private:
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
-  std::vector<std::string> snapshotActiveVectorOverlayNames();
+  // Builds outstanding active names and matches new in-flight selectors on the
+  // private output. Failed names are attempted only once per merge.
+  void prepareMergedVectorOverlays(SegInfo& output,
+                                   boost::unordered_flat_set<std::string>& attempted,
+                                   boost::unordered_flat_set<std::string>& matchedSelectors,
+                                   const char*& phase);
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,

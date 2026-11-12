@@ -139,6 +139,7 @@ public:
       MemPool statePool;
       MemPool::save_point stateStart = statePool.getSavePoint();
       bool populated = false;
+      bool counted = false; // Scalar facts survive membership payload release.
       bool released = false;
       uint64_t refills = 0;
       std::variant<States, BitsetPayload> payload;
@@ -166,11 +167,31 @@ public:
 
     // Segment tasks use distinct slots; preparation precedes dispatch and
     // facet bucket bindings sharing a weight run serially. Concurrent use of
-    // the same (weight, segment), including fill and release, is unsupported.
+    // the same (query, segment), including fill and release, is unsupported.
     // Populated facts are immutable until the executor releases the segment.
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
     };
+
+    // The facts depend on the query and segment only, so every weight a
+    // request builds for one query (ranking, count, domain) shares one memo:
+    // each segment's dictionary is walked and charged once.
+    struct SharedExpansions {
+      std::span<ExpansionMemo> memos;
+      // A subclass's own rewrite of the query, when it has one (for example a
+      // scored case_insensitive match), shared the same way.
+      Query* rewrite = nullptr;
+    };
+
+    static SharedExpansions& sharedExpansions(
+        Context& context, const MultiTermQuery& query) {
+      return context.getOrCreateLogicalPlan<SharedExpansions>(query, [&]() {
+        auto* shared = context.pool.make<SharedExpansions>();
+        shared->memos =
+            context.pool.make_span<ExpansionMemo>(context.numSegments());
+        return shared;
+      });
+    }
 
     MultiTermQuery& query;
     CachedFieldInfo* cachedFieldInfo = nullptr;
@@ -183,6 +204,13 @@ public:
     int32_t expansionCap;
 
   public:
+    // The query's shared rewrite slot (see SharedExpansions::rewrite). The
+    // logical plan cache is keyed by query alone, so a subclass keeps its
+    // rewrite here rather than under its own plan type.
+    static Query*& sharedRewrite(Context& context, const MultiTermQuery& query) {
+      return sharedExpansions(context, query).rewrite;
+    }
+
     // Test/bench force switch over the constant-score union scorers. AUTO is
     // the production policy. FORCE_EAGER always selects the eager scorer;
     // forced lazy modes require the lazy preconditions and retained-state
@@ -236,14 +264,24 @@ public:
                      == (NEED_SCORES | ALLOW_PRUNING)
                    && scorerModeForTests != ScorerMode::FORCE_EAGER),
         memoArena(context.arena()),
-        expansionMemos(
-            context.pool.make_span<ExpansionMemo>(context.numSegments())),
+        expansionMemos(sharedExpansions(context, query).memos),
         budget(context.multiTermBudget()),
         memoryTracker(context.planningContext().memoryTracker),
         expansionCap(query.capsExpansions()
             ? budget.maxExpansions() : std::numeric_limits<int32_t>::max()) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
+      // A disjoint count can supply completeness separately from bounded
+      // first-K ranking, including when whole-membership caching is bypassed.
+      if (needsScores() && !allowsPruning() && cachedFieldInfo != nullptr) {
+        for (auto& segment : context.topReader.segments()) {
+          auto* info = cachedFieldInfo->segInfos.at(segment);
+          if (info != nullptr && info->hasDisjointTermPostings() && !segment.hasDeletes()) {
+            traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
+            break;
+          }
+        }
+      }
     }
 
   private:
@@ -334,6 +372,13 @@ public:
       return nullptr;
     }
 
+    static ExpansionFacts* countedFacts(const ExpansionMemo& memo) {
+      for (auto* facts = memo.facts; facts != nullptr; facts = facts->next) {
+        if (facts->counted) return facts;
+      }
+      return nullptr;
+    }
+
     bool fillExpansionMemo(
         MemPool& scratchPool, IndexReader::Segment& segment,
         const Query::PlanContext& buildContext) {
@@ -413,6 +458,7 @@ public:
             }
 
             size_t nWords = FixedBitSet::sizeInWords(segment.maxDoc());
+            skipCount(SkipStats::multitermUnionBuilds);
             bitWords = google::protobuf::Arena::CreateArray<uint64_t>(
                 &memoArena, nWords);
             memset(bitWords, 0, nWords * sizeof(uint64_t));
@@ -445,6 +491,7 @@ public:
       facts->matchState = termCount == 0 ? Query::MatchState::EMPTY
                                        : Query::MatchState::NONEMPTY;
       facts->populated = true;
+      facts->counted = true;
       if (facts->released) {
         ++facts->refills;
         multitermExpansionRefills.fetch_add(1, std::memory_order_relaxed);
@@ -473,6 +520,7 @@ public:
         return FixedBitSet(facts.bitWords(), maxDoc);
       }
       size_t nWords = FixedBitSet::sizeInWords(maxDoc);
+      skipCount(SkipStats::multitermUnionBuilds);
       auto* words = (uint64_t*)targetPool.alloc(
           nWords * sizeof(uint64_t), alignof(uint64_t));
       memset(words, 0, nWords * sizeof(uint64_t));
@@ -488,7 +536,7 @@ public:
         const ExpansionFacts& facts, ExpansionMode mode) {
       unused(facts.sumDocFreq);
       if (facts.matchState == Query::MatchState::EMPTY) return nullptr;
-      int32_t maxDoc = segment.postingsReader().maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       if (mode == ExpansionMode::EAGER) {
         return targetPool.make<MultiTermQuery::Scorer>(
             materializeEagerBitset(targetPool, facts, maxDoc), maxDoc, boost);
@@ -582,9 +630,7 @@ public:
         : weight(weight), segment(segment), scratchPool(scratchPool) {}
 
       int64_t cost() override {
-        ExpansionFacts* facts =
-            weight.expansionMemos[(size_t) segment.ord].facts;
-        while (facts != nullptr && !facts->populated) facts = facts->next;
+        auto* facts = countedFacts(weight.expansionMemos[(size_t) segment.ord]);
         if (disableTruthfulCostForTests || facts == nullptr) {
           return segment.maxDoc();
         }
@@ -695,11 +741,24 @@ public:
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
+        if (bulkContext.requireConstantCount) {
+          auto shortcut = weight.countShortcut(segment, nullptr);
+          if (shortcut.how == CountHow::METADATA) {
+            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                    BulkAnswer::NO, nullptr, shortcut.maxMatches};
+          }
+          if (shortcut.how != CountHow::INDEX_WALK) return {};
+          const ExpansionFacts& facts = weight.expansionFacts(
+              scratchPool, segment, Weight::scorerBuildContext(
+                  Query::Demand::fromLeadCost(
+                      std::numeric_limits<int64_t>::max(), use)));
+          return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                  BulkAnswer::NO, nullptr, facts.sumDocFreq};
+        }
         // Keep pruned consumers on the lazy union. Eager consumers already
         // pay to materialize membership, so preserve that set through COUNT
         // and window collection instead of enumerating its bits again.
-        if (weight.canUseLazy || bulkContext.requireConstantCount
-            || bulkContext.requireFilterConsumption) {
+        if (weight.canUseLazy || bulkContext.requireFilterConsumption) {
           return {};
         }
         auto* state = scratchPool.make<BulkState>(*this, use);
@@ -733,6 +792,30 @@ public:
     };
 
   public:
+    // Disjoint postings make the expansion's docFreq sum exact. A cold sum
+    // needs a dictionary walk; a resident sum needs only metadata. Deletes
+    // and domains still need iteration.
+    CountShortcut countShortcut(IndexReader::Segment& segment,
+                                DocSet* domain) override {
+      auto* info = cachedFieldInfo == nullptr ? nullptr
+          : cachedFieldInfo->segInfos.at(segment.ord);
+      if (info == nullptr) return {0, CountHow::METADATA};
+      if (info->hasDisjointTermPostings()) {
+        if (auto* facts = countedFacts(expansionMemos[(size_t) segment.ord])) {
+          return countBound(segment, domain, facts->sumDocFreq, CountHow::METADATA);
+        }
+        auto shortcut = countBound(segment, domain, info->docsWithField, CountHow::INDEX_WALK);
+        if (shortcut.how == CountHow::INDEX_WALK) shortcut.resolver = this;
+        return shortcut;
+      }
+      int64_t bound = segment.maxDoc();
+      if ((info->flags & FieldType::INDEX_DOCS) != 0) {
+        bound = info->type == FieldType::STRING || info->type == FieldType::ID
+            ? info->docsWithField : std::min<int64_t>(bound, info->sumDocFreq);
+      }
+      return countBound(segment, domain, bound);
+    }
+
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {

@@ -237,6 +237,10 @@ a field at ingest can be used to match or bound that field later.
 - Integer fields accept JSON integers, integral floating-point numbers, and
   strings that parse to an integer within the signed 64-bit range.
 - Float and double fields accept JSON numbers and numeric strings.
+- Decimal fields accept numbers and numeric strings, rounding half away from zero
+  to their declared scale; see [Decimals](schema.md#decimals).
+- Boolean fields accept JSON `true`/`false` or the strings `"true"`/`"false"`.
+  Numbers, including 0 and 1, are rejected.
 - Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
   date math. Update messages interpret offset-less date text in UTC; search
   requests may supply a query time zone. See [Dates](dates.md).
@@ -284,3 +288,7 @@ unless its slop reaches that gap.
   relationships with IDs or flatten the fields in the producer.
 - Binary is reserved in the wire/schema enum but is not a usable engine field
   type in the current release.
+
+IP fields accept address strings and return canonical text. IPv4 and its
+v4-mapped IPv6 spelling are equal; CIDR is a match-query literal, not an
+ingest value. See [IP addresses](schema.md#ip-addresses).

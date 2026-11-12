@@ -92,3 +92,39 @@ git tag -a v0.1.0 -m 'Luxir 0.1.0'
 
 Keep published tags fixed. A subsequent fix gets a new patch version and tag.
 Uploading artifacts and pushing the branch/tag are separate publication steps.
+
+## Nightly binaries
+
+The `Nightly binaries` Actions workflow runs daily at 06:37 UTC on the upstream
+repository. It resolves `main` once and skips an unchanged `nightly` tag. To
+force a rebuild, select **Actions > Nightly binaries > Run workflow**. Manual
+runs also build `main`, including when dispatched from another branch; forks
+can dispatch manually to publish to their own repository.
+
+The rolling `nightly` prerelease contains the Linux x86-64 v2, v3, and v4
+optimized executables, executable and symbol archives, v2 Debug and ASan
+archives, and one combined `SHA256SUMS`. Names retain the source version, so
+use the release commit and packaged manifests to identify a particular nightly.
+The keyed dependency image must already have been published by `deps-image.yml`.
+
+Tests are advisory: each leg records all three test binaries' statuses and
+output in its workflow artifact and job summary. Unsupported CPU tiers are
+reported as `not run on this CPU`; containers use the hosted runner's CPU.
+Release notes list the commit, builder images, and per-preset test results.
+Artifacts and full logs are retained for 14 days.
+
+Every preset must build and package successfully or nothing is published and
+the previous nightly remains intact. Assets are uploaded to a staging draft
+before replacing the previous release and moving the `nightly` tag. GitHub
+does not offer an atomic release/tag replacement: a failure during the final
+replacement can require manual recovery from the staging draft. A failed
+upload leaves the previous nightly untouched and may leave a staging draft.
+Tag rules must allow the workflow token to move `nightly`; release immutability
+must not be enabled for this rolling prerelease.
+
+For local execution of one leg from a clean checkout with initialized
+submodules, set `LUXIR_DEV_IMAGE` to the keyed registry image and run
+`BUILD_JOBS=$(nproc) tools/nightly-build container-release`. Use a fresh
+`build/nightly/container-release` output directory for each run. Packaging
+checks embedded metadata without execution on CPUs that cannot run the selected
+tier; the manifest records whether the runtime version check was performed.

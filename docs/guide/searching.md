@@ -55,7 +55,7 @@ POST /collections/books/_search
   "query": "title_t:(dune OR messiah) AND year_i:>=1965",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "count_limit": -1,
+  "count_limit": -2,
   "get_scores": true,
   "fields": ["id", "title_t", "year_i", "price_f"]
 }
@@ -95,7 +95,7 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
+| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; `-2` permits an estimate; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
@@ -104,11 +104,41 @@ one.
 | `document_format` | `rows`, `columns`, or `adaptive`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
-### Counts are opt-in, exact or bounded
+### Counts are opt-in: exact, estimated or bounded
 
 `found` is opt-in. Unset or `count_limit: 0` omits the count and permits
 competitive-score skipping. `count_limit: -1` requests an exact count, even
-when only a few documents are returned.
+when only a few documents are returned. An exact count visits every match,
+which costs far more than finding the top documents for common terms.
+
+`count_limit: -2` asks for a count that may be estimated, and costs little at
+any scale. `found` is still exact when that is cheap: from index statistics,
+when ranking visited every match, or when the matches are few enough to count.
+For unfiltered prefix, wildcard, regex, term range and terms-in-set queries,
+each segment without deletions also supplies an exact count when its indexed
+`string` or `id` field has at most one distinct term per document. The count
+reuses the accepted terms' document frequencies computed during ranking.
+Otherwise each segment that ranking pruned counts a sample spread across its
+documents and scales it up, within the bounds index statistics prove, and
+`found_estimated: true` marks the result, which can be above or below the exact
+count. Where a sample is too thin to scale, `found` counts the matches seen and
+`found_gte: true` marks it as a lower bound.
+
+```http
+POST /collections/books/_search
+
+{"query": "title_t:the", "count_limit": -2}
+```
+
+```json
+{"found": 1830000, "found_estimated": true, "docs": [...]}
+```
+
+The packed `estimate_count` [request flag](http-api.md#packed-request-flags)
+asks the same of every list in its scope that leaves `count_limit` unset. On a
+positive `count_limit: N` it permits an estimate of at least N where the count
+would otherwise stop at N. An explicit `0` or `-1` overrides it, and `-2`
+applies only to its own list.
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
 list holds competitive-score skipping until N matches have been counted, or
@@ -131,7 +161,7 @@ POST /collections/books/_search
 Lists with `ops`, `collapse`, or `diversify`, field sorts, nested lists, and
 `limit: 0` count-only requests retain exact counting for any nonzero
 `count_limit`. Fusion also always supplies an exact count when requested.
-Values below -1 are rejected.
+Values below -2 are rejected.
 
 For a count plus analytics with no documents at all, set `limit: 0`. No
 document fields are loaded:
@@ -427,8 +457,8 @@ members. A request using only `collapse` performs no enrichment pass. Each
 streaming batch includes complete group metadata and operation results for its rows.
 
 A key field uses value binding and must be single-valued. Supported types
-are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
-a column. Use an object to group by a tuple of fields:
+are STRING or ID with an index and column, INT (signed 64-bit), DECIMAL, IP,
+BOOLEAN, and DATE with a column. Use an object to group by a tuple of fields:
 
 ```json
 "collapse": {"field": ["shop_s", "product_i"], "missing": "group"}
@@ -946,8 +976,11 @@ by the field's cardinality; see [Geo search](geo-search.md#return-points).
 
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
-column when requested. A field type with no typed column arm, such as a geo
-point, is a `col_val` column.
+column when requested. A field type with no typed column arm, such as a boolean
+or geo point, is a `col_val` column. BOOLEAN collapse components carry a boolean
+value in the `b` arm of `GroupComponent`. DECIMAL components use the `d`
+arm for doubles, or the `i` arm under `decimal_scaled`. IP components carry
+canonical address text in the `s` arm.
 
 ## Full request form
 
@@ -1046,7 +1079,7 @@ The recognized top-document parameters are:
 | `batch_size` | Signed 32-bit decimal integer. |
 | `document_format` | Exactly `default`, `rows`, `columns`, or `adaptive`. |
 | `get_scores` | Exactly `true` or `false`. |
-| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, positive values permit a lower bound. |
+| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, `-2` permits an estimate, positive values permit a lower bound. |
 
 URL form decoding happens before these grammars are applied, so `+` in a
 `sort` value is a space. `sort=` clears the body sort list; empty and non-empty
@@ -1101,8 +1134,10 @@ beside `ops` in the full form:
   native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
   output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
-  executes serially on the HTTP io thread that received it, with no
-  scheduler handoff. `1` moves the request onto the
+  lets the engine decide: it executes serially on the HTTP io thread that
+  received it, with no scheduler handoff, unless the operator has set
+  [`search.auto-parallel-min-work`](operations.md#indexing-memory-and-request-limits) and the request visits at
+  least that many documents, in which case it runs like `-1`. `1` moves the request onto the
   shared work-stealing scheduler, still serial, so an expensive query does
   not occupy its connection thread. `-1` removes the cap: the request starts
   on the receiving thread and shared workers join in, parallelizing across
@@ -1121,8 +1156,9 @@ Responses with `more: true` omit it, as does the `format=docs` document stream,
 which has no envelope to carry it; a pre-output JSON error still carries it.
 
 Profiling is opt-in and request-wide, and operations adopt instrumentation
-independently; string field facets are the currently instrumented operation.
-Their profile contains one entry per executed segment:
+independently; string field facets and `knn` queries are the currently
+instrumented operations. A facet's profile contains one entry per executed
+segment:
 
 ```json
 {
@@ -1159,6 +1195,42 @@ as prose for humans: its wording, ordering, and entry count change with the
 engine, so do not build tooling on it. Serial execution (the default, or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
+
+A `knn(<field>)` op has one piece per segment with eligible docs and live
+vectors. `strategy` is the initial routing, `ivf` or `exact`; an `ivf` piece
+may later complete exactly. `details` reports the planner's reason, predicted
+and actual coverage, rounds, terminal (full-precision) reads, and IVF budgets
+and list counts:
+
+```json
+{
+  "kind": "knn",
+  "segment": 0,
+  "strategy": "ivf",
+  "details": [
+    "reason=lowest modeled configuration; eligible_vectors=20000; exact_cost=...; ivf_scan_cost_at_predicted_coverage=...; ivf_linear=...; ivf_fixed=...",
+    "predicted_coverage=0.238; predicted_total=...; predicted_ivf_rounds=1; predicted_terminal_dims=...; predicted_terminal_reads=...; rounds=1; coverage=0.241; entries=4830; selector_passes=1; terminal_reads=212",
+    "reference_nlist=141; initial_nprobe=33.6",
+    "segment_nlist=141; lists_probed=34"
+  ]
+}
+```
+
+For IVF pieces, `coverage` is the fraction of the segment's live vectors in
+the probed lists. It remains IVF list coverage when a piece completes exactly;
+the exact scan does not raise it to 1.
+
+`reference_nlist` and `initial_nprobe` appear once, on the first piece that
+executed IVF, including one that later completes exactly. `initial_nprobe`
+is the round-one budget in units of the reference index (`reference_nlist`),
+before whole-list allocation, widening, and completion. `ivf.min_scan_fraction`
+can raise a pinned `ivf.nprobe`; budgets are also capped at `reference_nlist`.
+
+Every piece that executed IVF reports `segment_nlist` and `lists_probed`, the
+number of distinct lists scanned in that segment. Rescans do not increase
+`lists_probed`. These are per-segment counts, in different units from
+`initial_nprobe`, so they are not directly comparable to it. Pieces that never
+ran IVF carry none of these fields.
 
 ## Streaming HTTP responses
 
@@ -1248,7 +1320,7 @@ preparation without collecting results. See
   [Multi-match](query-reference.md#multi-match) for field types and phrase options.
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Per-group `collapse.ops` uses the page's matching member domains.
-  Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
+  Distinct facet counts support STRING/ID and INT/DECIMAL/BOOLEAN/IP/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets and metric facet sorts with
   distinct counts are unsupported.
 - Document-unit kNN selects `k` documents before collapse, so repeated keys
@@ -1262,5 +1334,5 @@ preparation without collecting results. See
 - The `(segment, docid)` tiebreak is reader-local and can change after segment
   merges, so it is not a durable pagination token.
 - `max_parallel` supports `-1`, `0`, and `1`; higher values are reserved.
-- Only string field facets emit profile entries; other operations run
-  unprofiled under `profile: true`.
+- Only string field facets and `knn` queries emit profile entries; other
+  operations run unprofiled under `profile: true`.
