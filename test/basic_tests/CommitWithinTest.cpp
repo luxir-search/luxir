@@ -27,6 +27,10 @@ bool waitForIds(CollectionHelper& helper, size_t count, std::chrono::millisecond
   return allIds(helper).size() == count;
 }
 
+uint64_t commits(CollectionHelper& helper) {
+  return helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK];
+}
+
 IndexResult addWithin(CollectionHelper& helper, const std::string& id, uint64_t withinMs) {
   CollectionHelper::UpdateBuilder request;
   request.add(flatdoc("id", id, "text_w", "commit within"));
@@ -47,8 +51,7 @@ TEST_F(CommitWithinTest, defersAndCommitsByDeadline) {
 
 TEST_F(CommitWithinTest, coalescesToOneCommitPerWindow) {
   CollectionHelper helper("main");
-  auto writer = helper.getIndexWriter();
-  uint64_t before = writer->stats(false).commits;
+  uint64_t before = commits(helper);
   // No hour-long window closes during the test, so the last update's short window
   // is the one deadline, and its commit covers every pending update.
   constexpr size_t docs = 20;
@@ -57,7 +60,10 @@ TEST_F(CommitWithinTest, coalescesToOneCommitPerWindow) {
   }
   ASSERT_TRUE(addWithin(helper, "d" + std::to_string(docs - 1), 1).success);
   EXPECT_TRUE(waitForIds(helper, docs, 10s));
-  EXPECT_EQ(before + 1, writer->stats(false).commits);
+  // The commit counts once its stage ends, just after publication.
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (commits(helper) == before && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+  EXPECT_EQ(before + 1, commits(helper));
 }
 
 TEST_F(CommitWithinTest, explicitCommitSatisfiesPendingDeadline) {
@@ -71,10 +77,10 @@ TEST_F(CommitWithinTest, explicitCommitSatisfiesPendingDeadline) {
     std::lock_guard lock(writer->autoCommitMutex);
     EXPECT_GT(writer->autoCommitDeadline, DeadlineScheduler::Clock::now() + std::chrono::hours(24 * 365));
   }
-  uint64_t before = writer->stats(false).commits;
+  uint64_t before = commits(helper);
   writer->commit();
   EXPECT_EQ((std::vector<std::string>{"d1"}), allIds(helper));
-  EXPECT_EQ(before + 1, writer->stats(false).commits);
+  EXPECT_EQ(before + 1, commits(helper));
   // The satisfied deadline leaves nothing for a trailing auto-commit to do.
   std::lock_guard lock(writer->autoCommitMutex);
   EXPECT_FALSE(writer->autoCommitPending);
