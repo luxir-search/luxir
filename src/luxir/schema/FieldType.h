@@ -41,6 +41,10 @@ struct CoerceContext {
 // before indexing any data.
 class FieldType {
 public:
+  // Ingest only: a zero-length string counts as no value. Set from the schema's
+  // coerce option on INT, FLOAT and DOUBLE fields; query parsing still rejects it.
+  bool emptyStringIsMissing = false;
+
   // NOTE: these ordinals are persisted as-is in the segment (PostingsWriter
   // writes IndexFieldInfo::type, FieldReader reads it back via static_cast).
   // Append new types at the end; reordering silently misreads existing segments.

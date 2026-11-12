@@ -2558,6 +2558,12 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // INT, FLOAT and DOUBLE only. Treat a zero-length string as no value, like a
+  // null or an absent field. A whitespace-only or otherwise unparsable string
+  // still fails the document. Unset inherits, else true. Set false to reject
+  // empty strings too.
+  optional bool coerce = 40;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

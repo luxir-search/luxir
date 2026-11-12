@@ -67,6 +67,7 @@ struct ResolvedField {
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
+  std::optional<bool> numericCoerce;
 };
 
 struct ResolvedOwnership {
@@ -297,6 +298,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                                               : parentResolved.geoIgnoreMalformed;
   r.geoIgnoreZValue = def.ignore_z_value ? def.ignore_z_value
                                          : parentResolved.geoIgnoreZValue;
+  r.numericCoerce = def.coerce ? def.coerce : parentResolved.numericCoerce;
   return r;
 }
 
@@ -455,6 +457,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
                       name + ")");
+  }
+  if (def.coerce && r.type != FieldClass::INT && r.type != FieldClass::FLOAT && r.type != FieldClass::DOUBLE) {
+    throw SchemaError("coerce is only valid for int, float and double fields (field: " + name + ")");
   }
 }
 
@@ -670,6 +675,7 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        ft->emptyStringIsMissing = r.numericCoerce.value_or(true);
         break;
       case FieldClass::IP:
         ft = std::make_shared<IpFieldType>(name, flags);
@@ -685,9 +691,11 @@ struct FieldCompiler {
         break;
       case FieldClass::FLOAT:
         ft = std::make_shared<FloatFieldType>(name, flags);
+        ft->emptyStringIsMissing = r.numericCoerce.value_or(true);
         break;
       case FieldClass::DOUBLE:
         ft = std::make_shared<DoubleFieldType>(name, flags);
+        ft->emptyStringIsMissing = r.numericCoerce.value_or(true);
         break;
       case FieldClass::DATE:
         ft = std::make_shared<DateFieldType>(name, flags,

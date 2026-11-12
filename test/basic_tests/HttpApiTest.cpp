@@ -1183,6 +1183,16 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, numericCoerceOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"strict": {"type":"int", "coerce":false}}})");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  EXPECT_NE(authored.body().find(R"("coerce": false)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  EXPECT_NE(resolved.body().find(R"("coerce": false)"), std::string::npos) << resolved.body();
+}
+
 TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
