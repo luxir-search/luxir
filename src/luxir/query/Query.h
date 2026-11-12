@@ -635,6 +635,7 @@ public:
     bool numericPredicateDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;
+    bool disableClauseFloorForwardingForTests = false;
     bool disableMandNotTwoPhaseForTests = false;
     bool disableFilteredUnionWandForTests = false;
 
@@ -665,6 +666,9 @@ public:
     // it. A parent choosing where verification runs prices the checks a
     // schedule adds with it.
     std::optional<double> verificationPoints;
+    // Receiving a floor on this scorer's own score saves work, and a floor
+    // that skips nothing has negligible cost. False is always conservative.
+    bool competitiveFloorPays = false;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -1994,6 +1998,8 @@ public:
         target = doc + 1;
       }
     }
+    /// A floor on this scorer's own output score. It may be ignored; honoring
+    /// it must preserve competitive documents. Profitability belongs to plans.
     virtual void setMinCompetitiveScore(float minScore) {
       unused(minScore);
     }
@@ -2298,6 +2304,62 @@ public:
     }
   };
 };
+
+// The floor a clause must reach for a doc to make `theta` when the rest of
+// the doc's score is at most `othersMax`, out of `clauses` summed scores; -inf
+// when no floor is proven. A float sum of n terms can exceed the exact sum by
+// about n float ulps of the total, so theta is lowered by that much, as the
+// compound scorers' scoreBoundFactor does, and by a margin on top. A positive
+// floor implies othersMax < theta, so a doc missing the clause cannot compete
+// and dropping the clause's low-scoring matches only drops docs below theta.
+inline float clauseFloor(float theta, double othersMax, size_t clauses) {
+  if (!(theta > 0.0f) || !std::isfinite(othersMax) || !std::isfinite(theta)) {
+    return -std::numeric_limits<float>::infinity();
+  }
+  othersMax = std::max(0.0, othersMax);
+  double factor = 1.0 + (double)(clauses + 1) * 0x1p-24;
+  double floor = (double)theta / factor - othersMax
+      - ((double)std::abs(theta) + std::abs(othersMax)) * 1e-6;
+  return floor > 0.0 ? (float)floor : -std::numeric_limits<float>::infinity();
+}
+
+// A setup-time choice of a clause and the fixed bound on all other scores.
+struct ClauseFloorTarget {
+  Query::Scorer* scorer;
+  double othersMax;
+};
+
+inline std::span<ClauseFloorTarget> makeClauseFloorTargets(
+    MemPool& pool, std::span<Query::Scorer* const> clauses,
+    std::span<const float> clauseMax, std::span<const uint8_t> floorPays,
+    double extraMax = 0.0) {
+  if (floorPays.empty()) return {};
+  assert(clauses.size() == clauseMax.size());
+  assert(clauses.size() == floorPays.size());
+  size_t count = std::count_if(floorPays.begin(), floorPays.end(),
+                               [](uint8_t pays) { return pays != 0; });
+  if (count == 0) return {};
+  auto targets = pool.make_span<ClauseFloorTarget>(count);
+  size_t at = 0;
+  for (size_t i = 0; i < clauses.size(); i++) {
+    if (!floorPays[i]) continue;
+    // Clamp the extra contribution before summing to avoid cancellation.
+    double others = extraMax < 0.0 ? 0.0 : extraMax;
+    for (size_t j = 0; j < clauseMax.size(); j++) {
+      if (j != i) others += (double)clauseMax[j];
+    }
+    if (std::isfinite(others)) targets[at++] = {clauses[i], others};
+  }
+  return targets.first(at);
+}
+
+inline void forwardClauseFloors(std::span<const ClauseFloorTarget> targets,
+                                float theta, size_t clauses) {
+  for (const auto& target : targets) {
+    float floor = clauseFloor(theta, target.othersMax, clauses);
+    if (floor > 0.0f) target.scorer->setMinCompetitiveScore(floor);
+  }
+}
 
 const Query* peelBoost(const Query* query, float& boost);
 Query* peelBoost(Query* query, float& boost);

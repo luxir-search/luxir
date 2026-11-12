@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -621,6 +622,43 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
     inverter.finishDoc();
   }
 
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+// Two fields of very different length: a short title and a long, skewed body,
+// the shape of a multi_match best_fields over title and text. Zipf-drawn terms
+// so the query terms are present in both fields at different frequencies.
+void buildDisMaxMultiFieldIndex(CollectionHelper& helper, int64_t nDocs) {
+  static const ZipfTable zipf(kBodyVocab, kZipfS);
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hTitle = inverter.getIndexHandler("title_w");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
+  std::mt19937_64 rng(1234);
+  std::string title;
+  std::string body;
+  auto appendTokens = [&](std::string& out, int count) {
+    for (int t = 0; t < count; t++) {
+      out += "t";
+      out += std::to_string(zipf.sample(rng()));
+      out += ' ';
+    }
+  };
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    double u = (double)(rng() >> 11) * 0x1.0p-53;
+    title.clear();
+    body.clear();
+    appendTokens(title, 3 + (int)(rng() % 8));
+    appendTokens(body, 40 + (int)(1500.0 * u * u * u * u));
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hTitle.index(inverter, title);
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
   iw->releaseInverter(inverter, true);
   helper.commit();
 }
@@ -1243,6 +1281,318 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
   auto mem = watcher.getDeltaKB();
   state.counters["RSS_delta"] = mem.first / 1024;
   state.counters["RSS_max"] = mem.second / 1024;
+}
+
+// These pull benchmarks share one dedicated corpus across captures.
+static bool ensureDisMaxMultiFieldIndex(CollectionHelper& helper, int64_t nDocs) {
+  const int32_t docsPerSeg[] = {(int32_t)nDocs};
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) buildDisMaxMultiFieldIndex(helper, nDocs);
+  return reuseIndex;
+}
+
+// Plain summing disjunctions: collectTopK drives the pull scorer with a rising
+// floor, including its essential/non-essential split and candidate probes.
+static void BM_FullTextScoreTopKPullOr(benchmark::State& state, int clauses) {
+  constexpr int32_t topK = 10;
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(2'000) : 500'000;
+  CollectionHelper helper("dismax_multifield_bm");
+  bool reuseIndex = ensureDisMaxMultiFieldIndex(helper, nDocs);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  const char* terms[] = {"t1", "t80", "t600", "t4000", "t12", "t300", "t1200", "t9000"};
+
+  auto runQuery = [&](bool pruning) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto optional = pool.make_span<Query*>(clauses);
+    for (int i = 0; i < clauses; i++) {
+      optional[(size_t)i] = pool.make<TermQuery>("body_w", terms[i]);
+    }
+    BooleanQuery query({}, optional, {}, {});
+    auto* weight = query.createWeight(context,
+        Query::NEED_SCORES | (pruning ? Query::ALLOW_PRUNING : 0));
+    TopDocsCollector collector(topK);
+    ScoreTopKResult result;
+    auto segments = context.topReader.segments();
+    for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer == nullptr) continue;
+      auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer);
+      if (maxScore == nullptr) {
+        state.SkipWithError("Expected a summing pull MaxScore scorer");
+        return result;
+      }
+      collectTopK(segnum, scorer, nullptr, nullptr, collector, pruning);
+      result.visited += maxScore->visited();
+      result.nonEssentialLookups += maxScore->nonEssentialLookupCount();
+    }
+    auto topDocs = collector.sort();
+    result.topDocs.assign(topDocs.begin(), topDocs.end());
+    sortScoreDocs(result.topDocs);
+    result.fp = scoreTopKFingerprint(result.topDocs);
+    return result;
+  };
+
+  ScoreTopKResult exhaustive = runQuery(false);
+  ScoreTopKResult pruned = runQuery(true);
+  assertSameTopK(exhaustive, pruned);
+  for (auto _ : state) {
+    ScoreTopKResult result = runQuery(true);
+    benchmark::DoNotOptimize(result.fp);
+  }
+  state.counters["clauses"] = clauses;
+  state.counters["visited"] = pruned.visited;
+  state.counters["nonessential_lookups"] = pruned.nonEssentialLookups;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+//
+// dis_max over per-field term disjunctions: the floor has to reach each field's
+// own MaxScore disjunction to skip documents. Compares with the floor
+// forwarded and withheld (forward=0), same query and scorers.
+//
+static void BM_DisMaxMultiField(benchmark::State& state, float tie, bool forward,
+                                bool headTerms = false, bool singleTerm = false) {
+  using DisMaxScorer = BooleanQuery::MaxScoreDisjunctionScorerT<true>;
+  constexpr int32_t topK = 10;
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(2'000) : 500'000;
+  CollectionHelper helper("dismax_multifield_bm");
+  bool reuseIndex = ensureDisMaxMultiFieldIndex(helper, nDocs);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+
+  auto runQuery = [&](bool pruning) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto fieldClause = [&](const char* field, std::span<const char* const> terms) -> Query* {
+      if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0]);
+      auto clauses = pool.make_span<Query*>(terms.size());
+      for (size_t i = 0; i < terms.size(); i++) {
+        clauses[i] = pool.make<TermQuery>(field, terms[i]);
+      }
+      return pool.make<BooleanQuery>(std::span<Query*>{}, clauses,
+                                     std::span<Query*>{}, std::span<Query*>{});
+    };
+    const char* midTerms[] = {"t9", "t80", "t600", "t4000"};
+    const char* frequentTerms[] = {"t1", "t12", "t300"};
+    std::span<const char* const> terms = headTerms
+        ? std::span<const char* const>(frequentTerms)
+        : std::span<const char* const>(midTerms);
+    const char* single[] = {headTerms ? "t1" : "t80"};
+    if (singleTerm) terms = single;
+    Query* parts[] = {fieldClause("title_w", terms), fieldClause("body_w", terms)};
+    auto* dismax = DisMaxQuery::make(pool, parts, tie);
+    auto* weight = dismax->createWeight(context,
+        Query::NEED_SCORES | (pruning ? Query::ALLOW_PRUNING : 0));
+    TopDocsCollector collector(topK);
+    ScoreTopKResult result;
+    auto segments = context.topReader.segments();
+    for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+      auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+      if (supplier == nullptr) continue;
+      auto planContext = supplier->makePlanContext(Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max()));
+      planContext.disableClauseFloorForwardingForTests = !forward;
+      auto* scorer = supplier->resolve(pool, planContext)->build(pool);
+      if (scorer == nullptr) continue;
+      collectTopK(segnum, scorer, nullptr, nullptr, collector, pruning);
+      if (auto* outer = dynamic_cast<DisMaxScorer*>(scorer)) result.visited += outer->visited();
+    }
+    auto topDocs = collector.sort();
+    result.topDocs.assign(topDocs.begin(), topDocs.end());
+    sortScoreDocs(result.topDocs);
+    result.fp = scoreTopKFingerprint(result.topDocs);
+    return result;
+  };
+
+  ScoreTopKResult exhaustive = runQuery(false);
+  ScoreTopKResult pruned = runQuery(true);
+  assertSameTopK(exhaustive, pruned);
+
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runQuery(true);
+    benchmark::DoNotOptimize(result.fp);
+    visited = result.visited;
+  }
+  state.counters["visited"] = visited;
+  state.counters["forward"] = forward ? 1 : 0;
+  state.counters["tie_percent"] = std::round(tie * 100.0f);
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+enum class ClauseFloorQuery {
+  MAND_DISMAX,
+  MAND_GROUPED_SUM,
+  SUM_DISMAX,
+  MAND_FILTERED_DISMAX,
+  DISMAX_MAND,
+  MAND_REQUIRED_FILTERED_DISMAX,
+  MAND_FILTERED_HEAD_TERMS,
+};
+
+static Query* clauseFloorQuery(MemPool& pool, ClauseFloorQuery shape) {
+  auto one = [&](Query* query) {
+    auto clauses = pool.make_span<Query*>(1);
+    clauses[0] = query;
+    return clauses;
+  };
+  auto field = [&](const char* name) -> Query* {
+    const char* terms[] = {"t9", "t80", "t600", "t4000"};
+    auto clauses = pool.make_span<Query*>(4);
+    for (size_t i = 0; i < clauses.size(); i++) clauses[i] = pool.make<TermQuery>(name, terms[i]);
+    return pool.make<BooleanQuery>(std::span<Query*>{}, clauses,
+                                   std::span<Query*>{}, std::span<Query*>{});
+  };
+  auto fields = pool.make_span<Query*>(2);
+  fields[0] = field("title_w");
+  fields[1] = field("body_w");
+  if (shape == ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS) {
+    fields[0] = pool.make<TermQuery>("title_w", "t1");
+    fields[1] = pool.make<TermQuery>("body_w", "t1");
+  }
+  Query* target = DisMaxQuery::make(pool, fields, 0.0f);
+  auto* term = pool.make<TermQuery>("body_w", "t5");
+  if (shape == ClauseFloorQuery::MAND_GROUPED_SUM) {
+    target = field("body_w");
+    // This required group is normalized independently, retaining the sum as
+    // one optional child instead of flattening its terms into the parent.
+    target = pool.make<BooleanQuery>(one(target), std::span<Query*>{},
+                                     std::span<Query*>{}, std::span<Query*>{});
+  }
+  if (shape == ClauseFloorQuery::MAND_FILTERED_DISMAX) {
+    target = pool.make<BooleanQuery>(std::span<Query*>{}, one(target), std::span<Query*>{},
+        one(pool.make<TermQuery>("body_w", "t12")), 1);
+  } else if (shape == ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX
+             || shape == ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS) {
+    target = pool.make<BooleanQuery>(one(target), std::span<Query*>{}, std::span<Query*>{},
+        one(pool.make<TermQuery>("body_w", "t12")));
+  }
+  if (shape == ClauseFloorQuery::SUM_DISMAX) {
+    auto optional = pool.make_span<Query*>(2);
+    optional[0] = target;
+    optional[1] = term;
+    return pool.make<BooleanQuery>(std::span<Query*>{}, optional,
+                                   std::span<Query*>{}, std::span<Query*>{});
+  }
+  if (shape == ClauseFloorQuery::DISMAX_MAND) {
+    return pool.make<BooleanQuery>(one(target), one(term),
+                                   std::span<Query*>{}, std::span<Query*>{});
+  }
+  return pool.make<BooleanQuery>(one(term), one(target),
+                                 std::span<Query*>{}, std::span<Query*>{});
+}
+
+// Inspect the actual execution tree outside the timed loop. In particular, a
+// bounded child disjunction can be a heap scorer rather than MaxScore.
+static std::string clauseFloorRoute(Query::Scorer* scorer, int64_t& visits) {
+  auto children = [&](auto scorers) {
+    std::string out;
+    for (auto* child : scorers) {
+      if (!out.empty()) out += ",";
+      out += clauseFloorRoute(child, visits);
+    }
+    return "(" + out + ")";
+  };
+  if (auto* dismax = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorerT<true>*>(scorer)) {
+    visits += dismax->visited();
+    return "MaxScoreDisMax" + children(dismax->clauseScorersForTests());
+  }
+  if (auto* sum = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
+    visits += sum->visited();
+    return "MaxScoreSum" + children(sum->clauseScorersForTests());
+  }
+  if (auto* heap = dynamic_cast<BooleanQuery::DisjunctionScorerT<true>*>(scorer)) {
+    return "HeapDisMax" + children(heap->clauseScorersForTests());
+  }
+  if (auto* heap = dynamic_cast<BooleanQuery::DisjunctionScorerT<false>*>(scorer)) {
+    return "HeapSum" + children(heap->clauseScorersForTests());
+  }
+  if (auto* mand = dynamic_cast<BooleanQuery::MandOptScorer*>(scorer)) {
+    return "MandOpt(" + clauseFloorRoute(mand->requiredScorerForTests(), visits) + ","
+        + clauseFloorRoute(mand->optionalScorerForTests(), visits) + ")";
+  }
+  if (auto* conjunction = dynamic_cast<BooleanQuery::ConjunctionScorer*>(scorer)) {
+    return "Conjunction" + children(conjunction->scoringScorersForTests());
+  }
+  if (auto* excluded = dynamic_cast<BooleanQuery::MandNotScorer*>(scorer)) {
+    return "MandNot(" + clauseFloorRoute(excluded->requiredScorerForTests(), visits) + ")";
+  }
+  return dynamic_cast<TermQuery::Scorer*>(scorer) ? "Term" : "Other";
+}
+
+static void BM_ClauseFloorForwarding(benchmark::State& state, ClauseFloorQuery shape,
+                                     bool forward, bool bulk = false) {
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(2'000) : 500'000;
+  CollectionHelper helper("dismax_multifield_bm");
+  ensureDisMaxMultiFieldIndex(helper, nDocs);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  std::string route;
+  auto runQuery = [&](bool pruning, bool inspect) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* query = clauseFloorQuery(pool, shape);
+    auto* weight = query->createWeight(context,
+        Query::NEED_SCORES | (pruning ? Query::ALLOW_PRUNING : 0));
+    TopDocsCollector collector(10);
+    ScoreTopKResult result;
+    auto& segment = reader->segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    if (supplier == nullptr) return result;
+    if (bulk) {
+      Query::ScorerSupplier::BulkScorerContext buildContext;
+      auto plan = supplier->planBulk(Query::ExecutionUse::MATCH_WINDOWS, buildContext);
+      auto* scorer = plan.available == Query::ScorerSupplier::BulkAnswer::YES
+          ? supplier->buildBulk(pool, plan) : nullptr;
+      if (scorer == nullptr) {
+        state.SkipWithError("Expected a bulk scorer");
+        return result;
+      }
+      collectTopKWindowed(segment.ord, scorer, nullptr, collector, nullptr,
+                          segment.maxDoc(), pruning);
+      if (inspect) {
+        if (auto* mand = dynamic_cast<BooleanQuery::MandOptBulkScorer*>(scorer)) {
+          route = "MandOptBulk(" + clauseFloorRoute(mand->requiredScorerForTests(), result.visited);
+          for (auto* child : mand->optionalScorersForTests()) {
+            route += "," + clauseFloorRoute(child, result.visited);
+          }
+        } else if (auto* sum = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(scorer)) {
+          route = "MaxScoreBulk(";
+          for (auto* child : sum->clauseScorersForTests()) {
+            if (route.back() != '(') route += ",";
+            route += clauseFloorRoute(child, result.visited);
+          }
+        } else {
+          state.SkipWithError("Unexpected bulk route");
+        }
+        route += ")";
+      }
+    } else {
+      auto buildContext = supplier->makePlanContext(
+          Query::Demand::fromLeadCost(std::numeric_limits<int64_t>::max()));
+      buildContext.disableClauseFloorForwardingForTests = !forward;
+      auto* scorer = supplier->resolve(pool, buildContext)->build(pool);
+      collectTopK(segment.ord, scorer, nullptr, nullptr, collector, pruning);
+      if (inspect) route = clauseFloorRoute(scorer, result.visited);
+    }
+    auto hits = collector.sort();
+    result.topDocs.assign(hits.begin(), hits.end());
+    sortScoreDocs(result.topDocs);
+    result.fp = scoreTopKFingerprint(result.topDocs);
+    return result;
+  };
+  auto exhaustive = runQuery(false, false);
+  auto pruned = runQuery(true, true);
+  assertSameTopK(exhaustive, pruned);
+  for (auto _ : state) {
+    auto result = runQuery(true, false);
+    benchmark::DoNotOptimize(result.fp);
+  }
+  state.SetLabel(route);
+  state.counters["forward"] = forward;
+  state.counters["visited"] = pruned.visited;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
 //
@@ -2066,6 +2416,42 @@ LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",  
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
+
+// Summing pull disjunctions with competitive pruning.
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPullOr, two, 2);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPullOr, four, 4);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPullOr, eight, 8);
+
+// dis_max over per-field term disjunctions A/B: the floor forwarded vs withheld.
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie0_forward, 0.0f, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie0_withheld, 0.0f, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, tie03, 0.3f, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, head_tie0_forward, 0.0f, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, head_tie0_withheld, 0.0f, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, single_mid_forward, 0.0f, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, single_mid_withheld, 0.0f, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, single_head_forward, 0.0f, true, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, single_head_withheld, 0.0f, false, true, true);
+
+// Derived floors through scored Boolean parents.
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_on, ClauseFloorQuery::MAND_DISMAX, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_off, ClauseFloorQuery::MAND_DISMAX, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_grouped_sum_on, ClauseFloorQuery::MAND_GROUPED_SUM, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_grouped_sum_off, ClauseFloorQuery::MAND_GROUPED_SUM, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_on, ClauseFloorQuery::SUM_DISMAX, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_off, ClauseFloorQuery::SUM_DISMAX, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_on, ClauseFloorQuery::MAND_FILTERED_DISMAX, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_off, ClauseFloorQuery::MAND_FILTERED_DISMAX, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_on, ClauseFloorQuery::DISMAX_MAND, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_off, ClauseFloorQuery::DISMAX_MAND, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_required_filtered_on, ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_required_filtered_off, ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_head_terms_on, ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_head_terms_off, ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_bulk, ClauseFloorQuery::DISMAX_MAND, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_bulk, ClauseFloorQuery::MAND_DISMAX, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_bulk, ClauseFloorQuery::SUM_DISMAX, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_bulk, ClauseFloorQuery::MAND_FILTERED_DISMAX, true, true);
 
 // Disjunction MaxScore A/B. t0 is the frequent low-idf clause; t1000 is rare
 // enough to lift the top-k threshold but common enough to supply k winners.
