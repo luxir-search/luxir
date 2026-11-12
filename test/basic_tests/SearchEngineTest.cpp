@@ -7237,11 +7237,11 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
   EXPECT_EQ(0, planned.island);
   EXPECT_EQ(0, planned.numericGeoIsland);
   EXPECT_GT(planned.denseWindows, 0);
-  // The range covers a docid run: zones emit it as whole words, below the
-  // cost of decoding its points.
-  EXPECT_EQ(0, planned.pointsArms);
+  // CONTIG points emit word runs and settle the unaligned boundary without
+  // testing values from a crossing column leaf.
+  EXPECT_GT(planned.pointsArms, 0);
   EXPECT_EQ(0, planned.complementArms);
-  EXPECT_GT(planned.zoneArms, 0);
+  EXPECT_EQ(0, planned.zoneArms);
   EXPECT_EQ(0, planned.sparseVerifyArms);
   EXPECT_EQ(oracle.pointsArms, planned.pointsArms);
   EXPECT_EQ(oracle.complementArms, planned.complementArms);

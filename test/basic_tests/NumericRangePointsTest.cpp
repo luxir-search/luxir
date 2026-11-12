@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -266,6 +267,40 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
 } // namespace
 
 class NumericRangePointsTest : public LuxirTest {};
+
+TEST_F(NumericRangePointsTest, rejectedPointsBudgetDoesNotCacheTheLowerBound) {
+  constexpr int32_t N = 65536;
+  CollectionHelper helper;
+  const RangeField fields[] = {{"points"}};
+  setRangeSchema(helper, fields);
+  std::vector<int64_t> values(N);
+  std::iota(values.begin(), values.end(), 0);
+  SplitMix64 rng(0x5eed);
+  for (int32_t i = N; i > 1; i--) std::swap(values[(size_t)i - 1], values[(size_t)rng.rint(i)]);
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int64_t value : values) {
+    inverter.startDoc();
+    inverter.getIndexHandler("points").index(inverter, value);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  MemPool pool;
+  QueryState state(pool, *reader, "points", N / 4, 3 * N / 4 - 1);
+  auto* supplier = state.weight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  // Tiny rejects by the lower bound. Medium needs the exact FOR price and
+  // still verifies. Large selects points; repeating exercises the exact cache.
+  for (int candidates : {100, N / 100, N / 10, N / 100}) {
+    auto context = supplier->makePlanContext(Query::Demand::fromLeadCost(candidates));
+    context.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
+    auto shape = supplier->describeScorer(context);
+    EXPECT_EQ(candidates == N / 10 ? Query::ReportedTwoPhase::NO : Query::ReportedTwoPhase::YES,
+              shape.reportedTwoPhase);
+  }
+}
 
 TEST_F(NumericRangePointsTest, plansAndBuildsTheRequestedArm) {
   using Arm = NumericPredicateQuery::ScorerArm;
@@ -718,10 +753,11 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   for (int64_t hi : {4095, 26'000, N - 1}) {
     expectShapeAndScorer(*reader, "arm_sorted", 0, hi, 0,
                         ExpectedScorerKind::SPARSE_VERIFY);
-    // Producing every document is a complement fill, cheaper than zones.
+    // The aligned short prefix uses zones. Complements emit the remaining
+    // word runs without testing a crossing column leaf.
     expectShapeAndScorer(*reader, "arm_sorted", 0, hi, N,
-                        hi == N - 1 ? ExpectedScorerKind::POINTS_BIT
-                                    : ExpectedScorerKind::ZONE_MAP);
+                        hi == 4095 ? ExpectedScorerKind::ZONE_MAP
+                                   : ExpectedScorerKind::POINTS_BIT);
   }
   for (auto consumption : {Consumption::EITHER, Consumption::CANDIDATES}) {
     expectShapeAndScorer(*reader, "arm_sorted", 0, 4095,

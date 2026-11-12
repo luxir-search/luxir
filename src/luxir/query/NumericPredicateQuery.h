@@ -24,6 +24,7 @@
 
 #include "luxir/query/Query.h"
 #include "luxir/query/PointsMaterialize.h"
+#include "luxir/query/NumericIndexPrice.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
 #include "luxir/reader/DocsEnum.h"
@@ -1465,6 +1466,68 @@ public:
     IndexReader::FieldSegments segInfos;
     float constantScore;
 
+    // Crossing values cost about 2x a dense scan. Require at least
+    // half the values to be structurally prunable before using zone maps.
+    // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
+    // least representative hardware described by the tuning caveat.
+    static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
+
+    struct ColumnCosts {
+      bool useZones;
+      bool hasOutside;
+      int32_t possibleDocs;
+      int32_t insideDocs;
+      // Zone production over the whole column: `checks` counts the values
+      // tested in unprunable blocks and `docVisits` the documents whose
+      // value ranges a multivalued column combines; `inside` is already in
+      // points, the emission of the inside runs (whole mask words for dense
+      // single-valued columns, values otherwise).
+      double checks;
+      double inside;
+      double docVisits;
+    };
+    // Column prices in point emissions (see Query::Demand). Block classification was
+    // measured by forcing each arm under a 35-candidate pull lead (5M docs,
+    // one segment, 2026-10-28). The rest are fitted on that board's
+    // forced-arm oracle: a scan tests a value in about 5 ns; zone checks and
+    // inside words are priced per unit of the column summary, which a dense
+    // lead's refills can reach about twice.
+    static constexpr double CLASSIFY_POINTS = 25;       // classify one column block
+    static constexpr double CHECK_POINTS = 4;           // test one value of an unprunable block
+    static constexpr double INSIDE_WORD_POINTS = 3;     // emit one dense inside mask word
+    static constexpr double INSIDE_VALUE_POINTS = 1;    // emit one inside value's document
+    static constexpr double DOC_VISIT_POINTS = CHECK_POINTS;  // combine one document's values
+
+    static ColumnCosts priceColumn(
+        const IntColReader& reader, NumColumnFormat::LeafMeta::RangeSummary summary) {
+      int64_t prunable = summary.outside + summary.insideLower;
+      int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
+      bool single = !reader.multiValued();
+      // Only dense single-valued INSIDE runs can emit whole mask words.
+      // Sparse columns map each rank to a doc; multivalued producers also
+      // visit documents whose values are entirely outside the predicate.
+      double insideWords = single && reader.denseDocsWithValue()
+          ? (double)((summary.insideLower + 63) / 64) : -1;
+      return {
+        prunable >= reader.numValues() / denominator
+            + (reader.numValues() % denominator != 0),
+        summary.outside != 0,
+        reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
+        single ? (int32_t)summary.insideLower : 0,
+        (double)(reader.numValues() - prunable),
+        insideWords >= 0 ? INSIDE_WORD_POINTS * insideWords
+            : INSIDE_VALUE_POINTS * (double)summary.insideLower,
+        single ? 0.0 : (double)reader.docsWithValue(),
+      };
+    }
+
+    static double zonePrice(const IntColReader& reader, const ColumnCosts& costs,
+                            double reach = 1, double classified = 1) {
+      return CLASSIFY_POINTS * (double)reader.numBlocks() * classified
+          + reach * (CHECK_POINTS * costs.checks + costs.inside
+              + DOC_VISIT_POINTS * costs.docVisits);
+    }
+
     static size_t fillPointRanges(
         PointsReader& points, const NumericPredicateQuery& query,
         std::span<PointsReader::OrdinalRange> output) {
@@ -1581,12 +1644,6 @@ public:
     }
 
     class Supplier final : public Query::ScorerSupplier {
-      // Crossing values cost about 2x a dense scan. Require at least
-      // half the values to be structurally prunable before using zone maps.
-      // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
-      // least representative hardware described by the tuning caveat.
-      static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
-
       using Materialized = PointsMaterialize::Materialized;
 
       NumericPredicateQuery::Weight& weight;
@@ -1598,46 +1655,12 @@ public:
       BlockPlans blockPlans;
       std::span<const PointsReader::OrdinalRange> pointRanges;
       uint64_t pointValueCount;
+      double pointLowerBound = 0;
       int64_t estimatedCost;
       Query::MatchState matchState;
       bool allMatch;
-      struct ColumnCosts {
-        bool useZones;
-        bool hasOutside;
-        int32_t possibleDocs;
-        int32_t insideDocs;
-        // Zone production over the whole column: `checks` counts the values
-        // tested in unprunable blocks and `docVisits` the documents whose
-        // value ranges a multivalued column combines; `inside` is already in
-        // points, the emission of the inside runs (whole mask words for dense
-        // single-valued columns, values otherwise).
-        double checks;
-        double inside;
-        double docVisits;
-      };
       mutable std::optional<ColumnCosts> columnCosts;
-
-      ColumnCosts priceColumn(NumColumnFormat::LeafMeta::RangeSummary summary) const {
-        int64_t prunable = summary.outside + summary.insideLower;
-        int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
-        bool single = !reader.multiValued();
-        // Only dense single-valued INSIDE runs can emit whole mask words.
-        // Sparse columns map each rank to a doc; multivalued producers also
-        // visit documents whose values are entirely outside the predicate.
-        double insideWords = single && reader.denseDocsWithValue()
-            ? (double)((summary.insideLower + 63) / 64) : -1;
-        return {
-          prunable >= reader.numValues() / denominator
-              + (reader.numValues() % denominator != 0),
-          summary.outside != 0,
-          reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
-          single ? (int32_t)summary.insideLower : 0,
-          (double)(reader.numValues() - prunable),
-          insideWords >= 0 ? INSIDE_WORD_POINTS * insideWords
-              : INSIDE_VALUE_POINTS * (double)summary.insideLower,
-          single ? 0.0 : (double)reader.docsWithValue(),
-        };
-      }
+      mutable std::optional<PointsReader::EmissionWork> pointWork;
 
       const ColumnCosts& column() const {
         // Points already supply exact cost/nonemptiness. Scalar COUNT needs
@@ -1648,23 +1671,10 @@ public:
           if (weight.query.isExactSet() && !allMatch) {
             summary.insideLower = summary.insideUpper = 0;
           }
-          columnCosts = priceColumn(summary);
+          columnCosts = priceColumn(reader, summary);
         }
         return *columnCosts;
       }
-
-      // Prices in point emissions (see Query::Demand); points production and
-      // verification are PointsMaterialize's. Block classification was
-      // measured by forcing each arm under a 35-candidate pull lead (5M docs,
-      // one segment, 2026-10-28). The rest are fitted on that board's
-      // forced-arm oracle: a scan tests a value in about 5 ns; zone checks and
-      // inside words are priced per unit of the column summary, which a dense
-      // lead's refills can reach about twice.
-      static constexpr double CLASSIFY_POINTS = 25;       // classify one column block
-      static constexpr double CHECK_POINTS = 4;           // test one value of an unprunable block
-      static constexpr double INSIDE_WORD_POINTS = 3;     // emit one dense inside mask word
-      static constexpr double INSIDE_VALUE_POINTS = 1;    // emit one inside value's document
-      static constexpr double DOC_VISIT_POINTS = CHECK_POINTS;  // combine one document's values
 
       struct Production {
         ScorerArm arm;
@@ -1677,11 +1687,26 @@ public:
         return arm == ScorerArm::COMPLEMENT ? ScorerArm::POINTS : arm;
       }
 
-      double pointsPrice() const {
+      double pointsPrice(double budget) const {
         bool complement = useComplement(pointValueCount);
-        return PointsMaterialize::price(
-            complement ? points->pointCount() - pointValueCount : pointValueCount,
-            segment.maxDoc(), complement);
+        uint64_t emitted = complement ? points->pointCount() - pointValueCount : pointValueCount;
+        if (!complement && !PointsMaterialize::useBitset(emitted, segment.maxDoc())) {
+          return PointsMaterialize::price(emitted, segment.maxDoc());
+        }
+        uint64_t baseDocs = complement && !reader.denseDocsWithValue() ? reader.docsWithValue() : 0;
+        if (!pointWork) {
+          // A rejected lower bound never populates the exact work cache.
+          if (pointLowerBound >= budget) return pointLowerBound;
+          pointWork.emplace();
+          uint64_t cursor = 0;
+          for (const auto& range : pointRanges) {
+            *pointWork += complement ? points->emissionWork(cursor, range.begin)
+                : points->emissionWork(range.begin, range.end);
+            cursor = range.end;
+          }
+          if (complement) *pointWork += points->emissionWork(cursor, points->pointCount());
+        }
+        return NumericIndexPrice::points(*pointWork, emitted, segment.maxDoc(), complement, baseDocs);
       }
 
       double postingsPrice() const {
@@ -1691,11 +1716,19 @@ public:
             : price + PointsMaterialize::price(postings->docFreq, segment.maxDoc());
       }
 
-      std::optional<Production> indexedProducer() const {
+      // Return an exact price only when it beats the competing arm.
+      std::optional<Production> indexedProducer(double budget) const {
         std::optional<Production> best;
-        if (points) best = Production{ScorerArm::POINTS, pointsPrice()};
-        if (postings && (!best || postingsPrice() < best->points)) {
-          best = Production{ScorerArm::POSTINGS, postingsPrice()};
+        if (postings) {
+          double price = postingsPrice();
+          if (price < budget) {
+            best = Production{ScorerArm::POSTINGS, price};
+            budget = price;
+          }
+        }
+        if (points) {
+          double price = pointsPrice(budget);
+          if (price < budget) best = Production{ScorerArm::POINTS, price};
         }
         return best;
       }
@@ -1743,27 +1776,23 @@ public:
       // zones classify the column's blocks (all of them when built for the
       // whole segment) and refine what is reached; a scan tests the values
       // it passes.
-      Production cheapestProducer(Reach reach, int64_t producerSpan) const {
+      Production cheapestProducer(Reach reach, int64_t producerSpan,
+                                  double budget = std::numeric_limits<double>::infinity()) const {
         if (weight.query.forcedArm) return {forcedScorerArm(), 0};
         const auto& costs = column();
-        std::optional<Production> best;
-        if (points) best = Production{ScorerArm::POINTS, pointsPrice()};
+        Production best{ScorerArm::SPARSE_VERIFY, budget};
         if (costs.useZones) {
           double classified = producerSpan >= segment.maxDoc() ? 1.0 : reach.classified;
-          double zones = CLASSIFY_POINTS * (double)reader.numBlocks() * classified
-              + reach.zones * (CHECK_POINTS * costs.checks + costs.inside
-                  + DOC_VISIT_POINTS * costs.docVisits);
-          if (!best || zones < best->points) best = Production{ScorerArm::ZONE_MAP, zones};
+          double price = zonePrice(reader, costs, reach.zones, classified);
+          if (price < best.points) best = {ScorerArm::ZONE_MAP, price};
+        } else if (!points) {
+          // Preserve scan as the fallback when points and prunable zones
+          // are unavailable, including the postings-only case.
+          double price = SCAN_POINTS * reach.scan * (double)reader.numValues();
+          if (price < best.points) best = {ScorerArm::SCAN, price};
         }
-        // Preserve the calibrated column policy: scan is the fallback when
-        // neither points nor structurally prunable zones are available.
-        if (!best) {
-          best = Production{ScorerArm::SCAN,
-              SCAN_POINTS * reach.scan * (double)reader.numValues()};
-        }
-        auto indexed = indexedProducer();
-        if (indexed && indexed->points < best->points) best = indexed;
-        return *best;
+        auto indexed = indexedProducer(best.points);
+        return indexed ? *indexed : best;
       }
 
       double estimatedMatches() const {
@@ -1982,7 +2011,7 @@ public:
               ? std::min(demand.candidates, (int64_t)std::ceil(demand.expectedCandidates))
               : demand.candidates;
           double verify = PointsMaterialize::verifyPrice(verifiableCandidates(candidates), demand);
-          auto producer = indexedProducer();
+          auto producer = indexedProducer(verify);
           return {producer && producer->points < verify ? producer->arm : ScorerArm::SPARSE_VERIFY,
                   Consumption::CANDIDATES};
         }
@@ -1991,9 +2020,6 @@ public:
           // pulls the candidates of its lead, or those the consumer expects
           // to reach this clause.
           bool windows = fillsExposedWindows(context);
-          Production producer = cheapestProducer(
-              windows ? windowReach(context.expectedSpan) : pullReach(demand.span),
-              context.expectedSpan);
           // A pull verifier sees only the candidates its approximation, the
           // documents with a value, lands on.
           double candidates = windows ? (double)demand.candidates
@@ -2001,11 +2027,15 @@ public:
                   ? std::min(demand.expectedCandidates, (double)reader.docsWithValue())
                   : (double)demand.span;
           double verify = PointsMaterialize::verifyPrice(candidates, demand);
+          Production producer = cheapestProducer(
+              windows ? windowReach(context.expectedSpan) : pullReach(demand.span),
+              context.expectedSpan, verify);
           return {verify <= producer.points ? ScorerArm::SPARSE_VERIFY : producer.arm,
                   Consumption::WINDOWS};
         }
-        Production producer = cheapestProducer(windowReach(demand.span), demand.span);
-        if (eitherVerifyPoints(demand) <= producer.points) {
+        double verify = eitherVerifyPoints(demand);
+        Production producer = cheapestProducer(windowReach(demand.span), demand.span, verify);
+        if (verify <= producer.points) {
           return {ScorerArm::SPARSE_VERIFY, Consumption::CANDIDATES};
         }
         return {producer.arm, Consumption::WINDOWS};
@@ -2183,8 +2213,15 @@ public:
             points(points), postings(postings), blockPlans(planPool, reader, weight.query),
             pointRanges(pointRanges), pointValueCount(pointValueCount),
             estimatedCost(estimatedCost), matchState(matchState), allMatch(allMatch) {
-        if (summary) columnCosts = priceColumn(*summary);
-
+        if (summary) columnCosts = priceColumn(reader, *summary);
+        if (points) {
+          bool complement = useComplement(pointValueCount);
+          uint64_t emitted = complement ? points->pointCount() - pointValueCount : pointValueCount;
+          uint64_t baseDocs = complement && !reader.denseDocsWithValue() ? reader.docsWithValue() : 0;
+          // Once per supplier, O(intervals); every budget probe is O(1).
+          pointLowerBound = NumericIndexPrice::pointsLowerBound(pointRanges, points->pointCount(),
+              points->maxPointsPerLeaf(), emitted, segment.maxDoc(), complement, baseDocs);
+        }
       }
 
       int64_t cost() override { return estimatedCost; }
