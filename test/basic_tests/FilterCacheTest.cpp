@@ -163,6 +163,20 @@ public:
   }
 };
 
+class CandidateTailFiltersGuard {
+  bool saved;
+
+public:
+  explicit CandidateTailFiltersGuard(bool disabled)
+    : saved(BooleanQuery::disableCandidateTailFiltersForTests) {
+    BooleanQuery::disableCandidateTailFiltersForTests = disabled;
+  }
+
+  ~CandidateTailFiltersGuard() {
+    BooleanQuery::disableCandidateTailFiltersForTests = saved;
+  }
+};
+
 class CandidateTermFeedFractionGuard {
   int64_t saved;
 
@@ -3836,6 +3850,80 @@ TEST(FilterCacheIntegrationTest,
             termFeedDisabled.postingsFeedEngagements);
   EXPECT_EQ(enabled.scoreWindows, termFeedDisabled.scoreWindows);
   EXPECT_EQ(0, termFeedDisabled.termFeedEngagements);
+}
+
+// Two boolean filter clauses: the cheaper one leads the candidate feed and
+// the other is probed per candidate. Top hits must match the plan that
+// declines the candidate route, with both filter provenances.
+TEST(FilterCacheIntegrationTest, filterLedCandidateProbesSecondFilter) {
+  LuxirConfig cachedConfig;
+  cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
+  LuxirConfig uncachedConfig;
+  uncachedConfig.queryCacheBytes = 0;
+  LuxirNode cachedNode(cachedConfig);
+  LuxirNode uncachedNode(uncachedConfig);
+  constexpr std::string_view collection = "filter_led_tail_filters";
+  ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
+  ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
+
+  auto run = [&](LuxirNode& node, bool prohibit, bool disabled) {
+    CandidateTailFiltersGuard tailGuard(disabled);
+    OwnedFilterStatsGuard statsGuard;
+    auto request = luxir::test::localReq(node.getSearchEngine());
+    request->collection(collection);
+    auto& cursor = request->topDocs("q");
+    // No exact count: count routes record batch engagements of their own.
+    cursor.withStats().fields({"id"}).limit(5);
+    auto& mr = cursor.mr();
+    std::vector<api::Query> prohibited;
+    if (prohibit) {
+      prohibited.push_back(luxir::test::qb::match(mr, "body_w", "rare"));
+    }
+    std::vector<api::Query> required{
+        luxir::test::qb::match(mr, "body_w", "alpha"),
+        luxir::test::qb::match(mr, "body_w", "gamma")};
+    std::vector<api::Query> filters{
+        luxir::test::qb::match(mr, "filter_w", "selected"),
+        luxir::test::qb::match(mr, "second_filter_w", "wide")};
+    cursor.rawQuery() = luxir::test::qb::boolean(
+        mr, required, {}, prohibited, filters);
+    request->execute(false);
+    EXPECT_TRUE(request->ok()) << request->errorMsg();
+    ExactFilteredConjResult result;
+    result.count = request->getMatchCount("q");
+    const auto* list = request->docList("q");
+    if (list != nullptr) {
+      const auto* ids = std::get_if<api::ColStr>(
+          &list->columns.find("id")->kind);
+      const auto* scores = std::get_if<api::ColFloat>(
+          &list->columns.find("_score_")->kind);
+      if (ids != nullptr && scores != nullptr) {
+        for (auto id : ids->v) result.ids.emplace_back(id);
+        result.scores.assign(scores->v.begin(), scores->v.end());
+      }
+    }
+    result.batchEngagements = SkipStats::filteredConjBatchEngagements;
+    return result;
+  };
+
+  for (bool prohibit : {false, true}) {
+    for (LuxirNode* node : {&cachedNode, &uncachedNode}) {
+      SCOPED_TRACE(testing::Message() << "prohibit=" << prohibit
+                   << " cached=" << (node == &cachedNode));
+      run(*node, prohibit, false);
+      run(*node, prohibit, false);
+      ExactFilteredConjResult probed = run(*node, prohibit, false);
+      ExactFilteredConjResult declined = run(*node, prohibit, true);
+      EXPECT_FALSE(probed.ids.empty());
+      expectSameExactFilteredConj(declined, probed);
+      // Postings filters keep whatever route they had before; the cached
+      // DocSets are the ones the second filter used to block.
+      if (node == &cachedNode) {
+        EXPECT_GT(probed.batchEngagements, 0);
+        EXPECT_EQ(0, declined.batchEngagements);
+      }
+    }
+  }
 }
 
 TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
