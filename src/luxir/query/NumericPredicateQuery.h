@@ -1548,24 +1548,16 @@ public:
     }
 
     static constexpr double SCAN_POINTS = 6; // test one value of a scanned column
-    // Uncalibrated prices in point emissions for cursor setup and doc decoding.
-    static constexpr double POSTING_TERM_POINTS = 64;
-    static constexpr double POSTING_DOC_POINTS = 2;
-
-    static double postingTraversalPrice(size_t terms, uint64_t docs) {
-      return POSTING_TERM_POINTS * (double)terms + POSTING_DOC_POINTS * (double)docs;
-    }
-
     struct PostingMatches {
       std::span<const TermsEnum::PostingsState> states;
-      uint64_t docFreq = 0;
+      NumericIndexPrice::PostingsWork work;
     };
 
     std::optional<PostingMatches> resolvePostings(
         MemPool& pool, IndexReader::Segment& segment, const SegFieldInfo& info,
-        double scanPrice) {
+        double budget) {
       boost::container::small_vector<TermsEnum::PostingsState, 8> states;
-      uint64_t docFreq = 0;
+      NumericIndexPrice::PostingsWork work;
       {
         auto scratch = MemPool::threadLocalPoolGuard();
         TermsEnum terms(scratch.pool(), segment.postingsReader(), info);
@@ -1583,14 +1575,13 @@ public:
           }
           while ((std::string_view)terms.term() <= upper) {
             skipCount(SkipStats::numericPredicatePostingsTerms);
-            uint64_t nextDocFreq = docFreq + terms.docFreq();
-            // Traversal alone already costs more than a full scan. Do not
-            // decode/retain another state or price an incomplete dictionary.
-            if (postingTraversalPrice(states.size() + 1, nextDocFreq) > scanPrice) {
+            work.add(terms.docFreq(), terms.packedBlockCount(), segment.maxDoc());
+            // Price the term's encoding counters before retaining its state;
+            // an incomplete dictionary is not a candidate producer.
+            if (NumericIndexPrice::postings(work, segment.maxDoc()) > budget) {
               return std::nullopt;
             }
             states.push_back(terms.postingsState());
-            docFreq = nextDocFreq;
             if (!terms.nextTerm()) { exhausted = true; break; }
           }
           if (exhausted) break;
@@ -1600,7 +1591,7 @@ public:
       // after its scratch guard has rewound.
       auto retained = pool.make_span<TermsEnum::PostingsState>(states.size());
       std::copy(states.begin(), states.end(), retained.begin());
-      return PostingMatches{retained, docFreq};
+      return PostingMatches{retained, work};
     }
 
     const PostingsReader::Field* segmentInfo(IndexReader::Segment& segment) const {
@@ -1711,9 +1702,9 @@ public:
 
       double postingsPrice() const {
         assert(postings);
-        double price = postingTraversalPrice(postings->states.size(), postings->docFreq);
+        double price = NumericIndexPrice::postings(postings->work, segment.maxDoc());
         return postings->states.size() <= 1 ? price
-            : price + PointsMaterialize::price(postings->docFreq, segment.maxDoc());
+            : price + NumericIndexPrice::postingsUnion(postings->work.docs, segment.maxDoc());
       }
 
       // Return an exact price only when it beats the competing arm.
@@ -1818,7 +1809,7 @@ public:
 
       Materialized materializePostings(MemPool& pool) {
         assert(postings);
-        if (PointsMaterialize::useBitset(postings->docFreq, segment.maxDoc())) {
+        if (PointsMaterialize::useBitset(postings->work.docs, segment.maxDoc())) {
           auto words = pool.make_span_zeroed<uint64_t>(FixedBitSet::sizeInWords(segment.maxDoc()));
           for (const auto& state : postings->states) {
             DocsOnlyEnum docs(state);
@@ -1826,7 +1817,7 @@ public:
           }
           return {{}, words.data()};
         }
-        auto matches = pool.make_span<int32_t>((size_t)postings->docFreq);
+        auto matches = pool.make_span<int32_t>((size_t)postings->work.docs);
         size_t size = 0;
         for (const auto& state : postings->states) {
           DocsOnlyEnum docs(state);
@@ -1834,7 +1825,7 @@ public:
             matches[size++] = doc;
           }
         }
-        assert(size == postings->docFreq);
+        assert(size == postings->work.docs);
         boost::sort::spreadsort::integer_sort(matches.begin(), matches.end());
         auto end = std::unique(matches.begin(), matches.end());
         return {matches.first((size_t)(end - matches.begin())), nullptr};
@@ -2159,7 +2150,7 @@ public:
       };
 
       int64_t exactCount() {
-        if (postings && !reader.multiValued()) return (int64_t)postings->docFreq;
+        if (postings && !reader.multiValued()) return (int64_t)postings->work.docs;
         if (points != nullptr && !reader.multiValued()) {
           return (int64_t)pointValueCount;
         }
@@ -2469,13 +2460,32 @@ public:
       std::optional<PostingMatches> postings;
       if ((!allMatch || query.forcedArm == ScorerArm::POSTINGS)
           && (segInfo->flags & FieldType::INDEX_DOCS)) {
-        postings = resolvePostings(targetPool, segment, *segInfo,
-            query.forcedArm == ScorerArm::POSTINGS ? std::numeric_limits<double>::infinity()
-                : SCAN_POINTS * (double)reader->numValues());
+        if (!summary) {
+          summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
+          if (query.isExactSet() && !allMatch) {
+            summary->insideLower = summary->insideUpper = 0;
+          }
+        }
+        double budget = SCAN_POINTS * (double)reader->numValues();
+        auto costs = priceColumn(*reader, *summary);
+        if (costs.useZones) budget = std::min(budget, zonePrice(*reader, costs));
+        if (query.forcedArm == ScorerArm::POSTINGS) budget = std::numeric_limits<double>::infinity();
+        int64_t termsLower = 0;
+        if (!reader->multiValued()) {
+          termsLower = NumericIndexPrice::postingsTermLowerBound(
+              summary->insideLower, segInfo->sumDocFreq, segInfo->nTerms);
+          if (!query.isExactSet()) {
+            termsLower = std::max(termsLower, NumericIndexPrice::postingsDomainLowerBound(
+                segInfo->nTerms, colMin, colMax, query.getLo(), query.getHi()));
+          }
+        }
+        if (NumericIndexPrice::TERM_POINTS * (double)termsLower <= budget) {
+          postings = resolvePostings(targetPool, segment, *segInfo, budget);
+        }
       }
       if (postings) {
-        cost = (int64_t)std::min<uint64_t>(postings->docFreq, reader->docsWithValue());
-        matchState = postings->docFreq == 0 ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
+        cost = (int64_t)std::min<uint64_t>(postings->work.docs, reader->docsWithValue());
+        matchState = postings->work.docs == 0 ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else if (segInfo->pointsMetaOff != 0) {
         points = targetPool.make<PointsReader>(segment.postingsReader(), *segInfo);
         if (points->pointCount() != (uint64_t)reader->numValues()) {
@@ -2496,7 +2506,7 @@ public:
         matchState = pointValueCount == 0
             ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
-        summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
+        if (!summary) summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
         // An exact set's envelope proves rejection, never inclusion in gaps.
         if (query.isExactSet() && !allMatch) {
           summary->insideLower = summary->insideUpper = 0;

@@ -302,6 +302,66 @@ TEST_F(NumericRangePointsTest, rejectedPointsBudgetDoesNotCacheTheLowerBound) {
   }
 }
 
+TEST_F(NumericRangePointsTest, postingsWalkUsesTheZoneBudget) {
+  constexpr int32_t N = 8192;
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"sorted", "collisions", "shuffled", "multi"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::INT;
+    field.index = api::FieldDef::IndexMode::MATCH;
+    field.multi = name == std::string_view("multi")
+        ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
+  std::vector<int64_t> shuffled(N);
+  std::iota(shuffled.begin(), shuffled.end(), 0);
+  SplitMix64 rng(0x5eed);
+  for (int32_t i = N; i > 1; i--) std::swap(shuffled[(size_t)i - 1], shuffled[(size_t)rng.rint(i)]);
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    inverter.getIndexHandler("sorted").index(inverter, (int64_t)doc);
+    int64_t collision = doc >= N / 4 && doc < N / 4 + 16 ? N / 4 : doc;
+    inverter.getIndexHandler("collisions").index(inverter, collision * 1000);
+    inverter.getIndexHandler("shuffled").index(inverter, shuffled[(size_t)doc]);
+    const int64_t multi[] = {doc, doc + N};
+    inverter.getIndexHandler("multi").index(inverter, std::span<const int64_t>(multi));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  for (std::string_view name : {"sorted", "collisions", "shuffled", "multi"}) {
+    int64_t scale = name == "collisions" ? 1000 : 1;
+    int64_t lo = N / 4 * scale, hi = (3 * N / 4 - 1) * scale;
+    auto& segment = reader->segments()[0];
+    IntColReader column(segment.postingsReader(), *reader->field(name).at(segment.ord));
+    if (name == "shuffled") {
+      EXPECT_EQ(0, column.leafMeta().summarizeRange(lo, hi).insideLower);
+    }
+    EXPECT_EQ(name == "multi", column.multiValued());
+    for (bool forced : {false, true}) {
+      SkipStatsScope stats;
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      NumericPredicateQuery query(name, lo, hi);
+      if (forced) query.forcedArm = NumericPredicateQuery::ScorerArm::POSTINGS;
+      auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+      ASSERT_NE(nullptr, supplier);
+      if (forced) {
+        EXPECT_EQ(N / 2 - (name == "collisions" ? 15 : 0), SkipStats::numericPredicatePostingsTerms);
+      } else if (name == "multi") {
+        EXPECT_GT(SkipStats::numericPredicatePostingsTerms, 0);
+      } else {
+        EXPECT_EQ(0, SkipStats::numericPredicatePostingsTerms);
+      }
+      EXPECT_EQ(N / 2, collect(buildScorerForTests(pool, *supplier, INT64_MAX)).size());
+    }
+  }
+}
+
 TEST_F(NumericRangePointsTest, plansAndBuildsTheRequestedArm) {
   using Arm = NumericPredicateQuery::ScorerArm;
   constexpr int32_t N = 4096;

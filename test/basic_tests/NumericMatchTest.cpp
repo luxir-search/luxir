@@ -264,8 +264,8 @@ TEST_F(NumericMatchTest, dictionaryResolutionIsBoundedByColumnScan) {
     } else if (narrow) {
       EXPECT_EQ(1, SkipStats::numericPredicatePostingsTerms);
     } else {
-      EXPECT_GT(SkipStats::numericPredicatePostingsTerms, 0);
-      EXPECT_LT(SkipStats::numericPredicatePostingsTerms, N / 2);
+      // The metadata term bound rejects this range before opening terms.
+      EXPECT_EQ(0, SkipStats::numericPredicatePostingsTerms);
     }
     auto actual = collect(buildScorerForTests(pool, *supplier, INT64_MAX));
     EXPECT_EQ(narrow ? 1 : 0, SkipStats::numericPredicatePostingsArms);
