@@ -5,6 +5,7 @@
 #include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/search/HitDecorator.h"
+#include "luxir/search/LanePolicy.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
@@ -25,6 +26,8 @@ struct Registries {
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
   HitDecoratorRegistry& hitDecorators;
+  // Serial or parallel execution of max_parallel 0 requests (search.lane-policy).
+  LanePolicyRegistry& lanePolicies;
 
   static Registries global();
   // Freezes every registry.

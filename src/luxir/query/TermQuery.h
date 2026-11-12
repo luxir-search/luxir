@@ -187,6 +187,10 @@ public:
       return countBound(segment, domain, docs, CountHow::METADATA);
     }
 
+    double workUnits(IndexReader::Segment& segment) override {
+      return work::postings(cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0, segment.maxDoc());
+    }
+
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The
     // default supplier reports maxDoc for every clause, which is useless for

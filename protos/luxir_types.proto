@@ -54,7 +54,7 @@ message SearchRequest {
 
   // Intra-request parallelism: 0 (default) lets the engine choose: serial
   // (over HTTP normally inline on the receiving thread, over gRPC on the shared
-  // executor) unless the operator's search.auto-parallel-min-work admits it.
+  // executor) unless the lane policy admits it (search.auto-parallel-min-saving-us).
   // 1 runs serially on the shared executor; -1 permits unlimited parallelism,
   // with shared workers joining in (starting on the receiving HTTP thread, or
   // on the shared executor over gRPC). Other values are rejected.
@@ -1703,6 +1703,22 @@ message ServiceStats {
   HistogramStats search_execution = 7;
   uint64 search_resource_exhausted = 8;
   uint64 search_warnings = 9;
+  // max_parallel 0 searches the lane policy ran serially.
+  uint64 search_lane_serial = 26;
+  // max_parallel 0 searches that would have run in parallel, but ran serially
+  // because other searches held the workers.
+  uint64 search_lane_serial_busy = 27;
+  // max_parallel 0 searches the lane policy ran in parallel.
+  uint64 search_lane_parallel = 28;
+  // max_parallel 0 searches that started serially, to fan out if they outlast
+  // their budget.
+  uint64 search_lane_probe = 29;
+  // Probing searches that outlasted their budget and fanned out.
+  uint64 search_lane_escalated = 30;
+  // Searches currently executing.
+  uint64 search_active = 31;
+  // The lane policy's nanoseconds per work unit; zero when not applicable.
+  double search_ns_per_work_unit = 32;
   ActivityStats index_batches = 10;
   // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
   uint64 documents_accepted = 11;

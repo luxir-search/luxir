@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <luxir/util/heap.h>
+#include "luxir/search/WorkModel.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
@@ -1793,6 +1794,12 @@ public:
     virtual CountShortcut countShortcut(IndexReader::Segment& segment,
                                          DocSet* domain) {
       return countBound(segment, domain, segment.maxDoc());
+    }
+
+    /// Estimated cost of visiting every match in the segment, in work units
+    /// (search/WorkModel.h). Metadata-only, under countShortcut's contract.
+    virtual double workUnits(IndexReader::Segment& segment) {
+      return (double)countShortcut(segment, nullptr).maxMatches * work::MATCH;
     }
 
     /// Policy family for choosing the sparse-filtered top-k density knee.

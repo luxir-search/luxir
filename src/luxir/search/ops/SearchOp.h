@@ -174,13 +174,27 @@ public:
   // domain whole, as a list or a fusion does.
   virtual bool ownsMatchDomain() const { return false; }
 
-  // Upper bound on the documents this op and its children visit, from index
-  // metadata alone (see SearchConfig::auto_parallel_min_work).
-  virtual size_t workEstimate() {
-    size_t total = 0;
-    for (auto& [name, subOp] : subOps) {
-      total = saturatingAdd(total, subOp->workEstimate());
-    }
+  // Adds the work of this op and its children, from index metadata alone (see
+  // LanePolicy). Plugin ops override these to price themselves.
+  virtual void quoteWork(WorkQuote& quote) {
+    for (auto& [name, subOp] : subOps) subOp->quoteWork(quote);
+  }
+
+  // Cost of consuming `matches` documents of a segment handed down by the
+  // parent. An op that finds its own matches quotes them in quoteWork instead.
+  virtual double consumeUnits(IndexReader::Segment& segment, int64_t matches) {
+    if (ownsMatchDomain()) return 0.0;
+    return (double)matches * work::MATCH + subOpsConsumeUnits(segment, matches);
+  }
+
+  // Cost of working over the whole segment as a top-level op.
+  virtual double scanUnits(IndexReader::Segment& segment) {
+    return consumeUnits(segment, segment.numLive());
+  }
+
+  double subOpsConsumeUnits(IndexReader::Segment& segment, int64_t matches) {
+    double total = 0;
+    for (auto& [name, subOp] : subOps) total += subOp->consumeUnits(segment, matches);
     return total;
   }
 

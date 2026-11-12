@@ -4150,7 +4150,7 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
 // The engine's own parallel lane resumes inside the arena too.
 TEST_F(HttpApiTest, backpressurePausesAutoParallelEmitter) {
   LuxirConfig config;
-  config.search.auto_parallel_min_work = 1;
+  config.search.lane_policy = "always";
   LuxirNode node(config);
   CollectionHelper ch(node, "http_bp");
   auto docs = backpressureDocs();

@@ -6,12 +6,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+
 #include "ExampleQuery.h"
 #include "ExampleNodeState.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/JsonRequest.h"
 #include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
@@ -20,6 +23,8 @@
 #include "test/TestUtils.h"
 
 void exampleThrowOnNodeStateCreation(bool value);
+std::atomic<int>& exampleLaneEscalations();
+std::string& exampleLaneTenant();
 
 using namespace luxir;
 using namespace luxir::test;
@@ -289,6 +294,57 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   // Out-of-tree plugins may register more operations beside the example's.
   EXPECT_NE(std::string::npos, unknown.body().find("unknown search op 'nope'; registered plugin operations: ")) << unknown.body();
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
+}
+
+TEST(LanePolicyPluginTest, policyProbesAndEscalatesWithoutChangingResults) {
+  initPlugins(addConfiguredPlugins);
+  LuxirConfig config;
+  config.search.lane_policy = "example_probe";
+  LuxirNode node(config);
+  CollectionHelper helper(node, "lanes");
+  for (int batch = 0; batch < 4; batch++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 200; doc++) {
+      docs.push_back(flatdoc("id", std::to_string(batch) + "_" + std::to_string(doc),
+                             "body_w", doc % 2 ? "alpha beta" : "alpha", "rank_i", (int64_t)(doc % 11)));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto run = [&](std::string_view body, int maxParallel) {
+    auto req = localReq(node.getSearchEngine());
+    parseQueryRequest(body, req->rawRequest(), req->mr);
+    req->collection("lanes");
+    req->execute(maxParallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  auto ids = [](const LocalReq& req) {
+    std::vector<std::string> out;
+    const auto& column = std::get<api::ColStr>(req.docList("q")->columns.find("id")->kind);
+    for (auto id : column.v) out.emplace_back(id);
+    return out;
+  };
+  exampleLaneEscalations() = 0;
+  for (std::string_view body : std::initializer_list<std::string_view>{
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha body_w:beta","get_scores":true,
+          "count_limit":-1,"fields":["id"],"limit":25}}}})",
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha","count_limit":-1,"sort":"rank_i desc",
+          "fields":["id"],"limit":25}}}})"}) {
+    auto probed = run(body, 0);
+    auto serial = run(body, 1);
+    EXPECT_TRUE(probed->laneEscalated) << body;
+    EXPECT_FALSE(probed->autoParallel) << body;
+    EXPECT_EQ(serial->getMatchCount("q"), probed->getMatchCount("q")) << body;
+    EXPECT_EQ(ids(*serial), ids(*probed)) << body;
+  }
+  EXPECT_EQ(2, exampleLaneEscalations());
+}
+
+TEST(LanePolicyPluginTest, unknownPolicyFailsNodeStartup) {
+  initPlugins(addConfiguredPlugins);
+  LuxirConfig config;
+  config.search.lane_policy = "no_such_policy";
+  EXPECT_THROW(LuxirNode node(config), std::invalid_argument);
 }
 
 TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {

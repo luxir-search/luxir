@@ -632,27 +632,31 @@ public:
 
   bool ownsMatchDomain() const override { return true; }
 
-  // Counting and ranking are priced apart, each at the matches it may visit.
-  // A count that metadata answers costs nothing, and score-ordered
-  // constant-score ranking stops at the first K. Sub-ops need every match. A
-  // prepared query's work is not a document count; it adds none.
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    if (weight == nullptr || weight->needsPrepare()) return total;
+  // A count metadata answers costs nothing, and score-ordered constant-score
+  // ranking stops at the first K. Sub-ops and an unbounded iterated count must
+  // visit every match; ranking and a bounded count may prune, so their cost is
+  // only an upper bound. A prepared query's work is not priced here.
+  void quoteWork(WorkQuote& quote) override {
+    SearchOp::quoteWork(quote);
+    if (weight == nullptr) {
+      for (auto& segment : req.reader->segments()) {
+        quote.required[(size_t)segment.ord] += subOpsConsumeUnits(segment, segment.numLive());
+      }
+      return;
+    }
+    if (weight->needsPrepare()) return;
     bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
     for (auto& segment : req.reader->segments()) {
       auto shortcut = weight->countShortcut(segment, nullptr);
-      auto matches = (size_t) shortcut.maxMatches;
-      size_t counting = !requirements.needsCount()
-              || shortcut.how == Query::CountHow::METADATA
-          ? 0 : matches;
-      size_t ranking = !requirements.needRankedDocs ? 0
-          : firstK ? std::min(matches, (size_t) std::max<int64_t>(topCount, 0))
-          : matches;
-      size_t work = subOps.empty() ? std::max(counting, ranking) : matches;
-      total = saturatingAdd(total, work);
+      bool counting = requirements.needsCount() && shortcut.how != Query::CountHow::METADATA;
+      auto ord = (size_t)segment.ord;
+      if (!subOps.empty() || (counting && !boundedCount)) {
+        quote.required[ord] += weight->workUnits(segment)
+            + subOpsConsumeUnits(segment, shortcut.maxMatches);
+      } else if (counting || (requirements.needRankedDocs && !firstK)) {
+        quote.prunable[ord] += weight->workUnits(segment);
+      }
     }
-    return total;
   }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -1408,12 +1412,47 @@ public:
             fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
             op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
       }
+      if constexpr (!Structural) {
+        if (tg == nullptr && op.req.laneProbing && subCalcs.empty() && domains.size() > 1) {
+          probeSegments<MetricGroups, Admission>(domains, order);
+          return;
+        }
+      }
       task_group_fanout(tg, domains.size(), [&](size_t i) {
         int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
           doCollect<Structural, MetricGroups, Admission>(tg, segnum, domain);
         };
+      });
+    }
+
+    // The PROBE lane: visit segments serially in serial order until the
+    // request outlasts its budget, then fan out the rest. Work a cheap request
+    // never needed is never spawned. The fan-out completes here, so the
+    // request otherwise stays on the serial lane.
+    template <bool MetricGroups, typename Admission>
+    void probeSegments(std::span<const DomainHandle> domains, const std::vector<int32_t>& order) {
+      auto& op = thisOp();
+      size_t n = domains.size();
+      auto segmentAt = [&](size_t i) { return order.empty() ? (int32_t)i : order[i]; };
+      size_t next = 0;
+      while (next < n) {
+        int32_t segnum = segmentAt(next++);
+        doCollect<false, MetricGroups, Admission>(nullptr, segnum, domains[(size_t)segnum]);
+        if (n - next >= 2 && op.req.laneShouldEscalate()) break;
+      }
+      if (next == n) return;
+      op.req.runInArena([&] {
+        TaskGroupRunner runner;
+        // Reversed, so the next segment in serial order runs on this thread.
+        task_group_fanout(runner.group(), n - next, [&](size_t i) {
+          int32_t segnum = segmentAt(n - 1 - i);
+          return [this, segnum, domain = domains[(size_t)segnum]]() {
+            doCollect<false, MetricGroups, Admission>(nullptr, segnum, domain);
+          };
+        });
+        runner.join();
       });
     }
 

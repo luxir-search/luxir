@@ -526,3 +526,25 @@ ALL and NONE report no terms and no leaf. Other opaque queries report leaf.
 Case-insensitive MATCH shows execution's representation: leaf until a scored
 weight has populated the shared case-variant rewrite, then its variant terms.
 Inspection never forces that rewrite or changes later unscored execution.
+
+## Lane policies
+
+`Registries::lanePolicies` registers a maker receiving the node and returning a
+`LanePolicy` (`luxir/search/LanePolicy.h`). `search.lane-policy` selects one per
+node; an unknown name fails node construction. The policy chooses the lane of
+each `max_parallel: 0` request; `1` and `-1` are never consulted.
+
+`decide(LaneFacts)` sees the tenant and collection, the request's priced work
+(required, and prunable upper bound, with the largest segment of each), and the
+node's workers. It returns `SERIAL`, `PARALLEL`, or `PROBE` with a budget: a
+probing request runs serially and fans out its remaining segments once it
+outlasts the budget, if workers are spare. Setting `observe` on the decision
+reports wall and thread CPU time to `observe()` after execution, which is how a
+policy learns; sample rather than observing every request. Both run
+concurrently on the request path and must not block. A lane never changes
+matches, order, scores or exact counts, so a policy cannot affect correctness.
+
+Plugin queries and ops are priced by the same model. Override
+`Query::Weight::workUnits` to price a query; the default is its `countShortcut`
+bound at a generic rate. Override `SearchOp::quoteWork` for an op that finds its
+own matches, or `consumeUnits` and `scanUnits` for one consuming a domain.

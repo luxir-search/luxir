@@ -5938,10 +5938,14 @@ TEST_F(SearchEngineTest, exactCountComposesForUnfilteredTextQueries) {
 }
 
 TEST_F(SearchEngineTest, autoParallelIsAnOperatorOptIn) {
-  LuxirConfig config;
-  config.search.auto_parallel_min_work = 100;
-  LuxirNode node(config);
-  for (LuxirNode* target : {&node, luxirNode}) {
+  LuxirConfig costConfig;
+  costConfig.search.auto_parallel_min_saving_us = 1;
+  costConfig.search.auto_parallel_ns_per_unit = 1000;
+  LuxirConfig alwaysConfig;
+  alwaysConfig.search.lane_policy = "always";
+  LuxirNode cost(costConfig);
+  LuxirNode always(alwaysConfig);
+  for (LuxirNode* target : {&cost, &always, luxirNode}) {
     CollectionHelper helper(*target, "auto_parallel");
     for (int32_t batch = 0; batch < 3; batch++) {
       std::vector<Doc> docs;
@@ -5949,7 +5953,8 @@ TEST_F(SearchEngineTest, autoParallelIsAnOperatorOptIn) {
         docs.push_back(flatdoc(
             "id", "parallel_" + std::to_string(batch) + "_" + std::to_string(doc),
             "body_w", (doc % 3) == 0 ? "alpha beta" : "alpha",
-            "cat_s", (doc % 2) == 0 ? "even" : "odd"));
+            "cat_s", (doc % 2) == 0 ? "even" : "odd",
+            "rank_i", (int64_t)(doc % 7)));
       }
       ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     }
@@ -5968,27 +5973,91 @@ TEST_F(SearchEngineTest, autoParallelIsAnOperatorOptIn) {
       "query":"body_w:alpha body_w:beta","count_limit":-1,"get_scores":true,
       "fields":["id"],"limit":20}}}})";
 
-  // Past the threshold, max_parallel 0 runs in parallel with the same results.
-  auto parallel = run(node, ranked, 0);
-  auto serial = run(node, ranked, 1);
-  EXPECT_TRUE(parallel->autoParallel);
-  EXPECT_FALSE(serial->autoParallel);
-  EXPECT_EQ(1500, parallel->getMatchCount("q"));
-  EXPECT_EQ(serial->getMatchCount("q"), parallel->getMatchCount("q"));
-  EXPECT_EQ(resultIds(*serial, "q"), resultIds(*parallel, "q"));
-  expectSameScoreMap(resultScoreMap(*serial, "q"), resultScoreMap(*parallel, "q"));
+  // A lane never changes results.
+  for (std::string_view body : std::initializer_list<std::string_view>{
+      ranked,
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha AND body_w:beta","count_limit":-1,
+          "get_scores":true,"fields":["id"],"limit":20}}}})",
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:\"alpha beta\"","count_limit":-1,
+          "get_scores":true,"fields":["id"],"limit":20}}}})",
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha","count_limit":-1,
+          "sort":"rank_i desc","fields":["id"],"limit":20}}}})",
+      R"({"ops":{"q":{"top_docs":{"query":"body_w:beta","count_limit":-1,"fields":["id"],
+          "limit":20,"ops":{"f":{"field_facet":{"field":"cat_s"}}}}}}})"}) {
+    auto parallel = run(always, body, 0);
+    auto serial = run(always, body, 1);
+    EXPECT_TRUE(parallel->autoParallel) << body;
+    EXPECT_FALSE(serial->autoParallel) << body;
+    EXPECT_EQ(serial->getMatchCount("q"), parallel->getMatchCount("q")) << body;
+    EXPECT_EQ(resultIds(*serial, "q"), resultIds(*parallel, "q")) << body;
+    expectSameScoreMap(resultScoreMap(*serial, "q"), resultScoreMap(*parallel, "q"));
+  }
 
+  // Iterated work is priced and fans out.
+  EXPECT_TRUE(run(cost, ranked, 0)->autoParallel);
   // A count that metadata answers is no work, nor is a first-K ranking.
-  EXPECT_FALSE(run(node, R"({"ops":{"q":{"top_docs":{"query":"*:*","count_limit":-1,
+  EXPECT_FALSE(run(cost, R"({"ops":{"q":{"top_docs":{"query":"*:*","count_limit":-1,
       "limit":1}}}})", 0)->autoParallel);
-  // Ranking a term's matches is work, though metadata knows their count.
-  EXPECT_TRUE(run(node, R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha","count_limit":-1,
-      "limit":10}}}})", 0)->autoParallel);
-  // A top-level facet reads the whole collection.
-  EXPECT_TRUE(run(node, R"({"ops":{"f":{"field_facet":{"field":"cat_s"}}}})", 0)->autoParallel);
+  // Pruning decides what ranking a term costs, so it starts serial and probes.
+  auto probed = run(cost, R"({"ops":{"q":{"top_docs":{"query":"body_w:alpha","count_limit":-1,
+      "limit":10}}}})", 0);
+  EXPECT_FALSE(probed->autoParallel);
+  EXPECT_TRUE(probed->laneProbing);
+  // The dictionary answers a top-level string facet.
+  EXPECT_FALSE(run(cost, R"({"ops":{"f":{"field_facet":{"field":"cat_s"}}}})", 0)->autoParallel);
 
   // Without the opt-in, max_parallel 0 stays serial.
-  EXPECT_FALSE(run(*luxirNode, ranked, 0)->autoParallel);
+  auto off = run(*luxirNode, ranked, 0);
+  EXPECT_FALSE(off->autoParallel);
+  EXPECT_FALSE(off->laneProbing);
+}
+
+TEST(LanePolicyTest, costPolicyWeighsSavingAgainstSkewAndLoad) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_saving_us = 500;
+  config.search.auto_parallel_ns_per_unit = 1;
+  LuxirNode node(config);
+  auto policy = LanePolicyRegistry::global().make("cost", node);
+  LaneFacts heavy{.requiredUnits = 5e6, .largestRequiredUnits = 1e6, .viableSegments = 8,
+                  .workers = 4, .spareWorkers = 4};
+  auto expect = [&](const LaneFacts& facts, Lane lane, LaneReason reason) {
+    auto decision = policy->decide(facts);
+    EXPECT_EQ(lane, decision.lane);
+    EXPECT_EQ(reason, decision.reason);
+    return decision;
+  };
+  expect(heavy, Lane::PARALLEL, LaneReason::SAVING);
+
+  auto skewed = heavy;
+  skewed.largestRequiredUnits = 4.9e6;
+  expect(skewed, Lane::SERIAL, LaneReason::BELOW_SAVING);
+
+  auto busy = heavy;
+  busy.spareWorkers = 1;
+  expect(busy, Lane::SERIAL, LaneReason::NO_SPARE_WORKERS);
+
+  auto light = heavy;
+  light.requiredUnits = 1e5;
+  light.largestRequiredUnits = 2e4;
+  expect(light, Lane::SERIAL, LaneReason::BELOW_SAVING);
+
+  LaneFacts pruned{.prunableUnits = 5e6, .largestPrunableUnits = 1e6, .viableSegments = 8,
+                   .workers = 4, .spareWorkers = 4};
+  EXPECT_EQ(500u, expect(pruned, Lane::PROBE, LaneReason::UNKNOWN_WORK).probeBudgetUs);
+}
+
+TEST(LanePolicyTest, costPolicyCalibratesFromObservedRequests) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_saving_us = 500;
+  LuxirNode node(config);
+  auto policy = LanePolicyRegistry::global().make("cost", node);
+  EXPECT_EQ(1.0, policy->nsPerUnit());
+  LaneFacts facts{.requiredUnits = 1e6, .largestRequiredUnits = 1e6, .viableSegments = 1, .workers = 4,
+                  .spareWorkers = 4};
+  for (int i = 0; i < 500; i++) policy->observe(facts, {}, {.cpuNanos = 2'000'000});
+  EXPECT_NEAR(2.0, policy->nsPerUnit(), 0.05);
+  for (int i = 0; i < 500; i++) policy->observe(facts, {}, {.cpuNanos = 1'000'000'000});
+  EXPECT_EQ(4.0, policy->nsPerUnit());
 }
 
 TEST_F(SearchEngineTest,

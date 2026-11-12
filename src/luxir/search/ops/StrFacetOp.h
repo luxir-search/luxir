@@ -358,6 +358,13 @@ public:
 
 public:
 
+  // Over all of a segment's documents, the dictionary's document frequencies
+  // are the counts; only deleted documents need visiting.
+  double scanUnits(IndexReader::Segment& segment) override {
+    if (!subOps.empty()) return consumeUnits(segment, segment.numLive());
+    return (double)(segment.maxDoc() - segment.numLive()) * work::FACET_DOC;
+  }
+
   // ProtobufSearchParser resolves the OrdMap and passes it in
   // (see TopDocsReq's ctor comment).
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,

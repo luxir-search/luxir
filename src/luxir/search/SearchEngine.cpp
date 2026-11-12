@@ -1,6 +1,9 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+#include <ctime>
+#include <format>
 #include <limits>
 #include <optional>
 
@@ -13,6 +16,111 @@
 #include "luxir/reader/SkipStats.h"
 
 namespace luxir {
+
+namespace {
+
+uint64_t threadCpuNanos() {
+  timespec now{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return 0;
+  return (uint64_t)now.tv_sec * 1'000'000'000ull + (uint64_t)now.tv_nsec;
+}
+
+constexpr std::string_view laneName(Lane lane) {
+  switch (lane) {
+    case Lane::SERIAL: return "serial";
+    case Lane::PARALLEL: return "parallel";
+    case Lane::PROBE: return "probe";
+  }
+  return "";
+}
+
+constexpr std::string_view laneReasonName(LaneReason reason) {
+  switch (reason) {
+    case LaneReason::BELOW_SAVING: return "below_saving";
+    case LaneReason::NO_SPARE_WORKERS: return "no_spare_workers";
+    case LaneReason::SAVING: return "saving";
+    case LaneReason::UNKNOWN_WORK: return "unknown_work";
+    case LaneReason::POLICY: return "policy";
+  }
+  return "";
+}
+
+}  // namespace
+
+SearchEngine::SearchEngine(LuxirNode& node)
+  : node(node),
+    lanePolicy(LanePolicyRegistry::global().make(node.getConfig().search.lane_policy, node)) {}
+
+SearchEngine::~SearchEngine() = default;
+
+int SearchEngine::spareWorkers() const {
+  return node.getWorkers() - std::max(0, getActiveSearches() - 1);
+}
+
+bool SearchEngine::shouldEscalate(SearchRequest& req) {
+  if (std::chrono::steady_clock::now() < req.laneProbeDeadline || spareWorkers() < 2) return false;
+  if (!req.laneEscalated) {
+    req.laneEscalated = true;
+    metrics().add(MetricCounter::SEARCH_LANE_ESCALATED);
+  }
+  return true;
+}
+
+bool SearchRequest::laneShouldEscalate() { return engine.shouldEscalate(*this); }
+
+void SearchRequest::runInArena(const std::function<void()>& f) {
+  engine.getNode().executeIsolated(f);
+}
+
+std::optional<LaneFacts> SearchEngine::chooseLane(SearchRequest& req, RootOp& root, LaneDecision& decision) {
+  // SkipStats counters are single-threaded; instrumented runs stay serial.
+  if (req.maxParallel != 0 || req.tg != nullptr || SkipStats::enabled
+      || req.reader->segments().size() <= 1 || !lanePolicy->active()) {
+    return std::nullopt;
+  }
+  WorkQuote quote(req.reader->segments().size());
+  root.quoteWork(quote);
+  LaneFacts facts{.tenant = req.tenant, .collection = req.proto.collection,
+                  .workers = node.getWorkers(), .spareWorkers = spareWorkers()};
+  for (size_t i = 0; i < quote.required.size(); i++) {
+    facts.requiredUnits += quote.required[i];
+    facts.prunableUnits += quote.prunable[i];
+    facts.largestRequiredUnits = std::max(facts.largestRequiredUnits, quote.required[i]);
+    facts.largestPrunableUnits = std::max(facts.largestPrunableUnits, quote.prunable[i]);
+    facts.viableSegments += quote.required[i] > 0 || quote.prunable[i] > 0;
+  }
+  decision = lanePolicy->decide(facts);
+  switch (decision.lane) {
+    case Lane::PARALLEL:
+      metrics().add(MetricCounter::SEARCH_LANE_PARALLEL);
+      break;
+    case Lane::PROBE:
+      req.laneProbing = true;
+      req.laneProbeDeadline = std::chrono::steady_clock::now()
+          + std::chrono::microseconds(decision.probeBudgetUs);
+      metrics().add(MetricCounter::SEARCH_LANE_PROBE);
+      break;
+    case Lane::SERIAL:
+      metrics().add(decision.reason == LaneReason::NO_SPARE_WORKERS
+          ? MetricCounter::SEARCH_LANE_SERIAL_BUSY : MetricCounter::SEARCH_LANE_SERIAL);
+      break;
+  }
+  if (auto* run = req.addExecutionProfileRun(req.addExecutionProfileOp("_lane"))) {
+    auto& piece = run->pieces.at(0);
+    piece.wire.kind = "lane";
+    piece.details = {
+        std::format("lane={} reason={}", laneName(decision.lane), laneReasonName(decision.reason)),
+        std::format("required_units={:.0f} largest_segment_units={:.0f} prunable_units={:.0f}",
+                    facts.requiredUnits, facts.largestRequiredUnits, facts.prunableUnits),
+        std::format("viable_segments={} workers={} spare_workers={} ns_per_unit={:.2f}",
+                    facts.viableSegments, facts.workers, facts.spareWorkers, lanePolicy->nsPerUnit())};
+    piece.complete = true;
+  }
+  LOG_DEBUG("search lane {} reason {} required {:.0f} prunable {:.0f} spare {}", laneName(decision.lane),
+            laneReasonName(decision.reason), facts.requiredUnits, facts.prunableUnits, facts.spareWorkers);
+  if (!decision.observe) return std::nullopt;
+  return facts;
+}
 
 const SearchConfig& SearchEngine::searchConfig() const {
   return node.getConfig().search;
@@ -68,20 +176,25 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
-  // With the operator's opt-in, max_parallel 0 fans a heavy request out across
-  // segments once parsing shows enough work; light requests stay serial and
-  // pay no handoff.
+  // The lane policy may fan a max_parallel 0 request out across segments once
+  // planning has priced it; other requests stay serial and pay no handoff.
   std::optional<oneapi::tbb::task_group> autoTg;
+  LaneDecision laneDecision;
+  std::optional<LaneFacts> observedFacts;
+  std::chrono::steady_clock::time_point observeWall;
+  uint64_t observeCpu = 0;
+  activeSearches.fetch_add(1, std::memory_order_relaxed);
   try {
     root = prepare(req);
     root->init();
-    size_t autoMinWork = searchConfig().auto_parallel_min_work;
-    // SkipStats counters are single-threaded; instrumented runs stay serial.
-    if (autoMinWork > 0 && req.maxParallel == 0 && req.tg == nullptr
-        && !SkipStats::enabled && req.reader->segments().size() > 1
-        && root->workEstimate() >= autoMinWork) {
+    observedFacts = chooseLane(req, *root, laneDecision);
+    if (laneDecision.lane == Lane::PARALLEL) {
       req.tg = &autoTg.emplace();
       req.autoParallel = true;
+    }
+    if (observedFacts) {
+      observeWall = std::chrono::steady_clock::now();
+      observeCpu = threadCpuNanos();
     }
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -105,6 +218,12 @@ void SearchEngine::submitBody(SearchRequest& req) {
       req.tg->wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
+    if (observedFacts) {
+      lanePolicy->observe(*observedFacts, laneDecision, {
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - observeWall).count(),
+          threadCpuNanos() - observeCpu, req.laneEscalated});
+    }
   } catch (std::exception& e) {
     // Cancel and drain in-flight tasks before tearing down their response.
     // Swallow any parked task exception so the original error is preserved.
@@ -126,6 +245,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
     }
     req.setError(info);
   }
+  activeSearches.fetch_sub(1, std::memory_order_relaxed);
 
   if (root != nullptr) {
     for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);

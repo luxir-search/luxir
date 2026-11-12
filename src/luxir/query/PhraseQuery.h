@@ -456,6 +456,19 @@ public:
       }
     }
 
+    // The rarest term leads, and each candidate reads every term's positions.
+    double workUnits(IndexReader::Segment& segment) override {
+      int64_t lead = segment.maxDoc();
+      double positions = 0;
+      for (const auto* termInfo : cachedTermInfos) {
+        const auto* state = termInfo->postingsStates[segment.ord];
+        if (state == nullptr || state->docFreq == 0) return 0.0;
+        lead = std::min<int64_t>(lead, state->docFreq);
+        positions += 1.0 + (double)state->totalTermFreq / (double)state->docFreq;
+      }
+      return (double)lead * positions * work::POSITION;
+    }
+
     std::vector<int32_t> querySlotSourcesForTests(
         IndexReader::Segment& segment, bool disableSort = false,
         bool disableRepeatDedup = false) const {

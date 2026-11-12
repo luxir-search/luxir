@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <string>
 
@@ -10,6 +11,16 @@
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
+
+std::atomic<int>& exampleLaneEscalations() {
+  static std::atomic<int> count{0};
+  return count;
+}
+
+std::string& exampleLaneTenant() {
+  static std::string tenant;
+  return tenant;
+}
 
 namespace luxir::example {
 
@@ -107,6 +118,19 @@ public:
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.lanePolicies.add("example_probe", [](LuxirNode&) {
+      // Fans out after the first segment, and counts what it observes.
+      struct ProbeAtOnce : LanePolicy {
+        LaneDecision decide(const LaneFacts& facts) override {
+          exampleLaneTenant() = facts.tenant;
+          return {.lane = Lane::PROBE, .reason = LaneReason::POLICY, .probeBudgetUs = 0, .observe = true};
+        }
+        void observe(const LaneFacts&, const LaneDecision&, const LaneOutcome& outcome) override {
+          if (outcome.escalated) exampleLaneEscalations().fetch_add(1);
+        }
+      };
+      return std::make_unique<ProbeAtOnce>();
+    });
     // Adds a "label" column holding the configured text to every emitted hit.
     r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
       struct Label : HitDecorator {
