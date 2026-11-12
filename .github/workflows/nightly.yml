@@ -1,0 +1,112 @@
+name: Nightly binaries
+
+on:
+  schedule:
+    - cron: '37 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize tag replacement, including manual dispatches. Never cancel a publish.
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  NIGHTLY_PRESETS: >-
+    container-release container-release-v3 container-release-v4
+    container-debug container-asan
+
+jobs:
+  plan:
+    if: github.event_name != 'schedule' || github.repository == 'luxir-search/luxir'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      build: ${{ steps.plan.outputs.build }}
+      image: ${{ steps.plan.outputs.image }}
+      presets: ${{ steps.plan.outputs.presets }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Sign in to registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Test release assembly
+        run: python3 tools/test-nightly
+      - name: Resolve source and dependency image
+        id: plan
+        run: python3 tools/nightly.py plan
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: ${{ fromJSON(needs.plan.outputs.presets) }}
+    env:
+      LUXIR_DEV_IMAGE: ${{ needs.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          submodules: true
+          persist-credentials: false
+      - name: Sign in to registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build, test, and package
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: BUILD_JOBS=$(nproc) tools/nightly-build "$PRESET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: nightly-${{ matrix.preset }}
+          path: build/nightly/${{ matrix.preset }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Add future platform build jobs to needs. All must succeed before publishing.
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Only the release assembly script is needed. Do not fetch build sources
+      # or run repository build/dependency scripts in this privileged job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+          sparse-checkout: tools/nightly.py
+          sparse-checkout-cone-mode: false
+      - name: Gather build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'nightly-*' --dir "$RUNNER_TEMP/nightly"
+      - name: Replace rolling prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: python3 tools/nightly.py publish "$RUNNER_TEMP/nightly" "$COMMIT" "$IMAGE"

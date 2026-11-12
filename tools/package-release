@@ -10,7 +10,12 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+
+# Packaging requires a clean source tree, including when importing helpers.
+sys.dont_write_bytecode = True
+from release_support import cpu_supported
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -97,8 +102,18 @@ def main():
         parser.error("the build is stale; rebuild and test before packaging")
     binary = directory / "bin/luxir"
     revision = run("git", "rev-parse", "HEAD")
-    if run(str(binary), "--version") != f"Luxir {version} ({tier}) commit {revision}":
-        parser.error("the executable version or source commit does not match its build configuration")
+    # Cross-tier packaging must work even when the loader rejects this binary
+    # on the builder CPU. BuildInfo contains these three NUL-terminated strings.
+    # Check the executable itself, not just the generated source or CMake cache.
+    data = binary.read_bytes()
+    if any(value.encode() + b"\0" not in data for value in (version, tier, revision)):
+        parser.error("the executable metadata does not match its build configuration")
+    runtime_checked = cpu_supported(tier)
+    if runtime_checked:
+        if run(str(binary), "--version") != f"Luxir {version} ({tier}) commit {revision}":
+            parser.error("the executable version or source commit does not match its build configuration")
+    else:
+        print(f"Skipping --version: {tier} not supported on this CPU; checked embedded metadata")
     notes = run("readelf", "-n", str(binary))
     needed_tiers = re.findall(r"x86-64-v[234]", notes)
     if not needed_tiers or max(needed_tiers) != tier:
@@ -129,6 +144,7 @@ def main():
     epoch = run("git", "show", "-s", "--format=%ct", "HEAD")
     manifest = {
         "version": version, "source_commit": revision,
+        "version_runtime_checked": runtime_checked,
         "source_commit_subject": run("git", "show", "-s", "--format=%s", "HEAD"),
         "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
         "builder_image": args.builder_image,

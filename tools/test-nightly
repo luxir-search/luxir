@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Exercise release fan-in and unchanged-source planning without GitHub/Docker."""
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("nightly", Path(__file__).with_name("nightly.py"))
+nightly = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nightly)
+
+
+class NightlyTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="luxir-nightly-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.commit = "a" * 40
+        self.presets = ("container-release", "container-debug")
+        os.environ.setdefault("GITHUB_REPOSITORY", "luxir-search/luxir")
+        os.environ.setdefault("GITHUB_RUN_ID", "123")
+        for preset, status in zip(self.presets, ("fail", "not run on this CPU")):
+            leg = self.root / f"nightly-{preset}"
+            (leg / "assets").mkdir(parents=True)
+            asset = leg / "assets" / f"luxir-0.1.0-linux-x86_64-v2-{preset}.tar.gz"
+            asset.write_bytes(preset.encode())
+            (leg / "assets/SHA256SUMS").write_text(f"{nightly.digest(asset)}  {asset.name}\n")
+            (leg / "result.json").write_text(json.dumps({
+                "preset": preset, "commit": self.commit, "subject": "Fixture", "date": "2026-11-11",
+                "builder_image": "sha256:" + "b" * 64,
+                "tests": {binary: {"status": status, "exit_code": 1 if status == "fail" else None}
+                          for binary in nightly.TESTS}}))
+
+    def assemble(self):
+        return nightly.assemble(self.root, self.commit, "registry:key", self.presets)
+
+    def test_advisory_results_and_combined_checksums(self):
+        assets, notes = self.assemble()
+        self.assertEqual(len(list(assets.iterdir())), 3)
+        for line in (assets / "SHA256SUMS").read_text().splitlines():
+            checksum, name = line.split("  ")
+            self.assertEqual(nightly.digest(assets / name), checksum)
+        self.assertIn("not run on this CPU", notes.read_text())
+        self.assertIn("| fail |", notes.read_text())
+
+    def test_missing_preset_blocks_assembly(self):
+        (self.root / "nightly-container-debug/result.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.assemble()
+
+    def test_wrong_commit_blocks_assembly(self):
+        self.commit = "c" * 40
+        with self.assertRaisesRegex(ValueError, "Wrong source"):
+            self.assemble()
+
+    def test_corruption_blocks_assembly(self):
+        next((self.root / "nightly-container-debug/assets").glob("luxir-*")).write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "Corrupt"):
+            self.assemble()
+
+    def test_missing_asset_blocks_assembly(self):
+        next((self.root / "nightly-container-debug/assets").glob("luxir-*")).unlink()
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            self.assemble()
+
+    def test_unchanged_main_skips_lightweight_and_annotated_tags(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-q", "--allow-empty", "-m", "Fixture")
+        git("remote", "add", "origin", str(repo))
+        for tag_args in ((), ("-a", "-m", "Nightly")):
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "tag", *tag_args, "nightly")
+            output = self.root / "outputs"
+            output.write_text("")
+            subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo, check=True,
+                           env=dict(os.environ, GITHUB_EVENT_NAME="schedule", GITHUB_OUTPUT=str(output),
+                                    NIGHTLY_PRESETS=" ".join(self.presets)))
+            self.assertIn("build=false\n", output.read_text())
+            self.assertIn(f"commit={git('rev-parse', 'HEAD')}\n", output.read_text())
+            git("tag", "-d", "nightly")
+
+
+if __name__ == "__main__":
+    unittest.main()
