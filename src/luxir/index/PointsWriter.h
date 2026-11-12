@@ -41,7 +41,7 @@ void sortPointsByValueDocid(std::span<Point> points) {
 class PointsWriter {
 public:
   static constexpr uint32_t MAGIC = 0x31545053;
-  static constexpr uint16_t VERSION = 1;
+  static constexpr uint16_t VERSION = 2;
   static constexpr uint8_t FORMAT_KIND = 1;
   static constexpr uint32_t FLAG_LEAF_MAX = 1;
   static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF = 512;
@@ -81,6 +81,7 @@ private:
   std::vector<int64_t> leafMin;
   std::vector<int64_t> leafMax;
   std::vector<uint64_t> leafFP;
+  std::vector<uint32_t> leafEncodings;
   std::vector<uint32_t> residuals;
   std::vector<char> encodedDocs;
   std::vector<char> encodedValues;
@@ -192,6 +193,11 @@ private:
       }
     }
 
+    // Two low codec bits; the remaining bits describe doc emission work.
+    uint32_t detail = docCodec == DOC_CONTIG ? docBase & 63
+        : docCodec == DOC_FOR ? docBits : (uint32_t)(encodedDocs.size() / 8);
+    leafEncodings.push_back((detail << 2) | docCodec);
+
     encodedValues.clear();
     if (valueFormat <= 32) {
       residuals.resize(leaf.size());
@@ -291,6 +297,7 @@ public:
     out.write(leafMin.data(), leafMin.size() * sizeof(int64_t));
     out.write(leafMax.data(), leafMax.size() * sizeof(int64_t));
     out.write(leafFP.data(), leafFP.size() * sizeof(uint64_t));
+    out.write(leafEncodings.data(), leafEncodings.size() * sizeof(uint32_t));
 
     return {seg_location(out.streamNumber, pointsStart), (int64_t)pointsMetaOff,
             pointCount, (uint32_t)leafMin.size()};

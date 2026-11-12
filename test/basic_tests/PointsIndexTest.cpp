@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -244,10 +245,11 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
     {1000, 3}, {2000, 4}, {3000, 5},
     {4000, 3}, {5000, 3}, {6000, 5},
     {7000, 5}, {8000, 9}, {9000, 17},
-    {10'000, 0}, {11'000, std::numeric_limits<int32_t>::max()}
+    {10'000, 63}, {11'000, 64}, {12'000, 65},
+    {13'000, 0}, {14'000, std::numeric_limits<int32_t>::max()}
   };
-  withPoints(points, 3, [](const PointsReader& reader, const PointsWriter::Data&,
-                           const InputStream&) {
+  withPoints(points, 3, [](const PointsReader& reader, const PointsWriter::Data& data,
+                           const InputStream& input) {
     EXPECT_EQ(PointsWriter::DOC_CONTIG, reader.leafInfo(0).docCodec);
     EXPECT_EQ(0, reader.leafInfo(0).docBytes);
     EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(1).docCodec);
@@ -255,8 +257,56 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
     EXPECT_EQ(PointsWriter::DOC_BITSET, reader.leafInfo(2).docCodec);
     EXPECT_EQ(0, reader.leafInfo(2).docBits);
     EXPECT_EQ(8, reader.leafInfo(2).docBytes);
-    EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(3).docCodec);
-    EXPECT_EQ(31, reader.leafInfo(3).docBits);
+    EXPECT_EQ(PointsWriter::DOC_CONTIG, reader.leafInfo(3).docCodec);
+    EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(4).docCodec);
+    EXPECT_EQ(31, reader.leafInfo(4).docBits);
+    EXPECT_EQ((3u << 2) | PointsWriter::DOC_CONTIG, reader.leafEncoding(0));
+    EXPECT_EQ((2u << 2) | PointsWriter::DOC_FOR, reader.leafEncoding(1));
+    EXPECT_EQ((1u << 2) | PointsWriter::DOC_BITSET, reader.leafEncoding(2));
+    EXPECT_EQ((63u << 2) | PointsWriter::DOC_CONTIG, reader.leafEncoding(3));
+    EXPECT_EQ((31u << 2) | PointsWriter::DOC_FOR, reader.leafEncoding(4));
+    EXPECT_EQ(input.size() - data.pointsLoc.offset(), reader.sizeInBytes());
+
+    auto work = reader.emissionWork(1, 8);
+    EXPECT_EQ(3, work.leaves);
+    EXPECT_EQ(6, work.decodedBits);
+    EXPECT_EQ(3, work.scattered);
+    EXPECT_EQ(3, work.bitsetWords);
+    EXPECT_EQ(1, work.runWords);
+    EXPECT_EQ(2, work.selects);
+    work = reader.emissionWork(4, 5);
+    EXPECT_EQ(6, work.decodedBits); // One ordinal still decodes three 2-bit values.
+    EXPECT_EQ(1, work.scattered);
+    work = reader.emissionWork(13, 14);
+    EXPECT_EQ(62, work.decodedBits); // The final, short leaf has two values.
+    EXPECT_EQ(1, work.scattered);
+    EXPECT_EQ(0, reader.emissionWork(5, 5).leaves);
+    EXPECT_THROW(reader.emissionWork(0, 15), std::out_of_range);
+
+    auto totals = [](const PointsReader::EmissionWork& value) {
+      return std::tuple(value.leaves, value.decodedBits, value.scattered,
+                        value.bitsetWords, value.runWords, value.selects);
+    };
+    EXPECT_EQ(std::make_tuple(5, 68, 5, 1, 3, 0), totals(reader.emissionWork(0, 14)));
+    // The single-leaf path retains the original boundary accounting. Compare
+    // every range, including all three codecs in the full-leaf interior loop.
+    for (uint64_t begin = 0; begin <= reader.pointCount(); begin++) {
+      for (uint64_t end = begin; end <= reader.pointCount(); end++) {
+        PointsReader::EmissionWork slow;
+        for (uint64_t cursor = begin; cursor < end;) {
+          uint64_t next = std::min(end, reader.leafOrdinalEnd((uint32_t)(cursor / 3)));
+          slow += reader.emissionWork(cursor, next);
+          cursor = next;
+        }
+        EXPECT_EQ(totals(slow), totals(reader.emissionWork(begin, end))) << begin << ":" << end;
+      }
+    }
+
+    std::vector<char> old(input.ptr(0), input.ptr(0) + input.size());
+    uint16_t version = 1;
+    memcpy(old.data() + data.pointsLoc.offset() + data.pointsMetaOff + 4, &version, sizeof(version));
+    InputStream oldInput(old.data(), old.data() + old.size());
+    EXPECT_THROW(PointsReader(oldInput, data.pointsLoc.offset(), data.pointsMetaOff), std::runtime_error);
   });
 
   std::vector<Point> sameDocDuplicates = {{9, 17}, {9, 17}};
