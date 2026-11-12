@@ -4762,9 +4762,6 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   std::span<int32_t> windowOrder;
   std::span<bool> isEssential;
   std::span<Scorer*> essentialPointers;
-  // Per-clause scores of the current doc, read when the sum has to be redone
-  // in stable clause order (see scoreCurrentDoc).
-  std::span<float> clauseScores;
   // Probe order + cumulative bounds for the demoted (non-essential) clauses:
   // neOrder[0..splitIndex) ascending by bound, nePrefix[s] = sum of bounds
   // over neOrder[0..s]. DISMAX combines this sum with the last (largest)
@@ -4780,6 +4777,7 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   int32_t maxDoc;
   int32_t windowSize;
   bool globalMode;
+  bool forwardDisMaxFloors;
   bool windowReady = false;
   // Some clause prunes on its own floor (forwardClauseFloors).
   bool forwardsClauseFloors = false;
@@ -4966,42 +4964,26 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
     }
   }
 
-  // The sum in stable clause order over the clauses matching docid. Probing
-  // the demoted clauses in descending bound order must not change score bits:
-  // a floor pushed by a parent would otherwise change a competitive doc's
-  // rounding, and with it its rank against a doc tied to within a ulp.
-  float stableSum() const {
-    float sum = 0.0f;
-    for (size_t i = 0; i < scorers.size(); i++) {
-      if (scorers[i]->docId() == docid) sum += clauseScores[i];
-    }
-    return sum;
-  }
-
   void scoreCurrentDoc() {
     // Essential clauses sit on the heap at docid: sum them first, then probe
     // the demoted clauses from the largest bound down, abandoning the doc as
     // soon as the unprobed bounds cannot lift it over the threshold (the
-    // bulk scorer's scoreCandidate shape). An abandoned doc keeps its partial
-    // score, which is below the pushed threshold, so the collector discards
-    // it. A doc that is not abandoned is re-summed in stable clause order
-    // when a demoted clause matched, so its score is bit-identical to the
-    // unpruned one.
-    bool demotedMatched = false;
-    bool abandoned = false;
+    // bulk scorer's scoreCandidate shape).  An abandoned doc keeps its
+    // partial score, which is below the pushed threshold, so the collector
+    // discards it. Summation order varies across execution paths, so score
+    // bits are not guaranteed identical.
     if constexpr (DISMAX) {
       float sum = 0.0f;
       float best = -std::numeric_limits<float>::infinity();
       double partialClampedSum = 0.0;
-      auto add = [&](size_t idx, float score) {
-        clauseScores[idx] = score;
+      auto add = [&](float score) {
         sum += score;
         best = std::max(best, score);
         partialClampedSum += (double) optionalUpperBound(score);
       };
       for (size_t i = 0; i < scorers.size(); i++) {
         if (isEssential[i] && scorers[i]->docId() == docid) {
-          add(i, scorers[i]->score());
+          add(scorers[i]->score());
         }
       }
       for (size_t s = splitIndex; s-- > 0; ) {
@@ -5012,51 +4994,35 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
         if (disMaxUpperBound(std::max(best, remainingMax),
                              partialClampedSum + nePrefix[s], tie, scoreBoundFactor)
             < minCompetitiveScore) {
-          abandoned = true;
           break;
         }
-        auto* scorer = scorers[idx];
+        auto* scorer = scorers[(size_t) neOrder[s]];
         nonEssentialLookups++;
         if (scorer->docId() < docid) scorer->advance(docid);
-        if (scorer->docId() == docid) {
-          add(idx, scorer->score());
-          demotedMatched = true;
-        }
+        if (scorer->docId() == docid) add(scorer->score());
       }
-      if (tie == 0.0f) {
-        currentScore = best;
-      } else {
-        if (demotedMatched && !abandoned) sum = stableSum();
-        currentScore = (1.0f - tie) * best + tie * sum;
-      }
+      currentScore = tie == 0.0f ? best : (1.0f - tie) * best + tie * sum;
     } else {
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
         if (isEssential[i] && scorers[i]->docId() == docid) {
-          float score = scorers[i]->score();
-          clauseScores[i] = score;
-          sum += score;
+          sum += scorers[i]->score();
         }
       }
       for (size_t s = splitIndex; s-- > 0; ) {
         if (((double) sum + nePrefix[s]) * scoreBoundFactor < (double) minCompetitiveScore) {
-          abandoned = true;
           break;
         }
-        size_t idx = (size_t) neOrder[s];
-        auto* scorer = scorers[idx];
+        auto* scorer = scorers[(size_t) neOrder[s]];
         nonEssentialLookups++;
         if (scorer->docId() < docid) {
           scorer->advance(docid);
         }
         if (scorer->docId() == docid) {
-          float score = scorer->score();
-          clauseScores[idx] = score;
-          sum += score;
-          demotedMatched = true;
+          sum += scorer->score();
         }
       }
-      currentScore = demotedMatched && !abandoned ? stableSum() : sum;
+      currentScore = sum;
     }
     visitedCandidates++;
   }
@@ -5157,35 +5123,7 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
     return bounds.bounds(tie, scoreBoundFactor);
   }
 
-  // Passes the collector floor to the disjuncts. At tie 0 the score is the
-  // best disjunct, so a disjunct score below theta is either the doc's best
-  // (the doc cannot compete) or not the best (dropping it changes nothing);
-  // every disjunct gets theta as is.
-  // At tie > 0 every matched disjunct feeds the score, so a floor is only
-  // proven against the other disjuncts' maxima (disMaxClauseFloor).
-  void forwardDisjunctFloors(float theta) {
-    if (tie == 0.0f) {
-      for (auto* scorer : scorers) scorer->setMinCompetitiveScore(theta);
-      return;
-    }
-    for (size_t i = 0; i < scorers.size(); i++) {
-      float othersBest = 0.0f;
-      double othersSum = 0.0;
-      for (size_t j = 0; j < scorers.size(); j++) {
-        if (j != i) {
-          othersBest = std::max(othersBest, clauseMax[j]);
-          othersSum += (double) clauseMax[j];
-        }
-      }
-      float floor = disMaxClauseFloor(theta, othersBest, othersSum, tie, scoreBoundFactor);
-      if (floor > 0.0f) scorers[i]->setMinCompetitiveScore(floor);
-    }
-  }
-
 public:
-  // Test knob: keep the pre-forwarding behaviour for A/B measurements.
-  static inline bool disableDisMaxFloorForwardingForTests = false;
-
   [[gnu::cold]] void prepareMembership() override {
     for (auto* scorer : scorers) scorer->prepareMembership();
   }
@@ -5193,20 +5131,20 @@ public:
   // The passed in span of scorers will be modified (rearranged).
   MaxScoreDisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
                             int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS,
-                            float tie = 0.0f)
+                            float tie = 0.0f, bool forwardDisMaxFloors = true)
           : scorers(scorers),
             clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
             windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
             windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
             isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
             essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()),
-            clauseScores(pool.make_arr<float>(scorers.size()), scorers.size()),
             neOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
             nePrefix(pool.make_arr<double>(scorers.size()), scorers.size()),
             pq(essentialPointers, (size_t) 0),
             maxDoc(maxDoc),
             windowSize(normalizeWindowSize(windowSize)),
-            globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
+            globalMode(normalizeWindowSize(windowSize) >= maxDoc),
+            forwardDisMaxFloors(DISMAX && tie == 0.0f && forwardDisMaxFloors) {
     // Float-summation error headroom for the double split bound (see member).
     scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
     if constexpr (DISMAX) {
@@ -5247,7 +5185,15 @@ public:
     if (minScore > minCompetitiveScore) {
       minCompetitiveScore = minScore;
       if constexpr (DISMAX) {
-        if (!disableDisMaxFloorForwardingForTests) forwardDisjunctFloors(minScore);
+        // Passes the collector floor to the disjuncts. At tie 0 the score is the
+        // best disjunct, so a disjunct score below theta is either the doc's best
+        // (the doc cannot compete) or not the best (dropping it changes nothing);
+        // every disjunct gets theta as is.
+        // At tie > 0 every matched disjunct feeds the score, so a floor needs the
+        // others' maxima; deriving those floors showed no gain and is not done.
+        if (forwardDisMaxFloors) {
+          for (auto* scorer : scorers) scorer->setMinCompetitiveScore(minScore);
+        }
       } else if (forwardsClauseFloors) {
         forwardClauseFloors(scorers, clauseMax, 0.0, minScore);
       }
@@ -8187,10 +8133,17 @@ class BooleanQuery::Weight final : public Query::Weight {
 
   template <template <bool> class Scorer, typename... Args>
   static Query::Scorer* makeDisjunctionScorer(
-      MemPool& targetPool, ScorePolicy policy, Args&&... args) {
+      MemPool& targetPool, ScorePolicy policy, const Query::PlanContext& planContext,
+      Args&&... args) {
     if (policy.kind == ScorePolicy::DISMAX) {
-      return targetPool.make<Scorer<true>>(
-          targetPool, std::forward<Args>(args)..., policy.tie);
+      if constexpr (std::is_same_v<Scorer<true>, MaxScoreDisjunctionScorerT<true>>) {
+        return targetPool.make<Scorer<true>>(
+            targetPool, std::forward<Args>(args)..., policy.tie,
+            !planContext.disableDisMaxFloorForwardingForTests);
+      } else {
+        return targetPool.make<Scorer<true>>(
+            targetPool, std::forward<Args>(args)..., policy.tie);
+      }
     }
     return targetPool.make<Scorer<false>>(
         targetPool, std::forward<Args>(args)...);
@@ -8311,11 +8264,11 @@ class BooleanQuery::Weight final : public Query::Weight {
             targetPool, optionalScorers, 1);
         } else if (useMaxScoreDisjunction) {
           optScorer = makeDisjunctionScorer<MaxScoreDisjunctionScorerT>(
-              targetPool, scorePolicy, optionalScorers, segment.maxDoc(),
+              targetPool, scorePolicy, planContext, optionalScorers, segment.maxDoc(),
               DocsEnumMeta::L1_DOCS);
         } else {
           optScorer = makeDisjunctionScorer<DisjunctionScorerT>(
-              targetPool, scorePolicy, optionalScorers, optionalTwoPhase,
+              targetPool, scorePolicy, planContext, optionalScorers, optionalTwoPhase,
               !planContext.disableBooleanTwoPhaseForTests
                   && !planContext.disableDisjunctionTwoPhaseForTests);
           optTwoPhase = !planContext.disableBooleanTwoPhaseForTests

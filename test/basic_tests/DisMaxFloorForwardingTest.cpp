@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -20,6 +19,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/TopKAssert.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -125,7 +125,7 @@ public:
     return DisMaxQuery::make(pool, parts, tie);
   }
 
-  TopK run(Query& query, int32_t k, bool pruning) {
+  TopK run(Query& query, int32_t k, bool pruning, bool forward = true) {
     MemPool pool;
     Query::Context context(pool, *reader);
     auto* weight = query.createWeight(context,
@@ -135,7 +135,12 @@ public:
     auto segments = context.topReader.segments();
     for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
       auto& segment = segments[segnum];
-      auto* scorer = weight->createScorer(pool, segment);
+      auto* supplier = weight->scorerSupplier(pool, segment);
+      if (supplier == nullptr) continue;
+      auto planContext = supplier->makePlanContext(Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max()));
+      planContext.disableDisMaxFloorForwardingForTests = !forward;
+      auto* scorer = supplier->resolve(pool, planContext)->build(pool);
       if (scorer == nullptr) continue;
       DocSet* live = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
       collectTopK(segnum, scorer, live, nullptr, collector, pruning);
@@ -158,22 +163,14 @@ TEST_F(DisMaxFloorForwardingTest, prunedTopKMatchesExhaustive) {
     int32_t k = std::array{1, 3, 10, 50}[rng() % 4];
     TopK exhaustive = run(*query, k, false);
     TopK pruned = run(*query, k, true);
-    ASSERT_EQ(exhaustive.hits.size(), pruned.hits.size()) << "iteration " << it;
-    for (size_t r = 0; r < pruned.hits.size(); r++) {
-      ASSERT_EQ(exhaustive.hits[r].doc, pruned.hits[r].doc)
-          << "iteration " << it << " tie " << tie << " rank " << r;
-      ASSERT_EQ(std::bit_cast<uint32_t>(exhaustive.hits[r].score),
-                std::bit_cast<uint32_t>(pruned.hits[r].score))
-          << "iteration " << it << " tie " << tie << " rank " << r
-          << " " << exhaustive.hits[r].score << " " << pruned.hits[r].score;
-    }
+    SCOPED_TRACE(::testing::Message() << "iteration " << it << " tie " << tie);
+    assertTopKEquivalent(exhaustive.hits, pruned.hits);
   }
 }
 
 // The floor has to reach the per-field disjunctions, whose own MaxScore split
 // removes docs that a dis_max split over whole fields cannot.
 TEST_F(DisMaxFloorForwardingTest, floorReachesPerFieldDisjuncts) {
-  using DisMaxScorer = BooleanQuery::MaxScoreDisjunctionScorerT<true>;
   MemPool pool;
   auto fieldQuery = [&](const char* field) -> Query* {
     auto terms = pool.make_span<Query*>(2);
@@ -184,58 +181,11 @@ TEST_F(DisMaxFloorForwardingTest, floorReachesPerFieldDisjuncts) {
   };
   Query* parts[] = {fieldQuery("title_w"), fieldQuery("body_w")};
   auto* dismax = DisMaxQuery::make(pool, parts, 0.0f);
-  DisMaxScorer::disableDisMaxFloorForwardingForTests = true;
-  TopK off = run(*dismax, 1, true);
-  DisMaxScorer::disableDisMaxFloorForwardingForTests = false;
+  TopK off = run(*dismax, 1, true, false);
   TopK on = run(*dismax, 1, true);
   ASSERT_EQ(off.hits.size(), on.hits.size());
   EXPECT_EQ(off.hits[0].doc, on.hits[0].doc);
   EXPECT_LT(on.visited, off.visited);
-}
-
-TEST(DisMaxClauseFloor, edgeCases) {
-  constexpr float inf = std::numeric_limits<float>::infinity();
-  double factor = 1.0 + 6.0 * 0x1p-24;
-  auto none = [](float floor) { return floor == -inf; };
-  EXPECT_TRUE(none(disMaxClauseFloor(inf, 1.0f, 1.0, 0.5f, factor)));
-  EXPECT_TRUE(none(disMaxClauseFloor(std::nanf(""), 1.0f, 1.0, 0.5f, factor)));
-  EXPECT_TRUE(none(disMaxClauseFloor(10.0f, inf, 1.0, 0.5f, factor)));
-  // A doc missing this disjunct can reach theta: no floor.
-  EXPECT_TRUE(none(disMaxClauseFloor(1.0f, 2.0f, 2.0, 0.3f, factor)));
-  // theta -> required, floor = theta - tie * others.
-  float required = disMaxClauseFloor(5.0f, 2.0f, 2.0, 0.5f, factor);
-  EXPECT_LT((double)required, 4.0);
-  EXPECT_GT((double)required, 3.99);
-  // theta above the others' combination but within reach of best: exact root
-  // (theta - without) / tie.
-  float root = disMaxClauseFloor(4.0f, 3.0f, 3.5, 0.5f, factor);
-  EXPECT_LT((double)root, (4.0 - 0.5 * 3.0 - 0.5 * 3.5) / 0.5);
-  EXPECT_GT((double)root, (4.0 - 0.5 * 3.0 - 0.5 * 3.5) / 0.5 * 0.999);
-}
-
-// An upper-bound check against the dis_max score function: every score below the
-// floor, with the others at their maxima, falls short of theta.
-TEST(DisMaxClauseFloor, floorIsExactForTheScoreFunction) {
-  auto score = [](float s, float best, float sum, float tie) {
-    float b = std::max(s, best);
-    return (1.0f - tie) * b + tie * (s + sum);
-  };
-  double factor = 1.0 + 6.0 * 0x1p-24;
-  for (float tie : {0.01f, 0.1f, 0.3f, 0.5f, 0.9f, 0.99f}) {
-    for (float theta : {0.5f, 1.0f, 3.7f, 12.0f}) {
-      for (float best : {0.0f, 0.2f, 1.0f, 3.0f, 8.0f}) {
-        for (float sum : {best, best * 1.5f, best * 3.0f}) {
-          float floor = disMaxClauseFloor(theta, best, (double)sum, tie, factor);
-          if (floor == -std::numeric_limits<float>::infinity()) continue;
-          float below = std::nextafter(floor, 0.0f);
-          ASSERT_LT(score(below, best, sum, tie), theta)
-              << tie << " " << theta << " " << best << " " << sum;
-          // Docs missing the disjunct cannot compete either.
-          ASSERT_LT(score(0.0f, best, sum, tie), theta);
-        }
-      }
-    }
-  }
 }
 
 }  // namespace

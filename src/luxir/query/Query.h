@@ -633,6 +633,7 @@ public:
     bool numericPredicateDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;
+    bool disableDisMaxFloorForwardingForTests = false;
     bool disableMandNotTwoPhaseForTests = false;
     bool disableFilteredUnionWandForTests = false;
 
@@ -2283,36 +2284,6 @@ inline float clauseFloor(float theta, double othersMax, size_t clauses) {
   double factor = 1.0 + (double)(clauses + 1) * 0x1p-24;
   double floor = (double)theta / factor - othersMax
       - ((double)std::abs(theta) + std::abs(othersMax)) * 1e-6;
-  return floor > 0.0 ? (float)floor : -std::numeric_limits<float>::infinity();
-}
-
-// The floor one disjunct of a dis_max with tie > 0 must reach for a doc to make
-// `theta`, when the other disjuncts' upper bounds have maximum `othersBest` and
-// sum `othersSum`; -inf when no floor is proven. Every matched disjunct's score
-// feeds the final score, so a low-scoring match still counts when another
-// disjunct carries the doc: a positive floor exists only when docs missing this
-// disjunct cannot reach theta. Score = (1 - tie) * best + tie * sum is monotone
-// in the disjunct's score s, so with the others at their maxima it reaches
-// theta at
-//   s = theta - tie * othersSum                 if that is >= othersBest
-//   s = (theta - without) / tie, without = (1 - tie) * othersBest + tie * othersSum
-// otherwise. `factor` is the float-combination headroom of the scorer's own
-// bounds (disMaxUpperBound). tie == 0 takes no floor from here: there the
-// disjunct's score is either the best or irrelevant, and the caller passes
-// theta on unchanged.
-inline float disMaxClauseFloor(float theta, float othersBest, double othersSum,
-                               float tie, double factor) {
-  if (!std::isfinite(theta) || !std::isfinite(othersBest)
-      || !std::isfinite(othersSum) || tie <= 0.0f || theta <= 0.0f) {
-    return -std::numeric_limits<float>::infinity();
-  }
-  double t = (double)tie;
-  double without = (1.0 - t) * (double)othersBest + t * othersSum;
-  double target = (double)theta / factor
-      - ((double)std::abs(theta) + without) * 1e-6;
-  if (!(target > without)) return -std::numeric_limits<float>::infinity();
-  double floor = target - t * othersSum;
-  if (floor < (double)othersBest) floor = (target - without) / t;
   return floor > 0.0 ? (float)floor : -std::numeric_limits<float>::infinity();
 }
 
