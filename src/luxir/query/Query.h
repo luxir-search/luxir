@@ -1802,6 +1802,11 @@ public:
       return (double)countShortcut(segment, nullptr).maxMatches * work::MATCH;
     }
 
+    /// Work units the segment costs before any match is visited, whatever
+    /// pruning later skips: term dictionary lookups planning has not done yet.
+    /// Metadata-only, under countShortcut's contract.
+    virtual double setupUnits(IndexReader::Segment&) { return 0.0; }
+
     /// Policy family for choosing the sparse-filtered top-k density knee.
     /// Existing and ineligible weights retain the conjunction-family default.
     virtual SparseFilteredTopKFamily sparseFilteredTopKFamily() const noexcept {

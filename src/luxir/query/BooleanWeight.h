@@ -12953,6 +12953,17 @@ public:
     return total;
   }
 
+  // Every clause, exclusions included, sets up in every segment.
+  double setupUnits(IndexReader::Segment& segment) override {
+    double total = 0;
+    for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
+      for (auto* child : weights) {
+        if (child) total += child->setupUnits(segment);
+      }
+    }
+    return total;
+  }
+
   std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);

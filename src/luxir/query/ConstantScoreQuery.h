@@ -354,6 +354,10 @@ public:
       return childWeight->workUnits(segment);
     }
 
+    double setupUnits(IndexReader::Segment& segment) override {
+      return childWeight->setupUnits(segment);
+    }
+
   };
 };
 

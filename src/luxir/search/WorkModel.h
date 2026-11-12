@@ -24,6 +24,12 @@ inline constexpr double POSITION = 1.5;
 // A facet, per document it counts and per segment it sets up.
 inline constexpr double FACET_DOC = 0.7;
 inline constexpr double FACET_SEGMENT = 8000.0;
+// Per term of an explicit term list, per segment: a dictionary seek, hit or
+// miss, and the postings setup of a hit. A 45,587-term list on a 6-segment,
+// 11.4M-document keyword field ran 27.7 ms faster across segments than
+// serially, about 120 ns per term and segment; rounded up for cold
+// dictionaries.
+inline constexpr double TERM_LOOKUP = 150.0;
 
 // Reading a posting list. Dense lists decode in bulk; sparse ones pay per
 // document.
