@@ -86,6 +86,21 @@ protected:
       catch (const CollectionUnavailableError&) { return false; }
     });
   }
+  // Serves "main" on the follower, then stops the source and republishes "main" there as a
+  // new incarnation sharing the served files. Returns the follower's copy; the source stays stopped.
+  std::shared_ptr<Collection> serveThenReplaceIncarnation() {
+    startSource(); startFollower();
+    { CollectionHelper h(*source, "main"); EXPECT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+    EXPECT_TRUE(caughtUp());
+    auto old = follower->getCollection("main");
+    stopSource();
+    FSDirFactory factory(sourceConfig.store.data_dir);
+    TenantCatalog storage(factory, "t0", "test", newUuid());
+    storage.adopt();
+    auto selected = *storage.current("main");
+    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
+    return old;
+  }
   bool caughtUp(const CollectionId& id) {
     auto target = source->getCollection(id)->getShard()->getSnapshots().snapshot()->id;
     return until([&] {
@@ -1940,42 +1955,57 @@ TEST_F(ReplicationFollowerTest, staleRepairLeavesUnrelatedReplacementAvailable) 
 }
 
 TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacement) {
-  startSource(); startFollower();
-  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
-  ASSERT_TRUE(caughtUp());
-  auto old = follower->getCollection("main");
+  auto old = serveThenReplaceIncarnation();
   std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
-  stopSource();
-  {
-    FSDirFactory factory(sourceConfig.store.data_dir);
-    TenantCatalog storage(factory, "t0", "test", newUuid());
-    storage.adopt();
-    auto selected = *storage.current("main");
-    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
-  }
-  startSource();
-  ASSERT_TRUE(caughtUp());
-  auto current = follower->getCollection("main");
-  ASSERT_NE(old, current);
-  auto snapshot = current->getShard()->getSnapshots().snapshot();
-  ASSERT_NE(snapshot->files.end(), std::ranges::find(snapshot->files, suspects[0]));
+  // The report arrives once the replacement is visible, before the follower records the switch.
+  std::atomic<bool> reported{false};
   std::atomic<unsigned> downloads{0}, otherDownloads{0};
   Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (!reported) return nullptr;
     if (((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
     else otherDownloads++;
     return nullptr;
   });
+  auto* catalog = &follower->collections().catalog("t0");
+  Signal::listen("catalogRead", [&](void* reader, void*, void*) -> void* {
+    if (reader != catalog || reported) return nullptr;
+    try { if (follower->getCollection("main") == old) return nullptr; }
+    catch (const CollectionUnavailableError&) { return nullptr; }
+    reported = true;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    return nullptr;
+  });
   auto cleanup = scope_guard([&] { stopFollower(); });
-  old->fail("late scrub result");
-  follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
-  ASSERT_TRUE(until([&] {
-    try { return follower->getCollection("main") != current; }
-    catch (const CollectionUnavailableError&) { return false; }
-  }));
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() == 1; }));
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(1u, downloads.load());
   EXPECT_EQ(0u, otherDownloads.load());
+}
+
+// A report that arrives before a mapping attempt fails still reaches the replacement on the retry.
+TEST_F(ReplicationFollowerTest, repairSurvivesFailedMappingAttempt) {
+  auto old = serveThenReplaceIncarnation();
+  std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
+  std::atomic<bool> reported{false};
+  std::atomic<unsigned> downloads{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (reported && ((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
+    return nullptr;
+  });
+  Signal::listen("replicationMappingReady", [&](void*, void*, void*) -> void* {
+    if (reported.exchange(true)) return nullptr;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    throw std::runtime_error("injected mapping failure");
+  });
+  auto cleanup = scope_guard([&] { stopFollower(); });
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() >= 1; }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
 TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {

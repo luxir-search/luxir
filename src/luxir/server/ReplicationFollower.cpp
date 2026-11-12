@@ -398,7 +398,12 @@ struct ReplicationFollower::Impl {
 
   void unloadCorrupt(const Key& key, const std::shared_ptr<const Repair>& repair) {
     std::shared_ptr<Collection> active;
-    { std::lock_guard lock(mutex); auto& state = states[key]; if (state.selectedName) active = state.local; }
+    {
+      std::lock_guard lock(mutex);
+      auto& state = states[key];
+      if (!state.selectedName && state.advertised) return; // an incoming copy keeps the report until it is selected
+      if (state.selectedName) active = state.local;
+    }
     auto shard = active ? active->getShard() : nullptr;
     auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
     auto failed = repair->collection.lock();
@@ -986,7 +991,7 @@ struct ReplicationFollower::Impl {
           for (auto& [candidate, state] : states) {
             if (!includes({candidate.tenant, ""}) || mappings[candidate.tenant].applying) continue;
             bool cleanup = state.retiring || (state.remove && !state.selectedName && !state.advertised);
-            bool work = cleanup || (connected && ((bool)state.corrupt || (state.advertised && ((state.advertised != state.serving && state.advertised != state.ready && !state.waiting)
+            bool work = cleanup || (connected && ((state.corrupt && (state.selectedName || !state.advertised)) || (state.advertised && ((state.advertised != state.serving && state.advertised != state.ready && !state.waiting)
                     || state.needsAck()))));
             if (!state.busy && (!state.unavailable || cleanup) && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               key = candidate; selected = &state;
@@ -1114,7 +1119,7 @@ void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<C
   auto repair = std::make_shared<const Impl::Repair>(Impl::Repair{collection, {suspects.begin(), suspects.end()}, reason});
   {
     std::lock_guard lock(impl->mutex);
-    for (auto& [key, state] : impl->states) if (key.tenant == id.tenant && (state.local == collection || state.selectedName == id.name)) state.corrupt = repair;
+    for (auto& [key, state] : impl->states) if (key.tenant == id.tenant && (state.local == collection || state.selectedName == id.name || state.name == id)) state.corrupt = repair;
   }
   impl->changed.notify_all();
 }
