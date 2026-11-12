@@ -570,21 +570,21 @@ allowed. Fields resolve through their `search` bindings, like `match`.
 Duplicate physical targets keep the larger weight, and field order does not
 affect the query.
 
-In `combined` mode, TEXT fields with the same effective analysis and
-`long_terms` policy form a group scored as one field with BM25F, whether the
-analyzer is inherited from a common parent or declared inline on each field.
+In `combined` mode, TEXT fields with the same expanded analyzer definition
+and `long_terms` policy form a group scored as one field with BM25F, whether
+the analyzer is inherited from a common parent or declared inline on each
+field.
 Group membership is determined by the schema, independently of the query text.
-Each group analyzes the text
-once; a term found in several fields saturates once within that group.
-A weight scales its field's term frequency and document length, including
-in a group with just one field. For a term, frequency is the weighted sum of
-per-field frequencies, and length is the weighted sum of per-field lengths,
-rounded and encoded as a norm. Every field contributes length even when the
-term is absent from that field. Average length is the weighted sum of total
-term counts divided by the largest per-field document count; document
-frequency is the largest per-field document frequency. This is a BM25F
-weight, not a score multiplier; the scoring follows Lucene's
-`CombinedFieldQuery`.
+Each group analyzes the text once; a term found in several fields saturates
+once within that group. A weight scales its field's term frequency and
+document length, including in a group with just one field. For a term,
+frequency is the weighted sum of per-field frequencies, and length is the
+weighted sum of per-field lengths, rounded and encoded as a norm. Every
+field contributes length even when the term is absent from that field.
+Average length is the weighted sum of total term counts divided by the
+largest per-field document count; document frequency is the largest
+per-field document frequency. This is a BM25F weight, not a score multiplier;
+the scoring follows Lucene's `CombinedFieldQuery`.
 
 STRING, ID, numeric, and date fields each form their own group with `match`
 semantics and a weight that multiplies the field's score. STRING/ID fields

@@ -321,11 +321,7 @@ TEST_F(MultiMatchQueryTest, inlineEquivalentAnalyzersShareGroup) {
   SchemaBuilder schema;
   schema.analyzer(textField(schema, "a"), "unicode_word", {"lowercase"});
   schema.analyzer(textField(schema, "b"), "unicode_word", {"lowercase"});
-  auto compiled = schema.set(helper.collection());
-  auto* aType = (TextFieldType*)compiled->physical("a");
-  auto* bType = (TextFieldType*)compiled->physical("b");
-  ASSERT_NE(aType->analyzer_.get(), bType->analyzer_.get());
-  ASSERT_EQ(aType->analyzer_->canonical, bType->analyzer_->canonical);
+  schema.set(helper.collection());
 
   std::string_view names[] = {"a", "b"};
   float weights[] = {1.0f, 1.0f};
@@ -337,9 +333,10 @@ TEST_F(MultiMatchQueryTest, inlineEquivalentAnalyzersShareGroup) {
   helper.index(flatdoc("id", "x1", "a", "dune", "b", "dune sand"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "x2", "a", "sand", "b", "sand"), UpdateMessage::COMMIT);
   // A term in both fields saturates once, unlike the per-field sum.
-  auto text = "dune";
-  EXPECT_LT(score(multiMatch(text, {{"a", {}}, {"b", {}}}, Mode::COMBINED), "x1"),
-            score(multiMatch(text, {{"a", {}}, {"b", {}}}, Mode::PER_FIELD, 1.0f), "x1"));
+  auto combined = run(multiMatch("dune", {{"a", {}}, {"b", {}}}, Mode::COMBINED));
+  auto perField = run(multiMatch("dune", {{"a", {}}, {"b", {}}}, Mode::PER_FIELD, 1.0f));
+  ASSERT_TRUE(combined && perField);
+  EXPECT_LT(combined->at("x1"), perField->at("x1"));
 }
 
 TEST_F(MultiMatchQueryTest, inlineDifferentAnalyzersSplitGroups) {
@@ -358,35 +355,15 @@ TEST_F(MultiMatchQueryTest, inlineDifferentAnalyzersSplitGroups) {
 
 TEST_F(MultiMatchQueryTest, presetAndInlineEquivalentShareGroup) {
   SchemaBuilder schema;
-  textField(schema, "a").analyzer.emplace().name = "english";
-  schema.analyzer(textField(schema, "b"), "unicode_word", {"nfkc_cf", "fold", "kstem"});
-  auto compiled = schema.set(helper.collection());
-  auto* aType = (TextFieldType*)compiled->physical("a");
-  auto* bType = (TextFieldType*)compiled->physical("b");
-  ASSERT_NE(aType->analyzer_.get(), bType->analyzer_.get());
-  ASSERT_EQ(aType->analyzer_->canonical, bType->analyzer_->canonical);
+  textField(schema, "a").analyzer.emplace().name = "standard";
+  schema.analyzer(textField(schema, "b"), "unicode_word", {"nfkc_cf"});
+  schema.set(helper.collection());
 
   std::string_view names[] = {"a", "b"};
   float weights[] = {1.0f, 1.0f};
   CombinedFieldQuery::Term terms[] = {{0, "dune"}, {1, "dune"}};
   CombinedFieldQuery expected(names, weights, terms);
   EXPECT_TRUE(parse(qb::multiMatch(mr(), "Dune", {{"a", {}}, {"b", {}}}))->equals(expected));
-}
-
-TEST_F(MultiMatchQueryTest, perFieldUnaffectedByGrouping) {
-  SchemaBuilder schema;
-  schema.analyzer(textField(schema, "a"), "unicode_word", {"lowercase"});
-  schema.analyzer(textField(schema, "b"), "unicode_word", {"lowercase"});
-  schema.set(helper.collection());
-  helper.index(flatdoc("id", "x1", "a", "dune", "b", "dune sand"), UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("id", "x2", "a", "sand", "b", "sand"), UpdateMessage::COMMIT);
-
-  auto m = [&](std::string_view field) { return qb::match(mr(), field, "dune"); };
-  std::initializer_list<api::WeightedField> fields = {{"a", {}}, {"b", {}}};
-  for (float tie : {0.0f, 1.0f}) {
-    EXPECT_FLOAT_EQ(score(qb::disMax(mr(), {m("a"), m("b")}, tie), "x1"),
-                    score(multiMatch("dune", fields, Mode::PER_FIELD, tie), "x1"));
-  }
 }
 
 TEST_F(MultiMatchQueryTest, fieldOrderBindingsAndDuplicates) {

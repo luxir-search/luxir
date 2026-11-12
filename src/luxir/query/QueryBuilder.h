@@ -1063,10 +1063,9 @@ public:
     return pool.make<BooleanQuery>(none, clauses, none, none, k);
   }
 
-  // Fields with equivalent analysis (same canonical definition) and long-term
-  // policy share one analysis pass and one BM25F query per term. Group order
-  // follows physical field order, independent of request order and the query
-  // text.
+  // Fields with the same expanded analyzer definition and long-term policy share
+  // one analysis pass and one BM25F query per term. Group order follows physical
+  // field order, independent of request order and the query text.
   Query* createMultiMatchCombined(std::span<const WeightedField> requested,
                                   std::string_view text, Operator op, int minMatch,
                                   float tie = 1.0f) {
@@ -1088,7 +1087,7 @@ public:
         for (group = 0; group < numGroups; group++) {
           if (groups[group].target->fieldType->type() != FieldType::TEXT) continue;
           auto* other = (TextFieldType*)groups[group].target->fieldType;
-          if (type->analyzer_->canonical == other->analyzer_->canonical
+          if (type->analyzer_->sameDefinitionAs(*other->analyzer_)
               && type->longTerms == other->longTerms) break;
         }
       }

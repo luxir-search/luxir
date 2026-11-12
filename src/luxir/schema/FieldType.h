@@ -240,8 +240,8 @@ public:
 
 class TextFieldType : public FieldType {
 public:
-  // The compiled chain (analysis/Analyzer.h), shared with every field that
-  // resolves to the same effective definition.
+  // The compiled plan (analysis/Analyzer.h), shared by fields inheriting the same
+  // authored definition; equal inline definitions may have separate plans.
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
