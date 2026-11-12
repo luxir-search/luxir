@@ -395,7 +395,8 @@ beside it. The expression must produce a value for every matched document;
 `def(popularity_i, 0)` or an `exists()` clause in the child query makes it
 total. `$name` variables inside the expression bind from the surrounding
 expression's `vars`. The value-expression language is the one sorting uses;
-see [Searching](searching.md#sorting).
+see [Searching](searching.md#sorting) and
+[Value expressions](value-expressions.md).
 
 ## Functions
 

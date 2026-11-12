@@ -18,24 +18,14 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/geo.h"
 #include "luxir/value/AggregateExpr.h"
+#include "luxir/value/ValueFunctionSupport.h"
 #include "luxir/util/Decimal.h"
 #include "luxir/schema/ValCoerce.h"
 
 namespace luxir {
 namespace {
 
-void requireNumeric(std::span<const ResolvedValue> args) {
-  for (const ResolvedValue& arg : args) {
-    if (arg.nature == ValueNature::GEO_POINT) {
-      throw std::runtime_error("GEO_POINT is not numeric; use geo_distance()");
-    }
-    if (arg.type == ValueType::COLUMN_ONLY) {
-      throw std::runtime_error(
-          "a non-numeric column is only valid as a complete sort expression, "
-          "as the argument of count(), or as the input of cardinality()");
-    }
-  }
-}
+using namespace valuefn;
 
 ValueResult decodeScalarColumnValue(const ValueNode& node, int64_t raw) {
   if (node.columnType == FieldType::FLOAT) {
@@ -54,12 +44,6 @@ ValueResult decodeScalarColumnValue(const ValueNode& node, int64_t raw) {
 ResolvedValue unaryDemote(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   return {args[0].type, ValueNature::NUMBER};
-}
-
-ResolvedValue unaryDouble(std::span<const ResolvedValue> args) {
-  requireNumeric(args);
-  return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
-          ValueNature::NUMBER};
 }
 
 ValueType binaryNumericType(std::span<const ResolvedValue> args) {
@@ -175,16 +159,6 @@ ResolvedValue countResolve(std::span<const ResolvedValue> args) {
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
-void requireScalars(std::span<const ResolvedValue> args) {
-  for (const ResolvedValue& arg : args) {
-    if (valueArray(arg.type)) {
-      // Not arrayReducerNames(): it resolves every function, including this one.
-      throw std::runtime_error(
-          "operands must be scalars; reduce an array first, for example with min() or max()");
-    }
-  }
-}
-
 // Comparisons and logical operators produce 0 or 1.
 ResolvedValue truthResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
@@ -237,25 +211,6 @@ ResolvedValue geoDistanceResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args.subspan(1));
   return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
           ValueNature::NUMBER};
-}
-
-[[noreturn]] void runtimeInvalid(const ValueNode& node, int32_t docid,
-                                 std::string_view reason) {
-  throw ValueEvaluationError(fmt::format(
-      "value function {}() {} at segment doc {}", node.text, reason, docid));
-}
-
-ValueResult promote(ValueResult value, ValueType type) {
-  if (!value.valid) return ValueResult::missing(type);
-  if (valueArray(type)) {
-    value.type = type;
-    return value;
-  }
-  if (type == ValueType::DOUBLE && value.type == ValueType::INT64) {
-    return ValueResult::floating((double)value.intValue);
-  }
-  value.type = type;
-  return value;
 }
 
 enum class ScalarKernelFailure : uint8_t {
@@ -882,19 +837,15 @@ ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
   return ValueResult::floating((double)(hash >> 40) * 0x1p-24);
 }
 
-double constantNumber(const ValueNode& node) {
-  return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
-}
-
 void prepareGeoDistance(ValueNode&, std::span<const ValueNode* const> args) {
-  geo::checkLatitude(constantNumber(*args[1]));
-  geo::checkLongitude(constantNumber(*args[2]));
+  geo::checkLatitude(numberOf(*args[1]));
+  geo::checkLongitude(numberOf(*args[2]));
 }
 
 double geoMeters(BoundValueProgram& program, const ValueNode& node, int64_t packed) {
   const auto& nodes = program.program.nodes;
   return geo::haversinMeters(
-      constantNumber(nodes[node.children[1]]), constantNumber(nodes[node.children[2]]),
+      numberOf(nodes[node.children[1]]), numberOf(nodes[node.children[2]]),
       geo::decodeLatitude(geo::unpackLatitude(packed)),
       geo::decodeLongitude(geo::unpackLongitude(packed)));
 }
@@ -929,10 +880,10 @@ enum class DecayShape : uint8_t { GAUSS, EXP, LINEAR };
 // (1 - decay for linear, ln(decay) otherwise) in doubleValue.
 template <DecayShape Shape>
 void prepareDecay(ValueNode& node, std::span<const ValueNode* const> args) {
-  double origin = constantNumber(*args[1]);
-  double scale = constantNumber(*args[2]);
-  double offset = args.size() > 3 ? constantNumber(*args[3]) : 0.0;
-  double decay = args.size() > 4 ? constantNumber(*args[4]) : 0.5;
+  double origin = numberOf(*args[1]);
+  double scale = numberOf(*args[2]);
+  double offset = args.size() > 3 ? numberOf(*args[3]) : 0.0;
+  double decay = args.size() > 4 ? numberOf(*args[4]) : 0.5;
   if (!std::isfinite(origin)) throw std::runtime_error("origin must be finite");
   if (!(scale > 0.0) || !std::isfinite(scale)) {
     throw std::runtime_error("scale must be positive and finite");
@@ -976,8 +927,8 @@ ValueResult evalDecayPoint(BoundValueProgram& program, const ValueNode& node,
   const ValueNode& originNode = nodes[node.children[1]];
   ValueResult origin = originNode.type == ValueType::INT64
       ? ValueResult::integer(originNode.intValue) : ValueResult::floating(originNode.doubleValue);
-  double scale = constantNumber(nodes[node.children[2]]);
-  double offset = node.childCount > 3 ? constantNumber(nodes[node.children[3]]) : 0.0;
+  double scale = numberOf(nodes[node.children[2]]);
+  double offset = node.childCount > 3 ? numberOf(nodes[node.children[3]]) : 0.0;
   ValueResult value = program.evalNode(node.children[0], docid, score);
   if (!value.valid) return ValueResult::floating(1.0);
   auto distance = [&](const ValueResult& element) {
@@ -997,24 +948,6 @@ ValueResult evalDecayPoint(BoundValueProgram& program, const ValueNode& node,
     present = true;
   }
   return ValueResult::floating(present ? decayScore(node, closest, scale) : 1.0);
-}
-
-ValueResult evalScalarOnlyElement(BoundValueProgram& program, const ValueNode& node,
-                                  const ValueArrayRef& array, int64_t index) {
-  unused(program);
-  unused(node);
-  unused(array);
-  unused(index);
-  throw std::logic_error("scalar value function used as an array expression");
-}
-
-void evalFunctionBatch(BoundValueProgram& program, const ValueNode& node,
-                       std::span<const int32_t> docids, std::span<const float> scores,
-                       std::span<ValueResult> results) {
-  for (size_t i = 0; i < docids.size(); i++) {
-    float score = scores.empty() ? 0.0f : scores[i];
-    results[i] = node.function->evalPoint(program, node, docids[i], score);
-  }
 }
 
 ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& node,
@@ -1037,19 +970,6 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
   ValueNode scalar = node;
   scalar.type = valueScalarType(node.type);
   return evalBinaryScalar(scalar, first, second, array.docid);
-}
-
-bool invalid(const ValueBounds& bounds) {
-  return bounds.certainty == BoundsCertainty::INVALID;
-}
-
-bool bounded(const ValueBounds& bounds) {
-  return bounds.certainty == BoundsCertainty::BOUNDED;
-}
-
-ValueBounds retag(ValueBounds bounds, ValueType type) {
-  bounds.type = type;
-  return bounds;
 }
 
 ValueBounds promoteBounds(ValueBounds bounds, ValueType type) {
@@ -1963,6 +1883,10 @@ ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args
       if (args[i].nature != ValueNature::GEO_POINT) {
         throw std::runtime_error(fmt::format("argument {} is not a GEO_POINT value", i + 1));
       }
+    } else if (operands[i].kind == Kind::DATE) {
+      if (!valueDate(args[i].nature)) {
+        throw std::runtime_error(fmt::format("argument {} is not a DATE value", i + 1));
+      }
     } else if (operands[i].kind == Kind::NUMERIC) {
       requireNumeric(args.subspan(i, 1));
     }
@@ -2000,22 +1924,40 @@ ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   return out;
 }
 
+namespace {
+
+// The core table followed by every family table, in one stable sequence so a
+// function's address is the same whichever way it is looked up.
+const std::vector<ValueFunction>& allFunctions() {
+  static const std::vector<ValueFunction> all = [] {
+    std::vector<ValueFunction> out(std::begin(FUNCTIONS), std::end(FUNCTIONS));
+    for (auto family : {valueMathFunctions(), valueDateFunctions(), valueGeoFunctions(),
+                        valueHashFunctions(), valueScopeFunctions()}) {
+      out.insert(out.end(), family.begin(), family.end());
+    }
+    return out;
+  }();
+  return all;
+}
+
+} // namespace
+
 const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
-  for (const ValueFunction& function : FUNCTIONS) {
+  for (const ValueFunction& function : allFunctions()) {
     if (function.name == name) return &function;
   }
   return nullptr;
 }
 
 std::span<const ValueFunction> ValueFunctionRegistry::entries() {
-  return FUNCTIONS;
+  return allFunctions();
 }
 
 std::string ValueFunctionRegistry::arrayReducerNames() {
   std::vector<std::string_view> names;
   std::array<ResolvedValue, 1> array{{
       {ValueType::INT64_ARRAY, ValueNature::NUMBER}}};
-  for (const ValueFunction& function : FUNCTIONS) {
+  for (const ValueFunction& function : allFunctions()) {
     if (function.minArity > 1 || function.maxArity < 1) continue;
     try {
       ResolvedValue resolved = function.resolveOperands(array);
@@ -2083,9 +2025,13 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
         return left.text == right.text && left.columnType == right.columnType
             && left.columnMultiValued == right.columnMultiValued
             && left.columnIndexed == right.columnIndexed;
+      case ValueNodeKind::LOCAL:
+        return left.slot == right.slot && left.intValue == right.intValue
+            && left.arraySize == right.arraySize;
       case ValueNodeKind::FUNCTION:
         if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount) return false;
+            || left.childCount != right.childCount || left.slot != right.slot
+            || left.counterSlot != right.counterSlot) return false;
         for (uint8_t i = 0; i < left.childCount; i++) {
           if (!self(self, left.children[i], right.children[i])) return false;
         }
@@ -2110,7 +2056,8 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
     : program(program), segment(segment),
-      nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
+      nodes(pool.make_span<BoundValueNode>(program.nodes.size())),
+      locals(pool.make_span<ValueResult>(program.localCount)) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
@@ -2118,6 +2065,8 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
+    } else if (node.kind == ValueNodeKind::LOCAL) {
+      bound.bounds = ValueBounds::unbounded(node.type, true);
     } else if (node.kind == ValueNodeKind::DOCID) {
       int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
@@ -2174,6 +2123,18 @@ void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
     if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = scoreBounds;
       bound.bounds.type = ValueType::DOUBLE;
+    } else if (node.kind == ValueNodeKind::LOCAL) {
+      // A let variable has the bounds of its value; a loop accumulator or
+      // counter carries the bounds the parser recorded for it (the counter's
+      // range, or unknown for an accumulator).
+      if (node.childCount == 1) {
+        bound.bounds = nodes[node.children[0]].bounds;
+        bound.bounds.type = node.type;
+      } else if (node.arraySize == 1 && node.intValue > 0) {
+        bound.bounds = ValueBounds::integer(0, node.intValue - 1);
+      } else {
+        bound.bounds = ValueBounds::unbounded(node.type, true);
+      }
     } else if (node.kind == ValueNodeKind::FUNCTION) {
       std::array<ValueBounds, VALUE_MAX_ARITY> children{};
       for (uint8_t child = 0; child < node.childCount; child++) {
@@ -2287,6 +2248,7 @@ ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float sco
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
     case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
+    case ValueNodeKind::LOCAL: return locals[node.slot];
     case ValueNodeKind::FUNCTION: return node.function->evalPoint(*this, node, docid, score);
   }
   throw std::runtime_error("invalid ValueExpr node");

@@ -237,7 +237,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
   (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
   `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
   and Elasticsearch-style `gauss_decay`, `exp_decay`, and `linear_decay`
-  decay functions over numeric, date, and geo values. `rescore` takes an
+  decay functions over numeric, date, and geo values. The same language has
+  bitwise operators and `%`, trigonometry and rounding, calendar parts of
+  dates, coordinates and distances between places, geohash and geotile keys,
+  hash functions for consistent sampling, `let` variables, and bounded `fold`
+  loops, with the Lucene expressions and Painless spellings `_score`,
+  `params.x`, and `doc['x'].value` ([value expressions](guide/value-expressions.md)). `rescore` takes an
   optional `min_score` cut-off (the `function_score` / `script_score`
   counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are

@@ -59,7 +59,8 @@ inline constexpr size_t VALUE_MAX_ARITY = 5;
 struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
   // ANY also takes GEO_POINT values and non-numeric (STRING or ID) columns.
-  enum class Kind : uint8_t { NUMERIC, GEO_POINT, ANY };
+  // DATE takes only DATE values (either unit).
+  enum class Kind : uint8_t { NUMERIC, GEO_POINT, DATE, ANY };
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
     bool lazy = false;
@@ -146,5 +147,13 @@ public:
   static std::optional<DecimalComparison> decimalComparison(const ValueFunction* function,
       int scale, const api::Val& literal, bool reverse);
 };
+
+// The function families registered beside the core table, each a constant table
+// defined in its own translation unit.
+std::span<const ValueFunction> valueMathFunctions();
+std::span<const ValueFunction> valueDateFunctions();
+std::span<const ValueFunction> valueGeoFunctions();
+std::span<const ValueFunction> valueHashFunctions();
+std::span<const ValueFunction> valueScopeFunctions();
 
 } // namespace luxir

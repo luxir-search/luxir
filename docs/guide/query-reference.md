@@ -494,8 +494,10 @@ The expression uses the same value-expression language as sorting (arithmetic,
 `def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
 `random`, reducers, and the Elasticsearch-style `gauss_decay`, `exp_decay`,
 and `linear_decay` decay functions; see
-[Searching](searching.md#sort-expressions-in-detail) and
-[Decay functions](searching.md#decay-functions)) and
+[Searching](searching.md#sort-expressions-in-detail),
+[Decay functions](searching.md#decay-functions), and
+[Value expressions](value-expressions.md) for the bitwise operators, trigonometry,
+date parts, geo functions, hashing, `let`, and `fold`) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
