@@ -92,6 +92,15 @@ class RescoreQuery final : public Query {
     bool pruning;
     bool cacheValid = false;
     bool shallowBoundsValid = false;
+    // Set when the expression's columns can bound the skip windows.
+    bool columnWindows = false;
+    bool columnWindowNew = false;
+    int32_t columnWindowFrom = -1;
+    int32_t columnWindowEnd = -1;
+    // Column windows that failed to skip in a row, and the doc before which
+    // no new one is attempted (see columnWindowOutcome).
+    int32_t columnWindowMisses = 0;
+    int32_t columnRetryDoc = 0;
 
     float convertResult(const ValueResult& result) const {
       if (!result.valid) {
@@ -126,25 +135,67 @@ class RescoreQuery final : public Query {
     ScoreBounds composeBounds(int32_t upTo, bool refined) {
       ScoreBounds childBounds = refined
           ? child->refineScoreBounds(upTo) : child->getScoreBounds(upTo);
-      const ValueBounds& valueBounds =
-          expression->boundsForScore(scoreEnvironment(childBounds));
+      // A column window narrows the expression only for a range it covers.
+      // Other ranges fall back to the column's segment-wide bounds.
+      bool windowed = columnWindowFrom >= 0 && upTo >= columnWindowFrom
+          && upTo <= columnWindowEnd;
+      const ValueBounds& valueBounds = windowed
+          ? expression->boundsForColumnWindow(scoreEnvironment(childBounds))
+          : expression->boundsForScore(scoreEnvironment(childBounds));
       return outputBounds(valueBounds, multiplier);
+    }
+
+    int32_t shallowWindow(int32_t target) {
+      int32_t upTo = child->advanceShallow(target);
+      if (!columnWindows) return upTo;
+      if (target < columnRetryDoc) {
+        // Bounds stay segment-wide, and the window stops at the retry doc
+        // so a child offering no blocks of its own still gets there.
+        columnWindowFrom = -1;
+        return std::min(upTo, columnRetryDoc - 1);
+      }
+      if (columnWindowFrom < 0 || target > columnWindowEnd) {
+        columnWindowFrom = target;
+        columnWindowEnd = expression->columnWindowUpTo(target);
+        columnWindowNew = true;
+      }
+      return std::min(upTo, columnWindowEnd);
+    }
+
+    // Columns whose leaves all reach the threshold (a decay around a common
+    // value, say) never skip. Back off so they cost what the child's own
+    // windows cost, retrying at growing doc distances.
+    void columnWindowOutcome(int32_t candidate, bool skipped) {
+      if (!columnWindowNew) return;
+      columnWindowNew = false;
+      if (skipped) {
+        columnWindowMisses = 0;
+        return;
+      }
+      constexpr int32_t PATIENCE = 32;
+      constexpr int32_t MAX_BACKOFF_SHIFT = 8;
+      if (++columnWindowMisses < PATIENCE) return;
+      int32_t shift = std::min(columnWindowMisses - PATIENCE, MAX_BACKOFF_SHIFT);
+      columnRetryDoc = (int32_t)std::min<int64_t>(
+          (int64_t)candidate + ((int64_t)NumColumnFormat::LEAF_ZONE_SIZE << shift),
+          PostingsReader::END);
     }
 
     int32_t skipUncompetitive(bool approximation, int32_t candidate) {
       while (candidate != PostingsReader::END && pruning
              && minCompetitiveScore != -std::numeric_limits<float>::infinity()) {
         if (candidate > shallowUpTo) {
-          shallowUpTo = child->advanceShallow(candidate);
+          shallowUpTo = shallowWindow(candidate);
           shallowBounds = getScoreBounds(shallowUpTo);
           if (shallowBounds.hi >= minCompetitiveScore) {
             shallowBounds = refineScoreBounds(shallowUpTo);
             // Refinement may parse a coarse impact group. Re-asking shallow
             // lets the child expose the now-known block boundary, so the next
             // candidate does not retain an earlier block's maximum.
-            shallowUpTo = child->advanceShallow(candidate);
+            shallowUpTo = shallowWindow(candidate);
             shallowBounds = getScoreBounds(shallowUpTo);
           }
+          columnWindowOutcome(candidate, shallowBounds.hi < minCompetitiveScore);
           shallowBoundsValid = true;
         }
         assert(shallowBoundsValid);
@@ -168,7 +219,8 @@ class RescoreQuery final : public Query {
     Scorer(Query::Scorer* child, BoundValueProgram* expression,
            float multiplier, bool needsChildScore, bool pruning)
       : child(child), expression(expression), multiplier(multiplier),
-        needsChildScore(needsChildScore), pruning(pruning) {
+        needsChildScore(needsChildScore), pruning(pruning),
+        columnWindows(pruning && expression->hasColumnWindows()) {
       // Re-run env-sensitive validation against the child's actual global
       // interval as part of scorer binding, before any matching begins.
       composeBounds(PostingsReader::END, false);
@@ -258,6 +310,7 @@ class RescoreQuery final : public Query {
     int32_t advanceShallow(int32_t target) override {
       shallowUpTo = -1;
       shallowBoundsValid = false;
+      columnWindowFrom = -1;
       return child->advanceShallow(target);
     }
 
