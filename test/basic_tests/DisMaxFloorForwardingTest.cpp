@@ -139,7 +139,7 @@ public:
       if (supplier == nullptr) continue;
       auto planContext = supplier->makePlanContext(Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max()));
-      planContext.disableDisMaxFloorForwardingForTests = !forward;
+      planContext.disableClauseFloorForwardingForTests = !forward;
       auto* scorer = supplier->resolve(pool, planContext)->build(pool);
       if (scorer == nullptr) continue;
       DocSet* live = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
@@ -160,6 +160,23 @@ TEST_F(DisMaxFloorForwardingTest, prunedTopKMatchesExhaustive) {
     MemPool pool;
     float tie = std::array{0.0f, 0.0f, 0.1f, 0.3f, 0.5f, 0.9f}[rng() % 6];
     Query* query = randomDisMax(pool, tie);
+    Query* required[] = {termQuery(pool, "body_w")};
+    Query* optional[] = {query};
+    switch (rng() % 4) {
+      case 0: query = pool.make<BooleanQuery>(required, optional,
+                         std::span<Query*>{}, std::span<Query*>{}); break;
+      case 1: {
+        Query* pair[] = {query, required[0]};
+        auto copied = pool.make_span<Query*>(2);
+        std::copy(std::begin(pair), std::end(pair), copied.begin());
+        query = pool.make<BooleanQuery>(std::span<Query*>{}, copied,
+                    std::span<Query*>{}, std::span<Query*>{});
+        break;
+      }
+      case 2: query = pool.make<BooleanQuery>(std::span<Query*>{}, optional,
+                         std::span<Query*>{}, required, 1); break;
+      default: break;
+    }
     int32_t k = std::array{1, 3, 10, 50}[rng() % 4];
     TopK exhaustive = run(*query, k, false);
     TopK pruned = run(*query, k, true);

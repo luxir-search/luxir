@@ -3,8 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -15,273 +17,185 @@
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/TopKAssert.h"
 
 using namespace luxir;
 using namespace luxir::test;
 
 namespace {
 
-// Several bulk windows, so theta is known before the later ones.
-constexpr int32_t kDocs = 5 * DocsEnumMeta::L1_DOCS;
-
-// Fixed per-doc score over an explicit doc list. When `prunes` it declares
-// prunesOnMinCompetitiveScore, records every floor it is given and skips
-// docs scoring below the current floor.
-struct FloorClause {
-  std::vector<int32_t> docs;
-  std::vector<float> scores;
-  std::vector<float> floors;
-  float maxScore = 0.0f;
-  bool prunes = true;
-};
-
-class FloorQuery final : public Query {
-  FloorClause& clause;
-
-  class FloorScorer final : public Query::Scorer {
-    FloorClause& clause;
-    size_t at = 0;
-    bool started = false;
-    float floor = 0.0f;
-
-    int32_t settle() {
-      while (at < clause.docs.size() && clause.scores[at] < floor) at++;
-      return docId();
-    }
-
-  public:
-    explicit FloorScorer(FloorClause& clause) : clause(clause) {}
-    int32_t next() override {
-      if (started) at++;
-      started = true;
-      return settle();
-    }
-    int32_t docId() override {
-      if (!started) return -1;
-      return at < clause.docs.size() ? clause.docs[at] : PostingsReader::END;
-    }
-    float score() override { return clause.scores[at]; }
-    bool prunesOnMinCompetitiveScore() const override { return clause.prunes; }
-    void setMinCompetitiveScore(float minScore) override {
-      if (!clause.prunes) return;
-      clause.floors.push_back(minScore);
-      floor = std::max(floor, minScore);
-    }
-    float getMaxScore(int32_t) override { return clause.maxScore; }
-    float getMaxScoreForSetup(int32_t) override { return clause.maxScore; }
-  };
-
-  class Supplier final : public Query::ScorerSupplier {
-    FloorClause& clause;
-
-    class Plan final : public Query::ScorerPlan {
-      FloorClause& clause;
-
-    protected:
-      Query::Scorer* buildScorer(MemPool& pool) override {
-        return pool.make<FloorScorer>(clause);
-      }
-
-    public:
-      Plan(FloorClause& clause, const Query::PlanContext& context,
-           const Query::ScorerShape& shape, int64_t cost)
-        : Query::ScorerPlan(context, shape, cost), clause(clause) {}
-    };
-
-  public:
-    explicit Supplier(FloorClause& clause) : clause(clause) {}
-    int64_t cost() override { return (int64_t)clause.docs.size(); }
-    Query::ScorerShape describeScorer(
-        const Query::PlanContext&) const override {
-      return {
-        .matchState = Query::MatchState::NONEMPTY,
-        .directKind = Query::DirectScorerKind::OTHER,
-        .reportedTwoPhase = Query::ReportedTwoPhase::NO,
-        .windowFillClause = Query::ClauseShape::NONE,
-        .termDisjunctionClause = Query::ClauseShape::NONE,
-        .termConjunctionClause = Query::ClauseShape::NONE,
-        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
-        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
-        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
-        .verificationPoints = std::nullopt,
-      };
-    }
-    Query::ScorerPlan* resolve(MemPool& pool,
-                               const Query::PlanContext& context) override {
-      Query::ScorerShape shape = describeScorer(context);
-      return pool.make<Plan>(clause, context, shape, cost());
-    }
-  };
-
-  class Weight final : public Query::Weight {
-    FloorClause& clause;
-
-  public:
-    Weight(Query::Context& context, const Query& query, int32_t flags,
-           FloorClause& clause)
-      : Query::Weight(context, query, flags), clause(clause) {}
-    Query::ScorerSupplier* scorerSupplierImpl(
-        MemPool& pool, IndexReader::Segment&,
-        Query::SupplierExecutionMode) override {
-      return pool.make<Supplier>(clause);
-    }
-    Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment&) override {
-      return pool.make<FloorScorer>(clause);
-    }
-  };
-
-public:
-  explicit FloorQuery(FloorClause& clause)
-    : Query(QueryKind::TEST), clause(clause) {}
-  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
-                                 const FilterKeyContext&) const override {
-    out.appendKind(kind);
-    return FilterKeyScope::UNCACHEABLE;
-  }
-  Query::Weight* createWeight(Query::Context& context, int32_t flags,
-                              float = 1.0f) override {
-    return context.pool.make<Weight>(context, *this, flags, clause);
-  }
-};
-
 using Hits = std::vector<TopDocsCollector::DocScore>;
+using SumScorer = BooleanQuery::MaxScoreDisjunctionScorer;
+using DisMaxScorer = BooleanQuery::MaxScoreDisjunctionScorerT<true>;
+
+int64_t visited(Query::Scorer* scorer) {
+  std::span<Query::Scorer*> children;
+  int64_t count = 0;
+  if (auto* dismax = dynamic_cast<DisMaxScorer*>(scorer)) {
+    count = dismax->visited();
+    children = dismax->clauseScorersForTests();
+  } else if (auto* sum = dynamic_cast<SumScorer*>(scorer)) {
+    count = sum->visited();
+    children = sum->clauseScorersForTests();
+  } else if (auto* mand = dynamic_cast<BooleanQuery::MandOptScorer*>(scorer)) {
+    return visited(mand->requiredScorerForTests()) + visited(mand->optionalScorerForTests());
+  } else if (auto* conjunction = dynamic_cast<BooleanQuery::ConjunctionScorer*>(scorer)) {
+    children = conjunction->scoringScorersForTests();
+  } else if (auto* excluded = dynamic_cast<BooleanQuery::MandNotScorer*>(scorer)) {
+    return visited(excluded->requiredScorerForTests());
+  } else if (auto* heap = dynamic_cast<BooleanQuery::DisjunctionScorerT<true>*>(scorer)) {
+    children = heap->clauseScorersForTests();
+  } else if (auto* heap = dynamic_cast<BooleanQuery::DisjunctionScorerT<false>*>(scorer)) {
+    children = heap->clauseScorersForTests();
+  }
+  for (auto* child : children) count += visited(child);
+  return count;
+}
 
 class ClauseFloorTest : public LuxirTest {
 public:
   CollectionHelper helper;
-  FloorClause clause;
-  bool bulkMissing = false;
   decltype(helper.getIndexWriter()->snapshots.readers.getReader()) reader;
 
   void SetUp() override {
     LuxirTest::SetUp();
-    std::vector<Doc> docs;
-    for (int32_t i = 0; i < kDocs; i++) {
-      std::string body = "pad";
-      for (int32_t p = 0; p < i % 7; p++) body += " pad";
-      if (i % 2 == 0) for (int32_t r = 0; r <= i % 3; r++) body += " alpha";
-      if (i % 3 == 0) body += " beta";
-      if (i % 5 == 0) body += " gamma";
-      docs.push_back(flatdoc("id", std::to_string(i), "body_w", body));
-      if (i % 4 != 3) {
-        clause.docs.push_back(i);
-        clause.scores.push_back(0.5f + (float)((i * 7) % 13) * 0.4f);
-        clause.maxScore = std::max(clause.maxScore, clause.scores.back());
+    std::mt19937 rng(235244);
+    auto text = [&](int count) {
+      std::string out;
+      for (int i = 0; i < count; i++) {
+        out += " t" + std::to_string((int)std::pow(16.0, (double)(rng() % 10000) / 10000.0) - 1);
       }
+      return out;
+    };
+    std::vector<Doc> docs;
+    for (int i = 0; i < 5 * DocsEnumMeta::L1_DOCS; i++) {
+      std::string body = text(20 + (int)(rng() % 150));
+      if (i % 17 != 0) body += " req";
+      if (i % 3 != 0) body += " keep";
+      if (i % 19 == 0) body += " omit";
+      docs.push_back(flatdoc("id", std::to_string(i), "title_w", text(1 + (int)(rng() % 8)),
+                             "body_w", body));
     }
     ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     reader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(1u, reader->segments().size());
   }
 
-  // Top k over the single segment, through the pull scorer or the bulk
-  // scorer, with competitive pruning on (floors flow) or off (exhaustive).
-  Hits run(Query& query, int32_t k, bool bulk, bool pruning) {
-    clause.floors.clear();
+  struct Result {
+    Hits hits;
+    int64_t visits = 0;
+  };
+
+  Result run(Query& query, bool bulk, bool pruning, bool forward = true) {
     MemPool pool;
     Query::Context context(pool, *reader);
     auto* weight = query.createWeight(context,
         Query::NEED_SCORES | (pruning ? Query::ALLOW_PRUNING : 0));
+    TopDocsCollector collector(5);
+    Result result;
     auto& segment = reader->segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(nullptr, supplier);
+    if (supplier == nullptr) return result;
     DocSet* live = segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr;
-    TopDocsCollector collector(k);
     if (bulk) {
-      auto* supplier = weight->scorerSupplier(pool, segment);
-      auto* scorer = supplier ? supplier->bulkScorer(pool) : nullptr;
-      bulkMissing = scorer == nullptr;
-      if (scorer == nullptr) return {};
-      collectTopKWindowed(segment.ord, scorer, live, collector, nullptr,
-                          segment.maxDoc(), pruning);
+      Query::ScorerSupplier::BulkScorerContext buildContext;
+      auto plan = supplier->planBulk(Query::ExecutionUse::MATCH_WINDOWS, buildContext);
+      auto* scorer = plan.available == Query::ScorerSupplier::BulkAnswer::YES
+          ? supplier->buildBulk(pool, plan) : nullptr;
+      EXPECT_NE(nullptr, scorer);
+      if (scorer == nullptr) return result;
+      collectTopKWindowed(segment.ord, scorer, live, collector, nullptr, segment.maxDoc(), pruning);
+      if (auto* mand = dynamic_cast<BooleanQuery::MandOptBulkScorer*>(scorer)) {
+        for (auto* child : mand->optionalScorersForTests()) result.visits += visited(child);
+      } else if (auto* sum = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(scorer)) {
+        for (auto* child : sum->clauseScorersForTests()) result.visits += visited(child);
+      } else {
+        ADD_FAILURE() << "Expected MandOptBulkScorer or MaxScoreBulkScorer";
+      }
     } else {
-      auto* scorer = weight->createScorer(pool, segment);
-      EXPECT_NE(scorer, nullptr);
-      if (scorer == nullptr) return {};
+      auto buildContext = supplier->makePlanContext(
+          Query::Demand::fromLeadCost(std::numeric_limits<int64_t>::max()));
+      buildContext.disableClauseFloorForwardingForTests = !forward;
+      auto* scorer = supplier->resolve(pool, buildContext)->build(pool);
       collectTopK(segment.ord, scorer, live, nullptr, collector, pruning);
+      result.visits = visited(scorer);
     }
-    auto sorted = collector.sort();
-    return Hits(sorted.begin(), sorted.end());
+    auto hits = collector.sort();
+    result.hits.assign(hits.begin(), hits.end());
+    return result;
   }
 
-  // Pruned run equals the exhaustive run where the clause declares nothing.
-  // Returns the largest floor forwarded.
-  float expectSame(Query& query, int32_t k, bool bulk,
-                   bool requireBulk = true) {
-    clause.prunes = false;
-    Hits expected = run(query, k, bulk, false);
-    clause.prunes = true;
-    Hits actual = run(query, k, bulk, true);
-    if (bulk && bulkMissing && !requireBulk) return 0.0f;
-    EXPECT_FALSE(bulkMissing);
-    float maxFloor = 0.0f;
-    for (float floor : clause.floors) maxFloor = std::max(maxFloor, floor);
-    EXPECT_EQ(expected.size(), actual.size());
-    for (size_t i = 0; i < std::min(expected.size(), actual.size()); i++) {
-      EXPECT_EQ(expected[i].doc, actual[i].doc) << "rank " << i;
-      EXPECT_FLOAT_EQ(expected[i].score, actual[i].score) << "rank " << i;
+  bool floorPays(Query& query, int64_t candidates) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
+    auto buildContext = supplier->makePlanContext(Query::Demand::fromLeadCost(candidates));
+    return supplier->resolve(pool, buildContext)->shape().competitiveFloorPays;
+  }
+
+  void exercise() {
+    MemPool pool;
+    auto field = [&](const char* name) -> Query* {
+      auto clauses = pool.make_span<Query*>(4);
+      const char* terms[] = {"t0", "t1", "t2", "t3"};
+      for (int i = 0; i < 4; i++) clauses[(size_t)i] = pool.make<TermQuery>(name, terms[i]);
+      return pool.make<BooleanQuery>(std::span<Query*>{}, clauses,
+                                     std::span<Query*>{}, std::span<Query*>{});
+    };
+    Query* fields[] = {field("title_w"), field("body_w")};
+    Query* dismax = DisMaxQuery::make(pool, fields, 0.0f);
+    TermQuery req("body_w", "req"), keep("body_w", "keep"), omit("body_w", "omit");
+    Query* must[] = {&req};
+    Query* optional[] = {dismax};
+    Query* filter[] = {&keep};
+    Query* prohibited[] = {&omit};
+    Query* pair[] = {dismax, &req};
+    BooleanQuery required(must, optional, {}, {}), sum({}, pair, {}, {});
+    BooleanQuery filtered({}, optional, {}, filter, 1), excluded({}, optional, prohibited, {});
+    Query* sumGroup[] = {field("body_w")};
+    BooleanQuery grouped(sumGroup, {}, {}, {});
+    Query* groupedOptional[] = {&grouped};
+    BooleanQuery requiredSum(must, groupedOptional, {}, {});
+    Query* filteredOptional[] = {&filtered};
+    Query* excludedOptional[] = {&excluded};
+    BooleanQuery wrapped(must, filteredOptional, {}, {}), withExclusion(must, excludedOptional, {}, {});
+    BooleanQuery requiredFiltered(optional, {}, {}, filter);
+    constexpr int64_t unbounded = std::numeric_limits<int64_t>::max();
+    EXPECT_TRUE(floorPays(*dismax, unbounded));
+    EXPECT_TRUE(floorPays(grouped, unbounded));
+    EXPECT_FALSE(floorPays(grouped, 1));
+    EXPECT_FALSE(floorPays(*dismax, 1));
+    EXPECT_FALSE(floorPays(req, unbounded));
+    EXPECT_TRUE(floorPays(filtered, 1));
+    EXPECT_TRUE(floorPays(excluded, unbounded));
+    EXPECT_FALSE(floorPays(requiredFiltered, unbounded));
+    bool floorArrived = false;
+    for (bool bulk : {false, true}) {
+      for (Query* query : std::array<Query*, 5>{&required, &sum, &requiredSum, &wrapped, &withExclusion}) {
+        SCOPED_TRACE(::testing::Message() << "bulk " << bulk << " query " << query);
+        Result exhaustive = run(*query, bulk, false);
+        Result on = run(*query, bulk, true);
+        assertTopKEquivalent(exhaustive.hits, on.hits);
+        // Only pull plans carry the switch that withholds floors.
+        if (bulk) continue;
+        Result off = run(*query, bulk, true, false);
+        assertTopKEquivalent(exhaustive.hits, off.hits);
+        floorArrived |= on.visits < off.visits;
+      }
     }
-    return maxFloor;
+    EXPECT_TRUE(floorArrived);
   }
 };
 
-TEST_F(ClauseFloorTest, mandatoryPlusFloorClause) {
-  TermQuery alpha("body_w", "alpha"), gamma("body_w", "gamma");
-  FloorQuery floor(clause);
-  Query* must[] = {&alpha};
-  Query* opt[] = {&floor};
-  Query* filter[] = {&gamma};
-  BooleanQuery plain(must, opt, {}, {});
-  BooleanQuery filtered(must, opt, {}, filter);
-  for (bool bulk : {false, true}) {
-    EXPECT_GT(expectSame(plain, 5, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(plain, 40, bulk), 0.0f) << bulk;
-    EXPECT_EQ(expectSame(plain, 50000, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(filtered, 3, bulk), 0.0f) << bulk;
-  }
-}
-
-TEST_F(ClauseFloorTest, optionalClauses) {
-  TermQuery alpha("body_w", "alpha"), beta("body_w", "beta");
-  FloorQuery floor(clause);
-  Query* two[] = {&floor, &alpha};
-  Query* three[] = {&floor, &alpha, &beta};
-  BooleanQuery pair({}, two, {}, {});
-  BooleanQuery triple({}, three, {}, {});
-  for (bool bulk : {false, true}) {
-    EXPECT_GT(expectSame(pair, 5, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(pair, 100, bulk), 0.0f) << bulk;
-    EXPECT_EQ(expectSame(pair, 50000, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(triple, 5, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(triple, 50, bulk), 0.0f) << bulk;
-  }
-}
+TEST_F(ClauseFloorTest, realQueries) { exercise(); }
 
 TEST_F(ClauseFloorTest, deletedDocs) {
   ASSERT_TRUE(helper.deleteByIds({"0", "3", "6", "12", "24"},
                                  UpdateMessage::COMMIT).success);
   reader = helper.getIndexWriter()->snapshots.readers.getReader();
-  TermQuery alpha("body_w", "alpha");
-  FloorQuery floor(clause);
-  Query* must[] = {&alpha};
-  Query* opt[] = {&floor};
-  Query* both[] = {&floor, &alpha};
-  BooleanQuery mandOpt(must, opt, {}, {});
-  BooleanQuery disj({}, both, {}, {});
-  for (bool bulk : {false, true}) {
-    EXPECT_GT(expectSame(mandOpt, 5, bulk), 0.0f) << bulk;
-    EXPECT_GT(expectSame(disj, 5, bulk), 0.0f) << bulk;
-  }
-}
-
-TEST_F(ClauseFloorTest, disMaxForwardsFloors) {
-  TermQuery alpha("body_w", "alpha");
-  FloorQuery floor(clause);
-  MemPool pool;
-  Query* parts[] = {&floor, &alpha};
-  // The pull path; a dis_max has no bulk plan.
-  auto* maxOfTwo = DisMaxQuery::make(pool, parts, 0.0f);
-  EXPECT_GT(expectSame(*maxOfTwo, 5, false), 0.0f);
-  auto* tied = DisMaxQuery::make(pool, parts, 0.3f);
-  expectSame(*tied, 5, false);
+  exercise();
 }
 
 TEST(ClauseFloor, edgeCases) {
@@ -299,8 +213,10 @@ TEST(ClauseFloor, edgeCases) {
   EXPECT_TRUE(none(clauseFloor(2.0f, 2.0, 2)));
   EXPECT_TRUE(none(clauseFloor(2.0f, 1.9999999, 2)));
   EXPECT_GT(clauseFloor(2.0f, 1.0, 2), 0.0f);
-  // Negative others (a bound below zero) still give a floor under theta.
-  EXPECT_GT(clauseFloor(1.0f, -0.5, 2), 0.0f);
+  // Negative other contributions are conservatively bounded by zero.
+  EXPECT_EQ(clauseFloor(1.0f, -0.5, 2), clauseFloor(1.0f, 0.0, 2));
+  EXPECT_TRUE(none(clauseFloor(0.0f, -1.0, 2)));
+  EXPECT_TRUE(none(clauseFloor(-1.0f, -1.01, 1001)));
 }
 
 TEST(ClauseFloor, roundingSlackKeepsEveryCompetitiveScore) {
