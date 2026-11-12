@@ -132,6 +132,17 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       "collections.shards.index.segments.merge_level", "collections.shards.index.segments.min_update_version",
       "collections.shards.index.segments.overlays.built_core_gen", "collections.shards.index.segments.overlays.bytes",
       "collections.shards.index.segments.overlays.commit_time", "collections.shards.index.segments.schema_gen",
+      // Per-field storage report, on demand via field_bytes=true.
+      "collections.shards.index.field_bytes.bytes", "collections.shards.index.field_bytes.column_bytes",
+      "collections.shards.index.field_bytes.column_index_bytes", "collections.shards.index.field_bytes.docs",
+      "collections.shards.index.field_bytes.docs_with_field_bytes", "collections.shards.index.field_bytes.norms_bytes",
+      "collections.shards.index.field_bytes.points_bytes", "collections.shards.index.field_bytes.positions",
+      "collections.shards.index.field_bytes.positions_bytes", "collections.shards.index.field_bytes.postings",
+      "collections.shards.index.field_bytes.postings_bytes", "collections.shards.index.field_bytes.segments",
+      "collections.shards.index.field_bytes.stored_bytes", "collections.shards.index.field_bytes.term_index_bytes",
+      "collections.shards.index.field_bytes.terms", "collections.shards.index.field_bytes.terms_bytes",
+      "collections.shards.index.field_bytes.values", "collections.shards.index.field_bytes.vector_bytes",
+      "collections.shards.index.field_bytes.vector_index_bytes", "collections.shards.index.unattributed_bytes",
       // Sums of the per-index series, which Prometheus aggregates itself.
       "totals.bytes", "totals.collections", "totals.committed_bytes", "totals.committed_segments",
       "totals.deleted_docs", "totals.live_docs", "totals.max_docs", "totals.segments", "totals.shards",
