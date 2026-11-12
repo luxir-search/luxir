@@ -242,3 +242,13 @@ transition instant. With EXPLICIT bounds, the phase comes from the local time
 of `start`. A facet may set its own `time_zone`; leaving it empty inherits the
 request's. See [range facets](faceting.md#range-facets) for DATA widening,
 `origin`, calendar alignment, DST behavior and limits.
+
+## Time clustering
+
+Range filters and histograms on a DATE field are cheapest when each segment's
+values arrive roughly in time order, so that each 4096-value block of the
+column covers a short time span and whole blocks can be skipped. Check this
+per segment with `GET /collections/{collection}/_stats?columns=true`: a
+`zone_overlap` near 1 means the blocks tile the segment's time range; one near
+the block count means arrival order is effectively random. See
+[operations.md](operations.md#column-zone-statistics).
