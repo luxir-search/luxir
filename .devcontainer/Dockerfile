@@ -1,6 +1,10 @@
 # Copyright 2020-2026 Yonik Seeley and Luxir contributors
 # SPDX-License-Identifier: Apache-2.0
 
+# The stage the ASan dependencies build on. deps-image.yml builds the two
+# dependency stages in separate jobs and names the published first stage here.
+ARG NORMAL_DEPENDENCIES=normal-dependencies
+
 FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7 AS toolchain
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -55,7 +59,11 @@ COPY deps/ports /opt/luxir-deps/ports
 COPY deps/triplets /opt/luxir-deps/triplets
 ARG BUILD_JOBS=12
 ENV VCPKG_MAX_CONCURRENCY=${BUILD_JOBS} VCPKG_DISABLE_METRICS=1
-ENV VCPKG_BINARY_SOURCES="clear;files,/var/cache/vcpkg,readwrite"
+# Packages are archived twice: in the BuildKit cache, which survives local
+# image rebuilds, and in this stage, so a later stage built from the published
+# image restores the host tools it shares. The dev stage does not copy them.
+ENV VCPKG_BINARY_SOURCES="clear;files,/var/cache/vcpkg,readwrite;files,/var/lib/luxir-vcpkg-archives,readwrite"
+RUN mkdir -p /var/lib/luxir-vcpkg-archives
 # Validate C LAPACK before building the complete dependency set.
 RUN --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/var/cache/vcpkg \
@@ -77,7 +85,7 @@ RUN --mount=type=cache,target=/opt/vcpkg/downloads \
       --host-triplet=x64-linux-luxir-v2 --x-feature=jemalloc \
       --clean-buildtrees-after-build --clean-packages-after-build
 
-FROM normal-dependencies AS dependencies
+FROM ${NORMAL_DEPENDENCIES} AS dependencies
 RUN --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/var/cache/vcpkg \
     /opt/vcpkg/vcpkg install --x-manifest-root=/opt/luxir-deps \

@@ -9,7 +9,8 @@ spec = importlib.util.spec_from_file_location('deps_key', Path(__file__).with_na
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-DOCKERFILE = '''FROM ubuntu:22.04 AS toolchain
+DOCKERFILE = '''ARG NORMAL_DEPENDENCIES=normal-dependencies
+FROM ubuntu:22.04 AS toolchain
 COPY .devcontainer/check-toolchain.cpp .devcontainer/check-toolchain.sh /opt/luxir-checks/
 FROM toolchain AS normal-dependencies
 COPY deps/vcpkg.json deps/vcpkg-configuration.json /opt/luxir-deps/
@@ -17,7 +18,7 @@ COPY deps/ports /opt/luxir-deps/ports
 COPY deps/triplets /opt/luxir-deps/triplets
 ARG BUILD_JOBS=12
 COPY test/blas_lapack_test.cpp /opt/luxir-checks/check-lapack.cpp
-FROM normal-dependencies AS dependencies
+FROM ${NORMAL_DEPENDENCIES} AS dependencies
 RUN echo later-stage
 FROM toolchain AS dev
 COPY --from=dependencies /opt/vcpkg /opt/vcpkg
@@ -61,7 +62,8 @@ class KeyContract(unittest.TestCase):
             for old, new in [('RUN apt-get install wamerican', 'RUN apt-get install other'),
                              ('AS dev', 'AS other'),
                              ('--from=dependencies /opt/vcpkg', '--from=toolchain /opt/vcpkg'),
-                             ('FROM normal-dependencies', 'FROM toolchain')]:
+                             ('FROM ${NORMAL_DEPENDENCIES}', 'FROM toolchain'),
+                             ('ARG NORMAL_DEPENDENCIES=normal-dependencies', 'ARG NORMAL_DEPENDENCIES=toolchain')]:
                 dockerfile.write_text(DOCKERFILE.replace(old, new))
                 if old.startswith('RUN'):
                     self.assertNotEqual(key, module.deps_key(root))
