@@ -6012,6 +6012,64 @@ TEST_F(SearchEngineTest, autoParallelIsAnOperatorOptIn) {
   EXPECT_FALSE(off->laneProbing);
 }
 
+TEST_F(SearchEngineTest, termListLookupsAreRequiredWork) {
+  LuxirConfig config;
+  config.search.auto_parallel_min_saving_us = 1000;
+  config.search.auto_parallel_ns_per_unit = 1;
+  LuxirNode node(config);
+  CollectionHelper helper(node, "term_list");
+  for (int32_t batch = 0; batch < 3; batch++) {
+    std::vector<Doc> docs;
+    for (int32_t doc = 0; doc < 500; doc++) {
+      docs.push_back(flatdoc("id", "doc_" + std::to_string(batch) + "_" + std::to_string(doc),
+                             "body_w", "alpha"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ(3u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  auto run = [&](std::string_view body, int maxParallel) {
+    auto req = localReq(node.getSearchEngine());
+    parseQueryRequest(body, req->rawRequest(), req->mr);
+    req->collection("term_list");
+    req->execute(maxParallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  // Every listed term is looked up in every segment, hit or miss, however
+  // early first-K ranking stops: 6,000 x 3 segments is ~2.7 ms of lookups.
+  auto termList = [](int32_t values) {
+    std::string list;
+    for (int32_t i = 0; i < values; i++) {
+      list += std::format(R"({}"{}")", i ? "," : "",
+                          i % 200 == 0 ? std::format("doc_{}_{}", i % 3, i / 200) : std::format("miss_{}", i));
+    }
+    return std::format(R"({{"any_of":{{"field":"id","values":[{}]}}}})", list);
+  };
+  auto body = [](const std::string& query, std::string_view count) {
+    return std::format(R"({{"ops":{{"q":{{"top_docs":{{"query":{},{}"get_scores":true,"fields":["id"],"limit":10}}}}}}}})",
+                       query, count);
+  };
+  auto large = termList(6000);
+  for (const auto& query : {large, std::format(R"({{"boolean":{{"required":["body_w:alpha"],"prohibited":[{}]}}}})", large)}) {
+    auto unset = run(body(query, ""), 0);
+    EXPECT_TRUE(unset->autoParallel) << query.substr(0, 80);
+    // A count is not what opens the lane.
+    EXPECT_TRUE(run(body(query, R"("count_limit":10000,)"), 0)->autoParallel);
+    for (int maxParallel : {1, -1}) {
+      auto other = run(body(query, ""), maxParallel);
+      EXPECT_EQ(resultIds(*other, "q"), resultIds(*unset, "q"));
+      expectSameScoreMap(resultScoreMap(*other, "q"), resultScoreMap(*unset, "q"));
+    }
+  }
+  EXPECT_EQ(10u, resultIds(*run(body(large, ""), 0), "q").size());
+  // A handful of terms, or a single term, is cheap and stays serial.
+  for (const auto& query : {termList(5), std::string(R"("id:doc_0_0")")}) {
+    auto small = run(body(query, ""), 0);
+    EXPECT_FALSE(small->autoParallel) << query;
+    EXPECT_FALSE(small->laneProbing) << query;
+  }
+}
+
 TEST(LanePolicyTest, costPolicyWeighsSavingAgainstSkewAndLoad) {
   LuxirConfig config;
   config.search.auto_parallel_min_saving_us = 500;

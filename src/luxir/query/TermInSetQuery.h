@@ -42,6 +42,8 @@ public:
 
   bool capsExpansions() const override { return false; }
 
+  size_t plannedLookups() const override { return terms.size(); }
+
   std::string describe() const override {
     return std::format("terms query of {} terms on field '{}'",
                        terms.size(), field);

@@ -56,6 +56,11 @@ public:
   // the request size already bounds them; the scan budgets still apply.
   virtual bool capsExpansions() const { return true; }
 
+  // Dictionary lookups an expansion makes per segment, when the query itself
+  // says how many (an explicit term list). Zero when only the dictionary walk
+  // can tell, as for prefix, wildcard, regex, fuzzy and range.
+  virtual size_t plannedLookups() const { return 0; }
+
   // Names the query in limit errors, e.g. "prefix query 'ab' on field 'f'".
   virtual std::string describe() const = 0;
 
@@ -814,6 +819,19 @@ public:
             ? info->docsWithField : std::min<int64_t>(bound, info->sumDocFreq);
       }
       return countBound(segment, domain, bound);
+    }
+
+    // The expansion seeks every listed term in every segment holding the
+    // field before ranking can stop, unless this request already walked it.
+    double setupUnits(IndexReader::Segment& segment) override {
+      if (cachedFieldInfo == nullptr || cachedFieldInfo->segInfos.at(segment.ord) == nullptr) {
+        return 0.0;
+      }
+      for (auto* facts = expansionMemos[(size_t)segment.ord].facts; facts != nullptr;
+           facts = facts->next) {
+        if (facts->populated) return 0.0;
+      }
+      return (double)query.plannedLookups() * work::TERM_LOOKUP;
     }
 
     Query::ScorerSupplier* scorerSupplierImpl(

@@ -635,7 +635,8 @@ public:
   // A count metadata answers costs nothing, and score-ordered constant-score
   // ranking stops at the first K. Sub-ops and an unbounded iterated count must
   // visit every match; ranking and a bounded count may prune, so their cost is
-  // only an upper bound. A prepared query's work is not priced here.
+  // only an upper bound. Setup, such as a term list's lookups, runs whatever
+  // pruning skips. A prepared query's work is not priced here.
   void quoteWork(WorkQuote& quote) override {
     SearchOp::quoteWork(quote);
     if (weight == nullptr) {
@@ -650,6 +651,9 @@ public:
       auto shortcut = weight->countShortcut(segment, nullptr);
       bool counting = requirements.needsCount() && shortcut.how != Query::CountHow::METADATA;
       auto ord = (size_t)segment.ord;
+      if (!subOps.empty() || counting || requirements.needRankedDocs) {
+        quote.required[ord] += weight->setupUnits(segment);
+      }
       if (!subOps.empty() || (counting && !boundedCount)) {
         quote.required[ord] += weight->workUnits(segment)
             + subOpsConsumeUnits(segment, shortcut.maxMatches);
