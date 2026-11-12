@@ -77,6 +77,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-fstack-protector)
 endif()
 
+# A program the build itself runs (code generator, dependency check) must run
+# on the build machine, which need not support a named LUXIR_CPU_TARGET tier:
+# an x86-64-v4 build on a CPU without AVX-512 would otherwise die generating
+# code. Later -march options win, so this replaces the tree-wide tier.
+function(luxir_runs_during_build target)
+  if(NOT CMAKE_CROSSCOMPILING AND LUXIR_CPU_TARGET MATCHES "^(x86-64-v|armv8)")
+    target_compile_options(${target} PRIVATE -march=native)
+  endif()
+endfunction()
+
 option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
 if(LUXIR_STATIC_RUNTIME)
   if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
