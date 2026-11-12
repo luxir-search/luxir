@@ -920,9 +920,10 @@ reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
 the search exhaustive over IVF lists, but bounded estimates or empirical
 intervals still decide which values are rescored.
 
-To see what effort a query actually spent, send `profile: true` and read the
+To see a query's initial budget and actual work, send `profile: true` and read the
 `knn(<field>)` op: `coverage` (fraction of live vectors in probed lists),
-`effective_nprobe` against `reference_nlist`, and `terminal_reads`. See
+`initial_nprobe` against `reference_nlist`, per-segment `lists_probed` against
+`segment_nlist`, and `terminal_reads`. See
 [profiling](searching.md#request-level-controls). Recall itself needs ground truth from an
 `exact: true` run of the same queries; the engine does not report it.
 

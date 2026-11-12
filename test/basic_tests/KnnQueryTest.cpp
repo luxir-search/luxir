@@ -9,6 +9,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -257,6 +258,16 @@ protected:
     cur.getScores().countLimit().fields({"id"});
     cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact,
                              refineCandidates, minScanFraction);
+  }
+
+  static std::optional<double> profileNumber(const api::ExecutionProfilePiece& piece, std::string_view field) {
+    std::string key = std::string(field) + "=";
+    for (auto detail : piece.details) {
+      auto pos = detail.find(key);
+      if (pos != std::string_view::npos && (pos == 0 || detail[pos - 1] == ' '))
+        return std::stod(std::string(detail.substr(pos + key.size())));
+    }
+    return std::nullopt;
   }
 
   // Build a TopDocs request with a KNN query for the given field + query
@@ -2922,7 +2933,18 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
                            /*nprobe=*/0, /*refineCandidates=*/8,
                            /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->collection("main").profile();
     req->execute();
+    ASSERT_OK(req);
+    ASSERT_TRUE(req->responses.back()->proto.profile.has_value());
+    const auto& ops = req->responses.back()->proto.profile->ops;
+    ASSERT_EQ(1u, ops.size());
+    ASSERT_EQ(1u, ops[0].pieces.size());
+    auto nlist = profileNumber(ops[0].pieces[0], "segment_nlist");
+    auto probed = profileNumber(ops[0].pieces[0], "lists_probed");
+    ASSERT_TRUE(nlist); ASSERT_TRUE(probed);
+    EXPECT_EQ(*nlist, *probed); // Full breadth, even though DEPTH rescans it.
+    EXPECT_GT(stats.lists.load(), *probed);
     auto ids = resultIds(*req);
     req->done();
     KnnQuery::statsForTests = nullptr;
@@ -4159,11 +4181,40 @@ TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
         KnnQuery::statsForTests = &stats;
         KnnQuery::tuning.completion = KnnQuery::Completion::FORCE;
         auto req = localReq(h.getSearchEngine());
+        req->collection("main").profile();
         auto& cur = req->collection("main").topDocs("q");
         configKnn(cur, field, {0, 0, 0, 0}, 7, 0, 0, exact);
         if (filter) addMatchFilter(cur, "keep_s", "yes");
         req->execute(parallel);
         ASSERT_OK(req);
+        ASSERT_TRUE(req->responses.back()->proto.profile.has_value());
+        const auto& ops = req->responses.back()->proto.profile->ops;
+        ASSERT_EQ(1u, ops.size());
+        ASSERT_EQ(3u, ops[0].pieces.size());
+        int queryLines = 0;
+        bool firstIvf = true;
+        for (const auto& piece : ops[0].pieces) {
+          for (auto detail : piece.details) queryLines += detail.starts_with("reference_nlist=");
+          bool ranIvf = stats.segmentWork[(size_t)piece.segment].ivfRounds > 0;
+          auto reference = profileNumber(piece, "reference_nlist");
+          auto initial = profileNumber(piece, "initial_nprobe");
+          auto nlist = profileNumber(piece, "segment_nlist");
+          auto probed = profileNumber(piece, "lists_probed");
+          if (ranIvf && std::exchange(firstIvf, false)) {
+            ASSERT_TRUE(reference); ASSERT_TRUE(initial);
+            EXPECT_NEAR(stats.initialBudget.load() * *reference, *initial, 1e-4);
+          } else {
+            EXPECT_FALSE(reference); EXPECT_FALSE(initial);
+          }
+          if (ranIvf) {
+            ASSERT_TRUE(nlist); ASSERT_TRUE(probed);
+            EXPECT_GT(*probed, 0);
+            EXPECT_LE(*probed, *nlist);
+          } else {
+            EXPECT_FALSE(nlist); EXPECT_FALSE(probed);
+          }
+        }
+        EXPECT_EQ(exact ? 0 : 1, queryLines);
         EXPECT_EQ(exact ? 0 : 1, stats.costWork[KnnPlanner::IVF_REQUEST]);
         if (exact) { expected = resultIds(*req); scores = resultScores(*req); }
         else {
@@ -4215,9 +4266,10 @@ TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
   }
 }
 
-TEST_F(KnnQueryTest, profileReportsEffectiveNprobeAndProbedLists) {
+TEST_F(KnnQueryTest, profileReportsInitialNprobeAndDistinctLists) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
+  SearchOverridesGuard saved(KnnQuery::statsForTests);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
   for (int i = 0; i < 160; i++) {
@@ -4231,33 +4283,43 @@ TEST_F(KnnQueryTest, profileReportsEffectiveNprobeAndProbedLists) {
   ASSERT_NE(auxReader, nullptr);
   auto* aux = (VectorAuxReader*)auxReader.get();
 
-  auto details = [&](int32_t nprobe, bool exact, std::string expectedStrategy) {
+  struct Case { int32_t nprobe; float minScanFraction; bool exact; };
+  for (auto c : {Case{2, 0, false}, Case{0, 0, false}, Case{2, 0.5f, false}, Case{0, 0, true}}) {
+    SCOPED_TRACE(std::format("nprobe={} min_scan_fraction={} exact={}", c.nprobe, c.minScanFraction, c.exact));
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
     auto req = localReq(h.getSearchEngine());
     req->collection("main").profile();
-    configKnn(req->topDocs("q"), "embedding_v", {0, 0, 0, 0}, 3, nprobe, 0, exact);
+    configKnn(req->topDocs("q"), "embedding_v", {0, 0, 0, 0}, 3, c.nprobe, 0, c.exact, c.minScanFraction);
     req->execute();
-    EXPECT_OK(req);
-    std::string joined;
-    for (const auto& op : req->responses.back()->proto.profile->ops) for (const auto& piece : op.pieces) {
-      if (piece.kind != "knn") continue;
-      EXPECT_EQ(expectedStrategy, piece.strategy);
-      for (auto detail : piece.details) joined += std::string(detail) + "\n";
+    ASSERT_OK(req);
+    ASSERT_TRUE(req->responses.back()->proto.profile.has_value());
+    const auto& ops = req->responses.back()->proto.profile->ops;
+    ASSERT_EQ(1u, ops.size());
+    ASSERT_EQ(1u, ops[0].pieces.size());
+    const auto& piece = ops[0].pieces[0];
+    EXPECT_EQ("knn", piece.kind);
+    EXPECT_EQ(c.exact ? "exact" : "ivf", piece.strategy);
+    auto reference = profileNumber(piece, "reference_nlist");
+    auto initial = profileNumber(piece, "initial_nprobe");
+    auto nlist = profileNumber(piece, "segment_nlist");
+    auto probed = profileNumber(piece, "lists_probed");
+    EXPECT_FALSE(profileNumber(piece, "effective_nprobe"));
+    EXPECT_FALSE(profileNumber(piece, "refine_target"));
+    if (c.exact) {
+      EXPECT_FALSE(reference); EXPECT_FALSE(initial); EXPECT_FALSE(nlist); EXPECT_FALSE(probed);
+      continue;
     }
-    return joined;
-  };
-  auto hasDetail = [](const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; };
-
-  auto pinned = details(2, false, "ivf");
-  EXPECT_TRUE(hasDetail(pinned, "effective_nprobe=2;")) << pinned;
-  EXPECT_TRUE(hasDetail(pinned, "segment_nlist=" + std::to_string(aux->getNList()) + ";")) << pinned;
-  EXPECT_FALSE(hasDetail(pinned, "lists_probed=0;")) << pinned;
-
-  auto byDefault = details(0, false, "ivf");
-  EXPECT_TRUE(hasDetail(byDefault, "effective_nprobe=")) << byDefault;
-  EXPECT_TRUE(hasDetail(byDefault, "reference_nlist=" + std::to_string(defaultIvfNList(160)) + ";")) << byDefault;
-
-  auto exact = details(0, true, "exact");
-  EXPECT_TRUE(hasDetail(exact, "lists_probed=0;")) << exact;
+    ASSERT_TRUE(reference); ASSERT_TRUE(initial); ASSERT_TRUE(nlist); ASSERT_TRUE(probed);
+    EXPECT_EQ(defaultIvfNList(160), *reference);
+    EXPECT_NEAR(stats.initialBudget.load() * *reference, *initial, 1e-5);
+    if (c.nprobe) {
+      EXPECT_DOUBLE_EQ(std::max((double)c.nprobe, c.minScanFraction * *reference), *initial);
+    }
+    EXPECT_EQ(aux->getNList(), *nlist);
+    EXPECT_GT(*probed, 0);
+    EXPECT_LE(*probed, *nlist);
+  }
 }
 
 TEST_F(KnnQueryTest, completionRetiresBoundedQuotaAndRefillsActiveSlot) {

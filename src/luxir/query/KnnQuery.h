@@ -1293,6 +1293,7 @@ public:
       auto executionEffort = planRequest;
       executionEffort.referenceBreadth = defaultIvfNList(liveNTotal);
       double initialFraction = KnnPlanner::initialScanFraction(executionEffort, selectivity);
+      const double initialNprobe = initialFraction * executionEffort.referenceBreadth;
       for (size_t i = 0; i < numSegs; i++) {
         if (activeIvf[i] && !eligibilityPerSeg[i].unfiltered
             && KnnPlanner::foldFirst(planSegments[i], initialFraction, tuning.selector, tuning.plannerCosts)) foldDomainAt(i);
@@ -1652,6 +1653,7 @@ public:
         for (size_t i = 0; i < numSegs; i++) if (plan.ivf[i])
           selectors += KnnPlanner::selectorCost(plan.prices[i], effort.initial, effort.coverage > effort.initial);
         plan.cost = KnnPlanner::totalCost(modeled, planRequest, tuning.plannerCosts, selectors);
+        auto listsProbed = profile ? baseEngine->listsProbedBySegment() : std::vector<size_t>{};
         if (statsForTests) {
           statsForTests->predictedCost += plan.cost;
           statsForTests->modeledActualCost += tuning.plannerCosts.requestCost;
@@ -1664,7 +1666,8 @@ public:
           auto features = KnnPlanner::actualWork(input, work);
           // Attribute the shared request charge to the first executed IVF
           // piece for reporting, including queries that later complete exactly.
-          if (work.ivfRounds > 0 && std::exchange(ivfRequestPending, false)) features[KnnPlanner::IVF_REQUEST] = 1;
+          bool firstIvfPiece = work.ivfRounds > 0 && std::exchange(ivfRequestPending, false);
+          if (firstIvfPiece) features[KnnPlanner::IVF_REQUEST] = 1;
           if (statsForTests) {
             (plan.ivf[i] ? statsForTests->plannedIvf : statsForTests->plannedExact)++;
             statsForTests->modeledActualCost += tuning.plannerCosts.price(features);
@@ -1690,9 +1693,11 @@ public:
                 KnnPlanner::terminalReads(modeled, KnnPlanner::coverage(modeled, planRequest), planRequest.k), work.rounds,
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
-            piece.details.push_back(std::format("reference_nlist={}; effective_nprobe={:.6g}; segment_nlist={}; lists_probed={}; refine_target={}",
-                planRequest.referenceBreadth, effort.initial * planRequest.referenceBreadth, input.nlist,
-                work.listSetups, planRequest.boundedTarget));
+            if (firstIvfPiece)
+              piece.details.push_back(std::format("reference_nlist={}; initial_nprobe={:.6g}",
+                  executionEffort.referenceBreadth, initialNprobe));
+            if (work.ivfRounds > 0)
+              piece.details.push_back(std::format("segment_nlist={}; lists_probed={}", input.nlist, listsProbed[i]));
             for (size_t f = 0; f < features.size(); f++)
               piece.details.push_back(std::format("{}={}", KnnPlanner::unitNames[f], features[f]));
             for (const auto& event : completions) if ((size_t)event.segment == i)
@@ -2682,6 +2687,13 @@ public:
           workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), parallel(parallel) {}
 
       double coveredFraction() const { return std::min(1.0, allocation.cost); }
+      std::vector<size_t> listsProbedBySegment() const {
+        std::vector<size_t> counts(workBySeg.size());
+        // Watermarks survive completion and count each scanned list once,
+        // independent of bounded DEPTH rescans.
+        for (size_t i = 0; i < scannedListCount.size(); i++) counts[(size_t)slots[i].segOrd] = scannedListCount[i];
+        return counts;
+      }
       bool breadthExhausted() const { return allocation.heapSize <= 0; }
       bool hasCoveredBounded() const {
         for (size_t i = 0; i < slots.size(); i++)

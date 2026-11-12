@@ -1189,10 +1189,11 @@ engine, so do not build tooling on it. Serial execution (the default, or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
 
-A `knn(<field>)` op has one piece per segment with vectors. `strategy` is `ivf`
-or `exact`, and `details` reports the planner's reason, predicted and actual
-coverage, rounds, terminal (full-precision) reads, the effective `nprobe`
-against the reference index, and the lists probed:
+A `knn(<field>)` op has one piece per segment with eligible docs and live
+vectors. `strategy` is the initial routing, `ivf` or `exact`; an `ivf` piece
+may later complete exactly. `details` reports the planner's reason, predicted
+and actual coverage, rounds, terminal (full-precision) reads, and IVF budgets
+and list counts:
 
 ```json
 {
@@ -1202,15 +1203,27 @@ against the reference index, and the lists probed:
   "details": [
     "reason=lowest modeled configuration; eligible_vectors=20000; exact_cost=...; ivf_scan_cost_at_predicted_coverage=...; ivf_linear=...; ivf_fixed=...",
     "predicted_coverage=0.238; predicted_total=...; predicted_ivf_rounds=1; predicted_terminal_dims=...; predicted_terminal_reads=...; rounds=1; coverage=0.241; entries=4830; selector_passes=1; terminal_reads=212",
-    "reference_nlist=141; effective_nprobe=33.6; segment_nlist=141; lists_probed=34; refine_target=100"
+    "reference_nlist=141; initial_nprobe=33.6",
+    "segment_nlist=141; lists_probed=34"
   ]
 }
 ```
 
-`coverage` is the fraction of the segment's live vectors in the probed lists.
-`effective_nprobe` is the initial effort expressed in lists of the reference
-index (`reference_nlist`), which is fixed by the live vector count; a pinned
-`ivf.nprobe` up to `reference_nlist` is reported as given.
+For IVF pieces, `coverage` is the fraction of the segment's live vectors in
+the probed lists. It remains IVF list coverage when a piece completes exactly;
+the exact scan does not raise it to 1.
+
+`reference_nlist` and `initial_nprobe` appear once, on the first piece that
+executed IVF, including one that later completes exactly. `initial_nprobe`
+is the round-one budget in units of the reference index (`reference_nlist`),
+before whole-list allocation, widening, and completion. `ivf.min_scan_fraction`
+can raise a pinned `ivf.nprobe`; budgets are also capped at `reference_nlist`.
+
+Every piece that executed IVF reports `segment_nlist` and `lists_probed`, the
+number of distinct lists scanned in that segment. Rescans do not increase
+`lists_probed`. These are per-segment counts, in different units from
+`initial_nprobe`, so they are not directly comparable to it. Pieces that never
+ran IVF carry none of these fields.
 
 ## Streaming HTTP responses
 
