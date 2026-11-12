@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "luxir/index/PointsWriter.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/PostingsReader.h"
@@ -24,6 +25,7 @@
 
 using namespace luxir;
 using namespace luxir::test;
+
 
 namespace {
 
@@ -264,6 +266,151 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
 } // namespace
 
 class NumericRangePointsTest : public LuxirTest {};
+
+TEST_F(NumericRangePointsTest, plansAndBuildsTheRequestedArm) {
+  using Arm = NumericPredicateQuery::ScorerArm;
+  constexpr int32_t N = 4096;
+  constexpr int32_t MATCHES = N * 9 / 10;
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"points", "postings", "column", "multi", "crossing", "constant"}) {
+    auto& f = schema.field(name);
+    f.type = api::FieldDef::FieldClass::INT;
+    f.index = name == std::string_view("points") || name == std::string_view("multi")
+        ? api::FieldDef::IndexMode::RANGE
+        : name == std::string_view("postings") || name == std::string_view("constant")
+            ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
+    f.multi = name == std::string_view("multi")
+        ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    for (auto name : {"points", "postings", "column"}) {
+      inverter.getIndexHandler(name).index(inverter, (int64_t)(doc < MATCHES));
+    }
+    const int64_t values[] = {0, 1};
+    inverter.getIndexHandler("multi").index(inverter, std::span<const int64_t>(values));
+    inverter.getIndexHandler("crossing").index(inverter, (int64_t)(doc % 2));
+    inverter.getIndexHandler("constant").index(inverter, (int64_t)1);
+    inverter.getIndexHandler("body_w").index(
+        inverter, std::string_view(doc % 100 == 0 ? "lead" : "all"));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  for (auto arm : {Arm::POINTS, Arm::COMPLEMENT, Arm::SPARSE_VERIFY,
+                   Arm::POSTINGS, Arm::ZONE_MAP, Arm::SCAN}) {
+    auto counter = [&] {
+      switch (arm) {
+        case Arm::POINTS: return SkipStats::numericPredicatePointsArms;
+        case Arm::COMPLEMENT: return SkipStats::numericPredicateComplementArms;
+        case Arm::SPARSE_VERIFY: return SkipStats::numericPredicateSparseVerifyArms;
+        case Arm::POSTINGS: return SkipStats::numericPredicatePostingsArms;
+        case Arm::ZONE_MAP: return SkipStats::numericPredicateZoneArms;
+        case Arm::SCAN: return SkipStats::numericPredicateScanArms;
+      }
+      std::unreachable();
+    };
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(arm == Arm::POSTINGS ? "postings" : "points", 1, 1);
+    query.forcedArm = arm;
+    auto* weight = query.createWeight(context, 0);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(Query::CountHow::ITERATE, weight->countShortcut(segment, nullptr).how);
+    for (auto consumption : {Query::MembershipConsumption::CANDIDATES,
+                             Query::MembershipConsumption::WINDOWS,
+                             Query::MembershipConsumption::EITHER}) {
+      for (int64_t candidates : {(int64_t)1, (int64_t)N}) {
+        auto planContext = supplier->makePlanContext(Query::Demand::fromLeadCost(candidates));
+        planContext.membershipConsumption = consumption;
+        SkipStatsScope stats;
+        auto* scorer = supplier->resolve(pool, planContext)->build(pool);
+        int32_t count = 0;
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          EXPECT_EQ(count++, doc);
+        }
+        EXPECT_EQ(MATCHES, count);
+        EXPECT_EQ(1, counter());
+      }
+    }
+    for (bool constantCount : {false, true}) {
+      SkipStatsScope stats;
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      bulkContext.requireConstantCount = constantCount;
+      auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, bulkContext);
+      if (constantCount || arm == Arm::SCAN || arm == Arm::SPARSE_VERIFY) {
+        EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::NO, plan.available);
+        EXPECT_EQ(0, counter());
+      } else {
+        ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+        EXPECT_FALSE(plan.hasConstantCount());
+        auto* bulk = supplier->buildBulk(pool, plan);
+        int64_t count = 0;
+        for (int32_t cursor = 0; cursor < N;) {
+          cursor = bulk->countNextWindow(count, nullptr, nullptr, cursor, N);
+        }
+        EXPECT_EQ(MATCHES, count);
+        EXPECT_EQ(1, counter());
+      }
+    }
+    // Exercise the real parent planner, including its scalar-count probes.
+    TermQuery lead("body_w", "lead");
+    std::array<Query*, 1> required{&lead}, filters{&query};
+    BooleanQuery filtered(required, {}, {}, filters);
+    auto* parent = filtered.createWeight(context, 0)->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, parent);
+    SkipStatsScope stats;
+    auto bulkPlan = parent->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
+    int64_t count = 0;
+    if (bulkPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+      auto* bulk = parent->buildBulk(pool, bulkPlan);
+      for (int32_t cursor = 0; cursor < N;) {
+        cursor = bulk->countNextWindow(count, nullptr, nullptr, cursor, N);
+      }
+    } else {
+      auto* scorer = buildScorerForTests(pool, *parent, INT64_MAX);
+      while (scorer->next() != PostingsReader::END) count++;
+    }
+    EXPECT_EQ((MATCHES + 99) / 100, count);
+    EXPECT_EQ(1, counter());
+  }
+
+  auto trySupplier = [&](std::string_view field, Arm arm) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(field, 1, 1);
+    query.forcedArm = arm;
+    query.createWeight(context, 0)->scorerSupplier(pool, segment);
+  };
+  for (auto [field, arm] : {std::pair{"column", Arm::POINTS}, {"points", Arm::POSTINGS},
+                           {"postings", Arm::POINTS}, {"multi", Arm::COMPLEMENT},
+                           {"crossing", Arm::ZONE_MAP}, {"missing", Arm::SCAN}}) {
+    EXPECT_THROW(trySupplier(field, arm), std::invalid_argument);
+  }
+  // All-match equality and a two-term union still execute postings.
+  for (auto field : {"constant", "postings"}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(field, field == std::string_view("constant") ? 1 : 0, 1);
+    query.forcedArm = Arm::POSTINGS;
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    SkipStatsScope stats;
+    auto* scorer = buildScorerForTests(pool, *supplier, INT64_MAX);
+    int32_t count = 0;
+    while (scorer->next() != PostingsReader::END) count++;
+    EXPECT_EQ(N, count);
+    EXPECT_EQ(1, SkipStats::numericPredicatePostingsArms);
+  }
+}
 
 TEST_F(NumericRangePointsTest, exactSetUsesCoalescedPointRunsForCostAndShape) {
   constexpr int32_t N = 1400;

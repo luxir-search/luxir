@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -36,6 +37,20 @@ namespace luxir {
 // DATE epoch units), so pruning and comparisons happen in encoded space. A
 // document matches when any value satisfies the range or set.
 class NumericPredicateQuery final : public Query {
+public:
+  enum class ScorerArm : uint8_t {
+    SPARSE_VERIFY,
+    POSTINGS,
+    POINTS,
+    ZONE_MAP,
+    SCAN,
+    COMPLEMENT,
+  };
+
+  // C++ execution override. Set before creating weights; absent uses pricing.
+  std::optional<ScorerArm> forcedArm;
+
+private:
   std::string_view field;
   PointsReader::ValueRange envelope;
   // hi - lo, so matchesValue's range test is one subtract and one compare.
@@ -195,7 +210,7 @@ public:
       out.appendSize(exactValues.size());
       for (int64_t value : exactValues) out.appendInt64(value);
     }
-    return filterKeyScope;
+    return forcedArm ? FilterKeyScope::UNCACHEABLE : filterKeyScope;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
@@ -1543,6 +1558,7 @@ public:
     // Partial single-valued indexed counts resolve at supplier construction;
     // other counts walk the column only at execution.
     CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      if (query.forcedArm) return countBound(segment, domain, segment.maxDoc());
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
       if (!info) return {0, CountHow::METADATA};
@@ -1572,14 +1588,6 @@ public:
       static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
 
       using Materialized = PointsMaterialize::Materialized;
-
-      enum class ScorerArm : uint8_t {
-        SPARSE_VERIFY,
-        POSTINGS,
-        POINTS,
-        ZONE_MAP,
-        SCAN,
-      };
 
       NumericPredicateQuery::Weight& weight;
       MemPool& planPool;
@@ -1663,6 +1671,12 @@ public:
         double points;
       };
 
+      ScorerArm forcedScorerArm() const {
+        // Complement shares the points plan; useComplement selects its build.
+        auto arm = *weight.query.forcedArm;
+        return arm == ScorerArm::COMPLEMENT ? ScorerArm::POINTS : arm;
+      }
+
       double pointsPrice() const {
         bool complement = useComplement(pointValueCount);
         return PointsMaterialize::price(
@@ -1730,6 +1744,7 @@ public:
       // whole segment) and refine what is reached; a scan tests the values
       // it passes.
       Production cheapestProducer(Reach reach, int64_t producerSpan) const {
+        if (weight.query.forcedArm) return {forcedScorerArm(), 0};
         const auto& costs = column();
         std::optional<Production> best;
         if (points) best = Production{ScorerArm::POINTS, pointsPrice()};
@@ -1900,7 +1915,7 @@ public:
       }
 
       BulkScorer* zoneBulkScorer(MemPool& pool, bool eager) {
-        assert(column().useZones);
+        assert(column().useZones || weight.query.forcedArm == ScorerArm::ZONE_MAP);
         skipCount(SkipStats::numericPredicateZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
             pool, reader, blockPlans, weight.query,
@@ -1917,6 +1932,9 @@ public:
       // gcc-release on 2026-07-10 on a hybrid-core laptop per the tuning
       // caveat.
       bool useComplement(uint64_t exactCount) const {
+        if (weight.query.forcedArm) {
+          return *weight.query.forcedArm == ScorerArm::COMPLEMENT;
+        }
         return points != nullptr && !reader.multiValued()
             && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
       }
@@ -1948,6 +1966,14 @@ public:
       // emissions at every consumption site.
       Selection selectScorer(const Query::PlanContext& context) const {
         using Consumption = Query::MembershipConsumption;
+        if (weight.query.forcedArm) {
+          auto consumption = context.membershipConsumption;
+          if (consumption == Consumption::EITHER) {
+            consumption = forcedScorerArm() == ScorerArm::SPARSE_VERIFY
+                ? Consumption::CANDIDATES : Consumption::WINDOWS;
+          }
+          return {forcedScorerArm(), consumption};
+        }
         const auto& demand = context.demand;
         if (context.membershipConsumption == Consumption::CANDIDATES) {
           // Zones' per-candidate protocol is not priced; indexed producers
@@ -2022,6 +2048,7 @@ public:
             skipCount(SkipStats::numericPredicatePostingsArms);
             return postingsScorer(targetPool);
           case ScorerArm::POINTS:
+          case ScorerArm::COMPLEMENT:
             if (complement) {
               skipCount(SkipStats::numericPredicateComplementArms);
               return scorerFor(targetPool,
@@ -2157,6 +2184,7 @@ public:
             pointRanges(pointRanges), pointValueCount(pointValueCount),
             estimatedCost(estimatedCost), matchState(matchState), allMatch(allMatch) {
         if (summary) columnCosts = priceColumn(*summary);
+
       }
 
       int64_t cost() override { return estimatedCost; }
@@ -2265,6 +2293,7 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount) {
+          if (weight.query.forcedArm) return {};
           auto shortcut = weight.countShortcut(segment, nullptr);
           if (shortcut.how == CountHow::METADATA) {
             return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
@@ -2345,20 +2374,55 @@ public:
 
     };
 
+    std::optional<NumColumnFormat::LeafMeta::RangeSummary> validateForcedArm(
+        const SegFieldInfo* info, IntColReader* reader) const {
+      bool available = info && reader;
+      std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary;
+      if (available) {
+        switch (*query.forcedArm) {
+          case ScorerArm::POINTS:
+            available = info->pointsMetaOff != 0;
+            break;
+          case ScorerArm::COMPLEMENT:
+            available = info->pointsMetaOff != 0 && !reader->multiValued();
+            break;
+          case ScorerArm::POSTINGS:
+            available = (info->flags & FieldType::INDEX_DOCS) != 0;
+            break;
+          case ScorerArm::ZONE_MAP:
+            summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
+            if (query.isExactSet() && !query.covers(reader->getMin(), reader->getMax())) {
+              summary->insideLower = summary->insideUpper = 0;
+            }
+            available = summary->outside != 0 || summary->insideLower != 0;
+            break;
+          case ScorerArm::SPARSE_VERIFY:
+          case ScorerArm::SCAN:
+            break;
+        }
+      }
+      if (!available) {
+        throw std::invalid_argument("NumericPredicateQuery: forced arm unavailable on segment");
+      }
+      return summary;
+    }
+
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      if (query.getHi() < query.getLo()) return nullptr;
+      if (!query.forcedArm && query.getHi() < query.getLo()) return nullptr;
       const auto* segInfo = segmentInfo(segment);
-      if (!segInfo) return nullptr;
-      auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
+      auto* reader = segInfo ? targetPool.make<IntColReader>(segment.postingsReader(), *segInfo)
+          : nullptr;
+      auto summary = query.forcedArm ? validateForcedArm(segInfo, reader)
+          : std::optional<NumColumnFormat::LeafMeta::RangeSummary>{};
+      if (query.getHi() < query.getLo() || !reader) return nullptr;
       if (reader->numValues() == 0) return nullptr;
       int64_t colMin = reader->getMin();
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
-      std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary;
       bool allMatch = query.covers(colMin, colMax);
       int64_t cost = 0;
       PointsReader* points = nullptr;
@@ -2366,9 +2430,11 @@ public:
       uint64_t pointValueCount = 0;
       Query::MatchState matchState = Query::MatchState::UNKNOWN;
       std::optional<PostingMatches> postings;
-      if (!allMatch && (segInfo->flags & FieldType::INDEX_DOCS)) {
+      if ((!allMatch || query.forcedArm == ScorerArm::POSTINGS)
+          && (segInfo->flags & FieldType::INDEX_DOCS)) {
         postings = resolvePostings(targetPool, segment, *segInfo,
-                                    SCAN_POINTS * (double)reader->numValues());
+            query.forcedArm == ScorerArm::POSTINGS ? std::numeric_limits<double>::infinity()
+                : SCAN_POINTS * (double)reader->numValues());
       }
       if (postings) {
         cost = (int64_t)std::min<uint64_t>(postings->docFreq, reader->docsWithValue());
