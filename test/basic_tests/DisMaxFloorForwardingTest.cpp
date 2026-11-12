@@ -14,6 +14,7 @@
 
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/DisMaxQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
@@ -98,7 +99,7 @@ public:
       for (auto& c : clauses) c = termQuery(pool, field);
       return clauses;
     };
-    switch (rng() % 7) {
+    switch (rng() % 8) {
       case 0: return termQuery(pool, field);
       case 1: return pool.make<BooleanQuery>(std::span<Query*>{}, clause(2),
                                              std::span<Query*>{}, std::span<Query*>{});
@@ -110,6 +111,15 @@ public:
                                              std::span<Query*>{}, std::span<Query*>{});
       case 5: return pool.make<BooleanQuery>(clause(1), clause(2),
                                              std::span<Query*>{}, std::span<Query*>{});
+      case 6: {
+        auto terms = pool.make_span<std::string_view>(2);
+        auto positions = pool.make_span<int32_t>(2);
+        for (int i = 0; i < 2; i++) {
+          terms[(size_t)i] = strings.emplace_back(token());
+          positions[(size_t)i] = i;
+        }
+        return pool.make<PhraseQuery>(field, terms, positions);
+      }
       default: return pool.make<BooleanQuery>(clause(1), clause(1),
                                               std::span<Query*>{}, std::span<Query*>{});
     }
@@ -162,7 +172,7 @@ TEST_F(DisMaxFloorForwardingTest, prunedTopKMatchesExhaustive) {
     Query* query = randomDisMax(pool, tie);
     Query* required[] = {termQuery(pool, "body_w")};
     Query* optional[] = {query};
-    switch (rng() % 4) {
+    switch (rng() % 6) {
       case 0: query = pool.make<BooleanQuery>(required, optional,
                          std::span<Query*>{}, std::span<Query*>{}); break;
       case 1: {
@@ -175,6 +185,17 @@ TEST_F(DisMaxFloorForwardingTest, prunedTopKMatchesExhaustive) {
       }
       case 2: query = pool.make<BooleanQuery>(std::span<Query*>{}, optional,
                          std::span<Query*>{}, required, 1); break;
+      case 3: query = pool.make<BooleanQuery>(optional, required,
+                         std::span<Query*>{}, std::span<Query*>{}); break;
+      case 4: {
+        auto* filtered = pool.make<BooleanQuery>(optional, std::span<Query*>{},
+                            std::span<Query*>{}, required);
+        auto wrapped = pool.make_span<Query*>(1);
+        wrapped[0] = filtered;
+        query = pool.make<BooleanQuery>(required, wrapped,
+                    std::span<Query*>{}, std::span<Query*>{});
+        break;
+      }
       default: break;
     }
     int32_t k = std::array{1, 3, 10, 50}[rng() % 4];

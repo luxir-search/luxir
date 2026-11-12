@@ -12,6 +12,7 @@
 
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/DisMaxQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
@@ -107,6 +108,7 @@ public:
       if (scorer == nullptr) return result;
       collectTopKWindowed(segment.ord, scorer, live, collector, nullptr, segment.maxDoc(), pruning);
       if (auto* mand = dynamic_cast<BooleanQuery::MandOptBulkScorer*>(scorer)) {
+        result.visits = visited(mand->requiredScorerForTests());
         for (auto* child : mand->optionalScorersForTests()) result.visits += visited(child);
       } else if (auto* sum = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(scorer)) {
         for (auto* child : sum->clauseScorersForTests()) result.visits += visited(child);
@@ -166,14 +168,20 @@ public:
     EXPECT_TRUE(floorPays(*dismax, unbounded));
     EXPECT_TRUE(floorPays(grouped, unbounded));
     EXPECT_FALSE(floorPays(grouped, 1));
-    EXPECT_FALSE(floorPays(*dismax, 1));
+    EXPECT_TRUE(floorPays(*dismax, 1));
     EXPECT_FALSE(floorPays(req, unbounded));
     EXPECT_TRUE(floorPays(filtered, 1));
     EXPECT_TRUE(floorPays(excluded, unbounded));
-    EXPECT_FALSE(floorPays(requiredFiltered, unbounded));
+    EXPECT_TRUE(floorPays(requiredFiltered, unbounded));
+    Query* bare[] = {&req, &keep};
+    EXPECT_TRUE(floorPays(*DisMaxQuery::make(pool, bare, 0.0f), 1));
+    EXPECT_FALSE(floorPays(*DisMaxQuery::make(pool, fields, 0.3f), 1));
+    Query* requiredFilteredOptional[] = {&requiredFiltered};
+    BooleanQuery heapWrapped(must, requiredFilteredOptional, {}, {});
+    BooleanQuery reversed(optional, must, {}, {}), both(optional, groupedOptional, {}, {});
     bool floorArrived = false;
     for (bool bulk : {false, true}) {
-      for (Query* query : std::array<Query*, 5>{&required, &sum, &requiredSum, &wrapped, &withExclusion}) {
+      for (Query* query : std::array<Query*, 8>{&required, &sum, &requiredSum, &wrapped, &withExclusion, &heapWrapped, &reversed, &both}) {
         SCOPED_TRACE(::testing::Message() << "bulk " << bulk << " query " << query);
         Result exhaustive = run(*query, bulk, false);
         Result on = run(*query, bulk, true);
@@ -196,6 +204,38 @@ TEST_F(ClauseFloorTest, deletedDocs) {
                                  UpdateMessage::COMMIT).success);
   reader = helper.getIndexWriter()->snapshots.readers.getReader();
   exercise();
+}
+
+TEST_F(ClauseFloorTest, positionedHeapKeepsCompetitiveScore) {
+  for (int count : {2, 3}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    TermQuery first("body_w", "t0"), second("body_w", "t1"), extra("title_w", "t0");
+    Query* terms[] = {&first, &second};
+    BooleanQuery sum({}, terms, {}, {});
+    std::string_view phraseTerms[] = {"t0", "t1"};
+    int32_t positions[] = {0, 1};
+    PhraseQuery phrase("body_w", phraseTerms, positions);
+    Query* clauses[] = {&sum, &phrase, &extra};
+    auto* query = DisMaxQuery::make(pool, std::span(clauses, (size_t)count), 0.0f);
+    auto* weight = query->createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
+    auto buildContext = supplier->makePlanContext(Query::Demand::fromLeadCost(1));
+    auto* scorer = supplier->resolve(pool, buildContext)->build(pool);
+    ASSERT_NE(nullptr, dynamic_cast<BooleanQuery::DisjunctionScorerT<true>*>(scorer));
+    float floor = 0.0f;
+    for (int i = 0; i < 20 && scorer->next() != PostingsReader::END; i++) {
+      int32_t doc = scorer->docId();
+      float score = scorer->score();
+      floor = std::max(floor, score);
+      scorer->setMinCompetitiveScore(floor);
+      EXPECT_EQ(doc, scorer->docId());
+      if (score >= floor) {
+        EXPECT_TRUE(scorer->matches());
+        EXPECT_NEAR(score, scorer->score(), 1e-5f);
+      }
+    }
+  }
 }
 
 TEST(ClauseFloor, edgeCases) {

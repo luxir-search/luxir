@@ -1420,13 +1420,12 @@ static void BM_DisMaxMultiField(benchmark::State& state, float tie, bool forward
 
 enum class ClauseFloorQuery {
   MAND_DISMAX,
-  MAND_SUM,
   MAND_GROUPED_SUM,
   SUM_DISMAX,
   MAND_FILTERED_DISMAX,
-  MAND_TIED_DISMAX,
   DISMAX_MAND,
   MAND_REQUIRED_FILTERED_DISMAX,
+  MAND_FILTERED_HEAD_TERMS,
 };
 
 static Query* clauseFloorQuery(MemPool& pool, ClauseFloorQuery shape) {
@@ -1445,22 +1444,24 @@ static Query* clauseFloorQuery(MemPool& pool, ClauseFloorQuery shape) {
   auto fields = pool.make_span<Query*>(2);
   fields[0] = field("title_w");
   fields[1] = field("body_w");
-  float tie = shape == ClauseFloorQuery::MAND_TIED_DISMAX ? 0.3f : 0.0f;
-  Query* target = DisMaxQuery::make(pool, fields, tie);
+  if (shape == ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS) {
+    fields[0] = pool.make<TermQuery>("title_w", "t1");
+    fields[1] = pool.make<TermQuery>("body_w", "t1");
+  }
+  Query* target = DisMaxQuery::make(pool, fields, 0.0f);
   auto* term = pool.make<TermQuery>("body_w", "t5");
-  if (shape == ClauseFloorQuery::MAND_SUM || shape == ClauseFloorQuery::MAND_GROUPED_SUM) {
+  if (shape == ClauseFloorQuery::MAND_GROUPED_SUM) {
     target = field("body_w");
     // This required group is normalized independently, retaining the sum as
     // one optional child instead of flattening its terms into the parent.
-    if (shape == ClauseFloorQuery::MAND_GROUPED_SUM) {
-      target = pool.make<BooleanQuery>(one(target), std::span<Query*>{},
-                                       std::span<Query*>{}, std::span<Query*>{});
-    }
+    target = pool.make<BooleanQuery>(one(target), std::span<Query*>{},
+                                     std::span<Query*>{}, std::span<Query*>{});
   }
   if (shape == ClauseFloorQuery::MAND_FILTERED_DISMAX) {
     target = pool.make<BooleanQuery>(std::span<Query*>{}, one(target), std::span<Query*>{},
         one(pool.make<TermQuery>("body_w", "t12")), 1);
-  } else if (shape == ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX) {
+  } else if (shape == ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX
+             || shape == ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS) {
     target = pool.make<BooleanQuery>(one(target), std::span<Query*>{}, std::span<Query*>{},
         one(pool.make<TermQuery>("body_w", "t12")));
   }
@@ -1480,7 +1481,7 @@ static Query* clauseFloorQuery(MemPool& pool, ClauseFloorQuery shape) {
 }
 
 // Inspect the actual execution tree outside the timed loop. In particular, a
-// bounded child disjunction can be a heap scorer that ignores score floors.
+// bounded child disjunction can be a heap scorer rather than MaxScore.
 static std::string clauseFloorRoute(Query::Scorer* scorer, int64_t& visits) {
   auto children = [&](auto scorers) {
     std::string out;
@@ -1548,8 +1549,10 @@ static void BM_ClauseFloorForwarding(benchmark::State& state, ClauseFloorQuery s
                           segment.maxDoc(), pruning);
       if (inspect) {
         if (auto* mand = dynamic_cast<BooleanQuery::MandOptBulkScorer*>(scorer)) {
-          route = "MandOptBulk(";
-          for (auto* child : mand->optionalScorersForTests()) route += clauseFloorRoute(child, result.visited);
+          route = "MandOptBulk(" + clauseFloorRoute(mand->requiredScorerForTests(), result.visited);
+          for (auto* child : mand->optionalScorersForTests()) {
+            route += "," + clauseFloorRoute(child, result.visited);
+          }
         } else if (auto* sum = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(scorer)) {
           route = "MaxScoreBulk(";
           for (auto* child : sum->clauseScorersForTests()) {
@@ -2227,20 +2230,19 @@ LUXIR_BENCHMARK_CAPTURE(BM_DisMaxMultiField, single_head_withheld, 0.0f, false, 
 // Derived floors through scored Boolean parents.
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_on, ClauseFloorQuery::MAND_DISMAX, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_off, ClauseFloorQuery::MAND_DISMAX, false);
-LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_sum_on, ClauseFloorQuery::MAND_SUM, true);
-LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_sum_off, ClauseFloorQuery::MAND_SUM, false);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_grouped_sum_on, ClauseFloorQuery::MAND_GROUPED_SUM, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_grouped_sum_off, ClauseFloorQuery::MAND_GROUPED_SUM, false);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_on, ClauseFloorQuery::SUM_DISMAX, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_off, ClauseFloorQuery::SUM_DISMAX, false);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_on, ClauseFloorQuery::MAND_FILTERED_DISMAX, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_off, ClauseFloorQuery::MAND_FILTERED_DISMAX, false);
-LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_tied_dismax_on, ClauseFloorQuery::MAND_TIED_DISMAX, true);
-LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_tied_dismax_off, ClauseFloorQuery::MAND_TIED_DISMAX, false);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_on, ClauseFloorQuery::DISMAX_MAND, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_off, ClauseFloorQuery::DISMAX_MAND, false);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_required_filtered_on, ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_required_filtered_off, ClauseFloorQuery::MAND_REQUIRED_FILTERED_DISMAX, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_head_terms_on, ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_head_terms_off, ClauseFloorQuery::MAND_FILTERED_HEAD_TERMS, false);
+LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, dismax_mand_bulk, ClauseFloorQuery::DISMAX_MAND, true, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_dismax_bulk, ClauseFloorQuery::MAND_DISMAX, true, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, sum_dismax_bulk, ClauseFloorQuery::SUM_DISMAX, true, true);
 LUXIR_BENCHMARK_CAPTURE(BM_ClauseFloorForwarding, mand_filtered_dismax_bulk, ClauseFloorQuery::MAND_FILTERED_DISMAX, true, true);
