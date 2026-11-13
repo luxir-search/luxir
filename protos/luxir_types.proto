@@ -2124,6 +2124,11 @@ message IndexStats {
   // catch-up, deduplicated across owners. Included in the node indexing
   // reservation.
   uint64 retained_delete_bytes = 19;
+  // Writer only: live segments, and the vectors in them, that pass the overlay
+  // thresholds on an ann.auto_build field and have no published overlay yet.
+  // Those vectors are served by exact scan until the overlay publishes.
+  uint64 vector_overlay_backlog_segments = 20;
+  uint64 vector_overlay_backlog_vectors = 21;
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -2416,6 +2421,12 @@ message VectorAnnDef {
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }
   Pq pq = 4;  // requires explicit codec pq
+
+  // Absent or false: overlays are built only when a commit selects the field
+  // with build_aux_indexes, and by merges once a field is active. True: the
+  // writer also builds missing overlays in the background after commits publish,
+  // and publishes them with a later commit. Durable, so it survives a restart.
+  optional bool auto_build = 5;
 }
 
 // A field, template, or variant definition, named by its enclosing map key.

@@ -568,6 +568,7 @@ With `collections=true`:
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
 | `luxir_index_commits_total` | Commits since the writer opened. |
 | `luxir_index_retained_delete_bytes` | Delete packets the writer retains for its pending set and merge catch-up, counted once per packet; part of `luxir_index_ram_reserved_bytes`. |
+| `luxir_index_vector_overlay_backlog_segments`, `luxir_index_vector_overlay_backlog_vectors` | Live segments on an `ann.auto_build` field that pass the overlay thresholds without a published overlay, and the vectors in them, served by exact scan until the overlays publish. See [Build in the background](vector-search.md#build-in-the-background). |
 | `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
@@ -671,6 +672,10 @@ transport threads; on machines with 4 or fewer logical CPUs it is one worker per
 CPU, because holding one back would idle a large share of a small node (half of
 a 2-vCPU one). Transport threads are not counted: they share the CPUs with the
 workers.
+
+Background vector overlay builds (`ann.auto_build`) run on a low-priority thread
+of their own, limited across the node by `--indexing.auto-build-concurrency`,
+with at most a quarter of the indexing workers helping.
 
 ```bash
 ./luxir --server.workers=2

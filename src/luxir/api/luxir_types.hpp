@@ -286,6 +286,7 @@ struct VectorAnnDef {
   std::optional<Pq> pq;
   std::optional<Codec> codec;
   std::optional<int32_t> nlist;
+  std::optional<bool> auto_build;
 };
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
@@ -441,6 +442,8 @@ struct IndexStats {
   uint64_t inverters_flushing = 0;
   uint64_t commits = 0;
   uint64_t retained_delete_bytes = 0;
+  uint64_t vector_overlay_backlog_segments = 0;
+  uint64_t vector_overlay_backlog_vectors = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;
