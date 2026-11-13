@@ -30,8 +30,9 @@ whose vector kind is `vector_faiss` and whose opaque metadata is
 `VectorAuxMeta`.
 
 A vector aux build is introduced during commit when `build_aux_indexes`
-selects a vector field or `"*"`. Plain commits without vector selectors never
-build vector overlays. After a segment has a vector overlay, that overlay
+selects a vector field or `"*"`, or in the background for a field with
+`ann.auto_build` (see [Background builds](#background-builds)). Plain commits
+without vector selectors never build vector overlays themselves. After a segment has a vector overlay, that overlay
 follows the segment by liveness: later commits carry it forward without
 checking the shard core generation. Delete-only commits keep existing
 overlays; deleted-document vectors remain in FAISS and are filtered at query
@@ -44,8 +45,9 @@ nothing to its captured segments, and activates nothing itself. Attachment and
 activation on success precede data sync and manifest publication; the failure
 rule applies to the build. A selecting commit records its selectors when it
 captures its segments (see [Merging](#merging)). Startup seeds active names
-only from overlays already present in the commit manifest, so Luxir never
-treats intent-only state as a boot-time "must build" queue.
+from overlays already present in the commit manifest and from `auto_build` in
+the schema. Otherwise intent-only state is lost on restart: only the durable
+setting makes a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the
 whole selected commit. If any requested vector build fails, staged overlay
@@ -56,6 +58,54 @@ Rebuilding does not require document reindexing at the storage level, but the
 current public API cannot remove an existing per-segment overlay. The writer
 has an internal drop/rebuild seam; exposing a safe collection-level rebuild is
 future work.
+
+### Background builds
+
+Commits are serial, so a long build inside one holds up every later commit,
+including a durability commit at shutdown, and a failed build blocks its
+publication. Builds for `auto_build` fields therefore stay out of the commit path:
+
+- **Scheduling.** After a publication, a merge or a schema change, a deadline slot
+  fires after a short debounce and queues a run of the writer's build node; the
+  process-wide deadline thread does nothing else, so it never waits on a build.
+  A run builds one overlay at a time, each under a node-wide merge slot
+  (`MergeSlots`, through a ticket of the writer's own). With no slot free the
+  ticket queues and the run ends; the slot's release queues the next run. A
+  segment is
+  built once a commit has published it, unless a merge holds it or will gather it
+  from a queued merge's level. Largest first. The writer's first scan of a segment
+  reads only field metadata, using the same thresholds as `build`.
+- **Arena.** The build node is a serial node of the writer's update graph, so
+  builds run in the indexing arena: they count against `--indexing.threads`,
+  run at its priority and `--indexing.nice`, leave the search floor alone, and
+  their FAISS kernels see the arena observer's one OpenMP thread. Merges already
+  build their outputs' overlays there. Like a merge, a build holds its worker
+  until done, and on a node with one indexing worker updates queue behind it;
+  sharing the merge slots keeps such long tasks to the merge limit, half the
+  indexing workers by default. A build takes no commit lock, and the overlay
+  generation comes from an atomic the manifest writer reads.
+- **Pins.** The build pins its segment against retirement, as a commit does. Losing
+  the segment to a merge or to deletes cancels the build through the same flag
+  closing the writer uses. A build polls that flag between row slices, including
+  inside k-means assignment and while writing lists.
+- **Publication.** Finished overlays wait in the writer with their files staged.
+  Every commit attaches those whose segment is in its snapshot, before the explicit
+  build, and syncs them with the rest of the commit. If none is in flight, the
+  writer submits a publish-only commit. A segment gone by then has its files deleted.
+  An attached overlay survives a failed commit on the segment, like a merge
+  output's, and publishes with the next.
+- **Explicit builds.** A selecting commit cancels a background build of what it
+  selects, and no build starts while it runs. If a build finishes first, the commit
+  attaches its overlay and skips that build. An overlay arriving for a segment
+  that already has that name is deleted, so one name never publishes twice, and
+  generations come from one counter, so the files never collide.
+- **Failure.** A failed build leaves the segment on exact scan and retries with a
+  per-overlay backoff. Close sets the cancel flag under the lock a build starts
+  under, so the graph drain waits at most one row slice for a running build;
+  staged and unpublished overlays are deleted, and startup sweeps any left by a
+  crash as orphans.
+- **Followers.** Only a writer has this machinery; replicas and read-only nodes
+  have no `IndexWriter`, and receive overlays as committed files.
 
 ## Codecs
 
@@ -403,7 +453,7 @@ publishes the merged segment publishes its overlay entries atomically with the
 segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
-explicit build succeeds or the segment merges again.
+explicit or background build succeeds or the segment merges again.
 
 A merge finishing during a selecting commit's build builds the selected
 overlays on its private output without waiting. The `*` selector matches the

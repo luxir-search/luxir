@@ -8,7 +8,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <faiss/MetricType.h>
@@ -20,6 +22,12 @@
 namespace luxir {
 
 class IndexRamBudget;
+/// Thrown out of a background overlay build when its cancel flag is set.  No
+/// overlay results; the caller deletes the files the build staged.
+class VectorBuildCancelled : public std::runtime_error {
+public:
+  VectorBuildCancelled() : std::runtime_error("vector overlay build cancelled") {}
+};
 
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
@@ -70,6 +78,7 @@ public:
   static int64_t ivfTrainingPointsPerCentroid;
   static size_t ivfTrainingSampleMaxBytes;
   static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
+  static std::atomic<int64_t> ivfBackgroundBuildCountForTests;
   // Add chunk input-byte target. Chunks also hold at least four row tasks
   // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
@@ -92,7 +101,8 @@ public:
 
   enum class BuildSite {
     COMMIT,
-    MERGE
+    MERGE,
+    BACKGROUND
   };
 
   /// One segment's worth of input.
@@ -109,16 +119,24 @@ public:
   /// and AuxIndexInfo.gen.  Overlay filenames are segment-prefixed
   /// (getSegmentOverlayFileName), so gen only has to distinguish rebuilds for
   /// the same live segment and field.
+  /// A non-null cancel flag is polled throughout the build, which then throws
+  /// VectorBuildCancelled once it is set.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
                      const Schema& schema, uint64_t overlayGen, uint64_t writerEpoch,
-                     IndexRamBudget* indexRamBudget = nullptr)
+                     IndexRamBudget* indexRamBudget = nullptr,
+                     const std::atomic<bool>* cancel = nullptr)
     : dir_(dir), segments_(segments), schema_(schema),
-      overlayGen_(overlayGen), writerEpoch_(writerEpoch), indexRamBudget(indexRamBudget) {}
+      overlayGen_(overlayGen), writerEpoch_(writerEpoch), indexRamBudget(indexRamBudget), cancel_(cancel) {}
 
   /// Expand selectors to concrete eligible overlay names present in this
   /// builder's segment inputs.  This applies schema and field eligibility but
   /// not the training floor or build threshold.
   std::vector<std::string> matchingOverlayNames(const std::vector<std::string>& selectors);
+
+  /// The overlays of this builder's segment inputs on ann.auto_build fields: name
+  /// and vector count, or a count of 0 for a field that build() would skip as below
+  /// the training floor or the build threshold.  Reads only metadata.
+  std::vector<std::pair<std::string, int64_t>> autoBuildOverlays();
 
   /// Build aux indexes for vector fields matching `selectors`.
   ///   selectors == ["*"]      - every eligible field
@@ -141,6 +159,7 @@ private:
   uint64_t overlayGen_;
   uint64_t writerEpoch_;
   IndexRamBudget* indexRamBudget;
+  const std::atomic<bool>* cancel_;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);

@@ -1487,6 +1487,8 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
+| <a id="field-luxir.indexstats.vector_overlay_backlog_segments"></a>[`vector_overlay_backlog_segments`](#field-luxir.indexstats.vector_overlay_backlog_segments) | 20 | `uint64` | singular | Writer only: live segments, and the vectors in them, that pass the overlay thresholds on an ann.auto\_build field and have no published overlay yet. Those vectors are served by exact scan until the overlay publishes. |
+| <a id="field-luxir.indexstats.vector_overlay_backlog_vectors"></a>[`vector_overlay_backlog_vectors`](#field-luxir.indexstats.vector_overlay_backlog_vectors) | 21 | `uint64` | singular |  |
 
 <a id="message-luxir.jemallocstats"></a>
 
@@ -2744,6 +2746,7 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 | <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
 | <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | codec rabitq (the default) only |
 | <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | requires explicit codec pq |
+| <a id="field-luxir.vectoranndef.auto_build"></a>[`auto_build`](#field-luxir.vectoranndef.auto_build) | 5 | `bool` | optional | Absent or false: overlays are built only when a commit selects the field with build\_aux\_indexes, and by merges once a field is active. True: the writer also builds missing overlays in the background after commits publish, and publishes them with a later commit. Durable, so it survives a restart. |
 
 <a id="message-luxir.vectoranndef.pq"></a>
 

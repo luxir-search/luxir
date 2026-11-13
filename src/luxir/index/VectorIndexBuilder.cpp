@@ -164,6 +164,14 @@ bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
   return ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_;
 }
 
+void throwIfCancelled(const std::atomic<bool>* cancel) {
+  if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) throw VectorBuildCancelled();
+}
+
+// Rows a cancellable build handles per compute slot between looks at its flag.
+// At 768 dims and 2236 centroids a slot takes about a quarter second over them.
+constexpr int64_t CANCEL_SLICE_ROWS = 1024;
+
 // Minimum rows per build task: FAISS routes a batch to BLAS only from
 // distance_compute_blas_threshold floats, so a smaller slice would run its
 // scalar kernels instead of a GEMM.
@@ -179,20 +187,34 @@ int64_t buildMinRowsPerTask(int32_t dims) {
 // by the arena observer. The caller is isolated: while it waits it must not
 // pick up an unrelated merge or flush.
 template <typename Fn>
-void forRowPartitions(int64_t n, int64_t minRows, Fn fn) {
-  int64_t width = computeWidth(oneapi::tbb::this_task_arena::max_concurrency());
+void forRowTasks(int64_t rowBase, int64_t n, int64_t minRows, int64_t width, Fn& fn) {
   int64_t tasks = std::min(n / std::max<int64_t>(1, minRows), width * 4);
   if (tasks <= 1) {
-    fn((int64_t)0, n);
+    fn(rowBase, rowBase + n);
     return;
   }
   oneapi::tbb::this_task_arena::isolate([&] {
     oneapi::tbb::parallel_for((int64_t)0, tasks, [&](int64_t task) {
       int64_t begin = n * task / tasks;
       int64_t end = n * (task + 1) / tasks;
-      fn(begin, end);
+      fn(rowBase + begin, rowBase + end);
     });
   });
+}
+
+// As above; a cancellable build runs them in slices, so it stops within one.
+template <typename Fn>
+void forRowPartitions(int64_t n, int64_t minRows, const std::atomic<bool>* cancel, Fn fn) {
+  int64_t width = computeWidth(oneapi::tbb::this_task_arena::max_concurrency());
+  if (cancel == nullptr) {
+    forRowTasks(0, n, minRows, width, fn);
+    return;
+  }
+  int64_t slice = std::max(minRows, CANCEL_SLICE_ROWS) * width;
+  for (int64_t off = 0; off < n; off += slice) {
+    throwIfCancelled(cancel);
+    forRowTasks(off, std::min(slice, n - off), minRows, width, fn);
+  }
 }
 
 // Coarse quantizer whose batch searches split their rows across TBB tasks.
@@ -201,13 +223,15 @@ void forRowPartitions(int64_t n, int64_t minRows, Fn fn) {
 // dynamic_cast to IndexFlat, so readers open a plain IndexFlat.
 class PartitionedFlatQuantizer final : public faiss::IndexFlat {
   int64_t minRows;
+  const std::atomic<bool>* cancel;
 public:
-  PartitionedFlatQuantizer(int32_t dims, faiss::MetricType metric, int64_t minRows)
-      : faiss::IndexFlat(dims, metric), minRows(minRows) {}
+  PartitionedFlatQuantizer(int32_t dims, faiss::MetricType metric, int64_t minRows,
+                           const std::atomic<bool>* cancel)
+      : faiss::IndexFlat(dims, metric), minRows(minRows), cancel(cancel) {}
 
   void search(faiss::idx_t n, const float* x, faiss::idx_t k, float* distances,
               faiss::idx_t* labels, const faiss::SearchParameters* params = nullptr) const override {
-    forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
+    forRowPartitions(n, minRows, cancel, [&](int64_t begin, int64_t end) {
       faiss::IndexFlat::search(end - begin, x + begin * d, k,
                                distances + begin * k, labels + begin * k, params);
     });
@@ -219,6 +243,7 @@ public:
 class PartitionedIVFPQ final : public faiss::IndexIVFPQ {
 public:
   using faiss::IndexIVFPQ::IndexIVFPQ;
+  const std::atomic<bool>* cancel = nullptr;
 
   void train_encoder(faiss::idx_t n, const float* x, const faiss::idx_t*) override {
     assert(pq.train_type == faiss::ProductQuantizer::Train_default);
@@ -233,7 +258,7 @@ public:
         }
         faiss::Clustering clus((int)pq.dsub, (int)pq.ksub, pq.cp);
         if (pq.verbose) clus.verbose = true;
-        faiss::IndexFlatL2 flat((int)pq.dsub);
+        PartitionedFlatQuantizer flat((int)pq.dsub, faiss::METRIC_L2, cancel != nullptr ? 1 : n, cancel);
         clus.train(n, slice.data(), flat);
         pq.set_params(clus.centroids.data(), m);
       });
@@ -292,6 +317,16 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
   return true;
 }
 
+// Training floor.  RaBitQ trains only the IVF centroids; PQ also trains
+// 2^bits centroids per sub-quantizer, which sets its (higher) floor.
+int64_t requiredTrainingVectors(const VectorAnnConfig& ann, int32_t nlist) {
+  if (ann.codec == VectorAnnConfig::RABITQ) {
+    return std::max<int64_t>(VectorIndexBuilder::ivfRaBitQMinTrainingVectors, nlist);
+  }
+  int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << std::clamp(ann.pqBits, 1, 8));
+  return std::max<int64_t>(std::max<int64_t>(VectorIndexBuilder::ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
+}
+
 } // namespace
 
 bool VectorIndexBuilder::buildFaissAuxIndexes = true;
@@ -311,6 +346,7 @@ std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
 int64_t VectorIndexBuilder::ivfTrainingPointsPerCentroid = 100;
 size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)2560 * 1024 * 1024;
 std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
+std::atomic<int64_t> VectorIndexBuilder::ivfBackgroundBuildCountForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
 
@@ -431,6 +467,26 @@ VectorIndexBuilder::matchingOverlayNames(const std::vector<std::string>& selecto
   return out;
 }
 
+std::vector<std::pair<std::string, int64_t>> VectorIndexBuilder::autoBuildOverlays() {
+  std::vector<std::pair<std::string, int64_t>> out;
+  for (const auto& [fieldName, vft] : collectEligibleFields()) {
+    if (!vft->ann().autoBuild) continue;
+    int32_t dims = vft->storedDims();
+    int64_t ntotal = 0;
+    forEachVectorSegment(segments_, fieldName, dims,
+        [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      ntotal += vr.numVectors();
+      return true;
+    });
+    bool eligible = ntotal > 0 && ntotal >= requiredTrainingVectors(vft->ann(), chooseIvfNList(vft->ann().nlist, ntotal))
+        && ntotal * (int64_t)dims >= ivfBuildThresholdScanCost;
+    std::string name(NAME_PREFIX);
+    name.append(fieldName);
+    out.emplace_back(std::move(name), eligible && buildFaissAuxIndexes ? ntotal : 0);
+  }
+  return out;
+}
+
 std::optional<AuxInfo>
 VectorIndexBuilder::buildIvfField(std::string_view fieldName,
                                   const VectorFieldType& ft,
@@ -441,6 +497,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // build-failure paths.  Args: the field name (std::string_view*) and the
   // build site, so a listener can target a specific field and/or site.
   Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
+  throwIfCancelled(cancel_);
   const VectorAnnConfig& ann = ft.ann();
   int32_t dims = ft.storedDims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
@@ -460,19 +517,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   }
 
   int32_t nlist = chooseIvfNList(ann.nlist, ntotal);
-  // Training floor.  RaBitQ trains only the IVF centroids; PQ also trains
-  // 2^bits centroids per sub-quantizer, which sets its (higher) floor.
   int32_t pqM = 0;
-  int32_t pqBits = 0;
-  int64_t requiredTraining;
-  if (rabitq) {
-    requiredTraining = std::max<int64_t>(ivfRaBitQMinTrainingVectors, nlist);
-  } else {
-    pqBits = std::clamp(ann.pqBits, 1, 8);
-    int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << pqBits);
-    requiredTraining = std::max<int64_t>(
-        std::max<int64_t>(ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
-  }
+  int32_t pqBits = rabitq ? 0 : std::clamp(ann.pqBits, 1, 8);
+  int64_t requiredTraining = requiredTrainingVectors(ann, nlist);
   if (ntotal < requiredTraining) {
     LOG_TRACE("VectorIndexBuilder: field {} has {} vectors, below {} training floor {}; "
               "using flat-over-column fallback",
@@ -531,7 +578,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int32_t rabitqBits = ann.resolvedRabitqBits(dims);
   std::unique_ptr<VectorRotation> rotation;
   int64_t minRows = buildMinRowsPerTask(dims);
-  auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows);
+  auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows, cancel_);
   std::unique_ptr<faiss::IndexIVF> index;
   if (rabitq) {
     rotation = std::make_unique<VectorRotation>(VectorRotation::FHT_KAC, dims, RABITQ_ROTATION_SEED);
@@ -544,6 +591,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     auto pq = std::make_unique<PartitionedIVFPQ>(
         quantizer.get(), (size_t)dims, (size_t)nlist, (size_t)pqM,
         (size_t)pqBits, metric);
+    pq->cancel = cancel_;
     // See min_points_per_centroid below.
     pq->pq.cp.min_points_per_centroid = 1;
     index = std::move(pq);
@@ -552,7 +600,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   index->own_fields = true;
 
   if (rotation != nullptr) {
-    forRowPartitions(ntrain, minRows, [&](int64_t begin, int64_t end) {
+    forRowPartitions(ntrain, minRows, cancel_, [&](int64_t begin, int64_t end) {
       float* rows = training.data() + begin * dims;
       rotation->applyBatch(end - begin, rows, rows);
     });
@@ -564,6 +612,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
             rabitq ? rabitqBits : 0);
   if (buildSite == BuildSite::MERGE) {
     ivfMergeBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
+  } else if (buildSite == BuildSite::BACKGROUND) {
+    ivfBackgroundBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   } else {
     ivfBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   }
@@ -615,7 +665,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     for (int64_t off = 0; off < vr.numVectors(); off += chunkRows) {
       int64_t n = std::min(chunkRows, vr.numVectors() - off);
       const float* base = (const float*)vr.vectorAtRank(off).data();
-      forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
+      forRowPartitions(n, minRows, cancel_, [&](int64_t begin, int64_t end) {
         int64_t count = end - begin;
         const float* x = base + begin * dims;
         if (normalize) {
@@ -688,12 +738,14 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       os.writeLong((int64_t)lists.list_size(i));
     }
     for (size_t i = 0; i < lists.nlist; i++) {
+      throwIfCancelled(cancel_);
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
       faiss::InvertedLists::ScopedIds ids(&lists, i);
       os.write(ids.get(), sz * sizeof(faiss::idx_t));
     }
     for (size_t i = 0; i < lists.nlist; i++) {
+      throwIfCancelled(cancel_);
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
       faiss::InvertedLists::ScopedCodes codes(&lists, i);
@@ -704,6 +756,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       // Encode in value-rank order, serialize beside each code's list position.
       std::array<float, 4096> buffer;
       for (size_t i = 0; i < lists.nlist; i++) {
+        throwIfCancelled(cancel_);
         faiss::InvertedLists::ScopedIds ids(&lists, i);
         for (size_t off = 0; off < lists.list_size(i); off += buffer.size()) {
           size_t count = std::min(buffer.size(), lists.list_size(i) - off);

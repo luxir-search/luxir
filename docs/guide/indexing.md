@@ -194,7 +194,7 @@ The request's `commit` object may contain:
 | Field | Meaning |
 |---|---|
 | `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
-| `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
+| `build_aux_indexes` | Missing vector overlays to build inside this commit, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. A field can instead [build in the background](vector-search.md#build-in-the-background). |
 | `wait_for_merges` | Wait for in-flight merges before publishing. |
 | `wait_for_replicas` | Typed requirement: `{"count": N}` or `{"all": {}}`. Forces an immediate commit; see [Replication](replication.md#2-commit-and-wait-for-followers). |
 | `wait_for_replicas_timeout_ms` | Visibility wait deadline; absent = 30000, zero checks immediately. Does not undo the local commit. |
