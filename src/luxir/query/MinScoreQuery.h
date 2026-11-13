@@ -31,16 +31,6 @@ class MinScoreQuery final : public Query {
   Query* child;
   float minScore;
 
-  static float childFloor(float floor, float minScore, float multiplier,
-                          bool scored) {
-    if (!scored || multiplier == 0.0f) return minScore;
-    float translated = multiplier == 1.0f
-        ? floor
-        : std::nextafter(floor / multiplier,
-                         -std::numeric_limits<float>::infinity());
-    return std::max(translated, minScore);
-  }
-
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
     float minScore;
@@ -432,6 +422,25 @@ class MinScoreQuery final : public Query {
   }
 
 public:
+  // The floor a child score must reach for its scaled score to reach `floor`.
+  // The scaled score is child * multiplier rounded to float, which reaches a
+  // floor from up to half an ulp below it. For a zero or subnormal floor that
+  // half ulp is an absolute 2^-150, which division by a multiplier under 1 can
+  // stretch past the one-ulp margin, so it is taken off the floor before
+  // dividing. The subtraction is exact in double for floors below 2^-97 and
+  // absorbed above that, where the one-ulp step down already covers the half
+  // ulp.
+  static float childFloor(float floor, float minScore, float multiplier,
+                          bool scored) {
+    if (!scored || multiplier == 0.0f) return minScore;
+    float translated = multiplier == 1.0f
+        ? floor
+        : std::nextafter(
+              (float)(((double)floor - 0x1p-150) / (double)multiplier),
+              -std::numeric_limits<float>::infinity());
+    return std::max(translated, minScore);
+  }
+
   MinScoreQuery(Query* child, float minScore)
     : Query(QueryKind::MIN_SCORE), child(child), minScore(minScore) {
     if (!std::isfinite(minScore)) {
