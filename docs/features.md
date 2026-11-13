@@ -204,8 +204,9 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Collections auto-create on first write (can be disabled).
 - Commits publish a new view: immediate, `commit_within_ms`, `?commit=true` on
   the URL, or at the end of a stream. Indexing memory is budgeted and flushes
-  automatically; merges run in the background and never stall ingest or
-  search.
+  automatically; merges run in the background, never block ingest or
+  search, and can be held to a thread cap, a lower CPU priority and a write
+  rate.
 
 ## Queries
 

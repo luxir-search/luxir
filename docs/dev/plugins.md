@@ -242,7 +242,8 @@ r.http.add("POST", "/collections/{collection}/_sample",
 });
 ```
 
-- The handler runs on a task-arena worker, so it may block on engine work through
+- The handler runs on a query-arena worker at normal priority, so heavy work in it
+  competes with searches. It may block on engine work through
   `request.node`, which also supplies `pluginState<T>(name)`. It answers with
   `status`, `contentType` and `body`, or sets
   `searchBody` to have the server run that body as a search with default URL

@@ -12,8 +12,16 @@
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
 
+#include <cerrno>
+#include <climits>
+#include <cstring>
+#include <thread>
 #include <omp.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 namespace luxir {
 
@@ -97,6 +105,88 @@ void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
   nameThisThread(name);
 }
 
+#if defined(__linux__)
+static id_t threadId() { return (id_t)syscall(SYS_gettid); }
+
+// A thread's nice value, or INT_MIN when it cannot be read (getpriority can
+// legitimately return -1).
+static int threadNice() {
+  errno = 0;
+  int nice = getpriority(PRIO_PROCESS, threadId());
+  return errno != 0 ? INT_MIN : nice;
+}
+
+static void restoreNice(id_t thread, int nice) {
+  if (setpriority(PRIO_PROCESS, thread, nice) == 0 || errno == ESRCH) return;
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true)) {
+    LOG_WARN("Restoring a worker's nice after indexing work failed ({}); it keeps the indexing priority",
+             strerror(errno));
+  }
+}
+#endif
+
+void LuxirNode::ArenaNice::on_scheduler_entry(bool worker) {
+#if defined(__linux__)
+  if (!worker) return;
+  int base = threadNice();
+  if (base == INT_MIN) return;
+  std::lock_guard lock(mutex);
+  if (setpriority(PRIO_PROCESS, threadId(), std::min(19, base + increment)) == 0) niced[(long)threadId()] = base;
+#else
+  unused(worker);
+#endif
+}
+
+void LuxirNode::ArenaNice::on_scheduler_exit(bool worker) {
+#if defined(__linux__)
+  if (!worker) return;
+  std::lock_guard lock(mutex);
+  auto it = niced.find((long)threadId());
+  if (it == niced.end()) return;
+  restoreNice(threadId(), it->second);
+  niced.erase(it);
+#else
+  unused(worker);
+#endif
+}
+
+LuxirNode::ArenaNice::~ArenaNice() {
+  observe(false);  // returns once no callback is running
+#if defined(__linux__)
+  std::lock_guard lock(mutex);
+  for (auto [thread, nice] : niced) restoreNice((id_t)thread, nice);
+#endif
+}
+
+// The nice increment for the indexing arena's workers: index.nice, or the auto
+// default, provided a thread can take it and return to its base afterwards.
+// Lowering priority is always allowed; raising it back needs CAP_SYS_NICE or
+// a high enough RLIMIT_NICE.  Probed on a scratch thread, so no pool worker
+// is ever left niced.
+static int resolveIndexNice(int configured) {
+  if (configured == 0) return 0;
+  int increment = configured < 0 ? IndexConfig::AUTO_NICE : configured;
+#if defined(__linux__)
+  bool restored = false;
+  std::thread([&] {
+    int base = threadNice();
+    if (base == INT_MIN || setpriority(PRIO_PROCESS, threadId(), std::min(19, base + increment)) != 0) return;
+    restored = setpriority(PRIO_PROCESS, threadId(), base) == 0;
+  }).join();
+  if (restored) return increment;
+  if (configured > 0) {
+    LOG_WARN("indexing.nice={} ignored: restoring a worker's priority needs CAP_SYS_NICE or RLIMIT_NICE >= {}",
+             configured, 20 - threadNice());
+  } else {
+    LOG_DEBUG("indexing.nice auto: off, restoring a worker's priority is not permitted");
+  }
+#else
+  if (configured > 0) LOG_WARN("indexing.nice={} ignored: per-thread nice is Linux only", configured);
+#endif
+  return 0;
+}
+
 // host:port of the listener, so a restarted node keeps its identity (and a
 // follower its acknowledgment rows). Without a fixed port, a per-process id.
 static std::string defaultNodeId(const ServerConfig& server, bool& random) {
@@ -111,10 +201,11 @@ static std::string defaultNodeId(const ServerConfig& server, bool& random) {
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+    indexThreads(this->config.resolveIndexThreads()),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
-    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+    indexArena(indexThreads + 1, 1, oneapi::tbb::task_arena::priority::low) {
   if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
   this->config.node.validate();
   if (!this->config.read_only) lifetime = newUuid();
@@ -154,6 +245,9 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
+  // Before the writers open: their first tasks already get the priority.
+  indexNiceIncrement = resolveIndexNice(this->config.index.nice);
+  if (indexNiceIncrement) indexNice.emplace(indexArena, indexNiceIncrement);
   collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {

@@ -10,7 +10,15 @@ locations, browse `src/luxir/<area>/`.
 1. **Server Layer** (`src/luxir/server/`)
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
-   - `LuxirNode`: Central coordinator wiring collections and services
+   - `LuxirNode`: Central coordinator wiring collections and services. Owns the
+     worker pool's two arenas: `taskArena` (queries, buffered update decoding,
+     admin, plugin routes; normal priority, reserved slots for transport threads
+     counted by `ArenaEntrants`) and `indexArena` (every writer's update graph:
+     batches, flushes, merges, commits, vector builds; low priority, width
+     `index.threads`). `ensureWorkerPool` sizes TBB's pool one past the widest
+     arena; `ArenaThreadNamer` names workers (`luxir_tbb_`, `luxir_idx_`) and
+     pins FAISS OpenMP to one thread; `ArenaNice` renices workers while they
+     are in `indexArena` when the restore is permitted (`index.nice`)
    - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
@@ -202,13 +210,14 @@ locations, browse `src/luxir/<area>/`.
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
 HTTP update bodies are not decoded on the connection's I/O shard thread. A
-buffered JSON body is decoded in the task-arena task that submits it. An
+buffered JSON body is decoded in the query-arena (`taskArena`) task that
+submits it. An
 NDJSON stream is only framed on the shard: records that may be control
 records (`{}` or a first key shaped `"_name_"`) are decoded there, in stream
 order, and document records stay where the body was read: `NdjsonFramer`
 reads the body straight into chunks and returns views, and the batch
 (`HttpStreamBatchState::records`) holds the chunks until it has decoded them. `StreamingUpdateMessage::handle` decodes
-them on the update graph's process node, after `startUpdateNode` has fixed
+them on the update graph's process node (in `indexArena`), after `startUpdateNode` has fixed
 the batch's update version, so batches of one connection decode in parallel.
 
 ## Key Design Patterns

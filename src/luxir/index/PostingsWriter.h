@@ -114,6 +114,7 @@ public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
   uint64_t creatorEpoch;
+  ByteRateLimiter* rateLimiter = nullptr;  // guarded by mutex
 
 public:
   PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
@@ -125,6 +126,12 @@ public:
         ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
   {
     segStr = Postings::segmentKey(segId, creatorEpoch);
+  }
+
+  // Paces this segment's data files; set before the first file is reserved.
+  void setRateLimiter(ByteRateLimiter* limiter) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    rateLimiter = limiter;
   }
 
   void configureRamDelegation(bool enabled,
@@ -190,6 +197,7 @@ private:
       Directory::FileCreateOptions options;
       options.ramDelegating = ramDelegatingFiles;
       options.ramSpillBytes = RAM_SPILL_BYTES;
+      options.rateLimiter = rateLimiter;
       options.ramBytesChanged = [this](int64_t delta) noexcept {
         adjustDelegatedRam(delta);
       };

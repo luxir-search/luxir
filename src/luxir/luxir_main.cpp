@@ -174,6 +174,10 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
     // Released by the first SIGTERM/SIGINT, or when gRPC run() returns early.
     std::binary_semaphore stop{0};
     LuxirNode node{config};
+    LOG_INFO("Threads: server.workers={} indexing.threads={} indexing.nice={} "
+             "indexing.merge-max-bytes-per-sec={} (0 = off/unlimited)",
+             node.getWorkers(), node.getIndexThreads(), node.getIndexNice(),
+             config.index.merge_max_bytes_per_sec);
 
     // The HTTP/JSON server runs on its own connection-I/O shards and accept
     // thread; start it (non-blocking) before gRPC.

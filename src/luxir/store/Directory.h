@@ -16,6 +16,7 @@
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include "luxir/util/ApiError.h"
+#include "luxir/util/ByteRateLimiter.h"
 #include "luxir/util/log.h"
 #include "luxir/util/Signal.h"
 #include "OutputStream.h"
@@ -80,6 +81,8 @@ public:
     size_t ramSpillBytes = 0;
     bool ramDelegating = false;
     std::optional<uint64_t> expectedSize;
+    // Paces the bytes written to the backing store (FS backends); null = unpaced.
+    ByteRateLimiter* rateLimiter = nullptr;
   };
 
   struct FileInfo {

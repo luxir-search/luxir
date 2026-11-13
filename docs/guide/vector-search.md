@@ -691,7 +691,7 @@ without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
 
 Builds run as indexing tasks, so their parallelism is bounded by the indexing
-arena, sized by `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
+arena, sized by `--indexing.threads` or else `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
 
 ### Index settings
 
