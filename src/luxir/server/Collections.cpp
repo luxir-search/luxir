@@ -91,6 +91,7 @@ void Collections::validate(const CollectionId& id) {
 Collections::Collections(const LuxirConfig& config, std::string lifetime, CollectionEvents& events, IndexRamBudget& indexRamBudget,
                          oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics)
     : metrics(std::move(metrics)), config(config), lifetime(std::move(lifetime)), events(events), indexRamBudget(indexRamBudget), arena(arena),
+      overlayBuildLimit(std::make_shared<OverlayBuildLimit>(config.index.auto_build_concurrency)),
       verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   // Backend, then plugin layers (innermost first), then the core wrappers below.
@@ -396,6 +397,8 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  col->shard->iw->overlayBuildLimit = overlayBuildLimit;
+  col->shard->iw->startOverlayBuilds();
   if (col->shard->snapshots->snapshot()->id.incarnation != selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
   if (creating) storage.activate(name.name, selected);
   retire(name, selected);

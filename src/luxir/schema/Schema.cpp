@@ -324,6 +324,7 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
     if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
     cfg.nlist = *def->nlist;
   }
+  cfg.autoBuild = def->auto_build.value_or(false);
   if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
     fail("rabitq settings require codec \"rabitq\"");
   }

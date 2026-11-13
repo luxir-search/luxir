@@ -119,6 +119,7 @@ private:
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
+  std::shared_ptr<OverlayBuildLimit> overlayBuildLimit; // shared by every writer
   bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
   std::mutex catalogsMutex;

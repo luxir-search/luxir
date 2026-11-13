@@ -203,6 +203,8 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
     r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
     r.gauge("luxir_index_retained_delete_bytes", "Delete packets retained by the writer, counted once per packet.", (double)index.retained_delete_bytes, labels);
+    r.gauge("luxir_index_vector_overlay_backlog_segments", "Live segments on an ann.auto_build field with no published overlay.", (double)index.vector_overlay_backlog_segments, labels);
+    r.gauge("luxir_index_vector_overlay_backlog_vectors", "Vectors in those segments, served by exact scan until their overlays publish.", (double)index.vector_overlay_backlog_vectors, labels);
     if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);
   }

@@ -5,11 +5,13 @@
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <optional>
 #include <string>
 #include <mutex>
 #include <span>
+#include <thread>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
@@ -102,7 +104,19 @@ public:
     // ANN entries are carried by segment liveness; coreGen does not
     // participate.
     std::vector<AuxInfo> auxOverlays;
-    uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
+    // High-water mark survives separately published drops.  Atomic: a background
+    // build takes a generation while a commit writes the mark to its manifest.
+    std::atomic<uint64_t> nextOverlayGen = 0;
+
+    // Overlays this segment still owes its ann.auto_build fields, and the scan that
+    // worked them out (see IndexWriter::overlayScanEpoch).  Protected by indexMutex.
+    struct OverlayWant {
+      int64_t vectors = 0;
+      uint32_t failures = 0;
+      std::chrono::steady_clock::time_point notBefore{};
+    };
+    boost::unordered_flat_map<std::string, OverlayWant> overlayWants;
+    uint64_t overlayScanEpoch = 0;
 
     uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
@@ -173,6 +187,7 @@ public:
   };
   struct Stats : ReaderManager::SnapshotStats<SegmentStats>, DeletePassStats {
     uint64_t commits = 0;
+    uint64_t overlayBacklogSegments = 0, overlayBacklogVectors = 0;
     uint64_t activeMerges = 0;
     uint64_t flushing = 0, idle = 0, indexing = 0;
     uint64_t retainedDeleteBytes = 0;
@@ -291,6 +306,15 @@ public:
 
 
       return mergeLevel;
+    }
+
+    // True for a segment a merge holds, or will gather once the queue reaches its
+    // level.  Without a queued merge a full level may be one that cannot be admitted.
+    // Call with indexMutex locked.
+    bool _mergeImminent(const SegInfo& seg) const {
+      if (seg.merging) return true;
+      return outstandingMerges > 0 && seg.mergeLevel >= 0 && seg.mergeLevel < (int)levelCounts.size()
+          && levelCounts[seg.mergeLevel] >= mergeFactor;
     }
 
     // Call with indexMutex locked.
@@ -455,6 +479,31 @@ public:
   // that capture misses the commit's build, so it must see this intent.
   std::vector<std::string> inFlightVectorSelectors;
 
+  // Background builds for ann.auto_build fields.  At most one thread per writer,
+  // and overlayBuildLimit across the node.  It holds no commit lock while building
+  // and is not a graph task, so commits run throughout and close() need not wait
+  // out a build.  State is protected by indexMutex unless noted.
+  std::shared_ptr<const Schema> autoBuildSchema; // the schema autoBuildEnabled describes
+  bool autoBuildEnabled = false;                 // some field or template opts in
+  uint64_t overlayScanEpoch = 1;                 // advances when the schema changes
+  // Built and staged, waiting for a commit to attach them.
+  struct FinishedOverlay {
+    uint64_t segId;
+    AuxInfo info;
+  };
+  std::vector<FinishedOverlay> finishedOverlays;
+  std::thread overlayBuildThread;
+  bool overlayBuildRunning = false;
+  bool overlayBuildsPaused = false;  // testDeleteAllData is taking the segments away
+  bool overlayPublishInFlight = false;
+  // The pinned segment being built, and what for.
+  SegInfo* overlayBuildTarget = nullptr;
+  std::string overlayBuildTargetName;
+  // Tells the running build to stop: writer closing, target gone, or an explicit
+  // build taking over.  Reset by the thread, under indexMutex, per build.
+  std::atomic<bool> overlayBuildCancel = false;
+  DeadlineScheduler::Slot overlayBuildSlot{[this] { overlayBuildTimerFired(); }};
+
   // Registered atomically with flushed segments and snapshotted with them.
   // A batch survives until a covering commit or a delete pass retires it.
   // Merge catch-up can hold additional references. Protected by indexMutex.
@@ -547,6 +596,7 @@ public:
 
   // A flow graph runs its tasks in the arena it is constructed in, so the ctor
   // emplaces it inside the writer's arena.
+  oneapi::tbb::task_arena* indexArena;
   std::optional<tbb::flow::graph> updateGraph;
   std::unique_ptr<UpdateMessageMultiFunc> startUpdateNode;
   std::unique_ptr<UpdateMessageFunc> processUpdateNode;
@@ -619,6 +669,18 @@ public:
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
 
+  // Background overlay builds.  Set before startOverlayBuilds().  The debounce
+  // gives a fresh segment time to be gathered by a merge; a failed build retries
+  // after retryMin, doubling up to retryMax.
+  std::shared_ptr<OverlayBuildLimit> overlayBuildLimit = std::make_shared<OverlayBuildLimit>(1);
+  std::chrono::milliseconds overlayBuildDebounce{1000};
+  std::chrono::milliseconds overlayBuildRetryMin{5000};
+  std::chrono::milliseconds overlayBuildRetryMax{300000};
+  // Nice value of the build thread: enough to yield to searches on a small node,
+  // while a saturated CPU still leaves it a share, since until it finishes those
+  // searches pay for exact scans.
+  int overlayBuildNice = 10;
+
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough
@@ -670,6 +732,10 @@ public:
   // Messages supply their admission pin. Without a pin, use the current schema.
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
+  // Starts work the manifest already owes: overlays missing on ann.auto_build
+  // fields.  Later commits and merges schedule their own.
+  void startOverlayBuilds();
+
   // Publish over the last physical snapshot without waiting for commit preparation.
   const CommitId& initialCommit() const { return openingCommit; }
   void setSchema(std::shared_ptr<Schema> schema);
@@ -705,6 +771,8 @@ private:
     void handle(IndexWriter& iw) override { unused(iw); }
     void done(IndexWriter& iw) override;
   };
+
+  class OverlayPublishMessage;
 
   // Deferred-commit (commit_within_ms) machinery; see the state block above.
   void deferCommitWithin(int64_t withinMs, uint64_t updateVersion);
@@ -871,9 +939,26 @@ private:
       std::span<const std::string> overlayNames,
       const Schema& schema,
       VectorIndexBuilder::BuildSite buildSite,
-      std::vector<std::string>& outFiles);
+      std::vector<std::string>& outFiles,
+      const std::atomic<bool>* cancel = nullptr);
   void deleteStagedOverlayFiles(std::span<const std::string> files,
                                 std::string_view context) noexcept;
+  void refreshAutoBuildSchemaLocked();
+  bool overlayBuildsAllowedLocked() const { return autoBuildEnabled && !overlayBuildsPaused && !isClosed(); }
+  bool overlayScanNeededLocked() const;
+  // The most vectors a build could serve now, setting seg and name; retryAt is the
+  // earliest a build held back by a failure could run.
+  bool pickOverlayBuildLocked(SegInfo*& seg, std::string& name,
+                              std::optional<std::chrono::steady_clock::time_point>& retryAt);
+  void scheduleOverlayBuilds() noexcept;
+  void overlayBuildTimerFired();
+  void overlayBuildThreadBody();
+  void scanOverlayWants();
+  void runOverlayBuild(SegInfo& seg, const std::string& name);
+  void stopOverlayBuildThread();
+  void attachFinishedOverlays(std::span<SegInfo*> segs);
+  void requestOverlayPublish();
+  void overlayPublishFinished(bool errored);
   // Release writer ownership; snapshot pins can retain the retired files.
   void tryDeleteSegments();
   std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
@@ -908,6 +993,9 @@ public:
 
   // Test hook for process-local vector activation state.
   bool testActiveVectorOverlayName(std::string_view name);
+  // No background overlay build is running or waiting for its publication.
+  bool testOverlayBuildsIdle();
+  bool testOverlayBuildsRunning();
   void testReseedActiveVectorOverlayNamesFromManifest();
   bool testMergeRunning();
   std::optional<MergeFailureInfo> testLastMergeFailure();

@@ -243,6 +243,8 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     dst.inverters_flushing = src.flushing;
     dst.commits = src.commits;
     dst.retained_delete_bytes = src.retainedDeleteBytes;
+    dst.vector_overlay_backlog_segments = src.overlayBacklogSegments;
+    dst.vector_overlay_backlog_vectors = src.overlayBacklogVectors;
   }
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);

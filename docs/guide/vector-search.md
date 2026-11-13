@@ -673,7 +673,8 @@ Or select one field by its `vec.` name:
 {"commit":{"build_aux_indexes":["vec.embedding_v"]}}
 ```
 
-Plain commits do not build overlays. A failed build leaves the commit
+Plain commits do not build overlays, unless the field opts in to
+[background builds](#build-in-the-background). A failed build leaves the commit
 unpublished and can be retried. Once a segment has an overlay, later commits
 carry it forward and delete-only commits keep it (deleted documents are
 filtered out at query time).
@@ -688,10 +689,60 @@ results contract either way. A merged segment gets fresh
 overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
-explicit build succeeds.
+explicit build, or a background build on an `auto_build` field, succeeds.
 
 Builds run as indexing tasks, so their parallelism is bounded by the indexing
 arena, sized by `--server.workers` (see [Threads and streaming backpressure](operations.md#threads-and-streaming-backpressure)).
+
+### Build in the background
+
+A commit that selects a field waits for its build, and a failed build leaves
+the commit unpublished. A field with `ann.auto_build` needs no selecting commit:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "ann": {"auto_build": true}
+    }
+  }
+}
+```
+
+The setting is part of the schema, so it survives a restart. After any commit
+publishes, including a deferred one or a merge's own, the writer looks for
+segments on the field that pass the size thresholds above and have no overlay,
+and builds them one at a time, largest first, at low priority. When a build
+finishes, the writer publishes its overlay with the next commit, making one if
+none is coming. That commit publishes segments already flushed, as a merge's
+does, and does not flush buffered updates. The field's merged segments get their
+overlays during the merge, as for a selected field. Fields without the setting
+cost nothing.
+
+- Until its overlay publishes, a segment answers by exact scan, with the same
+  results contract.
+- Builds never hold up a commit. A failed build changes nothing and is retried
+  with increasing delays; it is logged as an error.
+- A segment a merge is about to take is skipped, and one merged away during its
+  build is abandoned.
+- Closing the writer cancels a running build, which then leaves nothing behind.
+  A restart finds the missing overlay again.
+- `build_aux_indexes` still builds inside the commit for a caller who wants to
+  wait; whichever overlay reaches a segment first is the one that publishes.
+
+`--indexing.auto-build-concurrency` limits the builds running at once on a node
+(default 1), each using at most a quarter of the indexing workers. Merges build
+their overlays outside this limit. Followers and read-only nodes never build:
+overlays reach them as committed files.
+
+`vector_overlay_backlog_segments` and `vector_overlay_backlog_vectors` in
+[collection stats](operations.md) count what is still on exact scan on these
+fields.
 
 ### Index settings
 
@@ -716,6 +767,7 @@ POST /collections/books/_schema
 |---|---|
 | `codec` | `rabitq` (default) or explicit `pq`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
+| `auto_build` | Build missing overlays in the background; see [Build in the background](#build-in-the-background). Absent or `false`: only commits that select the field, and merges once it is active, build. |
 | `rabitq.bits` | Bits per dimension, `0` to `9`. Absent or `0` (default): automatic from the stored dimension, 2 below 384 dims and 1 at or above. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
 | `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for every metric. If none does, use the largest divisor under the same cap. |

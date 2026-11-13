@@ -527,6 +527,7 @@ struct VectorAnnConfig {
   int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
   int32_t pqM = 0;    // 0 = derived from dims
   int32_t pqBits = DEFAULT_PQ_BITS;
+  bool autoBuild = false;  // build missing overlays in the background; see IndexWriter
 
   // A second bit narrows the estimate intervals, so fewer candidates need
   // exact rescoring; the gain shrinks as dims grow. Measured k=100 latency

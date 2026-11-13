@@ -247,6 +247,44 @@ INSTANTIATE_TEST_SUITE_P(Storage, ReplicationMatrixTest,
                       std::pair<std::string, std::string>{"ram", "fs"}, std::pair<std::string, std::string>{"ram", "ram"}),
     [](const auto& info) { return info.param.first + "_" + info.param.second; });
 
+// The source builds and publishes; the overlay reaches the follower as committed
+// files, and a follower has no writer to build one with.
+TEST_F(ReplicationFollowerTest, followerReceivesAutoBuiltOverlayWithoutBuilding) {
+  IvfTestGuard guard;
+  VectorIndexBuilder::ivfBackgroundBuildCountForTests = 0;
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = api::VectorMetric::L2;
+  f.dims = 4;
+  auto ann = pqAnn(2, 1, 1);
+  ann.auto_build = true;
+  f.ann = ann;
+  b.set(h.collection());
+  auto iw = h.getIndexWriter();
+  iw->overlayBuildDebounce = 0ms;
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v", std::vector<float>{(float)i, 1.0f, 2.0f, 3.0f}));
+  }
+  h.commit();
+  auto published = [&](Collection& collection) {
+    auto reader = collection.getShard()->getSnapshots().snapshot();
+    std::pmr::monotonic_buffer_resource arena;
+    size_t overlays = 0;
+    for (const auto& seg : Manifest::decode(reader->bytes, arena).segments) overlays += seg.overlays.size();
+    return overlays;
+  };
+  ASSERT_TRUE(until([&] { return published(*source->getCollection("main")) == 1 && iw->testOverlayBuildsIdle(); }));
+  ASSERT_TRUE(caughtUp());
+  auto replica = follower->getCollection("main");
+  EXPECT_EQ(1u, published(*replica));
+  EXPECT_EQ(nullptr, replica->getShard()->getIndexWriter());
+  EXPECT_EQ(1, VectorIndexBuilder::ivfBackgroundBuildCountForTests.load());
+}
+
 TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   followerConfig.server.http.port = 9500;
   startSource(); startFollower();

@@ -6,11 +6,21 @@
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <typeinfo>
 
+#include <omp.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
+#include <oneapi/tbb/task_scheduler_observer.h>
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/padded_input.h"
 #include "luxir/store/OutputStream.h"
@@ -153,7 +163,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
-    snapshots(snapshots) {
+    snapshots(snapshots), indexArena(arena) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
   writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
@@ -206,7 +216,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
-      seg.nextOverlayGen = segment.next_overlay_gen;
+      seg.nextOverlayGen.store(segment.next_overlay_gen);
       seg.auxOverlays.reserve(segment.overlays.size());
       for (const auto& overlay : segment.overlays) {
         seg.auxOverlays.push_back(fromWire(overlay));
@@ -260,6 +270,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   {
     std::lock_guard<std::mutex> lock(indexMutex);
     seedActiveVectorOverlayNamesFromManifestLocked();
+    refreshAutoBuildSchemaLocked();
   }
 
   if (arena) arena->execute([this] { updateGraph.emplace(); });
@@ -445,11 +456,13 @@ void IndexWriter::fail(std::string reason) {
   failureReason = std::make_shared<const std::string>(std::move(reason));
   failed.store(true, std::memory_order_release);
   snapshots.fail();
+  overlayBuildCancel.store(true, std::memory_order_relaxed);
 }
 
 void IndexWriter::close() {
   // No delete-pass retry fires once this returns; detach waits out a running one.
   DeadlineScheduler::global().detach(deletePassRetrySlot);
+  DeadlineScheduler::global().detach(overlayBuildSlot);
   // Fatal publication can happen inside a graph task. Drain here even when
   // already marked, never recursively from the publishing task itself.
   std::lock_guard closeLock(closeMutex);
@@ -458,6 +471,8 @@ void IndexWriter::close() {
     std::lock_guard lock(indexMutex);
     closed.store(true, std::memory_order_release);
   }
+
+  stopOverlayBuildThread();
 
   // Stop new budget callbacks before draining the graph.  Registration reset
   // synchronizes with a callback already copied out of the budget; any task it
@@ -469,9 +484,16 @@ void IndexWriter::close() {
   // of the graph still going on?
   updateGraph->wait_for_all();
 
+  // Overlays no commit took: the segments stay on exact scan until a build
+  // after reopening.
+  std::vector<std::string> unpublishedOverlays;
   std::vector<UpdateMessage*> abandoned;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    for (const auto& finished : finishedOverlays) {
+      for (const auto& file : finished.info.files) unpublishedOverlays.push_back(file.name);
+    }
+    finishedOverlays.clear();
     abandoned.reserve(pendingForceMerges.size() + (activeForceMerge == nullptr ? 0 : 1));
     if (activeForceMerge != nullptr) {
       abandoned.push_back(activeForceMerge);
@@ -483,6 +505,7 @@ void IndexWriter::close() {
     }
   }
 
+  deleteStagedOverlayFiles(unpublishedOverlays, "closing with an unpublished overlay");
   for (auto* origin : abandoned) {
     setForceMergeError(*origin, "IndexWriter shut down before publication");
   }
@@ -708,6 +731,7 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   auto published = lastSnapshot.load();
   lock.unlock();
   tryDeleteSegments();
+  scheduleOverlayBuilds();
   return published;
 }
 
@@ -1695,12 +1719,23 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   auto vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
   auto endVectorIntent = scope_guard([this, active = !vectorSelectors.empty()] {
     if (!active) return;
-    const std::lock_guard lock(indexMutex);
-    inFlightVectorSelectors.clear();
+    {
+      const std::lock_guard lock(indexMutex);
+      inFlightVectorSelectors.clear();
+    }
+    // Background builds stood aside for this commit, which may have failed.
+    scheduleOverlayBuilds();
   });
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     if (!vectorSelectors.empty()) {
+      // This commit builds what it selects; a background build of the same overlay
+      // would be wasted.
+      if (overlayBuildTarget != nullptr && std::ranges::any_of(vectorSelectors, [&](const auto& selector) {
+            return selector == "*" || selector == overlayBuildTargetName;
+          })) {
+        overlayBuildCancel.store(true, std::memory_order_relaxed);
+      }
       inFlightVectorSelectors = std::move(vectorSelectors);
     }
     // A commit applies every pending batch and carried packet. publishOnly
@@ -1752,6 +1787,9 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // same canonical segment order.
   std::sort(segsToKeep.begin(), segsToKeep.end(),
             [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
+
+  // Before an explicit build below, which then skips what these provide.
+  attachFinishedOverlays(segsToKeep);
 
   // Collect unsynced segment data, liveDocs, and overlay files.  Keep them on
   // the segment until sync succeeds so a failed commit (sync failure or a
@@ -1841,6 +1879,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // Delete segment files only after the IndexInfo file is written.
   app.unpin();
   tryDeleteSegments();
+  scheduleOverlayBuilds();
 
   if (msg.maxSegments > 0) {
     enqueueForceMerge(msg); // completion ownership transfers here; don't access msg below.
@@ -1986,6 +2025,7 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
   if (it != segInfos.end()) {
     SegInfo* seg = it->second.get();
     INDEX_DEBUG("ToDelete += {}", *seg);
+    if (seg == overlayBuildTarget) overlayBuildCancel.store(true, std::memory_order_relaxed);
     // Remove from merge policy
     mergePolicy->_remove(seg);
     // Move the segment to deletion list instead of just erasing it
@@ -2192,8 +2232,7 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
 }
 
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
-  std::lock_guard lock(indexMutex);
-  return seg.nextOverlayGen++;
+  return seg.nextOverlayGen.fetch_add(1);
 }
 
 std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
@@ -2202,14 +2241,19 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     std::span<const std::string> overlayNames,
     const Schema& schema,
     VectorIndexBuilder::BuildSite buildSite,
-    std::vector<std::string>& outFiles) {
+    std::vector<std::string>& outFiles,
+    const std::atomic<bool>* cancel) {
   std::vector<AuxInfo> built;
   if (overlayNames.empty()) return built;
 
   boost::unordered_flat_set<std::string> existingNames;
-  for (const auto& overlay : seg.auxOverlays) {
-    if (overlay.kind == VectorIndexBuilder::KIND) {
-      existingNames.emplace(overlay.name);
+  {
+    // A commit may be attaching overlays to this segment during a background build.
+    std::lock_guard lock(indexMutex);
+    for (const auto& overlay : seg.auxOverlays) {
+      if (overlay.kind == VectorIndexBuilder::KIND) {
+        existingNames.emplace(overlay.name);
+      }
     }
   }
 
@@ -2221,7 +2265,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
 
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          schema, overlayGen, writerEpoch, indexRamBudget);
+                          schema, overlayGen, writerEpoch, indexRamBudget, cancel);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
@@ -2246,6 +2290,367 @@ void IndexWriter::deleteStagedOverlayFiles(std::span<const std::string> files,
                 file, context);
     }
   }
+}
+
+// Caller holds indexMutex.  Names of concrete fields activate here; fields from a
+// template activate when a scan first finds them in a segment.
+void IndexWriter::refreshAutoBuildSchemaLocked() {
+  auto schema = getSchema();
+  if (schema == autoBuildSchema) return;
+  autoBuildSchema = schema;
+  autoBuildEnabled = false;
+  overlayScanEpoch++;
+  for (const auto& [name, type] : schema->fieldTypeMap) {
+    if (type->type() != FieldType::VECTOR) continue;
+    const auto* vector = (const VectorFieldType*)type.get();
+    if (!vector->ann().autoBuild || !vector->knnSearchable()) continue;
+    autoBuildEnabled = true;
+    if ((type->flags_ & FieldType::ABSTRACT) != 0) continue;
+    std::string overlayName(VectorIndexBuilder::NAME_PREFIX);
+    overlayName.append((std::string_view)name);
+    activeVectorOverlayNames.emplace(std::move(overlayName));
+  }
+}
+
+bool IndexWriter::overlayScanNeededLocked() const {
+  return std::ranges::any_of(segInfos, [&](const auto& entry) { return entry.second->overlayScanEpoch != overlayScanEpoch; });
+}
+
+bool IndexWriter::pickOverlayBuildLocked(SegInfo*& seg, std::string& name,
+                                         std::optional<std::chrono::steady_clock::time_point>& retryAt) {
+  // Commits are serial and this one builds or fails before its end schedules again.
+  if (!inFlightVectorSelectors.empty()) return false;
+  auto now = std::chrono::steady_clock::now();
+  int64_t mostVectors = 0;
+  for (const auto& [segId, candidate] : segInfos) {
+    if (candidate->overlayWants.empty() || candidate->liveDocs == 0 || mergePolicy->_mergeImminent(*candidate)) continue;
+    // A segment no commit has published serves no searches yet.
+    if (std::ranges::find(lastCommittedSegIds, segId) == lastCommittedSegIds.end()) continue;
+    for (const auto& [wanted, want] : candidate->overlayWants) {
+      if (std::ranges::any_of(finishedOverlays, [&](const auto& finished) {
+            return finished.segId == segId && finished.info.name == wanted;
+          })) continue;
+      if (want.notBefore > now) {
+        retryAt = retryAt ? std::min(*retryAt, want.notBefore) : want.notBefore;
+      } else if (want.vectors > mostVectors) {
+        mostVectors = want.vectors;
+        seg = candidate.get();
+        name = wanted;
+      }
+    }
+  }
+  return mostVectors > 0;
+}
+
+// Called after publications and merges, so it must not fail them.
+void IndexWriter::scheduleOverlayBuilds() noexcept {
+  try {
+    bool arm = false;
+    {
+      const std::lock_guard lock(indexMutex);
+      refreshAutoBuildSchemaLocked();
+      if (!overlayBuildsAllowedLocked()) return;
+      arm = overlayScanNeededLocked() || std::ranges::any_of(segInfos, [](const auto& entry) {
+        return !entry.second->overlayWants.empty();
+      });
+    }
+    if (arm) DeadlineScheduler::global().arm(overlayBuildSlot, DeadlineScheduler::Clock::now() + overlayBuildDebounce);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Scheduling background vector overlay builds failed: {}", e.what());
+  }
+}
+
+void IndexWriter::startOverlayBuilds() {
+  scheduleOverlayBuilds();
+}
+
+// Runs on the DeadlineScheduler thread, so anything slow is left to the build
+// thread.  Commits and merges schedule again whatever is held back here for them.
+void IndexWriter::overlayBuildTimerFired() {
+  std::thread previous;
+  std::optional<DeadlineScheduler::Clock::time_point> rearm;
+  bool publish = false;
+  {
+    const std::lock_guard lock(indexMutex);
+    if (isClosed()) return;
+    publish = !finishedOverlays.empty() && !overlayPublishInFlight && !overlayBuildsPaused;
+    SegInfo* seg = nullptr;
+    std::string name;
+    if (!overlayBuildRunning && overlayBuildsAllowedLocked()
+        && (overlayScanNeededLocked() || pickOverlayBuildLocked(seg, name, rearm))) {
+      rearm.reset();
+      if (!overlayBuildLimit->tryAcquire()) {
+        rearm = DeadlineScheduler::Clock::now() + std::chrono::milliseconds(500);
+      } else {
+        previous = std::move(overlayBuildThread);
+        try {
+          overlayBuildThread = std::thread([this] { overlayBuildThreadBody(); });
+          overlayBuildRunning = true;
+        } catch (const std::exception& e) {
+          overlayBuildLimit->release();
+          LOG_ERROR("Starting a background vector overlay build failed: {}", e.what());
+          rearm = DeadlineScheduler::Clock::now() + overlayBuildRetryMin;
+        }
+      }
+    }
+  }
+  // It finished its last step under the lock taken above.
+  if (previous.joinable()) previous.join();
+  try {
+    if (rearm) DeadlineScheduler::global().arm(overlayBuildSlot, *rearm);
+    if (publish) requestOverlayPublish();
+  } catch (const std::exception& e) {
+    LOG_ERROR("Background vector overlay scheduling failed: {}", e.what());
+  }
+}
+
+namespace {
+
+// The arena's workers run FAISS kernels, which must not fan out over OpenMP.
+class SerialOpenMpObserver final : public oneapi::tbb::task_scheduler_observer {
+public:
+  explicit SerialOpenMpObserver(oneapi::tbb::task_arena& arena) : oneapi::tbb::task_scheduler_observer(arena) {
+    observe(true);
+  }
+  void on_scheduler_entry(bool) override { omp_set_num_threads(1); }
+};
+
+} // namespace
+
+void IndexWriter::overlayBuildThreadBody() {
+  nameThisThread("luxir_ovl_build");
+  #ifdef __linux__
+  if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), overlayBuildNice) != 0) {
+    LOG_DEBUG("Could not lower the priority of the vector overlay build thread");
+  }
+  #endif
+  auto finished = scope_guard([this] {
+    overlayBuildLimit->release();
+    std::optional<DeadlineScheduler::Clock::time_point> rearm;
+    {
+      const std::lock_guard lock(indexMutex);
+      overlayBuildRunning = false;
+      SegInfo* seg = nullptr;
+      std::string name;
+      // A commit may have asked for more after the last look.
+      if (overlayBuildsAllowedLocked()
+          && (overlayScanNeededLocked() || pickOverlayBuildLocked(seg, name, rearm))) {
+        rearm = DeadlineScheduler::Clock::now() + overlayBuildDebounce;
+      }
+    }
+    try {
+      if (rearm) DeadlineScheduler::global().arm(overlayBuildSlot, *rearm);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Re-arming background vector overlay builds failed: {}", e.what());
+    }
+  });
+  try {
+    // Its own arena over the shared worker pool, so the cap on this build's
+    // parallelism is a hard one, and no indexing arena seat is taken from a thread
+    // that waits on a graph.  It stays at a quarter of the indexing width.
+    int indexWidth = computeWidth(indexArena != nullptr ? indexArena->max_concurrency() : oneapi::tbb::this_task_arena::max_concurrency());
+    oneapi::tbb::task_arena arena(std::max(1, indexWidth / 4), 1, oneapi::tbb::task_arena::priority::low);
+    arena.initialize();
+    SerialOpenMpObserver serialOpenMp(arena);
+    arena.execute([this] {
+      for (;;) {
+        SegInfo* seg = nullptr;
+        std::string name;
+        bool scan;
+        {
+          const std::lock_guard lock(indexMutex);
+          if (!overlayBuildsAllowedLocked()) return;
+          scan = overlayScanNeededLocked();
+          if (!scan) {
+            std::optional<DeadlineScheduler::Clock::time_point> retryAt;
+            if (!pickOverlayBuildLocked(seg, name, retryAt)) return;
+            ++seg->preparationPins;
+            overlayBuildTarget = seg;
+            overlayBuildTargetName = name;
+            overlayBuildCancel.store(false, std::memory_order_relaxed);
+          }
+        }
+        if (scan) scanOverlayWants();
+        else runOverlayBuild(*seg, name);
+      }
+    });
+  } catch (const std::exception& e) {
+    LOG_ERROR("Background vector overlay builds stopped: {}", e.what());
+  }
+}
+
+// Works out what the unscanned segments owe auto-build fields.  Opening their
+// readers is why this is off the commit path.
+void IndexWriter::scanOverlayWants() {
+  std::vector<SegInfo*> segs;
+  std::shared_ptr<const Schema> schema;
+  uint64_t epoch;
+  {
+    const std::lock_guard lock(indexMutex);
+    schema = autoBuildSchema;
+    epoch = overlayScanEpoch;
+    for (const auto& [_, seg] : segInfos) {
+      if (seg->overlayScanEpoch == epoch) continue;
+      ++seg->preparationPins;
+      segs.push_back(seg.get());
+    }
+  }
+  for (auto* seg : segs) {
+    std::vector<std::pair<std::string, int64_t>> overlays;
+    try {
+      auto pr = getSegmentPostingsReader(*seg);
+      VectorIndexBuilder::SegInput input{seg->segId, pr.get(), seg->creatorEpoch};
+      VectorIndexBuilder scanner(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                                 *schema, 0, writerEpoch);
+      overlays = scanner.autoBuildOverlays();
+    } catch (const std::exception& e) {
+      // Leaves the segment on exact scan until the next schema change or restart.
+      LOG_ERROR("Reading vector fields of {} for background overlay builds failed: {}", seg->name(), e.what());
+    }
+    const std::lock_guard lock(indexMutex);
+    seg->overlayScanEpoch = epoch;
+    --seg->preparationPins;
+    boost::unordered_flat_map<std::string, SegInfo::OverlayWant> wants;
+    for (auto& [name, vectors] : overlays) {
+      // Also a field too small here: a merge can take it past the thresholds.
+      activeVectorOverlayNames.emplace(name);
+      if (vectors == 0 || std::ranges::any_of(seg->auxOverlays, [&](const auto& overlay) { return overlay.name == name; })) continue;
+      auto previous = seg->overlayWants.find(name);
+      SegInfo::OverlayWant want = previous != seg->overlayWants.end() ? previous->second : SegInfo::OverlayWant{};
+      want.vectors = vectors;
+      wants.emplace(std::move(name), want);
+    }
+    seg->overlayWants = std::move(wants);
+  }
+  tryDeleteSegments();
+}
+
+// Caller pinned seg and made it the build target.
+void IndexWriter::runOverlayBuild(SegInfo& seg, const std::string& name) {
+  std::vector<AuxInfo> built;
+  std::vector<std::string> files;
+  bool cancelled = false, failure = false;
+  try {
+    auto schema = getSchema();
+    auto pr = getSegmentPostingsReader(seg);
+    std::array<std::string, 1> names{name};
+    built = buildConcreteVectorOverlays(seg, *pr, names, *schema, VectorIndexBuilder::BuildSite::BACKGROUND,
+                                        files, &overlayBuildCancel);
+  } catch (const VectorBuildCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& e) {
+    failure = true;
+    // Nothing changes: the segment keeps answering by exact scan.
+    LOG_ERROR("Background vector overlay build failed for {} {}: {}", seg.name(), name, e.what());
+  } catch (...) {
+    failure = true;
+    LOG_ERROR("Background vector overlay build failed for {} {}: unknown exception", seg.name(), name);
+  }
+
+  bool stage = false, live = false;
+  {
+    const std::lock_guard lock(indexMutex);
+    overlayBuildTarget = nullptr;
+    overlayBuildTargetName.clear();
+    --seg.preparationPins;
+    auto it = segInfos.find(seg.segId);
+    live = it != segInfos.end() && it->second.get() == &seg;
+    auto want = seg.overlayWants.find(name);
+    if (failure && want != seg.overlayWants.end()) {
+      auto delay = overlayBuildRetryMin * ((int64_t)1 << std::min(want->second.failures, 16u));
+      want->second.failures++;
+      want->second.notBefore = std::chrono::steady_clock::now() + std::min(delay, overlayBuildRetryMax);
+    } else if (!failure && !cancelled && built.empty() && want != seg.overlayWants.end()) {
+      seg.overlayWants.erase(want); // the build found it below its thresholds after all
+    } else if (!built.empty() && live && !isClosed()) {
+      stage = true;
+      for (auto& info : built) finishedOverlays.push_back({seg.segId, std::move(info)});
+    }
+  }
+  if (stage) {
+    requestOverlayPublish();
+    return;
+  }
+  // Merged away, deleted, cancelled or failed: none of this was ever published.
+  deleteStagedOverlayFiles(files, "discarded background overlay build");
+  if (!live) tryDeleteSegments();
+}
+
+void IndexWriter::stopOverlayBuildThread() {
+  overlayBuildCancel.store(true, std::memory_order_relaxed);
+  std::thread thread;
+  {
+    const std::lock_guard lock(indexMutex);
+    thread = std::move(overlayBuildThread);
+  }
+  if (thread.joinable()) thread.join();
+}
+
+// A segment outside this commit's snapshot normally has been merged away or lost
+// its last document.  Whichever overlay reached a segment first stays, so an
+// explicit build and a background build of it cannot both publish.
+void IndexWriter::attachFinishedOverlays(std::span<SegInfo*> segs) {
+  std::vector<std::string> discarded;
+  {
+    const std::lock_guard lock(indexMutex);
+    std::erase_if(finishedOverlays, [&](FinishedOverlay& finished) {
+      auto it = std::lower_bound(segs.begin(), segs.end(), finished.segId,
+                                 [](const SegInfo* seg, uint64_t id) { return seg->segId < id; });
+      bool found = it != segs.end() && (*it)->segId == finished.segId;
+      if (!found && segInfos.contains(finished.segId)) return false;
+      if (!found || std::ranges::any_of((*it)->auxOverlays, [&](const auto& overlay) {
+            return overlay.name == finished.info.name;
+          })) {
+        for (const auto& file : finished.info.files) discarded.push_back(file.name);
+        return true;
+      }
+      for (const auto& file : finished.info.files) (*it)->unsyncedFiles.push_back(file.name);
+      (*it)->overlayWants.erase(finished.info.name);
+      (*it)->auxOverlays.push_back(std::move(finished.info));
+      return true;
+    });
+  }
+  deleteStagedOverlayFiles(discarded, "superseded background overlay build");
+}
+
+// A publication alone, like a merge's: it must not flush client updates, which
+// stay invisible until a client commit asks for them.
+class IndexWriter::OverlayPublishMessage final : public UpdateMessage {
+public:
+  OverlayPublishMessage() {
+    commit = COMMIT;
+    publishOnly = true;
+  }
+  void handle(IndexWriter&) override {}
+  void done(IndexWriter& writer) override {
+    bool errored = result.errored();
+    delete this;
+    writer.overlayPublishFinished(errored);
+  }
+};
+
+void IndexWriter::requestOverlayPublish() {
+  {
+    const std::lock_guard lock(indexMutex);
+    if (overlayPublishInFlight || finishedOverlays.empty() || isClosed()) return;
+    overlayPublishInFlight = true;
+  }
+  auto message = std::make_unique<OverlayPublishMessage>();
+  if (submitUpdate(message.get())) {
+    message.release();
+  } else {
+    overlayPublishFinished(true);
+  }
+}
+
+void IndexWriter::overlayPublishFinished(bool errored) {
+  {
+    const std::lock_guard lock(indexMutex);
+    overlayPublishInFlight = false;
+    if (finishedOverlays.empty() || isClosed()) return;
+  }
+  if (errored) DeadlineScheduler::global().arm(overlayBuildSlot, DeadlineScheduler::Clock::now() + overlayBuildRetryMin);
+  else requestOverlayPublish();
 }
 
 void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
@@ -2355,6 +2760,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
       for (const auto& file : staged.info.files) {
         staged.seg->unsyncedFiles.push_back(file.name);
       }
+      staged.seg->overlayWants.erase(staged.info.name);
       staged.seg->auxOverlays.push_back(std::move(staged.info));
     }
   }
@@ -2566,7 +2972,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.commit_time = seg.firstCommitTime;
     wire.live_docs = seg.liveDocs;
     wire.schema = seg.schema.wire();
-    wire.next_overlay_gen = seg.nextOverlayGen;
+    wire.next_overlay_gen = seg.nextOverlayGen.load();
     wire.files = toWire(seg.files, arena);
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
     for (size_t j = 0; j < seg.auxOverlays.size(); j++) overlays[j] = toWire(seg.auxOverlays[j], arena);
@@ -3160,9 +3566,13 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // request the synthetic publish commit.
   if (clientOrigin) {
     finishMergeTail(allowSyntheticCommit, chainNextMerge);
+    scheduleOverlayBuilds();
     return submitMergeCommit(msg, /*publishOnly=*/true);
   }
   bool triggerCommit = finishMergeTail(allowSyntheticCommit, chainNextMerge);
+  // A build held back for this merge may go ahead, if the merge failed or the
+  // sources were not all gathered.
+  scheduleOverlayBuilds();
   if (triggerCommit) {
     return submitMergeCommit(msg, /*publishOnly=*/false);
   } else {
@@ -3216,6 +3626,11 @@ bool IndexWriter::testIsEmpty() {
 void IndexWriter::testDeleteAllData() {
   INDEX_DEBUG("testDeleteAllData: deleting all data.");
   // wait for things in the execution graph to finish.
+  {
+    const std::lock_guard lock(indexMutex);
+    overlayBuildsPaused = true;
+  }
+  stopOverlayBuildThread();
   updateGraph->wait_for_all();
   std::unique_lock publicationLock(publicationMutex);
 
@@ -3262,6 +3677,9 @@ void IndexWriter::testDeleteAllData() {
     currentAuxIndexes_.clear();
     currentSegmentOverlays_.clear();
     activeVectorOverlayNames.clear();
+    autoBuildSchema = nullptr;
+    finishedOverlays.clear();
+    overlayBuildsPaused = false;
     lastMergeFailure.reset();
     pendingDeletes.clear();
     retirableThrough = 0;
@@ -3325,9 +3743,21 @@ bool IndexWriter::testActiveVectorOverlayName(std::string_view name) {
   return activeVectorOverlayNames.contains(std::string(name));
 }
 
+bool IndexWriter::testOverlayBuildsIdle() {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  return !overlayBuildRunning && !overlayPublishInFlight && finishedOverlays.empty();
+}
+
+bool IndexWriter::testOverlayBuildsRunning() {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  return overlayBuildRunning;
+}
+
 void IndexWriter::testReseedActiveVectorOverlayNamesFromManifest() {
   std::lock_guard<std::mutex> lock(indexMutex);
   seedActiveVectorOverlayNamesFromManifestLocked();
+  autoBuildSchema = nullptr;
+  refreshAutoBuildSchemaLocked();
 }
 
 bool IndexWriter::testMergeRunning() {
@@ -3364,6 +3794,11 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    for (const auto& [_, seg] : segInfos) {
+      if (seg->overlayWants.empty()) continue;
+      out.overlayBacklogSegments++;
+      for (const auto& [_, want] : seg->overlayWants) out.overlayBacklogVectors += (uint64_t)want.vectors;
+    }
     static_cast<DeletePassStats&>(out) = deletePassStats;
     out.completedUpdateVersion = completedUpdateVersion;
     out.minInverterDocVersion = minInverterDocVersion;

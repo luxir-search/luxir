@@ -125,6 +125,7 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  int auto_build_concurrency = 1;                // background overlay builds running at once on this node
 };
 
 struct IngestConfig {

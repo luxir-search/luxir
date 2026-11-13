@@ -252,6 +252,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
 
+  app.add_option("--indexing.auto-build-concurrency", index.auto_build_concurrency,
+                 "Background vector overlay builds (ann.auto_build) running at once on this node")
+      ->default_val(index.auto_build_concurrency)
+      ->check(CLI::PositiveNumber);
+
   app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
       ->transform(CLI::AsSizeValue(false))
