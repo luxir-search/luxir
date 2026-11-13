@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include "test/TestUtils.h"
@@ -158,7 +159,7 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   PostingsReader& postings = segment.postingsReader();
   auto physicalFile = directory.openFile(baseFiles[0], true);
   ASSERT_NE(nullptr, physicalFile);
-  EXPECT_EQ((uint64_t) physicalFile->size(), postings.sizeInBytes());
+  EXPECT_EQ((uint64_t) physicalFile->size(), postings.core().sizeInBytes());
   SegFieldInfo bodyInfo = fieldInfo(postings, "body");
   MemPool pool;
   TermsEnum terms(pool, postings, bodyInfo);
@@ -391,14 +392,15 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   EXPECT_EQ(nullptr, directory.openFile(Postings::getIndexFileName(seg, 1)).get());
   EXPECT_NE(nullptr, directory.openFile(Postings::getIndexFileName(seg, 2)).get());
 
-  PostingsReader reader(directory, 17, 1);
+  SegmentCore readerCore(directory, 17, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo movedInfo = fieldInfo(reader, "moved");
   SegFieldInfo survivorInfo = fieldInfo(reader, "survivor");
   EXPECT_EQ(0u, movedInfo.columnLoc.filenum());
   EXPECT_EQ(2u, survivorInfo.columnLoc.filenum());
   EXPECT_EQ((uint64_t) 0, movedInfo.columnLoc.offset() % 8);
 
-  InputStream movedInput = reader.getInputStreamSeek(movedInfo.columnLoc);
+  InputStream movedInput = reader.core().getInputStreamSeek(movedInfo.columnLoc);
   ASSERT_GE(movedInput.left(),
             (int64_t) encoded.size() + (int64_t) SVB_OVERREAD_PAD);
   std::array<uint32_t, VALUE_COUNT> decoded;
@@ -407,9 +409,9 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
                          VALUE_COUNT, 0);
   EXPECT_EQ(values, decoded);
 
-  InputStream survivorInput = reader.getInputStreamSeek(survivorInfo.columnLoc);
+  InputStream survivorInput = reader.core().getInputStreamSeek(survivorInfo.columnLoc);
   EXPECT_EQ((char) 0x5a, survivorInput.readByte());
-  EXPECT_EQ((uint64_t) files[0].size + files[1].size, reader.sizeInBytes());
+  EXPECT_EQ((uint64_t) files[0].size + files[1].size, reader.core().sizeInBytes());
 }
 
 TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
@@ -450,9 +452,10 @@ TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
   EXPECT_EQ(plainFiles[0].size, extraFiles[0].size)
       << "dropped header-only streams must not grow file 0";
 
-  PostingsReader reader(withExtras, 22, 1);
+  SegmentCore readerCore(withExtras, 22, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "f");
-  InputStream in = reader.getInputStreamSeek(info.columnLoc);
+  InputStream in = reader.core().getInputStreamSeek(info.columnLoc);
   EXPECT_EQ((char) 0x7f, in.readByte());
 }
 
@@ -491,10 +494,11 @@ TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
   std::string seg = Postings::segmentKey(18, 1);
   EXPECT_NE(nullptr, directory.openFile(
                          Postings::getIndexFileName(seg, 1), true).get());
-  PostingsReader reader(directory, 18, 1);
+  SegmentCore readerCore(directory, 18, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "spill");
   EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.getInputStreamSeek(info.columnLoc);
+  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
   ASSERT_GE(input.left(), (int64_t) payload.size());
   EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
 }
@@ -521,10 +525,11 @@ TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
   EXPECT_EQ(0, budget.reservedBytes());
   ASSERT_EQ(2u, baseSegmentFiles(directory, 19).size());
 
-  PostingsReader reader(directory, 19, 1);
+  SegmentCore readerCore(directory, 19, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "protected");
   EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.getInputStreamSeek(info.columnLoc);
+  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
   ASSERT_GE(input.left(), (int64_t) payload.size());
   EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
 }
@@ -620,14 +625,14 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   PostingsReader& postings = reader->segments()[0].postingsReader();
   SegFieldInfo info = fieldInfo(postings, "body");
   ASSERT_FALSE(info.rangeTableLoc.isNull());
-  InputStream table = postings.getInputStreamSeek(info.rangeTableLoc);
+  InputStream table = postings.core().getInputStreamSeek(info.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
   ASSERT_GT(header->nRanges, 1u);
   for (uint32_t i = 0; i < header->nRanges; i++) {
-    EXPECT_NE(nullptr, postings.getFile(rows[i].termsBase.filenum()));
-    EXPECT_NE(nullptr, postings.getFile(rows[i].docsBase.filenum()));
-    EXPECT_NE(nullptr, postings.getFile(rows[i].posBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].termsBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].docsBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].posBase.filenum()));
   }
 
   MemPool pool;

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include <set>
 #include "luxir/index/PostingsWriter.h"
@@ -32,7 +33,8 @@ protected:
   uint32_t termsPerFieldMax = 100;
 
 
-  std::unique_ptr<PostingsReader> reader;
+  std::unique_ptr<SegmentCore> core;
+  PostingsReader* reader = nullptr;
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsPosEnum> docsEnum;
@@ -61,7 +63,8 @@ protected:
     luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
-    reader = std::make_unique<PostingsReader>(dir, 0, 1);
+    core = std::make_unique<SegmentCore>(dir, 0, 1);
+    reader = &core->rootReader();
     fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state
@@ -309,7 +312,8 @@ TEST_F(PostingsTest, basic) {
   postingsWriter.finish();
 
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   while (fieldReader.readNextField()) {
@@ -406,7 +410,8 @@ TEST_F(PostingsTest, levelLadder) {
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
-    PostingsReader reader(dir, 0, 1);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -587,7 +592,8 @@ TEST_F(PostingsTest, blockPositions) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -666,7 +672,8 @@ TEST_F(PostingsTest, blockTerms) {
   }
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -732,7 +739,8 @@ TEST_F(PostingsTest, seekForward) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -917,7 +925,8 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1012,7 +1021,8 @@ TEST_F(PostingsTest, seekForwardRandom) {
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
-    PostingsReader reader(dir, 0, 1);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -1188,7 +1198,8 @@ TEST_F(PostingsTest, intCol) {
   dir.listFiles(files);
   ASSERT_EQ(files.size(), 1);
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), fname1);

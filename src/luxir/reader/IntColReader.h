@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <cstddef>
 
@@ -27,7 +28,7 @@ private:
 public:
   MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
              int64_t nValues) {
-    InputStream columnIS = postingsReader.getInputStreamSeek(loc);
+    InputStream columnIS = postingsReader.core().getInputStreamSeek(loc);
     const char* blocks = columnIS.ptr();
     values = MonoColumn(blocks, blocks + metaOff, nValues);
   }
@@ -140,7 +141,7 @@ public:
     nvals = fieldInfo.numValues;
     arrayMode = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
     docsWithField = fieldInfo.docsWithField;
-    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
+    columnIS = postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc);
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);

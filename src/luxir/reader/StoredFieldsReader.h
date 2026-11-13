@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -76,7 +77,7 @@ public:
     assert(fieldInfo.numValues > 0);
     assert(metadata != nullptr);
 
-    chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
+    chunkIS = postingsReader.core().getInputStream(fieldInfo.columnLoc.filenum());
     chunksStart = (int64_t)fieldInfo.columnLoc.offset();
     chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
     numChunks_ = (int32_t)fieldInfo.numValues;
@@ -281,7 +282,7 @@ public:
   static int64_t peekMaxChunkBytes(PostingsReader& postingsReader,
                                    const SegFieldInfo& fieldInfo) {
     assert(FieldType::storage(fieldInfo.type) == FieldType::Storage::BIN);
-    InputStream chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
+    InputStream chunkIS = postingsReader.core().getInputStream(fieldInfo.columnLoc.filenum());
     int64_t metadataOffset = (int64_t)fieldInfo.columnLoc.offset() + fieldInfo.columnMetaOff;
     const char* metaPtr = chunkIS.ptr(metadataOffset);
     const char* end = chunkIS.ptr(chunkIS.size());

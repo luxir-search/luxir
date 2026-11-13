@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include <gtest/gtest.h>
 
 #include "luxir/query/QueryBuilder.h"
@@ -156,7 +157,8 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
   auto check = [&] {
     auto reopened = readDurableIndexInfo(writer->dir);
     for (const auto& segment : reopened->segments) {
-      PostingsReader postings(writer->dir, segment.seg_id, segment.creator_epoch);
+      SegmentCore postingsCore(writer->dir, segment.seg_id, segment.creator_epoch);
+      auto& postings = postingsCore.rootReader();
       FieldReader fields(postings);
       while (fields.readNextField()) {
         SegFieldInfo info{};
@@ -187,7 +189,8 @@ TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
     info.typeFlags = type == FieldType::DECIMAL ? 19 : type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
     writeUnversionedRuns(writer);
     writer.finish();
-    PostingsReader reader(dir, 1, 1);
+    SegmentCore readerCore(dir, 1, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fields(reader);
     ASSERT_TRUE(fields.readNextField());
     SegFieldInfo decoded{};

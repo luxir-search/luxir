@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
+#include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -1285,7 +1286,7 @@ TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
   versions.add(4, 7); // The last boundary is outside maxDoc.
   versions.finish();
   ASSERT_TRUE(writer.finish());
-  EXPECT_THROW(PostingsReader::create(dir, 1, 1), std::runtime_error);
+  EXPECT_THROW(SegmentCore::create(dir, 1, 1), std::runtime_error);
   PostingsWriter missing(dir, 2, 1, 1);
   EXPECT_THROW(missing.finish(), std::runtime_error);
 }
@@ -1312,7 +1313,7 @@ TEST_F(IndexWriterTest, requestBirthBlocksRoundTrip) {
     PostingsWriter writer(dir, 1, 1, start);
     writer.writeVersionRuns(builder);
     ASSERT_TRUE(writer.finish());
-    auto reader = PostingsReader::create(dir, 1, 1);
+    auto reader = SegmentCore::create(dir, 1, 1);
     const auto& runs = reader->versionRuns();
     ASSERT_EQ(count, runs.size());
     VersionRuns::Cursor cursor(runs);
@@ -1374,7 +1375,7 @@ TEST_F(IndexWriterTest, requestBirthRollbackAcrossSealedBlock) {
   ASSERT_TRUE(last.success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(VersionRuns::BLOCK_SIZE + 1, reader->liveDocs());
-  const auto& runs = reader->segments()[0].postingsReader().versionRuns();
+  const auto& runs = reader->segments()[0].segmentCore().versionRuns();
   VersionRuns::Cursor cursor(runs);
   EXPECT_EQ(failed.updateVersion, cursor.birth(VersionRuns::BLOCK_SIZE));
   EXPECT_EQ(failed.updateVersion, cursor.birth(VersionRuns::BLOCK_SIZE + 1));
@@ -1422,8 +1423,8 @@ TEST_F(IndexWriterTest, requestBirthsCoverRollbackAndEmptyAcquisitions) {
   auto reader = iw->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   auto& postings = reader->segments()[0].postingsReader();
-  EXPECT_EQ(3, postings.versionRuns().runs().size());
-  VersionRuns::Cursor versions(postings.versionRuns());
+  EXPECT_EQ(3, postings.core().versionRuns().runs().size());
+  VersionRuns::Cursor versions(postings.core().versionRuns());
   EXPECT_EQ(first.updateVersion, versions.birth(0));
   EXPECT_EQ(failed.updateVersion, versions.birth(1));
   EXPECT_EQ(failed.updateVersion, versions.birth(2));
@@ -1456,7 +1457,7 @@ TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
   auto reader = iw->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   EXPECT_EQ(2, reader->liveDocs());
-  auto& runs = reader->segments()[0].postingsReader().versionRuns();
+  auto& runs = reader->segments()[0].segmentCore().versionRuns();
   ASSERT_EQ(2, runs.runs().size());
   VersionRuns::Cursor cursor(runs);
   EXPECT_EQ(first.updateVersion, cursor.birth(0));
@@ -1480,7 +1481,7 @@ TEST_F(IndexWriterTest, requestBirthMergeMixedBlocks) {
   helper.getIndexWriter()->mergeSegments();
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
-  VersionRuns::Cursor cursor(reader->segments()[0].postingsReader().versionRuns());
+  VersionRuns::Cursor cursor(reader->segments()[0].segmentCore().versionRuns());
   for (size_t i = 0; i < births.size(); i++) EXPECT_EQ(births[i], cursor.birth((int32_t)i));
 }
 
@@ -1792,11 +1793,11 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 
   // Test missingFileOK = false (should throw on missing files)
   EXPECT_THROW({
-      auto reader1 = PostingsReader::create(testDir, 999, 1, false);  // non-existent segment
+      auto reader1 = SegmentCore::create(testDir, 999, 1, false);  // non-existent segment
   }, std::filesystem::filesystem_error);
 
   // Test missingFileOK = true (should return nullptr on missing files)
-  auto reader2 = PostingsReader::create(testDir, 999, 1, true);
+  auto reader2 = SegmentCore::create(testDir, 999, 1, true);
   EXPECT_EQ(reader2, nullptr);
 
   // Test missingFileOK = false (should throw on missing files)
@@ -2531,7 +2532,7 @@ TEST_F(IndexWriterTest, idRangeClipsDeleteSelection) {
                                                : std::vector<std::string>{"x"}, UpdateMessage::COMMIT).success);
     EXPECT_EQ(wideEnvelope ? 2 : 1, applied.load());
     EXPECT_EQ(0, disjoint->liveGen);
-    EXPECT_EQ(nullptr, disjoint->sharedPostingsReader.load());
+    EXPECT_EQ(nullptr, disjoint->sharedSegmentCore.load());
     EXPECT_EQ(nullptr, iw->dir.openFile(Postings::getLiveDocsFileName(Postings::segmentKey(disjoint->segId, 1), 1, 1)));
     EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
     helper.clear();
@@ -2681,7 +2682,7 @@ TEST_F(IndexWriterTest, overwriteKeepsNewestVersionWithinInverter) {
     iw->releaseInverter(inv);
   }
   helper.commit();
-  auto& runs = iw->snapshots.readers.getReader()->segments()[0].postingsReader().versionRuns();
+  auto& runs = iw->snapshots.readers.getReader()->segments()[0].segmentCore().versionRuns();
   VersionRuns::Cursor cursor(runs);
   EXPECT_EQ(3, cursor.birth(1));
   EXPECT_EQ(2, cursor.birth(2));
@@ -3163,7 +3164,7 @@ TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
     {
       CommitSnapshotRegistry reopenedSnapshots(*dir);
       IndexWriter reopened(reopenedSnapshots);
-      auto& reopenedRuns = reopened.snapshots.readers.getReader()->segments()[0].postingsReader().versionRuns();
+      auto& reopenedRuns = reopened.snapshots.readers.getReader()->segments()[0].segmentCore().versionRuns();
       EXPECT_EQ(0, VersionRuns::Cursor(reopenedRuns).birth(0));
       reopened.commit();
       EXPECT_EQ(before, verify());
