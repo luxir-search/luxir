@@ -8,6 +8,7 @@ vcpkg_from_github(
         msvc-template.diff
         undef-small.diff
         dispatch-features.diff
+        rabitq-neon.diff  # NEON 1-bit RaBitQ popcounts; ARM_NEON forwards to scalar code upstream
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS

@@ -1,0 +1,144 @@
+--- a/faiss/utils/simd_impl/rabitq_neon.cpp
++++ b/faiss/utils/simd_impl/rabitq_neon.cpp
+@@ -9,15 +9,125 @@
+ 
+ #ifdef COMPILE_SIMD_ARM_NEON
+ 
++#include <arm_neon.h>
++
++#include <algorithm>
++#include <cstring>
++
+ namespace faiss::rabitq {
+ 
++// The NONE kernels count one 64-bit word at a time, which aarch64 does with
++// cnt + addv through the vector unit. These count 16 bytes per cnt into
++// per-plane lane sums and reduce them once per row. The sums are exact and
++// equal to the NONE kernels'.
++namespace {
++
++// Scalar tail from byte `offset`, same order and widths as the NONE kernels.
++template <bool Xor>
++inline uint64_t tail_dot(const uint8_t* query, const uint8_t* data, size_t size, size_t qb, size_t offset) {
++    uint64_t sum = 0;
++    for (; offset + 8 <= size; offset += 8) {
++        uint64_t yv, qv;
++        std::memcpy(&yv, data + offset, 8);
++        for (size_t j = 0; j < qb; j++) {
++            std::memcpy(&qv, query + j * size + offset, 8);
++            sum += (uint64_t)__builtin_popcountll(Xor ? qv ^ yv : qv & yv) << j;
++        }
++    }
++    for (; offset < size; ++offset) {
++        uint32_t yv = data[offset];
++        for (size_t j = 0; j < qb; j++) {
++            uint32_t qv = query[j * size + offset];
++            sum += (uint64_t)__builtin_popcount(Xor ? qv ^ yv : qv & yv) << j;
++        }
++    }
++    return sum;
++}
++
++// Per-lane bit counts of 16-byte chunks. A chunk adds at most 16 to a 16-bit
++// lane (uadalp) or 32 to a 32-bit lane (udot); reducing the lanes every 2048
++// chunks keeps a 16-bit lane below 65536.
++#if defined(__ARM_FEATURE_DOTPROD)
++using Lanes = uint32x4_t;
++inline Lanes lanes_zero() { return vdupq_n_u32(0); }
++inline Lanes lanes_add(Lanes acc, uint8x16_t bytes) { return vdotq_u32(acc, bytes, vdupq_n_u8(1)); }
++inline uint64_t lanes_sum(Lanes acc) { return vaddlvq_u32(acc); }
++#else
++using Lanes = uint16x8_t;
++inline Lanes lanes_zero() { return vdupq_n_u16(0); }
++inline Lanes lanes_add(Lanes acc, uint8x16_t bytes) { return vpadalq_u8(acc, bytes); }
++inline uint64_t lanes_sum(Lanes acc) { return vaddlvq_u16(acc); }
++#endif
++constexpr size_t BLOCK_CHUNKS = 2048;
++
++// Adds the popcounts of planes [0, Count) of q, each ANDed (or XORed) with
++// data, to out[j]. Each plane has its own accumulator, so no chunk waits on
++// another plane's result.
++template <bool Xor, int Count>
++inline void plane_counts(const uint8_t* q, const uint8_t* data, size_t size, size_t chunks, uint64_t* out) {
++    for (size_t c = 0; c < chunks;) {
++        size_t end = std::min(chunks, c + BLOCK_CHUNKS);
++        Lanes acc[Count];
++        for (int j = 0; j < Count; j++) acc[j] = lanes_zero();
++        for (; c < end; c++) {
++            uint8x16_t y = vld1q_u8(data + c * 16);
++            for (int j = 0; j < Count; j++) {
++                uint8x16_t qv = vld1q_u8(q + (size_t)j * size + c * 16);
++                acc[j] = lanes_add(acc[j], vcntq_u8(Xor ? veorq_u8(qv, y) : vandq_u8(qv, y)));
++            }
++        }
++        for (int j = 0; j < Count; j++) out[j] += lanes_sum(acc[j]);
++    }
++}
++
++template <bool Xor>
++inline uint64_t weighted_dot(const uint8_t* query, const uint8_t* data, size_t size, size_t qb) {
++    size_t chunks = size / 16;
++    uint64_t counts[4];
++    uint64_t sum = 0;
++    for (size_t first = 0; first < qb; first += 4) {
++        const uint8_t* q = query + first * size;
++        size_t count = std::min<size_t>(4, qb - first);
++        std::fill(counts, counts + 4, 0);
++        switch (count) {
++            case 1: plane_counts<Xor, 1>(q, data, size, chunks, counts); break;
++            case 2: plane_counts<Xor, 2>(q, data, size, chunks, counts); break;
++            case 3: plane_counts<Xor, 3>(q, data, size, chunks, counts); break;
++            default: plane_counts<Xor, 4>(q, data, size, chunks, counts); break;
++        }
++        for (size_t j = 0; j < count; j++) sum += counts[j] << (first + j);
++    }
++    return sum + tail_dot<Xor>(query, data, size, qb, chunks * 16);
++}
++
++inline uint64_t popcount_bytes(const uint8_t* data, size_t size) {
++    size_t chunks = size / 16;
++    uint64_t sum = 0;
++    for (size_t c = 0; c < chunks;) {
++        size_t end = std::min(chunks, c + BLOCK_CHUNKS);
++        Lanes acc = lanes_zero();
++        for (; c < end; c++) acc = lanes_add(acc, vcntq_u8(vld1q_u8(data + c * 16)));
++        sum += lanes_sum(acc);
++    }
++    size_t offset = chunks * 16;
++    for (; offset + 8 <= size; offset += 8) {
++        uint64_t yv;
++        std::memcpy(&yv, data + offset, 8);
++        sum += (uint64_t)__builtin_popcountll(yv);
++    }
++    for (; offset < size; ++offset) sum += (uint64_t)__builtin_popcount(data[offset]);
++    return sum;
++}
++
++} // namespace
++
+ template <>
+ uint64_t bitwise_and_dot_product<SIMDLevel::ARM_NEON>(
+         const uint8_t* query,
+         const uint8_t* data,
+         size_t size,
+         size_t qb) {
+-    return bitwise_and_dot_product<SIMDLevel::NONE>(query, data, size, qb);
++    return weighted_dot<false>(query, data, size, qb);
+ }
+ 
+ template <>
+@@ -26,12 +136,12 @@
+         const uint8_t* data,
+         size_t size,
+         size_t qb) {
+-    return bitwise_xor_dot_product<SIMDLevel::NONE>(query, data, size, qb);
++    return weighted_dot<true>(query, data, size, qb);
+ }
+ 
+ template <>
+ uint64_t popcount<SIMDLevel::ARM_NEON>(const uint8_t* data, size_t size) {
+-    return popcount<SIMDLevel::NONE>(data, size);
++    return popcount_bytes(data, size);
+ }
+ 
+ } // namespace faiss::rabitq
