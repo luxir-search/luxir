@@ -2386,8 +2386,12 @@ message VectorAnnDef {
   enum Codec {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
+    // IVF + 4-bit product quantization scanned with SIMD register lookups
+    // (fast-scan). Inner-product and cosine fields only. Uses pq.m (auto: twice
+    // pq's cap, the same code bytes above 256 dims) and implies 4-bit codes.
+    PQ4 = 2;
   }
-  optional Codec codec = 1;  // absent: rabitq; pq requires explicit selection
+  optional Codec codec = 1;  // absent: rabitq; pq and pq4 require explicit selection
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.

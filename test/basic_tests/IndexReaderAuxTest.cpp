@@ -254,6 +254,101 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
   }
 }
 
+// A pq4 overlay's codes section is block-packed: its size, its layout flag and
+// every list size must agree, with sizes bounded before they are summed.
+TEST_F(IndexReaderAuxTest, packedListCorruptionFailsOnOpen) {
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  h.clear();
+  SchemaBuilder b;
+  auto& f = b.field("embedding_v");
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
+  f.dims = 4;
+  f.metric = luxir::api::VectorMetric::IP;
+  f.ann = pq4Ann(2);
+  b.set(h.collection());
+  for (int i = 0; i < 700; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v", std::vector<float>{(float)(i % 7), (float)(i % 5), 2, 3}));
+  }
+  h.commit({"*"});
+  auto& dir = h.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  auto original = onlyVectorOverlay(durable.info);
+  auto file = dir.openFile(original.files[0].name, true);
+  auto stream = file->getInputStream();
+  const std::string payload(stream.ptr(), (size_t)stream.left());
+  auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name);
+  EXPECT_EQ(footer.version, 4);
+  EXPECT_EQ(footer.packBlock, VectorAuxListsFooter::PACK_BLOCK);
+  EXPECT_EQ(footer.expectedFileBytes(), payload.size());
+  EXPECT_EQ(footer.codesOffset() % 64, 0u);
+  EXPECT_EQ(footer.codesBytes % (footer.packBlock * footer.codeSize), 0);
+
+  std::string lastError;
+  auto opens = [&](const std::string& bytes) {
+    auto out = dir.createFile("corrupt-packed");
+    OutputStream os;
+    os.setFile(&*out);
+    os.write(bytes.data(), bytes.size());
+    os.close();
+    dir.finishFile(*out);
+    std::array<std::string, 1> names{"corrupt-packed"};
+    dir.sync(names);
+    auto copied = original;
+    auto descriptor = original.files[0];
+    descriptor.name = "corrupt-packed";
+    copied.files = std::span(&descriptor, 1);
+    bool ok = true;
+    try { VectorAuxReader::open(dir, copied, false); } catch (const std::runtime_error& e) {
+      ok = false;
+      lastError = e.what();
+      EXPECT_NE(lastError.find("VectorAuxReader"), std::string::npos) << lastError;
+    }
+    dir.deleteFile("corrupt-packed");
+    return ok;
+  };
+  ASSERT_TRUE(opens(payload)) << lastError;
+  auto badFooter = [&](auto change) {
+    auto bytes = payload;
+    auto bad = footer;
+    change(bad);
+    std::memcpy(bytes.data() + bytes.size() - sizeof(bad), &bad, sizeof(bad));
+    return bytes;
+  };
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.version--; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.packBlock = 0; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.packBlock = 16; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.codesBytes -= bad.packBlock * bad.codeSize; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.codesBytes = INT64_MAX; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.codesBytes = -1; })));
+  EXPECT_FALSE(opens(badFooter([](auto& bad) { bad.codeSize = INT64_MAX; })));
+  auto badSizes = [&](int64_t a, int64_t b) {
+    auto bytes = payload;
+    std::memcpy(bytes.data() + footer.sizesOffset(), &a, sizeof(a));
+    std::memcpy(bytes.data() + footer.sizesOffset() + sizeof(a), &b, sizeof(b));
+    return bytes;
+  };
+  ASSERT_EQ(footer.nlist, 2);
+  int64_t sizes[2];
+  std::memcpy(sizes, payload.data() + footer.sizesOffset(), sizeof(sizes));
+  EXPECT_TRUE(opens(badSizes(sizes[0], sizes[1])));
+  EXPECT_FALSE(opens(badSizes(-1, sizes[1] + sizes[0] + 1)));
+  EXPECT_FALSE(opens(badSizes(INT64_MAX, sizes[1])));
+  // The same ntotal in sizes that claim fewer blocks than the section holds.
+  if (VectorAuxListsFooter::packedBlocks(footer.ntotal)
+      != VectorAuxListsFooter::packedBlocks(sizes[0]) + VectorAuxListsFooter::packedBlocks(sizes[1])) {
+    EXPECT_FALSE(opens(badSizes(footer.ntotal, 0)));
+  }
+  // A flat-layout reader must not accept a packed file, nor the reverse.
+  auto meta = VectorAuxMeta::fromBytes(std::string_view((const char*)original.opaque_meta.data(), original.opaque_meta.size()), original.name);
+  EXPECT_TRUE(meta.engine == VectorAuxMeta::ENGINE_IVFPQ4FS);
+  meta.engine = VectorAuxMeta::ENGINE_IVFPQ;
+  std::string metaBytes = meta.toBytes();
+  auto flat = original;
+  flat.opaque_meta = std::as_bytes(std::span(metaBytes.data(), metaBytes.size()));
+  EXPECT_THROW(VectorAuxReader::open(dir, flat, false), std::runtime_error);
+}
+
 // mmap residency: only the IVF header (coarse quantizer + PQ codebooks) is
 // deserialized into RAM; the list payloads are served zero-copy from the aux
 // file's memory view through MmapInvertedLists.  Guards against silently

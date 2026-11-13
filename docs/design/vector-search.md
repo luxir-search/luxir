@@ -354,7 +354,7 @@ the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
 exposes a mmap view, validates finite, non-negative amplitudes once at open and
 exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 3 validate the component count and file size;
+version 4 validate the component count and file size;
 older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
@@ -373,6 +373,15 @@ but the intervals remain empirical: for IP, float cancellation in FAISS's
 not arithmetic-exact. The extra-bit factors have no such defect; in multi-bit
 search a bad 1-bit factor causes false gate rejections (a lost neighbor) or
 wasted extra-bit work, not false witnesses.
+
+The codes section starts on a 64-byte file offset and its length is recorded in
+the footer. `pq4` overlays store each list as whole blocks of 32 codes for the
+fast-scan kernels (`32 * ceil(M / 2)` bytes per block, unused lanes zero), which
+the footer's `packBlock` marks. Opening one bounds each list's block count
+against what remains of the section before anything is multiplied or summed,
+and the lists must claim the section exactly. `MmapInvertedLists::get_codes`
+throws on packed lists, so a FAISS flat scanner reaching one fails instead of
+reading blocks as flat codes; the fast-scan path uses `packedListBlocks`.
 
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
@@ -475,7 +484,12 @@ setup scales with dimensions. PQ list setup is zero for inner product and
 cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
 precomputed table; without it, FAISS computes a full distance table per list,
 priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
-the exact-dimension cost. Interval terminal reads have a shared floor of
+the exact-dimension cost. `pq4` differs from both: the kernel scores whole
+256-code chunks, so it pays per physical code and per code times sub-quantizer,
+and the filter reduces that only when a chunk holds no eligible code. Its
+selector test is a direct, branchless probe, with neither the PQ virtual-call
+term nor a misprediction term. It pays a small cost per list and one 16-entry
+table per query and segment. Interval terminal reads have a shared floor of
 `min(k, examined interval vectors)`, with dimensions scaled by the
 read-weighted average. Every query pays a request constant, and any query that
 runs IVF pays a second one. Units are nanoseconds divided by the cost of one exact

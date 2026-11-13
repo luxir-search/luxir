@@ -50,10 +50,10 @@ struct VectorAuxMeta {
   int32_t dims = 0;
   int32_t metric = 0;       // raw luxir::api::VectorMetric value
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
-  int32_t engine = 0;       // ENGINE_IVFPQ or ENGINE_IVFRABITQ: the overlay's codec
+  int32_t engine = 0;       // ENGINE_*: the overlay's codec
   int32_t nlist = 0;
-  int32_t pqM = 0;          // ENGINE_IVFPQ only
-  int32_t pqBits = 0;       // ENGINE_IVFPQ only
+  int32_t pqM = 0;          // ENGINE_IVFPQ, ENGINE_IVFPQ4FS only
+  int32_t pqBits = 0;       // ENGINE_IVFPQ, ENGINE_IVFPQ4FS only (4 for the latter)
   int32_t rabitqBits = 0;   // ENGINE_IVFRABITQ only: bits per dimension
 
   int32_t rotationKind = 0;  // ENGINE_IVFRABITQ only: VectorRotation kind
@@ -63,6 +63,9 @@ struct VectorAuxMeta {
   static constexpr int32_t ENGINE_IVFPQ = 1;
   // Bare IndexIVFRaBitQ in rotated space; queries use the recorded transform.
   static constexpr int32_t ENGINE_IVFRABITQ = 2;
+  // A bare 4-bit IndexIVFPQ header whose list codes are block-packed for the
+  // SIMD fast-scan kernels (see VectorAuxListsFooter). Inner product and cosine.
+  static constexpr int32_t ENGINE_IVFPQ4FS = 3;
 
   std::string toBytes() const {
     return std::string((const char*)this, sizeof(VectorAuxMeta));
@@ -82,7 +85,7 @@ struct VectorAuxMeta {
         "VectorAuxMeta: aux '{}' has unsupported metadata version {}",
         auxName, (int32_t)meta.version));
     }
-    if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ) {
+    if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ && meta.engine != ENGINE_IVFPQ4FS) {
       // (int32_t) copies: can't bind a reference to a packed field.
       throw std::runtime_error(std::format(
         "VectorAuxMeta: aux '{}' has unsupported vector engine {}",
@@ -137,7 +140,10 @@ internVectorRotation(int32_t kind, int32_t dims, uint64_t seed) {
 ///   [0, H)    FAISS index blob (faiss::write_index with lists swapped empty)
 ///   [H8, S)   per-list sizes, int64[nlist]           (H8 = H padded to 8)
 ///   [S, I)    ids, int64[ntotal], concatenated in list order (8-aligned)
-///   [I, C)    codes, uint8[ntotal * codeSize], same order
+///   [I64, C)  codes (I64 = I padded to 64), same order, codesBytes long. Flat
+///             lists: uint8[ntotal * codeSize]. Packed lists (packBlock != 0,
+///             ENGINE_IVFPQ4FS): each list as whole blocks of packBlock codes,
+///             packBlock * codeSize bytes each, unused lanes zero.
 ///   [C8, A)   amplitudes, float[ntotal * amplitudeCount], in list order
 ///   [.., end) this footer (8-aligned)
 ///
@@ -149,23 +155,31 @@ struct VectorAuxListsFooter {
   int64_t nlist = 0;
   int64_t codeSize = 0;
   int64_t ntotal = 0;
+  int64_t codesBytes = 0;
   int32_t amplitudeCount = 0;  // PQ: 0; RaBitQ 1-bit: sigma1; multi-bit: sigmaB
-  int32_t reserved = 0;
+  int32_t packBlock = 0;       // Flat lists: 0; packed lists: PACK_BLOCK
   int32_t version = 0;
   int32_t magic = 0;
 
   static constexpr int32_t MAGIC = 0x4C495853;  // "SXIL"
-  static constexpr int32_t VERSION = 3;
+  static constexpr int32_t VERSION = 4;
+  static constexpr int32_t PACK_BLOCK = 32;  // Codes per fast-scan block.
 
   static constexpr size_t align8(size_t n) noexcept { return (n + 7) & ~(size_t)7; }
+  static constexpr size_t align64(size_t n) noexcept { return (n + 63) & ~(size_t)63; }
+
+  /// Sub-quantizers the fast-scan kernels run over: M rounded up to even. An odd
+  /// M's last row is zero. codeSize = nsq / 2, so a block is 32 * codeSize bytes.
+  static constexpr size_t packedNsq(size_t m) noexcept { return (m + 1) & ~(size_t)1; }
+  static constexpr size_t packedBlocks(size_t codes) noexcept {
+    return (codes + PACK_BLOCK - 1) / PACK_BLOCK;
+  }
 
   /// Section offsets within the file, derived from the footer fields.
   size_t sizesOffset() const noexcept { return align8((size_t)faissHeaderBytes); }
   size_t idsOffset() const noexcept { return sizesOffset() + (size_t)nlist * 8; }
-  size_t codesOffset() const noexcept { return idsOffset() + (size_t)ntotal * 8; }
-  size_t amplitudesOffset() const noexcept {
-    return align8(codesOffset() + (uint64_t)ntotal * (uint64_t)codeSize);
-  }
+  size_t codesOffset() const noexcept { return align64(idsOffset() + (size_t)ntotal * 8); }
+  size_t amplitudesOffset() const noexcept { return align8(codesOffset() + (uint64_t)codesBytes); }
   size_t expectedFileBytes() const noexcept {
     // Unsigned multiply: ntotal/codeSize are file-controlled (read from the
     // footer before validation), so a corrupt footer could overflow a signed
@@ -200,14 +214,23 @@ struct VectorAuxListsFooter {
       offset += count * width;
       return true;
     };
-    auto align = [&]() { return section((8 - offset % 8) % 8, 1); };
+    auto align = [&](size_t to = 8) { return section((to - offset % to) % to, 1); };
+    // Bounded by the section just consumed, so the products cannot overflow.
+    // Per-list block counts are checked against codesBytes when the reader opens.
+    auto codesMatch = [&]() {
+      uint64_t bytes = (uint64_t)f.codesBytes, codeSize = (uint64_t)f.codeSize;
+      if ((uint64_t)f.ntotal > bytes / codeSize) return false;
+      if (f.packBlock == 0) return (uint64_t)f.ntotal * codeSize == bytes;
+      return codeSize <= bytes / PACK_BLOCK && bytes % (codeSize * PACK_BLOCK) == 0;
+    };
     // Consume the available bytes before multiplying or adding file-controlled
     // values. This also rejects overlapping sections and alignment overflow.
     if (f.faissHeaderBytes <= 0 || f.nlist <= 0 || f.codeSize <= 0 || f.ntotal < 0
-        || f.amplitudeCount < 0 || f.amplitudeCount > 1 || f.reserved != 0
+        || f.codesBytes < 0 || f.amplitudeCount < 0 || f.amplitudeCount > 1
+        || (f.packBlock != 0 && (f.packBlock != PACK_BLOCK || f.amplitudeCount != 0 || f.ntotal == 0))
         || !section(f.faissHeaderBytes, 1) || !align()
         || !section(f.nlist, 8) || !section(f.ntotal, 8)
-        || !section(f.ntotal, f.codeSize) || !align()
+        || !align(64) || !section(f.codesBytes, 1) || !codesMatch() || !align()
         || !section(f.ntotal, (uint32_t)f.amplitudeCount * sizeof(float)) || !align()
         || offset != payload) {
       throw std::runtime_error(std::format(
@@ -218,7 +241,7 @@ struct VectorAuxListsFooter {
   }
 } LUXIR_UNALIGNED_END;
 
-static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 4 * sizeof(int32_t),
+static_assert(sizeof(VectorAuxListsFooter) == 5 * sizeof(int64_t) + 4 * sizeof(int32_t),
               "VectorAuxListsFooter layout is an on-disk contract");
 
 // Relative to the factors following the sign bytes. The derived FAISS type
@@ -247,16 +270,31 @@ class MmapInvertedLists final : public faiss::ReadOnlyInvertedLists {
   const faiss::idx_t* ids;      // all lists' ids, concatenated in list order
   const uint8_t* codes;         // all lists' codes, same order
   std::vector<size_t> offsets;  // prefix sums of list sizes, nlist+1 entries
+  // Packed lists only: each list's byte offset into codes, nlist+1 entries.
+  std::vector<size_t> packedOffsets;
 
 public:
+  /// List sizes are already validated (VectorAuxReader's constructor).
   MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
-                    const faiss::idx_t* ids, const uint8_t* codes)
+                    const faiss::idx_t* ids, const uint8_t* codes, bool packed = false)
     : faiss::ReadOnlyInvertedLists(nlist, codeSize), ids(ids), codes(codes) {
     offsets.resize(nlist + 1);
     offsets[0] = 0;
+    if (packed) packedOffsets.assign(nlist + 1, 0);
     for (size_t i = 0; i < nlist; i++) {
       offsets[i + 1] = offsets[i] + (size_t)listSizes[i];
+      if (packed) {
+        packedOffsets[i + 1] = packedOffsets[i] + VectorAuxListsFooter::packedBlocks((size_t)listSizes[i])
+          * VectorAuxListsFooter::PACK_BLOCK * codeSize;
+      }
     }
+  }
+
+  bool isPacked() const noexcept { return !packedOffsets.empty(); }
+  /// The blocks of one packed list, for the fast-scan kernels.
+  const uint8_t* packedListBlocks(size_t listNo) const noexcept {
+    assert(isPacked());
+    return codes + packedOffsets[listNo];
   }
 
   size_t totalSize() const noexcept { return offsets.back(); }
@@ -265,7 +303,10 @@ public:
   size_t list_size(size_t listNo) const override {
     return offsets[listNo + 1] - offsets[listNo];
   }
+  /// Flat codes for FAISS's scanners. A packed list has none: those scanners
+  /// would read the blocks as flat codes and return garbage scores.
   const uint8_t* get_codes(size_t listNo) const override {
+    if (isPacked()) throw std::logic_error("MmapInvertedLists: flat access to a packed list");
     return codes + offsets[listNo] * code_size;
   }
   const faiss::idx_t* get_ids(size_t listNo) const override {
@@ -324,15 +365,31 @@ public:
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' amplitude layout does not match codec", this->name));
     }
+    if (footer.packBlock != (isPq4() ? VectorAuxListsFooter::PACK_BLOCK : 0)) {
+      throw std::runtime_error(std::format(
+        "VectorAuxReader: aux '{}' code layout does not match codec", this->name));
+    }
     const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
     int64_t remaining = footer.ntotal;
+    // Blocks of the codes section the lists have yet to claim. Each list is
+    // bounded by the remainder before anything is multiplied or summed.
+    uint64_t blocksLeft = (uint64_t)footer.codesBytes
+        / (std::max<uint64_t>(1, (uint64_t)footer.packBlock) * (uint64_t)footer.codeSize);
     for (int64_t i = 0; i < footer.nlist; i++) {
       if (sizes[i] < 0 || sizes[i] > remaining) {
         throw std::runtime_error("VectorAuxReader: invalid list size");
       }
       remaining -= sizes[i];
+      if (footer.packBlock != 0) {
+        uint64_t blocks = VectorAuxListsFooter::packedBlocks((uint64_t)sizes[i]);
+        if (blocks > blocksLeft) throw std::runtime_error("VectorAuxReader: invalid packed list size");
+        blocksLeft -= blocks;
+      }
     }
     if (remaining != 0) throw std::runtime_error("VectorAuxReader: list sizes do not match ntotal");
+    if (footer.packBlock != 0 && blocksLeft != 0) {
+      throw std::runtime_error("VectorAuxReader: packed list sizes do not match the codes section");
+    }
     // Validate once on open; list scans use unchecked, sequential float loads.
     if (isRaBitQ()) {
       const float* values = (const float*)(base + footer.amplitudesOffset());
@@ -354,6 +411,7 @@ public:
   }
   int32_t getEngine() const noexcept { return meta.engine; }
   bool isRaBitQ() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_IVFRABITQ; }
+  bool isPq4() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_IVFPQ4FS; }
   int32_t getNList() const noexcept { return meta.nlist; }
   int32_t getPqM() const noexcept { return meta.pqM; }
   int32_t getPqBits() const noexcept { return meta.pqBits; }
@@ -412,6 +470,16 @@ public:
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' header is not an IVF index", name));
       }
+      if (isPq4()) {
+        // Pq4QueryTable scores residual inner products with 16-entry tables.
+        auto* ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(ivf);
+        if (ivfpq == nullptr || ivfpq->pq.nbits != 4 || ivfpq->pq.M != (size_t)meta.pqM
+            || !ivfpq->by_residual || ivf->metric_type != faiss::METRIC_INNER_PRODUCT
+            || VectorAuxListsFooter::packedNsq(ivfpq->pq.M) != 2 * ivf->code_size) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: aux '{}' header is not a residual 4-bit inner-product IVF+PQ index", name));
+        }
+      }
       if (ivf->nlist != (size_t)meta.nlist) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: nlist mismatch for aux '{}': index has {}, opaque_meta says {}",
@@ -441,7 +509,7 @@ public:
       const uint8_t* listCodes = (const uint8_t*)(base + footer.codesOffset());
       assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0);
       auto lists = std::make_unique<MmapInvertedLists>(
-        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
+        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes, isPq4());
       if ((int64_t)lists->totalSize() != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' list sizes sum to {}, expected ntotal {}",
