@@ -586,10 +586,14 @@ public:
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
   // A supplied claim was established by the caller after checking its catalog.
+  // `opened`, with a claim, is the manifest the caller loaded under that claim
+  // from this directory: the writer uses it (and any listing it holds) rather
+  // than reading the root again.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {});
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {},
+                       Manifest* opened = nullptr);
   ~IndexWriter();
   void close();
 

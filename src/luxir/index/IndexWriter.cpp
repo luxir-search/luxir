@@ -149,16 +149,20 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed)
+                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed,
+                         Manifest* opened)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
+  if (opened && !claimed) throw std::invalid_argument("a supplied manifest needs the claim it was loaded under");
   writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
   writerEpoch = writerState.value.epoch;
-  auto manifest = Manifest::load(dir, &writerState);
+  Manifest loaded;
+  if (!opened) loaded = Manifest::load(dir, &writerState);
+  Manifest& manifest = opened ? *opened : loaded;
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
     throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
   }

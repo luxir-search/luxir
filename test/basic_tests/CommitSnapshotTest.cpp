@@ -12,6 +12,7 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/DelegatingDirectory.h"
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -411,6 +412,57 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
   EXPECT_THROW(IndexWriter{recovered}, std::runtime_error);
   EXPECT_EQ(1, IndexReader(writer->dir).liveDocs());
   for (const auto& desc : newest->files) EXPECT_NE(nullptr, writer->dir.openFile(desc.name));
+}
+
+namespace {
+// Counts listings; everything else goes to the wrapped directory.
+class ListCountingDirectory : public DelegatingDirectory {
+public:
+  std::atomic<int> lists{0};
+  using DelegatingDirectory::DelegatingDirectory;
+  void listFiles(std::vector<FileInfo>& target) override {
+    lists++;
+    delegate->listFiles(target);
+  }
+};
+}
+
+// STATE alone selects the root, so a healthy tip loads without a listing; a
+// torn tip still falls back to the newest intact generation the listing shows.
+TEST_F(CommitSnapshotTest, loadListsOnlyToFallBack) {
+  LuxirNode node;
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto previous = writer->snapshots.snapshot();
+  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  auto newest = writer->snapshots.snapshot();
+  auto& catalog = node.collections().catalog();
+  ListCountingDirectory dir(catalog.directory(*catalog.current("main")));
+
+  auto healthy = Manifest::load(dir);
+  EXPECT_EQ(0, dir.lists.load()) << "a healthy tip was loaded with a listing";
+  EXPECT_EQ(newest->id.index_gen, healthy.generation);
+  EXPECT_EQ(healthy.generation, healthy.highestGeneration);
+  EXPECT_FALSE(healthy.listed);
+  // Asked for, the listing is taken once and kept.
+  auto names = healthy.listingOf(dir).size();
+  EXPECT_GT(names, 0u);
+  EXPECT_EQ(names, healthy.listingOf(dir).size());
+  EXPECT_EQ(1, dir.lists.load());
+
+  writer->close();
+  dir.publishFile(previous->manifestName(), Manifest::withFooter(*previous->bytes), Directory::PublishMode::REPLACE);
+  dir.publishFile(newest->manifestName(), std::as_bytes(std::span("torn", 4)), Directory::PublishMode::REPLACE);
+  dir.lists = 0;
+  auto fallback = Manifest::load(dir);
+  EXPECT_EQ(1, dir.lists.load()) << "the fallback did not list exactly once";
+  EXPECT_TRUE(fallback.listed);
+  EXPECT_EQ(previous->id.index_gen, fallback.generation);
+  EXPECT_EQ(newest->id.index_gen, fallback.highestGeneration);
+  fallback.listingOf(dir);
+  EXPECT_EQ(1, dir.lists.load()) << "the fallback's listing was not reused";
 }
 
 TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {

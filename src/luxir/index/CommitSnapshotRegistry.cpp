@@ -122,14 +122,16 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   }
 }
 
-void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest, uint64_t writerEpoch) {
+void CommitSnapshotRegistry::sweepOrphans(Manifest& manifest, uint64_t writerEpoch) {
   if (!manifest.bytes) return;
   if (manifest.generation != manifest.highestGeneration) {
     LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
               manifest.generation, manifest.highestGeneration);
     return;
   }
-  auto listing = manifest.listing;
+  // The open's listing when it took one already. Older-epoch files cannot
+  // appear after the claim, so an earlier listing finds the same orphans.
+  auto listing = manifest.listingOf(dir);
   std::erase_if(listing, [&](const auto& file) {
     auto epoch = Manifest::fileEpoch(file.name);
     return !epoch || epoch >= writerEpoch;

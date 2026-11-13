@@ -20,6 +20,10 @@ void CorruptionMarker::write(Directory& dir, std::span<const std::string> files,
 std::vector<std::string> CorruptionMarker::read(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
+  return read(dir, listing);
+}
+
+std::vector<std::string> CorruptionMarker::read(Directory& dir, std::span<const Directory::FileInfo> listing) {
   std::set<std::string> names;
   for (const auto& entry : listing) {
     if (!isMarker(entry.name)) continue;
@@ -47,6 +51,10 @@ bool CorruptionMarker::present(Directory& dir) {
 void CorruptionMarker::clear(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
+  clear(dir, listing);
+}
+
+void CorruptionMarker::clear(Directory& dir, std::span<const Directory::FileInfo> listing) {
   std::vector<std::string> names;
   for (const auto& entry : listing) if (isMarker(entry.name)) names.push_back(entry.name);
   dir.deleteDurably(names);
