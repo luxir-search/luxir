@@ -33,6 +33,8 @@ enum class ValueNodeKind : uint8_t {
   SCORE,
   DOCID,
   FUNCTION,
+  // A let/fold variable, read from the bound program's slot `slot`.
+  LOCAL,
 };
 
 struct ValueNode {
@@ -48,9 +50,16 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
+  // let/fold: the slot of the bound variable (let) or accumulator (fold), and
+  // the loop counter's slot. LOCAL nodes read `slot`.
+  uint32_t slot = 0;
+  uint32_t counterSlot = 0;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
+  // A second integer parameter for functions that keep one (a box's longitudes,
+  // a date's unit); prepare() sets it.
+  int64_t intValue2 = 0;
   double doubleValue = 0.0;
 };
 
@@ -68,6 +77,8 @@ public:
   std::pmr::vector<double> doubleArrays;
   std::optional<ValueResult> constantScalar;
   uint32_t rootNode = 0;
+  // Slots for let/fold variables; each bound program allocates this many.
+  uint32_t localCount = 0;
   bool needsScore = false;
 
   explicit ValueProgram(google::protobuf::Arena& arena)
@@ -155,6 +166,8 @@ public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
   std::span<BoundValueNode> nodes;
+  // Values of the let/fold variables while their scope is being evaluated.
+  std::span<ValueResult> locals;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment, ValueFieldInfos fields);

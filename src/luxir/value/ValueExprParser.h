@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
+#include <string>
 #include <stdexcept>
 #include <string_view>
 #include <variant>
@@ -103,16 +106,39 @@ class ValueExprParser {
 
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
 
+  // A let variable or a fold accumulator or counter, visible while the body that
+  // declares it is parsed.
+  struct Binding {
+    enum class Kind : uint8_t { LET, ACCUMULATOR, COUNTER };
+    std::string_view name;
+    uint32_t slot = 0;
+    ValueType type = ValueType::INT64;
+    ValueNature nature = ValueNature::NUMBER;
+    Kind kind = Kind::LET;
+    uint32_t init = 0;  // LET: the node holding the value
+    int64_t steps = 0;  // COUNTER: the number of steps of its loop
+  };
+
   const ValueExprOptions& opts;
   google::protobuf::Arena& arena;
   Cursor* cur = nullptr;
   ValueProgram* program = nullptr;
   ValueConstantAnalysis constants;
+  std::vector<Binding> bindings;
+  // The product of the step counts of the loops around the body being parsed.
+  int64_t loopWork = 1;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
 public:
   using Node = uint32_t;
+
+  // fold() runs a fixed number of steps: at most MAX_LOOP_STEPS for one loop and
+  // MAX_LOOP_WORK in total for loops nested in each other, so the cost of a
+  // document's evaluation is bounded by the size of the expression.
+  static constexpr int64_t MAX_LOOP_STEPS = 256;
+  static constexpr int64_t MAX_LOOP_WORK = 4096;
+  static constexpr uint32_t MAX_LOCALS = 64;
 
   ValueExprParser(const ValueExprOptions& opts, google::protobuf::Arena& arena)
       : opts(opts), arena(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {}
@@ -134,12 +160,14 @@ public:
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
     constants.clear();
+    bindings.clear();
+    loopWork = 1;
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
     if (program->root().nature == ValueNature::GEO_POINT) {
-      fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance()");
+      fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance(), or geo_lat() and geo_lon()");
     }
     program->constantScalar = constants.scalar(program->rootNode);
     return program;
@@ -190,7 +218,7 @@ private:
     std::string_view name = value::lex::scanIdentifier(*cur);
     if (name.empty()) fail(pos, "expected a number, numeric column, variable, score, or function");
     if (cur->peek() == '(') return parseCall(grammar, name, pos);
-    if (name == "score" || (opts.sortIntrinsics && name == "_score_")) {
+    if (name == "score" || name == "_score" || (opts.sortIntrinsics && name == "_score_")) {
       ValueNode node;
       node.kind = ValueNodeKind::SCORE;
       node.type = ValueType::DOUBLE;
@@ -207,7 +235,18 @@ private:
       node.text = program->copyString(name);
       return append(node);
     }
-    return parseColumn(name, pos);
+    if (const Binding* binding = findBinding(name)) return appendLocal(*binding, pos);
+    auto failAt = [&](size_t at, std::string_view message) { fail(at, message); };
+    if (name == "params") {
+      std::string_view variable =
+          value::lex::scanParamsAccessor(*cur, program->resource, failAt);
+      if (!variable.empty()) return parseVariableNamed(variable, pos);
+    }
+    if (name == "doc" && cur->peek() == '[') {
+      std::string_view field = value::lex::scanBracketedName(*cur, program->resource, failAt);
+      return parseAccessors(parseColumn(field, pos));
+    }
+    return parseAccessors(parseColumn(name, pos));
   }
 
   uint32_t parseNumber() {
@@ -233,6 +272,11 @@ private:
     size_t pos = cur->position();
     std::string_view name = value::lex::scanVariable(*cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
+    return parseVariableNamed(name, pos);
+  }
+
+  // $name, params.name and params['name'] are the same variable.
+  uint32_t parseVariableNamed(std::string_view name, size_t pos) {
     const auto* view = opts.vars.find(name);
     if (view == nullptr) {
       fail(pos, fmt::format("undefined variable ${}", name));
@@ -334,6 +378,8 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
+    if (name == "let") return parseLet(grammar, pos);
+    if (name == "fold") return parseFold(grammar, pos);
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -368,7 +414,7 @@ private:
           *cur, program->resource,
           [&](size_t at, std::string_view message) { fail(at, message); });
     });
-    return parseColumn(name, pos);
+    return parseAccessors(parseColumn(name, pos));
   }
 
   void rewriteDecimalComparison(const ValueFunction*& function,
@@ -478,6 +524,259 @@ private:
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
+    return append(node);
+  }
+
+  // ---- accessors on a column: doc['f'].value, loc.lat, ts.date.year ----------
+
+  uint32_t parseAccessors(uint32_t node) {
+    for (;;) {
+      if (cur->peek() != '.' || !value::lex::identifierStart(cur->peekAt(1))) return node;
+      size_t pos = cur->position();
+      cur->advance();
+      std::string_view name = value::lex::scanIdentifier(*cur);
+      if (cur->peek() == '(' && cur->peekAt(1) == ')') cur->advance(2);
+      node = applyAccessor(node, name, pos);
+    }
+  }
+
+  uint32_t call(std::string_view function, size_t pos, std::initializer_list<uint32_t> args) {
+    std::array<uint32_t, VALUE_MAX_ARITY> nodes{};
+    std::copy(args.begin(), args.end(), nodes.begin());
+    return makeFunction(function, pos, std::span<const uint32_t>(nodes.data(), args.size()));
+  }
+
+  uint32_t appendInteger(int64_t value, size_t pos) {
+    ValueNode node;
+    node.kind = ValueNodeKind::CONSTANT;
+    node.type = ValueType::INT64;
+    node.intValue = value;
+    node.sourcePos = pos;
+    node.text = program->copyString(std::to_string(value));
+    return append(node);
+  }
+
+  // The Lucene expressions and Painless spellings of column access. A getter
+  // prefix is ignored (getYear() is year), and .date is a no-op step, so
+  // doc['ts'].date.getYear(), doc['ts'].date.year and ts.year are the same.
+  uint32_t applyAccessor(uint32_t node, std::string_view spelling, size_t pos) {
+    std::string key(spelling);
+    if (key.size() > 3 && key.starts_with("get") && key[3] >= 'A' && key[3] <= 'Z') {
+      key.erase(0, 3);
+      key[0] = (char)(key[0] - 'A' + 'a');
+    }
+    bool array = valueArray(program->nodes[node].type);
+    if (key == "value" || key == "date") return node;
+    if (key == "lat") return call("geo_lat", pos, {node});
+    if (key == "lon") return call("geo_lon", pos, {node});
+    if (key == "size" || key == "length") return call("count", pos, {node});
+    if (key == "empty") {
+      uint32_t count = call("count", pos, {node});
+      return call("eq", pos, {count, appendInteger(0, pos)});
+    }
+    if (key == "min" || key == "max" || key == "avg" || key == "sum") {
+      return array ? call(key, pos, {node}) : node;
+    }
+    static constexpr std::pair<std::string_view, std::string_view> DATE_PARTS[] = {
+        {"year", "year"}, {"monthOfYear", "month"}, {"month", "month"},
+        {"dayOfMonth", "day_of_month"}, {"dayOfWeek", "day_of_week"},
+        {"dayOfYear", "day_of_year"}, {"hourOfDay", "hour"}, {"hour", "hour"},
+        {"minuteOfHour", "minute"}, {"minute", "minute"}, {"secondOfMinute", "second"},
+        {"second", "second"}, {"millisOfSecond", "millis"}, {"millis", "millis"},
+        {"millisOfDay", "millis_of_day"}, {"weekOfWeekyear", "week_of_year"},
+        {"weekOfYear", "week_of_year"}, {"quarter", "quarter"},
+    };
+    for (const auto& [accessor, function] : DATE_PARTS) {
+      if (key == accessor) return call(function, pos, {node});
+    }
+    fail(pos, fmt::format(
+        "unknown accessor '.{}'; use .value, .lat, .lon, .size(), .length, .empty, .min, .max, "
+        ".avg, .sum, or a date part such as .date.year", spelling));
+  }
+
+  // ---- let and fold ---------------------------------------------------------
+
+  const Binding* findBinding(std::string_view name) const {
+    for (auto it = bindings.rbegin(); it != bindings.rend(); ++it) {
+      if (it->name == name) return &*it;
+    }
+    return nullptr;
+  }
+
+  uint32_t appendLocal(const Binding& binding, size_t pos) {
+    ValueNode node;
+    node.kind = ValueNodeKind::LOCAL;
+    node.type = binding.type;
+    node.nature = binding.nature;
+    node.slot = binding.slot;
+    node.sourcePos = pos;
+    node.text = program->copyString(binding.name);
+    // propagateBounds reads these: a let variable has its value's bounds and a
+    // counter the range of its loop.
+    if (binding.kind == Binding::Kind::LET) {
+      node.childCount = 1;
+      node.children[0] = binding.init;
+    } else if (binding.kind == Binding::Kind::COUNTER) {
+      node.arraySize = 1;
+      node.intValue = binding.steps;
+    }
+    return append(node);
+  }
+
+  std::string_view parseBindingName() {
+    cur->skipWs();
+    size_t pos = cur->position();
+    std::string_view name = value::lex::scanIdentifier(*cur);
+    if (name.empty()) fail(pos, "expected a variable name");
+    for (std::string_view reserved : {"score", "_score", "_score_", "_docid_", "doc", "params", "col"}) {
+      if (name == reserved) fail(pos, fmt::format("'{}' cannot be used as a variable name", name));
+    }
+    if (findBinding(name) != nullptr) fail(pos, fmt::format("variable '{}' is already defined", name));
+    return program->copyString(name);
+  }
+
+  uint32_t allocateSlot(size_t pos) {
+    if (program->localCount >= MAX_LOCALS) {
+      fail(pos, fmt::format("an expression may declare at most {} variables", MAX_LOCALS));
+    }
+    return program->localCount++;
+  }
+
+  // A decimal or boolean value is a number to the rest of the expression.
+  uint32_t numericScalar(uint32_t node, std::string_view what) {
+    const ValueNode& value = program->nodes[node];
+    if (valueArray(value.type)) {
+      fail(value.sourcePos, fmt::format(
+          "{} must be a scalar; reduce an array first, for example with min() or max()", what));
+    }
+    if (value.type == ValueType::COLUMN_ONLY || value.nature == ValueNature::IP) {
+      fail(value.sourcePos, fmt::format("{} must be numeric", what));
+    }
+    if (valueDecimal(value.nature) || value.nature == ValueNature::BOOLEAN) {
+      size_t start = program->nodes.size();
+      node = program->numericNode(node);
+      for (size_t n = start; n < program->nodes.size(); n++) constants.append(program->nodes[n]);
+    }
+    return node;
+  }
+
+  template <class Grammar>
+  uint32_t parseLet(Grammar& grammar, size_t pos) {
+    std::string_view name;
+    uint32_t value = 0;
+    uint32_t body = 0;
+    uint32_t slot = 0;
+    grammar.parseArguments("let", pos, 3, 3, [&](uint8_t argument) {
+      if (argument == 0) {
+        name = parseBindingName();
+      } else if (argument == 1) {
+        value = numericScalar(grammar.parseExpression(), "the value of let()");
+      } else {
+        slot = allocateSlot(pos);
+        const ValueNode& bound = program->nodes[value];
+        bindings.push_back({name, slot, bound.type, bound.nature, Binding::Kind::LET, value, 0});
+        body = numericScalar(grammar.parseExpression(), "the body of let()");
+        bindings.pop_back();
+      }
+    });
+    ValueNode node;
+    node.kind = ValueNodeKind::FUNCTION;
+    node.function = ValueFunctionRegistry::find("let");
+    node.children[0] = value;
+    node.children[1] = body;
+    node.childCount = 2;
+    node.type = program->nodes[body].type;
+    node.nature = program->nodes[body].nature;
+    node.slot = slot;
+    node.sourcePos = pos;
+    node.text = node.function->name;
+    return append(node);
+  }
+
+  template <class Grammar>
+  uint32_t parseFold(Grammar& grammar, size_t pos) {
+    std::string_view accumulator;
+    std::string_view counter;
+    uint32_t init = 0;
+    uint32_t count = 0;
+    uint32_t body = 0;
+    uint32_t accumulatorSlot = 0;
+    uint32_t counterSlot = 0;
+    ValueType type = ValueType::INT64;
+    grammar.parseArguments("fold", pos, 5, 5, [&](uint8_t argument) {
+      switch (argument) {
+        case 0:
+          accumulator = parseBindingName();
+          break;
+        case 1: {
+          init = numericScalar(grammar.parseExpression(), "the initial value of fold()");
+          const ValueNode& value = program->nodes[init];
+          if (value.nature != ValueNature::NUMBER) {
+            fail(value.sourcePos, "the initial value of fold() must be a number");
+          }
+          type = value.type;
+          break;
+        }
+        case 2:
+          counter = parseBindingName();
+          if (counter == accumulator) {
+            fail(cur->position(), "the loop counter and the accumulator need different names");
+          }
+          break;
+        case 3: {
+          size_t at = cur->position();
+          count = grammar.parseExpression();
+          if (!foldConstant(count) || program->nodes[count].type != ValueType::INT64) {
+            fail(at, "the number of steps of fold() must be an integer constant");
+          }
+          break;
+        }
+        default: {
+          int64_t steps = program->nodes[count].intValue;
+          if (steps < 0 || steps > MAX_LOOP_STEPS) {
+            fail(pos, fmt::format("fold() runs from 0 to {} steps, not {}", MAX_LOOP_STEPS, steps));
+          }
+          int64_t outer = loopWork;
+          if (steps > 0 && outer > MAX_LOOP_WORK / steps) {
+            fail(pos, fmt::format("nested fold() loops may run at most {} steps in total",
+                                  MAX_LOOP_WORK));
+          }
+          accumulatorSlot = allocateSlot(pos);
+          counterSlot = allocateSlot(pos);
+          bindings.push_back({accumulator, accumulatorSlot, type, ValueNature::NUMBER,
+                              Binding::Kind::ACCUMULATOR, 0, 0});
+          bindings.push_back({counter, counterSlot, ValueType::INT64, ValueNature::NUMBER,
+                              Binding::Kind::COUNTER, 0, steps});
+          loopWork = outer * std::max<int64_t>(steps, 1);
+          body = numericScalar(grammar.parseExpression(), "the body of fold()");
+          loopWork = outer;
+          bindings.pop_back();
+          bindings.pop_back();
+          const ValueNode& result = program->nodes[body];
+          if (result.nature != ValueNature::NUMBER) {
+            fail(result.sourcePos, "the body of fold() must be a number");
+          }
+          if (type == ValueType::INT64 && result.type == ValueType::DOUBLE) {
+            fail(result.sourcePos,
+                 "the body of fold() is a double but the accumulator starts as an integer; "
+                 "start it from a double, for example 0.0");
+          }
+        }
+      }
+    });
+    ValueNode node;
+    node.kind = ValueNodeKind::FUNCTION;
+    node.function = ValueFunctionRegistry::find("fold");
+    node.children[0] = init;
+    node.children[1] = body;
+    node.children[2] = count;
+    node.childCount = 3;
+    node.type = type;
+    node.nature = ValueNature::NUMBER;
+    node.slot = accumulatorSlot;
+    node.counterSlot = counterSlot;
+    node.sourcePos = pos;
+    node.text = node.function->name;
     return append(node);
   }
 

@@ -111,6 +111,12 @@ public:
     if (name.empty()) {
       fail(pos, "expected a number, variable, aggregate call, or parenthesized expression");
     }
+    if (name == "params") {
+      std::string_view variable = value::lex::scanParamsAccessor(
+          *cur, program->resource,
+          [&](size_t at, std::string_view message) { fail(at, message); });
+      if (!variable.empty()) return parseVariableNamed(variable, pos);
+    }
     if (cur->peek() != '(') {
       fail(pos, fmt::format("bucket expression leaf '{}' must be an aggregate call", name));
     }
@@ -221,6 +227,10 @@ private:
     size_t pos = cur->position();
     std::string_view name = value::lex::scanVariable(*cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
+    return parseVariableNamed(name, pos);
+  }
+
+  uint32_t parseVariableNamed(std::string_view name, size_t pos) {
     const auto* view = opts.vars.find(name);
     if (view == nullptr) fail(pos, fmt::format("undefined variable ${}", name));
 

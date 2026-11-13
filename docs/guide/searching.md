@@ -872,6 +872,13 @@ A rescore expression must produce a finite value for every matched document.
 Handle missing values with `def()` or exclude them with an `exists()` child
 query.
 
+More operators and functions are in [Value expressions](value-expressions.md):
+the bitwise operators and `%`, trigonometry and rounding, calendar parts of dates
+(`year(d)`, `day_of_week(d)`), coordinates and distances between places,
+hashing for consistent sampling, `let` variables and bounded `fold` loops, and
+the Lucene expressions and Painless spellings `_score`, `params.x`, and
+`doc['x'].value`.
+
 ### Decay functions
 
 `gauss_decay`, `exp_decay`, and `linear_decay` follow Elasticsearch's

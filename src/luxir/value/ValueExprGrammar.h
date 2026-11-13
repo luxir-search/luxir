@@ -66,6 +66,7 @@ class ValueExprGrammar {
       case '-': return "sub";
       case '*': return "mul";
       case '/': return "div";
+      case '%': return "mod";
     }
     std::unreachable();
   }
@@ -94,7 +95,7 @@ class ValueExprGrammar {
   // || binds more loosely than &&; both are left-associative.
   Node parseLogical(bool conjunction) {
     ChainDepthGuard depth(*this);
-    Node left = conjunction ? parseComparison() : parseLogical(true);
+    Node left = conjunction ? parseBitOr() : parseLogical(true);
     char op = conjunction ? '&' : '|';
     for (;;) {
       cur.skipWs();
@@ -102,9 +103,80 @@ class ValueExprGrammar {
       size_t pos = cur.position();
       depth.charge(pos);
       cur.advance(2);
-      Node right = conjunction ? parseComparison() : parseLogical(true);
+      Node right = conjunction ? parseBitOr() : parseLogical(true);
       std::array<Node, 2> args{left, right};
       left = actions.makeFunction(conjunction ? "and" : "or", pos, args);
+    }
+  }
+
+  // Java's bitwise precedence: | below ^ below &, all below the comparisons
+  // and above && and ||. A doubled operator belongs to the logical level.
+  Node parseBitOr() {
+    ChainDepthGuard depth(*this);
+    Node left = parseBitXor();
+    for (;;) {
+      cur.skipWs();
+      if (cur.peek() != '|' || cur.peekAt(1) == '|') return left;
+      size_t pos = cur.position();
+      depth.charge(pos);
+      cur.advance();
+      Node right = parseBitXor();
+      std::array<Node, 2> args{left, right};
+      left = actions.makeFunction("bit_or", pos, args);
+    }
+  }
+
+  Node parseBitXor() {
+    ChainDepthGuard depth(*this);
+    Node left = parseBitAnd();
+    for (;;) {
+      cur.skipWs();
+      if (cur.peek() != '^') return left;
+      size_t pos = cur.position();
+      depth.charge(pos);
+      cur.advance();
+      Node right = parseBitAnd();
+      std::array<Node, 2> args{left, right};
+      left = actions.makeFunction("bit_xor", pos, args);
+    }
+  }
+
+  Node parseBitAnd() {
+    ChainDepthGuard depth(*this);
+    Node left = parseComparison();
+    for (;;) {
+      cur.skipWs();
+      if (cur.peek() != '&' || cur.peekAt(1) == '&') return left;
+      size_t pos = cur.position();
+      depth.charge(pos);
+      cur.advance();
+      Node right = parseComparison();
+      std::array<Node, 2> args{left, right};
+      left = actions.makeFunction("bit_and", pos, args);
+    }
+  }
+
+  // << >> >>> bind more tightly than the comparisons and more loosely than
+  // + and -.
+  Node parseShift() {
+    ChainDepthGuard depth(*this);
+    Node left = parseAdditive();
+    for (;;) {
+      cur.skipWs();
+      char c = cur.peek();
+      if ((c != '<' && c != '>') || cur.peekAt(1) != c) return left;
+      std::string_view name = c == '<' ? "shl" : "shr";
+      size_t length = 2;
+      if (c == '>' && cur.peekAt(2) == '>') {
+        name = "ushr";
+        length = 3;
+      }
+      size_t pos = cur.position();
+      depth.charge(pos);
+      cur.advance(length);
+      Node right = parseAdditive();
+      std::array<Node, 2> args{left, right};
+      left = actions.makeFunction(name, pos, args);
     }
   }
 
@@ -123,7 +195,7 @@ class ValueExprGrammar {
   }
 
   Node parseComparison() {
-    Node left = parseAdditive();
+    Node left = parseShift();
     cur.skipWs();
     size_t length = 0;
     std::string_view name = comparisonFunction(length);
@@ -131,7 +203,7 @@ class ValueExprGrammar {
     size_t pos = cur.position();
     DepthGuard depth(*this, pos);
     cur.advance(length);
-    Node right = parseAdditive();
+    Node right = parseShift();
     cur.skipWs();
     if (!comparisonFunction(length).empty()) {
       actions.fail(cur.position(),
@@ -162,7 +234,7 @@ class ValueExprGrammar {
     for (;;) {
       cur.skipWs();
       char op = cur.peek();
-      if (op != '*' && op != '/') return left;
+      if (op != '*' && op != '/' && op != '%') return left;
       size_t pos = cur.position();
       depth.charge(pos);
       cur.advance();
@@ -180,6 +252,12 @@ class ValueExprGrammar {
       DepthGuard depth(*this, pos);
       std::array<Node, 1> args{parseUnary()};
       return actions.makeFunction("not", pos, args);
+    }
+    if (op == '~') {
+      cur.advance();
+      DepthGuard depth(*this, pos);
+      std::array<Node, 1> args{parseUnary()};
+      return actions.makeFunction("bit_not", pos, args);
     }
     if (op != '+' && op != '-') return parsePrimary();
 

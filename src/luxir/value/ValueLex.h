@@ -100,7 +100,7 @@ NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
     return literal;
   }
   char next = cur.peek();
-  constexpr std::string_view TERMINATORS = ",)+-*/<>=!?:&|";
+  constexpr std::string_view TERMINATORS = ",)+-*/%^<>=!?:&|]";
   if (!cur.atEnd() && cur.wsLen() == 0
       && TERMINATORS.find(next) == std::string_view::npos) {
     fail(pos, fmt::format("invalid numeric literal '{}'",
@@ -168,6 +168,37 @@ std::string_view scanQuoted(Cursor& cur, std::pmr::memory_resource& mr, Fail&& f
   }
   cur.advance();
   return body;
+}
+
+// The cursor sits on '[': reads a quoted name and the closing ']', as in
+// doc['price'] or params["boost"]. The name may not be empty.
+template <class Fail>
+std::string_view scanBracketedName(Cursor& cur, std::pmr::memory_resource& mr, Fail&& fail) {
+  size_t open = cur.position();
+  cur.advance();
+  cur.skipWs();
+  if (cur.peek() != '\'' && cur.peek() != '"') {
+    fail(cur.position(), "expected a quoted name after '['");
+  }
+  std::string_view name = scanQuoted(cur, mr, fail);
+  if (name.empty()) fail(open, "the name between the brackets is empty");
+  cur.skipWs();
+  if (!cur.consume(']')) fail(cur.position(), "expected ']'");
+  return name;
+}
+
+// After the identifier `params`: `.name`, `['name']` or `["name"]`, the
+// spellings of a $name variable that Painless and Lucene expression scripts
+// use. Consumes the accessor and returns the name; returns empty and leaves the
+// cursor alone when `params` is not followed by one.
+template <class Fail>
+std::string_view scanParamsAccessor(Cursor& cur, std::pmr::memory_resource& mr, Fail&& fail) {
+  if (cur.peek() == '.' && identifierStart(cur.peekAt(1))) {
+    cur.advance();
+    return scanIdentifier(cur);
+  }
+  if (cur.peek() == '[') return scanBracketedName(cur, mr, fail);
+  return {};
 }
 
 enum class ListSeparator { COMMA, CLOSE, INVALID };
