@@ -20,7 +20,10 @@ namespace luxir {
 struct Manifest {
   using Bytes = std::shared_ptr<const std::vector<std::byte>>;
   std::vector<std::string> names;
-  std::vector<Directory::FileInfo> listing; // reused by writer startup retirement
+  // The directory's files, once something needed them: load() lists only to
+  // fall back below a torn tip. listingOf() lists at most once per Manifest.
+  std::vector<Directory::FileInfo> listing;
+  bool listed = false;
   Bytes bytes;
   uint64_t generation = 0;
   uint64_t highestGeneration = 0;
@@ -122,7 +125,18 @@ struct Manifest {
     return bytes;
   }
 
-  // Only STATE selects a root. Scans are recovery fallback, never publication.
+  // The files of `dir`, listed on first use and kept: one open lists once
+  // however many of its steps need the listing.
+  const std::vector<Directory::FileInfo>& listingOf(Directory& dir) {
+    if (!listed) {
+      dir.listFiles(listing);
+      listed = true;
+    }
+    return listing;
+  }
+
+  // Only STATE selects a root. Scans are recovery fallback, never publication:
+  // a healthy tip is read without listing the directory.
   static Manifest load(Directory& dir, const IncarnationState* claimed = nullptr) {
     auto readCandidate = [&](uint64_t gen, uint64_t epoch) -> Bytes {
       try { return read(dir, gen, epoch); }
@@ -132,7 +146,6 @@ struct Manifest {
     if (!state) throw WriterSupersededError();
     for (;;) {
       Manifest result;
-      dir.listFiles(result.listing);
       if (state->value.tip.empty()) return result;
       auto [gen, epoch] = candidate(std::string(kPrefix) + state->value.tip);
       if (!gen) throw std::runtime_error("invalid STATE tip");
@@ -149,7 +162,7 @@ struct Manifest {
       if (!claimed && latest->version != state->version) { state = std::move(latest); continue; }
       std::vector<std::pair<uint64_t, uint64_t>> older;
       std::map<std::string, uint64_t> sizes;
-      for (const auto& file : result.listing) {
+      for (const auto& file : result.listingOf(dir)) {
         sizes.emplace(file.name, file.size);
         auto id = candidate(file.name);
         if (id.first && id.first < gen) older.push_back(id);
