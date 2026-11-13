@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2020-2026 Yonik Seeley and Luxir contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Package an already tested container build. Run through tools/dev-container."""
+"""Package an already tested native or container build."""
 
 import argparse
 import hashlib
@@ -12,10 +12,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
+import gzip
 
 # Packaging requires a clean source tree, including when importing helpers.
 sys.dont_write_bytecode = True
-from release_support import architecture, cpu_supported
+from release_support import architecture, cpu_supported, macos_baseline, macho_check
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -38,7 +40,9 @@ def copy(source, target):
     shutil.copy2(source, target)
 
 
-def build_id(path):
+def build_id(path, macos=False):
+    if macos:
+        return run("dwarfdump", "--uuid", str(path)).split()[1]
     return re.search(r"Build ID: (\w+)", run("readelf", "-n", str(path)))[1]
 
 
@@ -46,10 +50,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--builder-image", required=True, help="Immutable Docker image ID or digest")
+    parser.add_argument("--builder", required=True, help="JSON builder record")
     args = parser.parse_args()
-    if not re.search(r"sha256:[0-9a-f]{64}$", args.builder_image):
-        parser.error("--builder-image must identify immutable image content")
+    builder = json.loads(args.builder)
     if run("git", "status", "--porcelain", "--untracked-files=normal"):
         parser.error("commit source changes before packaging")
     status = subprocess.check_output(["git", "submodule", "status"], cwd=ROOT, text=True)
@@ -66,7 +69,7 @@ def main():
             if path.is_file():
                 installed = pathlib.Path("/opt/luxir-deps") / path.relative_to(ROOT / "deps")
                 if not installed.is_file() or sha256(path) != sha256(installed):
-                    parser.error(f"rebuild the container: dependency recipe differs at {path}")
+                    parser.error(f"rebuild dependencies: dependency recipe differs at {path}")
 
     directory = args.build_dir.resolve()
     cache = dict(re.findall(r"^([^/#\r\n][^:=\r\n]*):[^=\r\n]+=(.*)$",
@@ -83,8 +86,13 @@ def main():
         arch = architecture(tier)
     except StopIteration:
         parser.error("release packaging requires an explicit CPU target")
+    macos = arch.platform == "macos"
+    from nightly import validate_builder
+    validate_builder(builder, arch.platform + "-" + arch.name)
+    if macos and (config != "Release" or asan):
+        parser.error("macOS assets require an unsanitized Release build")
     if cache.get("LUXIR_STATIC_RUNTIME") != "ON" or config not in ("Release", "Debug"):
-        parser.error("use a container Release or Debug configuration with static runtimes")
+        parser.error("use a Release or Debug configuration with static runtimes")
     if (asan or config == "Debug") and tier != arch.tiers[0]:
         parser.error("public diagnostic packages use the architecture baseline")
     if asan and config != "Debug":
@@ -93,7 +101,7 @@ def main():
     # Refresh only the build graph (including CMake's source-glob checks).
     # Compiling here would invalidate the tests of the supplied executable.
     if cache.get("CMAKE_GENERATOR") != "Ninja":
-        parser.error("release packaging requires the Ninja container presets")
+        parser.error("release packaging requires the Ninja presets")
     subprocess.run(["ninja", "-C", str(directory), "build.ninja"], check=True)
     # Ninja 1.10 stops a dry run at CMake's always-dirty glob check. Read the
     # refreshed graph from stdin so Ninja checks targets without regenerating it.
@@ -116,23 +124,27 @@ def main():
             parser.error("the executable version or source commit does not match its build configuration")
     else:
         print(f"Skipping --version: {tier} not supported on this CPU; checked embedded metadata")
-    notes = run("readelf", "-n", str(binary))
-    needed_tiers = re.findall(r"x86-64-v[234]", notes)
-    if arch.isa_notes and (not needed_tiers or max(needed_tiers) != tier):
-        parser.error("the executable's required ISA note does not match its CPU tier")
-    interpreter = re.search(r"Requesting program interpreter: (.*?)\]",
-                            run("readelf", "-l", str(binary)))
-    if not interpreter or interpreter[1] != arch.loader:
-        parser.error("the executable loader does not match its architecture")
-    dynamic = run("readelf", "-d", str(binary))
-    libraries = re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic)
-    if set(libraries) - {"libc.so.6", "libm.so.6", pathlib.Path(arch.loader).name}:
-        parser.error(f"unexpected runtime libraries: {libraries}")
-    versions = re.findall(r"\bGLIBC_(\d+)\.(\d+)(?:\.(\d+))?\b",
-                          run("readelf", "--version-info", str(binary)))
-    glibc = max(tuple(int(part or 0) for part in item) for item in versions)
-    if glibc > (2, 35, 0):
-        parser.error(f"glibc requirement exceeds 2.35: {glibc}")
+    if macos:
+        baseline = macos_baseline(ROOT)
+        libraries = macho_check(binary, baseline)
+    else:
+        notes = run("readelf", "-n", str(binary))
+        needed_tiers = re.findall(r"x86-64-v[234]", notes)
+        if arch.isa_notes and (not needed_tiers or max(needed_tiers) != tier):
+            parser.error("the executable's required ISA note does not match its CPU tier")
+        interpreter = re.search(r"Requesting program interpreter: (.*?)\]",
+                                run("readelf", "-l", str(binary)))
+        if not interpreter or interpreter[1] != arch.loader:
+            parser.error("the executable loader does not match its architecture")
+        dynamic = run("readelf", "-d", str(binary))
+        libraries = re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic)
+        if set(libraries) - {"libc.so.6", "libm.so.6", pathlib.Path(arch.loader).name}:
+            parser.error(f"unexpected runtime libraries: {libraries}")
+        versions = re.findall(r"\bGLIBC_(\d+)\.(\d+)(?:\.(\d+))?\b",
+                              run("readelf", "--version-info", str(binary)))
+        glibc = max(tuple(int(part or 0) for part in item) for item in versions)
+        if glibc > (2, 35, 0):
+            parser.error(f"glibc requirement exceeds 2.35: {glibc}")
 
     suffix = "-asan" if asan else "-debug" if config == "Debug" else ""
     name = arch.package_name(version, tier, suffix)
@@ -153,17 +165,18 @@ def main():
         "version_runtime_checked": runtime_checked,
         "source_commit_subject": run("git", "show", "-s", "--format=%s", "HEAD"),
         "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
-        "builder_image": args.builder_image,
+        "builder": builder,
         "compiler": run(cache["CMAKE_CXX_COMPILER"], "--version").splitlines()[0],
-        "architecture": arch.name, "cpu_target": tier, "build_type": config, "address_sanitizer": asan,
-        "build_id": build_id(binary), "minimum_glibc": "2.35",
+        "platform": arch.platform + "-" + arch.name, "architecture": arch.name, "cpu_target": tier, "build_type": config, "address_sanitizer": asan,
+        "build_id": build_id(binary, macos),
+        **({"minimum_macos": baseline} if macos else {"minimum_glibc": "2.35"}),
         "dynamic_libraries": libraries, "vcpkg_triplet": triplet,
         "vcpkg_baseline": json.loads((ROOT / "deps/vcpkg.json").read_text())["builtin-baseline"],
         "submodules": run("git", "submodule", "status"),
         "fastpfor_commit": run("git", "-C", "deps/FastPFOR", "rev-parse", "HEAD"),
         "c_flags": cache["CMAKE_C_FLAGS"] + " " + cache["CMAKE_C_FLAGS_" + config.upper()],
         "cxx_flags": cache["CMAKE_CXX_FLAGS"] + " " + cache["CMAKE_CXX_FLAGS_" + config.upper()],
-        "dispatch": "FAISS and OpenBLAS select kernels at runtime; OpenBLAS is single-threaded",
+        "dispatch": "FAISS and Accelerate" if macos else "FAISS and OpenBLAS select kernels at runtime; OpenBLAS is single-threaded",
         "asan_exclusions": ["OpenBLAS AVX-512 assembly kernels"] if asan and arch.isa_notes else [],
     }
     with tempfile.TemporaryDirectory(prefix=".package-", dir=output) as temporary:
@@ -175,13 +188,23 @@ def main():
         if config == "Release":
             symbols = staging / (name + "-symbols") / name
             symbols.mkdir(parents=True)
-            debug = symbols / "luxir.debug"
-            subprocess.run(["objcopy", "--only-keep-debug", str(executable), str(debug)], check=True)
-            subprocess.run(["strip", "--strip-unneeded", str(executable)], check=True)
-            subprocess.run(["objcopy", "--add-gnu-debuglink=" + str(debug), str(executable)], check=True)
-            if build_id(executable) != build_id(debug):
-                raise RuntimeError("executable and symbols have different build IDs")
-            symbol_manifest = dict(manifest, symbols_sha256=sha256(debug))
+            if macos:
+                debug = symbols / "luxir.dSYM"
+                subprocess.run(["dsymutil", str(binary), "-o", str(debug)], check=True)
+                if build_id(binary, True) != build_id(debug, True):
+                    raise RuntimeError("executable and dSYM UUIDs differ")
+                subprocess.run(["strip", "-S", "-x", str(executable)], check=True)
+                subprocess.run(["codesign", "--force", "--sign", "-", str(executable)], check=True)
+                macho_check(executable, baseline, signed=True)
+                symbol_manifest = dict(manifest)
+            else:
+                debug = symbols / "luxir.debug"
+                subprocess.run(["objcopy", "--only-keep-debug", str(executable), str(debug)], check=True)
+                subprocess.run(["strip", "--strip-unneeded", str(executable)], check=True)
+                subprocess.run(["objcopy", "--add-gnu-debuglink=" + str(debug), str(executable)], check=True)
+                if build_id(executable) != build_id(debug):
+                    raise RuntimeError("executable and symbols have different build IDs")
+                symbol_manifest = dict(manifest, symbols_sha256=sha256(debug))
             (symbols / "BUILD-symbols.json").write_text(json.dumps(symbol_manifest, indent=2) + "\n")
         manifest["executable_sha256"] = sha256(executable)
         (package / "BUILD.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -202,7 +225,7 @@ def main():
                          "src/luxir/util/random.h", "src/luxir/util/luxir_util.h"):
             copy(ROOT / filename, package / "licenses/adapted" / filename)
         copy(install / "vcpkg/status", package / "BUILD-dependencies.txt")
-        (package / "README.txt").write_text(
+        readme = (
             f"Luxir {version} for Linux {tier}\n\n"
             "Requires glibc 2.35 or newer and the named CPU level.\n"
             "Install system tzdata for IANA time-zone names; UTC and fixed\n"
@@ -223,17 +246,38 @@ def main():
             "BUILD.json identifies the source and builder; BUILD-dependencies.txt\n"
             "records the installed dependency packages, including build tools.\n"
             "Third-party notices and runtime licenses are under licenses/.\n")
+        if macos:
+            readme = (
+                f"Luxir {version} for macOS {baseline}+ and Apple silicon (apple-m1).\n\n"
+                "GCC runtimes are included; no Homebrew installation is required.\n"
+                "This binary is ad-hoc signed, unsigned by a developer identity, and not notarized.\n"
+                "Browser downloads are quarantined. After verifying SHA256SUMS, run:\n"
+                "  xattr -d com.apple.quarantine ./luxir\n"
+                "  chmod +x ./luxir\n"
+                "For the standalone download, substitute its downloaded filename.\n"
+                "Run ./luxir --version or ./luxir --help. HTTP listens on port 9400.\n"
+                "See docs/guide/quickstart.md and https://luxir.org/docs/\n"
+                "Extract matching symbols beside this package to place luxir.dSYM beside luxir.\n"
+                "Use LLDB with the matching source checkout; BUILD.json records the source and builder.\n"
+                "Third-party notices and runtime licenses are under licenses/.\n")
+        (package / "README.txt").write_text(readme)
         for item in archive_names:
             archive = staging / (item + ".tar.gz")
-            subprocess.run(["tar", "--sort=name", "--mtime=@" + epoch, "--owner=0",
-                            "--group=0", "--numeric-owner", "-czf", str(archive),
-                            "-C", str(staging / item if item.endswith("-symbols") else staging),
-                            name], check=True)
+            source = staging / item if item.endswith("-symbols") else staging
+            def normalize(info):
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = int(epoch)
+                return info
+            with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                                         mtime=int(epoch)) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as stream:
+                    stream.add(source / name, arcname=name, filter=normalize)
             shutil.move(archive, output / archive.name)
         if config == "Release":
             copy(executable, output / name)
     checksums = "".join(f"{sha256(path)}  {path.name}\n"
-                        for path in sorted(output.glob(f"luxir-{version}-linux-*"))
+                        for path in sorted(output.glob(f"luxir-{version}-*"))
                         if path.is_file())
     (output / "SHA256SUMS").write_text(checksums)
     print(f"Packaged {name} into {output}")

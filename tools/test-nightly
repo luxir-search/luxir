@@ -24,21 +24,23 @@ class NightlyTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.commit = "a" * 40
-        self.presets = ("amd64/container-release", "amd64/container-debug", "arm64/container-release")
+        self.presets = ("linux-amd64/container-release", "linux-amd64/container-debug", "linux-arm64/container-release", "macos-arm64/macos-release")
         os.environ.setdefault("GITHUB_REPOSITORY", "luxir-search/luxir")
         os.environ.setdefault("GITHUB_RUN_ID", "123")
-        for leg_id, status in zip(self.presets, ("fail", "not run on this CPU", "pass")):
+        for leg_id, status in zip(self.presets, ("fail", "not run on this CPU", "pass", "pass")):
             arch, preset = nightly.split_leg(leg_id)
             leg = self.root / f"nightly-{arch}-{preset}"
             (leg / "assets").mkdir(parents=True)
-            asset_arch = "aarch64" if arch == "arm64" else "x86_64-v2"
+            asset_arch = "aarch64" if arch == "linux-arm64" else "x86_64-v2"
             suffix = "-debug" if preset == "container-debug" else ""
-            asset = leg / "assets" / f"luxir-0.1.0-linux-{asset_arch}{suffix}.tar.gz"
+            asset_platform = "macos-arm64" if arch == "macos-arm64" else f"linux-{asset_arch}"
+            asset = leg / "assets" / f"luxir-0.1.0-{asset_platform}{suffix}.tar.gz"
             asset.write_bytes(preset.encode())
             (leg / "assets/SHA256SUMS").write_text(f"{nightly.digest(asset)}  {asset.name}\n")
             (leg / "result.json").write_text(json.dumps({
-                "architecture": arch, "preset": preset, "commit": self.commit, "subject": "Fixture", "date": "2026-11-11",
-                "builder_image": "sha256:" + "b" * 64,
+                "platform": arch, "preset": preset, "commit": self.commit, "subject": "Fixture", "date": "2026-11-11",
+                "builder": ({"kind": "native", "dependency_digest": "sha256:" + "b" * 64, "toolchain": "fixture"}
+                            if arch == "macos-arm64" else {"kind": "container", "image": "sha256:" + "b" * 64}),
                 "tests": {binary: {"status": status, "exit_code": 1 if status == "fail" else None}
                           for binary in nightly.TESTS}}))
 
@@ -47,7 +49,7 @@ class NightlyTest(unittest.TestCase):
 
     def test_advisory_results_and_combined_checksums(self):
         assets, notes = self.assemble()
-        self.assertEqual(len(list(assets.iterdir())), 4)
+        self.assertEqual(len(list(assets.iterdir())), 5)
         for line in (assets / "SHA256SUMS").read_text().splitlines():
             checksum, name = line.split("  ")
             self.assertEqual(nightly.digest(assets / name), checksum)
@@ -55,7 +57,7 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("| fail |", notes.read_text())
 
     def test_missing_preset_blocks_assembly(self):
-        (self.root / "nightly-amd64-container-debug/result.json").unlink()
+        (self.root / "nightly-linux-amd64-container-debug/result.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.assemble()
 
@@ -65,27 +67,53 @@ class NightlyTest(unittest.TestCase):
             self.assemble()
 
     def test_corruption_blocks_assembly(self):
-        next((self.root / "nightly-amd64-container-debug/assets").glob("luxir-*")).write_bytes(b"corrupt")
+        next((self.root / "nightly-linux-amd64-container-debug/assets").glob("luxir-*")).write_bytes(b"corrupt")
         with self.assertRaisesRegex(ValueError, "Corrupt"):
             self.assemble()
 
     def test_missing_asset_blocks_assembly(self):
-        next((self.root / "nightly-amd64-container-debug/assets").glob("luxir-*")).unlink()
+        next((self.root / "nightly-linux-amd64-container-debug/assets").glob("luxir-*")).unlink()
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             self.assemble()
 
     def test_missing_arm64_blocks_assembly(self):
-        (self.root / "nightly-arm64-container-release/result.json").unlink()
+        (self.root / "nightly-linux-arm64-container-release/result.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.assemble()
 
     def test_wrong_architecture_blocks_assembly(self):
-        path = self.root / "nightly-arm64-container-release/result.json"
+        path = self.root / "nightly-linux-arm64-container-release/result.json"
         report = json.loads(path.read_text())
-        report["architecture"] = "amd64"
+        report["platform"] = "linux-amd64"
         path.write_text(json.dumps(report))
-        with self.assertRaisesRegex(ValueError, "architecture"):
+        with self.assertRaisesRegex(ValueError, "platform"):
             self.assemble()
+
+    def test_missing_macos_blocks_assembly(self):
+        (self.root / "nightly-macos-arm64-macos-release/result.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.assemble()
+
+    def test_native_builder_requires_digest_and_toolchain(self):
+        path = self.root / "nightly-macos-arm64-macos-release/result.json"
+        report = json.loads(path.read_text())
+        report["builder"].pop("toolchain")
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "toolchain"):
+            self.assemble()
+
+    def test_macos_packaging_policy(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        from release_support import architecture, macho_libraries
+        self.assertEqual(architecture("apple-m1").package_name("1.0", "apple-m1", ""),
+                         "luxir-1.0-macos-arm64")
+        system = "  /usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)"
+        self.assertEqual(macho_libraries(system), ["/usr/lib/libSystem.B.dylib"])
+        with self.assertRaises(ValueError):
+            macho_libraries(system.replace("/usr/lib/libSystem.B.dylib", "/opt/homebrew/lib/libgomp.1.dylib"))
+        for invalid in ("macos-arm64/container-asan", "linux-arm64/container-release-v3"):
+            with self.assertRaises(ValueError):
+                nightly.split_leg(invalid)
 
     def test_failure_excerpt(self):
         log = ("I 01:02:03.4 T8 a.cpp:1 noise\n/w/A.cpp:6: Failure\nExpected: false\n\n"
@@ -135,8 +163,9 @@ class NightlyTest(unittest.TestCase):
         helper.write_text("print('fixture-key')\n")
         commands = repo / "commands"
         commands.mkdir()
-        docker = commands / "docker"
-        docker.write_text('#!/bin/sh\ncase "$3" in *-arm64) exit 1 ;; esac\n')
+        docker = commands / "curl"
+        fake = '#!/bin/sh\nfor last; do :; done\ncase "$last" in */token*) echo \'{"token": "t"}\' ;; %s) exit 22 ;; esac\n'
+        docker.write_text(fake % "*-arm64")
         docker.chmod(0o755)
         env = dict(os.environ, GITHUB_EVENT_NAME="workflow_dispatch",
                    GITHUB_OUTPUT=str(output), NIGHTLY_LEGS=" ".join(self.presets),
@@ -146,14 +175,19 @@ class NightlyTest(unittest.TestCase):
                                 env=env, text=True, capture_output=True)
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("fixture-key-arm64", failed.stderr)
-        docker.write_text("#!/bin/sh\nexit 0\n")
+        docker.write_text(fake % "*-macos-arm64")
+        failed = subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo,
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fixture-key-macos-arm64", failed.stderr)
+        docker.write_text(fake % "none")
         output.write_text("")
         subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo, env=env, check=True)
         values = dict(line.split("=", 1) for line in output.read_text().splitlines())
         matrix = json.loads(values["matrix"])["include"]
-        self.assertEqual(len(matrix), 3)
-        self.assertEqual(matrix[-1]["runner"], "ubuntu-24.04-arm")
-        self.assertTrue(matrix[-1]["image"].endswith("fixture-key-arm64"))
+        self.assertEqual(len(matrix), 4)
+        self.assertEqual(matrix[-1]["runner"], "macos-15")
+        self.assertTrue(matrix[-1]["dependency"].endswith("fixture-key-macos-arm64"))
 
 
 

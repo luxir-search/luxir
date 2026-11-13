@@ -61,7 +61,7 @@ builder_image=$(docker image inspect "${LUXIR_DEV_IMAGE:-luxir-dev:jammy-gcc16}"
 for preset in container-release container-release-v3 container-release-v4 \
               container-debug container-asan; do
   LUXIR_DEV_IMAGE="$builder_image" ./tools/dev-container tools/package-release \
-    "build/$preset" --output build/releases/0.1.0 --builder-image "$builder_image" || break
+    "build/$preset" --output build/releases/0.1.0 --builder "$(python3 -c 'import json,sys; print(json.dumps(dict(kind="container", image=sys.argv[1])))' "$builder_image")" || break
 done
 ```
 
@@ -114,19 +114,20 @@ can dispatch manually to publish to their own repository.
 The rolling `nightly` prerelease contains the Linux x86-64 v2, v3, and v4
 optimized executables, executable and symbol archives, v2 Debug and ASan
 archives, the ARM64 release executable and its executable/symbol archives,
+the macOS Apple silicon executable and its executable/symbol archives,
 and one combined `SHA256SUMS`. Names retain the source version, so
 use the release commit and packaged manifests to identify a particular nightly.
 Both keyed dependency images (`<key>-amd64` and `<key>-arm64`) must already
-have been published by `deps-image.yml`. Missing either image fails planning.
+have been published by `deps-image.yml`. The macOS dependency artifact must also exist. Missing any dependency fails planning.
 These public images are pulled without registry sign-in.
 
 Tests are advisory: each leg records all three test binaries' statuses and
 output in its workflow artifact and job summary. Unsupported CPU tiers are
 reported as `not run on this CPU`; containers use the hosted runner's CPU.
-Release notes list the commit, builder images, and per-(architecture, preset) test results.
+Release notes list the commit, builder images, and per-(platform, preset) test results.
 Artifacts and full logs are retained for 14 days.
 
-Every (architecture, preset) leg must build and package successfully or nothing is published and
+Every (platform, preset) leg must build and package successfully or nothing is published and
 the previous nightly remains intact. Assets are uploaded to a staging draft
 before replacing the previous release and moving the `nightly` tag. GitHub
 does not offer an atomic release/tag replacement: a failure during the final
@@ -138,6 +139,49 @@ must not be enabled for this rolling prerelease.
 For local execution of one leg from a clean checkout with initialized
 submodules, set `LUXIR_DEV_IMAGE` to the keyed registry image and run
 `BUILD_JOBS=$(nproc) tools/nightly-build container-release`. Use a fresh
-`build/nightly/amd64-container-release` (or `arm64-container-release`) output directory for each run. Packaging
+`build/nightly/linux-amd64-container-release` (or `linux-arm64-container-release`) output directory for each run. Packaging
 checks embedded metadata without execution on CPUs that cannot run the selected
 tier; the manifest records whether the runtime version check was performed.
+
+## macOS nightly
+
+The `macos-arm64/macos-release` leg builds natively on `macos-15` (Apple M1).
+Assets are `luxir-<version>-macos-arm64`, `.tar.gz`, and `-symbols.tar.gz`.
+The baseline is macOS 15.0 and apple-m1. GCC runtimes are static; Apple system
+libraries and Accelerate remain dynamic. Packaging checks the thin arm64
+architecture, exact minimum OS, and an explicit system-library allowlist.
+It generates `luxir.dSYM` with dsymutil before stripping, checks matching UUIDs,
+then strips, signs ad hoc and verifies the final executable. LLDB can load the
+matching dSYM beside the executable.
+
+Downloads are not notarized or signed by a developer identity. For a browser
+download, verify SHA256SUMS, then remove quarantine and enable execution:
+
+```bash
+xattr -d com.apple.quarantine ./luxir-<version>-macos-arm64
+chmod +x ./luxir-<version>-macos-arm64
+```
+
+`deps-image.yml` has an independent, main-only macOS job. It publishes an OCI
+artifact in the existing public `luxir-dev` package using ORAS. No new package
+or Actions cache is used. The tag is `<key>-macos-arm64`; the installed tree
+and pinned vcpkg checkout restore to `/opt/vcpkg`, and the recorded recipes
+to `/opt/luxir-deps`. Restoration requires both paths to be absent, to avoid
+mixing installations. It downloads anonymously by immutable manifest digest.
+`tools/macos-toolchain setup` installs hosted tools. `tools/macos-deps publish`
+builds and publishes; `tools/macos-deps restore` restores for a build. For local
+use set `GITHUB_REPOSITORY_OWNER`; publication additionally requires REGISTRY,
+GITHUB_REPOSITORY, GITHUB_ACTOR and GH_TOKEN.
+
+The shared dependency-key tool retains the Linux Dockerfile contract and adds
+a native input set. The native key covers manifests, overlays, triplets and
+included baseline, setup/build scripts, full GCC C/C++ versions, macOS version,
+Xcode and SDK. Hosted toolchain changes require republishing dependencies.
+Planning runs on macOS so it can resolve that identity, and uses ORAS for
+both image and native artifact existence checks without Docker. Each native
+builder record includes toolchain identity and dependency manifest digest.
+Tests remain advisory and run without ASAN_OPTIONS on macOS.
+
+Changing macOS triplets changes the Linux image key too: the Dockerfile copies
+all triplets and the key hashes all of them. This change therefore requires
+republishing both Linux images as well as the macOS artifact.

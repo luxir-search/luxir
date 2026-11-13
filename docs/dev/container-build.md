@@ -179,3 +179,7 @@ ports against that checkout, and rebuild/test the image. Native builds share
 these ports and the manifest, using native CPU triplets and separate install
 directories. `deps/make_deps.sh` builds those native variants on the host; the
 Dockerfile builds the portable variants for this image.
+
+The nightly also has a native macOS Apple silicon leg; it does not use this
+container. See [releases](releases.md#macos-nightly) for its dependency artifact,
+macOS 15 baseline and asset validation.

@@ -4,39 +4,53 @@
 # Run one leg locally or on a hosted runner. Outputs stay under build/nightly/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-preset=${1:?container preset required}
-case "$preset" in
-  container-release|container-release-v3|container-release-v4|container-debug|container-asan) ;;
-  *) echo "Unsupported nightly preset: $preset" >&2; exit 2 ;;
+preset=${1:?preset required}
+case "$(uname -s)/$(uname -m)/$preset" in
+  Darwin/arm64/macos-release)
+    platform=macos-arm64
+    runner=()
+    jobs=${BUILD_JOBS:-$(tools/build-jobs 2500)}
+    mkdir -p build
+    tools/macos-deps restore
+    builder=$(cat build/macos-builder.json)
+    ;;
+  Linux/*/container-*)
+    case "$preset" in
+      container-release|container-release-v3|container-release-v4|container-debug|container-asan) ;;
+      *) exit 2 ;;
+    esac
+    case "$(uname -m)" in
+      x86_64) platform=linux-amd64 ;; aarch64|arm64) platform=linux-arm64 ;; *) exit 2 ;;
+    esac
+    docker pull "${LUXIR_DEV_IMAGE:?keyed dependency image required}"
+    LUXIR_DEV_IMAGE=$(docker image inspect "$LUXIR_DEV_IMAGE" --format '{{.Id}}')
+    export LUXIR_DEV_IMAGE
+    runner=(./tools/dev-container)
+    jobs=${BUILD_JOBS:-$(nproc)}
+    builder=$(python3 -c 'import json,os; print(json.dumps(dict(kind="container", image=os.environ["LUXIR_DEV_IMAGE"])))')
+    ;;
+  *) echo "Unsupported nightly host/preset" >&2; exit 2 ;;
 esac
-: "${LUXIR_DEV_IMAGE:?keyed dependency image required}"
-case "$(uname -m)" in
-  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
-esac
-output="build/nightly/$arch-$preset"
+output="build/nightly/$platform-$preset"
 [[ ! -e $output ]] || { echo "Use a fresh output directory: $output" >&2; exit 2; }
 mkdir -p "$output"
 ./deps/fetch_sources.sh
-docker pull "$LUXIR_DEV_IMAGE"
-LUXIR_DEV_IMAGE=$(docker image inspect "$LUXIR_DEV_IMAGE" --format '{{.Id}}')
-export LUXIR_DEV_IMAGE
-jobs=${BUILD_JOBS:-$(nproc)}
-if ! ./tools/dev-container cmake --preset "$preset" -DLUXIR_COMPILE_JOBS="$jobs" \
+if ! ${runner[@]+"${runner[@]}"} cmake --preset "$preset" -DLUXIR_COMPILE_JOBS="$jobs" \
     > "$output/configure.log" 2>&1; then
   tail -100 "$output/configure.log"
   exit 1
 fi
 build_status=0
-./tools/dev-container cmake --build --preset "$preset" > "$output/build.log" 2>&1 || build_status=$?
+${runner[@]+"${runner[@]}"} cmake --build --preset "$preset" > "$output/build.log" 2>&1 || build_status=$?
 grep -n 'warning:' "$output/configure.log" "$output/build.log" || true
 if (( build_status != 0 )); then
   tail -100 "$output/build.log"
   exit "$build_status"
 fi
 # Test failures are data. Infrastructure/reporting failures still fail the leg.
-./tools/dev-container python3 tools/nightly.py test "$preset" "$output" "$LUXIR_DEV_IMAGE"
+${runner[@]+"${runner[@]}"} python3 tools/nightly.py test "$preset" "$output" "$builder"
 if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
   cat "$output/tests.md" >> "$GITHUB_STEP_SUMMARY"
 fi
-./tools/dev-container tools/package-release "build/$preset" \
-  --output "$output/assets" --builder-image "$LUXIR_DEV_IMAGE"
+${runner[@]+"${runner[@]}"} tools/package-release "build/$preset" \
+  --output "$output/assets" --builder "$builder"

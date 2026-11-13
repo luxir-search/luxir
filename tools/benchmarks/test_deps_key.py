@@ -32,6 +32,33 @@ RUN apt-get install wamerican
 
 
 class KeyContract(unittest.TestCase):
+    def test_macos_identity(self):
+        root = Path(__file__).resolve().parents[2]
+        key = module.macos_key(root)
+        self.assertEqual(key, module.macos_key(root))
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            target = Path(tmp)
+            for name in ('deps', 'tools'):
+                # Copy only key inputs, not fetched dependency sources/builds.
+                (target / name).mkdir()
+            for name in ('deps/vcpkg.json', 'deps/vcpkg-configuration.json', 'deps/ports',
+                         'deps/triplets', 'deps/make_deps.sh', 'deps/fetch_sources.sh',
+                         'tools/macos-deps', 'tools/macos-toolchain'):
+                source = root / name
+                if source.is_dir():
+                    shutil.copytree(source, target / name)
+                else:
+                    (target / name).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target / name)
+            self.assertEqual(key, module.macos_key(target))
+            for path in sorted(target.rglob('*')):
+                if path.is_file():
+                    data = path.read_bytes()
+                    path.write_bytes(data + b'changed')
+                    self.assertNotEqual(key, module.macos_key(target), str(path))
+                    path.write_bytes(data)
+
     def test_inputs_and_normalization(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

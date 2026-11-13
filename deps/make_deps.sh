@@ -10,7 +10,7 @@ if (( $# > 1 )); then
   echo "Usage: $0 [VCPKG_ROOT]" >&2
   exit 1
 fi
-vcpkg_root=$(realpath "${1:-/opt/vcpkg}")
+vcpkg_root=$(cd "${1:-/opt/vcpkg}" && pwd)
 cd "$(dirname "$0")"
 deps_dir=$PWD
 revision=$(python3 -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')
@@ -50,7 +50,7 @@ fi
 # Dependency build jobs default to what the cores and memory allow
 # (tools/build-jobs); ASan compiles need more memory each.
 jobs=${VCPKG_MAX_CONCURRENCY:-}
-for variant in native native-asan; do
+for variant in ${LUXIR_DEPS_VARIANTS:-native native-asan}; do
   target_triplet=$triplet
   host_triplet=$triplet
   features=(${jemalloc[@]+"${jemalloc[@]}"})
@@ -60,6 +60,13 @@ for variant in native native-asan; do
     host_triplet=$triplet-host
     features=()
     job_mb=3500
+  fi
+  if [[ $variant == native-release ]]; then
+    [[ $(uname -s) == Darwin ]] || { echo "native-release requires macOS" >&2; exit 1; }
+    target_triplet=$triplet-release
+    host_triplet=$target_triplet
+  elif [[ $variant != native && $variant != native-asan ]]; then
+    echo "Unknown variant: $variant" >&2; exit 1
   fi
   # Guarded expansions keep empty arrays valid under set -u in bash 3.2.
   VCPKG_MAX_CONCURRENCY=${jobs:-$(../tools/build-jobs "$job_mb")} "$vcpkg_root/vcpkg" install \

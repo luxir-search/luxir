@@ -31,6 +31,11 @@ if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
   set(VCPKG_HOST_TRIPLET ${_luxir_host_triplet} CACHE STRING "")
 endif()
 
+if(CMAKE_HOST_APPLE)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/deps/triplets/common/macos-version.cmake")
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "${LUXIR_MACOS_DEPLOYMENT_TARGET}" CACHE STRING "macOS baseline" FORCE)
+endif()
+
 project(Luxir VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -87,12 +92,17 @@ function(luxir_runs_during_build target)
   endif()
 endfunction()
 
-option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
+option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining system libraries" OFF)
 if(LUXIR_STATIC_RUNTIME)
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux")
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux or macOS")
   endif()
-  add_link_options(-static-libstdc++ -static-libgcc -static-libasan -Wl,--as-needed)
+  add_link_options(-static-libstdc++ -static-libgcc)
+  if(APPLE)
+    link_libraries(iconv)
+  else()
+    add_link_options(-static-libasan -Wl,--as-needed)
+  endif()
   # FindOpenMP otherwise selects the compiler's shared libgomp.
   execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.a
                   OUTPUT_VARIABLE _luxir_gomp OUTPUT_STRIP_TRAILING_WHITESPACE
