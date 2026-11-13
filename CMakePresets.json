@@ -125,7 +125,7 @@
         "VCPKG_HOST_TRIPLET": "x64-linux-luxir-host",
         "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-toolchain.cmake",
         "LUXIR_HOST_PROTOC_GEN_HPP": "${sourceDir}/build/arm64-host-tools/protoc-gen-hpp",
-        "LUXIR_CPU_TARGET": "armv8-a",
+        "LUXIR_CPU_TARGET": "armv9-a+i8mm+bf16+fp16",
         "LUXIR_STATIC_RUNTIME": "ON"
       }
     },

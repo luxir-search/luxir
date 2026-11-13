@@ -1,8 +1,21 @@
 # Linux ARM64 release build
 
 `tools/build-arm64` cross-compiles Luxir and its test binary on a Linux x86-64
-host for the generic ARMv8-A baseline (`armv8-a`, with NEON). The outputs are
-`build/arm64-release/bin/luxir` and `build/arm64-release/bin/luxir_test`.
+host for the Arm Neoverse V2 feature set: `-march=armv9-a+i8mm+bf16+fp16`
+(Armv9.0-A with SVE2, plus dotprod, i8mm, BF16 and FP16) and generic tuning.
+The outputs are `build/arm64-release/bin/luxir` and
+`build/arm64-release/bin/luxir_test`.
+
+The binaries need a Neoverse V2 class core or newer, such as AWS Graviton4
+(c8g, m8g, r8g, i8g), Google Axion or NVIDIA Grace. They do not run on
+Graviton2 (Neoverse N1, no SVE) or Graviton3 (Neoverse V1, no SVE2), and
+fail there with an illegal instruction. For those CPUs, configure with
+`-DLUXIR_CPU_TARGET=armv8-a` and change the triplet's flags to match.
+
+Tuning stays generic: GCC 16.1 with `-mtune=neoverse-v2` miscompiles
+google-benchmark's `DoNotOptimize` (an inline asm `"+m,r"` operand is written
+to a temporary stack slot and never copied back), which breaks
+`Benchmarks.all`.
 
 ## Prerequisites
 
@@ -37,7 +50,7 @@ its own build tools independently of `CC`/`CXX`.
 ## Runtime compatibility
 
 The pinned sysroot supplies glibc 2.41. Deploy on a Linux ARM64 system with
-compatible glibc symbol versions and time-zone data. Generic CPU support does
+compatible glibc symbol versions and time-zone data. CPU support does
 not imply compatibility with older glibc releases or musl-based systems.
 Product libraries, libstdc++, libgcc, and OpenMP are linked statically; glibc
 and libm remain dynamic.
@@ -56,16 +69,16 @@ kernels. FAISS also selects its ARM NEON/SVE implementation at runtime.
 ## Validation
 
 If `qemu-aarch64` is installed, the build script executes its toolchain and
-LAPACK smoke tests and `luxir --version` with a Cortex-A53 CPU model to check
-the ARMv8-A baseline. Set `LUXIR_QEMU_AARCH64` to use an emulator at another path.
+LAPACK smoke tests and `luxir --version` with QEMU's `max` CPU model, which
+implements the baseline's features. Set `LUXIR_QEMU_AARCH64` to use an emulator at another path.
 
 Run the tests on a compatible ARM64 Linux host or under QEMU:
 
 ```bash
 arm64_sysroot="${LUXIR_CACHE_DIR:-$HOME/.cache/luxir}/arm64-toolchain/compiler/gcc-16.1.0/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot"
-qemu-aarch64 -cpu cortex-a53 -L "$arm64_sysroot" \
+qemu-aarch64 -cpu max -L "$arm64_sysroot" \
   build/arm64-release/bin/luxir --version
-qemu-aarch64 -cpu cortex-a53 -L "$arm64_sysroot" \
+qemu-aarch64 -cpu max -L "$arm64_sysroot" \
   build/arm64-release/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 

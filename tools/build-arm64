@@ -61,13 +61,13 @@ flock -u "$setup_lock"
 ln -sfn "$vcpkg" build/arm64-vcpkg-root
 
 stage runtime-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
-    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -fopenmp -pthread \
+    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv9-a+i8mm+bf16+fp16 -std=c++26 -O2 -fopenmp -pthread \
     -static-libstdc++ -static-libgcc -Wl,--as-needed .devcontainer/check-toolchain.cpp \
     "$LUXIR_ARM64_TOOLCHAIN/aarch64-unknown-linux-gnu/lib64/libgomp.a" \
     -o "$checks/check-runtime"
 qemu=${LUXIR_QEMU_AARCH64:-$(command -v qemu-aarch64 || true)}
 if [[ -n $qemu ]]; then
-    stage runtime-execute env OMP_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
+    stage runtime-execute env OMP_NUM_THREADS=2 "$qemu" -cpu max \
         -L "$LUXIR_ARM64_SYSROOT" "$checks/check-runtime"
 fi
 stage sources ./deps/fetch_sources.sh
@@ -78,12 +78,12 @@ stage dependencies env -u CC -u CXX "$vcpkg/vcpkg" install --x-manifest-root="$r
     --host-triplet=x64-linux-luxir-host --x-feature=jemalloc \
     --clean-buildtrees-after-build --clean-packages-after-build
 stage lapack-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
-    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -pthread \
+    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv9-a+i8mm+bf16+fp16 -std=c++26 -O2 -pthread \
     -static-libstdc++ -static-libgcc test/blas_lapack_test.cpp \
     build/arm64-deps/arm64-linux-luxir/lib/libopenblas.a -lm \
     -o "$checks/check-lapack"
 if [[ -n $qemu ]]; then
-    stage lapack-execute env OPENBLAS_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
+    stage lapack-execute env OPENBLAS_NUM_THREADS=2 "$qemu" -cpu max \
         -L "$LUXIR_ARM64_SYSROOT" "$checks/check-lapack"
 fi
 stage generator "$CXX" -std=c++26 -O2 -g0 -pthread \
@@ -103,7 +103,7 @@ fi
 stage configure "$cmake_bin" --fresh --preset arm64-release "${configure_args[@]}"
 stage build "$cmake_bin" --build --preset arm64-release
 if [[ -n $qemu ]]; then
-    stage binary-execute "$qemu" -cpu cortex-a53 -L "$LUXIR_ARM64_SYSROOT" \
+    stage binary-execute "$qemu" -cpu max -L "$LUXIR_ARM64_SYSROOT" \
         build/arm64-release/bin/luxir --version
 fi
 echo "ARM64 executable: $repo_dir/build/arm64-release/bin/luxir"
