@@ -127,15 +127,31 @@ inline bool longitudeInRange(int32_t longitude, int32_t minLongitude,
       : longitude >= minLongitude || longitude <= maxLongitude;
 }
 
-inline double haversinSortKey(double lat1, double lon1,
+// The per-origin part of the haversine key, for callers measuring many points
+// from one origin.
+struct HaversinOrigin {
+  double lon = 0.0;
+  double x = 0.0;
+  double cosX = 1.0;
+
+  HaversinOrigin() = default;
+  HaversinOrigin(double lat, double lon)
+      : lon(lon), x(lat * (std::numbers::pi / 180.0)), cosX(std::cos(x)) {}
+};
+
+inline double haversinSortKey(const HaversinOrigin& origin,
                               double lat2, double lon2) {
-  double x1 = lat1 * (std::numbers::pi / 180.0);
   double x2 = lat2 * (std::numbers::pi / 180.0);
-  double h = (1.0 - std::cos(x1 - x2))
-      + std::cos(x1) * std::cos(x2)
-          * (1.0 - std::cos((lon1 - lon2) * (std::numbers::pi / 180.0)));
+  double h = (1.0 - std::cos(origin.x - x2))
+      + origin.cosX * std::cos(x2)
+          * (1.0 - std::cos((origin.lon - lon2) * (std::numbers::pi / 180.0)));
   uint64_t bits = std::bit_cast<uint64_t>(h) & UINT64_C(0xfffffffffffffff8);
   return std::bit_cast<double>(bits);
+}
+
+inline double haversinSortKey(double lat1, double lon1,
+                              double lat2, double lon2) {
+  return haversinSortKey(HaversinOrigin(lat1, lon1), lat2, lon2);
 }
 
 inline double haversinMeters(double sortKey) {

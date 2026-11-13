@@ -192,6 +192,66 @@ TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeSco
   EXPECT_EQ(resultScores(*baseline), resultScores(*nested));
 }
 
+// The fused form must give every doc the bits the interpreter gives it, and
+// leave missing values and failures to the interpreter.
+TEST_F(RescoreQueryTest, fusedProgramMatchesInterpreterBitForBit) {
+  CollectionHelper helper;
+  SplitMix64 rng(99);
+  auto unit = [&] { return (double)(rng() >> 11) * 0x1p-53; };
+  auto point = [&] {
+    return std::vector<double>{unit() * 360.0 - 180.0, unit() * 180.0 - 90.0};
+  };
+  auto points = [&] { return std::vector<std::vector<double>>{point(), point()}; };
+  for (int segment = 0; segment < 3; segment++) {
+    for (int i = 0; i < 700; i++) {
+      std::string id = std::to_string(segment) + "-" + std::to_string(i);
+      int64_t num = (int64_t)(rng() % 1000000);
+      double val = unit() * 100.0 - 50.0;
+      // Every field is absent from some docs.
+      switch (i % 4) {
+        case 0:
+          helper.index(flatdoc("id_s", id, "num_i", num, "val_d", val,
+                               "geo_p", point(), "geos_ps", points()));
+          break;
+        case 1: helper.index(flatdoc("id_s", id, "val_d", val, "geos_ps", points())); break;
+        case 2: helper.index(flatdoc("id_s", id, "num_i", num, "geo_p", point())); break;
+        default: helper.index(flatdoc("id_s", id)); break;
+      }
+    }
+    helper.commit();
+  }
+  auto run = [&](const std::string& expr, bool fused) {
+    BoundValueProgram::disableFusedForTests = !fused;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery("rescore(*:*, " + expr + ")")
+        .fields({"id_s"}).getScores().limit(-1);
+    req->execute(false);
+    BoundValueProgram::disableFusedForTests = false;
+    EXPECT_TRUE(req->ok()) << expr << ": " << req->errorMsg();
+    return std::pair{resultIds(*req), resultScores(*req)};
+  };
+  for (std::string expr : {
+           "mul(score, div(log(add(mul(1.2, def(num_i, 0)), 2)), 2.302585092994046))",
+           "add(def(val_d, 1.5), sqrt(abs(def(val_d, 2))))",
+           "exp(div(def(num_i, 3), 1000000))",
+           "max(pow(abs(def(val_d, 0)), 1.5), log1p(def(num_i, 0)))",
+           "gauss_decay(geo_distance(geo_p, 52.37, 4.89), 0, 500000, 0, 0.1)",
+           "exp_decay(geo_distance(geos_ps, -33.8, 151.2), 0, 2000000, 1000, 0.5)",
+           "mul(score, linear_decay(geo_distance(geos_ps, 0, 179.9), 0, 9000000, 0, 0.2))",
+           "gauss_decay(def(num_i, 500), 1000, 400000, 10, 0.3)",
+           "exp_decay(def(val_d, 0.5), 1.25, 30, 0, 0.5)",
+       }) {
+    auto [fusedIds, fusedScores] = run(expr, true);
+    auto [plainIds, plainScores] = run(expr, false);
+    ASSERT_EQ(plainIds, fusedIds) << expr;
+    ASSERT_EQ(plainScores.size(), fusedScores.size()) << expr;
+    for (size_t i = 0; i < plainScores.size(); i++) {
+      ASSERT_EQ(std::bit_cast<uint32_t>(plainScores[i]),
+                std::bit_cast<uint32_t>(fusedScores[i])) << expr << " rank " << i;
+    }
+  }
+}
+
 // A rescore matches whatever its child matched, so over *:* it inherits
 // "matches all docs" - but it reorders what it matched, so TopDocs must not
 // take the match-all shortcut of ranking the domain's first K in doc order.
