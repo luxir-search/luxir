@@ -15,8 +15,8 @@ concurrency:
 
 env:
   NIGHTLY_LEGS: >-
-    amd64/container-release amd64/container-release-v3 amd64/container-release-v4
-    amd64/container-debug amd64/container-asan arm64/container-release
+    linux-amd64/container-release linux-amd64/container-release-v3 linux-amd64/container-release-v4
+    linux-amd64/container-debug linux-amd64/container-asan linux-arm64/container-release macos-arm64/macos-release
 
 jobs:
   plan:
@@ -45,29 +45,32 @@ jobs:
     needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 360
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      LUXIR_DEV_IMAGE: ${{ matrix.image }}
+      LUXIR_DEV_IMAGE: ${{ matrix.dependency }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.plan.outputs.commit }}
           submodules: true
           persist-credentials: false
+      - name: Install native tools
+        if: matrix.platform == 'macos-arm64'
+        run: tools/macos-toolchain setup
       - name: Build, test, and package
         env:
           PRESET: ${{ matrix.preset }}
-        run: BUILD_JOBS=$(nproc) tools/nightly-build "$PRESET"
+        run: tools/nightly-build "$PRESET"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: nightly-${{ matrix.arch }}-${{ matrix.preset }}
-          path: build/nightly/${{ matrix.arch }}-${{ matrix.preset }}/
+          name: nightly-${{ matrix.platform }}-${{ matrix.preset }}
+          path: build/nightly/${{ matrix.platform }}-${{ matrix.preset }}/
           if-no-files-found: error
           retention-days: 14
 

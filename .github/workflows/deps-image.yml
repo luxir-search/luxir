@@ -13,6 +13,10 @@ on:
       - 'test/blas_lapack_test.cpp'
       - 'tools/benchmarks/deps-key.py'
       - 'tools/deps-image'
+      - 'tools/macos-*'
+      - 'tools/build-jobs'
+      - 'deps/make_deps.sh'
+      - 'deps/fetch_sources.sh'
       - '.github/workflows/deps-image.yml'
 
 permissions:
@@ -36,6 +40,23 @@ env:
 # untrusted refs and can write cache entries, so every published image
 # comes from a cold build. Use all CPUs on each native hosted runner.
 jobs:
+  macos:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: tools/macos-toolchain setup
+      - name: Build and publish native dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/macos-deps publish
+
   toolchain:
     strategy:
       fail-fast: false

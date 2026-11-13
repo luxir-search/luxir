@@ -197,6 +197,28 @@
         "VCPKG_TARGET_TRIPLET": "$env{LUXIR_CONTAINER_ASAN_TRIPLET}",
         "CMAKE_CXX_FLAGS_DEBUG": "-g1 -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
       }
+    },
+    {
+      "name": "macos-release",
+      "inherits": [
+        "base-native",
+        "base-release"
+      ],
+      "displayName": "macOS Apple silicon distributable release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "LUXIR_CPU_TARGET": "apple-m1",
+        "LUXIR_STATIC_RUNTIME": "ON",
+        "VCPKG_TARGET_TRIPLET": "arm64-osx-luxir-m1-release",
+        "VCPKG_HOST_TRIPLET": "arm64-osx-luxir-m1-release",
+        "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native-release",
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -g -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -g -DNDEBUG -ftrivial-auto-var-init=uninitialized"
+      }
     }
   ],
 
@@ -210,6 +232,7 @@
     {"name": "container-release", "configurePreset": "container-release"},
     {"name": "container-release-v3", "configurePreset": "container-release-v3"},
     {"name": "container-release-v4", "configurePreset": "container-release-v4"},
-    {"name": "container-asan", "configurePreset": "container-asan"}
+    {"name": "container-asan", "configurePreset": "container-asan"},
+    {"name": "macos-release", "configurePreset": "macos-release"}
   ]
 }

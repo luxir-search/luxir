@@ -26,7 +26,7 @@ selects them by host architecture and records the compilers' effective CPU
 options in the binary-cache ABI, preventing reuse across incompatible native CPU
 settings.
 triplets/x64-linux-luxir-v2*.cmake provide the container's x86-64-v2 baseline.
-triplets/arm64-osx-luxir-m1*.cmake serve macOS: a fixed apple-m1 and macOS 14
+triplets/arm64-osx-luxir-m1*.cmake serve macOS: a fixed apple-m1 and macOS 15
 baseline rather than the host CPU, so no fingerprint is needed and one install
 serves local builds and binaries for other Macs. They define _DARWIN_C_SOURCE
 for C++: libstdc++ declares C library functions that the SDK otherwise hides
