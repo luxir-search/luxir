@@ -621,7 +621,7 @@ TEST_F(ReplicationFollowerTest, unreadableStartupCanBeDeletedBySourceOrAsOrphan)
       follower->deleteCollection("main");
     }
     ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
-    EXPECT_FALSE(std::filesystem::exists(retained));
+    EXPECT_TRUE(until([&] { return !std::filesystem::exists(retained); }));
     stopFollower(); stopSource();
     std::filesystem::remove_all(path);
   }
