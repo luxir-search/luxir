@@ -3,7 +3,7 @@ name: Dependency image
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, macos-nightly]
     paths:
       - '.devcontainer/**'
       - 'deps/vcpkg.json'
@@ -41,7 +41,6 @@ env:
 # comes from a cold build. Use all CPUs on each native hosted runner.
 jobs:
   macos:
-    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 360
     permissions:
