@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: '37 6 * * *'
   workflow_dispatch:
+  push:
+    branches: [macos-nightly]
 
 permissions:
   contents: read
@@ -15,8 +17,7 @@ concurrency:
 
 env:
   NIGHTLY_LEGS: >-
-    linux-amd64/container-release linux-amd64/container-release-v3 linux-amd64/container-release-v4
-    linux-amd64/container-debug linux-amd64/container-asan linux-arm64/container-release macos-arm64/macos-release
+    macos-arm64/macos-release
 
 jobs:
   plan:
@@ -33,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          ref: macos-nightly
           persist-credentials: false
       - name: Test release assembly
         run: python3 tools/test-nightly
@@ -81,7 +82,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
       actions: read
     steps:
       # Only the release assembly script is needed. Do not fetch build sources
@@ -101,4 +102,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           COMMIT: ${{ needs.plan.outputs.commit }}
           IMAGE: ${{ needs.plan.outputs.image }}
-        run: python3 tools/nightly.py publish "$RUNNER_TEMP/nightly" "$COMMIT" "$IMAGE"
+        run: |
+          python3 - "$RUNNER_TEMP/nightly" "$COMMIT" "$IMAGE" <<'PY'
+          import sys
+          sys.path.insert(0, "tools")
+          import nightly
+          from pathlib import Path
+          assets, notes = nightly.assemble(Path(sys.argv[1]), sys.argv[2], sys.argv[3], nightly.configured_legs())
+          print(notes.read_text())
+          print(sorted(path.name for path in assets.iterdir()))
+          open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a").write(notes.read_text())
+          PY
