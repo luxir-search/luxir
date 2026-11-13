@@ -45,7 +45,8 @@ protected:
   void advance(std::chrono::milliseconds by) { elapsedMs += by.count(); }
   void SetUp() override {
     LuxirTest::SetUp();
-    path = std::filesystem::temp_directory_path() / ("luxir-follower-" + newUuid());
+    // Canonical, as the server reports it: macOS reaches its temporary directory through a symlink.
+    path = std::filesystem::canonical(std::filesystem::temp_directory_path()) / ("luxir-follower-" + newUuid());
     sourceConfig.store.backend = followerConfig.store.backend = "fs";
     sourceConfig.store.checked_dir.sync = followerConfig.store.checked_dir.sync = "throw";
     sourceConfig.store.data_dir = (path / "source").string();
