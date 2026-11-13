@@ -8,7 +8,9 @@ with the intended tag. Development continues on `main`.
 Use the [development container](container-build.md). Its Ubuntu 22.04 baseline
 keeps the minimum glibc version at 2.35. The three optimized executables target
 x86-64-v2, v3, and v4; dependencies share the v2 baseline and retain their
-runtime-selected kernels. Debug and ASan downloads target v2.
+runtime-selected kernels. Debug and ASan x86 downloads target v2. Native
+ARM64 uses the same `container-release` preset and targets `armv8-a` on
+Ubuntu 22.04. Run only the baseline presets on ARM64; v3/v4 are x86-only.
 
 ## Build and validate
 
@@ -50,7 +52,7 @@ families. First verify the checker rejects deliberate forbidden instructions.
 
 `tools/package-release` requires a clean checkout and an up-to-date build. It
 packages the tested executable, checking its version, embedded source commit,
-required-ISA note, dynamic libraries, and glibc symbol requirements. It does not
+x86 required-ISA note, dynamic libraries, and glibc symbol requirements. It does not
 replace the test and CPU validation above. Record the immutable builder image:
 
 ```bash
@@ -69,6 +71,14 @@ are named `luxir-0.1.0-linux-x86_64-v2`, `-v3`, and `-v4`, without an archive
 suffix. They are byte-for-byte identical to the executables inside the
 corresponding archives, and are included in the checksums. Downloading one
 requires only `chmod +x` before running it; no unpacking is needed.
+
+ARM64 packaging writes `luxir-<version>-linux-aarch64`, its `.tar.gz`,
+and a matching `-symbols.tar.gz`, without a CPU tier suffix. Debug and ASan
+packaging supports `-debug` and `-asan` suffixes. It checks the AArch64 loader
+and the same glibc <= 2.35 and runtime library limits; ARM64 has no x86 ISA-note
+check. On ARM64 run the packaging command for `container-release` only for
+the nightly asset set. All packages written into the output directory are
+covered by `SHA256SUMS`.
 
 Each executable package contains its build manifest, installed
 dependency inventory, license notices, API definitions, and guides. The
@@ -103,17 +113,20 @@ can dispatch manually to publish to their own repository.
 
 The rolling `nightly` prerelease contains the Linux x86-64 v2, v3, and v4
 optimized executables, executable and symbol archives, v2 Debug and ASan
-archives, and one combined `SHA256SUMS`. Names retain the source version, so
+archives, the ARM64 release executable and its executable/symbol archives,
+and one combined `SHA256SUMS`. Names retain the source version, so
 use the release commit and packaged manifests to identify a particular nightly.
-The keyed dependency image must already have been published by `deps-image.yml`.
+Both keyed dependency images (`<key>-amd64` and `<key>-arm64`) must already
+have been published by `deps-image.yml`. Missing either image fails planning.
+These public images are pulled without registry sign-in.
 
 Tests are advisory: each leg records all three test binaries' statuses and
 output in its workflow artifact and job summary. Unsupported CPU tiers are
 reported as `not run on this CPU`; containers use the hosted runner's CPU.
-Release notes list the commit, builder images, and per-preset test results.
+Release notes list the commit, builder images, and per-(architecture, preset) test results.
 Artifacts and full logs are retained for 14 days.
 
-Every preset must build and package successfully or nothing is published and
+Every (architecture, preset) leg must build and package successfully or nothing is published and
 the previous nightly remains intact. Assets are uploaded to a staging draft
 before replacing the previous release and moving the `nightly` tag. GitHub
 does not offer an atomic release/tag replacement: a failure during the final
@@ -125,6 +138,6 @@ must not be enabled for this rolling prerelease.
 For local execution of one leg from a clean checkout with initialized
 submodules, set `LUXIR_DEV_IMAGE` to the keyed registry image and run
 `BUILD_JOBS=$(nproc) tools/nightly-build container-release`. Use a fresh
-`build/nightly/container-release` output directory for each run. Packaging
+`build/nightly/amd64-container-release` (or `arm64-container-release`) output directory for each run. Packaging
 checks embedded metadata without execution on CPUs that cannot run the selected
 tier; the manifest records whether the runtime version check was performed.

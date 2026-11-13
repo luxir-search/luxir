@@ -24,17 +24,20 @@ class NightlyTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.commit = "a" * 40
-        self.presets = ("container-release", "container-debug")
+        self.presets = ("amd64/container-release", "amd64/container-debug", "arm64/container-release")
         os.environ.setdefault("GITHUB_REPOSITORY", "luxir-search/luxir")
         os.environ.setdefault("GITHUB_RUN_ID", "123")
-        for preset, status in zip(self.presets, ("fail", "not run on this CPU")):
-            leg = self.root / f"nightly-{preset}"
+        for leg_id, status in zip(self.presets, ("fail", "not run on this CPU", "pass")):
+            arch, preset = nightly.split_leg(leg_id)
+            leg = self.root / f"nightly-{arch}-{preset}"
             (leg / "assets").mkdir(parents=True)
-            asset = leg / "assets" / f"luxir-0.1.0-linux-x86_64-v2-{preset}.tar.gz"
+            asset_arch = "aarch64" if arch == "arm64" else "x86_64-v2"
+            suffix = "-debug" if preset == "container-debug" else ""
+            asset = leg / "assets" / f"luxir-0.1.0-linux-{asset_arch}{suffix}.tar.gz"
             asset.write_bytes(preset.encode())
             (leg / "assets/SHA256SUMS").write_text(f"{nightly.digest(asset)}  {asset.name}\n")
             (leg / "result.json").write_text(json.dumps({
-                "preset": preset, "commit": self.commit, "subject": "Fixture", "date": "2026-11-11",
+                "architecture": arch, "preset": preset, "commit": self.commit, "subject": "Fixture", "date": "2026-11-11",
                 "builder_image": "sha256:" + "b" * 64,
                 "tests": {binary: {"status": status, "exit_code": 1 if status == "fail" else None}
                           for binary in nightly.TESTS}}))
@@ -44,7 +47,7 @@ class NightlyTest(unittest.TestCase):
 
     def test_advisory_results_and_combined_checksums(self):
         assets, notes = self.assemble()
-        self.assertEqual(len(list(assets.iterdir())), 3)
+        self.assertEqual(len(list(assets.iterdir())), 4)
         for line in (assets / "SHA256SUMS").read_text().splitlines():
             checksum, name = line.split("  ")
             self.assertEqual(nightly.digest(assets / name), checksum)
@@ -52,7 +55,7 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("| fail |", notes.read_text())
 
     def test_missing_preset_blocks_assembly(self):
-        (self.root / "nightly-container-debug/result.json").unlink()
+        (self.root / "nightly-amd64-container-debug/result.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.assemble()
 
@@ -62,14 +65,47 @@ class NightlyTest(unittest.TestCase):
             self.assemble()
 
     def test_corruption_blocks_assembly(self):
-        next((self.root / "nightly-container-debug/assets").glob("luxir-*")).write_bytes(b"corrupt")
+        next((self.root / "nightly-amd64-container-debug/assets").glob("luxir-*")).write_bytes(b"corrupt")
         with self.assertRaisesRegex(ValueError, "Corrupt"):
             self.assemble()
 
     def test_missing_asset_blocks_assembly(self):
-        next((self.root / "nightly-container-debug/assets").glob("luxir-*")).unlink()
+        next((self.root / "nightly-amd64-container-debug/assets").glob("luxir-*")).unlink()
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             self.assemble()
+
+    def test_missing_arm64_blocks_assembly(self):
+        (self.root / "nightly-arm64-container-release/result.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.assemble()
+
+    def test_wrong_architecture_blocks_assembly(self):
+        path = self.root / "nightly-arm64-container-release/result.json"
+        report = json.loads(path.read_text())
+        report["architecture"] = "amd64"
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            self.assemble()
+
+    def test_failure_excerpt(self):
+        log = ("I 01:02:03.4 T8 a.cpp:1 noise\n/w/A.cpp:6: Failure\nExpected: false\n\n"
+               "I 01:02:03.5 T8 a.cpp:1 noise\n[  FAILED  ] A.b\n[  PASSED  ] 2 tests.\n")
+        self.assertEqual(nightly.failures(log), "/w/A.cpp:6: Failure\nExpected: false\n[  FAILED  ] A.b\n")
+        self.assertEqual(nightly.failures("noise\nAborted\n"), "noise\nAborted\n")
+
+    def test_architecture_policy(self):
+        sys.path.insert(0, str(Path(__file__).parent))
+        from release_support import architecture
+        arm = architecture("armv8-a")
+        self.assertEqual(arm.package_name("1.0", "armv8-a", ""), "luxir-1.0-linux-aarch64")
+        self.assertEqual(arm.package_name("1.0", "armv8-a", "-asan"), "luxir-1.0-linux-aarch64-asan")
+        self.assertEqual(Path(arm.loader).name, "ld-linux-aarch64.so.1")
+        self.assertFalse(arm.isa_notes)
+        x86 = architecture("x86-64-v3")
+        self.assertEqual(x86.package_name("1.0", "x86-64-v3", ""), "luxir-1.0-linux-x86_64-v3")
+        self.assertTrue(x86.isa_notes)
+        with self.assertRaises(ValueError):
+            nightly.split_leg("riscv64/container-release")
 
     def test_unchanged_main_skips_lightweight_and_annotated_tags(self):
         repo = self.root / "repo"
@@ -89,10 +125,36 @@ class NightlyTest(unittest.TestCase):
             output.write_text("")
             subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo, check=True,
                            env=dict(os.environ, GITHUB_EVENT_NAME="schedule", GITHUB_OUTPUT=str(output),
-                                    NIGHTLY_PRESETS=" ".join(self.presets)))
+                                    NIGHTLY_LEGS=" ".join(self.presets)))
             self.assertIn("build=false\n", output.read_text())
             self.assertIn(f"commit={git('rev-parse', 'HEAD')}\n", output.read_text())
             git("tag", "-d", "nightly")
+        # Real command fixtures exercise plan without a registry or Docker.
+        helper = repo / "tools/benchmarks/deps-key.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("print('fixture-key')\n")
+        commands = repo / "commands"
+        commands.mkdir()
+        docker = commands / "docker"
+        docker.write_text('#!/bin/sh\ncase "$3" in *-arm64) exit 1 ;; esac\n')
+        docker.chmod(0o755)
+        env = dict(os.environ, GITHUB_EVENT_NAME="workflow_dispatch",
+                   GITHUB_OUTPUT=str(output), NIGHTLY_LEGS=" ".join(self.presets),
+                   GITHUB_REPOSITORY_OWNER="Luxir-Search",
+                   PATH=str(commands) + os.pathsep + os.environ["PATH"])
+        failed = subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo,
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fixture-key-arm64", failed.stderr)
+        docker.write_text("#!/bin/sh\nexit 0\n")
+        output.write_text("")
+        subprocess.run([sys.executable, nightly.__file__, "plan"], cwd=repo, env=env, check=True)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        matrix = json.loads(values["matrix"])["include"]
+        self.assertEqual(len(matrix), 3)
+        self.assertEqual(matrix[-1]["runner"], "ubuntu-24.04-arm")
+        self.assertTrue(matrix[-1]["image"].endswith("fixture-key-arm64"))
+
 
 
 if __name__ == "__main__":

@@ -6,7 +6,12 @@ set -euo pipefail
 check_dir=$(mktemp -d)
 trap 'rm -rf "$check_dir"' EXIT
 source_dir=$(cd "$(dirname "$0")" && pwd)
-flags=(-std=c++26 -g -O1 -march=x86-64-v2 -mtune=generic
+case "$(uname -m)" in
+  x86_64) loader=ld-linux-x86-64.so.2 ;;
+  aarch64) loader=ld-linux-aarch64.so.1 ;;
+  *) exit 2 ;;
+esac
+flags=(-std=c++26 -g -O1 -march=${LUXIR_CONTAINER_CPU} -mtune=generic
        -fopenmp -static-libstdc++ -static-libgcc -Wl,--as-needed)
 g++ "${flags[@]}" "$source_dir/check-toolchain.cpp" \
   -Wl,-Bstatic -lgomp -Wl,-Bdynamic -o "$check_dir/normal"
@@ -18,7 +23,7 @@ for executable in "$check_dir/normal" "$check_dir/asan"; do
   OMP_NUM_THREADS=2 "$executable"
   readelf --version-info "$executable" > "$check_dir/versions"
   readelf --dynamic "$executable" > "$check_dir/dynamic"
-  python3 - "$check_dir/versions" "$check_dir/dynamic" <<'PY'
+  python3 - "$check_dir/versions" "$check_dir/dynamic" "$loader" <<'PY'
 import pathlib, re, sys
 versions = pathlib.Path(sys.argv[1]).read_text()
 required = {tuple(map(int, v.split('.')))
@@ -26,10 +31,18 @@ required = {tuple(map(int, v.split('.')))
 assert max(required) <= (2, 35), sorted(required)
 dynamic = pathlib.Path(sys.argv[2]).read_text()
 needed = re.findall(r'\(NEEDED\).*\[(.*?)\]', dynamic)
-assert set(needed) <= {'libc.so.6', 'libm.so.6', 'ld-linux-x86-64.so.2'}, needed
+assert set(needed) <= {'libc.so.6', 'libm.so.6', sys.argv[3]}, needed
 print('Runtime check:', needed, 'maximum GLIBC', max(required))
 PY
 done
+
+# Dependency build tools such as protoc link the shared runtime.
+g++ -std=c++26 -fopenmp "$source_dir/check-toolchain.cpp" -o "$check_dir/shared"
+ldd "$check_dir/shared" > "$check_dir/libraries"
+for library in libstdc++.so.6 libgcc_s.so.1 libgomp.so.1; do
+  grep -q "$library => /opt/gcc/" "$check_dir/libraries" || { cat "$check_dir/libraries"; exit 1; }
+done
+OMP_NUM_THREADS=2 "$check_dir/shared"
 
 if ASAN_OPTIONS=allow_addr2line=1 "$check_dir/asan" 4 > "$check_dir/report" 2>&1; then
   echo 'ASan failed to detect the deliberate buffer overflow' >&2

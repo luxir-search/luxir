@@ -140,9 +140,9 @@
       "cacheVariables": {
         "VCPKG_MANIFEST_MODE": "OFF",
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed",
-        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2",
-        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-v2",
-        "LUXIR_CPU_TARGET": "x86-64-v2",
+        "VCPKG_TARGET_TRIPLET": "$env{LUXIR_CONTAINER_TRIPLET}",
+        "VCPKG_HOST_TRIPLET": "$env{LUXIR_CONTAINER_TRIPLET}",
+        "LUXIR_CPU_TARGET": "$env{LUXIR_CONTAINER_CPU}",
         "LUXIR_STATIC_RUNTIME": "ON",
         "CMAKE_C_FLAGS_DEBUG": "-g -Og -fno-omit-frame-pointer",
         "CMAKE_C_FLAGS_RELEASE": "-O3 -g -DNDEBUG"
@@ -174,12 +174,14 @@
       "name": "container-release-v3",
       "inherits": "container-release",
       "displayName": "Ubuntu 22.04 GCC release (x86-64-v3)",
+      "condition": {"type": "equals", "lhs": "$env{LUXIR_CONTAINER_CPU}", "rhs": "x86-64-v2"},
       "cacheVariables": {"LUXIR_CPU_TARGET": "x86-64-v3"}
     },
     {
       "name": "container-release-v4",
       "inherits": "container-release",
       "displayName": "Ubuntu 22.04 GCC release (x86-64-v4)",
+      "condition": {"type": "equals", "lhs": "$env{LUXIR_CONTAINER_CPU}", "rhs": "x86-64-v2"},
       "cacheVariables": {"LUXIR_CPU_TARGET": "x86-64-v4"}
     },
     {
@@ -192,7 +194,7 @@
       "displayName": "Ubuntu 22.04 GCC asan",
       "cacheVariables": {
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-asan",
-        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2-asan",
+        "VCPKG_TARGET_TRIPLET": "$env{LUXIR_CONTAINER_ASAN_TRIPLET}",
         "CMAKE_CXX_FLAGS_DEBUG": "-g1 -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
       }
     }

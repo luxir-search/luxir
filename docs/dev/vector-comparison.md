@@ -17,23 +17,29 @@ counts answer different questions from HTTP p50/p99 and total index size here.
 
 The [Dependency image workflow](../../.github/workflows/deps-image.yml) builds
 `.devcontainer/Dockerfile` through `dev`. It publishes
-`ghcr.io/<repository-owner>/luxir-dev:<key>` and skips a tag that already exists.
-A cold build of both dependency variants exceeds a hosted job's six-hour limit,
-so one job publishes the normal dependency stage as `<key>-normal` and a second
-builds the ASan dependencies and the `dev` image on it.
-The key is a SHA-256 of all four Dockerfile stages and their declared
+`ghcr.io/<repository-owner>/luxir-dev:<key>-<arch>` and skips a tag that already exists.
+A cold build exceeds a hosted job's six-hour limit, so three chained jobs
+publish the toolchain (`<key>-<arch>-toolchain`), the normal dependencies
+(`<key>-<arch>-normal`), and the `dev` image with the ASan dependencies.
+The key is a SHA-256 of all seven Dockerfile stages and their declared
 COPY inputs. Compiler, base image, vcpkg pins, ports, triplets, build checks,
 ASan dependencies, and final development setup therefore participate; engine
 source and build concurrency do not. Unknown COPY/ADD contracts fail so the helper must be reviewed when
 the Dockerfile layout changes. Ignore rules are validated by Docker at build
 time, rather than included in dependency identity.
 
+Each architecture publishes independently on its native hosted runner.
+`compare-refs` selects `amd64` or `arm64` from the local host architecture.
+
 The image includes normal and ASan dependencies and the development environment.
 Use it directly with the wrapper:
 
 ```bash
 key=$(python3 tools/benchmarks/deps-key.py .)
-export LUXIR_DEV_IMAGE="ghcr.io/<repository-owner>/luxir-dev:$key"
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
+esac
+export LUXIR_DEV_IMAGE="ghcr.io/<repository-owner>/luxir-dev:$key-$arch"
 docker pull "$LUXIR_DEV_IMAGE"
 ./tools/dev-container cmake --preset container-release
 ./tools/dev-container cmake --build --preset container-release --target luxir
@@ -184,5 +190,5 @@ need their own repeatability checks. The full development
 image, two source builds, and dataset need substantial disk space;
 hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent
-all search workloads. Native ARM, cold-cache performance, and ASan results are
+all search workloads. Cold-cache performance and ASan results are
 outside this workflow.

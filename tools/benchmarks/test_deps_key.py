@@ -9,10 +9,14 @@ spec = importlib.util.spec_from_file_location('deps_key', Path(__file__).with_na
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-DOCKERFILE = '''ARG NORMAL_DEPENDENCIES=normal-dependencies
-FROM ubuntu:22.04 AS toolchain
+DOCKERFILE = '''ARG TOOLCHAIN=toolchain
+ARG NORMAL_DEPENDENCIES=normal-dependencies
+FROM ubuntu:22.04 AS base
+FROM base AS gcc-amd64
+FROM base AS gcc-arm64
+FROM gcc-${TARGETARCH} AS toolchain
 COPY .devcontainer/check-toolchain.cpp .devcontainer/check-toolchain.sh /opt/luxir-checks/
-FROM toolchain AS normal-dependencies
+FROM ${TOOLCHAIN} AS normal-dependencies
 COPY deps/vcpkg.json deps/vcpkg-configuration.json /opt/luxir-deps/
 COPY deps/ports /opt/luxir-deps/ports
 COPY deps/triplets /opt/luxir-deps/triplets
@@ -20,7 +24,7 @@ ARG BUILD_JOBS=12
 COPY test/blas_lapack_test.cpp /opt/luxir-checks/check-lapack.cpp
 FROM ${NORMAL_DEPENDENCIES} AS dependencies
 RUN echo later-stage
-FROM toolchain AS dev
+FROM ${TOOLCHAIN} AS dev
 COPY --from=dependencies /opt/vcpkg /opt/vcpkg
 COPY --from=dependencies /opt/luxir-deps /opt/luxir-deps
 RUN apt-get install wamerican
@@ -61,6 +65,8 @@ class KeyContract(unittest.TestCase):
             self.assertNotEqual(key, module.deps_key(root))
             for old, new in [('RUN apt-get install wamerican', 'RUN apt-get install other'),
                              ('AS dev', 'AS other'),
+                             ('base AS gcc-arm64', 'gcc-amd64 AS gcc-arm64'),
+                             ('gcc-${TARGETARCH} AS toolchain', 'gcc-amd64 AS toolchain'),
                              ('--from=dependencies /opt/vcpkg', '--from=toolchain /opt/vcpkg'),
                              ('FROM ${NORMAL_DEPENDENCIES}', 'FROM toolchain'),
                              ('ARG NORMAL_DEPENDENCIES=normal-dependencies', 'ARG NORMAL_DEPENDENCIES=toolchain')]:

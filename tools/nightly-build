@@ -10,7 +10,10 @@ case "$preset" in
   *) echo "Unsupported nightly preset: $preset" >&2; exit 2 ;;
 esac
 : "${LUXIR_DEV_IMAGE:?keyed dependency image required}"
-output="build/nightly/$preset"
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
+esac
+output="build/nightly/$arch-$preset"
 [[ ! -e $output ]] || { echo "Use a fresh output directory: $output" >&2; exit 2; }
 mkdir -p "$output"
 ./deps/fetch_sources.sh

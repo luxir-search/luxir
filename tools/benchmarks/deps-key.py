@@ -9,14 +9,16 @@ from pathlib import Path
 def deps_key(root):
     root = Path(root)
     dockerfile = (root / '.devcontainer/Dockerfile').read_text()
-    # The dev target uses all four stages, including both dependency variants.
-    # Require the reviewed graph; a new stage or changed edge needs key review.
+    # Review every stage edge, including architecture selection and fan-in.
     stages = re.findall(r'^FROM (.+)$', dockerfile, re.M)
-    if (len(stages) != 4 or not stages[0].endswith(' AS toolchain')
-            or stages[1:] != ['toolchain AS normal-dependencies',
-                              '${NORMAL_DEPENDENCIES} AS dependencies', 'toolchain AS dev']
-            or re.findall(r'^ARG NORMAL_DEPENDENCIES\b.*$', dockerfile, re.M)
-            != ['ARG NORMAL_DEPENDENCIES=normal-dependencies']):
+    if (len(stages) != 7 or not stages[0].endswith(' AS base')
+            or stages[1:] != ['base AS gcc-amd64', 'base AS gcc-arm64',
+                              'gcc-${TARGETARCH} AS toolchain',
+                              '${TOOLCHAIN} AS normal-dependencies',
+                              '${NORMAL_DEPENDENCIES} AS dependencies',
+                              '${TOOLCHAIN} AS dev']
+            or re.findall(r'^ARG (?:TOOLCHAIN|NORMAL_DEPENDENCIES)\b.*$', dockerfile, re.M)
+            != ['ARG TOOLCHAIN=toolchain', 'ARG NORMAL_DEPENDENCIES=normal-dependencies']):
         raise ValueError('Dockerfile stage graph changed; review deps-key.py')
     stage = dockerfile
     copies = re.findall(r'^[ \t]*COPY[ \t]+(.+)$', stage, re.M | re.I)

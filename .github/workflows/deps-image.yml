@@ -25,45 +25,54 @@ concurrency:
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
 
-# A cold build of both dependency variants exceeds one hosted job's six hours,
-# so each variant gets its own job. The first publishes its stage as
-# <key>-normal; the second builds the ASan variant and the dev image on it.
+# A cold build exceeds one hosted job's six hours, so the image builds as three
+# chained jobs per architecture: the toolchain (ARM64 compiles GCC), the normal
+# dependencies, then the ASan dependencies and the dev image. Each publishes
+# its stage (<key>-<arch>-toolchain, <key>-<arch>-normal, <key>-<arch>) and the
+# next builds on it. Architectures are independent: a job runs whatever its
+# predecessor's outcome and fails by itself if the stage it needs is missing.
 #
 # No Actions cache: other workflows in this repository build and run
 # untrusted refs and can write cache entries, so every published image
-# comes from a cold build. Hosted runners count two cores; use all CPUs.
+# comes from a cold build. Use all CPUs on each native hosted runner.
 jobs:
-  normal:
-    runs-on: ubuntu-24.04
+  toolchain:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     permissions:
       contents: read
       packages: write
-    outputs:
-      image: ${{ steps.image.outputs.image }}
-      exists: ${{ steps.image.outputs.exists }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Test key contract
         run: python3 -m unittest discover -s tools/benchmarks -p 'test_deps_key.py'
-      - name: Compute key and check existing tags
-        id: image
+      - name: Build and publish stage
         env:
           GH_TOKEN: ${{ github.token }}
-        run: tools/deps-image plan
-      - name: Build and publish normal dependencies
-        if: steps.image.outputs.exists != 'true' && steps.image.outputs.normal_exists != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE: ${{ steps.image.outputs.image }}
-        run: tools/deps-image build normal-dependencies "$IMAGE-normal"
+        run: tools/deps-image toolchain
 
-  publish:
-    needs: normal
-    if: needs.normal.outputs.exists != 'true'
-    runs-on: ubuntu-24.04
+  normal:
+    needs: toolchain
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     permissions:
       contents: read
@@ -72,8 +81,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Build and publish development image
+      - name: Test key contract
+        run: python3 -m unittest discover -s tools/benchmarks -p 'test_deps_key.py'
+      - name: Build and publish stage
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE: ${{ needs.normal.outputs.image }}
-        run: tools/deps-image build dev "$IMAGE" --build-arg "NORMAL_DEPENDENCIES=$IMAGE-normal"
+        run: tools/deps-image normal-dependencies
+
+  publish:
+    needs: normal
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test key contract
+        run: python3 -m unittest discover -s tools/benchmarks -p 'test_deps_key.py'
+      - name: Build and publish stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/deps-image dev

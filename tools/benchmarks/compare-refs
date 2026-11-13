@@ -10,6 +10,9 @@ harness=$(cd "$(dirname "$0")" && pwd)
 : "${WORK_DIR:?fresh work directory required}"
 python=${BENCH_PYTHON:-python3}
 settings=${CANDIDATE_FIELD_SETTINGS:-'{}'}
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
+esac
 mkdir "$WORK_DIR"
 cd "$WORK_DIR"
 mkdir evidence
@@ -28,7 +31,7 @@ for variant in base candidate; do
   git -C "$variant" rev-parse HEAD > "evidence/$variant-revision.txt"
   key=$("$python" "$harness/deps-key.py" "$variant")
   echo "$key" > "evidence/$variant-deps-key.txt"
-  image="${DEPS_REGISTRY,,}:$key"
+  image="${DEPS_REGISTRY,,}:$key-$arch"
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     if ! timeout 60 docker manifest inspect "$image" >/dev/null; then
       echo "Missing $image. Publish reviewed dependency inputs with deps-image.yml first." >&2
@@ -37,13 +40,13 @@ for variant in base candidate; do
   fi
 done
 sort -u evidence/*-deps-key.txt | while read -r key; do
-  image="${DEPS_REGISTRY,,}:$key"
+  image="${DEPS_REGISTRY,,}:$key-$arch"
   docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
 done
 lscpu > evidence/lscpu.txt
 for variant in base candidate; do
   cd "$WORK_DIR/$variant"
-  LUXIR_DEV_IMAGE="${DEPS_REGISTRY,,}:$(cat "$WORK_DIR/evidence/$variant-deps-key.txt")"
+  LUXIR_DEV_IMAGE="${DEPS_REGISTRY,,}:$(cat "$WORK_DIR/evidence/$variant-deps-key.txt")-$arch"
   export LUXIR_DEV_IMAGE
   git submodule update --init
   ./deps/fetch_sources.sh

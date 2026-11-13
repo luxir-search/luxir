@@ -3,7 +3,8 @@
 The development image uses Ubuntu 22.04 (glibc 2.35), GCC 16.2, CMake 4.4.3,
 Ninja, ccache, and one pinned vcpkg checkout. It contains normal and
 AddressSanitizer dependencies, each with Debug and Release libraries.
-Linux x86-64 is the current target.
+Linux x86-64 and native Linux ARM64 are supported. GitHub builds them on
+`ubuntu-24.04` and `ubuntu-24.04-arm`, respectively.
 
 The two installs live at `/opt/vcpkg/installed` and `/opt/vcpkg/installed-asan`
 in the same checkout. They share source pins and the build's binary cache.
@@ -41,8 +42,9 @@ and a symbolized deliberate ASan error on Ubuntu 22.04. It also checks all ten
 LAPACK entry points referenced by FAISS, including numerical reconstruction.
 
 Compiler and CMake archives are verified against recorded checksums, and the
-Ubuntu base is pinned by image digest. The compiler is a prebuilt Compiler
-Explorer archive. Ubuntu packages receive current security updates when that
+Ubuntu base is pinned by image digest. On x86-64 the compiler is a prebuilt Compiler
+Explorer archive; ARM64 builds the GCC 16.2.0 release source with a recorded
+SHA-512 checksum in its own stage. CMake uses a checksum-verified native archive. Ubuntu packages receive current security updates when that
 apt layer is rebuilt; the Dockerfile is not a bit-for-bit reproducibility claim.
 The vcpkg source pin is `builtin-baseline` in [the manifest](../../deps/vcpkg.json).
 The FAISS and OpenBLAS overlays retain the upstream port structure and patches.
@@ -93,15 +95,22 @@ mounts resolve.
 
 ## CPU targets and runtime libraries
 
-The container presets compile Luxir at `x86-64-v2`, including vendored C/C++
-sources. Change only the engine target for a separate experiment:
+The image exports `LUXIR_CONTAINER_TRIPLET`, `LUXIR_CONTAINER_ASAN_TRIPLET`,
+and `LUXIR_CONTAINER_CPU`. The same `container-debug`, `container-release`,
+and `container-asan` presets read them: x86 uses `x64-linux-luxir-v2` and
+`x86-64-v2`; ARM64 uses `arm64-linux-luxir-v8` and `armv8-a`. Both use generic
+tuning and provide Debug and Release dependencies. The ASan triplets append
+`-asan`. The native ARM container path is separate from the
+[cross build](arm64-build.md).
+
+On x86, change only the engine target for a separate experiment:
 
 ```bash
 ./tools/dev-container cmake --preset container-release -B build/container-v3 -DLUXIR_CPU_TARGET=x86-64-v3
 ./tools/dev-container cmake --build build/container-v3
 ```
 
-Dependencies stay at v2. FAISS and OpenBLAS contain runtime-selected kernels.
+Dependencies stay at the image baseline. FAISS and OpenBLAS contain runtime-selected kernels.
 The OpenBLAS overlay includes C LAPACK with 32-bit LAPACK integers and keeps
 BLAS single-threaded, with locking for concurrent callers. Its ASan build
 excludes AVX-512 OpenBLAS kernels because GCC cannot instrument their inline
@@ -127,7 +136,7 @@ are omitted from the image; retrieve the matching sources when
 stepping into them in GDB.
 
 `container-release-v3` and `container-release-v4` select the other optimized
-CPU tiers. See [Building a release](releases.md) for packaging, symbols, and
+CPU tiers on x86 only. See [Building a release](releases.md) for packaging, symbols, and
 CPU compatibility validation.
 
 ## Share an already-built environment
@@ -143,20 +152,27 @@ gunzip -c luxir-dev-jammy-gcc16.tar.gz | docker load
 They still initialize the source checkout and run the same wrapper commands.
 An image can also be stored in a registry; set `LUXIR_DEV_IMAGE` to its pinned
 registry digest. The Dependency image workflow publishes the full `dev` target
-as `ghcr.io/<repository-owner>/luxir-dev:<key>`. For a matching checkout, compute
+as `ghcr.io/<repository-owner>/luxir-dev:<key>-<arch>`. For a matching checkout, compute
 the key and use the published image to skip the first dependency build:
 
 ```bash
 key=$(python3 tools/benchmarks/deps-key.py .)
-export LUXIR_DEV_IMAGE="ghcr.io/luxir-search/luxir-dev:$key"
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
+esac
+export LUXIR_DEV_IMAGE="ghcr.io/luxir-search/luxir-dev:$key-$arch"
 docker pull "$LUXIR_DEV_IMAGE"
 ./tools/dev-container cmake --preset container-release
 ```
 
 Use the publishing fork's owner instead of `luxir-search` when testing a fork.
-The key covers all four Dockerfile stages and their copied inputs, including
+The key covers all seven Dockerfile stages and their copied inputs, including
 ASan dependencies; only the `BUILD_JOBS` default is normalized. The workflow
-skips existing tags. No registry publication is part of the local build.
+skips existing tags independently for `amd64` and `arm64`. Each architecture
+publishes `<key>-<arch>-toolchain`, then `<key>-<arch>-normal`, then the final
+image with the ASan dependencies, each in its own job built on the stage before
+it, so GCC is compiled once and no job exceeds the hosted time limit. A failure
+on one architecture does not block the other from publishing. No registry publication is part of the local build.
 
 When updating dependencies, change the manifest baseline, review the overlay
 ports against that checkout, and rebuild/test the image. Native builds share

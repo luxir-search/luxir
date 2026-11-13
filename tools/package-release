@@ -15,7 +15,7 @@ import tempfile
 
 # Packaging requires a clean source tree, including when importing helpers.
 sys.dont_write_bytecode = True
-from release_support import cpu_supported
+from release_support import architecture, cpu_supported
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -79,12 +79,14 @@ def main():
     tier = cache["LUXIR_CPU_TARGET"]
     config = cache["CMAKE_BUILD_TYPE"]
     asan = "-fsanitize=address" in cache["CMAKE_CXX_FLAGS"]
-    if tier not in ("x86-64-v2", "x86-64-v3", "x86-64-v4"):
-        parser.error("release packaging requires an explicit CPU tier")
+    try:
+        arch = architecture(tier)
+    except StopIteration:
+        parser.error("release packaging requires an explicit CPU target")
     if cache.get("LUXIR_STATIC_RUNTIME") != "ON" or config not in ("Release", "Debug"):
         parser.error("use a container Release or Debug configuration with static runtimes")
-    if (asan or config == "Debug") and tier != "x86-64-v2":
-        parser.error("public diagnostic packages use x86-64-v2")
+    if (asan or config == "Debug") and tier != arch.tiers[0]:
+        parser.error("public diagnostic packages use the architecture baseline")
     if asan and config != "Debug":
         parser.error("public ASan packages use Debug")
 
@@ -116,11 +118,15 @@ def main():
         print(f"Skipping --version: {tier} not supported on this CPU; checked embedded metadata")
     notes = run("readelf", "-n", str(binary))
     needed_tiers = re.findall(r"x86-64-v[234]", notes)
-    if not needed_tiers or max(needed_tiers) != tier:
+    if arch.isa_notes and (not needed_tiers or max(needed_tiers) != tier):
         parser.error("the executable's required ISA note does not match its CPU tier")
+    interpreter = re.search(r"Requesting program interpreter: (.*?)\]",
+                            run("readelf", "-l", str(binary)))
+    if not interpreter or interpreter[1] != arch.loader:
+        parser.error("the executable loader does not match its architecture")
     dynamic = run("readelf", "-d", str(binary))
     libraries = re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic)
-    if set(libraries) - {"libc.so.6", "libm.so.6", "ld-linux-x86-64.so.2"}:
+    if set(libraries) - {"libc.so.6", "libm.so.6", pathlib.Path(arch.loader).name}:
         parser.error(f"unexpected runtime libraries: {libraries}")
     versions = re.findall(r"\bGLIBC_(\d+)\.(\d+)(?:\.(\d+))?\b",
                           run("readelf", "--version-info", str(binary)))
@@ -129,7 +135,7 @@ def main():
         parser.error(f"glibc requirement exceeds 2.35: {glibc}")
 
     suffix = "-asan" if asan else "-debug" if config == "Debug" else ""
-    name = f"luxir-{version}-linux-x86_64-{tier.rsplit('-', 1)[1]}{suffix}"
+    name = arch.package_name(version, tier, suffix)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     archive_names = [name] + ([name + "-symbols"] if config == "Release" else [])
@@ -149,7 +155,7 @@ def main():
         "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
         "builder_image": args.builder_image,
         "compiler": run(cache["CMAKE_CXX_COMPILER"], "--version").splitlines()[0],
-        "cpu_target": tier, "build_type": config, "address_sanitizer": asan,
+        "architecture": arch.name, "cpu_target": tier, "build_type": config, "address_sanitizer": asan,
         "build_id": build_id(binary), "minimum_glibc": "2.35",
         "dynamic_libraries": libraries, "vcpkg_triplet": triplet,
         "vcpkg_baseline": json.loads((ROOT / "deps/vcpkg.json").read_text())["builtin-baseline"],
@@ -158,7 +164,7 @@ def main():
         "c_flags": cache["CMAKE_C_FLAGS"] + " " + cache["CMAKE_C_FLAGS_" + config.upper()],
         "cxx_flags": cache["CMAKE_CXX_FLAGS"] + " " + cache["CMAKE_CXX_FLAGS_" + config.upper()],
         "dispatch": "FAISS and OpenBLAS select kernels at runtime; OpenBLAS is single-threaded",
-        "asan_exclusions": ["OpenBLAS AVX-512 assembly kernels"] if asan else [],
+        "asan_exclusions": ["OpenBLAS AVX-512 assembly kernels"] if asan and arch.isa_notes else [],
     }
     with tempfile.TemporaryDirectory(prefix=".package-", dir=output) as temporary:
         staging = pathlib.Path(temporary)
@@ -201,7 +207,7 @@ def main():
             "Requires glibc 2.35 or newer and the named CPU level.\n"
             "Install system tzdata for IANA time-zone names; UTC and fixed\n"
             "offsets work without it.\n"
-            "Run /lib64/ld-linux-x86-64.so.2 --help to inspect supported CPU levels.\n"
+            f"{arch.cpu_help}"
             "Run ./luxir --version or ./luxir --help. Start with ./luxir.\n"
             "The HTTP API listens on port 9400; see docs/guide/quickstart.md.\n"
             "Documentation: https://luxir.org/docs/\n\n"
@@ -227,7 +233,7 @@ def main():
         if config == "Release":
             copy(executable, output / name)
     checksums = "".join(f"{sha256(path)}  {path.name}\n"
-                        for path in sorted(output.glob(f"luxir-{version}-linux-x86_64-*"))
+                        for path in sorted(output.glob(f"luxir-{version}-linux-*"))
                         if path.is_file())
     (output / "SHA256SUMS").write_text(checksums)
     print(f"Packaged {name} into {output}")
