@@ -427,7 +427,9 @@ public:
   // floor from up to half an ulp below it. For a zero or subnormal floor that
   // half ulp is an absolute 2^-150, which division by a multiplier under 1 can
   // stretch past the one-ulp margin, so it is taken off the floor before
-  // dividing.
+  // dividing. The subtraction is exact in double for floors below 2^-97 and
+  // absorbed above that, where the one-ulp step down already covers the half
+  // ulp.
   static float childFloor(float floor, float minScore, float multiplier,
                           bool scored) {
     if (!scored || multiplier == 0.0f) return minScore;
@@ -438,6 +440,7 @@ public:
               -std::numeric_limits<float>::infinity());
     return std::max(translated, minScore);
   }
+
   MinScoreQuery(Query* child, float minScore)
     : Query(QueryKind::MIN_SCORE), child(child), minScore(minScore) {
     if (!std::isfinite(minScore)) {
