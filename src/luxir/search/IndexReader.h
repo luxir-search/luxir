@@ -14,7 +14,7 @@
 #include "DocSet.h"
 #include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
-#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Once.h"
@@ -93,7 +93,7 @@ public:
 
 
   class Segment {
-    const std::shared_ptr<PostingsReader> sharedPostingsReader;
+    const std::shared_ptr<SegmentCore> sharedSegmentCore;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
   public:
@@ -113,10 +113,10 @@ public:
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int32_t ord;            // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
+    Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<LiveDocs>&& liveDocs,
               std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
               SegmentInfo segInfo, int64_t base, int ord)
-            :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
+            :  sharedSegmentCore(std::move(segmentCore)), sharedLiveDocs(std::move(liveDocs)),
                 sharedAuxReaders(std::move(auxReaders)),
                 segInfo(segInfo), base(base), ord(ord) {
       assert((segInfo.live_gen != 0) == (sharedLiveDocs != nullptr));
@@ -125,13 +125,14 @@ public:
     }
 
     PostingsReader& postingsReader() const noexcept {
-      return *sharedPostingsReader;
+      return sharedSegmentCore->rootReader();
     }
 
-    // shared form of postingsReader(): every snapshot holding this physical
-    // segment, and the writer, use the one instance
-    std::shared_ptr<PostingsReader> postingsReaderShared() const noexcept {
-      return sharedPostingsReader;
+    SegmentCore& segmentCore() const noexcept { return *sharedSegmentCore; }
+
+    // Pins the immutable bundle and all of its space readers.
+    std::shared_ptr<SegmentCore> segmentCoreShared() const noexcept {
+      return sharedSegmentCore;
     }
 
     // Whether the segment has deleted documents: a live-docs generation exists,
@@ -309,7 +310,7 @@ private:
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
     // A segment's physical identity, which decides what a reopen reuses: the
-    // base files its PostingsReader maps, the live-docs file of this
+    // base files its SegmentCore maps, the live-docs file of this
     // snapshot's generation (none without deletes), and each overlay's files
     // (aux readers, reused by their own gen rule). Within an incarnation an
     // equal (segId, files) is the same mapped content, as is an equal
@@ -359,14 +360,14 @@ private:
   std::vector<std::string> searchable;
 
   // Opens the snapshot `manifest` (the newest durable root when null). Each
-  // segment's PostingsReader comes from `published` (the publisher's open
-  // readers, by manifest segment order), else from `previous` when its files
+  // segment's core comes from `published` (the publisher's open
+  // cores, by manifest segment order), else from `previous` when its files
   // are identical, else is opened; its live docs come from `previous` when
   // their file is identical.
   static Snapshot openSnapshot(Directory& dir, const IndexReader* previous,
                                std::shared_ptr<Schema> schema,
                                std::shared_ptr<const std::vector<std::byte>> manifest,
-                               std::span<const std::weak_ptr<PostingsReader>> published = {});
+                               std::span<const std::weak_ptr<SegmentCore>> published = {});
 
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
@@ -457,7 +458,7 @@ public:
   // retained for schema-specific source selection. Built once on first use
   // and immutable afterwards (segments never
   // change under a reader).  The views point into segment metadata that this
-  // reader's PostingsReaders keep mapped, so they are valid for as long as the
+  // reader's segment cores keep mapped, so they are valid for as long as the
   // caller holds the reader.
   std::span<const ProjectableField> projectableFields() {
     return core->projectableFields();
@@ -477,7 +478,7 @@ public:
   std::span<const std::string> searchableFields();
 
   // Opens a published snapshot, reusing what it shares with previousReader
-  // and the readers its publisher holds open (CommitSnapshot::openReaders).
+  // and the cores its publisher holds open (CommitSnapshot::openCores).
   IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
               std::shared_ptr<FilterCache> filterCache = nullptr);
   // Direct tools/tests: the newest durable root, or an empty index.

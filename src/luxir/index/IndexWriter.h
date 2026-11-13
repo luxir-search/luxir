@@ -69,12 +69,12 @@ public:
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
-    // The segment's open PostingsReader once the writer needed one (deletes, a merge, an overlay
+    // The segment's open core once the writer needed one (deletes, a merge, an overlay
     // build); kept until the segment is retired. Shared both ways with readers: filled from the
     // published IndexReader when that holds the segment, and handed to readers that open a
-    // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
-    // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    // snapshot this writer published (CommitSnapshot::openCores). Atomic: commit and merge
+    // threads fill it without a lock (IndexWriter::getSegmentCore).
+    std::atomic<std::shared_ptr<SegmentCore>> sharedSegmentCore = nullptr;
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
@@ -853,9 +853,9 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
-  // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
+  // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
-  std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   // Builds outstanding active names and matches new in-flight selectors on the

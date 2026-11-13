@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/search/HitDecorator.h"
 
 // Field loading + streaming response emission for an already-ranked list of
@@ -533,7 +534,7 @@ inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs,
   };
   addFieldLoader(loaders, runs, [&req, segDocs, target](std::span<RowIndex> indices) {
     auto segment = segDocs[indices[0]].segment();
-    VersionRuns::Cursor cursor(req.reader->segments()[segment].postingsReader().versionRuns());
+    VersionRuns::Cursor cursor(req.reader->segments()[segment].segmentCore().versionRuns());
     for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
   });
 }

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include "luxir/reader/FieldReader.h"
 #include <algorithm>
@@ -135,7 +136,7 @@ int64_t rootNodeSize(const char* node) {
 }
 
 int64_t trieRegionBytes(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
-  InputStream trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
+  InputStream trieIS = postingsReader.core().getInputStreamSeek(fieldInfo.trieLoc);
   const char* base = trieIS.ptr();
   const char* root = base + fieldInfo.trieRootOff;
   return fieldInfo.trieRootOff + rootNodeSize(root) + 8;

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -240,7 +241,7 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
   };
   for (size_t i = 0; i < corruptions.size(); i++) {
     auto copy = copySegment(dir, corruptions[i]);
-    EXPECT_THROW({ PostingsReader reader(*copy, segId, creatorEpoch); }, std::runtime_error) << "corruption " << i;
+    EXPECT_THROW({ SegmentCore readerCore(*copy, segId, creatorEpoch); }, std::runtime_error) << "corruption " << i;
   }
 
   // A field entry whose fields run on: the first value after its name never terminates.
@@ -249,7 +250,8 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     size_t afterName = entry + 1 + (uint8_t)b[entry];
     std::memset(b.data() + afterName, 0xff, std::min<size_t>(16, offsetsTable(b) - afterName));
   });
-  PostingsReader reader(*copy, segId, creatorEpoch);
+  SegmentCore readerCore(*copy, segId, creatorEpoch);
+  auto& reader = readerCore.rootReader();
   ASSERT_GT(reader.numFields(), 0);
   EXPECT_THROW(reader.fieldInfo(0), std::runtime_error);
 }

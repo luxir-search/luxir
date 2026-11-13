@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
@@ -714,7 +715,7 @@ private:
   static uint64_t estimateOutputBytes(std::span<PostingsReader*> readers) {
     uint64_t total = 0;
     for (const auto* reader : readers) {
-      uint64_t bytes = reader->sizeInBytes();
+      uint64_t bytes = reader->core().sizeInBytes();
       total = bytes > std::numeric_limits<uint64_t>::max() - total
           ? std::numeric_limits<uint64_t>::max() : total + bytes;
     }
@@ -880,7 +881,7 @@ private:
   void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target,
                          PostingsWriter::VersionRunsWriter& versions) {
     if (liveDocs == nullptr) {
-      VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+      VersionRuns::Iterator runs(seg.postingsReader->core().versionRuns());
       VersionRun run;
       while (runs.next(run)) versions.add((uint32_t)seg.base + run.firstDocId, run.version);
       return;
@@ -891,7 +892,7 @@ private:
     int32_t newDocId = 0;
     const FixedBitSet& bitset = liveDocs->bitset();
     
-    VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+    VersionRuns::Iterator runs(seg.postingsReader->core().versionRuns());
     VersionRun current, next;
     bool haveNext = runs.next(current) && runs.next(next);
     bool emitted = false;

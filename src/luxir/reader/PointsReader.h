@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -236,7 +237,7 @@ public:
 
   PointsReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
     if (fieldInfo.pointsMetaOff == 0) invalid("points index is absent");
-    InputStream input = postingsReader.getInputStream(fieldInfo.pointsLoc.filenum());
+    InputStream input = postingsReader.core().getInputStream(fieldInfo.pointsLoc.filenum());
     init(input, fieldInfo.pointsLoc.offset(), fieldInfo.pointsMetaOff);
   }
 

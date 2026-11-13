@@ -132,7 +132,7 @@ IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterC
 
 IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
                          std::shared_ptr<FilterCache> filterCache)
-  : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes, snapshot.openReaders),
+  : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes, snapshot.openCores),
                 filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 
@@ -144,7 +144,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader, std::share
 IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
                                                 std::shared_ptr<Schema> preferredSchema,
                                                 std::shared_ptr<const std::vector<std::byte>> manifest,
-                                                std::span<const std::weak_ptr<PostingsReader>> published) {
+                                                std::span<const std::weak_ptr<SegmentCore>> published) {
   assert(published.empty() || manifest);  // aligned with that manifest's segments
   auto core = std::make_shared<PhysicalCore>();
   const auto* previous = previousReader ? previousReader->core.get() : nullptr;
@@ -254,7 +254,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         int32_t nDocs = segment.max_doc;
         const auto& files = core->segmentFiles[i];
 
-        // Every holder of a physical segment shares one open PostingsReader.
+        // Every holder of a physical segment shares one open SegmentCore.
         // The publisher's (the writer's) comes first: it opened the segment for
         // deletes, a merge or an overlay build, possibly while a reader opened
         // it too, so preferring it converges all holders by the next reopen.
@@ -264,17 +264,17 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         // when the generation's file is unchanged.
         const Segment* prevSeg = previous ? previous->segment(segId) : nullptr;
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
-        std::shared_ptr<PostingsReader> postingsReader;
+        std::shared_ptr<SegmentCore> segmentCore;
         if ((size_t)i < published.size()) {
-          postingsReader = published[i].lock();
-          if (postingsReader && postingsReader->maxDoc() != nDocs) postingsReader = nullptr;
+          segmentCore = published[i].lock();
+          if (segmentCore && segmentCore->rootReader().maxDoc() != nDocs) segmentCore = nullptr;
         }
-        if (!postingsReader && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
-          postingsReader = prevSeg->sharedPostingsReader;
+        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
+          segmentCore = prevSeg->sharedSegmentCore;
         }
-        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true);
-        if (!postingsReader) {
-          // Failed to create PostingsReader (segment files not found) - trigger retry
+        if (!segmentCore) segmentCore = SegmentCore::create(dir, segId, segment.creator_epoch, missingFileOK, true);
+        if (!segmentCore) {
+          // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;
           break; // Break out of the segments loop to retry
         }
@@ -331,7 +331,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         segmentInfo.commit_time = segment.commit_time;
         segmentInfo.live_docs = segment.live_docs;
 
-        segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
+        segs.emplace_back(std::move(segmentCore), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
         totalMaxDoc += segs.back().maxDoc();
         livedocs += segs.back().numLive();
@@ -574,7 +574,7 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
 void IndexReader::PhysicalCore::buildFieldCatalogs() {
   callOnce(fieldCatalogsOnce, [this] {
     // Both name sources are views into segment files held open by the
-    // segment's PostingsReader: the field index (fi.fieldname) and the stored
+    // segment core's space reader: the field index (fi.fieldname) and the stored
     // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
