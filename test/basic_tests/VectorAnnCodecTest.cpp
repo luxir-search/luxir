@@ -15,10 +15,12 @@
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/impl/fast_scan/fast_scan.h>
 #include <faiss/utils/distances.h>
 
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
+#include "luxir/query/Pq4Scan.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
@@ -50,11 +52,11 @@ constexpr int32_t CLUSTERS = 16;
 // More than sqrt(live vectors) for every corpus below: probes every list.
 constexpr int32_t ALL_LISTS = 1 << 16;
 
-void installAnn(Collection& col, api::VectorMetric metric, const api::VectorAnnDef& ann) {
+void installAnn(Collection& col, api::VectorMetric metric, const api::VectorAnnDef& ann, int32_t dims = DIMS) {
   SchemaBuilder b;
   auto& f = b.field("emb_v");
   f.type = api::FieldDef_::FieldClass::VECTOR;
-  f.dims = DIMS;
+  f.dims = dims;
   f.metric = metric;
   f.ann = ann;
   b.set(col);
@@ -806,4 +808,293 @@ TEST_F(VectorAnnCodecTest, intervalEndpointsSupportPaddedDimensionsAndQueryBits)
     std::vector<float> query((size_t)dims, 0);
     EXPECT_EQ(knnIds(h, query, false, 0, false, 1, 1), knnIds(h, query, true, 0, false, 1, 1));
   }
+}
+
+// pq4: block-packed 4-bit lists scanned by Pq4ListScan.
+namespace {
+
+// Trains a PQ directly and packs the codes of n vectors into one list.
+struct Pq4List {
+  faiss::ProductQuantizer pq;
+  std::vector<uint8_t> blocks;
+  std::vector<faiss::idx_t> ids;
+  Pq4List(int32_t dims, int32_t m, size_t n) : pq((size_t)dims, (size_t)m, 4), ids(n) {
+    constexpr int32_t TRAIN = 1000;
+    std::vector<float> train;
+    for (int32_t i = 0; i < TRAIN; i++) {
+      auto v = clustered(i, i % CLUSTERS);
+      v.resize((size_t)dims);
+      train.insert(train.end(), v.begin(), v.end());
+    }
+    pq.cp.min_points_per_centroid = 1;
+    pq.train(TRAIN, train.data());
+    std::vector<uint8_t> flat(n * pq.code_size);
+    pq.compute_codes(train.data(), flat.data(), std::min(n, (size_t)TRAIN));
+    for (size_t i = TRAIN; i < n; i++) std::copy_n(flat.data() + (i % TRAIN) * pq.code_size, pq.code_size, flat.data() + i * pq.code_size);
+    size_t nb = VectorAuxListsFooter::packedBlocks(n) * VectorAuxListsFooter::PACK_BLOCK;
+    blocks.assign(nb * pq.code_size, 0);
+    faiss::pq4_pack_codes(flat.data(), n, pq.M, nb, VectorAuxListsFooter::PACK_BLOCK,
+                          VectorAuxListsFooter::packedNsq(pq.M), blocks.data());
+    for (size_t i = 0; i < n; i++) ids[i] = (faiss::idx_t)i;
+  }
+  float decoded(const float* q, size_t i) const {
+    float sum = 0;
+    for (size_t sub = 0; sub < pq.M; sub++) {
+      auto code = faiss::pq4_get_packed_element(blocks.data(), VectorAuxListsFooter::PACK_BLOCK,
+                                                VectorAuxListsFooter::packedNsq(pq.M), i, sub);
+      sum += faiss::fvec_inner_product(q + sub * pq.dsub, pq.get_centroids(sub, code), pq.dsub);
+    }
+    return sum;
+  }
+};
+
+// Keeps the top limit estimates when limit > 0, everything otherwise. The
+// threshold only rises, like the shared floor.
+struct Pq4Sink {
+  size_t limit = 0;
+  float threshold = -INFINITY;
+  std::vector<std::pair<float, faiss::idx_t>> hits;
+  void updateThreshold() {}
+  void add_result(float estimate, faiss::idx_t id) {
+    hits.emplace_back(estimate, id);
+    if (limit == 0) return;
+    std::sort(hits.begin(), hits.end(), std::greater<>());
+    if (hits.size() > limit) hits.resize(limit);
+    if (hits.size() == limit) threshold = std::nextafter(hits.back().first, -INFINITY);
+  }
+};
+
+}  // namespace
+
+// Every list-size class and odd M: the estimate of every code tracks its
+// decoded inner product, a pruning scan keeps exactly the top of an unpruned
+// scan (its threshold never drops a code), and a selector admits exactly its
+// members. The chunk and block edges are 256 and 32 codes.
+TEST_F(VectorAnnCodecTest, pq4ListSizesPruneLikeAnUnprunedScan) {
+  for (int32_t m : {8, 7, 1}) for (size_t n : {1, 31, 32, 33, 255, 256, 257, 700}) {
+    SCOPED_TRACE(::testing::Message() << "m=" << m << " n=" << n);
+    Pq4List list(m == 7 ? 28 : DIMS, m, n);
+    auto q = clustered(1'000'000, 3);
+    q.resize((size_t)list.pq.d);
+    Pq4QueryTable table(list.pq, q.data());
+    constexpr float COARSE = 0.25f;
+    Pq4Sink all;
+    Pq4ListScan scan(table);
+    scan.scanList(list.blocks.data(), n, list.ids.data(), COARSE, nullptr, all);
+    ASSERT_EQ(all.hits.size(), n);
+    EXPECT_EQ(scan.passes, (int64_t)n);
+    EXPECT_EQ(scan.kernelCodes % VectorAuxListsFooter::PACK_BLOCK, 0);
+    EXPECT_GE(scan.kernelCodes, (int64_t)n);
+    for (const auto& [estimate, id] : all.hits) {
+      EXPECT_EQ(id, all.hits[(size_t)id].second);
+      EXPECT_NEAR(estimate, COARSE + list.decoded(q.data(), (size_t)id), 0.05f);
+    }
+    for (size_t limit : {(size_t)1, (size_t)5}) {
+      Pq4Sink top;
+      top.limit = limit;
+      Pq4ListScan pruned(table);
+      pruned.scanList(list.blocks.data(), n, list.ids.data(), COARSE, nullptr, top);
+      auto sorted = all.hits;
+      std::sort(sorted.begin(), sorted.end(), std::greater<>());
+      std::vector<float> expected, actual;
+      for (size_t i = 0; i < std::min(limit, n); i++) {
+        expected.push_back(sorted[i].first);
+        actual.push_back(top.hits[i].first);
+      }
+      EXPECT_EQ(actual, expected);
+    }
+    Pq4Sink some;
+    Pq4ListScan filtered(table);
+    filtered.scanList(list.blocks.data(), n, list.ids.data(), COARSE,
+                      [](faiss::idx_t id) { return id % 3 == 0; }, some);
+    EXPECT_EQ(filtered.passes, (int64_t)(n + 2) / 3);
+    ASSERT_EQ(some.hits.size(), (n + 2) / 3);
+    for (const auto& [estimate, id] : some.hits) EXPECT_EQ(estimate, all.hits[(size_t)id].first);
+  }
+}
+
+// The floor is refreshed between chunks even when nothing in a chunk reaches
+// the handler, and a chunk with no eligible code never reaches the kernel.
+TEST_F(VectorAnnCodecTest, pq4RefreshesTheFloorBetweenChunks) {
+  constexpr size_t N = 1000;
+  Pq4List list(DIMS, 8, N);
+  auto q = clustered(1'000'000, 3);
+  Pq4QueryTable table(list.pq, q.data());
+  struct RaisedFloor : Pq4Sink {
+    int calls = 0;
+    void updateThreshold() { if (++calls == 2) threshold = INFINITY; }
+  } raised;
+  Pq4ListScan scan(table);
+  scan.scanList(list.blocks.data(), N, list.ids.data(), 0, nullptr, raised);
+  EXPECT_EQ(raised.calls, 4);
+  EXPECT_EQ(scan.kernelCodes, 256);
+  EXPECT_EQ(scan.passes, (int64_t)N);  // Skipped chunks were still examined.
+  Pq4Sink none;
+  Pq4ListScan empty(table);
+  empty.scanList(list.blocks.data(), N, list.ids.data(), 0, [](faiss::idx_t) { return false; }, none);
+  EXPECT_EQ(empty.kernelCodes, 0);
+  EXPECT_TRUE(none.hits.empty());
+}
+
+// Zero, denormal and NaN table ranges keep a finite scale and defined entries.
+TEST_F(VectorAnnCodecTest, pq4DegenerateTablesStayDefined) {
+  faiss::ProductQuantizer pq(8, 2, 4);
+  pq.centroids.assign(pq.M * pq.ksub * pq.dsub, 0);
+  for (size_t i = 0; i < pq.centroids.size(); i++) pq.centroids[i] = (float)(i % pq.ksub) * 1e-44f;
+  pq.sync_transposed_centroids();
+  std::array<uint8_t, 32> blocks{};
+  std::array<faiss::idx_t, 2> ids{0, 1};
+  for (float x : {0.0f, 1.0f, 1e-30f, NAN}) {
+    SCOPED_TRACE(x);
+    std::vector<float> q(pq.d, x);
+    Pq4QueryTable table(pq, q.data());
+    EXPECT_TRUE(std::isfinite(table.scale()));
+    EXPECT_GT(table.scale(), 0);
+    Pq4Sink sink;
+    Pq4ListScan scan(table);
+    scan.scanList(blocks.data(), 2, ids.data(), 0, nullptr, sink);
+    if (!std::isnan(x)) {
+      EXPECT_EQ(sink.hits.size(), 2u);
+    }
+    for (const auto& [estimate, id] : sink.hits) EXPECT_TRUE(std::isfinite(estimate));
+  }
+}
+
+// Packed lists have no flat codes: FAISS's scanners, which read them through
+// get_codes, fail loudly, and the query path runs without them.
+TEST_F(VectorAnnCodecTest, pq4FlatScannerIsNeverEntered) {
+  IvfTestGuard guard;
+  ForceIvfGuard forceIvf;
+  CollectionHelper h("main");
+  h.clear();
+  installAnn(h.collection(), api::VectorMetric::IP, pq4Ann());
+  indexSegment(h, 0, 1000);
+  std::shared_ptr<IndexReader> reader;
+  auto aux = overlays(h, reader);
+  ASSERT_EQ(aux.size(), 1u);
+  ASSERT_NE(aux[0], nullptr);
+  EXPECT_TRUE(aux[0]->isPq4());
+  auto* ivf = dynamic_cast<const faiss::IndexIVFPQ*>(aux[0]->getFaissIndex());
+  ASSERT_NE(ivf, nullptr);
+  EXPECT_EQ(ivf->pq.nbits, 4u);
+  auto* lists = dynamic_cast<const MmapInvertedLists*>(ivf->invlists);
+  ASSERT_NE(lists, nullptr);
+  EXPECT_TRUE(lists->isPacked());
+  EXPECT_THROW(lists->get_codes(0), std::logic_error);
+  auto q = clustered(1'000'000, 3);
+  std::array<float, 10> scores;
+  std::array<faiss::idx_t, 10> ids;
+  faiss::SearchParametersIVF params;
+  params.nprobe = ivf->nlist;
+  EXPECT_ANY_THROW(ivf->search(1, q.data(), 10, scores.data(), ids.data(), &params));
+  KnnQuery::Stats stats;
+  SearchOverridesGuard saved(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
+  for (bool groups : {false, true}) EXPECT_EQ(knnIds(h, q, false, 1000, groups).size(), 10u);
+  EXPECT_GT(stats.work.fastScanCodes, 0);
+  EXPECT_EQ(stats.work.pqScores, 0);
+}
+
+// Auto m is twice 8-bit pq's cap, odd when that is the largest divisor (100
+// dims: 25), and a segment below 39 * 16 vectors has no overlay.
+TEST_F(VectorAnnCodecTest, pq4AutoMAndTrainingFloor) {
+  IvfTestGuard guard;
+  for (auto [dims, expected] : {std::pair{32, 8}, {100, 25}, {256, 64}, {768, 192}}) {
+    SCOPED_TRACE(dims);
+    CollectionHelper h("main");
+    h.clear();
+    installAnn(h.collection(), api::VectorMetric::COSINE, pq4Ann(4), dims);
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < 700; i++) {
+      auto v = clustered(i, i % CLUSTERS);
+      v.resize((size_t)dims, 0.25f * (float)(i % 3));
+      docs.push_back(flatdoc("id", "d" + std::to_string(i), "emb_v", v));
+    }
+    h.indexAll(docs);
+    h.commit({"*"});
+    std::shared_ptr<IndexReader> reader;
+    auto aux = overlays(h, reader);
+    ASSERT_NE(aux[0], nullptr);
+    EXPECT_TRUE(aux[0]->isPq4());
+    EXPECT_EQ(aux[0]->getPqM(), expected);
+    EXPECT_EQ(aux[0]->getPqBits(), 4);
+  }
+  CollectionHelper h("main");
+  h.clear();
+  installAnn(h.collection(), api::VectorMetric::IP, pq4Ann(4));
+  indexSegment(h, 0, 39 * 16 - 1);
+  std::shared_ptr<IndexReader> reader;
+  EXPECT_EQ(overlays(h, reader)[0], nullptr);
+  h.clear();
+  installAnn(h.collection(), api::VectorMetric::IP, pq4Ann(4));
+  indexSegment(h, 0, 39 * 16);
+  ASSERT_NE(overlays(h, reader)[0], nullptr);
+}
+
+TEST_F(VectorAnnCodecTest, pq4DefaultPoolIsLargerThanPq) {
+  EXPECT_EQ(KnnQuery::boundedDefaultCandidates(10, 1'000'000), 129);
+  EXPECT_GT(KnnQuery::boundedDefaultCandidates(10, 1'000'000, true), 129);
+  EXPECT_EQ(KnnQuery::boundedDefaultCandidates(10, 50, true), 50);
+  IvfTestGuard guard;
+  ForceIvfGuard forceIvf;
+  CollectionHelper h("main");
+  h.clear();
+  installAnn(h.collection(), api::VectorMetric::IP, pq4Ann());
+  indexSegment(h, 0, 2000);
+  KnnQuery::Stats stats;
+  SearchOverridesGuard saved(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
+  auto q = clustered(1'000'000, 3);
+  auto req = localReq(h.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q").limit(10).fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, 10, ALL_LISTS, false, 0);
+  req->execute(1);
+  EXPECT_OK(req);
+  EXPECT_EQ(stats.terminalReads.load(), KnnQuery::boundedDefaultCandidates(10, 2000, true));
+  EXPECT_GT(stats.work.fastScanCodes, 0);
+  EXPECT_EQ(stats.work.pqScores, 0);
+  EXPECT_EQ(stats.work.selectorPasses, 2000);
+}
+
+TEST_F(VectorAnnCodecTest, pq4ServesDeletesGroupsAndParallelScans) {
+  IvfTestGuard guard;
+  ForceIvfGuard forceIvf;
+  for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+    SCOPED_TRACE((int)metric);
+    CollectionHelper h("main");
+    h.clear();
+    installAnn(h.collection(), metric, pq4Ann());
+    indexSegment(h, 0, 2000);
+    // A pool of the whole corpus rescores every code the scan produced.
+    EXPECT_EQ(recallVsExact(h, 2000), 1.0);
+    std::vector<std::string> dels;
+    for (int i = 0; i < 2000; i += 3) dels.push_back("d" + std::to_string(i));
+    h.deleteByIds(dels, UpdateMessage::COMMIT);
+    std::shared_ptr<IndexReader> reader;
+    EXPECT_TRUE(overlays(h, reader)[0]->isPq4());
+    EXPECT_EQ(recallVsExact(h, 2000), 1.0);
+    auto q = clustered(1'000'001, 5);
+    for (bool groups : {false, true}) {
+      auto serial = boundedKnn(h, q, groups, false, {}, 1);
+      EXPECT_EQ(boundedKnn(h, q, groups, false, {}, -1), serial);
+    }
+  }
+}
+
+TEST_F(VectorAnnCodecTest, pq4MergeRebuildsPackedLists) {
+  IvfTestGuard guard;
+  ForceIvfGuard forceIvf;
+  CollectionHelper h("main");
+  h.clear();
+  installAnn(h.collection(), api::VectorMetric::COSINE, pq4Ann());
+  indexSegment(h, 0, 1000);
+  indexSegment(h, 1000, 1000);
+  h.getIndexWriter()->mergeSegments();
+  std::shared_ptr<IndexReader> reader;
+  auto aux = overlays(h, reader);
+  ASSERT_EQ(aux.size(), 1u);
+  ASSERT_NE(aux[0], nullptr);
+  EXPECT_TRUE(aux[0]->isPq4());
+  EXPECT_EQ(aux[0]->getFaissIndex()->ntotal, 2000);
+  EXPECT_EQ(recallVsExact(h, 2000), 1.0);
 }

@@ -137,7 +137,7 @@ enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 enum class DateUnit { MS = 0, NS = 1 };
 }
-namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
+namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1, PQ4 = 2 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 

@@ -42,6 +42,7 @@ enum BenchCodec : int32_t {
   RABITQ2 = 3,
   PQ_D8 = 4,    // IVF+PQ, dims/8 sub-quantizers: one code byte per 8 dims,
                 // about the bytes of 1-bit RaBitQ
+  PQ4 = 5,      // 4-bit PQ fast-scan with its defaults (dims/4 sub-quantizers)
 };
 
 const char* benchCodecName(int32_t codec) {
@@ -51,6 +52,7 @@ const char* benchCodecName(int32_t codec) {
     case RABITQ4: return "rabitq4";
     case RABITQ2: return "rabitq2";
     case PQ_D8: return "pq_d8";
+    case PQ4: return "pq4";
     default: return "?";
   }
 }
@@ -60,7 +62,9 @@ int32_t benchRaBitQBits(int32_t codec) {
 }
 
 void setBenchAnn(api::FieldDef& f, int32_t dims, int32_t codec) {
-  if (codec == PQ || codec == PQ_D8) {
+  if (codec == PQ4) {
+    f.ann = pq4Ann();
+  } else if (codec == PQ || codec == PQ_D8) {
     f.ann = pqAnn(luxir::unit_tests ? 4 : 0,
                   luxir::unit_tests ? 2 : codec == PQ_D8 ? dims / 8 : 0,
                   luxir::unit_tests ? 1 : 8);
@@ -94,6 +98,7 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
 
 // The overlay engine/bits a codec arg produces, for index-reuse checks.
 bool overlayMatchesCodec(const VectorAuxReader& vaux, int32_t codec) {
+  if (codec == PQ4) return vaux.isPq4();
   if (codec == PQ || codec == PQ_D8) {
     return vaux.getEngine() == VectorAuxMeta::ENGINE_IVFPQ
       && (codec == PQ_D8) == (vaux.getPqM() == vaux.getDims() / 8);
@@ -1106,6 +1111,7 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   state.counters["work_newListLiveVectors"] = stats.work.newListLiveVectors / queries;
   state.counters["work_depthEntries"] = stats.work.depthEntries / queries;
   state.counters["work_pqScores"] = stats.work.pqScores / queries;
+  state.counters["work_fastScanCodes"] = stats.work.fastScanCodes / queries;
   state.counters["work_oneBitScores"] = stats.work.oneBitScores / queries;
   state.counters["work_extraBitScores"] = stats.work.extraBitScores / queries;
   state.counters["work_gateRejections"] = stats.work.gateRejections / queries;
@@ -1287,6 +1293,7 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, RABITQ4);
       datasetSweep(b, PQ);
       datasetSweep(b, PQ_D8);
+      datasetSweep(b, PQ4);
     })->UseRealTime()->MinTime(2.0);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
@@ -1320,7 +1327,7 @@ LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlat
 
 TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
     ->Apply([](benchmark::Benchmark* b) {
-      for (int codec : {PQ, RABITQ2, RABITQ1})
+      for (int codec : {PQ, PQ4, RABITQ2, RABITQ1})
         for (int selectivity : {1, 3, 10, 30, 100, 300, 1000, 3000})
           for (int correlation : {0, 1, 2, 3}) {
             for (int alpha : {0, 25, 50, 100}) b->Args({codec, selectivity, correlation, alpha, 1, 0, 1});

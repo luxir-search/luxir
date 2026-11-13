@@ -44,6 +44,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/Pq4Scan.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
@@ -65,7 +66,7 @@ namespace luxir {
 ///   2. Build one engine slot per segment behind the VectorEngine seam:
 ///      SegmentFlatColumnVectorEngine (exact brute-force over the mmapped
 ///      column - the default and the below-IVF-threshold fallback) or
-///      SegmentIvfScanner (IVF+RaBitQ or IVF+PQ aux, approximate).  All slots are
+///      SegmentIvfScanner (IVF+RaBitQ, IVF+PQ or IVF+PQ4 aux, approximate).  All slots are
 ///      wrapped in one CompositeVectorEngine, which owns global IVF list
 ///      allocation across segments (see its class comment).
 ///   3. WIDEN: satisfy the bounded channel's document budget and reach k
@@ -182,7 +183,7 @@ public:
     void addWork(const VectorSearchWork& work) {
       { std::lock_guard lock(workMutex); this->work += work; }
       lists += work.listSetups;
-      vectors += work.pqScores + work.oneBitScores - work.gateRejections
+      vectors += work.pqScores + work.fastScanCodes + work.oneBitScores - work.gateRejections
           + work.exactVectors + work.seedReads + work.remainingReads;
       bytes += work.scoreBytes;
       scanned += work.selectorPasses;
@@ -296,10 +297,16 @@ public:
   // Fitted on one corpus. Larger estimate error relative to neighbor gaps
   // (960-d L2 descriptors, 768/1536-d text with real queries) leaves recall
   // that larger counts recover. RaBitQ interval selection does not use this.
-  static int64_t boundedDefaultCandidates(int64_t k, int64_t cap) {
+  // pq4's 4-bit estimates are noisier at equal code bytes. Headroom x4 sits at
+  // the knee on Cohere 768-d and arxiv 1536-d, both 1M: at k=10 (486 candidates)
+  // recall is within about 1.2 points of a pool of 1000, and 1.5x that pool costs
+  // more latency than it returns. k=1 and k=100 were checked on Cohere.
+  static constexpr double PQ4_POOL_HEADROOM_SCALE = 4;
+  static int64_t boundedDefaultCandidates(int64_t k, int64_t cap, bool pq4 = false) {
     assert(k > 0 && cap >= 0);
     if (k >= cap) return cap;
     double headroom = 24.0 + std::ceil(15.0 * std::pow((double)k, 0.8));
+    if (pq4) headroom = std::ceil(headroom * PQ4_POOL_HEADROOM_SCALE);
     // Check before conversion/addition, including when cap is INT64_MAX.
     if (headroom >= (double)(cap - k)) return cap;
     return k + (int64_t)headroom;
@@ -967,7 +974,7 @@ public:
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
 
       int64_t boundedDocsWithValue = 0, boundedVectors = 0, boundedLiveVectors = 0;
-      bool anyMultiValued = false, anyEligible = false;
+      bool anyMultiValued = false, anyEligible = false, anyPq4 = false;
       int32_t dims = (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
         throw std::runtime_error(std::format(
@@ -1014,7 +1021,9 @@ public:
               if (vaux->getMetric() != metric) throw std::runtime_error(std::format(
                   "KnnQuery: segment index metric {} does not match field metric {} for field '{}'",
                   vaux->getMetric(), metric, query.getField()));
-              input.codec = vaux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ;
+              input.codec = vaux->isRaBitQ() ? KnnPlanner::Codec::RABITQ
+                  : vaux->isPq4() ? KnnPlanner::Codec::PQ4 : KnnPlanner::Codec::PQ;
+              anyPq4 |= vaux->isPq4();
               input.nlist = vaux->getNList(); input.pqM = vaux->getPqM(); input.pqBits = vaux->getPqBits();
               input.rabitqBits = vaux->getRaBitQBits();
               input.pqPerListTable = input.codec == KnnPlanner::Codec::PQ && input.l2
@@ -1066,7 +1075,7 @@ public:
         .k = query.getK(),
         .boundedTarget = query.getRefineCandidates() > 0
             ? std::max((int64_t)query.getK(), std::min(planCap, (int64_t)query.getRefineCandidates()))
-            : std::max((int64_t)query.getK(), boundedDefaultCandidates(query.getK(), planCap)),
+            : std::max((int64_t)query.getK(), boundedDefaultCandidates(query.getK(), planCap, anyPq4)),
         .nprobe = query.getNProbe(), .referenceBreadth = defaultIvfNList(liveNTotal),
         .minScanFraction = query.getMinScanFraction(), .dimFactor = defaultAnnBreadthDimFactor(dims),
         .alpha = tuning.filteredCoverageAlpha, .flatDensity = tuning.flatDomainDensityThreshold, .selector = tuning.selector};
@@ -1211,7 +1220,7 @@ public:
           if (query.getRefineCandidates() > 0) {
             baseReq = std::min(cap, std::max(kDocs, (int64_t)query.getRefineCandidates()));
           } else {
-            baseReq = boundedDefaultCandidates(kDocs, cap);
+            baseReq = boundedDefaultCandidates(kDocs, cap, anyPq4);
           }
           baseReq = std::max(baseReq, kDocs);
         }
@@ -1391,6 +1400,7 @@ public:
           if (!input.unfiltered || input.deletes || input.bounded || !eligibleSpans[i].empty()) w.selectorBitmap = w.physicalEntries;
           else w.selectorNone = w.physicalEntries;
           if (input.codec == KnnPlanner::Codec::PQ) w.pqScores = w.selectorPasses;
+          else if (input.codec == KnnPlanner::Codec::PQ4) w.fastScanCodes = w.physicalEntries;
           else {
             w.oneBitScores = w.selectorPasses;
             double survival = spent.oneBitScores ? (double)spent.extraBitScores / spent.oneBitScores : tuning.plannerCosts.extraBitSurvival(input.dims);
@@ -1828,6 +1838,9 @@ public:
 
       faiss::IndexIVF& ivf;
       faiss::IndexIVFRaBitQ* rabitq;
+      // Packed overlays only: FAISS's flat list scanners cannot read these lists.
+      const MmapInvertedLists* packedLists;
+      std::optional<Pq4QueryTable> pq4Table;
       int32_t segOrd;
       const SegV2D& v2d;
       LiveDocs* liveDocs;
@@ -2005,12 +2018,15 @@ public:
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+            packedLists(dynamic_cast<const MmapInvertedLists*>(ivf.invlists)),
             segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        if (packedLists != nullptr && !packedLists->isPacked()) packedLists = nullptr;
+        if (packedLists != nullptr) pq4Table.emplace(dynamic_cast<faiss::IndexIVFPQ&>(ivf).pq, preparedQuery.query);
       }
 
       bool usesIntervals() const { return intervals != nullptr; }
@@ -2073,7 +2089,7 @@ public:
         auto scan = [&](auto probe) {
           return scanListsWithProbe<Interval>(request, listIds, centroidDists, rangeLiveVectors, cut, selector, probe);
         };
-        if (rabitq == nullptr) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
+        if (rabitq == nullptr && !pq4Table) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
         return selector.withProbe(ivf.ntotal, scan);
       }
 
@@ -2090,8 +2106,10 @@ public:
         }();
         std::unique_ptr<faiss::InvertedListScanner> pqScanner;
         std::vector<float> centroid;
+        std::optional<Pq4ListScan> pq4Scan;
+        if (pq4Table) pq4Scan.emplace(*pq4Table);
         if (rabitq != nullptr) centroid.resize((size_t)ivf.d);
-        else {
+        else if (!pq4Table) {
           pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
           pqScanner->set_query(preparedQuery.query);
         }
@@ -2101,6 +2119,16 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
+          if constexpr (!Interval) {
+            if (pq4Scan) {
+              size_t count = ivf.invlists->list_size((size_t)id);
+              visited += (int64_t)count;
+              pq4Scan->scanList(packedLists->packedListBlocks((size_t)id), count,
+                                packedLists->get_ids((size_t)id), centroidDists[list], probe, handler);
+              handler.flush();
+              continue;
+            }
+          }
           faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
           faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
           size_t count = ivf.invlists->list_size((size_t)id);
@@ -2162,7 +2190,8 @@ public:
           handler.flush();
         }
         if constexpr (!Interval) {
-          if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
+          if (pq4Scan) scanned = pq4Scan->passes;
+          else if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
           cut.finishScan(scanned);
         }
         VectorSearchWork work;
@@ -2174,11 +2203,12 @@ public:
           work.newListSelectorPasses = scanned;
           work.newListLiveVectors = rangeLiveVectors;
         } else work.depthEntries = visited;
-        work.pqScores = rabitq == nullptr ? scanned : 0;
+        work.pqScores = rabitq == nullptr && !pq4Scan ? scanned : 0;
+        work.fastScanCodes = pq4Scan ? pq4Scan->kernelCodes : 0;
         work.oneBitScores = rabitq != nullptr ? scanned : 0;
         work.extraBitScores = extra;
         work.gateRejections = rejected;
-        work.scoreBytes = (multiBit ? extra : scanned) * (int64_t)ivf.code_size;
+        work.scoreBytes = (pq4Scan ? work.fastScanCodes : multiBit ? extra : scanned) * (int64_t)ivf.code_size;
         return work;
       }
     };

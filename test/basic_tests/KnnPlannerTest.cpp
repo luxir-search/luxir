@@ -271,6 +271,45 @@ TEST(KnnPlannerTest, sharedIvfRequestCanFavorExact) {
   }
 }
 
+// pq4 runs the kernel over every physical code: its units count entries, not
+// eligible vectors, and its filter test pays neither the virtual selector nor
+// a misprediction per code.
+TEST(KnnPlannerTest, pq4PricesPhysicalCodes) {
+  auto s = segment(10000);
+  s.l2 = false; s.codec = KnnPlanner::Codec::PQ4; s.pqM = 64; s.pqBits = 4;
+  auto price = KnnPlanner::price(s, {}, {});
+  EXPECT_EQ(0, price.linear[KnnPlanner::ENTRY_PQ]);
+  EXPECT_EQ(0, price.linear[KnnPlanner::ENTRY_MISPREDICT]);
+  EXPECT_EQ(0, price.linear[KnnPlanner::PQ_SUBCODE]);
+  EXPECT_EQ(0, price.linear[KnnPlanner::ONE_BIT_DIM]);
+  EXPECT_EQ(0, price.linear[KnnPlanner::RABITQ_LIST_DIM]);
+  EXPECT_NEAR(100000, price.linear[KnnPlanner::PQ4_CODE], 1);
+  EXPECT_EQ(price.linear[KnnPlanner::PQ4_CODE] * 64, price.linear[KnnPlanner::PQ4_SUBCODE]);
+  EXPECT_EQ(256, price.linear[KnnPlanner::PQ4_LIST]);
+  EXPECT_EQ(16 * 128, price.fixed[KnnPlanner::PQ_TABLE_DIM]);
+  EXPECT_EQ(100000, price.linear[KnnPlanner::ENTRY_BITMAP]);
+  // Chunks with no eligible code skip the kernel.
+  auto selective = segment(10);
+  selective.codec = KnnPlanner::Codec::PQ4; selective.pqM = 64; selective.pqBits = 4;
+  EXPECT_LT(KnnPlanner::price(selective, {}, {}).linear[KnnPlanner::PQ4_CODE], 3000);
+  VectorSearchWork work;
+  work.listSetups = 256; work.physicalEntries = 100000; work.fastScanCodes = 100032; work.selectorPasses = 10000;
+  work.selectorBitmap = 100000;
+  auto actual = KnnPlanner::actualWork(s, work);
+  EXPECT_EQ(100032, actual[KnnPlanner::PQ4_CODE]);
+  EXPECT_EQ(100032 * 64, actual[KnnPlanner::PQ4_SUBCODE]);
+  EXPECT_EQ(256, actual[KnnPlanner::PQ4_LIST]);
+  EXPECT_EQ(16 * 128, actual[KnnPlanner::PQ_TABLE_DIM]);
+  EXPECT_EQ(0, actual[KnnPlanner::ENTRY_PQ]);
+  EXPECT_EQ(0, actual[KnnPlanner::ENTRY_MISPREDICT]);
+  // At equal code bytes (m doubled) the unfiltered scan prices below 8-bit PQ.
+  auto pq = s;
+  pq.codec = KnnPlanner::Codec::PQ; pq.pqM = 32; pq.pqBits = 8; pq.eligibleVectors = pq.vectors; pq.unfiltered = true; pq.domain = false;
+  auto unfiltered = s;
+  unfiltered.eligibleVectors = unfiltered.vectors; unfiltered.unfiltered = true; unfiltered.domain = false;
+  EXPECT_LT(KnnPlanner::price(unfiltered, {}, {}).a, KnnPlanner::price(pq, {}, {}).a);
+}
+
 TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
   for (auto codec : {KnnPlanner::Codec::PQ, KnnPlanner::Codec::RABITQ})
     for (bool l2 : {false, true}) for (int selector : {0, 1, 2}) {

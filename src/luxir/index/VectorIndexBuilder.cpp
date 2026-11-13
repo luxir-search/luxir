@@ -11,6 +11,7 @@
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
+#include <faiss/impl/fast_scan/fast_scan.h>
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
@@ -131,7 +132,7 @@ int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
   return defaultIvfNList(ntotal);
 }
 
-int32_t choosePqM(int32_t configured, int32_t dims) {
+int32_t choosePqM(int32_t configured, int32_t dims, bool pq4) {
   if (configured > 0) {
     // The schema validates authored settings; keep this check for
     // programmatically constructed field types too.
@@ -144,7 +145,9 @@ int32_t choosePqM(int32_t configured, int32_t dims) {
 
   // One code byte per 8 dims above 256 dims, for every metric. L2's resident
   // precomputed table is bounded when the overlay is opened, not by capping m.
-  int32_t cap = std::max(32, dims / 8);
+  // 4-bit codes carry half the bits per sub-quantizer, so pq4 doubles the cap to
+  // keep those code bytes (the 4-dimension floor below still applies).
+  int32_t cap = std::max(32, dims / 8) * (pq4 ? 2 : 1);
   int32_t maxM = std::min(cap, dims);
   for (int32_t m = maxM; m >= 1; m--) {
     if (dims % m == 0 && dims / m >= 4) return m;
@@ -445,7 +448,12 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int32_t dims = ft.storedDims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;
-  const char* codecName = rabitq ? "IVF+RaBitQ" : "IVF+PQ";
+  bool pq4 = ann.codec == VectorAnnConfig::PQ4;
+  const char* codecName = rabitq ? "IVF+RaBitQ" : pq4 ? "IVF+PQ4" : "IVF+PQ";
+  if (pq4 && metric != faiss::METRIC_INNER_PRODUCT) {
+    throw std::runtime_error(fmt::format(
+      "VectorIndexBuilder: codec pq4 supports only inner product and cosine (field {})", fieldName));
+  }
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
@@ -468,7 +476,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   if (rabitq) {
     requiredTraining = std::max<int64_t>(ivfRaBitQMinTrainingVectors, nlist);
   } else {
-    pqBits = std::clamp(ann.pqBits, 1, 8);
+    pqBits = pq4 ? 4 : std::clamp(ann.pqBits, 1, 8);
     int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << pqBits);
     requiredTraining = std::max<int64_t>(
         std::max<int64_t>(ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
@@ -486,7 +494,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
-  if (!rabitq) pqM = choosePqM(ann.pqM, dims);
+  if (!rabitq) pqM = choosePqM(ann.pqM, dims, pq4);
 
   // Scale the sample with what it trains: the IVF lists and, for PQ, the
   // codebook entries of each sub-quantizer, which are trained on the same rows.
@@ -693,11 +701,27 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       faiss::InvertedLists::ScopedIds ids(&lists, i);
       os.write(ids.get(), sz * sizeof(faiss::idx_t));
     }
+    // 64-aligned in the file, so packed blocks start on a cache line (the
+    // file's mapping is page-aligned).
+    os.align(64);
+    int64_t codesBytes = 0;
+    constexpr size_t PACK_BLOCK = VectorAuxListsFooter::PACK_BLOCK;
+    std::vector<uint8_t> packed;
     for (size_t i = 0; i < lists.nlist; i++) {
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
       faiss::InvertedLists::ScopedCodes codes(&lists, i);
-      os.write(codes.get(), sz * lists.code_size);
+      if (!pq4) {
+        os.write(codes.get(), sz * lists.code_size);
+        codesBytes += (int64_t)(sz * lists.code_size);
+        continue;
+      }
+      size_t nb = VectorAuxListsFooter::packedBlocks(sz) * PACK_BLOCK;
+      packed.assign(nb * lists.code_size, 0);
+      faiss::pq4_pack_codes(codes.get(), sz, (size_t)pqM, nb, PACK_BLOCK,
+                            VectorAuxListsFooter::packedNsq((size_t)pqM), packed.data());
+      os.write(packed.data(), packed.size());
+      codesBytes += (int64_t)packed.size();
     }
     os.align(8);
     if (!amplitudes.empty()) {
@@ -718,7 +742,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     footer.nlist = (int64_t)lists.nlist;
     footer.codeSize = (int64_t)lists.code_size;
     footer.ntotal = ntotal;
+    footer.codesBytes = codesBytes;
     footer.amplitudeCount = amplitudeCount;
+    footer.packBlock = pq4 ? VectorAuxListsFooter::PACK_BLOCK : 0;
     footer.version = VectorAuxListsFooter::VERSION;
     footer.magic = VectorAuxListsFooter::MAGIC;
     os.write(&footer, sizeof(footer));
@@ -738,7 +764,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     meta.dims = dims;
     meta.metric = (int32_t)ft.metric_;
     meta.cosineNormalizeColumnOnRescore = shouldNormalizeForFaiss(ft) ? 1 : 0;
-    meta.engine = rabitq ? VectorAuxMeta::ENGINE_IVFRABITQ : VectorAuxMeta::ENGINE_IVFPQ;
+    meta.engine = rabitq ? VectorAuxMeta::ENGINE_IVFRABITQ
+                : pq4 ? VectorAuxMeta::ENGINE_IVFPQ4FS : VectorAuxMeta::ENGINE_IVFPQ;
     meta.nlist = nlist;
     meta.pqM = pqM;
     meta.pqBits = pqBits;
