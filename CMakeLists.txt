@@ -37,7 +37,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
 set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a
-             apple-m1 apple-m2 apple-m3 apple-m4 apple-m5)
+             armv9-a+i8mm+bf16+fp16 apple-m1 apple-m2 apple-m3 apple-m4 apple-m5)
 set(_luxir_cpu_name ${LUXIR_CPU_TARGET})
 # GCC's native detection reports every Apple core as apple-m1; name the chip.
 if(LUXIR_CPU_TARGET STREQUAL "native" AND APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
@@ -82,7 +82,7 @@ endif()
 # an x86-64-v4 build on a CPU without AVX-512 would otherwise die generating
 # code. Later -march options win, so this replaces the tree-wide tier.
 function(luxir_runs_during_build target)
-  if(NOT CMAKE_CROSSCOMPILING AND LUXIR_CPU_TARGET MATCHES "^(x86-64-v|armv8)")
+  if(NOT CMAKE_CROSSCOMPILING AND LUXIR_CPU_TARGET MATCHES "^(x86-64-v|armv8|armv9)")
     target_compile_options(${target} PRIVATE -march=native)
   endif()
 endfunction()
