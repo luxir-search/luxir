@@ -619,6 +619,11 @@ public:
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
 
+  // Paces the segment data files background merges write (node-wide, owned by
+  // Collections); null = unpaced.  Forced merges are never paced.  Set before
+  // the writer's first merge, like the fields above.
+  ByteRateLimiter* mergeRateLimiter = nullptr;
+
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough

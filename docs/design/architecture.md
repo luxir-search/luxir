@@ -45,7 +45,8 @@ Most of what follows depends on segments being immutable:
   durable commit point. `deleteDurably` persists removals. After a crash the
   index reopens at a complete commit.
 - Compaction is concurrent merging: merges produce new segments in the
-  background and never stall ingest or search.
+  background and never block ingest or search. They do share CPU, disk
+  bandwidth and page cache with searches; see the indexing arena below.
 
 ## Designed for modern hardware
 
@@ -53,6 +54,18 @@ Most of what follows depends on segments being immutable:
 
 All parallelism runs on a work-stealing task scheduler, which keeps
 every core busy even when work is skewed.
+
+The node's worker pool serves two arenas. Searches, buffered update decoding
+and administration run in the query arena at normal priority; indexing (update
+batches, flushes, merges, delete passes, vector builds, commits) runs in the
+indexing arena at low priority. The scheduler gives queries workers first and
+recalls workers from indexing between tasks, and the pool keeps one thread
+beyond either arena's width, so a query never waits for a worker to free up.
+Priority orders pool work only: inline HTTP searches never enter the pool, so
+the indexing arena can also be capped (`--indexing.threads`), its workers
+niced while they run indexing work (`--indexing.nice`), and background merge
+writes paced (`--indexing.merge-max-bytes-per-sec`). See
+[Threads and streaming backpressure](../guide/operations.md#threads-and-streaming-backpressure).
 
 - **Search** parallelizes across segments (and within segments) and
   across the independent operations in
@@ -101,7 +114,7 @@ response paths keep connection handling separate from long-running engine work.
   still on the wire. The connection thread only splits records, recognizes
   control records, and cuts batches; JSON decoding of documents happens on
   the indexing workers, so one connection can keep several cores busy.
-  Buffered JSON update bodies are likewise decoded on the task arena.
+  Buffered JSON update bodies are decoded in the query arena instead.
   Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.

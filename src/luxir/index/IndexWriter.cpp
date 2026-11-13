@@ -2846,6 +2846,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     {
       PostingsWriter pwriter(dir, outputSegId, writerEpoch);
+      if (!clientOrigin) pwriter.setRateLimiter(mergeRateLimiter);
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields

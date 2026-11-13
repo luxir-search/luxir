@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -120,6 +122,10 @@ public:
 
   // The task arena's worker threads (server.workers, resolved).
   int getWorkers() const { return workers; }
+  // Workers the indexing arena may use at once (index.threads, resolved).
+  int getIndexThreads() const { return indexThreads; }
+  // Nice increment applied to workers running indexing work; 0 = off.
+  int getIndexNice() const { return indexNiceIncrement; }
 
   // Runs f on the calling thread inside the task arena, in one of the slots
   // reserved for threads entering from outside.  Tasks f spawns are stealable
@@ -175,6 +181,7 @@ private:
   // CPU than the work.  The arenas are declared ahead of the collections and
   // the search engine so they outlive the work those run in them.
   int workers;
+  int indexThreads;
   int reservedSlots;
   std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
@@ -205,6 +212,30 @@ private:
   // waiting on a graph (close, tests).
   oneapi::tbb::task_arena indexArena;
   ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1};
+
+  // Raises a pool worker's nice by `increment` while it runs indexing work and
+  // restores it when the worker leaves the arena.  Workers move between the
+  // arenas, and inline HTTP searches never use the pool, so arena priority
+  // alone does not keep indexing off their CPUs.  Only workers: a thread that
+  // enters through execute() is a transport or closing thread.  Emplaced only
+  // once a probe proved the restore is permitted (see resolveIndexNice).
+  // Workers still in the arena when it is destroyed get no exit callback, and
+  // the pool outlives the node, so the destructor restores them itself.
+  class ArenaNice : public oneapi::tbb::task_scheduler_observer {
+    int increment;
+    std::mutex mutex;
+    std::map<long, int> niced;  // thread id -> nice before entry
+  public:
+    ArenaNice(oneapi::tbb::task_arena& arena, int increment)
+      : oneapi::tbb::task_scheduler_observer(arena), increment(increment) {
+      observe(true);
+    }
+    ~ArenaNice() override;
+    void on_scheduler_entry(bool worker) override;
+    void on_scheduler_exit(bool worker) override;
+  };
+  int indexNiceIncrement = 0;
+  std::optional<ArenaNice> indexNice;
 
   IndexRamBudget indexRamBudget;
   std::shared_ptr<ReplicationSource> replication;

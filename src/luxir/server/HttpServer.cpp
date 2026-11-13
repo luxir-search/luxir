@@ -219,7 +219,7 @@ struct HttpStreamBatchState {
 
   // Decodes the raw records into proto.docs.  Called from the update message's
   // handle() on an indexing worker, so a single connection's JSON decoding
-  // scales with the task arena instead of its I/O thread.  The I/O thread no
+  // scales with the indexing arena instead of its I/O thread.  The I/O thread no
   // longer touches the batch once it is submitted.  Decoded strings are copied
   // into the staging arena, so the raw bytes go as soon as decoding succeeds.
   // A malformed record fails the whole batch before any of it is indexed.
@@ -2978,7 +2978,7 @@ private:
   void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
     std::size_t maxInFlight = ingest.max_inflight_batches == 0
-        ? (std::size_t)node_.getWorkers() + 2
+        ? (std::size_t)node_.getIndexThreads() + 2
         : (std::size_t)ingest.max_inflight_batches;
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,
@@ -3302,8 +3302,9 @@ private:
     state->inFlight++;
     state->indexing++;
 
-    // This handler runs on the session shard. execute enters the node arena
-    // only for the immediate try_put and returns without waiting for indexing.
+    // This handler runs on the session shard. execute enters the query arena
+    // only for the immediate try_put and returns without waiting for indexing;
+    // the graph's tasks run in the indexing arena, where the graph was built.
     // Consecutive calls therefore reach startUpdateNode in stream order; enqueue
     // would not preserve the updateVersion ordering required by overwrite.
     bool success = false;

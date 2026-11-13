@@ -163,7 +163,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
   app.add_option("--server.workers", server.workers,
-                 "Task-arena worker threads for indexing, merges and parallel search "
+                 "Worker threads shared by the query arena and the low-priority indexing arena "
                  "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
       ->default_val(server.workers)
       ->check(CLI::NonNegativeNumber);
@@ -247,6 +247,19 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
       ->check(CLI::NonNegativeNumber)
       ->default_str("50% of --max-ram-mb");
+  app.add_option("--indexing.threads", index.threads,
+                 "Workers the indexing arena may use at once (0 = all of --server.workers)")
+      ->default_val(index.threads)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--indexing.nice", index.nice,
+                 "Nice increment for workers running indexing work (-1 = auto: " +
+                     std::to_string(IndexConfig::AUTO_NICE) + " when it can be undone, 0 = off)")
+      ->default_val(index.nice)
+      ->check(CLI::Range(-1, 19));
+  app.add_option("--indexing.merge-max-bytes-per-sec", index.merge_max_bytes_per_sec,
+                 "Node-wide write rate of background merges (e.g. 64MB, 0 = unlimited)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_val(index.merge_max_bytes_per_sec);
   app.add_option("--indexing.pressure-flush-floor-mb", index.pressure_flush_floor_mb,
                  "Min idle-inverter size (MiB) to flush when over the shared indexing RAM cap")
       ->default_val(index.pressure_flush_floor_mb)

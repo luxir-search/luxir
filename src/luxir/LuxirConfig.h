@@ -29,9 +29,12 @@ struct ServerConfig {
   // clamped to 1 by the servers.
   int64_t stream_buffer_bytes = 1 << 20;
 
-  // Worker threads of the node's task arena: indexing, merges, and parallel or
-  // dispatched search.  Transport threads (HTTP shards, gRPC) enter the arena
-  // through reserved slots and are not counted.  0 = auto: the affinity width
+  // Worker threads of the node's pool, shared by two arenas of this width: the
+  // query arena (dispatched and parallel search, normal priority) and the
+  // indexing arena (update batches, flushes, merges, vector builds, low
+  // priority; index.threads narrows it).  The pool has one more thread than
+  // either arena uses.  Transport threads (HTTP shards, gRPC) enter the query
+  // arena through reserved slots and are not counted.  0 = auto: the affinity width
   // less one, leaving a core for the transport threads, except on nodes of at
   // most kSmallNodeCores, where holding a core back idles too much of the
   // machine (half of a 2-vCPU node) and the transport threads share instead.
@@ -125,6 +128,22 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+
+  // Pool workers the indexing arena may use at once, capped at server.workers.
+  // 0 = all of server.workers.  A lower value keeps that many workers' worth of
+  // CPU free for searches, including inline HTTP searches, which never use the
+  // pool and so gain nothing from the arena's low priority.
+  int threads = 0;
+  // Nice increment for pool workers while they run indexing work.  Workers move
+  // between the arenas, so the increment is undone on leaving, and undoing it
+  // needs CAP_SYS_NICE or RLIMIT_NICE >= 20 - the base nice.  -1 = auto: 5 when
+  // the node can undo it, else off.  0 = off.  An explicit value the node
+  // cannot undo is logged and ignored.
+  int nice = -1;
+  static constexpr int AUTO_NICE = 5;
+  // Byte rate of segment data written by background merges, node-wide.  Forced
+  // merges (max_segments) are not paced: a client waits for them.  0 = unlimited.
+  uint64_t merge_max_bytes_per_sec = 0;
 };
 
 struct IngestConfig {
@@ -242,6 +261,12 @@ struct LuxirConfig {
   IndexConfig index;
   IngestConfig ingest;
   SearchConfig search;
+
+  /// Indexing arena width: index.threads (0 = all) capped at the resolved workers.
+  int resolveIndexThreads() const {
+    int workers = std::max(1, server.resolveWorkers());
+    return index.threads > 0 ? std::min(index.threads, workers) : workers;
+  }
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
