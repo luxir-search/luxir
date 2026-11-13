@@ -461,6 +461,32 @@ selects conservative paths: `reuseFiles` copies with `Directory::copyFile` inste
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
 
+### Remote backends
+
+A backend that keeps segments where a read is a network request (an object
+store) sets `REMOTE` in `capabilities()` and serves segment files lazily (see
+[storage tiers](../design/storage-tiers.md)):
+
+- `openFile` returns an `InputFile` that overrides `rangeStream` and
+  `prefetchRanges` and returns `true` from `lazy()`. Pointers it hands out stay
+  valid as long as the file lives, as with mmap. `openFile` returns null for
+  an absent name; a lazy fetch that later finds the object gone throws
+  `std::filesystem::filesystem_error`.
+- A `REMOTE` directory gets an `s<seg>__hot` file with every segment
+  (`PostingsWriter::finish`): the ranges opening the segment reads. On
+  `openFile` of a segment data file, read the segment's hotcache once
+  (`Hotcache::fileName`, `Hotcache::decode`) and `prefetchRanges` the file's
+  `rangesOf(fileNum)`; ignore a hotcache that does not decode.
+- `knownFiles` passes the committed files and sizes of the manifest that was
+  loaded, so opening them needs no size request.
+- A delete of a file a reader holds waits for the reader, as an unlinked file
+  stays readable on a filesystem.
+
+Core code that opens a segment reads through `rangeStream`, and code that wants
+the whole file through `getInputStream()` (or `read()`). `RecordingDirectory` (`reader/Hotcache.h`) wraps
+a directory and records the ranges read through it, which lets a test assert what
+a read path touches.
+
 ### The example plugin
 
 `test/plugins/example` registers a `counting_ram` backend (RAM storage counting
