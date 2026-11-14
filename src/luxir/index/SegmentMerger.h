@@ -948,9 +948,11 @@ private:
     int64_t numValues = 0;
     int64_t docsWithField = 0;
     int64_t synthesizedPointValues = 0;
+    int64_t sourceTerms = 0;
     bool ordColumn = true;
     bool replay = false;
     for (const auto& field : fields) {
+      sourceTerms += field.record->indexedTotals().numTerms;
       ordColumn = ordColumn && mergesOrdColumn(*field.record);
       replay = replay || replaysOrdColumn(*field.record);
       docsWithField += field.record->docsWithField;
@@ -970,6 +972,8 @@ private:
     if (type == FieldType::ID && space.ordinal == SpaceOrdinal::ROOT) {
       rebuiltBytes += (int64_t)IdFilter::buildBytes(postingsWriter.idFilterOptions, (uint64_t)space.maxDoc);
     }
+    int64_t termIndexBytes = (allFlags & FieldType::INDEX_DOCS) != 0
+        ? MergeCostModel::termIndexBytes(sourceTerms, Postings::TERMS_BLOCK_SIZE) : 0;
 
     if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
         && ordColumn) {
@@ -984,21 +988,21 @@ private:
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
-            + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
+            + MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
       }
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
       return (int64_t)space.maxDoc * 4
-          + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
+          + MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
-      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
-    return MergeCostModel::LIGHT_BYTES + rebuiltBytes;
+    return MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
   }
 
   // In postings and values processed. A merged term is a heap step over the
@@ -1608,11 +1612,14 @@ private:
     for (auto* field : fields) {
       ordMaps.emplace_back((size_t)field->record->indexedTotals().numTerms + 1);
     }
-    TextWriter textWriter(postingsWriter);
-    textWriter.startField(output.space, output);
-    mergeTermsTier<DocsEnumTier::DOCS, true>(textWriter, fields, nullptr,
-        std::nullopt, std::nullopt, pool, &ordMaps);
-    auto written = textWriter.endField();
+    // Scoped so its term index is freed before the column write.
+    auto written = [&] {
+      TextWriter textWriter(postingsWriter);
+      textWriter.startField(output.space, output);
+      mergeTermsTier<DocsEnumTier::DOCS, true>(textWriter, fields, nullptr,
+          std::nullopt, std::nullopt, pool, &ordMaps);
+      return textWriter.endField();
+    }();
 
     MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc(output.space));
     BasicOrdColWriter<MergedSourceOrds> writer(pool, postingsWriter, output.space, output.header.flags, ords);
@@ -1983,6 +1990,14 @@ private:
       std::vector<BasicBKDWriter<BKDInt64Traits>::Point> rangePoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
       bool rebuildRange = hasRangePoints(type, allFlags);
+      if (rebuildGeo || rebuildRange) {
+        // Upper bound (deleted docs drop out): no growth doubling. A range
+        // point is a (min, max) value pair.
+        int64_t values = 0;
+        for (auto* field : compactFields) values += field->record->numValues;
+        if (rebuildGeo) geoPoints.reserve((size_t)values);
+        else rangePoints.reserve((size_t)(values / 2));
+      }
       auto column = mergeIntCol(space, sortedFields, type,
                                 rebuildGeo ? &geoPoints : nullptr,
                                 rebuildRange ? &rangePoints : nullptr);
