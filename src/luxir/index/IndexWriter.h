@@ -519,6 +519,14 @@ public:
   // Zero derives the ceiling from this merge's size-scaled stream budget.
   // Tests and constrained deployments may set an explicit 2..64 ceiling.
   int32_t termPartitionMaxRanges = MergeCostModel::DERIVED_TERM_RANGES;
+  // Replay merges whose term ord maps reach this many bytes write them to
+  // node-local scratch files (ScratchFile) and map them, rather than holding
+  // every source's map on the heap. Debug builds spill every replay merge.
+#ifdef NDEBUG
+  int64_t ordMapSpillMinBytes = MergeCostModel::ORD_MAP_SPILL_MIN_BYTES;
+#else
+  int64_t ordMapSpillMinBytes = 1;
+#endif
 
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.

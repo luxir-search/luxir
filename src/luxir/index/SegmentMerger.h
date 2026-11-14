@@ -47,6 +47,7 @@
 // #define MERGER_DEBUG LOG_DEBUG
 
 #include "luxir/util/Signal.h"
+#include "luxir/util/ScratchFile.h"
 #include "luxir/reader/DocsReader.h"
 
 namespace luxir {
@@ -592,6 +593,9 @@ class SegmentMerger {
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
+  // Replay merges whose per-source term ord maps (replayOrdMapBytes) reach
+  // this write them to scratch files instead of the heap.
+  int64_t ordMapSpillMinBytes;
 
 public:
 
@@ -616,14 +620,16 @@ public:
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges, const Schema& schema,
-                StoredDictionaryRegistry& storedDictionaries)
+                StoredDictionaryRegistry& storedDictionaries,
+                int64_t ordMapSpillMinBytes = MergeCostModel::ORD_MAP_SPILL_MIN_BYTES)
   : cores(cores), root(SpaceOrdinal::ROOT, liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     schema(schema), storedDictionaries(storedDictionaries),
     estimatedOutputBytes(estimateOutputBytes(cores)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
-    termPartitionMaxRanges(termPartitionMaxRanges)
+    termPartitionMaxRanges(termPartitionMaxRanges),
+    ordMapSpillMinBytes(ordMapSpillMinBytes)
   {
     assert(cores.size() == liveDocs.size());
     root.preaders.reserve(cores.size());
@@ -974,6 +980,10 @@ private:
       if (replay) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
+        // Spilled maps are mapped page cache; the heap keeps a write buffer each.
+        if (mapBytes >= ordMapSpillMinBytes) {
+          mapBytes = (int64_t)fields.size() * (int64_t)ScratchFile::DEFAULT_BUFFER_BYTES;
+        }
         // Mapped source runs stream directly; only maps and codec plans grow.
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
@@ -1365,12 +1375,85 @@ private:
     void operator()() const {}
   };
 
+  // Bytes of the per-source term ord maps a replay merge builds.
+  static int64_t replayOrdMapBytes(std::span<MergeFieldInfo*> fields) {
+    int64_t bytes = 0;
+    for (auto* field : fields) bytes += (field->segFieldInfo.nTerms + 1) * (int64_t)sizeof(uint32_t);
+    return bytes;
+  }
+
+  // Per-source maps from a source term ord (slot ord + 1; slot 0 is unused)
+  // to the merged term ord, for a replay merge. The term walk visits each
+  // source's terms in increasing ord, so a map is written append-only and,
+  // when spilled, streams to a scratch file that is mapped for the column
+  // write: the heap then holds only a write buffer per source.
+  class ReplayOrdMaps {
+    std::vector<std::vector<uint32_t>> heap;
+    std::vector<std::unique_ptr<ScratchFile>> files;
+    std::vector<int64_t> slots;  // per source: map length (nTerms + 1)
+    std::vector<int64_t> next;   // per source: next slot to write (spilled)
+    std::vector<std::span<const uint32_t>> maps;
+
+    void appendZeros(size_t idx, int64_t upTo) {
+      static constexpr uint32_t ZEROS[256] = {};
+      while (next[idx] < upTo) {
+        int64_t n = std::min<int64_t>(upTo - next[idx], 256);
+        files[idx]->append(ZEROS, (size_t)n * sizeof(uint32_t));
+        next[idx] += n;
+      }
+    }
+
+  public:
+    ReplayOrdMaps(std::span<MergeFieldInfo*> fields, bool spill) {
+      for (auto* field : fields) slots.push_back(field->segFieldInfo.nTerms + 1);
+      if (!spill) {
+        for (int64_t n : slots) heap.emplace_back((size_t)n);
+        return;
+      }
+      for (size_t i = 0; i < slots.size(); i++) {
+        files.push_back(std::make_unique<ScratchFile>());
+        next.push_back(0);
+      }
+    }
+
+    bool spilled() const { return !files.empty(); }
+
+    void set(size_t idx, int64_t sourceOrd, uint32_t termOrd) {
+      int64_t slot = sourceOrd + 1;
+      assert(slot > 0 && slot < slots[idx]);
+      if (!spilled()) {
+        heap[idx][(size_t)slot] = termOrd;
+        return;
+      }
+      assert(slot >= next[idx]);
+      appendZeros(idx, slot);
+      files[idx]->append(&termOrd, sizeof(termOrd));
+      next[idx] = slot + 1;
+    }
+
+    // Completes every map; call once the term walk is done.
+    void finish() {
+      maps.clear();
+      for (size_t i = 0; i < slots.size(); i++) {
+        if (!spilled()) {
+          maps.emplace_back(heap[i]);
+          continue;
+        }
+        appendZeros(i, slots[i]);
+        auto bytes = files[i]->map();
+        maps.emplace_back((const uint32_t*)bytes.data(), bytes.size() / sizeof(uint32_t));
+      }
+    }
+
+    std::span<const uint32_t> operator[](size_t idx) const { return maps[idx]; }
+  };
+
   // onTerm runs after each merged term is written.
   template<DocsEnumTier Tier, bool Array = false, typename OnTerm = NoTermHook>
   void mergeTermsTier(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
                       OrdCollector* ordCollector, const std::optional<std::string>& lower,
                       const std::optional<std::string>& upper, MemPool& pool,
-                      std::vector<std::vector<uint32_t>>* ordMaps = nullptr,
+                      ReplayOrdMaps* ordMaps = nullptr,
                       OnTerm onTerm = {}) {
     struct TermsEnumIdx {
       TermsEnum tenum;
@@ -1416,7 +1499,7 @@ private:
         BasicDocsEnum<Tier> docsEnum(entry.tenum);
         if constexpr (Tier == DocsEnumTier::DOCS) {
           if constexpr (Array) {
-            (*ordMaps)[entry.idx][(size_t)entry.tenum.ord() + 1] = (uint32_t)termOrd;
+            ordMaps->set(entry.idx, entry.tenum.ord(), (uint32_t)termOrd);
             const auto& seg = *compactFields[entry.idx]->seg;
             for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
               auto [mapped, deleted] = seg.remapDocId(doc);
@@ -1472,7 +1555,7 @@ private:
   // disk rather than being copied into another merge-time collector.
   class MergedSourceOrds {
     std::span<MergeFieldInfo*> fields;
-    const std::vector<std::vector<uint32_t>>& maps;
+    const ReplayOrdMaps& maps;
     int32_t maxDoc;
     int32_t docCount = 0;
     bool multi = false;
@@ -1514,7 +1597,7 @@ private:
 
   public:
     MergedSourceOrds(std::span<MergeFieldInfo*> fields,
-                    const std::vector<std::vector<uint32_t>>& maps, int32_t maxDoc)
+                     const ReplayOrdMaps& maps, int32_t maxDoc)
         : fields(fields), maps(maps), maxDoc(maxDoc) {
       for (auto* field : fields) {
         OrdColReader source(*field->seg->postingsReader, field->segFieldInfo);
@@ -1595,8 +1678,7 @@ private:
   void LUXIR_NOINLINE mergeOrdColumnByReplay(
       std::span<MergeFieldInfo*> fields, PostingsWriter::IndexFieldInfo& output,
       MemPool& pool) {
-    std::vector<std::vector<uint32_t>> ordMaps;
-    for (auto* field : fields) ordMaps.emplace_back((size_t)field->segFieldInfo.nTerms + 1);
+    ReplayOrdMaps ordMaps(fields, replayOrdMapBytes(fields) >= ordMapSpillMinBytes);
     {
       // Scoped so its term index is freed before the column write.
       TextWriter textWriter(postingsWriter);
@@ -1606,6 +1688,9 @@ private:
       textWriter.endField();
     }
 
+    ordMaps.finish();
+    bool spilled = ordMaps.spilled();
+    Signal::emit("mergeOrdColumnByReplay", &output, &spilled);
     MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc(output.space));
     BasicOrdColWriter<MergedSourceOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
