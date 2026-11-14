@@ -330,10 +330,10 @@ public:
                 && !(disableOrdinalAggregateBatchesForTests
                      && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
-                  accumulator, binding, domainHandle.get(), maxDoc);
+                  accumulator, binding, domainHandle.get(op.req.reader->segments()[(size_t)segnum]), maxDoc);
             } else {
               accumulateExpression(
-                  accumulator, binding, domainHandle.get(), maxDoc);
+                  accumulator, binding, domainHandle.get(op.req.reader->segments()[(size_t)segnum]), maxDoc);
             }
           }
         } catch (const ValueEvaluationError&) {

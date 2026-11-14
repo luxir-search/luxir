@@ -476,7 +476,7 @@ public:
         DocSetBuilder empty(maxDoc);
         domain = empty.build();
       }
-      return DomainHandle(std::move(domain));
+      return DomainHandle(std::move(domain)).scoped(segment);
     }
 
     template <typename Key>
@@ -521,7 +521,7 @@ public:
                 if (chunk[i].id) owner.emplace(chunk[i].id->value, (int32_t)i);
               } else owner.emplace(chunk[i].key, (int32_t)i);
             }
-            return buildFacetBucketDomains(maxDoc, chunk.size(), [&](auto&& accept) {
+            return buildFacetBucketDomains(facet.reader.segments()[segnum], chunk.size(), [&](auto&& accept) {
               int64_t missing = 0;
               if constexpr (std::is_same_v<Key, std::string_view>) {
                 assert(ordMap || !info);
@@ -873,7 +873,7 @@ public:
                   for (size_t i = 0; i < chunk.size(); i++) {
                     if (chunk[i].id) bucketOf.emplace(chunk[i].id->value, (int32_t)i);
                   }
-                  return buildFacetBucketDomains(facet.reader.segments()[segnum].maxDoc(), chunk.size(),
+                  return buildFacetBucketDomains(facet.reader.segments()[segnum], chunk.size(),
                       [&](auto&& accept) {
                         int64_t missing = 0;
                         if constexpr (Ordinal) facet.facetSegOrdCol(input[segnum].get(), (int32_t)segnum,
@@ -912,7 +912,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
       unused(tg);
       if (segnum == -1) { driver.completeEmpty(); return; }
-      DocSet* docs = domain.get();
+      DocSet* docs = domain.get(op.req.reader->segments()[(size_t)segnum]);
       if (!input.empty()) input[(size_t)segnum] = std::move(domain);
       driver.contribute([&](DistinctFacetCounts& data) { collect(data, segnum, docs); });
     }
@@ -1079,6 +1079,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
+      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!thisOp().inlineSubOps.empty()) {
         if (segnum == -1) {
@@ -1212,7 +1213,7 @@ public:
         builderOfValue.emplace(buckets[i].key, (int32_t)i);
       }
       return buildFacetBucketDomains(
-          thisOp().reader.segments()[segnum].maxDoc(), buckets.size(),
+          thisOp().reader.segments()[segnum], buckets.size(),
           [&](auto&& accept) {
             int64_t missing = 0;
             thisOp().facetSegIntCol(eligibility, (int32_t)segnum,
@@ -1378,6 +1379,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
+      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (inlineDriver.has_value()) {
         if (segnum == -1) {
@@ -1836,12 +1838,13 @@ public:
         driver.completeEmpty();
         return;
       }
+      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!input.empty()) {
         if constexpr (Storage::growing) {
           if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
               std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
-          domain = domainHandle.get();
+          domain = domainHandle.get(op.req.reader->segments()[(size_t)segnum]);
           if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
               domain->ramBytesUsed(), std::memory_order_relaxed);
         }
@@ -1869,8 +1872,9 @@ public:
         return;
       }
       std::copy(domains.begin(), domains.end(), input.begin());
-      for ([[maybe_unused]] const DomainHandle& domain : input) {
-        assert(domain.isDeliverable());
+      for (size_t i = 0; i < input.size(); i++) {
+        assert(input[i].isDeliverable());
+        input[i].assertScope(op.req.reader->segments()[i]);
       }
       prepareAndDispatch(tg);
     }
@@ -1950,7 +1954,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     if (auto domains = zoneBucketDomains(segnum, buckets, builderOfBucket, eligibility, layout)) {
       return std::move(*domains);
     }
-    return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
+    return buildFacetBucketDomains(reader.segments()[segnum], buckets.size(),
         [&](auto&& accept) {
           int64_t missing = 0;
           facetSegIntCol(eligibility, (int32_t)segnum, missing, accept);
@@ -2072,7 +2076,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     }
     std::vector<DomainHandle> domains;
     domains.reserve(buckets.size());
-    for (auto& builder : visitor.builders) domains.emplace_back(builder.build());
+    for (auto& builder : visitor.builders) domains.push_back(DomainHandle(builder.build()).scoped(reader.segments()[segnum]));
     return domains;
   }
 
@@ -2384,7 +2388,7 @@ public:
       return DomainHandle(QueryPrep::materialize(
           bucketSource(bucket), segment, domain,
           Query::SupplierExecutionMode::ORDINARY,
-          QueryPrep::MaterializeMode::ORDINARY));
+          QueryPrep::MaterializeMode::ORDINARY)).scoped(segment);
     }
 
     void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
@@ -2424,11 +2428,11 @@ public:
       // latter are applied by StructuralConstraint::finish, never replayed
       // from this placeholder or from the bucket's original selected window.
       if (bucketSelection(bucket)) return DomainHandle(std::make_unique<ArrDocSet>(
-          std::vector<int32_t>{}));
+          std::vector<int32_t>{})).scoped(queryOp().reader.segments()[segnum]);
       auto& segment = queryOp().reader.segments()[segnum];
       auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
       return DomainHandle(QueryPrep::materialize(
-          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility));
+          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility)).scoped(queryOp().reader.segments()[segnum]);
     }
 
     void collectSegment(
@@ -2476,7 +2480,7 @@ public:
         }
         supplier = obtainSupplier();
         if (supplier == nullptr) continue;
-        DomainHandle matches(QueryPrep::materialize(supplier, guard.pool(), segment, domain));
+        DomainHandle matches = DomainHandle(QueryPrep::materialize(supplier, guard.pool(), segment, domain)).scoped(segment);
         data.counts[bucket] += matches.get()->card();
       }
       }

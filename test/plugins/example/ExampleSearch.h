@@ -100,6 +100,7 @@ public:
       if (segnum == 0) taskGroup = tg;
       auto& reader = *op.req.reader;
       auto& segment = reader.segments()[(size_t)segnum];
+      domain.assertScope(segment);
       if (const auto* info = reader.field("id").at(segment)) {
         auto poolGuard = luxir::MemPool::threadLocalPoolGuard();
         luxir::TermsEnum terms(poolGuard.pool(), segment.postingsReader(), *info);
@@ -131,7 +132,7 @@ public:
         for (int32_t s = 0; s < (int32_t)op.req.reader->segments().size(); s++) {
           luxir::DocSetBuilder builder(op.req.reader->segments()[(size_t)s].maxDoc());
           for (; doc != sorted.end() && doc->segment() == s; ++doc) builder.add(doc->docId());
-          domains.emplace_back(builder.build());  // an empty set, never null (null = all docs)
+          domains.push_back(luxir::DomainHandle(builder.build()).scoped(op.req.reader->segments()[(size_t)s]));  // an empty set, never null (null = all docs)
         }
         luxir::task_group_fanout(domains.empty() ? nullptr : tg, subCalcs.size(), [&](size_t i) {
           auto* subCalc = subCalcs[i].get();

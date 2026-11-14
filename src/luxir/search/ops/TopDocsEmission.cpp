@@ -163,14 +163,14 @@ void emitPage(const CollapsedPageSettings& settings,
                 if constexpr (Identity) {
                   DocSetBuilder builder(maxDoc);
                   for (int32_t doc : members) builder.add(doc);
-                  result.emplace_back(builder.build());
+                  result.push_back(DomainHandle(builder.build()).scoped(qr.req.reader->segments()[segnum]));
                 } else {
                   auto charge = std::make_shared<DomainVariantPlan::DomainCharge>(
                       qr.req.memoryTracker, sizeof(ArrDocSet) + members.size() * sizeof(int32_t),
                       "group bucket domain", "collapse member state");
                   result.push_back(DomainHandle(std::make_unique<ArrDocSet>(
                       std::vector<int32_t>(members.begin(), members.end())))
-                      .chargedWith(std::move(charge)));
+                      .scoped(qr.req.reader->segments()[segnum]).chargedWith(std::move(charge)));
                 }
               }
               return result;

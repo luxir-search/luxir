@@ -125,33 +125,52 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
-IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterCache)
-  : snapshotTime(snapshot.commitTime), snapshotGen(snapshot.indexGen),
-    core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
-    sharedFilterCache(std::move(filterCache)) {}
+IndexReader::IndexReader(OpenedSnapshot opened, std::shared_ptr<FilterCache> filterCache)
+  : snapshot(std::make_shared<Snapshot>(std::move(opened), std::move(filterCache))),
+    space(snapshot->core->root) {}
+
+IndexReader::IndexReader(std::shared_ptr<Snapshot> snapshot, std::shared_ptr<SpaceState> space)
+  : snapshot(std::move(snapshot)), space(std::move(space)) {}
+
+std::shared_ptr<IndexReader> IndexReader::view(std::string_view path) {
+  std::lock_guard lock(snapshot->viewsMutex);
+  if (auto self = weak_from_this().lock()) snapshot->views[std::string(this->path())] = self;
+  auto& cached = snapshot->views[std::string(path)];
+  if (auto reader = cached.lock()) return reader;
+  if (path == this->path()) {
+    if (auto reader = weak_from_this().lock()) {
+      cached = reader;
+      return reader;
+    }
+  }
+  auto reader = std::shared_ptr<IndexReader>(new IndexReader(snapshot, snapshot->core->space(path)));
+  cached = reader;
+  return reader;
+}
 
 IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
                          std::shared_ptr<FilterCache> filterCache)
   : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes, snapshot.openCores),
                 filterCache ? std::move(filterCache)
-                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
+                    : (previousReader ? previousReader->snapshot->filterCache : nullptr)) {}
 
 IndexReader::IndexReader(Directory& dir, IndexReader* previousReader, std::shared_ptr<FilterCache> filterCache)
   : IndexReader(openSnapshot(dir, previousReader, nullptr, nullptr),
                 filterCache ? std::move(filterCache)
-                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
+                    : (previousReader ? previousReader->snapshot->filterCache : nullptr)) {}
 
-IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
+IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
                                                 std::shared_ptr<Schema> preferredSchema,
                                                 std::shared_ptr<const std::vector<std::byte>> manifest,
                                                 std::span<const std::weak_ptr<SegmentCore>> published) {
   assert(published.empty() || manifest);  // aligned with that manifest's segments
   auto core = std::make_shared<PhysicalCore>();
-  const auto* previous = previousReader ? previousReader->core.get() : nullptr;
-  auto& segs = core->segs;
+  const auto* previous = previousReader ? previousReader->snapshot->core.get() : nullptr;
+  core->root = std::make_shared<SpaceState>();
+  auto& segs = core->bundles;
   auto& auxReadersList = core->auxReadersList;
-  auto& totalMaxDoc = core->totalMaxDoc;
-  auto& livedocs = core->livedocs;
+  auto& totalMaxDoc = core->root->totalMaxDoc;
+  auto& livedocs = core->root->livedocs;
   uint64_t commitTimeUs = 0;
   uint64_t indexGen = 0;
   std::shared_ptr<Schema> schema;
@@ -167,13 +186,13 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
   if (previous) {
-    assert(previous->segmentFiles.size() == previous->segs.size());
+    assert(previous->segmentFiles.size() == previous->bundles.size());
     for (const auto& r : previous->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
     }
-    for (const auto& seg : previous->segs) {
-      for (const auto& r : seg.auxReaders()) {
-        prevSegAuxByKey.emplace(segmentAuxKey(seg.segInfo.seg_id, r->getName()), r);
+    for (const auto& seg : previous->bundles) {
+      for (const auto& r : seg.aux) {
+        prevSegAuxByKey.emplace(segmentAuxKey(seg.info.seg_id, r->getName()), r);
       }
     }
   }
@@ -231,7 +250,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
       }
       for (const auto& aux : indexInfo.aux_indexes) core->auxFiles.push_back(fromWire(aux.files));
       if (previous && previous->segmentFiles == core->segmentFiles && previous->auxFiles == core->auxFiles) {
-        return {previousReader->core, std::move(schema), indexInfo.commit_time, indexGen};
+        return {previousReader->snapshot->core, std::move(schema), indexInfo.commit_time, indexGen};
       }
       commitTimeUs = indexInfo.commit_time;
       core->coreGeneration = indexInfo.core_gen;
@@ -262,7 +281,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         // delete or overlay commit leaves them unchanged); without descriptors
         // the identity is unknown and nothing is shared. Live docs carry over
         // when the generation's file is unchanged.
-        const Segment* prevSeg = previous ? previous->segment(segId) : nullptr;
+        const auto* prevSeg = previous ? previous->bundle(segId) : nullptr;
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
         std::shared_ptr<SegmentCore> segmentCore;
         if ((size_t)i < published.size()) {
@@ -270,7 +289,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           if (segmentCore && segmentCore->rootReader().maxDoc() != nDocs) segmentCore = nullptr;
         }
         if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
-          segmentCore = prevSeg->sharedSegmentCore;
+          segmentCore = prevSeg->core;
         }
         if (!segmentCore) segmentCore = SegmentCore::create(dir, segId, segment.creator_epoch, missingFileOK, true);
         if (!segmentCore) {
@@ -280,9 +299,9 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         }
 
         std::shared_ptr<LiveDocs> liveDocs;
-        if (liveGen > 0 && prevSeg && prevSeg->sharedLiveDocs && !files.liveDocs.empty()
+        if (liveGen > 0 && prevSeg && prevSeg->live && !files.liveDocs.empty()
             && prevFiles->liveDocs == files.liveDocs) {
-          liveDocs = prevSeg->sharedLiveDocs;
+          liveDocs = prevSeg->live;
         } else if (liveGen > 0) {
           liveDocs = LiveDocs::create(dir, segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs, missingFileOK, true);
           if (!liveDocs) {
@@ -331,11 +350,9 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         segmentInfo.commit_time = segment.commit_time;
         segmentInfo.live_docs = segment.live_docs;
 
-        segs.emplace_back(std::move(segmentCore), std::move(liveDocs),
-                          std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
-        totalMaxDoc += segs.back().maxDoc();
-        livedocs += segs.back().numLive();
-        assert(nDocs == segs.back().postingsReader().maxDoc());
+        segs.push_back({std::move(segmentCore), std::move(liveDocs),
+                        std::move(segmentAuxReaders), segmentInfo, i});
+        assert(nDocs == segs.back().core->rootReader().maxDoc());
       }
 
       // Aux indexes: open inside the same retry loop so a missing aux file
@@ -380,14 +397,25 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   while (retry);
 
   core->segOrds.reserve(segs.size());
-  for (const auto& seg : segs) core->segOrds.emplace_back(seg.segInfo.seg_id, seg.ord);
+  for (const auto& seg : segs) core->segOrds.emplace_back(seg.info.seg_id, seg.ord);
   std::ranges::sort(core->segOrds);
 
   // Base-segment metadata is unchanged by deletes and overlays.
   if (previous && previous->coreGeneration == core->coreGeneration) {
-    core->fields = previous->fields;
+    core->root->fields = previous->root->fields;
   } else {
-    core->fields = std::make_shared<FieldRecords>();
+    core->root->fields = std::make_shared<FieldRecords>();
+  }
+
+  core->root->segs.reserve(segs.size());
+  for (auto& bundle : segs) {
+    assert((bundle.info.live_gen != 0) == (bundle.live != nullptr));
+    assert(bundle.info.live_gen == 0 || bundle.info.live_docs < bundle.info.max_doc);
+    assert(bundle.info.live_docs == (bundle.live ? bundle.live->numLive() : bundle.info.max_doc));
+    core->root->segs.emplace_back(std::shared_ptr(bundle.core), std::shared_ptr(bundle.live),
+        std::vector(bundle.aux), bundle.info, totalMaxDoc, bundle.ord, &bundle.core->rootReader());
+    totalMaxDoc += bundle.info.max_doc;
+    livedocs += bundle.info.live_docs;
   }
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
@@ -397,9 +425,36 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
-const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
+const IndexReader::PhysicalCore::Bundle* IndexReader::PhysicalCore::bundle(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
-  return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
+  return it != segOrds.end() && it->first == segId ? &bundles[(size_t)it->second] : nullptr;
+}
+
+std::shared_ptr<IndexReader::SpaceState> IndexReader::PhysicalCore::space(std::string_view path) {
+  if (path.empty()) return root;
+  std::lock_guard lock(spacesMutex);
+  auto found = spaces.find(path);
+  if (found != spaces.end()) return found->second;
+  auto state = std::make_shared<SpaceState>();
+  state->path = path;
+  state->fields = std::make_shared<FieldRecords>();
+  state->segs.reserve(bundles.size());
+  for (const auto& bundle : bundles) {
+    auto* postings = bundle.core->spaceReader(path);
+    if (postings && bundle.live) {
+      throw ApiError(ErrorKind::INTERNAL, "child_liveness_unavailable",
+          "Cannot open space '" + std::string(path) + "' with root deletes");
+    }
+    // Segment metadata remains the root manifest metadata. Row counts and
+    // readers belong to this space; overlays currently belong to the root.
+    state->segs.emplace_back(std::shared_ptr(bundle.core), nullptr,
+        std::vector<std::shared_ptr<AuxReader>>{}, bundle.info,
+        state->totalMaxDoc, bundle.ord, postings);
+    state->totalMaxDoc += state->segs.back().maxDoc();
+    state->livedocs += state->segs.back().numLive();
+  }
+  spaces.emplace(path, state);
+  return state;
 }
 
 IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t numSegments,
@@ -466,20 +521,21 @@ const IndexReader::FieldRecord* IndexReader::FieldRecords::insert(std::unique_pt
 
 IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
-  const FieldRecord* record = core->fields->find(name, hash);
+  const FieldRecord* record = space->fields->find(name, hash);
   if (!record) {
-    for (size_t i = 0; i < core->segs.size(); i++) {
-      int32_t ordinal = core->segs[i].postingsReader().findOrdinal(name);
+    for (size_t i = 0; i < space->segs.size(); i++) {
+      if (!space->segs[i].hasSpace()) continue;
+      int32_t ordinal = space->segs[i].postingsReader().findOrdinal(name);
       if (ordinal < 0) continue;
-      record = core->fields->insert(
-          std::make_unique<FieldRecord>(name, hash, core->segs.size(), i, ordinal));
+      record = space->fields->insert(
+          std::make_unique<FieldRecord>(name, hash, space->segs.size(), i, ordinal));
       break;
     }
   }
   if (!record) return {};
-  FieldSegments result(record, core->segs.data());
-  if (sharedSchema) {
-    if (auto* expected = sharedSchema->getFieldTypePtr(name)) {
+  FieldSegments result(record, space->segs.data());
+  if (snapshot->schema) {
+    if (auto* expected = snapshot->schema->getFieldTypePtr(name)) {
       const auto& persisted = result.totals();
       if (expected->type() != persisted.type
           || expected->segmentTypeFlags() != FieldType::typeParameters(persisted.type, persisted.typeFlags)) {
@@ -509,7 +565,8 @@ int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
   assert(segment < record->numSegments);
   int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
   if (ordinal == FieldRecord::UNRESOLVED) {
-    ordinal = segments[segment].postingsReader().findOrdinal(record->name);
+    ordinal = segments[segment].hasSpace()
+        ? segments[segment].postingsReader().findOrdinal(record->name) : -1;
     record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
   return ordinal;
@@ -571,13 +628,14 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
   return record ? totals().flags : 0;
 }
 
-void IndexReader::PhysicalCore::buildFieldCatalogs() {
+void IndexReader::SpaceState::buildFieldCatalogs() {
   callOnce(fieldCatalogsOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment core's space reader: the field index (fi.fieldname) and the stored
     // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
+      if (!seg.hasSpace()) continue;
       auto& postingsReader = seg.postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(postingsReader);
@@ -619,7 +677,7 @@ void IndexReader::PhysicalCore::buildFieldCatalogs() {
 }
 
 std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
-  assert(sharedSchema);
+  assert(snapshot->schema);
   callOnce(retrievableOnce, [this] {
     std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
@@ -629,7 +687,7 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
       if (root.empty() || root[0] == '_') continue;
       FieldType* type;
       try {
-        type = sharedSchema->getFieldTypePtr(source.name);  // physical primary or variant, never a binding
+        type = snapshot->schema->getFieldTypePtr(source.name);  // physical primary or variant, never a binding
       } catch (const RequestError&) {
         // A template edit may make an old concrete root invalid for this schema.
         continue;
@@ -662,9 +720,9 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
 }
 
 std::span<const std::string> IndexReader::searchableFields() {
-  assert(sharedSchema);
+  assert(snapshot->schema);
   callOnce(searchableOnce, [this] {
-    searchable = sharedSchema->searchableFields(core->physicalFieldNames());
+    searchable = snapshot->schema->searchableFields(space->physicalFieldNames());
   });
   return searchable;
 }

@@ -445,11 +445,11 @@ void feedFacetBucketDomainChunks(
 // same document to a bucket more than once. Domains contain each document once.
 template <typename VisitValues, typename BucketOf>
 std::vector<DomainHandle> buildFacetBucketDomains(
-    int32_t maxDoc, size_t numBuckets, VisitValues&& visitValues,
+    Segment& segment, size_t numBuckets, VisitValues&& visitValues,
     BucketOf&& bucketOf) {
   std::vector<DocSetBuilder> builders;
   builders.reserve(numBuckets);
-  for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
+  for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(segment.maxDoc());
   std::vector<int32_t> lastAdded(numBuckets, -1);
   visitValues([&](int32_t docid, int64_t value) LUXIR_INLINE {
     int32_t bucket = bucketOf(value);
@@ -459,7 +459,7 @@ std::vector<DomainHandle> buildFacetBucketDomains(
   });
   std::vector<DomainHandle> domains;
   domains.reserve(numBuckets);
-  for (auto& builder : builders) domains.emplace_back(builder.build());
+  for (auto& builder : builders) domains.push_back(DomainHandle(builder.build()).scoped(segment));
   return domains;
 }
 

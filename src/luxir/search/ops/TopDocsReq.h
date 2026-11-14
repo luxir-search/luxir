@@ -836,7 +836,7 @@ public:
 
     DomainHandle resetBaseHandle(int32_t segment) {
       auto& seg = thisOp().req.reader->segments()[(size_t)segment];
-      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().req.reader);
+      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().req.reader).scoped(seg);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -1308,7 +1308,7 @@ public:
           reservation->grow(docs.get()->ramBytesUsed());
         }
         if (docs.get() == nullptr && filter.composesUnion()) {
-          return {};
+          return DomainHandle().scoped(seg);
         }
         sourcePtrs.push_back(docs.get());
         sources.push_back(std::move(docs));
@@ -1320,7 +1320,7 @@ public:
 
       assert(sourcePtrs.size() > 1);
       skipCount(SkipStats::selectionUnionCompositions);
-      DomainHandle result(DocSet::union_(sourcePtrs));
+      DomainHandle result = DomainHandle(DocSet::union_(sourcePtrs)).scoped(seg);
       if constexpr (Structural) {
         return DomainVariantPlan::account(std::move(result), op.req.memoryTracker, "selection union");
       } else {
@@ -1335,7 +1335,7 @@ public:
     DomainHandle buildEffectiveDomain(
         int32_t segnum, DocSet* baseDomain) {
       auto& op = thisOp();
-      if (op.filterWeights.empty()) return {};
+      if (op.filterWeights.empty()) return DomainHandle().scoped(op.req.reader->segments()[segnum]);
       auto& seg = op.req.reader->segments()[segnum];
 
       std::vector<DomainHandle> filters;
@@ -1353,12 +1353,12 @@ public:
         }
       }
       assert(source == op.filterWeights.size());
-      if (filterPtrs.empty()) return {};
+      if (filterPtrs.empty()) return DomainHandle().scoped(seg);
       if (filterPtrs.size() == 1) {
         auto result = std::move(filters[0]);
         return std::move(result).pinnedWith(op.planning.filterUses);
       }
-      return DomainHandle(DocSet::intersect(filterPtrs));
+      return DomainHandle(DocSet::intersect(filterPtrs)).scoped(seg);
     }
 
     void configureDiversify();
@@ -1412,6 +1412,7 @@ public:
         int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
+          domain.assertScope(thisOp().req.reader->segments()[(size_t)segnum]);
           doCollect<Structural, MetricGroups, Admission>(tg, segnum, domain);
         };
       });
@@ -1769,7 +1770,7 @@ public:
           } else if (reusableRaw != nullptr) {
             DomainHandle rawMatches = op.domainVariants.constrainRaw<Structural>(
                 DomainHandle::pinned(
-                    reusableRaw, op.planning.filterUses),
+                    reusableRaw, op.planning.filterUses).scoped(seg),
                 baseDomain,
               Structural ? &op.req.memoryTracker : nullptr);
             result.inheritBases = op.domainVariants.produceSharedBases<Structural>(
@@ -1832,7 +1833,7 @@ public:
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get();
+      DocSet* domain = domainHandle.get(op.req.reader->segments()[segnum]);
 
       // A constant-scoring match-all is the identity on its domain: every doc
       // in the domain matches, all with the same score.  So the domain IS the
@@ -1998,7 +1999,7 @@ public:
               if (!output.empty()) {
                 output[(size_t)segnum] =
                     DomainHandle::pinned(
-                        borrowedDomain, op.planning.filterUses);
+                        borrowedDomain, op.planning.filterUses).scoped(seg);
               }
             }
           }
@@ -2660,7 +2661,7 @@ public:
           }
         }
         if (builder.has_value()) {
-          DomainHandle built(builder->build());
+          DomainHandle built = DomainHandle(builder->build()).scoped(op.req.reader->segments()[segnum]);
           if constexpr (Structural) built = DomainVariantPlan::account(
               std::move(built), op.req.memoryTracker, "captured bucket matches");
           if (captureSharedRaw) {
@@ -2869,6 +2870,7 @@ public:
         return;
       }
 
+      domain.assertScope(op.req.reader->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
@@ -2892,6 +2894,7 @@ public:
       std::copy(domains.begin(), domains.end(), inputDomains.begin());
       for (size_t i = 0; i < inputDomains.size(); i++) {
         assert(inputDomains[i].isDeliverable());
+        inputDomains[i].assertScope(op.req.reader->segments()[i]);
         inputDomainViews[i] = inputDomains[i].get();
       }
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);

@@ -11,6 +11,7 @@
 
 #include "TestUtils.h"
 #include "luxir/index/IntColWriter.h"
+#include "luxir/index/NormsWriter.h"
 #include "luxir/index/OrdColWriter.h"
 #include "luxir/index/StoredFieldsWriter.h"
 #include "luxir/reader/OwnershipShape.h"
@@ -58,7 +59,8 @@ struct RowSpaceFixture {
     }
   }
 
-  static void fields(PostingsWriter& writer, SpaceOrdinal space, std::span<const Row> rows) {
+  static void fields(PostingsWriter& writer, SpaceOrdinal space, std::span<const Row> rows,
+                     std::span<const uint8_t> norms = {}) {
     if (rows.empty()) return;
     auto count = (int32_t)rows.size();
     std::vector<int32_t> docs;
@@ -86,8 +88,20 @@ struct RowSpaceFixture {
       auto& field = writer.addField(space, "body");
       field.type = FieldType::TEXT;
       field.flags = FieldType::INDEX_DOCS_FREQS;
+      DocStream normDocs(writer.pool);
+      Stream normBytes;
+      NormsWriter::PreparedNorms prepared;
+      if (!norms.empty()) {
+        assert(norms.size() == docs.size());
+        for (size_t i = 0; i < docs.size(); i++) {
+          normDocs.addDoc(writer.pool, docs[i]);
+          normBytes.writeByte(writer.pool, norms[i]);
+        }
+        prepared = NormsWriter::prepare(writer.pool, writer, field, normBytes, normDocs, (int32_t)docs.size());
+      }
       TextWriter text(writer);
       text.startField(&field);
+      if (!norms.empty()) text.setNorms(prepared.textView());
       for (const auto& [word, postings] : terms) {
         TermRef term(writer.pool, word.data(), word.size());
         text.startTerm(term);
@@ -95,7 +109,8 @@ struct RowSpaceFixture {
         text.endTerm(term);
       }
       text.endField();
-      presence(writer, field, docs, count);
+      if (norms.empty()) presence(writer, field, docs, count);
+      else NormsWriter::writeValues(writer.pool, writer, field, prepared, normDocs);
     }
 
     terms.clear();
