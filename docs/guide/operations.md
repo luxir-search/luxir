@@ -493,7 +493,9 @@ the response correlates directly with a directory listing: each segment's
 are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
-`update_version` are numeric. The `commit_<index_gen>.<epoch>` manifest selected
+`update_version` are numeric. `update_version` is a high-water mark: the
+highest update version the commit reflects, which does not imply that every
+lower-versioned update is in it. The `commit_<index_gen>.<epoch>` manifest selected
 by `STATE` references an immutable `schema_0.0.<local>.<epoch>` file in the
 incarnation. Schema files contain the authored definition and field introduction
 history, with the same length/xxh3 footer as manifests. They participate in the
