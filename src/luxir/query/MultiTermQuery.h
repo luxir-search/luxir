@@ -276,7 +276,7 @@ public:
       if (needsScores() && !allowsPruning() && cachedFieldInfo != nullptr) {
         for (auto& segment : context.topReader.segments()) {
           auto* info = cachedFieldInfo->segInfos.at(segment);
-          if (info != nullptr && info->hasDisjointTermPostings() && !segment.hasDeletes()) {
+          if (info != nullptr && info->hasDisjointTermPostings() && !segment.mayHaveDeletes()) {
             traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
             break;
           }

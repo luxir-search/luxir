@@ -257,7 +257,7 @@ public:
 
         PrefixProducer(std::remove_reference_t<IdentitySource>& source, Block block,
                        SearchOp::Calculator& parent, size_t)
-            : StructuralConstraint::Producer(parent.getOp().req,
+            : StructuralConstraint::Producer(parent.getOp().req, parent.getOp().view,
                   parent.structuralConstraint(), block.size()), source(source),
               resource(parent.getOp().req.memoryTracker, "bucket keys", "domain variants"),
               selected(block.begin(), block.end(), &resource) {}
@@ -320,7 +320,7 @@ public:
         for (size_t bucket = 0; bucket < blockSize; bucket++) {
           open(bucket);
           for (size_t child = 0; child < children.size(); child++) {
-            bindings[bucket * children.size() + child]->calcAll(nullptr, noDomains);
+            bindings[bucket * children.size() + child]->acceptAll(nullptr, noDomains);
           }
           close(bucket);
         }
@@ -396,7 +396,7 @@ public:
           if constexpr (!Structural) {
             for (size_t child = 0; child < children.size(); child++) {
               bindings[bucket * children.size() + child]
-                  ->calc(nullptr, (int32_t)segnum, domain);
+                  ->accept(nullptr, (int32_t)segnum, domain);
             }
           } else {
             deliverStructural(parent, children, reader, (int32_t)segnum,

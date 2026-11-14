@@ -66,7 +66,7 @@ namespace luxir::api {
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
+struct ToParentQuery; struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct GeoLatLon; struct GeoRing; struct GeoPolygon; struct GeoPolygonQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
 struct DisMaxQuery; struct PluginQuery; struct PluginOp;
@@ -387,6 +387,8 @@ struct FieldMetadataStats {
   uint64_t entry_bytes = 0;
   uint64_t names = 0;
   uint64_t name_bytes = 0;
+  uint64_t live_views = 0;
+  uint64_t live_view_bytes = 0;
 };
 struct MemoryStats {
   IndexRamStats indexing_budget;
@@ -935,6 +937,8 @@ struct Fusion {                                                  // needs TopDoc
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
+  std::optional<std::string_view> to_children;
+  std::optional<std::string_view> to_parent;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
   std::optional<bool> apply_parent_filters;
@@ -1126,6 +1130,11 @@ struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> score;
 };
+struct ToParentQuery {
+  std::string_view path;
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::string_view score;
+};
 struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> boost;
@@ -1207,7 +1216,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery>
+               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery, ToParentQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1230,7 +1239,7 @@ LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
-LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
+LUXIR_TD(ToParentQuery) LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(GeoLatLon) LUXIR_TD(GeoRing) LUXIR_TD(GeoPolygon) LUXIR_TD(GeoPolygonQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery) LUXIR_TD(PluginQuery) LUXIR_TD(PluginOp)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
@@ -1276,7 +1285,7 @@ LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
 LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
-LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
+LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ToParentQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(GeoPolygonQuery) LUXIR_ENTRY(ExprQuery)

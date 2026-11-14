@@ -762,7 +762,8 @@ inline std::vector<PreparedSource> prepareFilterSources(
       continue;
     }
 
-    if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
+    if (ctx.executionMode == Query::SupplierExecutionMode::ORDINARY
+        && use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
       auto probe = use->probeReaderStable(ctx.reader, ctx.domainPerSeg);
       std::shared_ptr<const FilterCache::ReaderValue> value;
       ReaderStablePreparedWeight::CacheOutcome outcome =
@@ -1417,17 +1418,20 @@ public:
 
 inline DomainHandle materializeEffectiveFilter(
     const PreparedSource& source, IndexReader& reader,
-    IndexReader::Segment& segment, DocSet* domain) {
+    IndexReader::Segment& segment, DocSet* domain,
+    Query::SupplierExecutionMode executionMode = Query::SupplierExecutionMode::ORDINARY) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
+  if (executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+      && use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) use = nullptr;
   if (source.domainDependence != PreparedDomainDependence::QUERY_CANONICAL
       && use != nullptr
       && use->scope() != FilterKeyScope::READER_STABLE) {
     use = nullptr;
   }
   if (use == nullptr) {
-    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
+    return DomainHandle(materialize(weight, prepared, segment, domain, executionMode)).scoped(segment);
   }
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
@@ -1439,9 +1443,19 @@ inline DomainHandle materializeEffectiveFilter(
     return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
+  auto effective = [&]() {
+    if (executionMode == Query::SupplierExecutionMode::ORDINARY) {
+      return use->effectiveDomain((size_t)segment.ord, reader, domain);
+    }
+    auto* raw = use->rawDocSet((size_t)segment.ord);
+    assert(raw != nullptr);
+    if (!domain) return DomainHandle::borrowed(raw).scoped(segment);
+    std::array<DocSet*, 2> sets{raw, domain};
+    return DomainHandle(DocSet::intersect(sets)).scoped(segment);
+  };
   auto probe = use->probe((size_t) segment.ord);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    return use->effectiveDomain((size_t) segment.ord, reader, domain);
+    return effective();
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
@@ -1459,20 +1473,19 @@ inline DomainHandle materializeEffectiveFilter(
       uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
       use->offerRaw(
           (size_t) segment.ord, std::move(raw), buildCostNanos);
-      DocSet* docs = use->effectiveDocSet((size_t) segment.ord, reader);
-      return DomainHandle::borrowed(docs).scoped(segment);
+      return effective();
     }
     if (!disableFilterOwnForTests
         && !weight.needsScores() && !weight.allowsPruning()) {
       auto raw = materializeRawFilter(weight, prepared, segment);
       use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
-      return use->effectiveDomain((size_t) segment.ord, reader, domain);
+      return effective();
     }
     return DomainHandle(
-        materialize(weight, prepared, segment, domain)).scoped(segment);
+        materialize(weight, prepared, segment, domain, executionMode)).scoped(segment);
   }
 
-  return use->effectiveDomain((size_t) segment.ord, reader, domain);
+  return effective();
 }
 
 DomainHandle materializeEffectiveFilter(
@@ -1513,14 +1526,15 @@ inline std::unique_ptr<DocSet> materializeIntersection(std::span<const PreparedS
 
 inline DomainHandle materializeEffectiveIntersection(
     std::span<const PreparedSource> sources, IndexReader& reader,
-    IndexReader::Segment& segment, DocSet* domain) {
+    IndexReader::Segment& segment, DocSet* domain,
+    Query::SupplierExecutionMode executionMode = Query::SupplierExecutionMode::ORDINARY) {
   std::vector<DomainHandle> sets;
   std::vector<DocSet*> ptrs;
   sets.reserve(sources.size());
   ptrs.reserve(sources.size());
   for (auto& source : sources) {
     sets.push_back(materializeEffectiveFilter(
-        source, reader, segment, domain));
+        source, reader, segment, domain, executionMode));
     ptrs.push_back(sets.back().get());
   }
   if (ptrs.empty()) return {};

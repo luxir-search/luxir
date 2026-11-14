@@ -30,7 +30,7 @@ MergeableCollector* MergeableCollector::mergeDiversified(MergeableCollector* a, 
 void TopDocsReq::CalcBase::configureDiversify() {
   auto& op = thisOp();
   collectorMerger.creator = [&op]() {
-    auto* collector = new MergeableCollector(op.topCount, op.sortPlan, op.req.reader.get(),
+    auto* collector = new MergeableCollector(op.topCount, op.sortPlan, op.view.get(),
                                             op.requestNeedsScores, *op.diversify);
     if (collector->useFieldSort) collector->diverseFieldCollector->primaryValues = op.sortValues;
     return collector;
@@ -53,7 +53,7 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
       if (requirements.needsCount()) list.found_groups = collector.groups->totalGroups();
       return list;
     };
-    emitDocsResponse(req, flags, target, (int64_t)docs.size(),
+    emitDocsResponse(req, *view, flags, target, (int64_t)docs.size(),
         [docs](int64_t i) { return docs[i].doc; },
         [docs](int64_t i) { return docs[i].score; }, collector.totalHits(),
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,

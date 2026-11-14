@@ -354,7 +354,15 @@ message Query {
     GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
+    ToParentQuery to_parent = 27;   // reduces child matches onto their owners
   }
+}
+
+message ToParentQuery {
+  string path = 1;
+  Query query = 2;
+  // none (constant score) or max. Unset selects max.
+  string score = 3;
 }
 
 message ExistsQuery {
@@ -1020,6 +1028,10 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // Expand into this descendant path, or project onto this ancestor path.
+  // The empty ancestor path identifies root rows.
+  optional string to_children = 6;
+  optional string to_parent = 7;
   // If present, replaces the incoming domain with this query's matches
   // within live documents and the enclosing structural bucket identities.
   // If absent, inherits the incoming domain.
@@ -1949,6 +1961,8 @@ message FieldMetadataStats {
   uint64 entry_bytes = 7;
   uint64 names = 8;
   uint64 name_bytes = 9;
+  uint64 live_views = 10;
+  uint64 live_view_bytes = 11;
 }
 
 // Node memory: Luxir's own budgets and usage, and the process allocator's

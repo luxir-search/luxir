@@ -3806,7 +3806,7 @@ public:
   BlockProbe& probe;
 
   ProbeOp(SearchRequest& req, BlockProbe& probe)
-    : SearchOp(req, "probe"), probe(probe) {}
+    : SearchOp(req, req.reader, "probe"), probe(probe) {}
 
   class Calc : public Calculator {
     BlockProbe& probe;

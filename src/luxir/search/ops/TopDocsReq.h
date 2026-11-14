@@ -640,7 +640,7 @@ public:
     size_t total = SearchOp::workEstimate();
     if (weight == nullptr || weight->needsPrepare()) return total;
     bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
-    for (auto& segment : req.reader->segments()) {
+    for (auto& segment : view->segments()) {
       auto shortcut = weight->countShortcut(segment, nullptr);
       auto matches = (size_t) shortcut.maxMatches;
       size_t counting = !requirements.needsCount()
@@ -728,7 +728,7 @@ public:
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         auto* collector = new MergeableCollector(
-            op.topCount, op.sortPlan, op.req.reader.get(),
+            op.topCount, op.sortPlan, op.view.get(),
             op.requestNeedsScores, op.collapse);
         if (collector->useFieldSort) {
           if (op.collapse != nullptr) collector->groupFieldCollector->primaryValues = op.sortValues;
@@ -746,7 +746,7 @@ public:
       if (op.subOps.size() > 0) {
         if (op.domainVariants.empty()
             || !op.domainVariants.needsInheritProduction()) {
-          output.resize(op.req.reader->segments().size());
+          output.resize(op.view->segments().size());
         }
         subCalcs.reserve(op.subOps.size());
         if (!op.domainVariants.empty()) {
@@ -763,7 +763,7 @@ public:
       }
       if (op.enrichGroups()) {
         memberReplay = std::make_unique<MemberReplay>(op.req.memoryTracker,
-            op.req.reader->segments().size());
+            op.view->segments().size());
       }
       requiresWholeIndexPrepare =
           op.weight != nullptr && op.weight->needsPrepare();
@@ -835,8 +835,8 @@ public:
     std::unique_ptr<StructuralResetState> structuralReset;
 
     DomainHandle resetBaseHandle(int32_t segment) {
-      auto& seg = thisOp().req.reader->segments()[(size_t)segment];
-      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().req.reader).scoped(seg);
+      auto& seg = thisOp().view->segments()[(size_t)segment];
+      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().view).scoped(seg);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -850,7 +850,7 @@ public:
     DocSet* resetBase(int32_t segment) {
       if constexpr (Structural) return resetBaseHandle(segment).get();
       else {
-        auto& seg = op.req.reader->segments()[(size_t)segment];
+        auto& seg = op.view->segments()[(size_t)segment];
         return seg.liveDocSet();
       }
     }
@@ -1292,16 +1292,16 @@ public:
         DomainHandle docs;
         if constexpr (Structural) {
           auto& sources = structural->producer->filterSources(op.filterWeights, op.filterUses,
-              *op.req.reader, op.planning, seg.ord, op.req.memoryTracker);
+              *op.view, op.planning, seg.ord, op.req.memoryTracker);
           assert(owner && owner->get() == baseDomain);
           docs = sources.resolve(source, *owner,
               prepared ? &(*prepared)[source] : nullptr);
         } else {
           docs = prepared != nullptr
               ? QueryPrep::materializeEffectiveFilter(
-                    (*prepared)[source], *op.req.reader, seg, baseDomain)
+                    (*prepared)[source], *op.view, seg, baseDomain)
               : QueryPrep::materializeEffectiveFilter(
-                    *op.filterWeights[source], op.filterUses[source], *op.req.reader, seg, baseDomain);
+                    *op.filterWeights[source], op.filterUses[source], *op.view, seg, baseDomain);
         }
         if constexpr (!Structural) if (reservation != nullptr && docs.get() != nullptr
             && docs.isDeliverable()) {
@@ -1335,8 +1335,8 @@ public:
     DomainHandle buildEffectiveDomain(
         int32_t segnum, DocSet* baseDomain) {
       auto& op = thisOp();
-      if (op.filterWeights.empty()) return DomainHandle().scoped(op.req.reader->segments()[segnum]);
-      auto& seg = op.req.reader->segments()[segnum];
+      if (op.filterWeights.empty()) return DomainHandle().scoped(op.view->segments()[segnum]);
+      auto& seg = op.view->segments()[segnum];
 
       std::vector<DomainHandle> filters;
       std::vector<DocSet*> filterPtrs;
@@ -1367,7 +1367,7 @@ public:
     void completeEmpty(oneapi::tbb::task_group* tg) {
       std::span<const DomainHandle> noDomains;
       for (auto& subCalc : subCalcs) {
-        subCalc->calcAll(tg, noDomains);
+        subCalc->acceptAll(tg, noDomains);
       }
       doneCollecting<MetricGroups>();
     }
@@ -1390,7 +1390,7 @@ public:
     void dispatch(
         oneapi::tbb::task_group* tg,
         std::span<const DomainHandle> domains) {
-      assert(domains.size() == thisOp().req.reader->segments().size());
+      assert(domains.size() == thisOp().view->segments().size());
       // Keep the same task-stack ordering as Calculator::calcAll, except
       // that a field sort visits segments in its visit order
       // (fieldSortVisitOrder). Sequentially, one collector then carries its
@@ -1405,14 +1405,14 @@ public:
           && op.sortPlan.useFieldSort && op.topCount > 0
           && !disableFieldSortPruning) {
         order = fieldSortVisitOrder(
-            fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
+            fieldSortSegmentKeys(*op.view, op.sortPlan, op.sortValues),
             op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
       }
       task_group_fanout(tg, domains.size(), [&](size_t i) {
         int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
-          domain.assertScope(thisOp().req.reader->segments()[(size_t)segnum]);
+          domain.assertScope(thisOp().view->segments()[(size_t)segnum]);
           doCollect<Structural, MetricGroups, Admission>(tg, segnum, domain);
         };
       });
@@ -1424,7 +1424,7 @@ public:
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation,
         const DomainHandle* owner = nullptr) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       std::vector<DomainHandle> filters;
       filters.reserve(op.filters.size());
       size_t source = 0;
@@ -1447,7 +1447,7 @@ public:
         int32_t segnum,
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       DomainHandle base;
       DocSet* live;
       if constexpr (Structural) {
@@ -1474,7 +1474,7 @@ public:
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation,
         const DomainHandle* owner = nullptr) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       DocSet* live = resetBase<Structural>(segnum);
       if (!preparedDomainExtraSets.empty()
           && op.domainVariants.sourceIsResetExtra(source)
@@ -1491,7 +1491,7 @@ public:
       }
       if constexpr (Structural) {
         auto& sources = structural->producer->segmentSources(
-            op.domainVariants, *op.req.reader, op.planning, segnum, op.req.memoryTracker);
+            op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
         assert(owner && owner->get() == base);
         return sources.resolve(source, *owner,
             preparedDomainSources.empty() ? nullptr : &preparedDomainSources[source]);
@@ -1500,9 +1500,9 @@ public:
           ? QueryPrep::materializeEffectiveFilter(
                 *op.domainVariants.sourceWeight(source),
                 op.domainVariants.sourceUse(source),
-                *op.req.reader, seg, base)
+                *op.view, seg, base)
           : QueryPrep::materializeEffectiveFilter(
-                preparedDomainSources[source], *op.req.reader, seg, base);
+                preparedDomainSources[source], *op.view, seg, base);
       if (result.get() != nullptr && result.isDeliverable()) {
         reservation->grow(result.get()->ramBytesUsed());
       }
@@ -1557,7 +1557,7 @@ public:
         std::vector<DomainHandle> domains;
         if (op.domainVariants.segmentLocal(structural->hasSelection())) {
           auto& sources = structural->producer->segmentSources(
-              op.domainVariants, *op.req.reader, op.planning, segnum, op.req.memoryTracker);
+              op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
           domains = op.domainVariants.produceSegment(sources, {}, base,
               op.req.memoryTracker, bases, DomainVariantPlan::Frame::RESET);
         } else {
@@ -1833,7 +1833,7 @@ public:
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get(op.req.reader->segments()[segnum]);
+      DocSet* domain = domainHandle.get(op.view->segments()[segnum]);
 
       // A constant-scoring match-all is the identity on its domain: every doc
       // in the domain matches, all with the same score.  So the domain IS the
@@ -1850,7 +1850,7 @@ public:
       std::unique_ptr<std::conditional_t<MetricGroups, MetricGroupData, MergeableCollector>> data;
       std::optional<RoutedProduction> routedProduction;
       DocSet* routedBaseDomain = nullptr;
-      int64_t numSegs = (int64_t)op.req.reader->segments().size();
+      int64_t numSegs = (int64_t)op.view->segments().size();
 
       {
         auto& seg = op.planning.topReader.segments()[segnum];
@@ -1873,7 +1873,7 @@ public:
               std::vector<DomainHandle> parts{domainHandle};
               for (size_t i = 0; i < op.filterWeights.size(); i++) {
                 parts.push_back(QueryPrep::materializeEffectiveFilter(
-                    *op.filterWeights[i], op.filterUses[i], *op.req.reader, seg, nullptr));
+                    *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
               }
               domainHandle = memberReplay->compose(std::move(parts),
                   op.domainVariants.estimatedSetBytes(seg.maxDoc()));
@@ -1893,7 +1893,7 @@ public:
           if (!requiresWholeIndexPrepare && op.domainVariants.empty() && !memberReplay) {
             for (size_t i = 0; i < op.filterWeights.size(); i++) {
               parts.push_back(QueryPrep::materializeEffectiveFilter(
-                  *op.filterWeights[i], op.filterUses[i], *op.req.reader, seg, nullptr));
+                  *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
             }
           }
           auto eligibility = DomainVariantPlan::compose(std::move(parts));
@@ -1937,7 +1937,7 @@ public:
           if (!requiresWholeIndexPrepare && op.requirements.needExactDomain
               && !op.exactDomainPlan.empty()) {
             auto result = op.exactDomainPlan.produce(
-                poolGuard.pool(), *op.req.reader, seg, domain);
+                poolGuard.pool(), *op.view, seg, domain);
             exactDomain = result.available;
             if (exactDomain) {
               if (result.docs.get() == domain) {
@@ -1970,7 +1970,7 @@ public:
               && !(matchEverything && (rankFromDocOrder || data->topCount() == 0))
               && !op.wholeMembershipPlan.empty()) {
             wholeMembershipResult = op.wholeMembershipPlan.resolve(
-                *op.req.reader, seg, domain, preparedWeight.get(),
+                *op.view, seg, domain, preparedWeight.get(),
                 [&](Query::Weight& resolver) {
                   return &resolver == op.weight ? obtainMainSupplier()
                       : resolver.scorerSupplier(poolGuard.pool(), seg);
@@ -2122,7 +2122,7 @@ public:
               for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
                 filters.push_back(QueryPrep::materializeEffectiveFilter(
                     *thisOp().filterWeights[i], thisOp().filterUses[i],
-                    *op.req.reader, seg, nullptr));
+                    *op.view, seg, nullptr));
                 filterPtrs.push_back(filters.back().get());
               }
               if (domain) {
@@ -2661,7 +2661,7 @@ public:
           }
         }
         if (builder.has_value()) {
-          DomainHandle built = DomainHandle(builder->build()).scoped(op.req.reader->segments()[segnum]);
+          DomainHandle built = DomainHandle(builder->build()).scoped(op.view->segments()[segnum]);
           if constexpr (Structural) built = DomainVariantPlan::account(
               std::move(built), op.req.memoryTracker, "captured bucket matches");
           if (captureSharedRaw) {
@@ -2705,7 +2705,7 @@ public:
         auto domain = childDomain(child);
         return [subCalc, tg, segnum, domain = std::move(domain)]() {
           Signal::emit("searchTopDocsChildStart", subCalc);
-          subCalc->calc(tg, segnum, domain);
+          subCalc->accept(tg, segnum, domain);
         };
       });
       auto count = [&] {
@@ -2737,7 +2737,7 @@ public:
   // ProtobufSearchParser resolves everything that can fail and passes the
   // execution sources in. A fully resident validated membership plan may omit
   // the main Weight entirely.
-  TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
+  TopDocsReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::PlanningContext& planning, Query::Context* weightContext,
     Query* query, Query::Weight* weight,
     Query::Weight* variantMembershipWeight,
@@ -2755,7 +2755,7 @@ public:
     Query* domainQuery, Query::Weight* domainQueryWeight,
     std::span<Query::Weight*> domainFilterWeights,
     std::span<FilterCache::Use*> residentExactDomainUses)
-    : SearchOp(req, name), topDocsProto(topDocsProto), planning(planning),
+    : SearchOp(req, view, name), topDocsProto(topDocsProto), planning(planning),
       weightContext(weightContext), query(query),
       weight(weight), variantMembershipWeight(variantMembershipWeight),
       countWeight(countWeight), rankingWeight(rankingWeight),
@@ -2845,11 +2845,11 @@ public:
       if constexpr (Structural) {
         assert(this->structural && op.domainVariants.hasResetVariants());
         structuralReset = std::make_unique<StructuralResetState>(
-            op.req.memoryTracker, op.req.reader->segments().size());
+            op.req.memoryTracker, op.view->segments().size());
         requiresWholeIndexPrepare |= op.bucketVariantsNeedCompleteInput(this->structural->hasSelection());
       }
       if (requiresWholeIndexPrepare) {
-        auto numSegs = op.req.reader->segments().size();
+        auto numSegs = op.view->segments().size();
         inputDomains.resize(numSegs);
         inputDomainViews.resize(numSegs);
         effectiveDomains.resize(numSegs);
@@ -2870,19 +2870,19 @@ public:
         return;
       }
 
-      domain.assertScope(op.req.reader->segments()[segnum]);
+      domain.assertScope(op.view->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =
           gatheredDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
-      if (count != (int32_t)thisOp().req.reader->segments().size()) return;
+      if (count != (int32_t)thisOp().view->segments().size()) return;
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) override {
       if constexpr (Structural) assert(tg == nullptr);
-      assert(domains.size() == thisOp().req.reader->segments().size());
+      assert(domains.size() == thisOp().view->segments().size());
       if (domains.empty()) {
         completeEmpty<MetricGroups>(tg);
         return;
@@ -2894,7 +2894,7 @@ public:
       std::copy(domains.begin(), domains.end(), inputDomains.begin());
       for (size_t i = 0; i < inputDomains.size(); i++) {
         assert(inputDomains[i].isDeliverable());
-        inputDomains[i].assertScope(op.req.reader->segments()[i]);
+        inputDomains[i].assertScope(op.view->segments()[i]);
         inputDomainViews[i] = inputDomains[i].get();
       }
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
@@ -2922,7 +2922,7 @@ public:
         ? std::numeric_limits<size_t>::max() : (size_t)topCount * perDoc;
     size_t bytes = saturatingAdd(sizeof(CalcBase), heap);
     bytes = saturatingAdd(
-        bytes, req.reader->segments().size() * 4 * sizeof(DomainHandle));
+        bytes, view->segments().size() * 4 * sizeof(DomainHandle));
     for (const auto& [name, child] : subOps) {
       unused(name);
       bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());

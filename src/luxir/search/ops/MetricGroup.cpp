@@ -72,8 +72,8 @@ struct Members {
 
   explicit Members(TopDocsReq& op)
       : tracker(op.req.memoryTracker), resource(tracker, "best members", "group aggregate state"),
-        field(std::min<int64_t>(op.req.reader->maxDoc(), INT32_MAX), memberClauses(op),
-              op.req.reader.get(), op.requestNeedsScores), heads(&resource), strings(&resource) {
+        field(std::min<int64_t>(op.view->maxDoc(), INT32_MAX), memberClauses(op),
+              op.view.get(), op.requestNeedsScores), heads(&resource), strings(&resource) {
     for (auto& clause : field.clauses) {
       if (auto* text = dynamic_cast<StrColComparator*>(clause.comparator.get())) {
         strings.push_back(text);
@@ -239,7 +239,7 @@ MetricGroupData::~MetricGroupData() = default;
 void MetricGroupData::collect(int32_t segment, Query::Scorer* scorer, DocSet* filter,
     DocSetBuilder* builder, DomainBuildMode mode, DocSet* rawDomain) {
   auto& data = *impl;
-  auto& seg = data.op.req.reader->segments()[(size_t)segment];
+  auto& seg = data.op.view->segments()[(size_t)segment];
   data.members.segment = segment;
   data.members.field.setSegment(seg, &MemPool::threadLocal());
   FieldSortCollector::ExpressionBindings expressions(data.members.field, MemPool::threadLocal(), seg);

@@ -74,6 +74,7 @@ class ProtobufQueryParser {
   Query* parseSimpleQuery(const luxir::api::SimpleQuery& sq, const luxir::api::Query& node);
   Query* parseExpr(const luxir::api::ExprQuery& exprQuery, const luxir::api::Query& node);
   Query* parseConstantScore(const luxir::api::ConstantScoreQuery& constantScoreQuery);
+  Query* parseToParent(const luxir::api::ToParentQuery& query);
   Query* parseBoost(const luxir::api::BoostQuery& boostQuery);
   Query* parseRescore(const luxir::api::RescoreQuery& rescoreQuery);
   Query* parseMultiMatch(const luxir::api::MultiMatchQuery& query);

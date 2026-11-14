@@ -7,6 +7,7 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/OwnershipMapper.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
@@ -49,6 +50,56 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 }
 
 } // namespace
+
+LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive)
+    : docSet(FixedBitSet(words.get(), maxDoc), numLive), ownedWords(std::move(words)),
+      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)) {
+  fieldMetadataMemory.liveViews.fetch_add(1, std::memory_order_relaxed);
+  fieldMetadataMemory.liveViewBytes.fetch_add(derivedBytes, std::memory_order_relaxed);
+}
+
+LiveDocs::~LiveDocs() {
+  if (derivedBytes) {
+    fieldMetadataMemory.liveViews.fetch_sub(1, std::memory_order_relaxed);
+    fieldMetadataMemory.liveViewBytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
+  }
+}
+
+std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
+  return value.getOrCreate([&]() -> std::shared_ptr<LiveDocs> {
+    OwnershipMapper mapper(*core, "", path);
+    int32_t count = core->spaceReader(path)->maxDoc();
+    auto words = FixedBitSet::allocate(count, true);
+    int32_t live = count;
+    // Only dead roots decode individual ranges; all-live words need no mapping.
+    for (int32_t word = 0; word < (int32_t)FixedBitSet::sizeInWords(root->size()); word++) {
+      int32_t end = (int32_t)std::min((int64_t)(word + 1) * 64, (int64_t)root->size());
+      uint64_t dead = ~root->bitset().words[word];
+      if (end & 63) dead &= (1ULL << (end & 63)) - 1;
+      while (dead) {
+        int32_t parent = word * 64 + (int32_t)std::countr_zero(dead);
+        dead &= dead - 1;
+        auto [first, last] = mapper.range(parent);
+        live -= last - first;
+        // Disjoint ranges clear each full child word at most once. Partial
+        // words handle the family boundaries without visiting child rows.
+        while (first < last && (first & 63)) {
+          words[first >> 6] &= ~(1ULL << (first & 63));
+          ++first;
+        }
+        int32_t fullEnd = last & ~63;
+        if (first < fullEnd) {
+          std::fill(words.get() + (first >> 6), words.get() + (fullEnd >> 6), 0);
+          first = fullEnd;
+        }
+        if (first < last) words[first >> 6] &= ~((1ULL << (last - first)) - 1);
+      }
+    }
+    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live);
+    knownCard.store(live, std::memory_order_release);
+    return result;
+  });
+}
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
@@ -350,8 +401,11 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         segmentInfo.commit_time = segment.commit_time;
         segmentInfo.live_docs = segment.live_docs;
 
+        auto childLives = prevSeg && prevSeg->core == segmentCore && prevSeg->live == liveDocs
+            ? prevSeg->childLives : liveDocs && segmentCore->spaces().size() > 1
+                ? std::make_shared<PhysicalCore::ChildLives>() : nullptr;
         segs.push_back({std::move(segmentCore), std::move(liveDocs),
-                        std::move(segmentAuxReaders), segmentInfo, i});
+                        std::move(segmentAuxReaders), segmentInfo, i, std::move(childLives)});
         assert(nDocs == segs.back().core->rootReader().maxDoc());
       }
 
@@ -441,17 +495,19 @@ std::shared_ptr<IndexReader::SpaceState> IndexReader::PhysicalCore::space(std::s
   state->segs.reserve(bundles.size());
   for (const auto& bundle : bundles) {
     auto* postings = bundle.core->spaceReader(path);
+    std::shared_ptr<ChildLiveDocs> live;
     if (postings && bundle.live) {
-      throw ApiError(ErrorKind::INTERNAL, "child_liveness_unavailable",
-          "Cannot open space '" + std::string(path) + "' with root deletes");
+      std::lock_guard liveLock(bundle.childLives->mutex);
+      auto& entry = bundle.childLives->paths[std::string(path)];
+      if (!entry) entry = std::make_shared<ChildLiveDocs>(bundle.core, bundle.live, std::string(path));
+      live = entry;
     }
     // Segment metadata remains the root manifest metadata. Row counts and
     // readers belong to this space; overlays currently belong to the root.
     state->segs.emplace_back(std::shared_ptr(bundle.core), nullptr,
         std::vector<std::shared_ptr<AuxReader>>{}, bundle.info,
-        state->totalMaxDoc, bundle.ord, postings);
+        state->totalMaxDoc, bundle.ord, postings, std::move(live));
     state->totalMaxDoc += state->segs.back().maxDoc();
-    state->livedocs += state->segs.back().numLive();
   }
   spaces.emplace(path, state);
   return state;

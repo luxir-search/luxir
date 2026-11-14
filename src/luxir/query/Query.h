@@ -77,6 +77,7 @@ enum class QueryKind : uint8_t {
   // Every query a plugin query type builds (QueryRegistry). Shape questions
   // get the conservative answers, as for TEST.
   PLUGIN,
+  TO_PARENT,
   TEST,
 };
 
@@ -825,14 +826,15 @@ public:
   // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
   static CountShortcut countBound(IndexReader::Segment& segment, DocSet* domain,
                                   int64_t docs, CountHow how = CountHow::ITERATE) {
-    int64_t bound = std::min<int64_t>(docs, segment.numLive());
+    auto [minLive, maxLive] = segment.liveCountBounds();
+    int64_t bound = std::min<int64_t>(docs, maxLive);
     if (domain && domain->cachedCard() >= 0) {
       bound = std::min<int64_t>(bound, domain->cachedCard());
     }
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
-        ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.hasDeletes()) how = CountHow::ITERATE;
+        ? std::max<int64_t>(0, docs - (segment.maxDoc() - minLive)) : 0;
+    if (domain || minLive != segment.maxDoc()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 
@@ -1673,7 +1675,11 @@ public:
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
+    /// Canonical predicate preparation may use RAW_MEMBERSHIP: its domains
+    /// contain only predicates from the query tree, and the destination owns
+    /// liveness. Domain-consuming queries require ordinary live eligibility.
     ///
+    /// The following live-domain contract applies to ORDINARY preparation.
     /// Domain contract: a segment's domain, when present, is LIVE-FILTERED -
     /// it is liveDocs intersected with any enclosing filter clauses, and is
     /// the complete eligibility predicate (consumers must not re-check
@@ -1690,10 +1696,13 @@ public:
       std::span<DocSet* const> domainPerSeg;
       bool parallel;
       ExecutionWarnings* warnings;
+      SupplierExecutionMode executionMode;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel, ExecutionWarnings* warnings) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings) {}
+                     bool parallel, ExecutionWarnings* warnings,
+                     SupplierExecutionMode executionMode = SupplierExecutionMode::ORDINARY) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings),
+          executionMode(executionMode) {}
     };
 
     /// Immutable result of prepare() for segment-scorer creation after
