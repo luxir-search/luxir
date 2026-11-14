@@ -44,6 +44,8 @@ struct MergeCostModel {
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
   static constexpr int32_t MAX_TERM_RANGES_CAP = 64;
   static constexpr int32_t DERIVED_TERM_RANGES = 0;
+  // Replay term ord maps at least this large go to scratch files.
+  static constexpr int64_t ORD_MAP_SPILL_MIN_BYTES = 64LL << 20;
   static constexpr int64_t MAX_MERGED_ORD_TERMS =
       (int64_t)std::numeric_limits<int32_t>::max() - (1 << 20);
 
