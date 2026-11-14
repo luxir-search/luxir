@@ -637,6 +637,15 @@ public:
   // Zero derives the ceiling from this merge's size-scaled stream budget.
   // Tests and constrained deployments may set an explicit 2..64 ceiling.
   int32_t termPartitionMaxRanges = MergeCostModel::DERIVED_TERM_RANGES;
+  // Multi-valued indexed string (SET) merges whose uninverted ords could reach
+  // this many OrdCollector pool bytes rebuild the ord column from the source
+  // columns instead. Debug builds replay every multi-valued SET merge so the
+  // suite covers both paths; tests that need the collector pin it high.
+#ifdef NDEBUG
+  int64_t ordReplayMinBytes = MergeCostModel::ORD_REPLAY_MIN_BYTES;
+#else
+  int64_t ordReplayMinBytes = 1;
+#endif
 
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.

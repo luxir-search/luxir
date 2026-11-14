@@ -570,6 +570,9 @@ class SegmentMerger {
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
+  // SET ord columns whose ordCollectorPoolBound() reaches this merge by
+  // replaying the source columns instead of uninverting into an OrdCollector.
+  int64_t ordReplayMinBytes;
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
@@ -586,14 +589,16 @@ public:
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges, const Schema& schema,
-                StoredDictionaryRegistry& storedDictionaries)
+                StoredDictionaryRegistry& storedDictionaries,
+                int64_t ordReplayMinBytes = MergeCostModel::ORD_REPLAY_MIN_BYTES)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     schema(schema), storedDictionaries(storedDictionaries),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
-    termPartitionMaxRanges(termPartitionMaxRanges)
+    termPartitionMaxRanges(termPartitionMaxRanges),
+    ordReplayMinBytes(ordReplayMinBytes)
   {
     assert(preaders.size() == liveDocs.size());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
@@ -1299,7 +1304,8 @@ private:
     }
   }
 
-  // A replayable, doc-ordered source for the writer's count/plan/encode passes.
+  // A replayable, doc-ordered source for the writer's count/plan/encode passes
+  // (ARRAY columns, and SET columns merged by replay).
   // Only one source column/cursor is live at a time. Sequence payloads stay on
   // disk rather than being copied into another merge-time collector.
   class MergedArrayOrds {
@@ -1379,9 +1385,27 @@ private:
     }
   };
 
-  // ARRAY columns cannot be reconstructed from DOCS-only postings. Keep their
-  // term map/replay workspace and walks out of the SET merge instantiation.
-  void LUXIR_NOINLINE mergeArrayOrdColumn(
+  // Upper bound on the OrdCollector pool bytes a term-major merge of these
+  // sources would need: each multi-valued doc's stream header and first slice,
+  // and per value a vint plus its share of slice forwarding pointers.
+  // Single-valued sources keep their ords in the collector's slots.
+  static int64_t ordCollectorPoolBound(std::span<MergeFieldInfo*> fields) {
+    int64_t bytes = 0;
+    for (auto* field : fields) {
+      const auto& info = field->segFieldInfo;
+      if (info.numValues > info.docsWithField) {
+        bytes += 40 * (int64_t)info.docsWithField + 8 * info.numValues;
+      }
+    }
+    return bytes;
+  }
+
+  // Rebuilds an ord column doc-major from the source ord columns through
+  // per-source term ord maps, holding one map entry per source term instead of
+  // every doc's ords. ARRAY columns always merge this way since they cannot be
+  // reconstructed from DOCS-only postings; large SET columns do so because the
+  // OrdCollector's 32-bit pool cannot hold their ords (see ordReplayMinBytes).
+  void LUXIR_NOINLINE mergeOrdColumnByReplay(
       std::span<MergeFieldInfo*> fields, PostingsWriter::IndexFieldInfo& output,
       MemPool& pool) {
     std::vector<std::vector<uint32_t>> ordMaps;
@@ -1392,6 +1416,7 @@ private:
         std::nullopt, std::nullopt, pool, &ordMaps);
     textWriter.endField();
 
+    Signal::emit("mergeOrdColumnByReplay", &output);
     MergedArrayOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
     BasicOrdColWriter<MergedArrayOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
@@ -1747,8 +1772,11 @@ private:
 
     // if this is an indexed string column, we need to collect the ordinals for each doc
     bool isOrdCol = (storage == FieldType::Storage::TERMS) && (allFlags & FieldType::INDEX_DOCS);
-    if (isOrdCol && (allFlags & FieldType::MULTI_ARRAY)) {
-      mergeArrayOrdColumn(compactFields, outputFieldInfo, pool);
+    if (isOrdCol && ((allFlags & FieldType::MULTI_ARRAY)
+                     || ordCollectorPoolBound(compactFields) >= ordReplayMinBytes)) {
+      // ARRAY columns, and SET columns whose uninverted ords could outgrow the
+      // OrdCollector's pool, are rebuilt from the source columns instead.
+      mergeOrdColumnByReplay(compactFields, outputFieldInfo, pool);
       return;
     }
     std::optional<OrdCollector> ordCollector;

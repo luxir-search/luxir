@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <numeric>
@@ -17,6 +18,7 @@
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/SortField.h"
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -887,6 +889,49 @@ TEST_F(OrdColFormatTest, indexedStringMixedModesMergeKeepsSurvivingSequences) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_NE(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
+}
+
+// Large SET ord columns merge by replaying the source columns rather than
+// uninverting into an OrdCollector; both paths must write the same column.
+TEST_F(OrdColFormatTest, setMergeByReplayMatchesCollector) {
+  for (bool replay : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("value");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.multi = api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.getIndexWriter()->ordReplayMinBytes = replay ? 1 : INT64_MAX;
+    std::atomic<int> replays = 0;
+    Signal::listen("mergeOrdColumnByReplay", [&](void*, void*, void*) -> void* { replays++; return nullptr; });
+    ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", vecs("z", "b", "a")), UpdateMessage::NO_COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "gone", "value", vecs("x", "b")), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", "y"), UpdateMessage::NO_COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "d", "value", vecs("c", "y", "b")), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+
+    CollectionHelper::UpdateBuilder update;
+    update.commit(true, 1);
+    ASSERT_TRUE(helper.submit(update).success);
+    Signal::unlisten("mergeOrdColumnByReplay");
+    if (replay) EXPECT_LT(0, replays.load());
+    else EXPECT_EQ(0, replays.load());
+
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+    qb::sort(top, "id", qb::ASC);
+    req->execute(false);
+    ASSERT_OK(req);
+    const auto& rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+    std::vector<std::vector<std::string>> values;
+    for (const auto& row : rows) values.emplace_back(row.v.begin(), row.v.end());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"a", "b", "z"}, {"y"}, {}, {"b", "c", "y"}}), values);
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    EXPECT_EQ(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
+  }
 }
 
 TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {
