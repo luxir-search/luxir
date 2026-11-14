@@ -44,8 +44,8 @@ class StrHandler final : public Inverter::IndexHandler {
   int32_t lastFieldDoc = -1;    // last doc that contributed a value to this field
 
 public:
-  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       stringValue(*fieldType), arrayValues(inverter.pool), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
   }
 
@@ -135,7 +135,7 @@ public:
       return; // drop the field.
     }
 
-    auto nDocs = inverter.getMaxDoc();
+    auto nDocs = inverter.getPostingsWriter().getMaxDoc(space);
     auto guard = MemPool::threadLocalPoolGuard();
 
 
@@ -143,7 +143,7 @@ public:
 
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(SpaceOrdinal::ROOT, fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();

@@ -162,11 +162,12 @@ public:
 
     PackedTerm fieldName;
     std::shared_ptr<FieldType> fieldType;
+    const SpaceOrdinal space;
 
     IndexHandler(IndexHandler& other) = delete; // let's not move any of these
   public:
-    IndexHandler(PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : fieldName(fieldName), fieldType(fieldType) {
+    IndexHandler(PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : fieldName(fieldName), fieldType(fieldType), space(space) {
     }
     virtual ~IndexHandler() = default;
 
@@ -433,26 +434,49 @@ public:
 
 private:
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
-  // Stored-fields writers, keyed by resource name.  Lazily populated when
-  // fields with the STORED flag are first indexed.  PackedTermHash/Equal
-  // give transparent lookup by string_view/PackedTerm/std::string.
-  boost::unordered_flat_map<std::string, std::unique_ptr<StoredFieldsWriter>,
-                            PackedTermHash, PackedTermEqual> storedFields_;
+  // Stored-fields writers, keyed by space and resource name. Lazily populated
+  // when fields with the STORED flag are first indexed. Transparent lookup
+  // avoids constructing a resource name on a hit.
+  struct StoredResourceKey {
+    SpaceOrdinal space;
+    std::string name;
+    struct View {
+      SpaceOrdinal space;
+      std::string_view name;
+      bool operator==(const View&) const = default;
+    };
+    operator View() const { return {space, name}; }
+  };
+  struct StoredResourceHash {
+    using is_transparent = void;
+    size_t operator()(StoredResourceKey::View key) const noexcept {
+      // Keep root resource hashing, and hence its iteration order, unchanged.
+      return PackedTermHash{}(key.name) ^ (size_t)key.space;
+    }
+  };
+  struct StoredResourceEqual {
+    using is_transparent = void;
+    bool operator()(StoredResourceKey::View a, StoredResourceKey::View b) const noexcept { return a == b; }
+  };
+  boost::unordered_flat_map<StoredResourceKey, std::unique_ptr<StoredFieldsWriter>,
+                            StoredResourceHash, StoredResourceEqual> storedFields_;
 
+public:
   // Get-or-create the StoredFieldsWriter for the named resource (column
-  // family).  config may be null to use defaults.  Called from
+  // family). config may be null to use defaults. Called from
   // createInputHandler for the logical storage owner.
-  StoredFieldsWriter& getOrCreateStoredFields(std::string_view resourceName,
-                                              const StoredFieldType* config) {
-    auto it = storedFields_.find(resourceName);
+  StoredFieldsWriter& getOrCreateStoredFields(SpaceOrdinal space, std::string_view resourceName,
+                                              const StoredFieldType* config = nullptr) {
+    auto it = storedFields_.find(StoredResourceKey::View{space, resourceName});
     if (it != storedFields_.end()) return *it->second;
     const auto& format = config ? config->format_ : StoredChunkFormat{};
     auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, SpaceOrdinal::ROOT, resourceName, format, std::move(dictionary));
-    auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, space, resourceName, format, std::move(dictionary));
+    auto [newIt, _] = storedFields_.emplace(StoredResourceKey{space, std::string(resourceName)}, std::move(writer));
     return *newIt->second;
   }
 
+private:
   InputHandler& createInputHandler(std::string_view name);
   IndexHandler& createPhysicalHandler(std::string_view name,
                                       const std::shared_ptr<FieldType>& fieldType);

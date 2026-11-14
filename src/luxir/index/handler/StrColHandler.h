@@ -56,14 +56,14 @@ private:
   int32_t maxSize = std::numeric_limits<int32_t>::min();
 
 public:
-  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : StrColHandler(inverter, fieldName, fieldType, ValueStorage::BUFFERED) {
+  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : StrColHandler(inverter, fieldName, fieldType, space, ValueStorage::BUFFERED) {
   }
 
 protected:
   StrColHandler(Inverter& inverter, const std::string_view& fieldName,
-                const std::shared_ptr<FieldType>& fieldType, ValueStorage valueStorage)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+                const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space, ValueStorage valueStorage)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       stringValue(*fieldType),
       docsWithVal(inverter.pool),
       valSizeStream(inverter.pool),
@@ -210,13 +210,13 @@ public:
     auto& tmpPool = MemPool::threadLocal();
 
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     fieldInfo.numValues = numValuesTotal;
 
-    auto maxDoc = inverter.getMaxDoc();
+    auto maxDoc = inverter.getPostingsWriter().getMaxDoc(space);
     bool full = numDocs == maxDoc;
     bool multiValued = (fieldInfo.flags & FieldType::MULTI_VALUED) != 0;
     // When there are no values (e.g., multi-valued field with only empty arrays),
