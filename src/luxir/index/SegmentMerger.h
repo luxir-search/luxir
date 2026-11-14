@@ -790,9 +790,11 @@ private:
     int64_t numValues = 0;
     int64_t docsWithField = 0;
     int64_t synthesizedPointValues = 0;
+    int64_t collectorPoolBound = 0;
     for (const auto& field : fields) {
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
+      collectorPoolBound += ordCollectorPoolBound(field.segFieldInfo);
       if (field.segFieldInfo.pointsMetaOff == 0) {
         synthesizedPointValues += field.segFieldInfo.numValues;
       }
@@ -808,7 +810,9 @@ private:
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus a pool delta stream per multi-valued doc.  This is the
       // heavy class the budget exists for.
-      if (allFlags & FieldType::MULTI_ARRAY) {
+      // ARRAY columns, and SET columns mergeField routes to replay, hold
+      // per-source term ord maps instead.
+      if ((allFlags & FieldType::MULTI_ARRAY) || collectorPoolBound >= ordReplayMinBytes) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
         // Mapped source runs stream directly; only maps and codec plans grow.
@@ -1389,14 +1393,13 @@ private:
   // sources would need: each multi-valued doc's stream header and first slice,
   // and per value a vint plus its share of slice forwarding pointers.
   // Single-valued sources keep their ords in the collector's slots.
+  static int64_t ordCollectorPoolBound(const SegFieldInfo& info) {
+    if (info.numValues <= info.docsWithField) return 0;
+    return 40 * (int64_t)info.docsWithField + 8 * info.numValues;
+  }
   static int64_t ordCollectorPoolBound(std::span<MergeFieldInfo*> fields) {
     int64_t bytes = 0;
-    for (auto* field : fields) {
-      const auto& info = field->segFieldInfo;
-      if (info.numValues > info.docsWithField) {
-        bytes += 40 * (int64_t)info.docsWithField + 8 * info.numValues;
-      }
-    }
+    for (auto* field : fields) bytes += ordCollectorPoolBound(field->segFieldInfo);
     return bytes;
   }
 
