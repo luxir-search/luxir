@@ -935,6 +935,56 @@ TEST_F(OrdColFormatTest, setMergeReplaysSourceColumns) {
   EXPECT_EQ(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
 }
 
+// Replay merges spill their term ord maps to scratch files past a threshold;
+// SET and ARRAY columns read back the same either way.
+TEST_F(OrdColFormatTest, replayOrdMapsSpillMatchesHeap) {
+  for (bool array : {false, true}) {
+    std::vector<std::vector<std::vector<std::string>>> results;
+    for (bool spill : {false, true}) {
+      CollectionHelper helper;
+      helper.clear();
+      SchemaBuilder schema;
+      auto& field = schema.field("value");
+      field.type = api::FieldDef::FieldClass::STRING;
+      field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+      schema.set(helper.collection());
+      helper.getIndexWriter()->ordMapSpillMinBytes = spill ? 1 : INT64_MAX;
+      std::atomic<int> spilled = 0, replays = 0;
+      Signal::listen("mergeOrdColumnByReplay", [&](void*, void* b, void*) -> void* {
+        replays++;
+        spilled += *(bool*)b;
+        return nullptr;
+      });
+      ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", vecs("z", "b", "z")), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "gone", "value", vecs("x")), UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", vecs("y", "b")), UpdateMessage::NO_COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", "d", "value", vecs("c", "a", "y")), UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+      Signal::unlisten("mergeOrdColumnByReplay");
+      EXPECT_LT(0, replays.load());
+      EXPECT_EQ(spill ? replays.load() : 0, spilled.load());
+
+      auto req = localReq(helper.getSearchEngine());
+      auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+      qb::sort(top, "id", qb::ASC);
+      req->execute(false);
+      ASSERT_OK(req);
+      auto& values = results.emplace_back();
+      for (const auto& row : std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v) {
+        values.emplace_back(row.v.begin(), row.v.end());
+      }
+    }
+    EXPECT_EQ(results[0], results[1]);
+    EXPECT_EQ(array ? (std::vector<std::vector<std::string>>{{"z", "b", "z"}, {"y", "b"}, {}, {"c", "a", "y"}})
+                    : (std::vector<std::vector<std::string>>{{"b", "z"}, {"b", "y"}, {}, {"a", "c", "y"}}),
+              results[1]);
+  }
+}
+
 // column: false keeps an indexed string's postings and docs-with-field set
 // (exists, scoring) but writes no ord column, at flush or merge.
 TEST_F(OrdColFormatTest, indexedStringWithoutColumnKeepsPostingsOnly) {
