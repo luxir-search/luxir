@@ -130,7 +130,8 @@ uint64_t buildReferenceDigest() {
     Fixture::fields(writer, SpaceOrdinal::ROOT, "", roots);
     if (id < 3) {
       auto reverse = id == 1 ? std::optional<std::span<const int64_t>>(owners) : std::nullopt;
-      auto child = writer.addSpace(Fixture::CHILD, (int32_t)children.size(), Fixture::shape(writer, ends, reverse));
+      auto child = writer.addSpace(Fixture::CHILD);
+      writer.finishSpace(child, (int32_t)children.size(), Fixture::shape(writer, ends, reverse));
       Fixture::fields(writer, child, "", children);
     }
     writeUnversionedRuns(writer);

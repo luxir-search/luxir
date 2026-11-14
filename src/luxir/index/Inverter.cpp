@@ -92,7 +92,7 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
     // will use defaults.  fromProto registers "_stored_" and rejects
     // references to undeclared resources, so this only happens for schemas
     // assembled directly.
-    writer = &getOrCreateStoredFields(resourceName, resConfig);
+    writer = &getOrCreateStoredFields(SpaceOrdinal::ROOT, resourceName, resConfig);
   }
 
   auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
@@ -116,29 +116,29 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
   u_ptr<IndexHandler> fieldHandler;
 
   if (fieldType->type() == FieldType::ID) {
-    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
+    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
     idHandler_ = fieldHandler.get();
   } else if (fieldType->type() == FieldType::GEO_POINT) {
     if (fieldType->multiValued()) {
-      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
     } else {
-      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
     }
   } else {
     switch (FieldType::storage(fieldType->type())) {
       case FieldType::Storage::TEXT:
-        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
         break;
       case FieldType::Storage::TERMS:
         if (!fieldType->indexed() && fieldType->hasColumn()) {
           // If the field is not indexed (column stored only), use StrColHandler
-          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
         } else {
           // indexed and column stored (via ord)
           if (fieldType->multiArray()) {
-            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType, SpaceOrdinal::ROOT);
           } else {
-            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType, SpaceOrdinal::ROOT);
           }
         }
         break;
@@ -147,13 +147,13 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         // encoding (raw ints, sortable bits, epoch millis) comes from
         // FieldType::coerceColInt64, not the handler.
         if (fieldType->multiValued()) {
-          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
         } else {
-          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
         }
         break;
       case FieldType::Storage::VECTOR:
-        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType, SpaceOrdinal::ROOT);
         break;
       default:
         throw std::runtime_error("Unknown field type: " + std::string(name));
@@ -324,8 +324,8 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
   // Stored-fields chunk streams are also held through indexing. Finish all
   // resources now so their chunk and metadata streams are available for reuse
   // by normal field flushing.
-  for (auto& [_, writer] : storedFields_) {
-    writer->finish(getMaxDoc());
+  for (auto& [key, writer] : storedFields_) {
+    writer->finish(postingsWriter.getMaxDoc(key.space));
   }
 
   for (auto fieldHandler : fields) {

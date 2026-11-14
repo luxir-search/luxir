@@ -334,9 +334,20 @@ public:
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
-    if (finished || (fieldInfos.empty() && maxDoc <= 0)) {
-      return false;  // already called, or no data added.
+    if (finished) return false; // already called
+    for (size_t index = 1; index < spaceDescriptors.size(); index++) {
+      const auto& space = spaceDescriptors[index];
+      if (!space.ownership || space.maxDoc <= 0) {
+        throw std::invalid_argument("unfinished row space: " + space.path);
+      }
+      auto parent = spaceParentPath(space.path);
+      auto entry = std::find_if(spaceDescriptors.begin(), spaceDescriptors.end(),
+          [&](const auto& candidate) { return candidate.path == parent; });
+      if (entry == spaceDescriptors.end() || (parent.empty() ? maxDoc : entry->maxDoc) <= 0) {
+        throw std::invalid_argument("row space has no parent rows: " + space.path);
+      }
     }
+    if (fieldInfos.empty() && maxDoc <= 0) return false; // no data added
 
     if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
       throw std::runtime_error("Segment has no request birth versions");
@@ -405,24 +416,37 @@ public:
     if (space == SpaceOrdinal::ROOT) return maxDoc;
     const auto* descriptor = findSpace(space);
     if (!descriptor) throw std::invalid_argument("unknown row space");
+    if (!descriptor->ownership) throw std::invalid_argument("row space count is not finalized");
     return descriptor->maxDoc;
   }
 
   // Declare a child space before its fields. Ownership streams use the same
   // allocator as field data and are relocated by the same finalize pass.
-  SpaceOrdinal addSpace(std::string_view path, int32_t count, OwnershipDescriptor ownership) {
+  SpaceOrdinal addSpace(std::string_view path) {
     auto parent = spaceParentPath(path);
     bool hasParent = false;
     for (const auto& space : spaceDescriptors) {
       if (space.path == path) throw std::invalid_argument("duplicate row space path");
       if (space.path == parent) hasParent = true;
     }
-    if (path.empty() || count <= 0 || count >= PostingsReader::HARD_MAX_DOC
-        || !hasParent || ownership.ends.isNull()) {
+    if (finished || path.empty() || !hasParent) {
       throw std::invalid_argument("invalid row space declaration");
     }
-    spaceDescriptors.push_back({std::string(path), count, {}, 0, ownership});
+    spaceDescriptors.push_back({std::string(path), 0, {}, 0, {}});
     return (SpaceOrdinal)(spaceDescriptors.size() - 1);
+  }
+
+  // Attach the final row count and encoded ownership after indexing.
+  void finishSpace(SpaceOrdinal ordinal, int32_t count, OwnershipDescriptor ownership) {
+    if (finished || ordinal == SpaceOrdinal::ROOT || !findSpace(ordinal)
+        || count <= 0 || count >= PostingsReader::HARD_MAX_DOC || ownership.ends.isNull()
+        || ownership.endsMetaOff < 0 || ownership.ownersMetaOff < 0) {
+      throw std::invalid_argument("invalid row space finalization");
+    }
+    auto& space = spaceDescriptors[(size_t)ordinal];
+    if (space.ownership) throw std::invalid_argument("row space already finalized");
+    space.maxDoc = count;
+    space.ownership = ownership;
   }
 
   int64_t getSizeInBytes() {

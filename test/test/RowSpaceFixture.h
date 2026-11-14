@@ -152,7 +152,8 @@ struct RowSpaceFixture {
     PostingsWriter writer(dir, id, 1, (int32_t)roots.size());
     fields(writer, SpaceOrdinal::ROOT, "", roots);
     if (!children.empty()) {
-      auto child = writer.addSpace(CHILD, (int32_t)children.size(), shape(writer, ends, owners));
+      auto child = writer.addSpace(CHILD);
+      writer.finishSpace(child, (int32_t)children.size(), shape(writer, ends, owners));
       fields(writer, child, CHILD, children);
     }
     writeUnversionedRuns(writer);

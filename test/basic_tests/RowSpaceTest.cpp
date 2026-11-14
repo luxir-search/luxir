@@ -13,7 +13,13 @@
 #include "luxir/search/OwnershipRelation.h"
 #include "luxir/query/AllQuery.h"
 #include "luxir/index/SegmentMerger.h"
+#include "luxir/index/handler/FullTextHandler.h"
+#include "luxir/index/handler/IntColHandler.h"
+#include "luxir/index/handler/StrHandler.h"
+#include "luxir/index/handler/VectorHandler.h"
+#include "luxir/reader/VectorReader.h"
 #include "luxir/reader/ColumnShape.h"
+#include "luxir/reader/NormsReader.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -170,8 +176,7 @@ TEST_F(RowSpaceTest, openNeedsNoChildRowMapOrScan) {
   RAMDir dir;
   PostingsWriter writer(dir, 1, 1, 1);
   const int32_t children = 100000000;
-  writer.addSpace(Fixture::CHILD, children,
-                  Fixture::shape(writer, std::vector<int64_t>{children}));
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), children, Fixture::shape(writer, std::vector<int64_t>{children}));
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish());
   SegmentCore core(dir, 1, 1);
@@ -190,7 +195,7 @@ TEST_F(RowSpaceTest, ownershipSeeksAcrossMonoBlockBoundaries) {
     ends.push_back((int64_t)owners.size());
   }
   PostingsWriter writer(dir, 1, 1, parents);
-  writer.addSpace(Fixture::CHILD, (int32_t)owners.size(), Fixture::shape(writer, ends));
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), (int32_t)owners.size(), Fixture::shape(writer, ends));
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish());
   SegmentCore core(dir, 1, 1);
@@ -204,10 +209,12 @@ TEST_F(RowSpaceTest, ownershipSeeksAcrossMonoBlockBoundaries) {
 
 TEST_F(RowSpaceTest, pathLookupBindsFieldsAndImmediateOwnership) {
   PostingsWriter writer(dir, 1, 1, 3);
-  auto items = writer.addSpace("z", 4, Fixture::shape(writer, ENDS));
+  auto items = writer.addSpace("z");
+  writer.finishSpace(items, 4, Fixture::shape(writer, ENDS));
   Fixture::fields(writer, items, "z", CHILDREN);
-  writer.addSpace("z.parts", 2, Fixture::shape(writer, std::vector<int64_t>{1, 1, 2, 2}));
-  auto earlier = writer.addSpace("a", 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 3}));
+  writer.finishSpace(writer.addSpace("z.parts"), 2, Fixture::shape(writer, std::vector<int64_t>{1, 1, 2, 2}));
+  auto earlier = writer.addSpace("a");
+  writer.finishSpace(earlier, 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 3}));
   Fixture::fields(writer, earlier, "a", ROOTS);
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish());
@@ -231,7 +238,7 @@ TEST_F(RowSpaceTest, invalidOwnershipEndpointsFailOpen) {
   auto write = [&](std::span<const int64_t> ends, std::optional<std::span<const int64_t>> owners) {
     dir.clear();
     PostingsWriter writer(dir, 1, 1, 3);
-    writer.addSpace(Fixture::CHILD, 4, Fixture::shape(writer, ends, owners));
+    writer.finishSpace(writer.addSpace(Fixture::CHILD), 4, Fixture::shape(writer, ends, owners));
     writeUnversionedRuns(writer);
     ASSERT_TRUE(writer.finish());
   };
@@ -248,7 +255,7 @@ TEST_F(RowSpaceTest, ownershipStreamsStayInTheSharedFileInventory) {
   footer.reset();
   uint32_t pinned = shape.ends.filenum();
   writer.protectOutputFiles(std::span(&pinned, 1));
-  writer.addSpace(Fixture::CHILD, 4, shape);
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), 4, shape);
   writeUnversionedRuns(writer);
   std::vector<FileDescriptor> files;
   ASSERT_TRUE(writer.finish(nullptr, &files));
@@ -281,10 +288,10 @@ TEST_F(RowSpaceTest, multiSpaceMergeFailsBeforeWritingFields) {
 
 TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
   PostingsWriter writer(dir, 1, 1, 5);
-  writer.addSpace(Fixture::CHILD, 205, Fixture::shape(writer, std::vector<int64_t>{70, 70, 200, 200, 205}));
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), 205, Fixture::shape(writer, std::vector<int64_t>{70, 70, 200, 200, 205}));
   std::vector<int64_t> ends(205, 2);
   std::fill(ends.begin() + 200, ends.end(), 3);
-  writer.addSpace("items.deep", 3, Fixture::shape(writer, ends));
+  writer.finishSpace(writer.addSpace("items.deep"), 3, Fixture::shape(writer, ends));
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish(nullptr));
   auto core = SegmentCore::create(dir, 1, 1);
@@ -298,6 +305,112 @@ TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
   for (int32_t row = 0; row < 205; row++) EXPECT_EQ(row < 70 || row >= 200, live->docset().get(row));
   ChildLiveDocs deep(core, roots, "items.deep");
   EXPECT_EQ(nullptr, deep.get());
+}
+
+
+TEST_F(RowSpaceTest, spaceReservationRequiresFinalCountsBeforeFinish) {
+  PostingsWriter writer(dir, 1, 1, 2);
+  auto items = writer.addSpace("items");
+  auto deep = writer.addSpace("items.deep");
+  EXPECT_THROW(writer.addSpace("items"), std::invalid_argument);
+  EXPECT_THROW(writer.addSpace("missing.deep"), std::invalid_argument);
+  EXPECT_THROW(writer.getMaxDoc(items), std::invalid_argument);
+  EXPECT_THROW(writer.finishSpace(items, 0, {}), std::invalid_argument);
+  writeUnversionedRuns(writer);
+  EXPECT_THROW(writer.finish(), std::invalid_argument);
+  writer.finishSpace(deep, 1, Fixture::shape(writer, std::vector<int64_t>{0, 1}));
+  writer.finishSpace(items, 2, Fixture::shape(writer, std::vector<int64_t>{1, 2}));
+  EXPECT_THROW(writer.finishSpace(items, 2, {}), std::invalid_argument);
+  ASSERT_TRUE(writer.finish());
+  SegmentCore core(dir, 1, 1);
+  EXPECT_EQ(2, core.spaceReader("items")->maxDoc());
+  EXPECT_EQ(1, core.ownership("items.deep")->owner(0));
+}
+
+TEST_F(RowSpaceTest, physicalHandlersFlushAgainstTheirBoundSpace) {
+  Inverter inverter(dir, 1, 1);
+  auto& writer = inverter.getPostingsWriter();
+  auto space = writer.addSpace("items_nested");
+  auto bind = [&]<typename T>(std::string_view local) -> T& {
+    auto name = Schema::qualify("items_nested", local);
+    auto field = inverter.pool.make_unique<T>(inverter, name, inverter.schema->getFieldTypeEx(name), space);
+    auto* result = field.get();
+    inverter.indexHandlers.emplace(std::move(name), std::move(field));
+    return *result;
+  };
+  auto& ints = bind.operator()<handler::IntColHandler>("number_i");
+  auto& many = bind.operator()<handler::MultiIntColHandler>("many_is");
+  auto& text = bind.operator()<handler::FullTextHandler>("body_w");
+  auto& labels = bind.operator()<handler::StrHandler<>>("label_s");
+  auto& raw = bind.operator()<handler::StrColHandler>("raw_sc");
+  auto& vectors = bind.operator()<handler::VectorHandler>("embedding_v");
+  for (int32_t row = 0; row < 3; row++) {
+    inverter.startDoc();
+    if (row != 1) ints.index(inverter, (int64_t)row + 10);
+    const int64_t values[]{row, row + 10};
+    many.index(inverter, std::span<const int64_t>(values));
+    text.index(inverter, std::string_view("common common"));
+    labels.index(inverter, std::string_view("label"));
+    raw.index(inverter, std::string_view("raw"));
+    const float value[]{(float)row, 1.0f};
+    api::Val vector;
+    vector.kind.emplace<api::Vector>().f32.emplace().v = value;
+    vectors.index(inverter, vector);
+  }
+  inverter.setDoc(5); // The root and child counts deliberately differ.
+  writer.finishSpace(space, 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 2, 2, 3, 3}));
+  ASSERT_TRUE(inverter.flush());
+  SegmentCore core(dir, 1, 1);
+  auto& child = *core.spaceReader("items_nested");
+  EXPECT_EQ(6, core.rootReader().maxDoc());
+  EXPECT_EQ(3, child.maxDoc());
+  for (auto name : {"number_i", "many_is", "body_w", "label_s", "raw_sc", "embedding_v"}) {
+    auto qualified = Schema::qualify("items_nested", name);
+    EXPECT_EQ(nullptr, core.rootReader().fieldInfo(qualified));
+    ASSERT_NE(nullptr, child.fieldInfo(qualified));
+  }
+  IntColReader column(child, *child.fieldInfo("items_nested.number_i"));
+  IntColReader::SparseIterator values(column);
+  EXPECT_EQ(0, values.advance(0)); EXPECT_EQ(10, values.value());
+  EXPECT_EQ(2, values.advance(1)); EXPECT_EQ(12, values.value());
+  EXPECT_EQ(PostingsReader::END, values.advance(3));
+  auto& body = *child.fieldInfo("items_nested.body_w");
+  EXPECT_EQ(3, body.docsWithField);
+  NormsReader norms(child, body);
+  EXPECT_TRUE(norms.isFlat());
+  EXPECT_EQ(3, norms.numBytes());
+  EXPECT_EQ(2, norms.value(2));
+  OrdColReader ords(child, *child.fieldInfo("items_nested.label_s"));
+  EXPECT_TRUE(ords.docIdIndexed());
+  EXPECT_NE(0, ords.ordAt(2));
+  VectorReader vector(child, *child.fieldInfo("items_nested.embedding_v"));
+  EXPECT_EQ(2, vector.dims());
+}
+
+TEST_F(RowSpaceTest, inverterStoredResourcesAreLocalToTheirBoundSpace) {
+  Inverter inverter(dir, 1, 1);
+  auto& writer = inverter.getPostingsWriter();
+  auto space = writer.addSpace("items");
+  auto& roots = inverter.getOrCreateStoredFields(SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE);
+  auto& children = inverter.getOrCreateStoredFields(space, Postings::STORED_DEFAULT_RESOURCE);
+  EXPECT_NE(&roots, &children);
+  EXPECT_EQ(&roots, &inverter.getOrCreateStoredFields(SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE));
+  roots.addValue(0, "payload", "root");
+  children.addValue(0, "items.payload", "child");
+  inverter.setDoc(5);
+  writer.finishSpace(space, 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 2, 2, 3, 3}));
+  ASSERT_TRUE(inverter.flush());
+  SegmentCore core(dir, 1, 1);
+  for (auto path : {"", "items"}) {
+    auto& reader = *core.spaceReader(path);
+    StoredFieldsReader stored(reader, *reader.fieldInfo(Postings::STORED_DEFAULT_RESOURCE));
+    EXPECT_EQ(path == std::string_view("") ? 6 : 3, stored.maxDoc());
+    stored.readDoc(0, [&](std::string_view name, std::span<const std::string_view> values) {
+      EXPECT_EQ(path == std::string_view("") ? "payload" : "items.payload", name);
+      ASSERT_EQ(1u, values.size());
+      EXPECT_EQ(path == std::string_view("") ? "root" : "child", values[0]);
+    });
+  }
 }
 
 class ScopedRowSpaceTest : public LuxirTest {
@@ -360,7 +473,8 @@ protected:
         PostingsWriter writer(directory, segment.seg_id, 1, (int32_t)roots.size());
         Fixture::fields(writer, SpaceOrdinal::ROOT, "", roots, std::vector<uint8_t>{1, 1, 1});
         if (i < 2) {
-          auto child = writer.addSpace(Fixture::CHILD, (int32_t)CHILDREN.size(), Fixture::shape(writer, ends));
+          auto child = writer.addSpace(Fixture::CHILD);
+          writer.finishSpace(child, (int32_t)CHILDREN.size(), Fixture::shape(writer, ends));
           Fixture::fields(writer, child, Fixture::CHILD, CHILDREN, std::vector<uint8_t>{2, 2, 1});
           auto& vectors = writer.addField(child, "items.embedding");
           vectors.type = FieldType::VECTOR;
@@ -375,7 +489,7 @@ protected:
             vectors.columnMetaOff = sizeof(values);
           }
           Fixture::presence(writer, vectors, std::vector<int32_t>{0, 1, 2, 3}, 4);
-          writer.addSpace("items.deep", 4, Fixture::shape(writer, std::vector<int64_t>{1, 2, 3, 4}));
+          writer.finishSpace(writer.addSpace("items.deep"), 4, Fixture::shape(writer, std::vector<int64_t>{1, 2, 3, 4}));
         }
         VersionRunBuilder versions;
         for (uint32_t row = 0; row < roots.size(); row++) versions.add(row, 100 + (uint64_t)i * 10 + row);
@@ -590,7 +704,7 @@ TEST_F(ScopedRowSpaceTest, heldViewSurvivesNewSnapshotWithoutCycles) {
 TEST_F(ScopedRowSpaceTest, openingViewsUsesCountsWithoutScanningChildRows) {
   const int32_t count = 100000000;
   PostingsWriter writer(directory, 4, 1, 1);
-  writer.addSpace(Fixture::CHILD, count, Fixture::shape(writer, std::vector<int64_t>{count}));
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), count, Fixture::shape(writer, std::vector<int64_t>{count}));
   writeUnversionedRuns(writer);
   std::vector<FileDescriptor> files;
   ASSERT_TRUE(writer.finish(nullptr, &files));
