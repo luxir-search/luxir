@@ -92,7 +92,7 @@ std::vector<DomainHandle> StructuralConstraint::finish(IndexReader& reader, std:
         QueryPrep::materialize(*weight, prepared.get(), reader.segments()[segment], domains[segment].get());
     auto charge = std::make_shared<DomainVariantPlan::Reservation>(tracker, docs ? docs->ramBytesUsed() : 0,
                                                                    "structural selection domain");
-    selected.push_back(DomainHandle(std::move(docs)).chargedWith(std::move(charge)));
+    selected.push_back(DomainHandle(std::move(docs)).scoped(reader.segments()[segment]).chargedWith(std::move(charge)));
   }
   return selected;
 }
@@ -101,7 +101,7 @@ std::vector<DomainHandle> SearchOp::Calculator::structuralDomains() const {
   std::vector<DomainHandle> domains;
   auto path = structuralConstraint();
   for (auto& segment : op.req.reader->segments()) {
-    DomainHandle live = DomainHandle::pinned(segment.liveDocSet(), op.req.reader);
+    DomainHandle live = DomainHandle::pinned(segment.liveDocSet(), op.req.reader).scoped(segment);
     domains.push_back(path ? path->prefix(segment.ord, std::move(live)) : std::move(live));
   }
   return domains;
@@ -128,7 +128,7 @@ DomainHandle StructuralConstraint::Producer::prefix(int32_t segnum, size_t bucke
   }
   if (ready[(size_t)segnum] != 1) {
     auto& seg = req.reader->segments()[(size_t)segnum];
-    DomainHandle base = DomainHandle::pinned(seg.liveDocSet(), req.reader);
+    DomainHandle base = DomainHandle::pinned(seg.liveDocSet(), req.reader).scoped(seg);
     if (ancestor) base = ancestor->prefix(segnum, std::move(base));
     values.resize(bucketCount);
     if (base.get() && base.get()->card() == 0) {

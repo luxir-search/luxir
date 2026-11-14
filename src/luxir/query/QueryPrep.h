@@ -716,7 +716,7 @@ public:
 
   DocSet* docSet(IndexReader::Segment& segment) const {
     return value->docSet((size_t) segment.ord,
-                         {segment.segInfo.seg_id, segment.maxDoc()});
+                         {segment.segInfo.seg_id, segment.maxDoc(), segment.spaceOrdinal()});
   }
 
   Query::ScorerSupplier* scorerSupplierImpl(
@@ -1063,7 +1063,7 @@ public:
                SkipStats::wholeFieldSortBuilds);
       }
       return {
-        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+        true, DomainHandle::pinned(docs, lifetime).scoped(segment), (int64_t) docs->card()
       };
     }
 
@@ -1304,7 +1304,7 @@ inline ExactDomainResult tryExactDomain(
     MemPool& targetPool, std::span<const ExactDomainSource> sources,
     IndexReader& reader, IndexReader::Segment& segment, DocSet* domain) {
   if (domain != nullptr && domain->card() == 0) {
-    return {true, DomainHandle::borrowed(domain)};
+    return {true, DomainHandle::borrowed(domain).scoped(segment)};
   }
 
   std::vector<DocSet*> sets;
@@ -1362,18 +1362,18 @@ inline ExactDomainResult tryExactDomain(
 
     if (matchesNone) {
       DocSetBuilder empty(segment.maxDoc());
-      return {true, DomainHandle(empty.build())};
+      return {true, DomainHandle(empty.build()).scoped(segment)};
     }
     sets.push_back(exact);
   }
   if (!allAvailable) return {};
   if (domain != nullptr) sets.push_back(domain);
 
-  if (sets.empty()) return {true, DomainHandle()};
+  if (sets.empty()) return {true, DomainHandle().scoped(segment)};
   if (sets.size() == 1) {
-    return {true, DomainHandle::borrowed(sets[0])};
+    return {true, DomainHandle::borrowed(sets[0]).scoped(segment)};
   }
-  return {true, DomainHandle(DocSet::intersect(sets))};
+  return {true, DomainHandle(DocSet::intersect(sets)).scoped(segment)};
 }
 
 class ExactDomainPlan {
@@ -1427,16 +1427,16 @@ inline DomainHandle materializeEffectiveFilter(
     use = nullptr;
   }
   if (use == nullptr) {
-    return DomainHandle(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
       DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
-      return DomainHandle::borrowed(cached->docSet(segment));
+      return DomainHandle::borrowed(cached->docSet(segment)).scoped(segment);
     }
-    return DomainHandle(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   auto probe = use->probe((size_t) segment.ord);
@@ -1460,7 +1460,7 @@ inline DomainHandle materializeEffectiveFilter(
       use->offerRaw(
           (size_t) segment.ord, std::move(raw), buildCostNanos);
       DocSet* docs = use->effectiveDocSet((size_t) segment.ord, reader);
-      return DomainHandle::borrowed(docs);
+      return DomainHandle::borrowed(docs).scoped(segment);
     }
     if (!disableFilterOwnForTests
         && !weight.needsScores() && !weight.allowsPruning()) {
@@ -1469,7 +1469,7 @@ inline DomainHandle materializeEffectiveFilter(
       return use->effectiveDomain((size_t) segment.ord, reader, domain);
     }
     return DomainHandle(
-        materialize(weight, prepared, segment, domain));
+        materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   return use->effectiveDomain((size_t) segment.ord, reader, domain);
@@ -1525,7 +1525,7 @@ inline DomainHandle materializeEffectiveIntersection(
   }
   if (ptrs.empty()) return {};
   if (ptrs.size() == 1) return std::move(sets[0]);
-  return DomainHandle(DocSet::intersect(ptrs));
+  return DomainHandle(DocSet::intersect(ptrs)).scoped(segment);
 }
 
 // domain AND NOT (union of sources), under the live-filtered domain contract:
@@ -1536,7 +1536,7 @@ inline DomainHandle materializeEffectiveIntersection(
 inline DomainHandle materializeEffectiveExclusion(
     std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DomainHandle domain) {
-  DocSet* base = domain.get();
+  DocSet* base = domain.get(segment);
   assert(base != nullptr || !segment.hasDeletes());
   std::vector<DomainHandle> excluded;
   std::vector<DocSet*> ptrs;
@@ -1546,7 +1546,7 @@ inline DomainHandle materializeEffectiveExclusion(
     DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
     if (set.get() == nullptr) {
       set = DomainHandle(materialize(
-          source.segmentSource(), segment, base));
+          source.segmentSource(), segment, base)).scoped(segment);
     }
     if (set.get()->card() > 0) {
       ptrs.push_back(set.get());
@@ -1554,7 +1554,7 @@ inline DomainHandle materializeEffectiveExclusion(
     }
   }
   if (excluded.empty() && base != nullptr) return domain;
-  return DomainHandle(DocSet::andNot(base, ptrs, segment.maxDoc()));
+  return DomainHandle(DocSet::andNot(base, ptrs, segment.maxDoc())).scoped(segment);
 }
 
 } // namespace luxir::QueryPrep

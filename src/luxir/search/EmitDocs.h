@@ -525,6 +525,10 @@ inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
 inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
                             luxir::api::Column& fieldCol, FieldLoaders* loaders,
                             PendingCols& pendingCols, std::pmr::memory_resource& mr) {
+  if (!req.reader->path().empty()) {
+    throw ApiError(ErrorKind::INTERNAL, "child_version_unavailable",
+        "Birth versions are unavailable on child rows");
+  }
   auto& col = fieldCol.kind.emplace<luxir::api::ColInt>();
   auto* target = build::allocArray(col.v, segDocs.size(), mr);
   auto& pending = pendingCols.emplace_back();
@@ -1496,6 +1500,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
+    if (f == "_version_" && !req.reader->path().empty()) {
+      throw ApiError(ErrorKind::INTERNAL, "child_version_unavailable",
+          "Birth versions are unavailable on child rows");
+    }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
     if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
       auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
@@ -1510,6 +1518,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       throw RequestError(message, "invalid_field");
     }
     auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+    if (kind == ReturnField::Kind::VERSION && !req.reader->path().empty()) {
+      throw ApiError(ErrorKind::INTERNAL, "child_version_unavailable",
+          "Birth versions are unavailable on child rows");
+    }
     picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
   };
   if (fields.empty()) {

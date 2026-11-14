@@ -1259,6 +1259,7 @@ public:
         filterKeyContext(filterKeyContext), limits(limits),
         warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
+      this->filterKeyContext.path = topReader.path();
       if (this->limits.multiTermBudget == nullptr) {
         ownedMultiTermBudget = std::make_unique<MultiTermBudget>();
         this->limits.multiTermBudget = ownedMultiTermBudget.get();

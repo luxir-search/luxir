@@ -112,7 +112,7 @@ public:
       auto domain = builder.build();
       auto charge = std::make_shared<DomainVariantPlan::DomainCharge>(
           op.req.memoryTracker, domain->ramBytesUsed(), "fused domain", "fusion collapse");
-      fusedDomains.push_back(DomainHandle(std::move(domain)).chargedWith(std::move(charge)));
+      fusedDomains.push_back(DomainHandle(std::move(domain)).scoped(segments[(size_t)segment]).chargedWith(std::move(charge)));
     }
     // Ordinary fusion children retain the entire evidence union, including
     // documents excluded from the returned groups by missing: drop.

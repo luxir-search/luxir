@@ -202,6 +202,7 @@ void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
           representative == 0 ? preparedRoutedReservations[segnum] : variantReservations[segnum];
       DomainHandle matches(QueryPrep::materialize(*op.weight, variantWeight, segments[segnum],
                                                   eligibility[segnum][representative].get()));
+      matches = std::move(matches).scoped(segments[segnum]);
       if (matches.get() != nullptr) {
         reservation->grow(matches.get()->ramBytesUsed());
       }
@@ -281,7 +282,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
   std::vector<std::vector<DomainHandle>> eligibility(segmentCount, std::vector<DomainHandle>(variantCount));
   for (size_t segnum = 0; segnum < segmentCount; segnum++) {
     DomainHandle live = Structural ? resetBaseHandle((int32_t)segnum)
-                                   : DomainHandle::pinned(liveDomains[segnum], op.req.reader);
+                                   : DomainHandle::pinned(liveDomains[segnum], op.req.reader).scoped(op.req.reader->segments()[segnum]);
     for (size_t variant = 1; variant < variantCount; variant++) {
       if (op.domainVariants.frame(variant) != DomainVariantPlan::Frame::RESET) {
         continue;

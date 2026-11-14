@@ -499,6 +499,7 @@ public:
       task_group_fanout(tg, domains.size(), [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
+          domain.assertScope(op.req.reader->segments()[segnum]);
           calc(tg, (int32_t)segnum, domain);
         };
       });

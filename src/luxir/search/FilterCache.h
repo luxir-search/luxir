@@ -23,6 +23,7 @@
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 #include "luxir/search/DocSet.h"
+#include "luxir/reader/Space.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/RequestMemTracker.h"
 #include "luxir/util/Striped.h"
@@ -103,6 +104,7 @@ public:
   struct SegmentIdentity {
     uint64_t segId;
     int32_t maxDoc;
+    SpaceOrdinal space = SpaceOrdinal::ROOT;
 
     friend bool operator==(const SegmentIdentity&, const SegmentIdentity&) = default;
   };
@@ -205,6 +207,7 @@ public:
       uint64_t segId;
       int32_t maxDoc;
       std::unique_ptr<DocSet> docs;
+      SpaceOrdinal space;
     };
 
     uint64_t readerVersion_;
@@ -525,6 +528,7 @@ private:
   struct SegmentSlot {
     uint64_t segId;
     int32_t maxDoc;
+    SpaceOrdinal space;
     std::atomic<bool> active{true};
     std::atomic<bool> building{false};
     std::atomic<std::shared_ptr<const SegmentValue>> value;
@@ -534,8 +538,8 @@ private:
     std::atomic<uint32_t> deadBuildStreak{0};
     std::atomic<uint32_t> buildBypassesRemaining{0};
 
-    SegmentSlot(uint64_t segId, int32_t maxDoc)
-      : segId(segId), maxDoc(maxDoc) {}
+    SegmentSlot(uint64_t segId, int32_t maxDoc, SpaceOrdinal space)
+      : segId(segId), maxDoc(maxDoc), space(space) {}
 
     void lock() {
       while (feedbackTransition.test_and_set(std::memory_order_acquire)) {
@@ -595,6 +599,7 @@ private:
     uint64_t coreGen = 0;
     uint64_t readerVersion = 0;
     std::vector<SegmentIdentity> segments;
+    size_t bundleCount = 0;
   };
 
   struct AtomicCounters {

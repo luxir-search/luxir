@@ -670,6 +670,7 @@ public:
       int64_t totalDomainSize = 0;
       inlineExpectedValues = inlineOps.empty() ? -1 : 0;
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        domains[segnum].assertScope(thisOp().reader.segments()[segnum]);
         int32_t maxDoc = thisOp().reader.segments()[segnum].maxDoc();
         int64_t domainSize = domains[segnum].get() != nullptr
             ? domains[segnum].get()->card() : maxDoc;
@@ -755,7 +756,7 @@ public:
       }
 
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get();
+      DocSet* domain = domainHandle.get(op.req.reader->segments()[(size_t)segnum]);
       if (!feedOps.empty()) input[(size_t)segnum] = std::move(domainHandle);
 
       if (profileRun != nullptr) {
@@ -1671,7 +1672,7 @@ public:
 
         for (size_t i = 0; i < numBuckets; i++) {
           domains[segnum * numBuckets + i] =
-              DomainHandle(builders[i].build());
+              DomainHandle(builders[i].build()).scoped(segment);
         }
       }
       return domains;

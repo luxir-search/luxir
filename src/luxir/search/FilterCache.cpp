@@ -35,14 +35,14 @@ size_t ninetyPercent(size_t bytes) {
 
 bool identityLess(const FilterCache::SegmentIdentity& a,
                   const FilterCache::SegmentIdentity& b) {
-  return std::tie(a.segId, a.maxDoc) < std::tie(b.segId, b.maxDoc);
+  return std::tie(a.segId, a.space, a.maxDoc) < std::tie(b.segId, b.space, b.maxDoc);
 }
 
 std::vector<FilterCache::SegmentIdentity> readerIdentities(IndexReader& reader) {
   std::vector<FilterCache::SegmentIdentity> identities;
   identities.reserve(reader.segments().size());
   for (const auto& segment : reader.segments()) {
-    identities.push_back({segment.segInfo.seg_id, segment.maxDoc()});
+    identities.push_back({segment.segInfo.seg_id, segment.maxDoc(), segment.spaceOrdinal()});
   }
   return identities;
 }
@@ -92,7 +92,7 @@ FilterCache::ReaderValue::ReaderValue(
     docs[i]->card();
     charge += docs[i]->ramBytesUsed();
     segments.push_back({identities[i].segId, identities[i].maxDoc,
-                        std::move(docs[i])});
+                        std::move(docs[i]), identities[i].space});
   }
 }
 
@@ -103,7 +103,7 @@ DocSet* FilterCache::ReaderValue::docSet(
         "reader-stable segment ordinal is outside the cached reader");
   }
   const auto& segment = segments[segmentOrd];
-  if (segment.segId != identity.segId || segment.maxDoc != identity.maxDoc) {
+  if (segment.segId != identity.segId || segment.maxDoc != identity.maxDoc || segment.space != identity.space) {
     throw std::logic_error(
         "reader-stable segment identity does not match cached reader");
   }
@@ -408,7 +408,8 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
   const auto& slot = slotsByOrd[segmentOrd];
   if (!slot->active.load(std::memory_order_acquire)
       || slot->segId != readerSegments[segmentOrd].segId
-      || slot->maxDoc != readerSegments[segmentOrd].maxDoc) {
+      || slot->maxDoc != readerSegments[segmentOrd].maxDoc
+      || slot->space != readerSegments[segmentOrd].space) {
     cache->counter.misses.add(1);
     return bypass();
   }
@@ -428,6 +429,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
   if (!slot->active.load(std::memory_order_acquire)
       || slot->segId != readerSegments[segmentOrd].segId
       || slot->maxDoc != readerSegments[segmentOrd].maxDoc
+      || slot->space != readerSegments[segmentOrd].space
       || readerCoreGen
           < cache->publishedCoreGen.load(std::memory_order_acquire)) {
     cache->counter.misses.add(1);
@@ -735,7 +737,8 @@ DocSet* FilterCache::Use::effectiveDocSet(
   }
   auto& segment = reader.segments()[segmentOrd];
   if (segment.segInfo.seg_id != readerSegments[segmentOrd].segId
-      || segment.maxDoc() != readerSegments[segmentOrd].maxDoc) {
+      || segment.maxDoc() != readerSegments[segmentOrd].maxDoc
+      || segment.spaceOrdinal() != readerSegments[segmentOrd].space) {
     return nullptr;
   }
   if (scope_ == FilterKeyScope::READER_STABLE) {
@@ -778,7 +781,7 @@ DomainHandle FilterCache::Use::effectiveDomain(
     if (domain == canonical) domain = nullptr;
   }
   if (domain == nullptr) {
-    return DomainHandle::borrowed(effectiveDocSet(segmentOrd, reader));
+    return DomainHandle::borrowed(effectiveDocSet(segmentOrd, reader)).scoped(reader.segments()[segmentOrd]);
   }
   // A reader-stable value is live-exact for the canonical domain only.
   if (scope_ == FilterKeyScope::READER_STABLE) return {};
@@ -787,7 +790,7 @@ DomainHandle FilterCache::Use::effectiveDomain(
   std::array<DocSet*, 2> sets{stable, domain};
   auto docs = DocSet::intersect(sets);
   docs->card();
-  return DomainHandle(std::move(docs));
+  return DomainHandle(std::move(docs)).scoped(reader.segments()[segmentOrd]);
 }
 
 size_t FilterCache::Use::ownedBytesForTest() {
@@ -1106,6 +1109,11 @@ void FilterCache::recordReaderCapacityEviction(
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
                            const SegmentIdentity& identity) const {
+  if (identity.space == (SpaceOrdinal)UINT32_MAX && identity.maxDoc == 0) {
+    auto bundle = std::lower_bound(snapshot.segments.begin(), snapshot.segments.end(), identity.segId,
+        [](const auto& item, uint64_t segId) { return item.segId < segId; });
+    return bundle != snapshot.segments.end() && bundle->segId == identity.segId;
+  }
   auto iter = std::lower_bound(snapshot.segments.begin(), snapshot.segments.end(),
                                identity, identityLess);
   return iter != snapshot.segments.end() && *iter == identity;
@@ -1192,8 +1200,8 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
         slots.begin(), slots.end(), identity,
         [](const std::shared_ptr<SegmentSlot>& slot,
            const SegmentIdentity& target) {
-          return std::tie(slot->segId, slot->maxDoc)
-              < std::tie(target.segId, target.maxDoc);
+          return std::tie(slot->segId, slot->space, slot->maxDoc)
+              < std::tie(target.segId, target.space, target.maxDoc);
         });
   };
   auto exactSlot = [&](const SlotVector& slots,
@@ -1201,7 +1209,7 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
       -> const std::shared_ptr<SegmentSlot>* {
     auto found = lowerBound(slots, identity);
     bool exact = found != slots.end() && (*found)->segId == identity.segId
-        && (*found)->maxDoc == identity.maxDoc;
+        && (*found)->maxDoc == identity.maxDoc && (*found)->space == identity.space;
     return exact ? &*found : nullptr;
   };
   auto needsInsert = [&](const SlotVector& slots,
@@ -1256,7 +1264,7 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
         }
         updated->insert(lowerBound(*updated, identity),
                         std::make_shared<SegmentSlot>(identity.segId,
-                                                      identity.maxDoc));
+                                                      identity.maxDoc, identity.space));
         added++;
       }
       entry->slotsCharge += added * SLOT_METADATA_BYTES;
@@ -1322,11 +1330,11 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
         current->begin(), current->end(), identity,
         [](const std::shared_ptr<SegmentSlot>& slot,
            const SegmentIdentity& target) {
-          return std::tie(slot->segId, slot->maxDoc)
-              < std::tie(target.segId, target.maxDoc);
+          return std::tie(slot->segId, slot->space, slot->maxDoc)
+              < std::tie(target.segId, target.space, target.maxDoc);
         });
     if (found == current->end() || (*found)->segId != identity.segId
-        || (*found)->maxDoc != identity.maxDoc
+        || (*found)->maxDoc != identity.maxDoc || (*found)->space != identity.space
         || !(*found)->active.load(std::memory_order_acquire)
         || !isActive(*active, identity)) {
       return nullptr;
@@ -1370,7 +1378,7 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
     bool valid = value != nullptr
         && value->readerVersion() == use.readerVersion
         && active->readerVersion == use.readerVersion
-        && active->segments.size() == use.readerSegments.size();
+        && active->bundleCount == use.readerSegments.size();
     for (const auto& identity : use.readerSegments) {
       valid = valid && isActive(*active, identity);
     }
@@ -1403,7 +1411,7 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
     const auto& slot = use.slotsByOrd[i];
     if (slot == nullptr || use.existingCandidates[i] == nullptr
         || !slot->active.load(std::memory_order_acquire)
-        || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc
+        || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc || slot->space != identity.space
         || !isActive(*active, identity)) {
       return false;
     }
@@ -1497,7 +1505,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
       bool valid = use.entry->resident
           && slot->active.load(std::memory_order_acquire)
           && slot->segId == identity.segId
-          && slot->maxDoc == identity.maxDoc
+          && slot->maxDoc == identity.maxDoc && slot->space == identity.space
           && use.allowsSegmentPopulation(slot->maxDoc)
           && use.readerCoreGen >= publishedCoreGen.load(std::memory_order_acquire)
           && isActive(*active, identity)
@@ -1571,7 +1579,7 @@ FilterCache::publishReaderValue(
       localEntry->lastUsed.store(nextEpoch(), std::memory_order_relaxed);
     } else {
       auto active = activeSegments.load(std::memory_order_acquire);
-      bool identitiesMatch = active->segments.size() == use.readerSegments.size();
+      bool identitiesMatch = active->bundleCount == use.readerSegments.size();
       for (const auto& identity : use.readerSegments) {
         identitiesMatch = identitiesMatch && isActive(*active, identity);
       }
@@ -1650,6 +1658,11 @@ bool FilterCache::onReaderPublished(
   next->readerVersion = readerVersion;
   next->segments.assign(segments.begin(), segments.end());
   std::sort(next->segments.begin(), next->segments.end(), identityLess);
+  uint64_t lastSegId = 0;
+  for (const auto& identity : next->segments) {
+    if (next->bundleCount == 0 || identity.segId != lastSegId) next->bundleCount++;
+    lastSegId = identity.segId;
+  }
   publishedCoreGen.store(coreGen, std::memory_order_release);
   publishedReaderVersion.store(readerVersion, std::memory_order_release);
   activeSegments.store(next, std::memory_order_release);
@@ -1664,11 +1677,11 @@ bool FilterCache::onReaderPublished(
     std::lock_guard<std::mutex> lock(entry->mutex);
     auto readerValue = entry->readerValue.load(std::memory_order_acquire);
     bool readerSegmentsCurrent = readerValue != nullptr
-        && readerValue->segments.size() == next->segments.size();
+        && readerValue->segments.size() == next->bundleCount;
     if (readerValue != nullptr) {
       for (const auto& segment : readerValue->segments) {
         readerSegmentsCurrent = readerSegmentsCurrent
-            && isActive(*next, {segment.segId, segment.maxDoc});
+            && isActive(*next, {segment.segId, segment.maxDoc, segment.space});
       }
     }
     if (readerValue != nullptr
@@ -1693,7 +1706,7 @@ bool FilterCache::onReaderPublished(
     for (size_t i = 0; i < slots->size(); i++) {
       const auto& slot = (*slots)[i];
       std::lock_guard<SegmentSlot> feedbackLock(*slot);
-      SegmentIdentity identity{slot->segId, slot->maxDoc};
+      SegmentIdentity identity{slot->segId, slot->maxDoc, slot->space};
       bool active = resident && isActive(*next, identity);
       slot->active.store(active, std::memory_order_release);
       if (resident && !active && kept == nullptr) {
@@ -1733,7 +1746,13 @@ bool FilterCache::onReaderPublished(
 }
 
 bool FilterCache::onReaderPublished(IndexReader& reader) {
-  auto identities = readerIdentities(reader);
+  std::vector<SegmentIdentity> identities;
+  for (const auto& bundle : reader.snapshot->core->bundles) {
+    const auto& catalog = bundle.core->spaces();
+    for (size_t i = 0; i < catalog.size(); i++) {
+      identities.push_back({bundle.info.seg_id, catalog[i].maxDoc, (SpaceOrdinal)i});
+    }
+  }
   return onReaderPublished(reader.coreGen(), reader.coreCommitTime(), identities);
 }
 
@@ -2203,7 +2222,7 @@ void FilterCache::validateForTest() {
           throw std::logic_error(
               "FilterCache validation: stale reader-stable value is resident");
         }
-        if (readerValue->segments.size() != active->segments.size()) {
+        if (readerValue->segments.size() != active->bundleCount) {
           throw std::logic_error(
               "FilterCache validation: reader-stable segment count mismatch");
         }
@@ -2211,7 +2230,7 @@ void FilterCache::validateForTest() {
             + readerValue->segments.capacity()
                 * sizeof(ReaderValue::SegmentDocs);
         for (const auto& segment : readerValue->segments) {
-          SegmentIdentity identity{segment.segId, segment.maxDoc};
+          SegmentIdentity identity{segment.segId, segment.maxDoc, segment.space};
           if (segment.docs == nullptr || !isActive(*active, identity)) {
             throw std::logic_error(
                 "FilterCache validation: reader-stable segment identity mismatch");
@@ -2231,15 +2250,15 @@ void FilterCache::validateForTest() {
       throw std::logic_error(
           "FilterCache validation: slot entry owns reader build backoff");
     }
-    uint64_t previousSegId = 0;
+    SegmentIdentity previousIdentity{};
     bool first = true;
     for (const auto& slot : *slots) {
-      if (!first && slot->segId <= previousSegId) {
+      if (!first && !identityLess(previousIdentity, {slot->segId, slot->maxDoc, slot->space})) {
         throw std::logic_error(
             "FilterCache validation: slot segIds are not strictly sorted");
       }
       first = false;
-      previousSegId = slot->segId;
+      previousIdentity = {slot->segId, slot->maxDoc, slot->space};
       uint32_t streak = slot->deadBuildStreak.load(
           std::memory_order_relaxed);
       uint32_t bypasses = slot->buildBypassesRemaining.load(
@@ -2266,7 +2285,8 @@ void FilterCache::validateForTest() {
       }
       #ifndef NDEBUG
       if (value->identityForTest.segId != slot->segId
-          || value->identityForTest.maxDoc != slot->maxDoc) {
+          || value->identityForTest.maxDoc != slot->maxDoc
+          || value->identityForTest.space != slot->space) {
         throw std::logic_error(
             "FilterCache validation: resident value identity mismatch");
       }

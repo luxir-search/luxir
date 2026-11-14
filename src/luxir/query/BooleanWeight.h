@@ -13096,7 +13096,7 @@ public:
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
         auto& segment = ctx.reader.segments()[segnum];
         DomainHandle domain = filterSources.empty()
-            ? DomainHandle::borrowed(outerDomain)
+            ? DomainHandle::borrowed(outerDomain).scoped(segment)
             : QueryPrep::materializeEffectiveIntersection(
                 QueryPrep::preparedSpan(filterSources), ctx.reader,
                 segment, outerDomain);

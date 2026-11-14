@@ -67,6 +67,7 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
   for (auto& row : inputs) row.resize(segments.size());
   for (size_t segnum = 0; segnum < segments.size(); segnum++) {
     bucketDomains(segnum, [&](size_t bucket, DomainHandle domain) {
+      domain.assertScope(segments[segnum]);
       if (needInherited) inputs[bucket][segnum] = std::move(domain);
     });
   }
@@ -142,7 +143,7 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
       DomainHandle base = domain;
       if (plan->variants.hasResetVariants()) {
         auto& seg = reader.segments()[(size_t)segnum];
-        base = DomainHandle::pinned(seg.liveDocSet(), parent.getOp().req.reader);
+        base = DomainHandle::pinned(seg.liveDocSet(), parent.getOp().req.reader).scoped(seg);
         if (auto path = binding->structuralConstraint()) {
           base = path->prefix((int32_t)segnum, std::move(base));
         }

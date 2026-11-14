@@ -262,6 +262,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {
       assert(domain.isDeliverable());
+      if (segnum >= 0) domain.assertScope(op.req.reader->segments()[(size_t)segnum]);
       // Every segment shares the request task group; only the segment-0 (or
       // empty-index) dispatch writes it so there is a single writer.  That
       // dispatch precedes source completion, whose acq_rel counters order the
@@ -283,7 +284,7 @@ public:
 
     DomainHandle buildSharedFilter(int32_t segnum, DocSet* domain) {
       auto& op = thisOp();
-      if (op.filterWeights.empty()) return {};
+      if (op.filterWeights.empty()) return DomainHandle().scoped(op.req.reader->segments()[segnum]);
 
       std::vector<DomainHandle> filterDocSets;
       std::vector<DocSet*> filterPtrs;
@@ -306,14 +307,14 @@ public:
         }
         filterPtrs.push_back(filterDocSets.back().get());
       }
-      if (filterPtrs.empty()) return {};
+      if (filterPtrs.empty()) return DomainHandle().scoped(seg);
       if (filterPtrs.size() == 1) {
         auto result = std::move(filterDocSets[0]);
         assert(!op.sources.empty());
         return std::move(result).pinnedWith(
             op.sources.front()->planning.filterUses);
       }
-      return DomainHandle(DocSet::intersect(filterPtrs));
+      return DomainHandle(DocSet::intersect(filterPtrs)).scoped(seg);
     }
 
     void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -506,7 +507,7 @@ public:
             ++doc;
           }
           // An empty segment needs an empty set: a null domain means all docs.
-          fusedDomains.emplace_back(builder.build());
+          fusedDomains.push_back(DomainHandle(builder.build()).scoped(op.req.reader->segments()[segnum]));
         }
       }
 
