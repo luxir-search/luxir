@@ -166,7 +166,7 @@ public:
     scratch.components.resize(plan.fields.size());
     auto& seg = plan.reader.segments()[(size_t)segment];
     for (size_t i = 0; i < columns.size(); i++) {
-      auto* info = plan.fields[i].segments.at((size_t)segment);
+      auto* info = SegFieldInfo::column(plan.fields[i].segments.at((size_t)segment));
       if (!info) continue;
       auto& postings = seg.postingsReader();
       columns[i].dense = info->docsWithField == seg.maxDoc();

@@ -24,6 +24,7 @@
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -41,6 +42,7 @@
 // #define MERGER_DEBUG LOG_DEBUG
 
 #include "luxir/util/Signal.h"
+#include "luxir/reader/DocsReader.h"
 
 namespace luxir {
 
@@ -791,7 +793,9 @@ private:
     int64_t docsWithField = 0;
     int64_t synthesizedPointValues = 0;
     int64_t collectorPoolBound = 0;
+    bool ordColumn = true;
     for (const auto& field : fields) {
+      ordColumn = ordColumn && mergesOrdColumn(field.segFieldInfo);
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
       collectorPoolBound += ordCollectorPoolBound(field.segFieldInfo);
@@ -805,7 +809,8 @@ private:
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues) : 0;
 
-    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
+        && ordColumn) {
       // Ord columns hold the term-order -> doc-order transposition in RAM until the
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus a pool delta stream per multi-valued doc.  This is the
@@ -1393,6 +1398,39 @@ private:
   // sources would need: each multi-valued doc's stream header and first slice,
   // and per value a vint plus its share of slice forwarding pointers.
   // Single-valued sources keep their ords in the collector's slots.
+  // Writes the merged docs-with-field set of an indexed field without a
+  // column from each source's set, in merged doc order.
+  void mergeDocsWithField(std::span<MergeFieldInfo*> compactFields,
+                          PostingsWriter::IndexFieldInfo& output, MemPool& pool) {
+    auto forEachDoc = [&](auto&& accept) {
+      for (auto* field : compactFields) {
+        const Segment& seg = *field->seg;
+        DocsReader docs(*seg.postingsReader, field->segFieldInfo);
+        auto emit = [&](int32_t doc) {
+          auto [mapped, deleted] = seg.remapDocId(doc);
+          if (!deleted) accept(mapped);
+        };
+        if (!docs.hasBitset()) {
+          for (int32_t doc = 0; doc < docs.numDocs(); doc++) emit(doc);
+          continue;
+        }
+        screaming::BitSet::Iterator it(docs.bitset());
+        for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) emit(doc);
+      }
+    };
+    int32_t numDocs = 0;
+    forEachDoc([&](int32_t) { numDocs++; });
+    output.numValues = output.sumDocFreq;
+    DocsWithValWriter::write(pool, postingsWriter, output, numDocs, forEachDoc);
+  }
+
+  // An indexed TERMS field keeps an ord column only when every source has one
+  // and declares it (COLUMN_STORED): column: false drops it, and a schema
+  // change never needs a column rebuilt for sources written without one.
+  static bool mergesOrdColumn(const SegFieldInfo& info) {
+    return info.hasOrdColumn() && (info.flags & FieldType::COLUMN_STORED) != 0;
+  }
+
   static int64_t ordCollectorPoolBound(const SegFieldInfo& info) {
     if (info.numValues <= info.docsWithField) return 0;
     return 40 * (int64_t)info.docsWithField + 8 * info.numValues;
@@ -1732,6 +1770,10 @@ private:
     allFlags &= ~FieldType::SEGMENT_MARKERS;
     auto storage = FieldType::storage(type);
     bool isText = storage == FieldType::Storage::TEXT;
+    bool isIndexedTerms = storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS);
+    bool isOrdCol = isIndexedTerms
+        && std::ranges::all_of(compactFields, [](auto* f) { return mergesOrdColumn(f->segFieldInfo); });
+    if (isIndexedTerms && !isOrdCol) allFlags &= ~FieldType::COLUMN_STORED;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
       int64_t serialCost = estimateCost(mergeFieldInfos);
@@ -1774,7 +1816,6 @@ private:
     }
 
     // if this is an indexed string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (storage == FieldType::Storage::TERMS) && (allFlags & FieldType::INDEX_DOCS);
     if (isOrdCol && ((allFlags & FieldType::MULTI_ARRAY)
                      || ordCollectorPoolBound(compactFields) >= ordReplayMinBytes)) {
       // ARRAY columns, and SET columns whose uninverted ords could outgrow the
@@ -1813,6 +1854,8 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
+    } else if (isIndexedTerms) {
+      mergeDocsWithField(compactFields, outputFieldInfo, pool);
     } else if (isText) {
       NormsWriter::writeValues(pool, postingsWriter, outputFieldInfo, preparedNorms,
                                normDocsWithField);

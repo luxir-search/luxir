@@ -719,7 +719,7 @@ public:
       auto& segment = child.req.reader->segments()[(size_t)segnum];
       int32_t maxDoc = segment.maxDoc();
 
-      auto* info = source.segInfos.at((size_t)segnum);
+      auto* info = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
       if (!info) return;
       const auto& parentInfo = *info;
       OrdColReader parentColumn(segment.postingsReader(), parentInfo);

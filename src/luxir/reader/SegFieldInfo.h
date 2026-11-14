@@ -110,6 +110,20 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // Indexed STRING/ID fields declared without a column (column: false) keep
+  // only postings and the docs-with-field set; segments written before a
+  // schema change may disagree, so column readers check per segment.
+  bool hasOrdColumn() const { return ordFormat != ORD_NONE; }
+
+  // `info` for column reads: null (no values in this segment) for an indexed
+  // TERMS field this segment holds without an ord column.
+  static const SegFieldInfo* column(const SegFieldInfo* info) {
+    if (info == nullptr || info->hasOrdColumn()) return info;
+    bool indexedTerms = FieldType::storage(info->type) == FieldType::Storage::TERMS
+        && (info->flags & FieldType::INDEX_DOCS) != 0;
+    return indexedTerms ? nullptr : info;
+  }
+
   // Every indexed STRING/ID document contributes at least one distinct term.
   // Equality makes different terms' postings disjoint, even for repeated ARRAY
   // values. This does not imply one column value per document.

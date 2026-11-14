@@ -116,7 +116,7 @@ public:
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
-    return segInfos.at((size_t)segnum);
+    return SegFieldInfo::column(segInfos.at((size_t)segnum));
   }
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,

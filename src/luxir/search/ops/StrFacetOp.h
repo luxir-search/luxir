@@ -1995,7 +1995,7 @@ public:
       int64_t routedDocs = 0;
       int64_t routedValues = 0;
 
-      auto* parentInfo = source.segInfos.at((size_t)segnum);
+      auto* parentInfo = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
       if (!parentInfo) return;
       auto* childFieldInfo = child.fieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;

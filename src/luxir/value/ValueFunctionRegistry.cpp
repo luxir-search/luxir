@@ -2124,7 +2124,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                 : ValueBounds::integer(segment.base,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
-      auto* fieldInfo = fields[index].at(segment);
+      auto* fieldInfo = SegFieldInfo::column(fields[index].at(segment));
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {

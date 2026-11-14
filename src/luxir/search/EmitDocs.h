@@ -243,6 +243,7 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
+  info = SegFieldInfo::column(info);
   if (!info) return;
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
