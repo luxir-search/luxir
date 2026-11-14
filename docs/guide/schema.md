@@ -11,6 +11,7 @@ Choose a type based on how you want to search and use the values:
 
 | Type | Description and typical uses |
 |---|---|
+| `nested` | Structural object path; see [Nested paths](#nested-paths-and-qualified-field-names). Nested input values are currently rejected. |
 | `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
 | `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
@@ -210,6 +211,7 @@ The built-in templates are:
 
 | Suffix | Type and default behavior |
 |---|---|
+| `_nested` | Nested object path; structural, with no scalar value. |
 | `_s` | Indexed exact string with a column. |
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
@@ -1066,3 +1068,25 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
+
+## Nested paths and qualified field names
+
+Declare nested paths and their fields by flat qualified names, for example
+`"items": "nested"` and `"items.color": "string"` in `fields`.
+Each intermediate component must be a nested path. Global suffix templates
+also work under paths: `lines_nested.color_s` needs no explicit declaration
+in the default schema. A nested path cannot declare scalar value settings,
+variants, indexing, columns or storage. Nested input values are currently
+rejected; these declarations establish the schema and reader namespaces.
+
+Dots separate path components. Each component starts with an ASCII letter
+and contains letters, digits or underscores. A physical name, including
+a generated `__variant` suffix, must fit in 127 bytes.
+
+Request field names are relative to their view. In the `items` view,
+`color` resolves to `items.color`; there is no spelling for an upward
+reference. Returned keys are relative too, and `fields: ["*"]` selects
+only fields in that view. The virtual `_version_` is available in child
+views and reports the owning root's birth version. Explicit `to_parent`
+query paths and Domain `to_children` paths are relative to the current view;
+Domain `to_parent` names its target by full path.

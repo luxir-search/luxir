@@ -220,7 +220,7 @@ public:
   const std::shared_ptr<IndexReader>& view() const { return *scopedView; }
 
   explicit SearchParserImpl(SearchRequest& req)
-    : req(req), scopedView(&req.reader), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
+    : req(req), scopedView(&req.reader), fields(*req.schema, req.resolvedFields, req.reader->path()), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
   // Every planning context of the request draws on one multi-term budget.
@@ -430,7 +430,8 @@ public:
     if (searchOp.domain && (searchOp.domain->to_children || searchOp.domain->to_parent)) {
       const auto& domain = *searchOp.domain;
       if (domain.to_children && domain.to_parent) throw RequestError("domain cannot expand and project together");
-      const auto& destination = req.pinView(domain.to_children ? *domain.to_children : *domain.to_parent);
+      const auto& destination = req.pinView(domain.to_children
+          ? fields.resolvePath(*domain.to_children).physicalName : *domain.to_parent);
       bool descending = destination->path().size() > view()->path().size();
       if (descending != domain.to_children.has_value()) throw RequestError("domain transform has the wrong direction");
       input = arenaCreate<InputDomainPlan>(req.arena);
@@ -441,6 +442,7 @@ public:
       enclosingCollapse = nullptr;
       inheritedFacetMeasure = nullptr;
       owningList = nullptr;
+      auto fieldScope = fields.scopedPath(destination->path());
       auto context = createParseContext(name);
       auto parsed = parseDomain(domain, name, context);
       input->applyParentFilters = parsed.applyParentFilters;
@@ -457,6 +459,7 @@ public:
         input->variants.buildWeights(*weights, *input->planning, 0);
       }
     }
+    auto fieldScope = fields.scopedPath(view()->path());
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
@@ -618,7 +621,7 @@ public:
         req.arena, *view(), spec.missing, getNumber);
     std::unordered_set<std::string> resolved;
     for (std::string_view name : spec.field) {
-      auto field = req.schema->resolveFor(name, OpClass::VALUE);
+      auto field = fields.resolveLocal(name, OpClass::VALUE);
       auto& type = *field.fieldType;
       if (type.multiValued() || !type.hasColumn()) {
         throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
@@ -773,7 +776,7 @@ public:
       const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
@@ -881,7 +884,7 @@ public:
       OpsPlacement placement) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     bool dataBounds = facetReq.bounds == api::RangeFacet_::Bounds::DATA;
     if (!dataBounds && facetReq.bounds != api::RangeFacet_::Bounds::EXPLICIT) {
@@ -1542,7 +1545,7 @@ public:
         QueryBuilder builder(req.requestPool, *req.schema,
                              parseContext.coerceContext, key, &req.warnings, &fields);
         CanonicalValueSet canonical = builder.canonicalizeFieldValues(
-            fields.resolve(fieldProto->field, OpClass::VALUE), selected, true);
+            fields.resolveLocal(fieldProto->field, OpClass::VALUE), selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
         preparedFacets.emplace(

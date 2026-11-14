@@ -2452,6 +2452,7 @@ message FieldDef {
     BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
     IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
+    NESTED = 14;   // structural path of nested object rows
   }
   optional FieldClass type = 2; // required unless inherited from parent
 

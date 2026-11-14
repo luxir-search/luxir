@@ -58,14 +58,15 @@ public:
     GEO_POINT, // latitude/longitude point; packed into one int64 column value
     BOOLEAN,  // true/false; column-stored as 0/1
     DECIMAL,  // fixed-point number; scale in type flags
-    IP        // 16-byte address term
+    IP,       // 16-byte address term
+    NESTED    // structural row-space declaration, never a physical field
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
 
   static constexpr Storage storage(Type type) {
     switch (type) {
-      case NONE: return Storage::NONE;
+      case NONE: case NESTED: return Storage::NONE;
       case STRING: case ID: case IP: return Storage::TERMS;
       case TEXT: return Storage::TEXT;
       case BIN: return Storage::BIN;
@@ -288,6 +289,11 @@ public:
                                       std::span<char> buf) const;
 };
 
+
+class NestedFieldType final : public FieldType {
+public:
+  explicit NestedFieldType(std::string_view name) : FieldType(name, NESTED, 0) {}
+};
 
 class TextFieldType : public FieldType {
 public:

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/schema/Schema.h"
+#include "luxir/query/FieldResolver.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/store/OutputStream.h"
@@ -2199,4 +2200,93 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
   }
   EXPECT_THROW(schemaJson(R"({"fields":{"t":{"type":"text","analyzer":{"name":"english","filters":["fold"]}}}})"),
                SchemaError);
+}
+
+TEST_F(SchemaTest, nestedNamesProveEveryContainingComponent) {
+  auto s = schemaJson(R"({"fields":{"items":"nested","items.parts":"nested",
+    "items.title":{"type":"text","variants":{"s":"string"}}},
+    "templates":{"_s":"string","_nested":"nested"}})");
+  EXPECT_EQ(FieldType::NESTED, s->resolveInput("items").fieldType->type());
+  EXPECT_EQ("items.parts", s->resolveInput("items.parts.code_s").path);
+  EXPECT_EQ("items.title__s", s->resolveFor("items.title", OpClass::VALUE).physicalName);
+  EXPECT_EQ("items.title", s->resolveFor("items.title__self", OpClass::SEARCH).physicalName);
+  EXPECT_EQ(FieldType::STRING, s->physical("lines_nested.parts_nested.code_s")->type());
+  EXPECT_NO_THROW(s->requirePath("lines_nested.parts_nested"));
+  for (auto name : {"unknown.code_s", "items.title.code_s", "items__s.title", "items._version_"}) {
+    EXPECT_THROW(s->resolveFor(name, OpClass::PRIMARY), RequestError) << name;
+    EXPECT_EQ(nullptr, s->getFieldTypePtr(name)) << name;
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"missing.color":"string"}})"), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"items":"string","items.color":"string"}})"), SchemaError);
+  auto defaults = Schema::createDefaultSchema();
+  EXPECT_EQ(FieldType::NESTED, defaults->resolveInput("lines_nested").fieldType->type());
+}
+
+TEST_F(SchemaTest, nestedPathRejectsValueSettings) {
+  for (auto option : {R"("multi":false)", R"("stored":false)", R"("column":false)",
+                      R"("index":"none")", R"("variants":{})", R"("defaults":{})",
+                      R"("dims":0)", R"("truncate_dims":0)", R"("stored_resource":"")",
+                      R"("analyzer":{})", R"("normalizer":[])", R"("long_terms":"truncate")"}) {
+    EXPECT_THROW(schemaJson("{\"fields\":{\"items\":{\"type\":\"nested\"," + std::string(option) + "}}}"), SchemaError)
+        << option;
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"items":{"type":"nested","parent":"_scalar"}},
+    "templates":{"_scalar":{"type":"string","column":true}}})"), SchemaError);
+}
+
+TEST_F(SchemaTest, relativeResolutionMemosAreScopedAndRestoreTheirView) {
+  auto s = schemaJson(R"({"fields":{"items":"nested","items.parts":"nested",
+    "items.code":"string","items.parts.code":"int","code":"text"}})");
+  FieldResolver fields(*s);
+  auto* root = &fields.resolve("code", OpClass::PRIMARY);
+  {
+    auto scope = fields.scopedPath("items");
+    auto* item = &fields.resolve("code", OpClass::PRIMARY);
+    EXPECT_EQ("items.code", item->physicalName);
+    EXPECT_NE(root, item);
+    EXPECT_EQ("items.parts.code", fields.resolve("parts.code", OpClass::PRIMARY).physicalName);
+    EXPECT_THROW(fields.resolveLocal("parts.code", OpClass::PRIMARY), RequestError);
+    {
+      auto deeper = fields.scopedPath("items.parts");
+      EXPECT_EQ("items.parts.code", fields.resolve("code", OpClass::PRIMARY).physicalName);
+      auto copy = fields.resolve("code", OpClass::PRIMARY);
+      EXPECT_EQ("items.parts", copy.path);
+    }
+    EXPECT_EQ(item, &fields.resolve("code", OpClass::PRIMARY));
+    EXPECT_EQ("_version_", fields.resolve("_version_", OpClass::RETRIEVE).physicalName);
+    try {
+      fields.resolve("items.code", OpClass::SEARCH);
+      FAIL() << "absolute field spelling accepted inside child view";
+    } catch (const RequestError& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("view 'items'"));
+    }
+  }
+  EXPECT_EQ(root, &fields.resolve("code", OpClass::PRIMARY));
+}
+
+TEST_F(SchemaTest, nestedSchemaHistoryPersistsAndReportsStructuralPaths) {
+  CollectionHelper helper;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  ASSERT_TRUE(api::read_json(def, R"({"fields":{"items":"nested","items.color_s":"string"}})", arena));
+  auto first = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
+  EXPECT_EQ("\"nested\"", first->signatures().at("items").properties.at("type"));
+  ASSERT_TRUE(api::read_json(def, R"({"fields":{"items.parts_nested.weight_i":"int"}})", arena));
+  auto next = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
+  EXPECT_EQ(first->introduction("items"), next->introduction("items"));
+  auto manifest = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  auto stored = SchemaCache{}.load(helper.getIndexWriter()->dir, *manifest);
+  EXPECT_EQ(FieldType::INT, stored->resolveFor("items.parts_nested.weight_i", OpClass::VALUE).fieldType->type());
+  EXPECT_EQ(next->introducedGen, stored->introducedGen);
+  glz::generic_sorted_u64 json;
+  ASSERT_FALSE(glz::read_json(json, helper.getIndexWriter()->snapshots.readers.resolvedSchema()));
+  EXPECT_EQ("\"nested\"", glz::write_json(json["fields"]["items"]["type"]).value());
+  EXPECT_THROW(helper.collection().updateSchema(def, api::SchemaRequest_::Mode::REPLACE_ALL), SchemaError);
+}
+
+TEST_F(SchemaTest, qualifiedNamesRemainOpaqueInOverlayFilenames) {
+  auto name = Postings::getSegmentOverlayFileName(1, "vec.items.Parts.embedding_v__raw", 3, 0, 1, 2);
+  EXPECT_TRUE(Manifest::indexFile(name));
+  EXPECT_EQ(2u, Manifest::fileEpoch(name));
+  EXPECT_NE(name, Postings::getSegmentOverlayFileName(1, "vec.items.parts.embedding_v__raw", 3, 0, 1, 2));
 }

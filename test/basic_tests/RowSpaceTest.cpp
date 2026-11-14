@@ -61,7 +61,7 @@ TEST_F(RowSpaceTest, persistedBundleUsesExistingReadersInBothSpaces) {
     EXPECT_EQ(4, child->maxDoc());
     EXPECT_EQ(child, core.spaceReader(child->spaceOrdinal()));
     EXPECT_EQ(Fixture::CHILD, core.spaces()[(size_t)child->spaceOrdinal()].path);
-    EXPECT_NE(core.rootReader().fieldInfo("number"), child->fieldInfo("number"));
+    EXPECT_NE(core.rootReader().fieldInfo("number"), child->fieldInfo("items.number"));
     EXPECT_EQ(nullptr, core.spaceReader("missing"));
     EXPECT_EQ(nullptr, core.ownership(SpaceOrdinal::ROOT));
     VersionRuns::Cursor births(core.versionRuns());
@@ -86,7 +86,7 @@ TEST_F(RowSpaceTest, persistedBundleUsesExistingReadersInBothSpaces) {
 TEST_F(RowSpaceTest, childNumericColumnPreservesSparseRowsAndRepeatedValues) {
   auto core = open();
   auto& child = *core->spaceReader(Fixture::CHILD);
-  auto* number = child.fieldInfo("number");
+  auto* number = child.fieldInfo("items.number");
   ASSERT_NE(nullptr, number);
   EXPECT_EQ(3, number->docsWithField);
   IntColReader roots(core->rootReader(), *core->rootReader().fieldInfo("number"));
@@ -104,13 +104,13 @@ TEST_F(RowSpaceTest, childTermsAndPostingsUseTheirOwnFieldCatalog) {
   auto core = open();
   auto& child = *core->spaceReader(Fixture::CHILD);
   MemPool pool;
-  TermsEnum terms(pool, child, *child.fieldInfo("body"));
+  TermsEnum terms(pool, child, *child.fieldInfo("items.body"));
   ASSERT_TRUE(terms.seek("shared"));
   DocsFreqEnum docs(terms);
   EXPECT_EQ(0, docs.nextDoc()); EXPECT_EQ(2, docs.termFreq());
   EXPECT_EQ(2, docs.nextDoc()); EXPECT_EQ(1, docs.termFreq());
   EXPECT_EQ(PostingsReader::END, docs.nextDoc());
-  EXPECT_EQ(5, child.fieldInfo("body")->sumTotalTermFreq);
+  EXPECT_EQ(5, child.fieldInfo("items.body")->sumTotalTermFreq);
   TermsEnum rootTerms(pool, core->rootReader(), *core->rootReader().fieldInfo("body"));
   EXPECT_FALSE(rootTerms.seek("shared"));
 }
@@ -118,7 +118,7 @@ TEST_F(RowSpaceTest, childTermsAndPostingsUseTheirOwnFieldCatalog) {
 TEST_F(RowSpaceTest, childStringColumnKeepsSpaceLocalDensityAndPresence) {
   auto core = open();
   auto& child = *core->spaceReader(Fixture::CHILD);
-  auto* label = child.fieldInfo("label");
+  auto* label = child.fieldInfo("items.label");
   MemPool pool;
   OrdColReader strings(child, *label);
   EXPECT_TRUE(strings.docIdIndexed());
@@ -205,10 +205,10 @@ TEST_F(RowSpaceTest, ownershipSeeksAcrossMonoBlockBoundaries) {
 TEST_F(RowSpaceTest, pathLookupBindsFieldsAndImmediateOwnership) {
   PostingsWriter writer(dir, 1, 1, 3);
   auto items = writer.addSpace("z", 4, Fixture::shape(writer, ENDS));
-  Fixture::fields(writer, items, CHILDREN);
+  Fixture::fields(writer, items, "z", CHILDREN);
   writer.addSpace("z.parts", 2, Fixture::shape(writer, std::vector<int64_t>{1, 1, 2, 2}));
   auto earlier = writer.addSpace("a", 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 3}));
-  Fixture::fields(writer, earlier, ROOTS);
+  Fixture::fields(writer, earlier, "a", ROOTS);
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish());
   SegmentCore core(dir, 1, 1);
@@ -219,7 +219,7 @@ TEST_F(RowSpaceTest, pathLookupBindsFieldsAndImmediateOwnership) {
     auto* reader = core.spaceReader(path);
     ASSERT_NE(nullptr, reader);
     EXPECT_EQ(reader, core.spaceReader(reader->spaceOrdinal()));
-    IntColReader column(*reader, *reader->fieldInfo("number"));
+    IntColReader column(*reader, *reader->fieldInfo(std::string(path) + ".number"));
     IntColReader::SparseIterator values(column);
     EXPECT_EQ(0, values.advance(0)); EXPECT_EQ(expected, values.value());
   }
@@ -320,6 +320,13 @@ protected:
     schema->fieldTypeMap["embedding"] = std::make_shared<VectorFieldType>("embedding", 1,
         FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2);
     schema->fieldTypeMap["payload"] = std::make_shared<TextFieldType>("payload", FieldType::STORED, "whitespace");
+    for (auto name : {"number", "body", "label", "embedding", "payload"}) {
+      schema->fieldTypeMap.emplace(Schema::qualify(Fixture::CHILD, name), schema->fieldTypeMap.at(name));
+    }
+    for (auto name : {"items", "items.deep", "absent"}) {
+      schema->fieldTypeMap.emplace(name, std::make_shared<NestedFieldType>(name));
+    }
+    schema->fieldTypeMap.emplace("absent.number", schema->fieldTypeMap.at("number"));
     CommitSnapshotRegistry snapshots(reserveIncarnation(directory));
     {
       IndexWriter writer(snapshots, schema);
@@ -351,11 +358,11 @@ protected:
       std::vector<FileDescriptor> files;
       if (previous.empty()) {
         PostingsWriter writer(directory, segment.seg_id, 1, (int32_t)roots.size());
-        Fixture::fields(writer, SpaceOrdinal::ROOT, roots, std::vector<uint8_t>{1, 1, 1});
+        Fixture::fields(writer, SpaceOrdinal::ROOT, "", roots, std::vector<uint8_t>{1, 1, 1});
         if (i < 2) {
           auto child = writer.addSpace(Fixture::CHILD, (int32_t)CHILDREN.size(), Fixture::shape(writer, ends));
-          Fixture::fields(writer, child, CHILDREN, std::vector<uint8_t>{2, 2, 1});
-          auto& vectors = writer.addField(child, "embedding");
+          Fixture::fields(writer, child, Fixture::CHILD, CHILDREN, std::vector<uint8_t>{2, 2, 1});
+          auto& vectors = writer.addField(child, "items.embedding");
           vectors.type = FieldType::VECTOR;
           vectors.flags = FieldType::COLUMN_STORED | FieldType::FIXED_SIZE;
           vectors.numValues = 4;
@@ -422,15 +429,15 @@ TEST_F(ScopedRowSpaceTest, viewsAlignLeavesAndKeepFieldStateSeparate) {
     EXPECT_EQ(&root->segments()[i].segmentCore(), &child->segments()[i].segmentCore());
     EXPECT_EQ(4, child->segments()[i].segInfo.max_doc);
   }
-  EXPECT_EQ(8, child->field("body").stats().maxDoc);
-  EXPECT_EQ(6, child->field("body").stats().docsWithField);
-  EXPECT_EQ(10, child->field("body").stats().sumTotalTermFreq);
+  EXPECT_EQ(8, child->field("items.body").stats().maxDoc);
+  EXPECT_EQ(6, child->field("items.body").stats().docsWithField);
+  EXPECT_EQ(10, child->field("items.body").stats().sumTotalTermFreq);
   EXPECT_EQ(9, root->field("body").stats().sumTotalTermFreq);
-  EXPECT_NE(child->getOrdMap("label"), root->getOrdMap("label"));
+  EXPECT_NE(child->getOrdMap("items.label"), root->getOrdMap("label"));
   MemPool pool;
   Query::Context context(pool, *child);
   Similarity::TermStats stats;
-  ASSERT_TRUE(context.lookupTermStats("body", "shared", stats));
+  ASSERT_TRUE(context.lookupTermStats("items.body", "shared", stats));
   EXPECT_EQ(4, stats.docFreq);
   EXPECT_EQ(6, stats.totalTermFreq);
   EXPECT_EQ(0, root->view("absent")->maxDoc());
@@ -610,7 +617,7 @@ TEST_F(ScopedRowSpaceTest, openingViewsUsesCountsWithoutScanningChildRows) {
   auto reopened = std::make_shared<IndexReader>(directory, *next, root.get(), cache);
   auto child = reopened->view(Fixture::CHILD);
   EXPECT_EQ(count + 8, child->maxDoc());
-  EXPECT_EQ(count + 8, child->field("body").stats().maxDoc);
+  EXPECT_EQ(count + 8, child->field("items.body").stats().maxDoc);
   EXPECT_LT(child->segments()[3].segmentCore().sizeInBytes(), 1024u);
   EXPECT_EQ(8, root->view(Fixture::CHILD)->maxDoc());
 }
@@ -741,7 +748,7 @@ TEST_F(ScopedRowSpaceTest, preparedPredicateChildKeepsRawMembershipAcrossDeletes
     if (deleted) publish(0);
     auto before = fieldMetadataMemory.liveViews.load();
     auto req = request();
-    auto inner = qb::toParent(req->mr, "items.deep", qb::all(), "none");
+    auto inner = qb::toParent(req->mr, "deep", qb::all(), "none");
     auto predicate = qb::boolean(req->mr, {inner}, {}, {}, {qb::match(req->mr, "label", "a")});
     auto join = qb::toParent(req->mr, Fixture::CHILD, predicate, "none");
     req->topDocs().countLimit().limit(0).rawQuery() = join;
@@ -926,6 +933,59 @@ TEST_F(ScopedRowSpaceTest, warmedJoinAndChildFiltersStayCorrectAfterDeletes) {
     }
   }
   EXPECT_GT(cache->counters().hits, 0u);
+}
+
+TEST_F(ScopedRowSpaceTest, relativeJoinAndExpansionPathsStartAtTheCurrentView) {
+  auto req = request();
+  req->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr, "deep", qb::all());
+  auto& deeper = req->topDocs("deeper").allQuery().countLimit().limit(0);
+  deeper.rawOp().domain.emplace().to_children = "deep";
+  req->execute(root->view(Fixture::CHILD));
+  ASSERT_OK(req);
+  EXPECT_EQ(8, req->getMatchCount());
+  EXPECT_EQ(8, req->getMatchCount("deeper"));
+}
+
+TEST_F(ScopedRowSpaceTest, childWildcardEmitUsesLocalKeysAndOwnStoredValues) {
+  auto req = request();
+  req->topDocs().matchQuery("label", "a").countLimit().fields({"*"});
+  req->execute(root->view(Fixture::CHILD));
+  ASSERT_OK(req);
+  ASSERT_EQ(4u, req->getDocs().size());
+  EXPECT_TRUE(docEquals(flatdoc("number", (int64_t)11, "label", "a", "payload", "child zero"), req->getDocs()[0]));
+  for (const auto& doc : req->getDocs()) {
+    for (const auto& value : doc) EXPECT_EQ(std::string::npos, value.name.find('.'));
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, unknownFieldsAndPathsReportTheCurrentView) {
+  for (auto name : {"items.body", "unknown"}) {
+    auto req = request();
+    req->topDocs().matchQuery(name, "shared");
+    req->execute(root->view(Fixture::CHILD));
+    ASSERT_FALSE(req->responses.empty());
+    auto& response = req->responses[0]->proto;
+    ASSERT_TRUE(response.error.has_value());
+    EXPECT_NE(std::string_view::npos, response.error->message.find("view 'items'"));
+  }
+  auto req = request();
+  req->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr, "unknown", qb::all());
+  req->execute(root);
+  ASSERT_TRUE(req->responses[0]->proto.error.has_value());
+  EXPECT_NE(std::string_view::npos, req->responses[0]->proto.error->message.find("Field not found: unknown"));
+  EXPECT_EQ(std::string_view::npos, req->responses[0]->proto.error->message.find("view"));
+}
+
+TEST_F(ScopedRowSpaceTest, declaredAbsentPathsAreEmptyAndOtherPathsAreRejected) {
+  auto empty = request();
+  empty->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(empty->mr, "absent", qb::all());
+  empty->execute(root);
+  ASSERT_OK(empty);
+  EXPECT_EQ(0, empty->getMatchCount());
+  auto bad = request();
+  bad->reader = root;
+  EXPECT_THROW(bad->pinView("missing"), RequestError);
+  EXPECT_THROW(bad->pinView("number"), RequestError);
 }
 
 } // namespace

@@ -364,3 +364,23 @@ TEST_F(UpdateErrorTest, deleteAndRepeatedOverwriteInOneRequestKeepLastDocument) 
   EXPECT_TRUE(matchDocs(helper, "first").empty());
   EXPECT_TRUE(matchDocs(helper, "old").empty());
 }
+
+TEST_F(UpdateErrorTest, nestedInputIsRejectedWithoutDiscardingOtherRoots) {
+  CollectionHelper helper;
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(luxir::api::read_json(doc,
+        R"({"id":"bad","items_nested":[{"color_s":"red"}]})", arena));
+  });
+  input.add(flatdoc("id", "good", "color_s", "red"));
+  auto result = helper.submit(input);
+  EXPECT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("Nested path"));
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs().allQuery().countLimit().fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(1, req->getMatchCount());
+}
