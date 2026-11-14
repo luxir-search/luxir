@@ -26,6 +26,7 @@
 #include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/RowSpaceFixture.h"
 #include "test/SchemaBuilder.h"
 
 namespace luxir::test {
@@ -38,8 +39,8 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 12;
-constexpr uint64_t kReferenceDigest = 0xf6021ff38c5e7fd3;
+constexpr uint64_t kReferenceVersion = 13;
+constexpr uint64_t kReferenceDigest = 0xbf22b3f3bbe90ae2;
 
 // A small index over every default field template's kind, with two segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -113,7 +114,24 @@ uint64_t buildReferenceDigest() {
   LuxirNode node(LuxirConfig{});
   CollectionHelper ch(node, "main");
   buildReferenceIndex(ch);
-  return referenceDigest(ch.getIndexWriter()->dir);
+  std::vector<uint64_t> fingerprints{referenceDigest(ch.getIndexWriter()->dir)};
+  // Cover the child catalog and both optional reverse-map states as well as
+  // the ordinary root index, so a child-only format change trips the oracle.
+  RAMDir bundles;
+  using Fixture = RowSpaceFixture;
+  std::vector<Fixture::Row> roots{{17, {"root"}, "root", "root source"}, {}, {19, {"root"}, "root", {}}};
+  std::vector<Fixture::Row> children{{11, {"common", "common"}, "a", "child source"}, {}, {11, {"common"}, "a", {}}};
+  std::vector<int64_t> ends{2, 2, 3}, owners{0, 0, 2};
+  auto files = Fixture::write(bundles, 1, roots, children, ends, owners);
+  auto noReverse = Fixture::write(bundles, 2, roots, children, ends);
+  files.insert(files.end(), noReverse.begin(), noReverse.end());
+  auto absent = Fixture::write(bundles, 3, roots, {}, {});
+  files.insert(files.end(), absent.begin(), absent.end());
+  for (const auto& file : files) {
+    fingerprints.push_back(file.size);
+    fingerprints.push_back(file.xxh3);
+  }
+  return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
 }
 
 // Copies every file of the reference index's first segment into a RAM

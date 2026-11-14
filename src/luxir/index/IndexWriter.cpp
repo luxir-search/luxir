@@ -1467,7 +1467,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                         inverter.getPostingsWriter().creatorEpoch,
-                                        inverter.getPostingsWriter().getMaxDoc());
+                                        inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2875,7 +2875,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
-      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc());
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc(SpaceOrdinal::ROOT));
       newSegInfo->minVersion = segs.front()->minVersion;
       newSegInfo->maxVersion = segs.front()->maxVersion;
       newSegInfo->schema = segs.front()->schema;

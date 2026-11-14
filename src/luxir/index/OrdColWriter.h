@@ -75,7 +75,7 @@ class BasicOrdColWriter : public OrdColWriterSettings {
     }
 
     assert(indexing == SegFieldInfo::ORD_DOCID);
-    int32_t maxDoc = postingsWriter.getMaxDoc();
+    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
     if (rankToDoc.empty()) {
       assert(ords.size() == maxDoc);
       for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -194,7 +194,7 @@ public:
   }
 
   void finish(std::span<const int32_t> rankToDoc = {}) {
-    int32_t maxDoc = postingsWriter.getMaxDoc();
+    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
     int32_t nSlots = ords.size();
     assert(rankToDoc.empty() || (int32_t)rankToDoc.size() == nSlots);
     assert(fieldInfo.nTerms >= 0 && fieldInfo.nTerms <= INT32_MAX);

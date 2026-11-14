@@ -353,7 +353,7 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
       values.data(), encoded.data(), encoded.data() + keyBytes, VALUE_COUNT, 0);
   encoded.resize((size_t) (encodedEnd - encoded.data()));
 
-  auto& moved = writer.addField("moved");
+  auto& moved = writer.addField(SpaceOrdinal::ROOT, "moved");
   moved.type = FieldType::BIN;
   moved.flags = FieldType::COLUMN_STORED;
   moved.docsWithField = 1;
@@ -362,7 +362,7 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   moved.columnMetaOff = (int64_t) encoded.size();
   streams[1]->write(encoded.data(), encoded.size());
 
-  auto& survivor = writer.addField("survivor");
+  auto& survivor = writer.addField(SpaceOrdinal::ROOT, "survivor");
   survivor.type = FieldType::BIN;
   survivor.flags = FieldType::COLUMN_STORED;
   survivor.docsWithField = 1;
@@ -425,7 +425,7 @@ TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
       auto unused = writer.getOutputStreams<2>();
       for (auto& stream : unused) stream.reset();
     }
-    auto& field = writer.addField("f");
+    auto& field = writer.addField(SpaceOrdinal::ROOT, "f");
     field.type = FieldType::BIN;
     field.flags = FieldType::COLUMN_STORED;
     field.docsWithField = 1;
@@ -477,7 +477,7 @@ TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
   PostingsWriter writer(directory, 18, 1, 1, &budget, true);
   auto streams = writer.getOutputStreams<2>();
   std::string payload = patternedBytes(PostingsWriter::RAM_SPILL_BYTES + 4096);
-  auto& field = writer.addField("spill");
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "spill");
   initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
   streams[1]->write(payload.data(), payload.size());
   EXPECT_FALSE(streams[1]->isRelocatable());
@@ -510,7 +510,7 @@ TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
   PostingsWriter writer(directory, 19, 1, 1, &budget, true);
   auto streams = writer.getOutputStreams<2>();
   std::string payload = patternedBytes(64ULL << 10);
-  auto& field = writer.addField("protected");
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "protected");
   initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
   streams[1]->write(payload.data(), payload.size());
   ASSERT_TRUE(streams[1]->isRelocatable());

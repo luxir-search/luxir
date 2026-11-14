@@ -362,7 +362,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   PostingsWriter sourcePostings(sourceDir, 0, 1, 1);
   {
     TextWriter writer(sourcePostings);
-    auto& fieldInfo = sourcePostings.addField("pos");
+    auto& fieldInfo = sourcePostings.addField(SpaceOrdinal::ROOT, "pos");
     fieldInfo.type = FieldType::TEXT;
     fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     writer.startField(&fieldInfo);
@@ -397,7 +397,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   PostingsWriter targetPostings(targetDir, 1, 1, 1);
   {
     TextWriter writer(targetPostings);
-    auto& fieldInfo = targetPostings.addField("pos");
+    auto& fieldInfo = targetPostings.addField(SpaceOrdinal::ROOT, "pos");
     fieldInfo.type = FieldType::TEXT;
     fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     writer.startField(&fieldInfo);

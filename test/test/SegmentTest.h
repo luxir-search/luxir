@@ -164,7 +164,7 @@ public:
 
   void getFieldName(std::string& target, uint32_t fieldNum) {
     target.resize(13);
-    sprintf(term.data(), "field%08d", fieldNum);
+    snprintf(target.data(), target.size() + 1, "field%08u", fieldNum);
   }
 
 
@@ -272,7 +272,7 @@ public:
       makeTermsEnum();
     } else {
       writer = std::make_unique<TextWriter>(*postingsWriter);
-      writer->startField(fname);
+      writer->startField(SpaceOrdinal::ROOT, fname);
     }
     int realNumTerms = 0;
     for (uint32_t i = 0; i < numTerms; i++) {

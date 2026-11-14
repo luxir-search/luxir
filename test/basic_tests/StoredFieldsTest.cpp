@@ -1009,7 +1009,7 @@ static void writeStoredSegment(RAMDir& dir, const StoredChunkFormat& format,
                                std::shared_ptr<const StoredCompressionDictionary> dictionary,
                                std::span<const std::string> docs, uint64_t segId = 1) {
   PostingsWriter postings(dir, segId, 1, (int32_t)docs.size());
-  StoredFieldsWriter stored(postings, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
+  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
   for (size_t doc = 0; doc < docs.size(); doc++) stored.addValue((int32_t)doc, "body", docs[doc]);
   stored.finish((int32_t)docs.size());
   postings.writeVersionRuns(VersionRunBuilder{});
@@ -1568,7 +1568,7 @@ TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
   auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
   RAMDir dir;
   PostingsWriter postings(dir, 1, 1);
-  StoredFieldsWriter stored(postings, "_stored_", DICT_FORMAT, prepared);
+  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, "_stored_", DICT_FORMAT, prepared);
   auto other = DICT_FORMAT;
   other.dictionaryBytes = 0;
   other.zstdLevel = 7;

@@ -170,7 +170,7 @@ protected:
     PostingsWriter postingsWriter(dir, 0, 1, (int32_t) tfs.size() + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
       writer.startField(&finfo);
@@ -375,7 +375,7 @@ protected:
     PostingsWriter postingsWriter(dir, 0, 1, maxDoc);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
       writer.startField(&finfo);
@@ -453,7 +453,7 @@ protected:
     PostingsWriter postingsWriter(dir, 0, 1, docs.back() + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS;
       writer.startField(&finfo);
@@ -556,7 +556,7 @@ protected:
     PostingsWriter postingsWriter(dir, 0, 1, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = flags;
       writer.startField(&finfo);
@@ -749,7 +749,7 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   PostingsWriter postingsWriter(dir, 0, 1, N + Postings::DOCS_BLOCK_SIZE + 100);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = FieldType::INDEX_DOCS;
     writer.startField(&finfo);

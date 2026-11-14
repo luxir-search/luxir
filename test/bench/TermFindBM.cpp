@@ -324,7 +324,7 @@ private:
   void writeIndex() {
     seg.initWriter();
     TextWriter writer(*seg.postingsWriter.get());
-    writer.startField(std::string(kFieldName));
+    writer.startField(SpaceOrdinal::ROOT, std::string(kFieldName));
     for (int32_t ord = 0; ord < nTerms; ord++) {
       TermRef term(seg.pool, terms[ord].data(), (uint32_t)terms[ord].size());
       writer.startTerm(term);
@@ -788,7 +788,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   {
     TextWriter w(*seg.postingsWriter.get());
-    w.startField(fname);
+    w.startField(SpaceOrdinal::ROOT, fname);
     for (auto docid: sorted) {
       auto term = terms[docid];
       w.startTerm(term);

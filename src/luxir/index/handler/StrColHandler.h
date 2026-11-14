@@ -210,7 +210,7 @@ public:
     auto& tmpPool = MemPool::threadLocal();
 
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();

@@ -163,7 +163,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -174,7 +174,7 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numVals >= postingsWriter.getMaxDoc();
+    auto full = numVals >= postingsWriter.getMaxDoc(SpaceOrdinal::ROOT);
 
     if (fieldType->indexed()) {
       auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
@@ -334,7 +334,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -345,7 +345,7 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numDocs >= postingsWriter.getMaxDoc();
+    auto full = numDocs >= postingsWriter.getMaxDoc(SpaceOrdinal::ROOT);
 
     if (fieldType->indexed()) {
       auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);

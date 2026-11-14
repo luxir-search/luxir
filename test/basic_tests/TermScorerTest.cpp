@@ -4812,7 +4812,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   PostingsWriter postingsWriter(dir, 0, 1, N + 16);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = FieldType::INDEX_DOCS_FREQS;
     writer.startField(&finfo);

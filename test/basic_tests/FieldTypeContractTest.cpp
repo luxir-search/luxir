@@ -184,7 +184,7 @@ TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
     PostingsWriter writer(dir, 1, 1, 0);
-    auto& info = writer.addField("value");
+    auto& info = writer.addField(SpaceOrdinal::ROOT, "value");
     info.type = (FieldType::Type)type;
     info.typeFlags = type == FieldType::DECIMAL ? 19 : type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
     writeUnversionedRuns(writer);
