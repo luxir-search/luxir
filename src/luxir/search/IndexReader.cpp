@@ -778,7 +778,7 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
 std::span<const std::string> IndexReader::searchableFields() {
   assert(snapshot->schema);
   callOnce(searchableOnce, [this] {
-    searchable = snapshot->schema->searchableFields(space->physicalFieldNames());
+    searchable = snapshot->schema->searchableFields(space->physicalFieldNames(), path());
   });
   return searchable;
 }

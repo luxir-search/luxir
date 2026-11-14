@@ -65,6 +65,12 @@ void Inverter::clearUndoLog() {
 
 Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   auto resolved = schema->resolveInput(name);
+  if (resolved.fieldType->type() == FieldType::NESTED) {
+    throw DocumentError("Nested path cannot be indexed: " + std::string(name));
+  }
+  if (!resolved.path.empty()) {
+    throw DocumentError("Field must be supplied inside nested path '" + resolved.path + "': " + std::string(name));
+  }
   auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
   StoredFieldsWriter* writer = nullptr;
   if (fieldType->isStored()

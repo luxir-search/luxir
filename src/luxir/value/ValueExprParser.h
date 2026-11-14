@@ -416,7 +416,7 @@ private:
   uint32_t parseColumn(std::string_view name, size_t pos) {
     ResolvedFieldHandle target;
     try {
-      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
+      target = opts.fieldResolver ? opts.fieldResolver->resolveLocal(name, OpClass::VALUE, opts.opName)
           : opts.schema->resolveFor(name, OpClass::VALUE);
     } catch (const RequestError& e) {
       fail(pos, e.what());

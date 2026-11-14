@@ -122,11 +122,20 @@ uint64_t buildReferenceDigest() {
   std::vector<Fixture::Row> roots{{17, {"root"}, "root", "root source"}, {}, {19, {"root"}, "root", {}}};
   std::vector<Fixture::Row> children{{11, {"common", "common"}, "a", "child source"}, {}, {11, {"common"}, "a", {}}};
   std::vector<int64_t> ends{2, 2, 3}, owners{0, 0, 2};
-  auto files = Fixture::write(bundles, 1, roots, children, ends, owners);
-  auto noReverse = Fixture::write(bundles, 2, roots, children, ends);
-  files.insert(files.end(), noReverse.begin(), noReverse.end());
-  auto absent = Fixture::write(bundles, 3, roots, {}, {});
-  files.insert(files.end(), absent.begin(), absent.end());
+  // Keep the format oracle's original physical names independent of the
+  // request schema's qualified-name convention.
+  std::vector<FileDescriptor> files;
+  for (uint64_t id = 1; id <= 3; id++) {
+    PostingsWriter writer(bundles, id, 1, (int32_t)roots.size());
+    Fixture::fields(writer, SpaceOrdinal::ROOT, "", roots);
+    if (id < 3) {
+      auto reverse = id == 1 ? std::optional<std::span<const int64_t>>(owners) : std::nullopt;
+      auto child = writer.addSpace(Fixture::CHILD, (int32_t)children.size(), Fixture::shape(writer, ends, reverse));
+      Fixture::fields(writer, child, "", children);
+    }
+    writeUnversionedRuns(writer);
+    EXPECT_TRUE(writer.finish(nullptr, &files));
+  }
   for (const auto& file : files) {
     fingerprints.push_back(file.size);
     fingerprints.push_back(file.xxh3);

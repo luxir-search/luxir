@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+
+#include "luxir/query/FieldResolver.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/OwnershipMapper.h"
 #include "luxir/search/HitDecorator.h"
@@ -1489,13 +1491,18 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req, IndexReade
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
+  FieldResolver resolver(*req.schema, req.resolvedFields, reader.path());
+  auto relative = [&](std::string_view name) {
+    return reader.path().empty() ? name : name.substr(reader.path().size() + 1);
+  };
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
-    if (extraNames.contains(field.name)) {
+    auto output = relative(field.name);
+    if (extraNames.contains(output)) {
       throw RequestError("Extra column '" + std::string(field.name)
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
                            " or select the extra by name");
     }
-    picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
+    picked.push_back({output, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
   };
   auto pushExplicit = [&](std::string_view f) {
     if (extraNames.contains(f)) return;  // extras are appended after the physical fields
@@ -1506,7 +1513,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req, IndexReade
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
-    auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
+    auto source = resolver.resolveLocal(f, OpClass::RETRIEVE);
     if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
       auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
       std::string message = "Field '" + std::string(f) + "' has no retrievable value";
@@ -1544,9 +1551,9 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req, IndexReade
         pushExplicit(f);
         continue;
       }
-      forEachFieldPattern(catalog, f, [](const auto& field) { return field.name; },
+      forEachFieldPattern(catalog, f, [&](const auto& field) { return relative(field.name); },
           [](const auto& field) { return field.derived; }, [&](const auto& field) {
-            if (taken.insert(field.name).second) pushDiscovered(field);
+            if (taken.insert(relative(field.name)).second) pushDiscovered(field);
           });
     }
   }

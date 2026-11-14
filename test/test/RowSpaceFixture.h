@@ -59,14 +59,14 @@ struct RowSpaceFixture {
     }
   }
 
-  static void fields(PostingsWriter& writer, SpaceOrdinal space, std::span<const Row> rows,
+  static void fields(PostingsWriter& writer, SpaceOrdinal space, std::string_view path, std::span<const Row> rows,
                      std::span<const uint8_t> norms = {}) {
     if (rows.empty()) return;
     auto count = (int32_t)rows.size();
     std::vector<int32_t> docs;
     for (int32_t doc = 0; doc < count; doc++) if (rows[doc].number) docs.push_back(doc);
     if (!docs.empty()) {
-      auto& field = writer.addField(space, "number");
+      auto& field = writer.addField(space, Schema::qualify(path, "number"));
       field.type = FieldType::INT;
       field.flags = FieldType::COLUMN_STORED;
       {
@@ -85,7 +85,7 @@ struct RowSpaceFixture {
       for (const auto& word : rows[doc].words) terms[word][doc]++;
     }
     if (!terms.empty()) {
-      auto& field = writer.addField(space, "body");
+      auto& field = writer.addField(space, Schema::qualify(path, "body"));
       field.type = FieldType::TEXT;
       field.flags = FieldType::INDEX_DOCS_FREQS;
       DocStream normDocs(writer.pool);
@@ -116,7 +116,7 @@ struct RowSpaceFixture {
     terms.clear();
     for (int32_t doc = 0; doc < count; doc++) if (rows[doc].label) terms[*rows[doc].label][doc] = 1;
     if (!terms.empty()) {
-      auto& field = writer.addField(space, "label");
+      auto& field = writer.addField(space, Schema::qualify(path, "label"));
       field.type = FieldType::STRING;
       field.flags = FieldType::INDEX_DOCS | FieldType::COLUMN_STORED;
       OrdCollector ords(writer.pool, count);
@@ -140,7 +140,7 @@ struct RowSpaceFixture {
 
     StoredFieldsWriter stored(writer, space);
     for (int32_t doc = 0; doc < count; doc++) {
-      if (rows[doc].stored) stored.addValue(doc, "payload", *rows[doc].stored);
+      if (rows[doc].stored) stored.addValue(doc, Schema::qualify(path, "payload"), *rows[doc].stored);
     }
     stored.finish(count);
   }
@@ -150,10 +150,10 @@ struct RowSpaceFixture {
                                           std::span<const int64_t> ends,
                                           std::optional<std::span<const int64_t>> owners = {}) {
     PostingsWriter writer(dir, id, 1, (int32_t)roots.size());
-    fields(writer, SpaceOrdinal::ROOT, roots);
+    fields(writer, SpaceOrdinal::ROOT, "", roots);
     if (!children.empty()) {
       auto child = writer.addSpace(CHILD, (int32_t)children.size(), shape(writer, ends, owners));
-      fields(writer, child, children);
+      fields(writer, child, CHILD, children);
     }
     writeUnversionedRuns(writer);
     std::vector<FileDescriptor> files;

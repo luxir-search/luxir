@@ -17,6 +17,7 @@ const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path
   if (!scopedStates) scopedStates = std::make_unique<std::map<std::string, ScopedState, std::less<>>>();
   auto found = scopedStates->find(path);
   if (found != scopedStates->end()) return found->second.reader;
+  reader->schema()->requirePath(path);
   auto scoped = reader->view(path);
   auto uses = std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped);
   return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}}).first->second.reader;

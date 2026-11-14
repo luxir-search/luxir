@@ -7,6 +7,7 @@
 #include <array>
 #include <format>
 #include <memory>
+#include <map>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
@@ -25,25 +26,91 @@ class FieldResolver {
                                             PackedTermHash, PackedTermEqual>;
   Schema& schema;
   std::vector<std::string>* explanations;
-  std::array<Handles, (size_t)OpClass::PRIMARY + 1> fields;  // one memo per OpClass
+  using Memos = std::array<Handles, (size_t)OpClass::PRIMARY + 1>;
+  Memos fields;  // one memo per OpClass
+  std::map<std::string, Memos, std::less<>> scopedFields;
+  Memos* current = nullptr;
+  std::string_view viewPath;
   boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
 
+  // Names the view in errors raised below the root.
+  std::string where() const {
+    return viewPath.empty() ? std::string() : " in view '" + std::string(viewPath) + "'";
+  }
+
+  void setPath(std::string_view path) {
+    if (path.empty()) {
+      current = nullptr;
+      viewPath = {};
+    } else {
+      auto entry = scopedFields.find(path);
+      if (entry == scopedFields.end()) entry = scopedFields.try_emplace(std::string(path)).first;
+      current = &entry->second;
+      viewPath = entry->first;
+    }
+  }
+
 public:
-  explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
-      : schema(schema), explanations(explanations) {}
+  explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr,
+                         std::string_view path = {})
+      : schema(schema), explanations(explanations) { setPath(path); }
+
+  class Scope {
+    FieldResolver& fields;
+    std::string_view previous;
+
+  public:
+    Scope(FieldResolver& fields, std::string_view path) : fields(fields), previous(fields.viewPath) {
+      fields.setPath(path);
+    }
+    ~Scope() { fields.setPath(previous); }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+  };
+
+  Scope scopedPath(std::string_view path) { return Scope(*this, path); }
+  std::string_view path() const { return viewPath; }
+
+  const ResolvedFieldHandle& resolvePath(std::string_view name) {
+    const auto& target = resolve(name, OpClass::PRIMARY);
+    if (target.fieldType->type() != FieldType::NESTED) {
+      throw RequestError("Field '" + std::string(name) + "' is not a nested path" + where());
+    }
+    return target;
+  }
 
   const ResolvedFieldHandle& resolve(std::string_view name, OpClass op,
                                      std::string_view context = {}) {
-    auto& memo = fields[(size_t)op];
+    auto& memo = (current ? *current : fields)[(size_t)op];
     auto found = memo.find(name);
     if (found == memo.end()) {
-      auto target = schema.resolveFor(name, op);
+      ResolvedFieldHandle target;
+      // Birth versions are virtual metadata of every view.
+      if (!current || (name == "_version_" && op == OpClass::RETRIEVE)) {
+        target = schema.resolveFor(name, op);
+      } else {
+        try {
+          target = schema.resolveFor(Schema::qualify(viewPath, name), op);
+        } catch (const RequestError& e) {
+          throw RequestError("Field '" + std::string(name) + "'" + where() + ": " + e.what(), e.code);
+        }
+      }
       found = memo.emplace(std::string(name), std::move(target)).first;
     }
     const auto& target = found->second;
     if (explanations && !context.empty() && name != target.physicalName) {
       auto note = std::format("{}: {} -> {}", context, name, target.physicalName);
       if (!std::ranges::contains(*explanations, note)) explanations->push_back(std::move(note));
+    }
+    return target;
+  }
+
+  const ResolvedFieldHandle& resolveLocal(std::string_view name, OpClass op,
+                                          std::string_view context = {}) {
+    const auto& target = resolve(name, op, context);
+    if (target.path != viewPath && target.physicalName != "_version_") {
+      throw RequestError("Field '" + std::string(name) + "'" + where()
+          + " requires a query or operation in nested path '" + target.path + "'");
     }
     return target;
   }

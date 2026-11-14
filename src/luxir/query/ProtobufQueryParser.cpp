@@ -216,7 +216,7 @@ luxir::Query* ProtobufQueryParser::parseRange(const luxir::api::RangeQuery& rang
 }
 
 luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery) {
-  const auto& target = context.fields.resolve(geoBoxQuery.field, OpClass::PRIMARY, context.opName);
+  const auto& target = context.fields.resolveLocal(geoBoxQuery.field, OpClass::PRIMARY, context.opName);
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoBox query on non-geo field: {}", geoBoxQuery.field));
   }
@@ -227,7 +227,7 @@ luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& ge
 
 luxir::Query* ProtobufQueryParser::parseGeoDistance(
     const luxir::api::GeoDistanceQuery& geoDistanceQuery) {
-  const auto& target = context.fields.resolve(geoDistanceQuery.field, OpClass::PRIMARY, context.opName);
+  const auto& target = context.fields.resolveLocal(geoDistanceQuery.field, OpClass::PRIMARY, context.opName);
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoDistance query on non-geo field: {}", geoDistanceQuery.field));
   }
@@ -238,7 +238,7 @@ luxir::Query* ProtobufQueryParser::parseGeoDistance(
 
 luxir::Query* ProtobufQueryParser::parseGeoPolygon(
     const luxir::api::GeoPolygonQuery& geoPolygonQuery) {
-  const auto& target = context.fields.resolve(geoPolygonQuery.field, OpClass::PRIMARY, context.opName);
+  const auto& target = context.fields.resolveLocal(geoPolygonQuery.field, OpClass::PRIMARY, context.opName);
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoPolygon query on non-geo field: {}", geoPolygonQuery.field));
   }
@@ -275,7 +275,7 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
 }
 
 luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
-  const auto& target = context.fields.resolve(knnQuery.field, OpClass::PRIMARY, context.opName);
+  const auto& target = context.fields.resolveLocal(knnQuery.field, OpClass::PRIMARY, context.opName);
   auto field = api::build::arenaStr(pool, target.physicalName);
   FieldType& fieldType = *target.fieldType;
   if (fieldType.type() != FieldType::Type::VECTOR) {
@@ -465,23 +465,20 @@ luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery
   if (!query.query || std::holds_alternative<std::monostate>(query.query->kind)) {
     throw RequestError("to_parent requires a child query");
   }
-  if (query.path.empty() || query.path == context.reader->path()) {
-    throw RequestError("to_parent requires a descendant path");
-  }
-  auto path = query.path;
-  while (!path.empty() && path != context.reader->path()) path = spaceParentPath(path);
-  if (path != context.reader->path()) throw RequestError("to_parent requires a descendant path");
+  if (query.path.empty()) throw RequestError("to_parent requires a descendant path");
+  auto path = context.fields.resolvePath(query.path).physicalName;
   if (!query.score.empty() && query.score != "none" && query.score != "max") {
     throw RequestError("to_parent score must be none or max");
   }
   auto& req = *context.request;
   auto& destination = req.pinView(context.reader->path());
-  auto& source = req.pinView(query.path);
+  auto& source = req.pinView(path);
   auto& relation = req.ownershipRelation(*source, *destination);
   auto* planning = req.createPlanningContext(*source);
   auto* previous = context.reader;
   auto* collapse = context.collapse;
   auto restore = scope_guard([&]() noexcept { context.reader = previous; context.collapse = collapse; });
+  auto fieldScope = context.fields.scopedPath(source->path());
   context.reader = source.get();
   context.collapse = nullptr;
   auto* child = parse(*query.query);
