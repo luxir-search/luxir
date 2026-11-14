@@ -1,6 +1,6 @@
 --- a/faiss/utils/simd_impl/rabitq_neon.cpp
 +++ b/faiss/utils/simd_impl/rabitq_neon.cpp
-@@ -9,15 +9,125 @@
+@@ -9,15 +9,181 @@
  
  #ifdef COMPILE_SIMD_ARM_NEON
  
@@ -12,36 +12,37 @@
  namespace faiss::rabitq {
  
 +// The NONE kernels count one 64-bit word at a time, which aarch64 does with
-+// cnt + addv through the vector unit. These count 16 bytes per cnt into
++// cnt + addv through the vector unit. Long rows count 16 bytes per cnt into
 +// per-plane lane sums and reduce them once per row. The sums are exact and
 +// equal to the NONE kernels'.
 +namespace {
 +
-+// Scalar tail from byte `offset`, same order and widths as the NONE kernels.
++// Scalar tail from byte offset, with memcpy for unaligned words. FAISS
++// query bits are 1..8, so a weighted word count is at most 64 << 7 = 8192.
 +template <bool Xor>
 +inline uint64_t tail_dot(const uint8_t* query, const uint8_t* data, size_t size, size_t qb, size_t offset) {
 +    uint64_t sum = 0;
 +    for (; offset + 8 <= size; offset += 8) {
 +        uint64_t yv, qv;
 +        std::memcpy(&yv, data + offset, 8);
-+        for (size_t j = 0; j < qb; j++) {
++        for (int j = 0; j < qb; j++) {
 +            std::memcpy(&qv, query + j * size + offset, 8);
-+            sum += (uint64_t)__builtin_popcountll(Xor ? qv ^ yv : qv & yv) << j;
++            sum += (uint64_t)(__builtin_popcountll(Xor ? qv ^ yv : qv & yv) << j);
 +        }
 +    }
 +    for (; offset < size; ++offset) {
 +        uint32_t yv = data[offset];
-+        for (size_t j = 0; j < qb; j++) {
++        for (int j = 0; j < qb; j++) {
 +            uint32_t qv = query[j * size + offset];
-+            sum += (uint64_t)__builtin_popcount(Xor ? qv ^ yv : qv & yv) << j;
++            sum += (uint64_t)(__builtin_popcount(Xor ? qv ^ yv : qv & yv) << j);
 +        }
 +    }
 +    return sum;
 +}
 +
-+// Per-lane bit counts of 16-byte chunks. A chunk adds at most 16 to a 16-bit
-+// lane (uadalp) or 32 to a 32-bit lane (udot); reducing the lanes every 2048
-+// chunks keeps a 16-bit lane below 65536.
++// A chunk adds at most 16 per uint16_t lane (uadalp), or 32 per uint32_t
++// lane (udot). After 2048 chunks these are at most 32768 and 65536,
++// respectively, so neither lane type can overflow before reduction.
 +#if defined(__ARM_FEATURE_DOTPROD)
 +using Lanes = uint32x4_t;
 +inline Lanes lanes_zero() { return vdupq_n_u32(0); }
@@ -75,8 +76,61 @@
 +    }
 +}
 +
++// Short rows have at most 31 * 8 = 248 set bits per plane. Byte lane
++// additions and the byte-wide horizontal sum therefore cannot overflow.
++// The first and last full words/vectors stay inside the row; masking the
++// overlapping bytes of the last one counts each byte exactly once.
++inline uint8x8_t masked_tail8(const uint8_t* data, size_t size) {
++    const uint8x8_t indices = {0, 1, 2, 3, 4, 5, 6, 7};
++    uint8x8_t mask = vcge_u8(indices, vdup_n_u8(8 - size % 8));
++    return vand_u8(vld1_u8(data + size - 8), mask);
++}
++
++template <bool Xor>
++inline uint64_t small_dot(const uint8_t* query, const uint8_t* data, size_t size, size_t qb) {
++    uint64_t sum = 0;
++    if (size < 16) {
++        const uint8x8_t indices = {0, 1, 2, 3, 4, 5, 6, 7};
++        uint8x8_t mask = vcge_u8(indices, vdup_n_u8(16 - size));
++        uint8x8_t first = vld1_u8(data), last = vld1_u8(data + size - 8);
++        for (size_t j = 0; j < qb; j++) {
++            const uint8_t* q = query + j * size;
++            uint8x8_t q0 = vld1_u8(q), qt = vld1_u8(q + size - 8);
++            uint8x8_t a = Xor ? veor_u8(q0, first) : vand_u8(q0, first);
++            uint8x8_t b = Xor ? veor_u8(qt, last) : vand_u8(qt, last);
++            sum += (uint64_t)vaddv_u8(vadd_u8(vcnt_u8(a), vcnt_u8(vand_u8(b, mask)))) << j;
++        }
++    } else {
++        const uint8x16_t indices = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
++        uint8x16_t mask = vcgeq_u8(indices, vdupq_n_u8(32 - size));
++        uint8x16_t first = vld1q_u8(data), last = vld1q_u8(data + size - 16);
++        for (size_t j = 0; j < qb; j++) {
++            const uint8_t* q = query + j * size;
++            uint8x16_t q0 = vld1q_u8(q);
++            uint8x16_t a = vcntq_u8(Xor ? veorq_u8(q0, first) : vandq_u8(q0, first));
++            if (size > 16) {
++                uint8x16_t qt = vld1q_u8(q + size - 16);
++                uint8x16_t b = Xor ? veorq_u8(qt, last) : vandq_u8(qt, last);
++                a = vaddq_u8(a, vcntq_u8(vandq_u8(b, mask)));
++            }
++            sum += (uint64_t)vaddvq_u8(a) << j;
++        }
++    }
++    return sum;
++}
++
++inline uint64_t small_popcount(const uint8_t* data, size_t size) {
++    uint8x8_t acc = vcnt_u8(vld1_u8(data));
++    if (size >= 16) acc = vadd_u8(acc, vcnt_u8(vld1_u8(data + 8)));
++    if (size >= 24) acc = vadd_u8(acc, vcnt_u8(vld1_u8(data + 16)));
++    if (size % 8) acc = vadd_u8(acc, vcnt_u8(masked_tail8(data, size)));
++    return vaddv_u8(acc);
++}
++
 +template <bool Xor>
 +inline uint64_t weighted_dot(const uint8_t* query, const uint8_t* data, size_t size, size_t qb) {
++    if (size <= 8) return tail_dot<Xor>(query, data, size, qb, 0);
++    if (size < 32) return small_dot<Xor>(query, data, size, qb);
 +    size_t chunks = size / 16;
 +    uint64_t counts[4];
 +    uint64_t sum = 0;
@@ -96,6 +150,8 @@
 +}
 +
 +inline uint64_t popcount_bytes(const uint8_t* data, size_t size) {
++    if (size == 8) return vaddv_u8(vcnt_u8(vld1_u8(data)));
++    if (size >= 8 && size < 32) return small_popcount(data, size);
 +    size_t chunks = size / 16;
 +    uint64_t sum = 0;
 +    for (size_t c = 0; c < chunks;) {
@@ -127,7 +183,7 @@
  }
  
  template <>
-@@ -26,12 +136,12 @@
+@@ -26,12 +192,12 @@
          const uint8_t* data,
          size_t size,
          size_t qb) {
