@@ -238,6 +238,16 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->check(CLI::PositiveNumber)
       ->default_str("--indexing.max-ram-mb, capped at " +
                     std::to_string(IndexConfig::MAX_INVERTER_RAM_CAP_MB));
+  app.add_option("--indexing.max-merged-segment-docs", index.max_merged_segment_docs,
+                 "Live docs a natural merge may produce; larger segments stop merging (0 = unlimited). "
+                 "A force merge with max_segments overrides it")
+      ->default_val(index.max_merged_segment_docs)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--indexing.max-merge-working-set-mb", index.max_merge_working_set_mb,
+                 "Estimated per-field merge working set (MiB) a natural merge may reach "
+                 "(0 = the indexing RAM budget)")
+      ->default_val(index.max_merge_working_set_mb)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--indexing.merge-factor", index.merge_factor,
                  "Same-level segments required to trigger a merge")
       ->default_val(index.merge_factor)

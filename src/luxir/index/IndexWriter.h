@@ -201,9 +201,14 @@ public:
     int32_t segCount = 0;  // a sanity check that we are in-sync with segments in the IndexWriter.
   public:
     static constexpr int32_t DEFAULT_MERGE_FACTOR = 10;
+    static constexpr int64_t DEFAULT_MAX_MERGED_SEGMENT_DOCS = 50'000'000;
     IndexWriter& iw;
     int32_t outstandingMerges = 0;
     int32_t mergeFactor = DEFAULT_MERGE_FACTOR;
+    // Natural merges never produce a segment with more live docs than this
+    // (0 = unlimited), and a segment over half of it takes no further part in
+    // them. A client force merge (max_segments) overrides it.
+    int64_t maxMergedSegmentDocs = DEFAULT_MAX_MERGED_SEGMENT_DOCS;
     // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
     // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
     // when a merge happens at tier 3, sweep up all the smaller segments as well.  I'm not sure this
@@ -269,12 +274,22 @@ public:
     // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
     // If seg is nullptr, then we check all segment levels for a merge.
     // Call with indexMutex locked.
+    // Too large to merge again without passing maxMergedSegmentDocs.
+    bool _tooLargeToMerge(const SegInfo* seg) const {
+      return maxMergedSegmentDocs > 0 && (int64_t)seg->maxDoc > maxMergedSegmentDocs / 2;
+    }
+
     int32_t _update(SegInfo* seg) {
       // assert that the index mutex is locked
       int32_t mergeLevel = -1;
 
       if (seg != nullptr) {
         segCount++;
+        if (_tooLargeToMerge(seg)) {
+          seg->mergeLevel = -1;  // in no level, so no natural merge selects it
+          INDEX_DEBUG("merge level update: seg={} excluded as too large to merge", *seg);
+          return -1;
+        }
 
         // For MERGE_FACTOR 10, rows 0-9 = level 0, 10-99 = level 1, etc.
         seg->mergeLevel = _mergeLevelForRows(seg->mergeRows);
@@ -644,6 +659,11 @@ public:
   // Zero derives the ceiling from this merge's size-scaled stream budget.
   // Tests and constrained deployments may set an explicit 2..64 ceiling.
   int32_t termPartitionMaxRanges = MergeCostModel::DERIVED_TERM_RANGES;
+  // A natural merge admits sources only while its most expensive field's
+  // estimated working set (SegmentMerger::estimateFieldCost) stays within
+  // this; 0 uses the whole indexing RAM budget, and an uncapped budget leaves
+  // it unlimited. A client force merge is warned about, not trimmed.
+  int64_t maxMergeWorkingSetBytes = 0;
   // Replay merges whose term ord maps reach this many bytes write them to
   // node-local scratch files (ScratchFile) and map them, rather than holding
   // every source's map on the heap. Debug builds spill every replay merge.
