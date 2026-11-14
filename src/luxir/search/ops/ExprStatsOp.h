@@ -60,7 +60,7 @@ class ExprStatsOp : public SearchOp {
       return nullptr;
     }
     auto infos = fields[aggregate.leaves.front().producer].values[producer.input->rootNode];
-    for (auto& segment : req.reader->segments()) {
+    for (auto& segment : view->segments()) {
       if (segment.maxDoc() == 0) continue;
       auto* field = infos.at((size_t)segment.ord);
       if (!field) return nullptr;
@@ -113,9 +113,9 @@ class ExprStatsOp : public SearchOp {
   void warnFailure(const BucketScalar& result) const { warnFailure(result, flags); }
 
 public:
-  ExprStatsOp(SearchRequest& req, std::string_view name,
+  ExprStatsOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name,
               AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
-      : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
+      : SearchOp(req, view, name), aggregate(aggregate), fields(fields) {}
 
   bool nativeOutput(uint64_t outputFlags) const {
     return nativeValueOutput(aggregate.root().nature, outputFlags);
@@ -144,6 +144,7 @@ public:
 
   bool shareProducersFrom(ExprStatsOp& leader) {
     assert(!passive && members.empty() && !leader.passive && &leader != this);
+    if (view != leader.view || inputDomain != leader.inputDomain) return false;
     if (!aggregate.adoptProducers(leader.aggregate)) return false;
     fields = leader.fields;
     if (leader.members.empty()) leader.members.push_back(&leader);
@@ -270,7 +271,7 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
         : Calculator(op, parent, slot, numSlots, structural),
-          driver(op.req.reader->segments().size(),
+          driver(op.view->segments().size(),
                  [this](std::unique_ptr<AggregateAccumulator> accumulator) {
                    emitResult(*accumulator);
                    if (aggregateExecutionStatsForTests != nullptr) {
@@ -320,7 +321,7 @@ public:
         try {
           auto poolGuard = MemPool::threadLocalPoolGuard();
           MemPool& pool = poolGuard.pool();
-          auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
+          auto& segment = thisOp().view->segments()[(size_t)segnum];
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
               thisOp().aggregate, pool, segment, thisOp().fields);
 
@@ -330,10 +331,10 @@ public:
                 && !(disableOrdinalAggregateBatchesForTests
                      && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
-                  accumulator, binding, domainHandle.get(op.req.reader->segments()[(size_t)segnum]), maxDoc);
+                  accumulator, binding, domainHandle.get(op.view->segments()[(size_t)segnum]), maxDoc);
             } else {
               accumulateExpression(
-                  accumulator, binding, domainHandle.get(op.req.reader->segments()[(size_t)segnum]), maxDoc);
+                  accumulator, binding, domainHandle.get(op.view->segments()[(size_t)segnum]), maxDoc);
             }
           }
         } catch (const ValueEvaluationError&) {
@@ -616,7 +617,7 @@ public:
       segmentFailure = AggregateFailure::NONE;
       try {
         MemPool& pool = MemPool::threadLocal();
-        auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
+        auto& segment = thisOp().view->segments()[(size_t)segnum];
         bindings = bindAggregateInputs(thisOp().aggregate, pool, segment, thisOp().fields);
       } catch (const ValueEvaluationError&) {
         bindings.clear();
@@ -716,7 +717,7 @@ public:
     void replaySegment(int32_t segnum) {
       static constexpr size_t BATCH_SIZE = 256;
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      auto& segment = child.req.reader->segments()[(size_t)segnum];
+      auto& segment = child.view->segments()[(size_t)segnum];
       int32_t maxDoc = segment.maxDoc();
 
       auto* info = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
@@ -1028,7 +1029,7 @@ public:
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
     if (passive || !members.empty()) return nullptr;
-    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
+    if (inputDomain != nullptr || bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (context.stringColumn == nullptr) return nullptr;
     if (!std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
           return producer.resolved.state.replayCapable;

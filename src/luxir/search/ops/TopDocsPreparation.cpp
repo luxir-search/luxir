@@ -19,7 +19,7 @@ template <bool Structural, bool MetricGroups, typename Admission>
 void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
   {
     auto release = scope_guard([&]() noexcept {
-      for (auto& segment : thisOp().req.reader->segments()) releaseSegmentState(segment);
+      for (auto& segment : thisOp().view->segments()) releaseSegmentState(segment);
     });
     prepareDomains<Structural>(tg);
   }
@@ -31,18 +31,18 @@ template <bool Structural>
 void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
   auto& op = thisOp();
   auto baseDomains = std::span<DocSet* const>(inputDomainViews.data(), inputDomainViews.size());
-  Query::Weight::PrepareContext baseCtx{*op.req.reader, baseDomains, tg != nullptr, &op.req};
+  Query::Weight::PrepareContext baseCtx{*op.view, baseDomains, tg != nullptr, &op.req};
   bool routed = !op.domainVariants.empty();
   bool mainNeedsPrepare = op.weight != nullptr && (op.wholeMembershipPlan.preparesMainWeight(*op.weight) ||
                                                    op.weight->needsPrepare());
   if (routed) {
-    size_t segmentCount = op.req.reader->segments().size();
+    size_t segmentCount = op.view->segments().size();
     preparedRoutedReservations.resize(segmentCount);
     if (mainNeedsPrepare) {
       preparedRoutedFilters.resize(segmentCount);
     }
     for (size_t i = 0; i < segmentCount; i++) {
-      auto& seg = op.req.reader->segments()[i];
+      auto& seg = op.view->segments()[i];
       std::string detail = "top_docs '" + std::string(op.name) + "'";
       if (mainNeedsPrepare) detail += " variant 0";
       detail += " segment " + std::to_string(i);
@@ -58,11 +58,11 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
 
   if (routed && (op.domainVariants.sourceCount() > 0 || op.domainVariants.needsResetParentFilters())) {
     std::vector<DocSet*> liveDomains;
-    liveDomains.reserve(op.req.reader->segments().size());
-    for (auto& segment : op.req.reader->segments()) {
+    liveDomains.reserve(op.view->segments().size());
+    for (auto& segment : op.view->segments()) {
       liveDomains.push_back(resetBase<Structural>(segment.ord));
     }
-    Query::Weight::PrepareContext liveCtx{*op.req.reader,
+    Query::Weight::PrepareContext liveCtx{*op.view,
                                           std::span<DocSet* const>(liveDomains.data(), liveDomains.size()),
                                           tg != nullptr, &op.req};
     if (op.domainVariants.needsResetParentFilters()) {
@@ -78,7 +78,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
 
   if (routed) {
     if (mainNeedsPrepare) {
-      for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
+      for (size_t i = 0; i < op.view->segments().size(); i++) {
         preparedRoutedFilters[i] =
             materializeRoutedFilters<Structural>((int32_t)i, baseDomains[i], preparedRoutedReservations[i],
                                                  Structural ? &inputDomains[i] : nullptr);
@@ -88,7 +88,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
         effectiveDomainViews[i] = effectiveDomains[i].get();
       }
       Query::Weight::PrepareContext queryCtx{
-          *op.req.reader, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
+          *op.view, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
           tg != nullptr, &op.req};
       if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
         preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
@@ -105,7 +105,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
     return;
   }
 
-  for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
+  for (size_t i = 0; i < op.view->segments().size(); i++) {
     if (op.filterWeights.empty()) {
       effectiveDomains[i] = inputDomains[i];
     } else {
@@ -116,7 +116,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
   }
 
   Query::Weight::PrepareContext queryCtx{
-      *op.req.reader, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
+      *op.view, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
       tg != nullptr, &op.req};
   if (op.weight != nullptr && op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
     preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
@@ -136,7 +136,7 @@ void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
     return;
   }
 
-  auto segments = op.req.reader->segments();
+  auto segments = op.view->segments();
   size_t baseCount = op.domainVariants.inheritBaseCount();
   std::vector<std::vector<DomainHandle>> eligibility(segments.size());
   for (size_t segnum = 0; segnum < segments.size(); segnum++) {
@@ -182,7 +182,7 @@ void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
             segments[segnum].maxDoc(), "top_docs '" + std::string(op.name) + "' variant " +
                                            std::to_string(variant) + " segment " + std::to_string(segnum));
       }
-      Query::Weight::PrepareContext context{*op.req.reader,
+      Query::Weight::PrepareContext context{*op.view,
                                             std::span<DocSet* const>(domainViews.data(), domainViews.size()),
                                             tg != nullptr, &op.req};
       ownedWeight = op.weight->prepare(context);
@@ -224,7 +224,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
                                                       oneapi::tbb::task_group* tg) {
   auto& op = thisOp();
   size_t sourceCount = op.domainVariants.sourceCount();
-  size_t segmentCount = op.req.reader->segments().size();
+  size_t segmentCount = op.view->segments().size();
   preparedDomainSources.resize(sourceCount);
   std::vector<size_t> extraSources;
   std::vector<size_t> resetExtraSources;
@@ -242,7 +242,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
       resetExtraSources.push_back(source);
     }
   }
-  Query::Weight::PrepareContext liveContext{*op.req.reader, liveDomains, tg != nullptr, &op.req};
+  Query::Weight::PrepareContext liveContext{*op.view, liveDomains, tg != nullptr, &op.req};
   auto preparedExtras = QueryPrep::prepareFilterSources(extraWeights, extraUses, liveContext);
   if constexpr (Structural)
     for (const auto& source : preparedExtras) {
@@ -262,15 +262,15 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
       preparedResetRoutedFilters[segnum] =
           materializeResetParentFilters<Structural>((int32_t)segnum, reservation);
     }
-    auto& segment = op.req.reader->segments()[segnum];
+    auto& segment = op.view->segments()[segnum];
     for (size_t source : resetExtraSources) {
       DomainHandle set;
       if constexpr (Structural) {
-        auto& sources = structural->producer->segmentSources(op.domainVariants, *op.req.reader, op.planning,
+        auto& sources = structural->producer->segmentSources(op.domainVariants, *op.view, op.planning,
                                                              (int32_t)segnum, op.req.memoryTracker);
         set = sources.resolve(source, resetBaseHandle((int32_t)segnum), &preparedDomainSources[source]);
       } else {
-        set = QueryPrep::materializeEffectiveFilter(preparedDomainSources[source], *op.req.reader, segment,
+        set = QueryPrep::materializeEffectiveFilter(preparedDomainSources[source], *op.view, segment,
                                                     liveDomains[segnum]);
         if (set.get() != nullptr && set.isDeliverable()) reservation->grow(set.get()->ramBytesUsed());
       }
@@ -282,7 +282,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
   std::vector<std::vector<DomainHandle>> eligibility(segmentCount, std::vector<DomainHandle>(variantCount));
   for (size_t segnum = 0; segnum < segmentCount; segnum++) {
     DomainHandle live = Structural ? resetBaseHandle((int32_t)segnum)
-                                   : DomainHandle::pinned(liveDomains[segnum], op.req.reader).scoped(op.req.reader->segments()[segnum]);
+                                   : DomainHandle::pinned(liveDomains[segnum], op.view).scoped(op.view->segments()[segnum]);
     for (size_t variant = 1; variant < variantCount; variant++) {
       if (op.domainVariants.frame(variant) != DomainVariantPlan::Frame::RESET) {
         continue;
@@ -307,18 +307,18 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
 
   if constexpr (!Structural) {
     preparedDomainVariants = op.domainVariants.prepareResetVariants(
-        preparedDomainSources, eligibility, liveDomains, *op.req.reader, tg != nullptr, &op.req,
+        preparedDomainSources, eligibility, liveDomains, *op.view, tg != nullptr, &op.req,
         [&](size_t variant, size_t segnum) {
-          auto& segment = op.req.reader->segments()[segnum];
+          auto& segment = op.view->segments()[segnum];
           return reserveVariantPreparation<Structural>(
               segment.maxDoc(), "top_docs '" + std::string(op.name) + "' variant " + std::to_string(variant) +
                                     " segment " + std::to_string(segnum));
         });
   } else {
     preparedDomainVariants = op.domainVariants.prepareResetVariants(
-        preparedDomainSources, eligibility, liveDomains, *op.req.reader, tg != nullptr, &op.req,
+        preparedDomainSources, eligibility, liveDomains, *op.view, tg != nullptr, &op.req,
         [&](size_t variant, size_t segnum) {
-          auto& segment = op.req.reader->segments()[segnum];
+          auto& segment = op.view->segments()[segnum];
           return reserveVariantPreparation<Structural>(
               segment.maxDoc(), "top_docs '" + std::string(op.name) + "' variant " + std::to_string(variant) +
                                     " segment " + std::to_string(segnum));

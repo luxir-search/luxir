@@ -10426,7 +10426,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         // for partial consumers until that comparison prices partial traversal.
         if (bulkContext.expectedConsumption.span >= segment.maxDoc()
             && !needsScores && !plan.hasOptionalGroup && prohibitedSources.empty()
-            && segment.numLive() == segment.maxDoc()
+            && !segment.mayHaveDeletes()
             && !candidateFilters.empty() && (entries.size() == 1 || candidateFilters.size() > 1)) {
           planMembershipOrder(entries, candidateFilters, use, control);
           plan.leadCost = entries[0].cost;
@@ -11576,7 +11576,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (!needsScores && !disableDisjunctionCountIdentityForTests) {
-        if (segment.hasDeletes()) {
+        if (segment.mayHaveDeletes()) {
           state->identityFallback =
               DisjunctionIdentityFallback::DELETES;
         } else {
@@ -12688,6 +12688,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     bool needsScores = false;
     bool allowsPruning = false;
     bool uniformConstantCandidate = false;
+    Query::SupplierExecutionMode preparedMode;
 
   public:
     BooleanPreparedWeight(std::span<Query::Weight*> filterWeights,
@@ -12703,7 +12704,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                           int minShouldMatch, bool needsScores,
                           bool allowsPruning,
                           bool uniformConstantCandidate,
-                          ScorePolicy scorePolicy)
+                          ScorePolicy scorePolicy, Query::SupplierExecutionMode preparedMode)
       : filterWeights(filterWeights), reader(reader),
         mandatorySources(std::move(mandatorySources)),
         mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
@@ -12715,7 +12716,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         prohibitedCacheEnabled(prohibitedCacheEnabled),
         scorePolicy(scorePolicy), minShouldMatch(minShouldMatch),
         needsScores(needsScores), allowsPruning(allowsPruning),
-        uniformConstantCandidate(uniformConstantCandidate) {}
+        uniformConstantCandidate(uniformConstantCandidate), preparedMode(preparedMode) {}
 
     size_t retainedBytes() const noexcept override {
       size_t bytes = sizeof(*this) + mandatoryScores.capacity() * sizeof(uint8_t)
@@ -12736,6 +12737,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       if (hasFilters
+          && preparedMode != Query::SupplierExecutionMode::RAW_MEMBERSHIP
           && executionMode
               == Query::SupplierExecutionMode::RAW_MEMBERSHIP) {
         throw std::logic_error(
@@ -13099,7 +13101,7 @@ public:
             ? DomainHandle::borrowed(outerDomain).scoped(segment)
             : QueryPrep::materializeEffectiveIntersection(
                 QueryPrep::preparedSpan(filterSources), ctx.reader,
-                segment, outerDomain);
+                segment, outerDomain, ctx.executionMode);
         if (foldProhibited) {
           domain = QueryPrep::materializeEffectiveExclusion(
               QueryPrep::preparedSpan(prohibitedSources), ctx.reader,
@@ -13117,7 +13119,7 @@ public:
     Query::Weight::PrepareContext childCtx{
       ctx.reader,
       std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-      ctx.parallel, ctx.warnings};
+      ctx.parallel, ctx.warnings, ctx.executionMode};
     auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
     auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
     // The folded domain supplier is required, which would demote an
@@ -13136,7 +13138,7 @@ public:
       prohibitedCacheRoutes, !filterSources.empty() || foldProhibited,
       foldProhibited, prohibitedCacheEnabled, preparedMinShouldMatch,
       needsScores, allowsPruning,
-      uniformConstantCandidate, scorePolicy);
+      uniformConstantCandidate, scorePolicy, ctx.executionMode);
   }
 
   Query::ScorerSupplier* scorerSupplierImpl(

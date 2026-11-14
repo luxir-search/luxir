@@ -8,7 +8,10 @@
 #include "test/QueryBuild.h"
 #include "test/StorageTestUtils.h"
 #include "luxir/index/LiveDocsWriter.h"
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/search/DomainVariantPlan.h"
+#include "luxir/search/OwnershipRelation.h"
+#include "luxir/query/AllQuery.h"
 #include "luxir/index/SegmentMerger.h"
 #include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/DocsEnum.h"
@@ -276,6 +279,27 @@ TEST_F(RowSpaceTest, multiSpaceMergeFailsBeforeWritingFields) {
   EXPECT_TRUE(files.empty());
 }
 
+TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
+  PostingsWriter writer(dir, 1, 1, 5);
+  writer.addSpace(Fixture::CHILD, 205, Fixture::shape(writer, std::vector<int64_t>{70, 70, 200, 200, 205}));
+  std::vector<int64_t> ends(205, 2);
+  std::fill(ends.begin() + 200, ends.end(), 3);
+  writer.addSpace("items.deep", 3, Fixture::shape(writer, ends));
+  writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish(nullptr));
+  auto core = SegmentCore::create(dir, 1, 1);
+  auto words = FixedBitSet::allocate(5, true);
+  words[0] &= ~((1ULL << 1) | (1ULL << 2)); // Root 1 has no children.
+  auto roots = std::make_shared<LiveDocs>(std::move(words), 5, 3);
+  ChildLiveDocs child(core, roots, "items");
+  auto live = child.get();
+  ASSERT_NE(nullptr, live);
+  EXPECT_EQ(75, live->numLive());
+  for (int32_t row = 0; row < 205; row++) EXPECT_EQ(row < 70 || row >= 200, live->docset().get(row));
+  ChildLiveDocs deep(core, roots, "items.deep");
+  EXPECT_EQ(nullptr, deep.get());
+}
+
 class ScopedRowSpaceTest : public LuxirTest {
 protected:
   std::filesystem::path directoryPath = std::filesystem::temp_directory_path() / ("luxir-views-" + newUuid());
@@ -289,9 +313,12 @@ protected:
 
   void SetUp() override {
     auto schema = std::make_shared<Schema>();
+    schema->fieldTypeMap["_version_"] = std::make_shared<IntFieldType>("_version_", 0);
     schema->fieldTypeMap["number"] = std::make_shared<IntFieldType>("number", FieldType::COLUMN_STORED);
     schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>("body", FieldType::INDEX_DOCS_FREQS, "whitespace");
     schema->fieldTypeMap["label"] = std::make_shared<StrFieldType>("label", FieldType::INDEX_DOCS | FieldType::COLUMN_STORED);
+    schema->fieldTypeMap["embedding"] = std::make_shared<VectorFieldType>("embedding", 1,
+        FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2);
     schema->fieldTypeMap["payload"] = std::make_shared<TextFieldType>("payload", FieldType::STORED, "whitespace");
     CommitSnapshotRegistry snapshots(reserveIncarnation(directory));
     {
@@ -319,6 +346,8 @@ protected:
       segment.creator_epoch = 1;
       segment.schema = *manifest.schema;
       segment.max_doc = segment.live_docs = (int32_t)roots.size();
+      segment.min_version = 100 + (uint64_t)i * 10;
+      segment.max_version = segment.min_version + roots.size() - 1;
       std::vector<FileDescriptor> files;
       if (previous.empty()) {
         PostingsWriter writer(directory, segment.seg_id, 1, (int32_t)roots.size());
@@ -326,19 +355,36 @@ protected:
         if (i < 2) {
           auto child = writer.addSpace(Fixture::CHILD, (int32_t)CHILDREN.size(), Fixture::shape(writer, ends));
           Fixture::fields(writer, child, CHILDREN, std::vector<uint8_t>{2, 2, 1});
+          auto& vectors = writer.addField(child, "embedding");
+          vectors.type = FieldType::VECTOR;
+          vectors.flags = FieldType::COLUMN_STORED | FieldType::FIXED_SIZE;
+          vectors.numValues = 4;
+          vectors.mono2MetaOff = sizeof(float);
+          {
+            auto output = writer.getOutputStream();
+            vectors.columnLoc = output->slocation();
+            const float values[]{0, 1, 10, 11};
+            output->write(values, sizeof(values));
+            vectors.columnMetaOff = sizeof(values);
+          }
+          Fixture::presence(writer, vectors, std::vector<int32_t>{0, 1, 2, 3}, 4);
+          writer.addSpace("items.deep", 4, Fixture::shape(writer, std::vector<int64_t>{1, 2, 3, 4}));
         }
-        writeUnversionedRuns(writer);
+        VersionRunBuilder versions;
+        for (uint32_t row = 0; row < roots.size(); row++) versions.add(row, 100 + (uint64_t)i * 10 + row);
+        writer.writeVersionRuns(versions);
         ASSERT_TRUE(writer.finish(nullptr, &files));
       } else {
         auto& old = previous[(size_t)i];
-        auto liveName = old.live_gen ? Postings::getLiveDocsFileName(
-            Postings::segmentKey(old.seg_id, old.creator_epoch), old.live_gen, old.live_epoch) : std::string{};
-        for (const auto& file : old.files) if (file.name != liveName) {
+        for (const auto& file : old.files) {
           files.push_back({std::string(file.name), file.size, file.xxh3});
         }
+        segment.live_gen = old.live_gen;
+        segment.live_epoch = old.live_epoch;
+        segment.live_docs = old.live_docs;
       }
-      if (i == deletedBundle) {
-        uint64_t word = 13;
+      if (i == deletedBundle && segment.live_gen == 0) {
+        uint64_t word = 14;
         segment.live_gen = segment.live_epoch = 1;
         segment.live_docs = 3;
         LiveDocsWriter::writeLiveDocs(directory, segment.seg_id, 1, 1, 1, FixedBitSet(&word, 4), 4, 3, &files);
@@ -569,23 +615,317 @@ TEST_F(ScopedRowSpaceTest, openingViewsUsesCountsWithoutScanningChildRows) {
   EXPECT_EQ(8, root->view(Fixture::CHILD)->maxDoc());
 }
 
-TEST_F(ScopedRowSpaceTest, refusesChildLivenessAndBirthVersions) {
-  auto req = request();
-  req->topDocs().allQuery().fields({"_version_"});
-  req->execute(root->view(Fixture::CHILD));
-  EXPECT_FALSE(req->ok());
-  EXPECT_EQ(ErrorKind::INTERNAL, req->errorKind());
-  EXPECT_EQ("child_version_unavailable", req->errorCode());
+TEST_F(ScopedRowSpaceTest, childLivenessFollowsRootDeletesAndRetainsOldViews) {
+  auto old = root->view(Fixture::CHILD);
   publish(2); // Deletes in an absent path's bundle do not affect the child view.
   EXPECT_EQ(8, root->view(Fixture::CHILD)->liveDocs());
   publish(0);
-  try {
-    root->view(Fixture::CHILD);
-    FAIL() << "child rows with root deletes must be refused";
-  } catch (const ApiError& error) {
-    EXPECT_EQ(ErrorKind::INTERNAL, error.kind);
-    EXPECT_NE(std::string::npos, std::string(error.what()).find("root deletes"));
+  auto child = root->view(Fixture::CHILD);
+  EXPECT_EQ(6, child->liveDocs());
+  EXPECT_EQ(8, old->liveDocs());
+  EXPECT_FALSE(child->segments()[0].liveDocSet()->get(0));
+  EXPECT_FALSE(child->segments()[0].liveDocSet()->get(1));
+  EXPECT_TRUE(child->segments()[0].liveDocSet()->get(2));
+  auto held = child->segments()[0].liveDocsShared();
+  publish(1);
+  EXPECT_EQ(held, root->view(Fixture::CHILD)->segments()[0].liveDocsShared());
+  EXPECT_EQ(4, root->view(Fixture::CHILD)->liveDocs());
+  auto req = request();
+  req->topDocs().allQuery().countLimit().limit(0);
+  req->topDocs("not_shared").countLimit().limit(0).rawQuery() = qb::boolean(req->mr,
+      {qb::all()}, {}, {qb::match(req->mr, "body", "shared")});
+  req->execute(child);
+  ASSERT_OK(req);
+  EXPECT_EQ(6, req->getMatchCount());
+  EXPECT_EQ(3, req->getMatchCount("not_shared"));
+}
+
+TEST_F(ScopedRowSpaceTest, childBirthVersionsResolveTheirRootRows) {
+  auto req = request();
+  req->topDocs().allQuery().countLimit().fields({"_version_"});
+  req->execute(root->view(Fixture::CHILD));
+  ASSERT_OK(req);
+  auto versions = std::get<api::ColInt>(req->docList()->columns.find("_version_")->kind).v;
+  EXPECT_EQ((std::vector<int64_t>{100, 100, 102, 102, 110, 110, 112, 112}),
+      std::vector<int64_t>(versions.begin(), versions.end()));
+}
+
+TEST_F(ScopedRowSpaceTest, joinReducersComposeWithRootQueries) {
+  for (auto score : {"none", "max"}) {
+    auto req = request();
+    auto join = qb::toParent(req->mr, Fixture::CHILD, qb::match(req->mr, "body", "shared"), score);
+    req->topDocs().withStats().fields({"number"}).rawQuery() = join;
+    req->topDocs("and").countLimit().limit(0).rawQuery() = qb::boolean(req->mr,
+        {join, qb::match(req->mr, "number", "101")});
+    req->topDocs("not").countLimit().limit(0).rawQuery() = qb::boolean(req->mr, {qb::all()}, {}, {join});
+    req->topDocs("filtered").countLimit().matchFilter("number", "103").rawQuery() = join;
+    req->execute(root);
+    ASSERT_OK(req);
+    EXPECT_EQ(4, req->getMatchCount());
+    EXPECT_EQ(2, req->getMatchCount("and"));
+    EXPECT_EQ(8, req->getMatchCount("not"));
+    EXPECT_EQ(2, req->getMatchCount("filtered"));
+    if (score == std::string_view("none")) {
+      auto scores = std::get<api::ColFloat>(req->docList()->columns.find("_score_")->kind).v;
+      for (float value : scores) EXPECT_FLOAT_EQ(1, value);
+    }
   }
+}
+
+TEST_F(ScopedRowSpaceTest, maximumJoinScoreIsTheChildMaximum) {
+  auto children = request();
+  children->topDocs().matchQuery("body", "shared").withStats().fields({"payload"});
+  children->execute(root->view(Fixture::CHILD));
+  ASSERT_OK(children);
+  auto childScores = std::get<api::ColFloat>(children->docList()->columns.find("_score_")->kind).v;
+  auto parents = request();
+  parents->topDocs().withStats().fields({"number"}).rawQuery() = qb::toParent(parents->mr,
+      Fixture::CHILD, qb::match(parents->mr, "body", "shared"));
+  parents->execute(root);
+  ASSERT_OK(parents);
+  auto scores = std::get<api::ColFloat>(parents->docList()->columns.find("_score_")->kind).v;
+  ASSERT_EQ(childScores.size(), scores.size());
+  for (size_t i = 0; i < scores.size(); i++) EXPECT_FLOAT_EQ(childScores[i], scores[i]);
+}
+
+TEST_F(ScopedRowSpaceTest, maximumReducerVisitsAllMatchingSiblings) {
+  auto req = request();
+  req->topDocs().withStats().fields({"number"}).rawQuery() = qb::toParent(req->mr, Fixture::CHILD,
+      qb::rescore(req->mr, qb::exists(req->mr, "number"), "number"));
+  req->execute(root);
+  ASSERT_OK(req);
+  auto scores = std::get<api::ColFloat>(req->docList()->columns.find("_score_")->kind).v;
+  ASSERT_EQ(4u, scores.size());
+  EXPECT_EQ((std::vector<float>{22, 22, 11, 11}), std::vector<float>(scores.begin(), scores.end()));
+}
+
+TEST_F(ScopedRowSpaceTest, consumingChildSelectsWithinOwnerEligibility) {
+  auto req = request();
+  auto& list = req->topDocs().withStats().matchFilter("number", "103").fields({"number"});
+  list.rawQuery() = qb::toParent(req->mr, Fixture::CHILD, qb::knn(req->mr, "embedding", {0}, 2, 0, true));
+  req->execute(root);
+  ASSERT_OK(req);
+  EXPECT_EQ(2, req->getMatchCount());
+  for (const auto& doc : req->getDocs()) EXPECT_TRUE(docEquals(flatdoc("number", (int64_t)103), doc));
+}
+
+TEST_F(ScopedRowSpaceTest, consumingChildUsesDerivedLiveEligibilityAfterDelete) {
+  for (bool deleted : {false, true}) {
+    if (deleted) publish(0);
+    auto req = request();
+    auto join = qb::toParent(req->mr, Fixture::CHILD, qb::knn(req->mr, "embedding", {0}, 2, 0, true));
+    req->topDocs().allQuery().countLimit().limit(0).filter(join);
+    req->execute(root);
+    ASSERT_OK(req);
+    EXPECT_EQ(deleted ? 1 : 2, req->getMatchCount());
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, streamingJoinDoesNotBuildChildLiveBitmap) {
+  publish(0);
+  auto before = fieldMetadataMemory.liveViews.load();
+  auto req = request();
+  req->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr, Fixture::CHILD, qb::all(), "none");
+  auto child = qb::boolean(req->mr, {qb::exists(req->mr, "number")}, {},
+      {qb::match(req->mr, "body", "shared")});
+  req->topDocs("boolean").countLimit().limit(0).rawQuery() = qb::toParent(req->mr, Fixture::CHILD, child);
+  req->execute(root);
+  ASSERT_OK(req);
+  EXPECT_EQ(3, req->getMatchCount());
+  EXPECT_EQ(2, req->getMatchCount("boolean"));
+  EXPECT_EQ(before, fieldMetadataMemory.liveViews.load());
+}
+
+TEST_F(ScopedRowSpaceTest, preparedPredicateChildKeepsRawMembershipAcrossDeletes) {
+  for (bool deleted : {false, true}) {
+    if (deleted) publish(0);
+    auto before = fieldMetadataMemory.liveViews.load();
+    auto req = request();
+    auto inner = qb::toParent(req->mr, "items.deep", qb::all(), "none");
+    auto predicate = qb::boolean(req->mr, {inner}, {}, {}, {qb::match(req->mr, "label", "a")});
+    auto join = qb::toParent(req->mr, Fixture::CHILD, predicate, "none");
+    req->topDocs().countLimit().limit(0).rawQuery() = join;
+    req->topDocs("cached").allQuery().countLimit().limit(0).filter(join);
+    req->execute(root);
+    ASSERT_OK(req);
+    EXPECT_EQ(deleted ? 3 : 4, req->getMatchCount());
+    EXPECT_EQ(deleted ? 3 : 4, req->getMatchCount("cached"));
+    EXPECT_EQ(before, fieldMetadataMemory.liveViews.load());
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, transformedDomainsListFacetAndProjectDistinctOwners) {
+  auto req = request();
+  auto& children = req->topDocs().allQuery().countLimit().fields({"number", "payload"});
+  children.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  children.facet("labels", "label").mincount(1);
+  auto& owners = children.topDocs("owners").allQuery().countLimit().fields({"number"});
+  owners.rawOp().domain.emplace().to_parent = "";
+  req->topDocs("roots").allQuery().countLimit().limit(0);
+  req->execute(root);
+  ASSERT_OK(req);
+  EXPECT_EQ(8, req->getMatchCount());
+  EXPECT_EQ(12, req->getMatchCount("roots"));
+  const auto* list = req->docList();
+  auto* labels = (*list->ops.find("labels"))->facetResult();
+  EXPECT_EQ((std::vector<int64_t>{4, 2}), std::vector<int64_t>(labels->counts.begin(), labels->counts.end()));
+  EXPECT_EQ(4, *(*list->ops.find("owners"))->docList()->found);
+}
+
+TEST_F(ScopedRowSpaceTest, transformedDomainFeedsAChildFieldFacetDirectly) {
+  auto req = request();
+  auto& facet = req->facet("labels", "label").mincount(1);
+  facet.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  req->execute(root);
+  ASSERT_OK(req);
+  auto* labels = (*req->responses[0]->proto.ops.find("labels"))->facetResult();
+  EXPECT_EQ((std::vector<int64_t>{4, 2}), std::vector<int64_t>(labels->counts.begin(), labels->counts.end()));
+}
+
+TEST_F(ScopedRowSpaceTest, inheritedOwnerDomainExcludesWholeFamilies) {
+  auto req = request();
+  auto& owners = req->topDocs().matchQuery("number", "101").countLimit().limit(0);
+  auto& children = owners.topDocs("children").allQuery().countLimit().fields({"number"});
+  children.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  req->execute(root, false);
+  ASSERT_OK(req);
+  EXPECT_EQ(3, req->getMatchCount());
+  auto* childList = (*req->docList()->ops.find("children"))->docList();
+  EXPECT_EQ(4, *childList->found);
+}
+
+TEST_F(ScopedRowSpaceTest, transformedResetKeepsItsRootBucket) {
+  auto req = request();
+  auto& roots = req->facet("numbers", "number").mincount(1);
+  auto& children = roots.topDocs("children").allQuery().countLimit().limit(0);
+  auto& domain = children.rawOp().domain.emplace();
+  domain.to_children = Fixture::CHILD;
+  auto* query = (api::Query*)req->mr.allocate(sizeof(api::Query), alignof(api::Query));
+  new (query) api::Query(qb::all());
+  domain.query = query;
+  req->execute(root, false);
+  ASSERT_OK(req);
+  auto* numbers = (*req->responses[0]->proto.ops.find("numbers"))->facetResult();
+  auto& lists = std::get<api::ArrVal>((**numbers->ops.find("children")).kind).v;
+  ASSERT_EQ(3u, lists.size());
+  EXPECT_EQ(4, *lists[0].docList()->found);
+  EXPECT_EQ(0, *lists[1].docList()->found);
+  EXPECT_EQ(4, *lists[2].docList()->found);
+}
+
+TEST_F(ScopedRowSpaceTest, transformedResetReappliesOwnerFiltersInTheirOwnSpace) {
+  auto req = request();
+  auto& owners = req->topDocs().matchQuery("number", "101").matchFilter("number", "103").countLimit().limit(0);
+  auto& labels = owners.facet("labels", "label").mincount(0);
+  auto& children = labels.topDocs("children").allQuery().countLimit().limit(0);
+  auto& domain = children.rawOp().domain.emplace();
+  domain.to_children = Fixture::CHILD;
+  domain.apply_parent_filters = true;
+  auto* query = (api::Query*)req->mr.allocate(sizeof(api::Query), alignof(api::Query));
+  new (query) api::Query(qb::all());
+  domain.query = query;
+  req->execute(root, false);
+  ASSERT_OK(req);
+  EXPECT_EQ(0, req->getMatchCount());
+  auto* facets = (*req->docList()->ops.find("labels"))->facetResult();
+  auto& lists = std::get<api::ArrVal>((**facets->ops.find("children")).kind).v;
+  ASSERT_EQ(1u, lists.size());
+  EXPECT_EQ(4, *lists[0].docList()->found);
+}
+
+TEST_F(ScopedRowSpaceTest, jsonSurfaceCrossesViewsAndKeepsEmptyParentPath) {
+  auto req = request();
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"json({"ops":{
+    "q":{"top_docs":{"query":{"to_parent":{"path":"items","score":"none",
+      "query":{"match":{"field":"body","val":"shared"}}}},"count_limit":-1,"limit":0}},
+    "children":{"domain":{"to_children":"items"},"top_docs":{"count_limit":-1,"limit":0,
+      "ops":{"owners":{"domain":{"to_parent":""},"top_docs":{"count_limit":-1,"limit":0}}}}}
+  }})json", req->mr));
+  req->execute(root);
+  ASSERT_OK(req);
+  EXPECT_EQ(4, req->getMatchCount());
+  EXPECT_EQ(8, req->getMatchCount("children"));
+  EXPECT_EQ(4, *(*req->docList("children")->ops.find("owners"))->docList()->found);
+}
+
+TEST_F(ScopedRowSpaceTest, relationsAreSharedByPairInEitherRequestView) {
+  for (auto primary : {root, root->view(Fixture::CHILD)}) {
+    auto req = request();
+    req->reader = primary;
+    auto& many = req->pinView(Fixture::CHILD);
+    auto& one = req->pinView("");
+    auto& relation = req->ownershipRelation(*many, *one);
+    EXPECT_EQ(&relation, &req->ownershipRelation(*many, *one));
+    auto& deep = req->pinView("items.deep");
+    EXPECT_NE(&relation, &req->ownershipRelation(*deep, *one));
+    RowRelation::Mapping expand{&relation, RowRelation::Direction::EXPAND};
+    RowRelation::Mapping project{&relation, RowRelation::Direction::PROJECT};
+    EXPECT_EQ(one.get(), &expand.source());
+    EXPECT_EQ(many.get(), &project.source());
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, noneReducerKeepsReadsStableAcrossNextAndAdvance) {
+  auto many = root->view(Fixture::CHILD);
+  MemPool pool;
+  Query::Context context(pool, *many);
+  OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+  AllQuery all;
+  auto* weight = all.createWeight(context, 0);
+  for (bool seek : {false, true}) {
+    auto* input = weight->scorerSupplier(pool, many->segments()[0]);
+    auto* supplier = relation.reduce(pool, 0, *input, nullptr, false, 2.0f);
+    auto* scorer = buildScorerForTests(pool, *supplier, 4);
+    ASSERT_NE(nullptr, scorer);
+    EXPECT_EQ(0, scorer->next());
+    for (int repeat = 0; repeat < 3; repeat++) {
+      EXPECT_EQ(0, scorer->docId());
+      EXPECT_FLOAT_EQ(2.0f, scorer->score());
+    }
+    EXPECT_EQ(2, seek ? scorer->advance(1) : scorer->next());
+    for (int repeat = 0; repeat < 3; repeat++) {
+      EXPECT_EQ(2, scorer->docId());
+      EXPECT_FLOAT_EQ(2.0f, scorer->score());
+    }
+    EXPECT_EQ(PostingsReader::END, seek ? scorer->advance(3) : scorer->next());
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, reducersShareFilterCacheMembership) {
+  uint64_t hits = 0;
+  for (auto reducer : {"none", "max"}) {
+    auto req = request();
+    req->topDocs().allQuery().countLimit().limit(0).filter(qb::toParent(req->mr,
+        Fixture::CHILD, qb::match(req->mr, "label", "a"), reducer));
+    req->execute(root);
+    ASSERT_OK(req);
+    EXPECT_EQ(4, req->getMatchCount());
+    if (reducer == std::string_view("max")) {
+      EXPECT_GT(cache->counters().hits, hits);
+    }
+    hits = cache->counters().hits;
+  }
+}
+
+TEST_F(ScopedRowSpaceTest, warmedJoinAndChildFiltersStayCorrectAfterDeletes) {
+  for (bool afterDelete : {false, true}) {
+    if (afterDelete) publish(0);
+    for (int repeat = 0; repeat < 2; repeat++) {
+      auto owners = request();
+      owners->topDocs().allQuery().countLimit().limit(0).filter(qb::toParent(owners->mr,
+          Fixture::CHILD, qb::match(owners->mr, "label", "a"), "none"));
+      owners->execute(root);
+      ASSERT_OK(owners);
+      EXPECT_EQ(afterDelete ? 3 : 4, owners->getMatchCount());
+      auto children = request();
+      children->topDocs().allQuery().countLimit().limit(0).matchFilter("label", "a");
+      children->execute(root->view(Fixture::CHILD));
+      ASSERT_OK(children);
+      EXPECT_EQ(afterDelete ? 3 : 4, children->getMatchCount());
+    }
+  }
+  EXPECT_GT(cache->counters().hits, 0u);
 }
 
 } // namespace

@@ -21,6 +21,8 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ToParentQuery.h"
+#include "luxir/search/SearchRequest.h"
 #include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
@@ -458,6 +460,34 @@ luxir::Query* ProtobufQueryParser::parseExpr(
   return parse(*root);
 }
 
+luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery& query) {
+  if (!context.request || !context.reader) throw RequestError("to_parent requires a searched reader");
+  if (!query.query || std::holds_alternative<std::monostate>(query.query->kind)) {
+    throw RequestError("to_parent requires a child query");
+  }
+  if (query.path.empty() || query.path == context.reader->path()) {
+    throw RequestError("to_parent requires a descendant path");
+  }
+  auto path = query.path;
+  while (!path.empty() && path != context.reader->path()) path = spaceParentPath(path);
+  if (path != context.reader->path()) throw RequestError("to_parent requires a descendant path");
+  if (!query.score.empty() && query.score != "none" && query.score != "max") {
+    throw RequestError("to_parent score must be none or max");
+  }
+  auto& req = *context.request;
+  auto& destination = req.pinView(context.reader->path());
+  auto& source = req.pinView(query.path);
+  auto& relation = req.ownershipRelation(*source, *destination);
+  auto* planning = req.createPlanningContext(*source);
+  auto* previous = context.reader;
+  auto* collapse = context.collapse;
+  auto restore = scope_guard([&]() noexcept { context.reader = previous; context.collapse = collapse; });
+  context.reader = source.get();
+  context.collapse = nullptr;
+  auto* child = parse(*query.query);
+  return pool.make<ToParentQuery>(child, *planning, relation, query.score != "none");
+}
+
 luxir::Query* ProtobufQueryParser::parseConstantScore(
     const luxir::api::ConstantScoreQuery& constantScoreQuery) {
   if (!constantScoreQuery.query.has_value() ||
@@ -667,6 +697,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::KnnQuery& k) -> luxir::Query* { return parseKnn(k); },
     [&](const luxir::api::BooleanQuery& b) -> luxir::Query* { return parseBoolean(b); },
     [&](const luxir::api::ConstantScoreQuery& c) -> luxir::Query* { return parseConstantScore(c); },
+    [&](const luxir::api::ToParentQuery& q) -> luxir::Query* { return parseToParent(q); },
     [&](const luxir::api::BoostQuery& b) -> luxir::Query* { return parseBoost(b); },
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);

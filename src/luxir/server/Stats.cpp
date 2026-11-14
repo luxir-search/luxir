@@ -55,7 +55,9 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   fields.entry_bytes = fieldMetadataMemory.entryBytes.load(std::memory_order_relaxed);
   fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
   fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
-  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes;
+  fields.live_views = fieldMetadataMemory.liveViews.load(std::memory_order_relaxed);
+  fields.live_view_bytes = fieldMetadataMemory.liveViewBytes.load(std::memory_order_relaxed);
+  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes + fields.live_view_bytes;
   auto process = processAllocatorStats();
   if (!process) return;
   auto& jemalloc = memory.jemalloc.emplace();

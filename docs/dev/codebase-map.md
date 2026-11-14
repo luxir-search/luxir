@@ -35,7 +35,7 @@ locations, browse `src/luxir/<area>/`.
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
-   - `IndexReader` is for reading a whole index and contains a leaf per index segment;
+   - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
      a reopen shares each unchanged `SegmentCore` and live docs with the previous
      snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
@@ -68,7 +68,7 @@ locations, browse `src/luxir/<area>/`.
 
 4. **Query System** (`src/luxir/query/`)
 
-   Query execution flows from an index-independent `Query` through a
+   Query execution flows from a logical `Query` through a
    cross-segment `Weight`, then through a per-segment `ScorerSupplier` that
    resolves retained construction plans for the cursor, docs-only, bulk, or
    constant-count product the consumer will execute. The Overview in
@@ -85,6 +85,14 @@ locations, browse `src/luxir/<area>/`.
    Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
    and white-box tests include.
 
+   - `ToParentQuery` reduces child matches onto owners through `RowRelation`.
+     Ordinary children stream raw membership; domain-consuming children prepare
+     against mapped live eligibility. `RowRelation::Mapping` carries an
+     expand/project direction across operation domains. `OwnershipRelation` owns the shared per-leaf mappers and reducing
+     scorer. Ownership-specific mapping stays outside
+     generic weights and domain scope.
+   - Child liveness is derived lazily from root deletes through ownership ranges;
+     metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full

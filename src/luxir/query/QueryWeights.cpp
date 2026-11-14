@@ -13,6 +13,7 @@
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ToParentQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -158,6 +159,10 @@ Query::Weight* ConstantScoreQuery::createWeight(Context& context, int32_t flags,
                                                 float multiplier) {
   return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
                                                        multiplier);
+}
+
+Query::Weight* ToParentQuery::createWeight(Context& context, int32_t flags, float multiplier) {
+  return context.pool.make<ToParentQuery::Weight>(context, *this, flags, multiplier);
 }
 
 ExistsQuery::Weight* ExistsQuery::createWeight(

@@ -20,6 +20,7 @@ namespace luxir {
 class CollapsePlan;
 class IndexReader;
 class LuxirNode;
+class SearchRequest;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
@@ -27,6 +28,7 @@ class LuxirNode;
 // budget and operator rules. This is the request-scoped parse/build context
 // from the query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
+  SearchRequest* request = nullptr;
   const CollapsePlan* collapse = nullptr;
   // The searched reader, when there is one: wildcard field lists reuse its
   // schema-specific search catalog.

@@ -37,6 +37,8 @@ class LiveDocs {
 private:
   BitDocSet docSet;                                   // The actual bitset (memory mapped)
   std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
+  std::unique_ptr<uint64_t[]> ownedWords;
+  size_t derivedBytes = 0;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
 
@@ -47,6 +49,9 @@ public:
            std::shared_ptr<InputFile>&& file, int32_t numLive)
       : docSet(FixedBitSet(mappedMemory, maxDocCount), numLive),
         deleteFile(std::move(file)) {}
+
+  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive);
+  ~LiveDocs();
 
   // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
@@ -92,6 +97,21 @@ public:
   }
 };
 
+// One lazy value for a path, bundle and root live generation. Shared by leaves
+// of successive snapshots; constructing a view does not construct its bitmap.
+class ChildLiveDocs {
+  std::shared_ptr<SegmentCore> core;
+  std::shared_ptr<LiveDocs> root;
+  std::string path;
+  std::atomic<int32_t> knownCard{-1};
+  SharedLazyCell<LiveDocs> value;
+
+public:
+  ChildLiveDocs(std::shared_ptr<SegmentCore> core, std::shared_ptr<LiveDocs> root,
+                std::string path) : core(std::move(core)), root(std::move(root)), path(std::move(path)) {}
+  std::shared_ptr<LiveDocs> get();
+  int32_t knownCount() const noexcept { return knownCard.load(std::memory_order_acquire); }
+};
 
   class Segment {
     const std::shared_ptr<SegmentCore> sharedSegmentCore;
@@ -99,6 +119,7 @@ public:
     const int32_t rowCount;
     const int32_t liveCount;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
+    const std::shared_ptr<ChildLiveDocs> childLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
   public:
     friend class IndexReader;
@@ -119,11 +140,13 @@ public:
 
     Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<LiveDocs>&& liveDocs,
               std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
-              SegmentInfo segInfo, int64_t base, int ord, PostingsReader* spaceReader)
+              SegmentInfo segInfo, int64_t base, int ord, PostingsReader* spaceReader,
+              std::shared_ptr<ChildLiveDocs> childLiveDocs = {})
             :  sharedSegmentCore(std::move(segmentCore)), spaceReader(spaceReader),
                 rowCount(spaceReader ? spaceReader->maxDoc() : 0),
                 liveCount(liveDocs ? liveDocs->numLive() : rowCount),
                 sharedLiveDocs(std::move(liveDocs)),
+                childLiveDocs(std::move(childLiveDocs)),
                 sharedAuxReaders(std::move(auxReaders)),
                 segInfo(segInfo), base(base), ord(ord) {
       assert(!sharedLiveDocs || sharedLiveDocs->size() == rowCount);
@@ -149,22 +172,31 @@ public:
 
     // Whether this space has deleted rows. Root writers create a live-docs
     // generation only with at least one deletion. Never opens files.
-    bool hasDeletes() const noexcept { return liveCount != rowCount; }
+    bool hasDeletes() const { return numLive() != rowCount; }
+
+    // Metadata probes must not construct a derived live view. Until it has
+    // been used, a child count is an interval rather than an exact count.
+    std::pair<int32_t, int32_t> liveCountBounds() const noexcept {
+      int32_t count = childLiveDocs ? childLiveDocs->knownCount() : liveCount;
+      return count < 0 ? std::pair{0, rowCount} : std::pair{count, count};
+    }
+
+    bool mayHaveDeletes() const noexcept { return liveCountBounds().first != rowCount; }
 
     // returns null if all docs are live (no deletes)
-    LiveDocs* liveDocs() const noexcept {
-      return sharedLiveDocs.get();
+    LiveDocs* liveDocs() const {
+      return childLiveDocs ? childLiveDocs->get().get() : sharedLiveDocs.get();
     }
 
     // The segment's live docset, or null when there are no deletes.
-    BitDocSet* liveDocSet() const noexcept {
+    BitDocSet* liveDocSet() const {
       auto* live = liveDocs();
       return live ? &live->docset() : nullptr;
     }
 
     // shared form of liveDocs(), for callers that cache views into its mapped bits
-    std::shared_ptr<LiveDocs> liveDocsShared() const noexcept {
-      return sharedLiveDocs;
+    std::shared_ptr<LiveDocs> liveDocsShared() const {
+      return childLiveDocs ? childLiveDocs->get() : sharedLiveDocs;
     }
 
     std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
@@ -183,13 +215,15 @@ public:
     }
 
     // Number of deleted rows in this space.
-    int32_t numDeletes() const noexcept {
+    int32_t numDeletes() const {
       return maxDoc() - numLive();
     }
 
     // Number of live rows in this space.
-    int32_t numLive() const noexcept {
-      return liveCount;
+    int32_t numLive() const {
+      if (!childLiveDocs) return liveCount;
+      auto* live = liveDocs();
+      return live ? live->numLive() : rowCount;
     }
   };
 
@@ -318,6 +352,7 @@ private:
     std::shared_ptr<FieldRecords> fields;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
+    OnceFlag liveOnce;
 
     void buildFieldCatalogs();
     std::span<const ProjectableField> projectableFields() {
@@ -331,12 +366,17 @@ private:
   };
 
   struct PhysicalCore {
+    struct ChildLives {
+      std::mutex mutex;
+      std::map<std::string, std::shared_ptr<ChildLiveDocs>, std::less<>> paths;
+    };
     struct Bundle {
       std::shared_ptr<SegmentCore> core;
       std::shared_ptr<LiveDocs> live;
       std::vector<std::shared_ptr<AuxReader>> aux;
       Segment::SegmentInfo info;
       int32_t ord;
+      std::shared_ptr<ChildLives> childLives;
     };
     std::vector<Bundle> bundles;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
@@ -470,7 +510,13 @@ public:
     return space->totalMaxDoc;
   }
 
-  int64_t liveDocs() const noexcept {
+  int64_t liveDocs() const {
+    if (!space->path.empty()) {
+      callOnce(space->liveOnce, [&] {
+        space->livedocs = 0;
+        for (const auto& segment : space->segs) space->livedocs += segment.numLive();
+      });
+    }
     return space->livedocs;
   }
   

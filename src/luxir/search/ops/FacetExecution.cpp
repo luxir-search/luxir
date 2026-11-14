@@ -87,17 +87,18 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
   SearchOp::SegmentStateRetention retain(children, segments);
   for (size_t bucket = 0; bucket < blockSize; bucket++) {
     open(bucket);
-    auto& first = bindings[bucket * children.size()];
     std::vector<DomainHandle> base;
     std::vector<std::pair<BucketDomainPlan*, std::vector<std::vector<DomainHandle>>>> routed;
     for (size_t child = 0; child < children.size(); child++) {
       auto& binding = bindings[bucket * children.size() + child];
       auto* plan = children[child]->bucketDomain;
       if (!plan) {
-        binding->calcAll(nullptr, inputs[bucket]);
+        binding->acceptAll(nullptr, inputs[bucket]);
         continue;
       }
-      if (base.empty() && plan->variants.hasResetVariants()) base = first->structuralDomains();
+      if (base.empty() && plan->variants.hasResetVariants()) {
+        base = binding->structuralDomains(parent.getOp().view, binding->inputConstraint());
+      }
       auto found = std::ranges::find_if(routed, [&](const auto& entry) { return entry.first == plan; });
       if (found == routed.end()) {
         auto resetBase = base.empty() ? std::span<const DomainHandle>(inputs[bucket])
@@ -112,13 +113,14 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
         };
         routed.emplace_back(plan, plan->variants.produceBucketDomains(
                                       reader, *plan->planning, inputs[bucket], resetBase, false,
-                                      &parent.getOp().req, tracker, sourcesFor, first->structuralFinish()));
+                                      &parent.getOp().req, tracker, sourcesFor,
+                                      binding->structuralFinish(parent.getOp().view, binding->inputConstraint())));
         found = std::prev(routed.end());
       }
       size_t variant = plan->variants.variantForChild(children[child]->name);
       std::vector<DomainHandle> domains;
       for (auto& segment : found->second) domains.push_back(segment[variant]);
-      binding->calcAll(nullptr, domains);
+      binding->acceptAll(nullptr, domains);
     }
     close(bucket);
     inputs[bucket].clear();
@@ -135,7 +137,7 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
     auto& binding = bindings[child];
     auto* plan = children[child]->bucketDomain;
     if (!plan) {
-      binding->calc(nullptr, (int32_t)segnum, domain);
+      binding->accept(nullptr, (int32_t)segnum, domain);
       continue;
     }
     auto found = std::ranges::find_if(routed, [&](const auto& entry) { return entry.first == plan; });
@@ -143,8 +145,8 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
       DomainHandle base = domain;
       if (plan->variants.hasResetVariants()) {
         auto& seg = reader.segments()[(size_t)segnum];
-        base = DomainHandle::pinned(seg.liveDocSet(), parent.getOp().req.reader).scoped(seg);
-        if (auto path = binding->structuralConstraint()) {
+        base = DomainHandle::pinned(seg.liveDocSet(), parent.getOp().view).scoped(seg);
+        if (auto path = binding->inputConstraint()) {
           base = path->prefix((int32_t)segnum, std::move(base));
         }
       }
@@ -155,7 +157,7 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
       found = std::prev(routed.end());
     }
     size_t variant = plan->variants.variantForChild(children[child]->name);
-    binding->calc(nullptr, (int32_t)segnum, found->second[variant]);
+    binding->accept(nullptr, (int32_t)segnum, found->second[variant]);
   }
 }
 

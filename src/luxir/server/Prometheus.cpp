@@ -105,7 +105,8 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_schema_cache_bytes", "Estimated parsed schema payload held by snapshots and readers.", (double)m.schema_cache_bytes);
   const auto& f = m.field_metadata;
   for (auto [part, count, bytes] : {std::tuple{"directory", f.directories, f.directory_bytes}, {"page", f.pages, f.page_bytes},
-                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes}}) {
+                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes},
+                                    {"live_view", f.live_views, f.live_view_bytes}}) {
     auto labels = PrometheusText::label("part", part);
     r.gauge("luxir_field_metadata_objects", "Cached field metadata objects.", (double)count, labels);
     r.gauge("luxir_field_metadata_bytes", "Cached field metadata payload bytes, excluding allocator overhead.", (double)bytes, labels);

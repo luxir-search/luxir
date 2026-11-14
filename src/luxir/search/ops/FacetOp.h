@@ -119,9 +119,9 @@ public:
     return SegFieldInfo::column(segInfos.at((size_t)segnum));
   }
 
-  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
+  FacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing)
-    : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
+    : SearchOp(req, view, facetName), reader(*view), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
@@ -898,7 +898,7 @@ public:
                  std::shared_ptr<OrdMap> ordMap = {}, FacetDimension values = {},
                  const StructuralConstraint* structural = nullptr)
         : Calc(op, parent, slot, numSlots, structural), ordMap(std::move(ordMap)),
-          driver(op.req.reader->segments().size(),
+          driver(op.view->segments().size(),
               [this](std::unique_ptr<DistinctFacetCounts> data) { result(std::move(data)); }),
           domainResource(op.req.memoryTracker, std::format("facet '{}' domains", op.name)), input(&domainResource) {
       driver.setCreator([this]() { return new DistinctFacetCounts(this->op.req.memoryTracker,
@@ -906,13 +906,13 @@ public:
       if constexpr (Ordinal) valueDimension = {true, 0, (uint64_t)(this->ordMap ? this->ordMap->numOrds() : 0)};
       else valueDimension = values;
       mode = DistinctFacetCounts::select(valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous);
-      if (!this->fieldOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!this->fieldOp().subOps.empty()) input.resize(op.view->segments().size());
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
       unused(tg);
       if (segnum == -1) { driver.completeEmpty(); return; }
-      DocSet* docs = domain.get(op.req.reader->segments()[(size_t)segnum]);
+      DocSet* docs = domain.get(op.view->segments()[(size_t)segnum]);
       if (!input.empty()) input[(size_t)segnum] = std::move(domain);
       driver.contribute([&](DistinctFacetCounts& data) { collect(data, segnum, docs); });
     }
@@ -921,11 +921,11 @@ public:
   };
 
 public:
-  FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+  FieldFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing, std::span<const int64_t> selectedInts,
     std::span<const std::string_view> selectedStrings) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing),
+  FacetReq(req, view, fieldName, facetName, limit, minCount, missing),
   fieldFacet(fieldFacet), selectedInts(selectedInts),
   selectedStrings(selectedStrings) {}
 
@@ -1004,10 +1004,10 @@ public:
     bool useVector = false;
   };
 
-  IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
+  IntFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::span<const int64_t> selected) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 selected, {}) {
     auto range = scanGlobalRange(reader, segInfos);
     globalMin = range.min;
@@ -1058,11 +1058,11 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableIntFacet> m){ facetResult(*m); }) {
-      if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!thisOp().subOps.empty()) input.resize(op.view->segments().size());
       if (!thisOp().inlineSubOps.empty()) {
-        inlineDriver.emplace(op.req.reader->segments().size(),
+        inlineDriver.emplace(op.view->segments().size(),
             [this](std::unique_ptr<MergeableFieldFacetInline> m) {
               facetInlineResult(std::move(m));
             });
@@ -1079,7 +1079,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
-      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!thisOp().inlineSubOps.empty()) {
         if (segnum == -1) {
@@ -1336,11 +1336,11 @@ class FullTextFacetReq : public FieldFacetReq {
   };
 
 public:
-  FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+  FullTextFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing,
     std::span<const std::string_view> selected) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected) {}
 
   bool canEmitAsBucketChild() const override {
@@ -1355,11 +1355,11 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableStrFacet> m){ facetResult(*m); }) {
-      if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!thisOp().subOps.empty()) input.resize(op.view->segments().size());
       if (!thisOp().inlineSubOps.empty()) {
-        inlineDriver.emplace(op.req.reader->segments().size(),
+        inlineDriver.emplace(op.view->segments().size(),
             [this](std::unique_ptr<MergeableTextInline> m) {
               facetInlineResult(std::move(m));
             });
@@ -1379,7 +1379,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
-      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (inlineDriver.has_value()) {
         if (segnum == -1) {
@@ -1590,11 +1590,11 @@ public:
   };
 
   FixedBucketFacetReq(
-      SearchRequest& req, std::string_view fieldName,
+      SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view fieldName,
       std::string_view facetName, int64_t minCount, bool missing,
       size_t numBuckets,
       std::span<const size_t> selectedBuckets)
-    : FacetReq(req, fieldName, facetName, -1, minCount, missing),
+    : FacetReq(req, view, fieldName, facetName, -1, minCount, missing),
       numBuckets(numBuckets), selectedBuckets(selectedBuckets) {}
 
   size_t bucketCount() const { return numBuckets; }
@@ -1790,7 +1790,7 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : Calculator(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<Data> merged) {
                  if constexpr (Storage::growing) {
                    auto release = scope_guard([&]() noexcept { input.clear(); });
@@ -1805,7 +1805,7 @@ public:
         }
       }
       if (!fixedOp().subOps.empty() || fixedOp().requiresWholeReaderDomain()) {
-        input.resize(op.req.reader->segments().size());
+        input.resize(op.view->segments().size());
       }
     }
 
@@ -1838,13 +1838,13 @@ public:
         driver.completeEmpty();
         return;
       }
-      if (segnum >= 0) domainHandle.assertScope(op.req.reader->segments()[(size_t)segnum]);
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!input.empty()) {
         if constexpr (Storage::growing) {
           if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
               std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
-          domain = domainHandle.get(op.req.reader->segments()[(size_t)segnum]);
+          domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
           if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
               domain->ramBytesUsed(), std::memory_order_relaxed);
         }
@@ -1874,7 +1874,7 @@ public:
       std::copy(domains.begin(), domains.end(), input.begin());
       for (size_t i = 0; i < input.size(); i++) {
         assert(input[i].isDeliverable());
-        input[i].assertScope(op.req.reader->segments()[i]);
+        input[i].assertScope(op.view->segments()[i]);
       }
       prepareAndDispatch(tg);
     }
@@ -2086,22 +2086,22 @@ public:
 
   std::span<const int64_t> bucketFences() const { return fences; }
 
-  IntFacetRangeReq(SearchRequest& req,
+  IntFacetRangeReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
     int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
-        req, fieldName, facetName, minCount, missing,
+        req, view, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
     fences(fences), affineGap(affineGap),
     affine(affine), runs(runs) {}
 
-  IntFacetRangeReq(SearchRequest& req,
+  IntFacetRangeReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
       std::string_view fieldName, std::string_view facetName,
       RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
       int64_t minCount, bool missing)
-    : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
+    : FixedBucketFacetReq(req, view, fieldName, facetName, minCount, missing, 0, {}),
       affineGap(0), affine(false), grid(std::move(grid)),
       wideningStart(start), wideningEnd(end) {}
 
@@ -2308,11 +2308,11 @@ class QueryFacetReq : public FixedBucketFacetReq {
 
 public:
   QueryFacetReq(
-      SearchRequest& req, const ReqQueryFacet& queryFacet,
+      SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
       std::string_view facetName, std::span<Query*> bucketQueries,
       std::span<Query::Weight*> bucketWeights)
     : FixedBucketFacetReq(
-          req, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
+          req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
       queryFacet(queryFacet), bucketQueries(bucketQueries),
       bucketWeights(bucketWeights),
       preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
@@ -2398,7 +2398,7 @@ public:
         domains.push_back(domain.get());
       }
       Query::Weight::PrepareContext context{
-        *queryOp().req.reader,
+        *queryOp().view,
         std::span<DocSet* const>(domains.data(), domains.size()),
         tg != nullptr, &queryOp().req};
       preparedSources = QueryPrep::prepareSources(
