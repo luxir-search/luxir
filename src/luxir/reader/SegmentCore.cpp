@@ -8,6 +8,8 @@
 #include <format>
 #include <stdexcept>
 #include "Postings.h"
+#include "OwnershipShape.h"
+#include <algorithm>
 
 namespace luxir {
 
@@ -30,13 +32,21 @@ void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
 
 } // namespace
 
+void SegmentCore::checkLocation(seg_location loc, uint64_t length) const {
+  uint32_t fnum = loc.filenum();
+  if (fnum >= files.size() || !files[fnum] || loc.offset() > files[fnum]->size()
+      || length > files[fnum]->size() - loc.offset()) {
+    throw std::runtime_error("segment data location out of range");
+  }
+}
+
 // Every region a field's metadata points to lies within one of the segment's files.
 void SegmentCore::checkFieldLocations(const SegFieldInfo& field) const {
   auto check = [&](seg_location loc, uint64_t length = 0) {
     if (loc.isNull()) return;
-    uint32_t fnum = loc.filenum();
-    if (fnum >= files.size() || !files[fnum] || loc.offset() > files[fnum]->size()
-        || length > files[fnum]->size() - loc.offset()) {
+    try {
+      checkLocation(loc, length);
+    } catch (const std::runtime_error&) {
       throw std::runtime_error(std::format(
           "Field '{}' of a segment is corrupt or in an unsupported format: data location out of range",
           std::string_view(field.fieldname)));
@@ -55,6 +65,69 @@ void SegmentCore::checkFieldLocations(const SegFieldInfo& field) const {
   check(field.monoLoc, field.monoMetaOff);
   check(field.mono2Loc, field.mono2MetaOff);
   check(field.valDocLoc, field.valDocMetaOff);
+}
+
+struct SegmentCore::ChildSpace {
+  PostingsReader reader;
+  OwnershipShape shape;
+
+  ChildSpace(SegmentCore& core, SpaceOrdinal ordinal, OwnershipShape shape)
+      : reader(core, ordinal), shape(std::move(shape)) {}
+};
+
+SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
+    : segId(segId), creatorEpoch(creatorEpoch), root(*this, SpaceOrdinal::ROOT) {}
+
+SegmentCore::~SegmentCore() = default;
+
+std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
+  auto found = std::lower_bound(spaceDescriptors.begin(), spaceDescriptors.end(), path,
+                               [](const auto& space, std::string_view target) { return space.path < target; });
+  if (found == spaceDescriptors.end() || found->path != path) return {};
+  return (SpaceOrdinal)(found - spaceDescriptors.begin());
+}
+
+PostingsReader* SegmentCore::spaceReader(SpaceOrdinal ordinal) noexcept {
+  if (ordinal == SpaceOrdinal::ROOT) return &root;
+  return (size_t)ordinal < spaceDescriptors.size() ? &children[(size_t)ordinal - 1]->reader : nullptr;
+}
+
+PostingsReader* SegmentCore::spaceReader(std::string_view path) noexcept {
+  auto ordinal = spaceOrdinal(path);
+  return ordinal ? spaceReader(*ordinal) : nullptr;
+}
+
+const OwnershipShape* SegmentCore::ownership(SpaceOrdinal child) const noexcept {
+  if (child == SpaceOrdinal::ROOT) return nullptr;
+  return (size_t)child < spaceDescriptors.size() ? &children[(size_t)child - 1]->shape : nullptr;
+}
+
+const OwnershipShape* SegmentCore::ownership(std::string_view path) const noexcept {
+  auto ordinal = spaceOrdinal(path);
+  return ordinal ? ownership(*ordinal) : nullptr;
+}
+
+void SegmentCore::initializeSpace(PostingsReader& reader, const SpaceDescriptor& space) {
+  // Field offset tables live in the base footer, before segment metadata.
+  if (space.fieldOffsets.filenum() != 0 || space.fieldCount > INT32_MAX
+      || space.fieldOffsets.offset() < Postings::LUXIR_HEADER.size()
+      || (space.fieldOffsets.offset() & 3) != 0
+      || space.fieldOffsets.offset() > (uint64_t)segInfoOffset
+      || ((uint64_t)space.fieldCount + 1) * sizeof(uint32_t) > (uint64_t)segInfoOffset - space.fieldOffsets.offset()) {
+    throw std::runtime_error("invalid row space field table");
+  }
+  auto fields = getInputStream(0);
+  auto offsetsLoc = (int64_t)space.fieldOffsets.offset();
+  const auto* offsets = (const uint32_t*)fields.ptr(offsetsLoc);
+  fields.seek(offsetsLoc + (int64_t)space.fieldCount * sizeof(uint32_t));
+  if (fields.checkedInt() != (int32_t)space.fieldCount) throw std::runtime_error("inconsistent row space field count");
+  // Each offset is back from the table to a field's metadata, which starts with its name.
+  for (uint32_t i = 0; i < space.fieldCount; i++) {
+    if (offsets[i] == 0 || offsets[i] > offsetsLoc - (int64_t)Postings::LUXIR_HEADER.size()) {
+      throw std::runtime_error("invalid row space field offset");
+    }
+  }
+  reader.initialize(space.maxDoc, offsetsLoc, offsets, (int32_t)space.fieldCount);
 }
 
 // Initialize from files, returns false if missing files and missingFileOK=true
@@ -78,6 +151,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
 
   // File 0 ends with: ... field metadata, field offsets table, field count,
   // segment info, segment info size. See PostingsWriter.writeSegmentInfo.
+  // Each space has its own field table; segment info catalogs their locations.
   const int64_t headerSize = (int64_t)Postings::LUXIR_HEADER.size();
   if (firstIS.size() < headerSize + 2 * (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no segment info");
   firstIS.seek(firstIS.size() - sizeof(int32_t));
@@ -109,6 +183,37 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
     }
     versionsLoc = seg_location::checkedRead(segInfo);
     versionCount = segInfo.checkedVint();
+    uint32_t spaceCount = segInfo.checkedVint();
+    if (spaceCount == 0 || spaceCount > segInfo.left()) throw std::runtime_error("invalid row space count");
+    spaceDescriptors.reserve(spaceCount);
+    for (uint32_t i = 0; i < spaceCount; i++) {
+      SpaceDescriptor space;
+      uint32_t pathSize = segInfo.checkedVint();
+      segInfo.require(pathSize);
+      space.path.assign(segInfo.ptr(), pathSize);
+      segInfo.skip(pathSize);
+      uint32_t count = segInfo.checkedVint();
+      if (count > INT32_MAX || (i != 0 && count >= (uint32_t)PostingsReader::HARD_MAX_DOC)) {
+        throw std::runtime_error("row space count exceeds row id limit");
+      }
+      space.maxDoc = (int32_t)count;
+      space.fieldOffsets = seg_location::checkedRead(segInfo);
+      space.fieldCount = segInfo.checkedVint();
+      if ((i == 0 && (!space.path.empty() || space.maxDoc != maxdoc))
+          || (i != 0 && (space.path <= spaceDescriptors.back().path || count == 0))) {
+        throw std::runtime_error("row space catalog is not strictly sorted from root");
+      }
+      if (i != 0) {
+        OwnershipDescriptor shape;
+        shape.ends = seg_location::checkedRead(segInfo);
+        shape.endsMetaOff = (int64_t)segInfo.checkedVlong();
+        shape.owners = seg_location::checkedRead(segInfo);
+        shape.ownersMetaOff = (int64_t)segInfo.checkedVlong();
+        space.ownership = shape;
+      }
+      spaceDescriptors.push_back(space);
+    }
+    if (segInfo.left() != 0) throw std::runtime_error("trailing segment catalog bytes");
   } catch (const std::runtime_error& e) {
     invalidSegment(segInfoFile, e.what());
   }
@@ -140,21 +245,17 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
   } else if (maxdoc != 0 || versionCount != 0 || !versionsLoc.isNull()) {
     throw std::runtime_error("Segment has invalid request birth versions");
   }
-  auto fields = getInputStream(0);
-  fields.seek(segInfoOffset - sizeof(int32_t));
-  int64_t count = fields.readInt();
-  if (count < 0 || count > (segInfoOffset - (int64_t)sizeof(int32_t) - headerSize) / (int64_t)sizeof(uint32_t)) {
-    invalidSegment(segInfoFile, "invalid field count");
+  initializeSpace(root, spaceDescriptors[0]);
+  children.reserve(spaceDescriptors.size() - 1);
+  for (size_t i = 1; i < spaceDescriptors.size(); i++) {
+    const auto& space = spaceDescriptors[i];
+    auto parent = spaceOrdinal(spaceParentPath(space.path));
+    if (!parent || (size_t)*parent >= i) invalidSegment(segInfoFile, "missing row space path prefix");
+    auto child = std::make_unique<ChildSpace>(*this, (SpaceOrdinal)i,
+        OwnershipShape(*this, *space.ownership, spaceDescriptors[(size_t)*parent].maxDoc, space.maxDoc));
+    initializeSpace(child->reader, space);
+    children.push_back(std::move(child));
   }
-  int64_t fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - count * (int64_t)sizeof(uint32_t);
-  const uint32_t* fieldOffsets = (const uint32_t*)fields.ptr(fieldOffsetsLoc);
-  // Each offset is back from the table to a field's metadata, which starts with its name.
-  for (int64_t i = 0; i < count; i++) {
-    if (fieldOffsets[i] == 0 || fieldOffsets[i] > fieldOffsetsLoc - headerSize) {
-      invalidSegment(segInfoFile, "invalid field offset");
-    }
-  }
-  root.initialize(maxdoc, fieldOffsetsLoc, fieldOffsets, (int32_t)count);
   return true;
 }
 

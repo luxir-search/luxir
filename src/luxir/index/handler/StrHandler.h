@@ -143,7 +143,7 @@ public:
 
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(SpaceOrdinal::ROOT, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();

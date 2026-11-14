@@ -211,7 +211,7 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
   PostingsWriter postingsWriter(dir, 0, 1, 1000000);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = flags;
     writer.startField(&finfo);
@@ -256,7 +256,7 @@ void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
                                std::unique_ptr<SegmentCore>& reader,
                                SegFieldInfo& fieldInfo) {
   PostingsWriter postingsWriter(dir, 0, 1, 1);
-  auto& finfo = postingsWriter.addField("f");
+  auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
   finfo.type = FieldType::TEXT;
   finfo.flags = FieldType::INDEX_DOCS;
   {

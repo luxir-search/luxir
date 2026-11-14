@@ -12,6 +12,7 @@
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
 #include "SegFieldInfo.h"
+#include "Space.h"
 #include "StoredFieldsMetadata.h"
 #include "luxir/store/InputStream.h"
 
@@ -29,6 +30,7 @@ class DocsEnum;
 class PostingsReader {
   SegmentCore& segmentCore;
   int32_t maxdoc = 0;
+  const SpaceOrdinal ordinal;
 
   // Ordinals follow the sorted field index. Only the directory is allocated
   // at open; slot pages and immutable headers are published on first use.
@@ -82,7 +84,7 @@ public:
 
 private:
   friend class SegmentCore;
-  explicit PostingsReader(SegmentCore& core) : segmentCore(core) {}
+  PostingsReader(SegmentCore& core, SpaceOrdinal ordinal) : segmentCore(core), ordinal(ordinal) {}
   void initialize(int32_t maxDoc, int64_t fieldOffsetsLoc, const uint32_t* fieldOffsets, int32_t count);
 
 public:
@@ -91,6 +93,7 @@ public:
     return maxdoc;
   }
 
+  SpaceOrdinal spaceOrdinal() const noexcept { return ordinal; }
   int32_t numFields() const noexcept { return nFields; }
   SegmentCore& core() const noexcept { return segmentCore; }
 

@@ -448,7 +448,7 @@ private:
     if (it != storedFields_.end()) return *it->second;
     const auto& format = config ? config->format_ : StoredChunkFormat{};
     auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, format, std::move(dictionary));
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, SpaceOrdinal::ROOT, resourceName, format, std::move(dictionary));
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }

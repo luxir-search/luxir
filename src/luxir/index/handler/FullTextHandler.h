@@ -171,7 +171,7 @@ public:
     // Sorting terms per field could run in parallel across fields.
     auto terms = sortForFlush(inverter, termsHash);
 
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(SpaceOrdinal::ROOT, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();

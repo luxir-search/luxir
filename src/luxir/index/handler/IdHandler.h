@@ -157,7 +157,7 @@ public:
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
       auto guard = MemPool::threadLocalPoolGuard();
       TextWriter textWriter(postingsWriter);
-      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, fieldName);
       fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->segmentFlags();
       fieldInfo.typeFlags = fieldType->segmentTypeFlags();

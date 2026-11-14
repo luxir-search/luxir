@@ -611,6 +611,11 @@ public:
   }
 
   void merge() {
+    for (const auto* reader : preaders) {
+      if (reader->core().spaces().size() != 1 || reader->spaceOrdinal() != SpaceOrdinal::ROOT) {
+        throw std::invalid_argument("merging multi-space segment bundles is not supported");
+      }
+    }
     auto guard = MemPool::threadLocalPoolGuard();
 
     segs.reserve(preaders.size());
@@ -821,7 +826,7 @@ private:
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
-      return (int64_t)postingsWriter.getMaxDoc() * 4
+      return (int64_t)postingsWriter.getMaxDoc(SpaceOrdinal::ROOT) * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
@@ -1439,7 +1444,7 @@ private:
         std::nullopt, std::nullopt, pool, &ordMaps);
     textWriter.endField();
 
-    MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
+    MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc(SpaceOrdinal::ROOT));
     BasicOrdColWriter<MergedSourceOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
   }
@@ -1496,7 +1501,7 @@ private:
       merger.buildMergedNorms(compactFields, normBytes, normDocsWithField,
                               numNormDocsWithField, pool);
 
-      outputFieldInfo = &merger.postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
+      outputFieldInfo = &merger.postingsWriter.addField(SpaceOrdinal::ROOT, compactFields[0]->segFieldInfo.fieldname);
       outputFieldInfo->type = FieldType::TEXT;
       outputFieldInfo->flags = flags;
       preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
@@ -1712,7 +1717,7 @@ private:
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
     auto& mergeFieldInfos = batch.fields;
-    int32_t nDocs = postingsWriter.getMaxDoc();
+    int32_t nDocs = postingsWriter.getMaxDoc(SpaceOrdinal::ROOT);
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
@@ -1786,7 +1791,7 @@ private:
     }
 
     // get/reserve a new fieldInfo from the postingsReader
-    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
+    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(SpaceOrdinal::ROOT, compactFields[0]->segFieldInfo.fieldname);
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
     outputFieldInfo.typeFlags = FieldType::typeParameters(type, firstInfo.typeFlags);
@@ -1980,7 +1985,7 @@ private:
     }
 
     auto format = storedFormat(resourceName);
-    StoredFieldsWriter writer(postingsWriter, resourceName, format,
+    StoredFieldsWriter writer(postingsWriter, SpaceOrdinal::ROOT, resourceName, format,
                               storedDictionary(resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
@@ -2050,7 +2055,7 @@ private:
       }
     }
 
-    writer.finish(postingsWriter.getMaxDoc());
+    writer.finish(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT));
   }
 
   // Merges non-indexed string/binary columns written by StrColHandler.
@@ -2240,8 +2245,8 @@ private:
 
     if (docsWriter) {
       assert(docsWriter->numAdded() == docsWithField);
-      if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
-        docsWriter->finishDense(postingsWriter.getMaxDoc());
+      if (docsWriter->numAdded() == postingsWriter.getMaxDoc(SpaceOrdinal::ROOT)) {
+        docsWriter->finishDense(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT));
       } else {
         docsWriter->finish();
       }
@@ -2471,17 +2476,17 @@ private:
     intColWriter->finish(outputFieldInfo);
     if (docsWriter) {
       assert(docsWriter->numAdded() == docsWithField);
-      if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
+      if (docsWriter->numAdded() == postingsWriter.getMaxDoc(SpaceOrdinal::ROOT)) {
         // all docs were added.  We may have written stuff into the index,
         // but we can forget it (it will be dropped on the next merge).
         // TODO: we could look into rewinding any part of the OutputStream that was unflushed as well.
-        docsWriter->finishDense(postingsWriter.getMaxDoc());
+        docsWriter->finishDense(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT));
       } else {
         // some docs were not added, so we need to finish it.
         docsWriter->finish();
       }
     } else {
-      outputFieldInfo.docsWithField = postingsWriter.getMaxDoc();
+      outputFieldInfo.docsWithField = postingsWriter.getMaxDoc(SpaceOrdinal::ROOT);
       outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
     if (endValueRankWriter) {

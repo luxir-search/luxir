@@ -49,9 +49,13 @@ locations, browse `src/luxir/<area>/`.
 
 3. **Segment Reading** (`src/luxir/reader/`)
    - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
-     across snapshots and with the writer. It owns the root `PostingsReader`, a concrete
-     row-space reader with its own maxDoc, field catalog and lazy immutable field metadata
+     across snapshots and with the writer. Its base footer catalogs row spaces and their
+     field tables, keyed by path name (root is the empty path). It owns a concrete `PostingsReader` per space, each with its own maxDoc,
+     field catalog and lazy immutable field metadata
      (including numeric leaf bounds). Codec cursors borrow the space reader and mapped bytes
+   - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
+     optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
+     opening reads metadata and endpoints without scanning child rows.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
