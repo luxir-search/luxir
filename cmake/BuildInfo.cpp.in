@@ -6,7 +6,7 @@
 namespace luxir {
 
 const BuildInfo& buildInfo() {
-  static constexpr BuildInfo info{"@PROJECT_VERSION@", "@luxir_source_commit@", "@_luxir_cpu_name@"};
+  static constexpr BuildInfo info{"@LUXIR_VERSION@", "@luxir_source_commit@", "@_luxir_cpu_name@"};
   return info;
 }
 

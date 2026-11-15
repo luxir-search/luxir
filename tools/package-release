@@ -51,6 +51,7 @@ def main():
     parser.add_argument("build_dir", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--builder", required=True, help="JSON builder record")
+    parser.add_argument("--label", help="asset name label in place of the version, e.g. nightly")
     args = parser.parse_args()
     builder = json.loads(args.builder)
     if run("git", "status", "--porcelain", "--untracked-files=normal"):
@@ -78,7 +79,7 @@ def main():
         parser.error("the build directory belongs to a different checkout")
     if cache.get("LUXIR_LOCAL_TARGETS") == "ON":
         parser.error("release packaging does not allow LocalTargets.cmake customizations")
-    version = cache["CMAKE_PROJECT_VERSION"]
+    version = cache["LUXIR_VERSION"]
     tier = cache["LUXIR_CPU_TARGET"]
     config = cache["CMAKE_BUILD_TYPE"]
     asan = "-fsanitize=address" in cache["CMAKE_CXX_FLAGS"]
@@ -147,7 +148,8 @@ def main():
             parser.error(f"glibc requirement exceeds 2.35: {glibc}")
 
     suffix = "-asan" if asan else "-debug" if config == "Debug" else ""
-    name = arch.package_name(version, tier, suffix)
+    label = args.label or version
+    name = arch.package_name(label, tier, suffix)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     archive_names = [name] + ([name + "-symbols"] if config == "Release" else [])
@@ -277,7 +279,7 @@ def main():
         if config == "Release":
             copy(executable, output / name)
     checksums = "".join(f"{sha256(path)}  {path.name}\n"
-                        for path in sorted(output.glob(f"luxir-{version}-*"))
+                        for path in sorted(output.glob(f"luxir-{label}-*"))
                         if path.is_file())
     (output / "SHA256SUMS").write_text(checksums)
     print(f"Packaged {name} into {output}")

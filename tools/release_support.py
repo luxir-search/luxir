@@ -17,9 +17,9 @@ class Architecture:
     isa_notes: bool = False
     platform: str = "linux"
 
-    def package_name(self, version, tier, suffix):
+    def package_name(self, label, tier, suffix):
         level = "-" + tier.rsplit("-", 1)[1] if self.isa_notes else ""
-        return f"luxir-{version}-{self.platform}-{self.asset}{level}{suffix}"
+        return f"luxir-{label}-{self.platform}-{self.asset}{level}{suffix}"
 
 
 ARCHITECTURES = (

@@ -53,4 +53,4 @@ if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
   cat "$output/tests.md" >> "$GITHUB_STEP_SUMMARY"
 fi
 ${runner[@]+"${runner[@]}"} tools/package-release "build/$preset" \
-  --output "$output/assets" --builder "$builder"
+  --output "$output/assets" --builder "$builder" --label nightly

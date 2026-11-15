@@ -3,7 +3,9 @@
 The `v0.1` branch holds the 0.1 maintenance line. Annotated tags identify exact
 releases: `v0.1.0`, then `v0.1.1` for a subsequent fix. Build all artifacts from
 one clean commit on that branch. Keep the version in `CMakeLists.txt` in step
-with the intended tag. Development continues on `main`.
+with the intended tag, and set `LUXIR_VERSION_SUFFIX` to empty on the release
+branch. Development continues on `main`, which carries the next version with
+the `-dev` suffix, so its binaries (including nightlies) report e.g. `0.2.0-dev`.
 
 Use the [development container](container-build.md). Its Ubuntu 22.04 baseline
 keeps the minimum glibc version at 2.35. The three optimized executables target
@@ -115,8 +117,10 @@ The rolling `nightly` prerelease contains the Linux x86-64 v2, v3, and v4
 optimized executables, executable and symbol archives, v2 Debug and ASan
 archives, the ARM64 release executable and its executable/symbol archives,
 the macOS Apple silicon executable and its executable/symbol archives,
-and one combined `SHA256SUMS`. Names retain the source version, so
-use the release commit and packaged manifests to identify a particular nightly.
+and one combined `SHA256SUMS`. Assets are named `luxir-nightly-<platform>`
+(`tools/package-release --label nightly`), so download URLs stay fixed across
+version changes; use the release commit and packaged manifests to identify a
+particular nightly.
 Both keyed dependency images (`<key>-amd64` and `<key>-arm64`) must already
 have been published by `deps-image.yml`. The macOS dependency artifact must also exist. Missing any dependency fails planning.
 These public images are pulled without registry sign-in.

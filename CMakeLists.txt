@@ -36,7 +36,11 @@ if(CMAKE_HOST_APPLE)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "${LUXIR_MACOS_DEPLOYMENT_TARGET}" CACHE STRING "macOS baseline" FORCE)
 endif()
 
-project(Luxir VERSION 0.1.0)
+project(Luxir VERSION 0.2.0)
+# Marks builds that are not a release. Empty on a release branch.
+set(LUXIR_VERSION_SUFFIX "-dev")
+# The reported version. Cached so packaging can read it.
+set(LUXIR_VERSION "${PROJECT_VERSION}${LUXIR_VERSION_SUFFIX}" CACHE INTERNAL "Reported version")
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 

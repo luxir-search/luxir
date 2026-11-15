@@ -34,7 +34,7 @@ class NightlyTest(unittest.TestCase):
             asset_arch = "aarch64" if arch == "linux-arm64" else "x86_64-v2"
             suffix = "-debug" if preset == "container-debug" else ""
             asset_platform = "macos-arm64" if arch == "macos-arm64" else f"linux-{asset_arch}"
-            asset = leg / "assets" / f"luxir-0.1.0-{asset_platform}{suffix}.tar.gz"
+            asset = leg / "assets" / f"luxir-nightly-{asset_platform}{suffix}.tar.gz"
             asset.write_bytes(preset.encode())
             (leg / "assets/SHA256SUMS").write_text(f"{nightly.digest(asset)}  {asset.name}\n")
             (leg / "result.json").write_text(json.dumps({
