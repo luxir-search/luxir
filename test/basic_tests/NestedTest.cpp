@@ -365,4 +365,44 @@ TEST_F(NestedTest, aPathAddedLaterSeesOlderSegmentsAsElementless) {
   EXPECT_EQ(std::vector<std::string>({"new", "old"}), ids(sorted));
 }
 
+TEST_F(NestedTest, segmentsWithoutElementsServeEveryScopedOperation) {
+  schema(VARIANTS_SCHEMA);
+  ASSERT_TRUE(index({R"J({"id": "E", "title": "cap"})J"}).success);
+  ASSERT_TRUE(index({R"J({"id": "A", "title": "shirt", "variants": [{"color": "red", "price": 10}, {"color": "blue", "price": 12}]})J"}).success);
+  CollectionHelper h = helper();
+  ASSERT_EQ(2u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  auto check = [&] {
+    // Scope lists without a field list discover the scope's fields over every segment.
+    auto json = search(R"J({"ops": {"q": {"top_docs": {
+        "query": {"to_parent": {"path": "variants", "name": "m", "query": {"match": {"variants.color": "blue"}}}},
+        "fields": ["id"], "document_format": "rows", "row_ops": {
+          "all": {"domain": {"to_children": "variants"}, "top_docs": {"sort": [{"expr": "variants.price"}], "document_format": "rows"}},
+          "hit": {"domain": {"from_match": "m"}, "top_docs": {"document_format": "rows"}}}}}}})J");
+    EXPECT_NE(std::string::npos, json.find(R"J("all":{"docs":[{"color":"red","price":10},{"color":"blue","price":12}])J")) << json;
+    EXPECT_NE(std::string::npos, json.find(R"J("hit":{"docs":[{"color":"blue","price":12}])J")) << json;
+    json = search(R"J({"ops": {"q": {"top_docs": {"limit": 0, "count_limit": -1, "ops": {
+        "n": {"domain": {"to_children": "variants"}, "top_docs": {"limit": 0, "count_limit": -1}},
+        "els": {"domain": {"to_children": "variants"}, "top_docs": {"sort": [{"expr": "variants.price"}], "document_format": "rows"}},
+        "colors": {"domain": {"to_children": "variants"}, "field_facet": {"field": "variants.color"}},
+        "total": {"domain": {"to_children": "variants"}, "expr_op": {"expr": "sum(variants.price)"}},
+        "owners": {"domain": {"to_children": "variants"}, "top_docs": {"limit": 0, "count_limit": -1, "ops": {
+          "back": {"domain": {"to_parent": true}, "top_docs": {"fields": ["id"], "document_format": "rows"}}}}}}}}}})J");
+    EXPECT_NE(std::string::npos, json.find(R"J("n":{"found":2)J")) << json;
+    EXPECT_NE(std::string::npos, json.find(R"J("els":{"docs":[{"color":"red","price":10},{"color":"blue","price":12}])J")) << json;
+    EXPECT_NE(std::string::npos, json.find(R"J("blue")J")) << json;
+    EXPECT_NE(std::string::npos, json.find(R"J("total":22)J")) << json;
+    EXPECT_NE(std::string::npos, json.find(R"J("back":{"docs":[{"id":"A"}])J")) << json;
+    EXPECT_EQ(std::vector<std::string>({"A"}), ids(topDocs(R"J({"to_parent": {"path": "variants", "query": {"match": {"variants.color": "red"}}}})J")));
+    EXPECT_EQ(std::vector<std::string>({"A", "E"}), ids(R"J({"ops": {"q": {"top_docs": {"limit": -1, "fields": ["id"],
+        "sort": [{"expr": "max(variants.price)", "dir": "desc"}]}}}})J"));
+  };
+  check();
+  // A merge of a segment with elements and one without.
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(h.submit(merge).success);
+  ASSERT_EQ(1u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  check();
+}
+
 }  // namespace

@@ -25,12 +25,15 @@ class FieldReader {
   // TODO: field number?
 public:
   explicit FieldReader(PostingsReader& postingsReader) {
-    // Field metadata ends where the offsets table begins; reads are checked against that bound.
-    auto file = postingsReader.getInputStream(0);
-    fieldIS = InputStream(file.ptr(0), file.ptr(postingsReader.fieldOffsetsLoc));
     nFields = postingsReader.nFields;
     fieldOffsets = postingsReader.fieldOffsets;
     fieldOffsetsLoc = postingsReader.fieldOffsetsLoc;
+    // A reader with no fields may have no files (a nested scope a segment holds
+    // no elements for, see PostingsReader::emptyScope): it iterates nothing.
+    if (nFields == 0) return;
+    // Field metadata ends where the offsets table begins; reads are checked against that bound.
+    auto file = postingsReader.getInputStream(0);
+    fieldIS = InputStream(file.ptr(0), file.ptr(postingsReader.fieldOffsetsLoc));
   }
 
   FieldReader(PostingsReader& reader, int32_t ordinal) : FieldReader(reader) {
