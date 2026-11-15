@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "IndexReader.h"
+#include "luxir/reader/OwnerMap.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
@@ -273,7 +274,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           postingsReader = prevSeg->sharedPostingsReader;
         }
         if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, segment.creator_epoch, missingFileOK, true);
-        if (!postingsReader) {
+        if (!postingsReader || !postingsReader->openScopes(dir, missingFileOK, true)) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
           retry = true;
           break; // Break out of the segments loop to retry
@@ -396,6 +397,72 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
+
+// Element rows of a nested scope are live iff their owner row is.
+std::shared_ptr<LiveDocs> LiveDocs::foldScope(const LiveDocs& owners, const OwnerMap& map) {
+  int32_t rows = map.rows();
+  std::vector<uint64_t> words(FixedBitSet::sizeInWords(rows), 0);
+  int32_t live = 0;
+  OwnerMap::RangeCursor ranges(map);
+  for (int32_t owner = 0; owner < map.ownerMaxDoc(); owner++) {
+    if (!owners.bitset().get(owner)) continue;
+    auto [begin, end] = ranges.range(owner);
+    for (int32_t row = begin; row < end; row++) words[(size_t)row >> 6] |= (uint64_t)1 << (row & 63);
+    live += end - begin;
+  }
+  if (live == rows) return nullptr;
+  return std::make_shared<LiveDocs>(std::move(words), rows, live);
+}
+
+std::shared_ptr<IndexReader::PhysicalCore> IndexReader::PhysicalCore::scopeCore(std::string_view path) {
+  std::lock_guard lock(scopeMutex);
+  for (const auto& [name, scope] : scopeCores) {
+    if (name == path) return scope;
+  }
+  auto scope = std::make_shared<PhysicalCore>();
+  scope->coreGeneration = coreGeneration;
+  scope->commitTime = commitTime;
+  scope->incarnation = incarnation;
+  scope->fields = std::make_shared<FieldRecords>();
+  scope->segs.reserve(segs.size());
+  for (const auto& seg : segs) {
+    auto reader = seg.postingsReader().scopeReader(path);
+    if (!reader) reader = PostingsReader::emptyScope(path);
+    std::shared_ptr<LiveDocs> live;
+    if (seg.liveDocs() && reader->maxDoc() > 0) {
+      const auto& map = reader->owners();
+      live = seg.liveDocs()->scopeLive(path, [&] { return LiveDocs::foldScope(*seg.liveDocs(), map); });
+    }
+    Segment::SegmentInfo info = seg.segInfo;
+    info.max_doc = reader->maxDoc();
+    info.live_gen = live ? seg.segInfo.live_gen : 0;
+    info.live_docs = live ? live->numLive() : info.max_doc;
+    scope->segs.emplace_back(std::move(reader), std::move(live), std::vector<std::shared_ptr<AuxReader>>{},
+                             info, scope->totalMaxDoc, seg.ord);
+    scope->totalMaxDoc += info.max_doc;
+    scope->livedocs += info.live_docs;
+  }
+  scope->segmentFiles.resize(segs.size());
+  scope->segOrds = segOrds;
+  scopeCores.emplace_back(path, scope);
+  return scope;
+}
+
+IndexReader* IndexReader::scope(std::string_view path) {
+  if (parentScope_ != nullptr) return nullptr;  // one nesting level
+  const auto* childSchema = sharedSchema->scope(path);
+  if (childSchema == nullptr) return nullptr;
+  std::lock_guard lock(scopesMutex_);
+  for (const auto& [name, reader] : scopes_) {
+    if (name == path) return reader.get();
+  }
+  Snapshot snapshot{core->scopeCore(path), *childSchema, snapshotTime, snapshotGen};
+  auto reader = std::unique_ptr<IndexReader>(new IndexReader(std::move(snapshot), nullptr));
+  reader->parentScope_ = this;
+  reader->scopePath_ = std::string(path);
+  scopes_.emplace_back(path, std::move(reader));
+  return scopes_.back().second.get();
+}
 
 const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
@@ -650,6 +717,10 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
           break;
         case FieldType::Storage::INT64:
           retrievable = source.column && type->hasColumn();
+          break;
+        case FieldType::Storage::BIN:
+          // A nested path's stored source (retrieval decodes it).
+          retrievable = stored && sharedSchema->scope(source.name) != nullptr;
           break;
         default:
           break;

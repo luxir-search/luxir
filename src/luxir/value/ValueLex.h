@@ -37,9 +37,17 @@ inline bool identifier(std::string_view s) {
   return true;
 }
 
+// Nested element fields are dotted paths ("variants.price"): a '.' followed
+// by an identifier continues the name.
 inline std::string_view scanIdentifier(Cursor& cur) {
   if (!identifierStart(cur.peek())) return {};
-  return cur.takeWhile([](char c) { return identifierChar(c); });
+  size_t start = cur.position();
+  cur.takeWhile([](char c) { return identifierChar(c); });
+  while (cur.peek() == '.' && identifierStart(cur.peekAt(1))) {
+    cur.advance();
+    cur.takeWhile([](char c) { return identifierChar(c); });
+  }
+  return cur.slice(start, cur.position());
 }
 
 // Cursor sits on '$'. The returned name excludes it.

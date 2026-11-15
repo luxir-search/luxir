@@ -611,6 +611,9 @@ public:
   CollectionRequirements requirements;
   // The requested quantity stays in requirements; exact routes need no hold.
   bool boundedCount = false;
+  // Per-row sub-operations (row_ops), emitted as one extra column each.
+  std::shared_ptr<class RowOps> rowOps;
+  std::vector<ExtraColumn> rowColumns;
   bool countLimitProven = false;
   // The request permits an estimate of this bounded count. The estimator
   // samples through the ranking weight, scored with pruning allowed, so lazy

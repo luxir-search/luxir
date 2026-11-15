@@ -520,7 +520,7 @@ public:
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
         return *slotArm<luxir::api::DocList>(resp);
       };
-      DocEmission emission = underBucketSlot()
+      DocEmission emission = underBucketSlot() || op.req.singleResponse
           ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
       emitDocsResponse(op.req, op.flags, getDocList,

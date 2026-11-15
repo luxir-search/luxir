@@ -20,6 +20,8 @@
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/search/ops/ScopeOp.h"
+#include "luxir/search/ops/RowOps.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
@@ -411,8 +413,48 @@ public:
     groupExprStats(currOp, placement, destination ? *destination : currOp.subOps);
   }
 
+  // Domain.to_children / Domain.to_parent: the operation runs in another
+  // scope (ScopeOp). Its own filters apply in that scope.
+  SearchOp* parseScope(std::string_view name, const luxir::api::SearchOp& searchOp, OpsPlacement placement) {
+    const auto& domain = *searchOp.domain;
+    bool toChildren = !domain.to_children.empty();
+    bool toParent = domain.to_parent.value_or(false);
+    std::string where = "op '" + std::string(name) + "'.domain";
+    if (toChildren && toParent) throw RequestError(where + " cannot set both to_children and to_parent");
+    if (domain.query || domain.apply_parent_filters) {
+      throw RequestError(where + ": a scope change inherits the incoming domain; use filter, not query");
+    }
+    if (placement != OpsPlacement::REQUEST_ROOT && placement != OpsPlacement::TOP_DOCS) {
+      throw RequestError(where + ": scope changes are supported at the request root and under top_docs");
+    }
+    if (std::holds_alternative<luxir::api::Fusion>(searchOp.kind)) {
+      throw RequestError(where + ": fusion cannot change scope; fuse within one scope");
+    }
+    IndexReader* target;
+    if (toChildren) {
+      if (req.schema->isScope()) {
+        throw RequestError(where + ".to_children: already inside nested path '" + req.schema->scopePath() + "'");
+      }
+      target = req.reader->scope(domain.to_children);
+      if (target == nullptr) {
+        throw RequestError(where + ".to_children: '" + std::string(domain.to_children) + "' is not a nested field",
+                           "unknown_field");
+      }
+    } else {
+      target = req.reader->parentScope();
+      if (target == nullptr) throw RequestError(where + ".to_parent requires a nested scope (inside to_children)");
+    }
+    luxir::api::SearchOp inner = searchOp;
+    inner.domain.reset();
+    if (!domain.filter.empty()) inner.domain.emplace().filter = domain.filter;
+    return luxir::arenaCreate<ScopeOp>(req.arena, req, name, *target, toChildren, inner);
+  }
+
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
+    if (searchOp.domain && (!searchOp.domain->to_children.empty() || searchOp.domain->to_parent.value_or(false))) {
+      return parseScope(name, searchOp, placement);
+    }
     auto inherited = options;
     options = inherited.child(searchOp, name);
     auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
@@ -572,9 +614,16 @@ public:
     using Missing = luxir::api::Collapse_::MissingPolicy;
     if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
         && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
-    if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
+    if (spec.field.empty() && spec.owner.empty()) throw RequestError("collapse.field must not be empty");
+    if (!spec.owner.empty()) {
+      if (spec.owner != "root") throw RequestError("owner must be \"root\"");
+      if (!req.schema->isScope()) {
+        throw RequestError("owner keys apply to the elements of a nested path (a to_children domain)");
+      }
+    }
     auto* collapse = luxir::arenaCreate<CollapsePlan>(
         req.arena, *req.reader, spec.missing, getNumber);
+    if (!spec.owner.empty()) CollapsePlan::addOwnerKey(*collapse);
     std::unordered_set<std::string> resolved;
     for (std::string_view name : spec.field) {
       auto field = req.schema->resolveFor(name, OpClass::VALUE);
@@ -1109,7 +1158,10 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (root.kind == ValueNodeKind::COLUMN) {
+      if (root.kind == ValueNodeKind::COLUMN && !root.scope.empty()) {
+        throw RequestError("sort expression '" + std::string(sortSpec.expr) + "' produces an element array; "
+                           "choose an explicit reducer such as min(...), max(...), avg(...), sum(...), or count(...)");
+      } else if (root.kind == ValueNodeKind::COLUMN) {
         auto* fieldTypePtr = req.schema->physical(root.text);
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
       } else if (root.kind == ValueNodeKind::SCORE) {
@@ -1179,6 +1231,8 @@ public:
       const api::SearchOp& child = **childView;
       auto childOptions = options.child(child, key);
       if (!child.domain.has_value()) continue;
+      // A scope change keeps the incoming domain; ScopeOp transforms it.
+      if (!child.domain->to_children.empty() || child.domain->to_parent.value_or(false)) continue;
       auto inheritedCoercion = parseContext.coerceContext;
       parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(childOptions.flags);
       parseContext.coerceContext.decimalScaled = (childOptions.flags & RequestFlags::DECIMAL_SCALED) != 0;
@@ -2200,6 +2254,11 @@ public:
     qr->estimateCount = estimateCount && qr->boundedCount;
     qr->headSort = std::move(headSort);
     qr->resultQuery = resultQuery;
+    if (!topDocsReq.row_ops.empty()) {
+      if (placement == TopDocsPlacement::FUSION_SOURCE) throw RequestError("fusion sources cannot have row_ops");
+      qr->rowOps = std::make_shared<RowOps>(req, topDocsReq);
+      qr->rowColumns = qr->rowOps->columns();
+    }
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       DecoratorContext::QuerySource source{qr->resultQuery, decoratorQueryContext(*qr)};
       DecoratorContext dc{req, parseContext, {&source, 1}};

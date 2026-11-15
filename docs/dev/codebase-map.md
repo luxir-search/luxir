@@ -46,6 +46,11 @@ locations, browse `src/luxir/<area>/`.
        `?explain=request` only parses and serializes
    - `EmitDocs`: `ReturnField` separates the requested output key from the physical
      read source; wildcard discovery returns logical primaries only
+   - Nested scopes: `IndexReader::scope(path)` is a child reader over each
+     segment's per-path element rows (segments aligned by ord, liveness folded
+     from owners); `ScopeOp` runs an operation subtree in another scope as a
+     `NestedScopeRequest`; `RowOps` runs per-row element lists. See
+     [../design/nested-documents.md](../design/nested-documents.md)
 
 3. **Segment Reading** (`src/luxir/reader/`)
    - `PostingsReader` reads a single segment and owns the open files for that segment, plus
@@ -54,6 +59,9 @@ locations, browse `src/luxir/<area>/`.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
+   - `OwnerMap` reads a scope segment's owner map (owner row -> element
+     range, element row -> owner); `PostingsReader::createScope` /
+     `openScopes` open a segment's nested row spaces
    - `IntColReader` reads the doc-order numeric column (all numeric field
      classes store an order-preserving encoded int64)
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
@@ -153,6 +161,8 @@ locations, browse `src/luxir/<area>/`.
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
+   - `type: nested` fields compile into child `Schema` scopes (`Schema::scope`),
+     addressed as `<path>.<field>`; `Inverter::scopeRows` writes their rows
    - `LogicalField`: Primary, variants, and search/value bindings;
      `FieldType` describes one physical representation
    - `ResolvedFieldHandle`: Logical owner, role, descriptor, and owned logical/physical

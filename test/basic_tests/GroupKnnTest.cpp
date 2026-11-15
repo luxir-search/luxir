@@ -249,7 +249,7 @@ TEST_F(GroupKnnTest, reportsExhaustionAndCapsAndRejectsMissingScope) {
   auto invalid = knn(3, false);
   invalid.insert(invalid.size() - 2, R"(,"unit":"bogus")");
   auto invalidUnit = run("main", R"("collapse":"key_s","query":)" + invalid, 1, false);
-  EXPECT_NE(std::string::npos, invalidUnit->errorMsg().find("knn.unit must be docs or groups"));
+  EXPECT_NE(std::string::npos, invalidUnit->errorMsg().find("knn.unit must be docs, groups or owner"));
   auto explicitDocs = knn(3, false);
   explicitDocs.insert(explicitDocs.size() - 2, R"(,"unit":"docs")");
   auto ordinary = run("main", R"("limit":-1,"query":)" + explicitDocs);

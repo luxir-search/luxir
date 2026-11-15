@@ -30,6 +30,7 @@
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermRangeQuery.h"
+#include "luxir/query/ToParentQuery.h"
 
 namespace luxir {
 
@@ -379,6 +380,56 @@ void RescoreQuery::visitImpl(QueryVisitor& visitor, Context& context, float) con
   // The value expression can transform scores arbitrarily. Report the matching
   // child's terms with its own scoring multiplier, as used by execution.
   child->visit(visitor, context, 1.0f);
+}
+
+Query::Weight* ToParentQuery::createWeight(Context& context, int32_t flags, float multiplier) {
+  return context.pool.make<ToParentQuery::Weight>(context, *this, flags, multiplier);
+}
+
+void ToParentQuery::visitImpl(QueryVisitor& visitor, Context&, float) const {
+  visitor.leaf(*this);
+}
+
+std::shared_ptr<LiveDocs> descendDomain(const IndexReader::Segment& ownerSegment, DocSet* owners,
+                                        const IndexReader::Segment& scopeSegment) {
+  if (owners == nullptr) return nullptr;
+  const auto& map = scopeSegment.postingsReader().owners();
+  int32_t rows = scopeSegment.maxDoc();
+  std::vector<uint64_t> words(FixedBitSet::sizeInWords(rows), 0);
+  int32_t live = 0;
+  OwnerMap::RangeCursor ranges(map);
+  auto* elementLive = scopeSegment.liveDocSet();
+  int32_t ownerRows = std::min(ownerSegment.maxDoc(), map.ownerMaxDoc());
+  for (int32_t owner = 0; owner < ownerRows; owner++) {
+    if (!owners->get(owner)) continue;
+    auto [begin, end] = ranges.range(owner);
+    for (int32_t row = begin; row < end; row++) {
+      if (elementLive && !elementLive->get(row)) continue;
+      words[(size_t)row >> 6] |= (uint64_t)1 << (row & 63);
+      live++;
+    }
+  }
+  return std::make_shared<LiveDocs>(std::move(words), rows, live);
+}
+
+std::unique_ptr<Query::Weight::PreparedWeight> ToParentQuery::Weight::prepare(
+    Query::Weight::PrepareContext& ctx) {
+  QueryPrep::PreparedSource source;
+  source.weight = childWeight;
+  std::vector<std::shared_ptr<LiveDocs>> held;
+  if (childWeight->needsPrepare()) {
+    auto segments = scopeReader.segments();
+    std::vector<DocSet*> domains(segments.size(), nullptr);
+    held.resize(segments.size());
+    for (size_t i = 0; i < segments.size(); i++) {
+      DocSet* owners = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+      held[i] = descendDomain(ctx.reader.segments()[i], owners, segments[i]);
+      domains[i] = held[i] ? (DocSet*)&held[i]->docset() : (DocSet*)segments[i].liveDocSet();
+    }
+    Query::Weight::PrepareContext childContext(scopeReader, domains, ctx.parallel, ctx.warnings);
+    source.setPrepared(childWeight->prepare(childContext));
+  }
+  return std::make_unique<Prepared>(*this, std::move(source), std::move(held));
 }
 
 void MinScoreQuery::visitImpl(QueryVisitor& visitor, Context& context, float) const {

@@ -146,7 +146,14 @@ whole machine. Designed from the start for parallelism on modern hardware.
   can be customized and combined with explicit field definitions, which take
   precedence.
 - Field types: analyzed text, string, int, float, double, date (ISO-8601 in,
-  epoch-millis storage), id, vector, geo point.
+  epoch-millis storage), id, vector, geo point, and nested lists of typed
+  sub-objects (variants, chunks) stored in their own per-segment row spaces.
+  [Nested documents](guide/nested.md) correlate clauses on one element
+  (`to_parent` with max/min/sum/avg/none scoring), run any operation over
+  elements (`domain.to_children`), rank elements or documents with kNN
+  (`unit: owner`, diversify or collapse by owner), sort documents by element
+  values (`min(variants.price)`), and return each row's matching elements
+  (`row_ops`).
 - Explicit schema API over HTTP/JSON and gRPC. `GET` returns the authored
   schema, and the output is itself a valid write body; `POST` sets the named
   definitions (`mode=set`) or replaces the whole schema (`mode=replace_all`;

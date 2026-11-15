@@ -35,6 +35,13 @@ FieldSignatures Schema::signatures(bool includeTemplates) const {
       }
     }
   }
+  // Child scope fields are tracked by the owner under "<path>.<field>".
+  for (const auto& [path, child] : scopes_) {
+    for (auto& [name, signature] : child->signatures(includeTemplates)) {
+      std::string scoped = path + "." + name;
+      result.emplace(scoped, FieldSignature(scoped, *child->getFieldTypePtr(name)));
+    }
+  }
   return result;
 }
 
@@ -67,6 +74,7 @@ void Schema::inheritIntroductions(const Schema* previous) {
     }
     introducedGen.emplace(name, gen);
   }
+  syncScopes();
 }
 
 api::SchemaInfo Schema::storedInfo(std::pmr::memory_resource& arena) const {
@@ -88,6 +96,7 @@ std::shared_ptr<Schema> Schema::fromStored(const api::SchemaInfo& info, SchemaBi
   schema->binding = std::move(binding);
   schema->gen_ = schema->binding.generation();
   for (const auto& [name, gen] : info.introduced) schema->introducedGen.emplace(name, gen);
+  schema->syncScopes();
   return schema;
 }
 

@@ -143,6 +143,15 @@ public:
   // machinery does not belong on the public API); nothing wire-facing sets it.
   bool testForcePrepare = false;
 
+  // A nested-scope inner request (ScopeOp): reader and schema are set by the
+  // owner request rather than resolved from the collection; the root domain
+  // of each segment is baseDomains[segment] (live-filtered, null = all rows)
+  // instead of its live docs; and every result is assembled into the one
+  // final response instead of streaming.
+  bool presetResources = false;
+  std::vector<DocSet*> baseDomains;
+  bool singleResponse = false;
+
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
                 google::protobuf::Arena& arena,
                 std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());

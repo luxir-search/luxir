@@ -115,16 +115,31 @@ public:
   uint64_t segId;
   uint64_t creatorEpoch;
 
-public:
+  // Nested row spaces (see Postings::scopeKey). A root segment lists the
+  // paths whose row spaces it carries; a scope segment records its owner map.
+  std::vector<std::string> scopePaths;
+  struct OwnerBlock {
+    int32_t ownerMaxDoc = -1;    // -1: not a scope segment
+    seg_location endsLoc;        // per owner row: cumulative end of its element rows
+    int64_t endsMetaOff = 0;
+    seg_location ownersLoc;      // per element row: its owner row
+    int64_t ownersMetaOff = 0;
+  } owner;
+  std::string scope;
+  // Files of the scope segments written for this segment by a merge, which
+  // the merge records with this segment's own files.
+  std::vector<std::string> scopeFiles;
+  std::vector<FileDescriptor> scopeDescriptors;
+
   PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
                  IndexRamBudget* ramBudget = nullptr,
-                 bool ramDelegatingFiles = false)
+                 bool ramDelegatingFiles = false, std::string_view scope = {})
       : directory(dir), maxDoc(maxDoc),
         delegatedRamGuard(ramBudget == nullptr
             ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
-        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
+        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch), scope(scope)
   {
-    segStr = Postings::segmentKey(segId, creatorEpoch);
+    segStr = Postings::scopeKey(segId, creatorEpoch, scope);
   }
 
   void configureRamDelegation(bool enabled,
@@ -431,6 +446,8 @@ private:
     // location's file even to read zero bytes).
     std::vector<bool> referenced(files.size(), false);
     if (!versionRunsLoc.isNull()) referenced[versionRunsLoc.filenum()] = true;
+    if (!owner.endsLoc.isNull()) referenced[owner.endsLoc.filenum()] = true;
+    if (!owner.ownersLoc.isNull()) referenced[owner.ownersLoc.filenum()] = true;
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations([&](seg_location location) {
         if (location.filenum() < referenced.size()) {
@@ -478,6 +495,8 @@ private:
       fieldInfo.relocateLocations(relocate);
     }
     if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
+    if (!owner.endsLoc.isNull()) owner.endsLoc = relocate(owner.endsLoc);
+    if (!owner.ownersLoc.isNull()) owner.ownersLoc = relocate(owner.ownersLoc);
 
     std::vector<uint32_t> survivors;
     survivors.reserve(files.size());
@@ -501,6 +520,18 @@ private:
     for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
     out.writeVal(versionRunsLoc);
     out.writeVint(versionRunCount);
+    out.writeVint((uint32_t)scopePaths.size());
+    for (const auto& path : scopePaths) {
+      out.writeVint((uint32_t)path.size());
+      out.write(path.data(), path.size());
+    }
+    out.writeVint((uint32_t)(owner.ownerMaxDoc + 1));
+    if (owner.ownerMaxDoc >= 0) {
+      out.writeVal(owner.endsLoc);
+      out.writeVlong((uint64_t)owner.endsMetaOff);
+      out.writeVal(owner.ownersLoc);
+      out.writeVlong((uint64_t)owner.ownersMetaOff);
+    }
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }

@@ -292,7 +292,38 @@ private:
     }
   }
 
+  // An element field of a nested path, from the owner's side: an array of the
+  // owner's element values (numeric element columns only).
+  uint32_t parseScopedColumn(std::string_view name, std::string_view path, std::string_view field, size_t pos) {
+    const auto* scope = (opts.schema ? opts.schema : &opts.fieldResolver->resolverSchema())->scope(path);
+    ResolvedFieldHandle target;
+    try {
+      target = (*scope)->resolveForLocal(field, OpClass::VALUE);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
+    }
+    FieldType* type = target.fieldType;
+    if (!FieldType::isNumericColumn(type->type()) || !type->hasColumn()) {
+      fail(pos, fmt::format("element field '{}' must be a numeric column to use as a value array", name));
+    }
+    ValueNode node;
+    node.kind = ValueNodeKind::COLUMN;
+    node.columnType = type->type();
+    node.columnMultiValued = true;
+    node.columnIndexed = type->indexed();
+    bool floating = type->type() == FieldType::FLOAT || type->type() == FieldType::DOUBLE;
+    node.type = floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY;
+    node.nature = type->valueNature();
+    node.sourcePos = pos;
+    node.text = program->copyString(target.physicalName);
+    node.scope = program->copyString(path);
+    return append(node);
+  }
+
   uint32_t parseColumn(std::string_view name, size_t pos) {
+    if (const Schema* owner = opts.schema ? opts.schema : opts.fieldResolver ? &opts.fieldResolver->resolverSchema() : nullptr) {
+      if (auto scoped = owner->scopedName(name)) return parseScopedColumn(name, scoped->first, scoped->second, pos);
+    }
     ResolvedFieldHandle target;
     try {
       target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)

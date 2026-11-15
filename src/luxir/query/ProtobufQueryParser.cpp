@@ -35,8 +35,10 @@
 #include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
+#include "luxir/query/ToParentQuery.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/Collapse.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
 
@@ -333,11 +335,25 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   }
 
   bool groups = knnQuery.unit == "groups";
-  if (!knnQuery.unit.empty() && knnQuery.unit != "docs" && !groups) {
-    throw std::runtime_error("knn.unit must be docs or groups");
+  bool owners = knnQuery.unit == "owner";
+  if (!knnQuery.unit.empty() && knnQuery.unit != "docs" && !groups && !owners) {
+    throw std::runtime_error("knn.unit must be docs, groups or owner");
   }
   if (groups && context.collapse == nullptr) {
     throw std::runtime_error("knn.unit groups requires an enclosing collapse");
+  }
+  const CollapsePlan* unitPlan = groups ? context.collapse : nullptr;
+  if (owners) {
+    // k counts distinct owners: the owner is a structural key of each element
+    // row, admitted before any cut.
+    if (!schema.isScope()) {
+      throw RequestError("knn.unit owner applies to a vector field of a nested path", "invalid_request");
+    }
+    if (context.reader == nullptr) throw RequestError("knn.unit owner requires a searched reader", "invalid_request");
+    auto* plan = luxir::arenaCreate<CollapsePlan>(context.arena, *context.reader,
+                                                  luxir::api::Collapse_::MissingPolicy::EXPAND, false);
+    CollapsePlan::addOwnerKey(*plan);
+    unitPlan = plan;
   }
   std::optional<float> similarity = knnQuery.similarity;
   if (similarity.has_value()) {
@@ -355,7 +371,7 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
 
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
-    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr,
+    minScanFraction, knnQuery.exact, unitPlan,
     similarity);
 }
 
@@ -622,6 +638,51 @@ luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& qu
   return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tie);
 }
 
+luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery& q) {
+  if (q.path.empty()) throw RequestError("to_parent requires a path", "invalid_request");
+  const auto* scope = schema.scope(q.path);
+  if (scope == nullptr) {
+    throw RequestError(schema.isScope()
+        ? "to_parent cannot be nested inside nested path '" + schema.scopePath() + "'"
+        : "to_parent path '" + std::string(q.path) + "' is not a nested field", "unknown_field");
+  }
+  if (!q.query.has_value() || q.query->kind.index() == 0) {
+    throw RequestError("to_parent requires a query over the path's elements", "invalid_request");
+  }
+  using Mode = luxir::ToParentQuery::ScoreMode;
+  Mode mode = Mode::MAX;
+  if (q.score) {
+    auto s = *q.score;
+    if (s == "max") mode = Mode::MAX;
+    else if (s == "min") mode = Mode::MIN;
+    else if (s == "sum") mode = Mode::SUM;
+    else if (s == "avg") mode = Mode::AVG;
+    else if (s == "none") mode = Mode::NONE;
+    else throw RequestError("to_parent score must be max, min, sum, avg or none, not '" + std::string(s) + "'",
+                            "invalid_request");
+  }
+  int32_t minChildren = q.min_children.value_or(1);
+  int32_t maxChildren = q.max_children.value_or(std::numeric_limits<int32_t>::max());
+  if (minChildren < 1 || maxChildren < minChildren) {
+    throw RequestError("to_parent needs 1 <= min_children <= max_children", "invalid_request");
+  }
+  ParseContext child(pool, **scope, context.arena, context.coerceContext, context.opName, context.warnings,
+                     nullptr, context.node);
+  child.reader = context.reader ? context.reader->scope(q.path) : nullptr;
+  child.minLiteralPrefix = context.minLiteralPrefix;
+  child.parentScope = &context;
+  child.nestingBudget = context.nestingBudget;
+  luxir::Query* inner;
+  {
+    NestingScope nesting(context);
+    child.nestingBudget = context.nestingBudget;
+    ProtobufQueryParser parser(child);
+    inner = parser.parse(*q.query);
+  }
+  // Request views outlive the query tree.
+  return pool.make<luxir::ToParentQuery>(q.path, q.name, inner, mode, minChildren, maxChildren);
+}
+
 luxir::Query* ProtobufQueryParser::parsePlugin(const luxir::api::PluginQuery& query) {
   const auto& [name, def] = QueryRegistry::global().require(query.name);
   PluginQueryContext ctx(context, name, ParamReader(name, query.params),
@@ -678,6 +739,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
     [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     [&](const luxir::api::PluginQuery& p) -> luxir::Query* { return parsePlugin(p); },
+    [&](const luxir::api::ToParentQuery& t) -> luxir::Query* { return parseToParent(t); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

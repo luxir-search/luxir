@@ -843,12 +843,44 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
   return std::make_shared<StoredFieldType>(name, format);
 }
 
+Schema::Schema(const Schema& other)
+  : fieldTypeMap(other.fieldTypeMap), binding(other.binding), file(other.file), gen_(other.gen_),
+    sourceDef_(other.sourceDef_), introducedGen(other.introducedGen), logicalFields(other.logicalFields),
+    scopePath_(other.scopePath_), parentScope_(other.parentScope_) {
+  // Child scopes carry history derived from this schema, so each copy owns its own.
+  for (const auto& [path, child] : other.scopes_) {
+    auto copy = std::make_shared<Schema>(*child);
+    copy->parentScope_ = this;
+    scopes_.emplace(path, std::move(copy));
+  }
+}
+
+void Schema::syncScopes() {
+  for (auto& [path, child] : scopes_) {
+    child->parentScope_ = this;
+    child->binding = binding;
+    child->gen_ = gen_;
+    child->file = {};
+    child->introducedGen.clear();
+    std::string prefix = path + ".";
+    for (const auto& [name, version] : introducedGen) {
+      if (name.starts_with(prefix)) child->introducedGen.emplace(name.substr(prefix.size()), version);
+    }
+  }
+}
+
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
   return compile(def, base, InvalidStopWords::REJECT);
 }
 
-std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords) {
+std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords,
+                                        std::string_view scopePath) {
   auto schema = std::make_shared<Schema>();
+  schema->scopePath_ = std::string(scopePath);
+  bool childScope = !scopePath.empty();
+  if (childScope && !def.templates.empty()) {
+    throw SchemaError("nested path '" + std::string(scopePath) + "' cannot declare templates");
+  }
 
   // ---- assemble the authored source entries (merge or replace) ----
   // All FieldDef views are backed by the request or by baseArena; both live
@@ -899,12 +931,12 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   auto hasEntry = [&](std::string_view name) {
     return std::ranges::any_of(entries, [&](const SourceEntry& e) { return e.name == name; });
   };
-  if (!hasEntry("id")) {
+  if (!childScope && !hasEntry("id")) {
     SourceEntry e{"id", {}, false};
     e.def.type = FieldClass::ID;
     entries.push_back(e);
   }
-  if (!hasEntry("_version_")) {
+  if (!childScope && !hasEntry("_version_")) {
     SourceEntry e{"_version_", {}, false};
     e.def.type = FieldClass::INT;
     entries.push_back(e);
@@ -954,6 +986,42 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 
+  // ---- nested paths: each compiles into its own child scope ----
+  // The entries are taken out of the owner's graph: nothing inherits from a
+  // nested entry and a nested entry inherits from nothing.
+  std::vector<SourceEntry> nestedEntries;
+  for (const auto& e : entries) {
+    if (!e.def.fields.empty() && (!e.def.type || *e.def.type != FieldClass::NESTED)) {
+      throw SchemaError("fields is only valid for nested fields (field: " + std::string(e.name) + ")");
+    }
+    if (!e.def.type || *e.def.type != FieldClass::NESTED) continue;
+    std::string name(e.name);
+    if (childScope) {
+      throw SchemaError("nested field '" + name + "' cannot be declared inside nested path '" +
+                        std::string(scopePath) + "' (one nesting level is supported)");
+    }
+    if (e.isTemplate) throw SchemaError("a template cannot be nested: " + name);
+    if (!e.def.parent.empty()) throw SchemaError("nested field '" + name + "' cannot declare a parent");
+    if (e.def.fields.empty()) throw SchemaError("nested field '" + name + "' requires fields");
+    const auto& d = e.def;
+    if (d.index || d.column || d.multi || d.variants || d.defaults || d.analyzer || d.normalizer ||
+        d.stored_resource || d.long_terms || d.scale || d.unit || d.dims || d.truncate_dims || d.metric ||
+        d.normalized || d.normalize_on_write || d.ann || d.ignore_malformed || d.ignore_z_value) {
+      throw SchemaError("nested field '" + name + "' accepts only type, fields and stored; "
+                        "settings belong to its child fields");
+    }
+    nestedEntries.push_back(e);
+  }
+  std::erase_if(entries, [](const SourceEntry& e) { return e.def.type && *e.def.type == FieldClass::NESTED; });
+  for (const auto& e : entries) {
+    for (const auto& n : nestedEntries) {
+      if (e.def.parent == n.name) {
+        throw SchemaError("field '" + std::string(e.name) + "' cannot inherit from nested field '" +
+                          std::string(n.name) + "'");
+      }
+    }
+  }
+
   // ---- resolve the whole merged graph ----
   sv_entry_map defMap;
   defMap.reserve(entries.size());
@@ -990,7 +1058,16 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   }
   ownership_map ownership;
   for (const auto& e : entries) resolveOwnership(e.name, defMap, ownership);
-  validateReservedFields(resolved, ownership);
+  if (childScope) {
+    for (const auto& [name, r] : resolved) {
+      if (r.hasType && r.type == FieldClass::ID) {
+        throw SchemaError("type 'id' is not valid inside nested path '" + std::string(scopePath) +
+                          "' (field: " + std::string(name) + "); elements are addressed through their document");
+      }
+    }
+  } else {
+    validateReservedFields(resolved, ownership);
+  }
   // A stored_resource must be declared, so a typo cannot silently start a
   // separate resource with default settings.
   for (const auto& e : entries) {
@@ -1070,6 +1147,27 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     schema->logicalFields.emplace(e.name, std::move(logical));
   }
 
+  for (const auto& e : nestedEntries) {
+    std::string name(e.name);
+    if (schema->logicalFields.contains(name)) throw SchemaError("duplicate definition of '" + name + "'");
+    api::SchemaDef childDef;
+    childDef.fields = e.def.fields;
+    std::shared_ptr<Schema> child;
+    try {
+      child = compile(childDef, nullptr, invalidStopWords, name);
+    } catch (const SchemaError& err) {
+      throw SchemaError(std::string(err.what()) + " (in nested field '" + name + "')");
+    }
+    child->parentScope_ = schema.get();
+    auto logical = std::make_unique<LogicalField>();
+    logical->name = name;
+    logical->primary = std::make_shared<NestedFieldType>(name, e.def.stored.value_or(true));
+    logical->multi = true;
+    schema->fieldTypeMap.emplace(name, logical->primary);
+    schema->logicalFields.emplace(name, std::move(logical));
+    schema->scopes_.emplace(name, std::move(child));
+  }
+
   // Stored-fields resources share the field registry (a segment registers
   // each under its own name), so they cannot reuse a field or template name.
   for (const auto& [name, rd] : resources) {
@@ -1145,7 +1243,41 @@ ResolvedFieldHandle Schema::resolveInput(std::string_view docKey) const {
   return handle(docKey, "self", **root.primary, root.owner);
 }
 
+std::optional<std::pair<std::string_view, std::string_view>> Schema::scopedName(std::string_view name) const {
+  auto dot = name.find('.');
+  if (dot == std::string_view::npos) return std::nullopt;
+  auto path = name.substr(0, dot);
+  if (!scopes_.contains(path)) return std::nullopt;
+  return std::pair{path, name.substr(dot + 1)};
+}
+
 ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const {
+  if (isScope()) {
+    // Child scopes are addressed by their full path; short names never fall
+    // back between scopes.
+    auto dot = name.find('.');
+    if (dot == std::string_view::npos || name.substr(0, dot) != scopePath_) {
+      if (dot != std::string_view::npos && name.substr(0, dot) == "root") {
+        throw RequestError("Field '" + std::string(name) + "' is an owner field; owner values are "
+                           "available to fields lists only, not inside nested path '" + scopePath_ + "'",
+                           "nested_scope_field");
+      }
+      throw RequestError("Field '" + std::string(name) + "' is not in nested path '" + scopePath_ +
+                         "'; address element fields as '" + scopePath_ + ".<field>'", "nested_scope_field");
+    }
+    auto h = resolveForLocal(name.substr(dot + 1), op);
+    h.logicalName = std::string(name);
+    return h;
+  }
+  if (auto scoped = scopedName(name)) {
+    throw RequestError("Field '" + std::string(name) + "' belongs to nested path '" +
+                       std::string(scoped->first) + "'; use it inside a to_parent query or a "
+                       "domain with to_children", "nested_scope_field");
+  }
+  return resolveForLocal(name, op);
+}
+
+ResolvedFieldHandle Schema::resolveForLocal(std::string_view name, OpClass op) const {
   auto split = name.rfind("__");
   auto rootName = split == std::string_view::npos ? name : name.substr(0, split);
   if (!validFieldName(rootName)) {

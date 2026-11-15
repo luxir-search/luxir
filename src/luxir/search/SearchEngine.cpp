@@ -237,6 +237,7 @@ void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
 }
 
 void SearchEngine::getResources(SearchRequest& req) {
+  if (req.presetResources) return;
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;

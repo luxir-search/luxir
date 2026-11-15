@@ -66,7 +66,7 @@ namespace luxir::api {
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
+struct ExistsQuery; struct ConstantScoreQuery; struct ToParentQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct GeoLatLon; struct GeoRing; struct GeoPolygon; struct GeoPolygonQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
 struct DisMaxQuery; struct PluginQuery; struct PluginOp;
@@ -131,7 +131,7 @@ enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11, IP = 12, DECIMAL = 13 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11, IP = 12, DECIMAL = 13, NESTED = 30 };
 enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
@@ -294,6 +294,7 @@ struct FieldDef {
   using LongTerms = luxir::api::FieldDef_::LongTerms;
   using DateUnit = luxir::api::FieldDef_::DateUnit;
   using Metric = luxir::api::VectorMetric;
+  map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;  // NESTED children
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
   std::optional<std::string_view> stored_resource;
@@ -890,6 +891,7 @@ struct Filter {
 };
 struct Collapse {
   std::span<const std::string_view> field;
+  std::string_view owner;
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::span<const SortSpec> head_sort;
   std::span<const SortSpec> sort;
@@ -898,6 +900,7 @@ struct Collapse {
 };
 struct Diversify {
   std::span<const std::string_view> field;
+  std::string_view owner;
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::optional<int64_t> max_per_key;
 };
@@ -917,6 +920,7 @@ struct TopDocs {                                                 // all indirect
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -937,7 +941,10 @@ struct Fusion {                                                  // needs TopDoc
 struct Domain {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
+  std::string_view to_children;
+  std::string_view from_match;
   std::optional<bool> apply_parent_filters;
+  std::optional<bool> to_parent;
 };
 struct ExprOp {
   std::string_view expr;
@@ -1126,6 +1133,14 @@ struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> score;
 };
+struct ToParentQuery {
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::string_view path;
+  std::string_view name;
+  std::optional<std::string_view> score;
+  std::optional<int32_t> min_children;
+  std::optional<int32_t> max_children;
+};
 struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> boost;
@@ -1207,7 +1222,8 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery>
+               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery,
+               ToParentQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1230,7 +1246,7 @@ LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
-LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
+LUXIR_TD(ConstantScoreQuery) LUXIR_TD(ToParentQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(GeoLatLon) LUXIR_TD(GeoRing) LUXIR_TD(GeoPolygon) LUXIR_TD(GeoPolygonQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery) LUXIR_TD(PluginQuery) LUXIR_TD(PluginOp)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
@@ -1276,7 +1292,7 @@ LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
 LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
-LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
+LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(ToParentQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(GeoPolygonQuery) LUXIR_ENTRY(ExprQuery)

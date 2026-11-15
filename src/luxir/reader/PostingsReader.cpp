@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "PostingsReader.h"
+#include "OwnerMap.h"
 
 #include <cstring>
 #include <filesystem>
@@ -109,8 +110,12 @@ struct PostingsReader::FieldPage {
 };
 
 // Initialize from files, returns false if missing files and missingFileOK=true
-bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced) {
-  std::string segStr = Postings::segmentKey(segId, creatorEpoch);
+bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced,
+                                         std::string_view scope) {
+  std::string segStr = Postings::scopeKey(segId, creatorEpoch, scope);
+  scope_ = std::string(scope);
+  segId_ = segId;
+  creatorEpoch_ = creatorEpoch;
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);
   files.emplace_back(dir.openFile(segInfoFile, expectSynced));
 
@@ -159,6 +164,24 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, uint64_
     }
     versionsLoc = seg_location::checkedRead(segInfo);
     versionCount = segInfo.checkedVint();
+    uint32_t scopeCount = segInfo.checkedVint();
+    if (scopeCount > segInfo.left()) throw std::runtime_error("invalid scope count");
+    for (uint32_t i = 0; i < scopeCount; i++) {
+      uint32_t length = segInfo.checkedVint();
+      if (length == 0 || length > segInfo.left()) throw std::runtime_error("invalid scope path");
+      scopePaths_.emplace_back(segInfo.ptr(), length);
+      segInfo.skip(length);
+    }
+    owner_.ownerMaxDoc = (int32_t)segInfo.checkedVint() - 1;
+    if (owner_.ownerMaxDoc >= 0) {
+      owner_.endsLoc = seg_location::checkedRead(segInfo);
+      owner_.endsMetaOff = (int64_t)segInfo.checkedVlong();
+      owner_.ownersLoc = seg_location::checkedRead(segInfo);
+      owner_.ownersMetaOff = (int64_t)segInfo.checkedVlong();
+    }
+    if ((owner_.ownerMaxDoc >= 0) != !scope.empty()) {
+      throw std::runtime_error("scope segment owner map does not match its key");
+    }
   } catch (const std::runtime_error& e) {
     invalidSegment(segInfoFile, e.what());
   }
@@ -222,6 +245,52 @@ std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t 
   if (!reader->initializeFromFiles(dir, segId, creatorEpoch, missingFileOK, expectSynced)) {
     return nullptr;  // Missing files and missingFileOK=true
   }
+  return reader;
+}
+
+bool PostingsReader::openScopes(Directory& dir, bool missingFileOK, bool expectSynced) {
+  std::lock_guard lock(scopeMutex_);
+  if (scopesOpened_) return true;
+  std::vector<std::pair<std::string, std::shared_ptr<PostingsReader>>> opened;
+  for (const auto& path : scopePaths_) {
+    auto reader = createScope(dir, segId_, creatorEpoch_, path, missingFileOK, expectSynced);
+    if (!reader) return false;
+    if (reader->owner_.ownerMaxDoc != maxdoc) {
+      throw std::runtime_error("nested row space '" + path + "' does not match its segment's rows");
+    }
+    opened.emplace_back(path, std::move(reader));
+  }
+  scopeReaders_ = std::move(opened);
+  scopesOpened_ = true;
+  return true;
+}
+
+std::shared_ptr<PostingsReader> PostingsReader::scopeReader(std::string_view path) {
+  std::lock_guard lock(scopeMutex_);
+  assert(scopesOpened_ || scopePaths_.empty());
+  for (const auto& [name, reader] : scopeReaders_) {
+    if (name == path) return reader;
+  }
+  return nullptr;
+}
+
+std::shared_ptr<PostingsReader> PostingsReader::createScope(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
+                                                            std::string_view scope, bool missingFileOK,
+                                                            bool expectSynced) {
+  auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
+  if (!reader->initializeFromFiles(dir, segId, creatorEpoch, missingFileOK, expectSynced, scope)) {
+    return nullptr;
+  }
+  reader->ownerMap_ = std::make_unique<OwnerMap>(*reader, reader->owner_.ownerMaxDoc);
+  return reader;
+}
+
+std::shared_ptr<PostingsReader> PostingsReader::emptyScope(std::string_view scope) {
+  auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
+  reader->segInfoOffset = 0;
+  reader->maxdoc = 0;
+  reader->scope_ = std::string(scope);
+  reader->ownerMap_ = std::make_unique<OwnerMap>();
   return reader;
 }
 

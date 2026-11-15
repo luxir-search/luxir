@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -20,6 +21,7 @@
 namespace luxir {
 
 class PostingsReader;
+class OwnerMap;
 class FieldReader;
 class TermsEnum;
 class DocsEnum;
@@ -39,6 +41,28 @@ class PostingsReader {
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
   VersionRuns versions;
+  // Nested row spaces: the paths a root segment carries, or the owner map of
+  // a scope segment (see PostingsWriter::OwnerBlock).
+  std::vector<std::string> scopePaths_;
+  std::string scope_;
+  uint64_t segId_ = 0;
+  uint64_t creatorEpoch_ = 0;
+public:
+  struct OwnerLocations {
+    int32_t ownerMaxDoc = -1;
+    seg_location endsLoc;
+    int64_t endsMetaOff = 0;
+    seg_location ownersLoc;
+    int64_t ownersMetaOff = 0;
+  };
+private:
+  OwnerLocations owner_;
+  // Scope segments of a root segment, opened once and shared by every holder
+  // of this reader; the owner map of a scope segment.
+  std::mutex scopeMutex_;
+  bool scopesOpened_ = false;
+  std::vector<std::pair<std::string, std::shared_ptr<PostingsReader>>> scopeReaders_;
+  std::unique_ptr<OwnerMap> ownerMap_;
 
   // Ordinals follow the sorted field index. Only the directory is allocated
   // at open; slot pages and immutable headers are published on first use.
@@ -90,6 +114,13 @@ public:
   // Returns nullptr if missingFileOK=true and any required files are missing.
   // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
   static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK = false, bool expectSynced = false);
+  // The row space of nested path `scope` inside segment segId.
+  static std::shared_ptr<PostingsReader> createScope(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
+                                                     std::string_view scope, bool missingFileOK = false,
+                                                     bool expectSynced = false);
+  // A reader over no rows and no fields: the row space of a path a segment
+  // does not carry.
+  static std::shared_ptr<PostingsReader> emptyScope(std::string_view scope);
 
   explicit PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~PostingsReader();
@@ -101,7 +132,8 @@ private:
   PostingsReader() = default;
 
   // Initialize from files, returns false if missing files and missingFileOK=true
-  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced);
+  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced,
+                           std::string_view scope = {});
 
 public:
 
@@ -110,6 +142,21 @@ public:
   }
 
   int32_t numFields() const noexcept { return nFields; }
+  const std::vector<std::string>& scopePaths() const noexcept { return scopePaths_; }
+  bool hasScope(std::string_view path) const noexcept {
+    return std::ranges::find(scopePaths_, path) != scopePaths_.end();
+  }
+  const std::string& scope() const noexcept { return scope_; }
+  uint64_t segId() const noexcept { return segId_; }
+  uint64_t creatorEpoch() const noexcept { return creatorEpoch_; }
+  const OwnerLocations& ownerLocations() const noexcept { return owner_; }
+  // Opens the scope segments this root segment carries (idempotent). Returns
+  // false when missingFileOK and a scope file is missing.
+  bool openScopes(Directory& dir, bool missingFileOK, bool expectSynced);
+  // The opened scope segment of `path`, or null when this segment carries none.
+  std::shared_ptr<PostingsReader> scopeReader(std::string_view path);
+  // The owner map of a scope segment (empty for an empty scope).
+  const OwnerMap& owners() const { return *ownerMap_; }
   const VersionRuns& versionRuns() const { return versions; }
 
   // Immutable headers, decoded on first use and shared by all snapshots.

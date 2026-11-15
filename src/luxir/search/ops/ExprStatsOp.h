@@ -55,6 +55,7 @@ class ExprStatsOp : public SearchOp {
     const ValueNode& input = producer.input->root();
     if (producer.resolved.denseFacetState == nullptr
         || input.kind != ValueNodeKind::COLUMN
+        || !input.scope.empty()
         || input.type != ValueType::INT64
         || input.columnMultiValued) {
       return nullptr;

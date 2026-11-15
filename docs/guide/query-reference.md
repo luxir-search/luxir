@@ -776,6 +776,21 @@ A bare JSON string is sugar for `expr.q`. Variables are substituted as values,
 not parsed as query syntax. See [Query language](query-language.md) for the full
 grammar and the function-call subset.
 
+## Nested elements (`to_parent`)
+
+`to_parent` matches documents whose elements of a nested field match its
+query; every clause of that query applies to one element.
+
+```json
+{"to_parent": {"path": "variants", "score": "max", "min_children": 1,
+               "query": {"match": {"variants.color": "red"}}}}
+```
+
+`path` names the nested field, `query` uses `<path>.<field>` names, `score`
+is `max` (default), `min`, `sum`, `avg`, or `none`, `min_children` and
+`max_children` bound the matching elements per document, and `name` labels
+the clause for `row_ops`. See [Nested documents](nested.md).
+
 ## Vector and geo
 
 Vector and geographic queries use the same `Query` node and are documented

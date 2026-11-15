@@ -112,10 +112,29 @@ public:
                  ramBudget, std::move(dictionaryProvider)) {}
 
   Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
-           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
-      : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {},
+           std::string_view scope = {})
+      : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true, scope), schema(std::move(schema)),
         storedDictionaryProvider(std::move(dictionaryProvider)),
-        ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+        ramGuard(ramBudget == nullptr || !scope.empty()
+                 ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
+        ramBudget_(ramBudget) {}
+
+  // Nested row spaces. Each nested path a document of this segment uses gets
+  // a child inverter over the path's child schema, writing the path's own
+  // scope segment files. Element rows are append-only like owner rows: the
+  // elements of a failed or deleted document stay in the files and are dead
+  // because their owner is. `ends[d]` is the element-row end of owner row d.
+  struct ScopeRows {
+    std::string path;
+    std::unique_ptr<Inverter> rows;
+    std::vector<int64_t> ends;
+  };
+  std::vector<ScopeRows> scopes;
+  ScopeRows& scopeRows(std::string_view path);
+  // Owner-row ends for this inverter when it is itself a child scope; set by
+  // the owner before flush.
+  std::span<const int64_t> ownerEnds;
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
@@ -139,6 +158,7 @@ public:
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
+    for (auto& scope : scopes) scope.rows->updateVersions(version);
     versionRuns.add((uint32_t)getMaxDoc(), version);
     minVersion = std::min(minVersion, version);
     maxVersion = std::max(maxVersion, version);
@@ -291,6 +311,7 @@ public:
     std::shared_ptr<FieldType> fieldType;
     LogicalField::Shape shape;
     bool multi;
+    bool nested = false;  // a nested path: the value goes to its row space
     StoredFieldsWriter* writer;
     std::vector<Branch> branches;
     std::vector<GeoPoint> geoPoints;
@@ -415,7 +436,9 @@ public:
   // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
   // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    return pool.size() + extraRamBytes + versionRuns.allocatedBytes();
+    size_t bytes = pool.size() + extraRamBytes + versionRuns.allocatedBytes();
+    for (auto& scope : scopes) bytes += scope.rows->memSize() + scope.ends.capacity() * sizeof(int64_t);
+    return bytes;
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a
@@ -423,7 +446,9 @@ public:
   // whole message stays in one inverter so within-request id overwrites resolve
   // in memory (see ProtoUpdateMessage::handle).
   bool shouldFlush(size_t ramCap, size_t docCap) {
-    return memSize() > ramCap || (size_t)getMaxDoc() > docCap;
+    if (memSize() > ramCap || (size_t)getMaxDoc() > docCap) return true;
+    for (auto& scope : scopes) if ((size_t)scope.rows->getMaxDoc() > docCap) return true;
+    return false;
   }
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)
@@ -431,7 +456,12 @@ public:
   /// If filenames is provided, appends the names of all files written (for fsync at commit time).
   bool flush(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr);
 
+  // Index the value of a nested input field (its InputHandler's type is
+  // NestedFieldType) into the path's row space for the current document.
+  void indexNested(InputHandler& input, const IndexVal& val);
+
 private:
+  IndexRamBudget* ramBudget_ = nullptr;
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
   // Stored-fields writers, keyed by resource name.  Lazily populated when
   // fields with the STORED flag are first indexed.  PackedTermHash/Equal

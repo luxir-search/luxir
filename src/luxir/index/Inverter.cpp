@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Inverter.h"
+#include "OwnerMapWriter.h"
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
@@ -67,8 +68,10 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   auto resolved = schema->resolveInput(name);
   auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
   StoredFieldsWriter* writer = nullptr;
+  bool nested = dynamic_cast<NestedFieldType*>(fieldType.get()) != nullptr;
   if (fieldType->isStored()
-      && (fieldType->type() == FieldType::Type::TEXT
+      && (nested
+          || fieldType->type() == FieldType::Type::TEXT
           || fieldType->type() == FieldType::Type::STRING
           || fieldType->type() == FieldType::Type::ID)) {
     const std::string& resourceName = fieldType->storedResource_;
@@ -90,6 +93,12 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   }
 
   auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
+  if (nested) {
+    input->nested = true;
+    auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
+    assert(inserted);
+    return *iter->second;
+  }
   input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType)});
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
@@ -225,6 +234,10 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (nested) {
+    inverter.indexNested(*this, val);
+    return;
+  }
   if (shape == LogicalField::Shape::GEO) {
     // Parse once for every branch, and fully before any branch indexes.
     geoPoints.clear();
@@ -285,6 +298,82 @@ void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const Geo
 }
 
 
+Inverter::ScopeRows& Inverter::scopeRows(std::string_view path) {
+  for (auto& scope : scopes) {
+    if (scope.path == path) return scope;
+  }
+  const auto* child = schema->scope(path);
+  if (child == nullptr) throw std::logic_error("no nested scope '" + std::string(path) + "'");
+  auto& scope = scopes.emplace_back();
+  scope.path = std::string(path);
+  scope.rows = std::make_unique<Inverter>(postingsWriter.getDirectory(), postingsWriter.segId,
+                                          postingsWriter.creatorEpoch, *child, ramBudget_,
+                                          storedDictionaryProvider, path);
+  scope.rows->overwrite = false;
+  // Element rows carry their owner's request version; readers require runs.
+  scope.rows->updateVersions(currVersion);
+  return scope;
+}
+
+void Inverter::indexNested(InputHandler& input, const IndexVal& val) {
+  std::string_view path(input.fieldName);
+  if (coerce::isNull(val)) return;  // a null list is an absent path
+  const auto* list = std::get_if<api::ArrVal>(&val.kind);
+  const auto* single = std::get_if<api::Map>(&val.kind);
+  if (list == nullptr && single == nullptr) {
+    throw DocumentError(fmt::format("Field '{}' is nested: expected a list of objects", path));
+  }
+  auto& scope = scopeRows(path);
+  Inverter& rows = *scope.rows;
+  rows.coerceContext = coerceContext;
+  int32_t owner = getDoc();
+  // Owners without this path own no rows; a failed earlier owner keeps the
+  // rows it appended (they are dead with it).
+  if ((int32_t)scope.ends.size() < owner) scope.ends.resize(owner, rows.getMaxDoc());
+  std::vector<std::pair<InputHandler*, const IndexVal*>> fields;
+  const int32_t firstRow = rows.getMaxDoc();
+  auto element = [&](const IndexVal& elem) {
+    rows.startDoc();
+    if (coerce::isNull(elem)) return;  // an element with no values still exists
+    const auto* map = std::get_if<api::Map>(&elem.kind);
+    if (map == nullptr) {
+      throw DocumentError(fmt::format("Field '{}' is nested: every element must be an object or null", path));
+    }
+    fields.clear();
+    for (const auto& [name, v] : map->fields) {
+      InputHandler* handler;
+      try {
+        handler = &rows.getIndexHandler(name);
+      } catch (const RequestError& e) {
+        throw DocumentError(fmt::format("Field '{}.{}': {}", path, name, e.what()), e.code);
+      }
+      uint32_t slot = handler->claim(rows, (uint32_t)fields.size());
+      if (slot == fields.size()) fields.emplace_back(handler, &*v);
+      else fields[slot].second = &*v;
+    }
+    for (const auto& [handler, v] : fields) {
+      try {
+        handler->index(rows, *v);
+      } catch (const DocumentError& e) {
+        throw DocumentError(fmt::format("Field '{}' element {}: {}", path, rows.getDoc() - firstRow,
+                                        e.what()), e.code);
+      }
+    }
+  };
+  if (single != nullptr) {
+    element(val);
+  } else {
+    for (const auto& elem : list->v) element(elem);
+  }
+  if ((int32_t)scope.ends.size() == owner) scope.ends.push_back(rows.getMaxDoc());
+  else scope.ends[owner] = rows.getMaxDoc();
+  if (input.writer) {
+    std::vector<std::byte> encoded;
+    if (!api::encode(val, encoded)) throw DocumentError(fmt::format("Field '{}': cannot encode value", path));
+    input.writer->addValue(owner, path, std::string_view((const char*)encoded.data(), encoded.size()));
+  }
+}
+
 bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
   // Index-time stored/vector streams begin as candidates because their final
@@ -324,6 +413,18 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
 
   for (auto fieldHandler : fields) {
     fieldHandler->flush(*this);
+  }
+
+  // Nested row spaces flush into their own scope segment files, listed with
+  // the owner's. A path whose lists were all empty writes nothing.
+  std::sort(scopes.begin(), scopes.end(), [](const ScopeRows& a, const ScopeRows& b) { return a.path < b.path; });
+  for (auto& scope : scopes) {
+    scope.ends.resize(getMaxDoc(), scope.rows->getMaxDoc());
+    scope.rows->ownerEnds = scope.ends;
+    if (scope.rows->flush(filenames, descriptors)) postingsWriter.scopePaths.push_back(scope.path);
+  }
+  if (!ownerEnds.empty() || postingsWriter.scope.size()) {
+    if (getMaxDoc() > 0) writeOwnerMap(postingsWriter, pool, ownerEnds);
   }
 
   if (getMaxDoc()) noteFlushWorkspace(versionRuns.flushWorkspaceBytes());

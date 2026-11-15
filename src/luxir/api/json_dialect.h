@@ -348,6 +348,12 @@ struct from<JSON, luxir::api::Domain> {
                 value.query, ctx, vit, vend);
           } else if (key == "apply_parent_filters") {
             util::from_json<O>(value.apply_parent_filters, ctx, vit, vend);
+          } else if (key == "to_children") {
+            util::from_json<O>(value.to_children, ctx, vit, vend);
+          } else if (key == "to_parent") {
+            util::from_json<O>(value.to_parent, ctx, vit, vend);
+          } else if (key == "from_match") {
+            util::from_json<O>(value.from_match, ctx, vit, vend);
           } else if (key == "filter") {
             decltype(auto) filters =
                 ::hpp_proto::detail::as_modifiable(ctx, value.filter);
@@ -943,6 +949,9 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
           } else if (key == "ignore_z_value") {
             util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
+          } else if (key == "fields") {
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
+            glz::util::parse_repeated<V>(true, fields, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1142,6 +1151,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::KnnQuery>);
           } else if (key == "constant_score") {
             arm(std::in_place_type<api::ConstantScoreQuery>);
+          } else if (key == "to_parent") {
+            arm(std::in_place_type<api::ToParentQuery>);
           } else if (key == "prefix") {
             arm(std::in_place_type<api::PrefixQuery>);
           } else if (key == "wildcard") {
@@ -1379,6 +1390,7 @@ struct from<JSON, luxir::api::Collapse> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "get_count") util::from_json<O>(value.get_count, ctx, vit, vend);
           else if (key == "ops") {
@@ -1419,6 +1431,7 @@ struct from<JSON, luxir::api::Diversify> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
           else { ctx.error = error_code::unknown_key; return true; }
@@ -1485,6 +1498,9 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.document_format, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "row_ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.row_ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
           } else if (key == "decorate") {
             decltype(auto) decorators = ::hpp_proto::detail::as_modifiable(ctx, value.decorate);

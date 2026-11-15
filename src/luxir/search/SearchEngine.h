@@ -63,6 +63,10 @@ public:
   // force old call sites to say what they mean.
   void submit(SearchRequest& req, bool) = delete;
 
+  // Runs a nested-scope inner request (SearchRequest::presetResources)
+  // serially on the calling thread; its final response goes to reply().
+  void executeScoped(SearchRequest& req) { req.maxParallel = 0; submitBody(req); }
+
 
   SearchEngine(const SearchEngine&) = delete;
   SearchEngine& operator=(const SearchEngine&) = delete;

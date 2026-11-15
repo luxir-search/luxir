@@ -158,12 +158,16 @@ message Collapse {
   // Exhaustive group order by metrics in ops; missing/failed values last.
   // Ties use the best member under the list sort, then document order.
   repeated SortSpec sort = 6;
+  // In a nested scope, "root" adds the element's owner as a structural key
+  // component (no key field is declared or decoded).
+  string owner = 7;
 }
 
 // A document cap, applied before paging in the list's ordinary rank order.
 message Diversify {
   repeated string field = 1; // One field or an exact tuple, as in Collapse.
   Collapse.MissingPolicy missing = 3;
+  string owner = 4;          // "root": cap elements per owner, as in Collapse.owner
   oneof kind {
     int64 max_per_key = 2; // Positive cap; keeps each key's best documents.
   }
@@ -172,6 +176,12 @@ message Diversify {
 message TopDocs {
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 25;
+  // Per-row sub-operations over each returned row's own nested elements,
+  // returned as one value per row under the operation's name. Each is a
+  // top_docs in the elements' scope; its domain is the row's elements of
+  // domain.to_children, or (domain.from_match) the elements a named
+  // to_parent clause of this list's query admitted, scored by that clause.
+  map<string, SearchOp> row_ops = 26;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
 
@@ -354,7 +364,25 @@ message Query {
     GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
+    ToParentQuery to_parent = 27;   // owners whose nested elements match, scored by a reducer
   }
+}
+
+// Selects the owners of the elements of nested `path` that match `query`.
+// Every clause of `query` evaluates on one element, so separate clauses must
+// be satisfied by the same element; separate to_parent clauses may be
+// satisfied by different elements. Element fields are named <path>.<field>.
+message ToParentQuery {
+  string path = 1;
+  Query query = 2;
+  // How the scores of an owner's matching elements combine: max (default),
+  // min, sum, avg, or none (owners score 0).
+  optional string score = 3;
+  // Bounds on the number of matching elements per owner; unset = unbounded.
+  optional int32 min_children = 4;
+  optional int32 max_children = 5;
+  // Names this clause, for retrieving the elements it admitted.
+  string name = 6;
 }
 
 message ExistsQuery {
@@ -1033,6 +1061,16 @@ message Domain {
   // Additional non-scoring constraints, ANDed with the inherited or reset
   // domain. Entries and query must each specify a query kind.
   repeated Query filter = 5;
+
+  // Scope changes. to_children: this operation runs over the elements of
+  // nested path to_children whose owners are in the incoming domain (fields,
+  // queries, filters and sub-operations then address <path>.<field>).
+  // to_parent: from a nested scope, run over the distinct owners of the
+  // incoming elements. Both exclude query; filter applies in the new scope.
+  string to_children = 6;
+  optional bool to_parent = 7;
+  // Row operations only: the name of a to_parent clause in the list's query.
+  string from_match = 8;
 }
 
 // A nonfatal degradation reported by the query parser or engine. Documented
@@ -2437,6 +2475,7 @@ message FieldDef {
     BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
     IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
+    NESTED = 30;   // list of owned sub-objects with typed child fields (see fields)
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2558,6 +2597,11 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only: the typed fields of each element. Each element of the list
+  // is a row in its own per-path row space, addressed in queries as
+  // <field>.<child>. Elements live and die with their document.
+  map<string, FieldDef> fields = 41;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

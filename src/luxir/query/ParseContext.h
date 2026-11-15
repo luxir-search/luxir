@@ -61,6 +61,9 @@ struct ParseContext {
   FieldResolver localFields;
   FieldResolver& fields;
   std::map<const api::Val*, std::pair<std::string_view, size_t>> exactSources;
+  // Set for the context of a nested scope's query (inside to_parent): the
+  // owner scope's context. The schema and reader are the scope's own.
+  ParseContext* parentScope = nullptr;
 
   ParseContext(MemPool& pool, Schema& schema, google::protobuf::Arena& arena,
                const CoerceContext& coerceContext,

@@ -50,6 +50,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/api/padded_input.h"
 #include "luxir/util/thread.h"
 
 namespace luxir {
@@ -1452,6 +1453,175 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 // stored-field target).  Entries from patterns or an empty list are marked
 // discovered. Extra columns are always returned; explicit selectors naming one
 // select the extra even if a physical field has the same name. Discovered fields
+// Retrieval of a nested path from its owner's stored source: `path` alone
+// returns the submitted list; with `element`, each owner returns the list of
+// that element field's values (null where an element lacks it). Rows read
+// their owner's stored value, decoded into the response arena.
+inline ExtraColumn nestedSourceColumn(IndexReader& reader, std::string_view outputKey, std::string_view path,
+                                      std::string_view element, std::string_view resource) {
+  ExtraColumn column;
+  column.name = outputKey;
+  column.value = [](int64_t, api::Val&, std::pmr::memory_resource&) { assert(false); };
+  column.batchValue = [&reader, path, element, resource](std::span<const segdoc> segDocs,
+                                                         std::span<const uint32_t> rows,
+                                                         std::span<api::Val> values,
+                                                         std::pmr::memory_resource& mr) {
+    int32_t openSegment = -1;
+    std::optional<StoredFieldsReader> stored;
+    for (uint32_t row : rows) {
+      const segdoc& sd = segDocs[row];
+      if (sd.segment() != openSegment) {
+        openSegment = sd.segment();
+        stored.reset();
+        auto& pr = reader.segments()[(size_t)openSegment].postingsReader();
+        if (const auto* info = pr.fieldInfo(resource)) stored.emplace(pr, *info);
+      }
+      api::Val& out = values[row];
+      out = {};
+      if (!stored) continue;
+      stored->readDoc(sd.docId(), [&](std::string_view name, std::span<const std::string_view> vals) {
+        if (name != path || vals.empty()) return;
+        api::Val decoded;
+        auto bytes = std::as_bytes(std::span(vals[0].data(), vals[0].size()));
+        if (!api::decode(decoded, api::copyToPaddedInput(bytes, mr), mr)) {
+          throw std::runtime_error("corrupt stored nested value for '" + std::string(path) + "'");
+        }
+        if (element.empty()) {
+          out = decoded;
+          return;
+        }
+        std::span<const api::Val> elements;
+        if (auto* list = std::get_if<api::ArrVal>(&decoded.kind)) elements = list->v;
+        else if (std::holds_alternative<api::Map>(decoded.kind)) elements = std::span<const api::Val>(&decoded, 1);
+        auto& result = out.kind.emplace<api::ArrVal>();
+        auto* items = build::allocArray(result.v, elements.size(), mr);
+        for (size_t i = 0; i < elements.size(); i++) {
+          if (auto* map = std::get_if<api::Map>(&elements[i].kind)) {
+            if (auto* value = map->fields.find(element)) items[i] = **value;
+          }
+        }
+      });
+    }
+  };
+  return column;
+}
+
+// An owner field (root.<field>) of each element row in a nested scope: the
+// owner row's value, read from the owner reader's stored source or column.
+inline ExtraColumn ownerFieldColumn(IndexReader& elementReader, std::string_view outputKey, std::string_view field) {
+  IndexReader& owners = *elementReader.parentScope();
+  auto handle = owners.schema()->resolveFor(field, OpClass::RETRIEVE);
+  FieldType* type = handle.fieldType;
+  auto storage = FieldType::storage(type->type());
+  bool stored = type->isStored() && (storage == FieldType::Storage::TEXT || storage == FieldType::Storage::TERMS);
+  if (!stored && !(type->hasColumn() && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::INT64))) {
+    throw RequestError("Owner field '" + std::string(field) + "' has no stored value or column to retrieve",
+                       "invalid_field");
+  }
+  auto physical = owners.schema()->getFieldTypeEx(handle.physicalName)->name();
+  std::string_view resource = type->storedResource_;
+  ExtraColumn column;
+  column.name = outputKey;
+  column.value = [](int64_t, api::Val&, std::pmr::memory_resource&) { assert(false); };
+  column.batchValue = [&elementReader, &owners, type, physical, stored, resource](
+      std::span<const segdoc> segDocs, std::span<const uint32_t> rows, std::span<api::Val> values,
+      std::pmr::memory_resource& mr) {
+    // Rows of one batch arrive grouped by segment; owners are monotone in
+    // element order, so each segment's distinct owners form a sorted list.
+    size_t i = 0;
+    while (i < rows.size()) {
+      int32_t segment = segDocs[rows[i]].segment();
+      size_t end = i;
+      while (end < rows.size() && segDocs[rows[end]].segment() == segment) end++;
+      auto& elementSeg = elementReader.segments()[(size_t)segment];
+      auto& ownerSeg = owners.segments()[(size_t)segment];
+      const auto& map = elementSeg.postingsReader().owners();
+      std::vector<std::pair<int32_t, uint32_t>> byOwner;  // (owner row, output row)
+      byOwner.reserve(end - i);
+      for (size_t r = i; r < end; r++) byOwner.emplace_back(map.owner(segDocs[rows[r]].docId()), rows[r]);
+      std::sort(byOwner.begin(), byOwner.end());
+      std::vector<int32_t> distinct;
+      for (auto& [owner, row] : byOwner) if (distinct.empty() || distinct.back() != owner) distinct.push_back(owner);
+      std::vector<api::Val> fetched(distinct.size());
+      auto& pr = ownerSeg.postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      if (stored) {
+        if (const auto* info = pr.fieldInfo(resource)) {
+          StoredFieldsReader reader(pr, *info);
+          for (size_t k = 0; k < distinct.size(); k++) {
+            reader.readDoc(distinct[k], [&](std::string_view name, std::span<const std::string_view> vals) {
+              if (name != physical || vals.empty()) return;
+              if (!type->multiValued()) {
+                fetched[k].kind = build::arenaStr(mr, vals[0]);
+              } else {
+                auto& arr = fetched[k].kind.emplace<api::ArrStr>();
+                auto* out = build::allocArray(arr.v, vals.size(), mr);
+                for (size_t v = 0; v < vals.size(); v++) out[v] = build::arenaStr(mr, vals[v]);
+              }
+            });
+          }
+        }
+      } else if (const auto* info = pr.fieldInfo(physical)) {
+        auto decode = [type](int64_t v) -> api::Val {
+          api::Val out;
+          switch (type->type()) {
+            case FieldType::FLOAT: out.kind = sortableInt32ToFloat((int32_t)v); break;
+            case FieldType::DOUBLE: out.kind = sortableInt64ToDouble(v); break;
+            case FieldType::BOOLEAN: out.kind = v != 0; break;
+            default: out.kind = v; break;
+          }
+          return out;
+        };
+        bool terms = FieldType::storage(type->type()) == FieldType::Storage::TERMS;
+        bool indexed = (info->flags & FieldType::INDEX_DOCS) != 0;
+        auto addMulti = [&](size_t idx, api::Val value, int64_t valIdx, int64_t numVals) {
+          auto& arr = valIdx == 0 ? fetched[idx].kind.emplace<api::ArrVal>() : std::get<api::ArrVal>(fetched[idx].kind);
+          if (valIdx == 0) build::allocArray(arr.v, numVals, mr);
+          const_cast<api::Val*>(arr.v.data())[valIdx] = value;
+        };
+        if (terms && indexed) {
+          TermsEnum tenum(poolGuard.pool(), pr, *info);
+          auto term = [&](int32_t ord) {
+            tenum.seekOrd(ord - 1);
+            api::Val v;
+            v.kind = build::arenaStr(mr, (std::string_view)tenum.term());
+            return v;
+          };
+          if (!type->multiValued()) {
+            OrdColReader::getSingleValues(poolGuard.pool(), pr, *info, distinct,
+                [&](size_t idx, int32_t, int32_t ord) { fetched[idx] = term(ord); });
+          } else {
+            OrdColReader::getValues(poolGuard.pool(), pr, *info, distinct,
+                [&](size_t idx, int32_t, int32_t ord, int64_t valIdx, int64_t n) { addMulti(idx, term(ord), valIdx, n); });
+          }
+        } else if (terms) {
+          auto str = [&](std::string_view s) { api::Val v; v.kind = build::arenaStr(mr, s); return v; };
+          if (!type->multiValued()) {
+            StrColReader::getValues(poolGuard.pool(), pr, *info, distinct,
+                [&](size_t idx, int32_t, std::string_view s) { fetched[idx] = str(s); });
+          } else {
+            StrColReader::getMultiValues(poolGuard.pool(), pr, *info, distinct,
+                [&](size_t idx, int32_t, std::string_view s, int64_t valIdx, int64_t n) { addMulti(idx, str(s), valIdx, n); });
+          }
+        } else if (!type->multiValued()) {
+          IntColReader::getSingleValues(poolGuard.pool(), pr, *info, distinct,
+              [&](size_t idx, int32_t, int64_t v) { fetched[idx] = decode(v); });
+        } else {
+          IntColReader::getValues(poolGuard.pool(), pr, *info, distinct,
+              [&](size_t idx, int32_t, int64_t v, int64_t valIdx, int64_t n) { addMulti(idx, decode(v), valIdx, n); });
+        }
+      }
+      size_t k = 0;
+      for (auto& [owner, row] : byOwner) {
+        while (distinct[k] != owner) k++;
+        values[row] = fetched[k];
+      }
+      i = end;
+    }
+  };
+  return column;
+}
+
 // must not collide with extras, and synthetic output names are reserved.
 // The plan is allocated from the protobuf request arena: emission
 // starts on task-group threads and concurrent ops must not race (protobuf
@@ -1477,11 +1647,29 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
+  // Nested paths and element fields read the owner's stored source.
+  std::vector<ExtraColumn> nested;
+  auto pushNested = [&](std::string_view f, std::string_view path, std::string_view element) {
+    auto* type = req.schema->getFieldTypePtr(path);
+    if (type == nullptr || !type->isStored()) {
+      throw RequestError("Nested field '" + std::string(path) + "' is not stored, so '" + std::string(f) +
+                         "' cannot be retrieved; query it with to_parent or a to_children domain", "invalid_field");
+    }
+    if (!element.empty()) {
+      // Validates the element field name against the path's schema.
+      (*req.schema->scope(path))->resolveForLocal(element, OpClass::RETRIEVE);
+    }
+    nested.push_back(nestedSourceColumn(*req.reader, f, path, element, type->storedResource_));
+  };
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
     if (extraNames.contains(field.name)) {
       throw RequestError("Extra column '" + std::string(field.name)
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
                            " or select the extra by name");
+    }
+    if (req.schema->scope(field.name)) {
+      if (field.type && field.type->isStored()) pushNested(field.name, field.name, {});
+      return;
     }
     picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
   };
@@ -1492,6 +1680,21 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
+      return;
+    }
+    for (const auto& column : nested) {
+      if (column.name == f) return;
+    }
+    if (req.schema->scope(f)) {
+      pushNested(f, f, {});
+      return;
+    }
+    if (req.schema->isScope() && f.starts_with("root.") && req.reader->parentScope() != nullptr) {
+      nested.push_back(ownerFieldColumn(*req.reader, f, f.substr(5)));
+      return;
+    }
+    if (auto scoped = req.schema->scopedName(f)) {
+      pushNested(f, scoped->first, scoped->second);
       return;
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
@@ -1536,6 +1739,14 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
           [](const auto& field) { return field.derived; }, [&](const auto& field) {
             if (taken.insert(field.name).second) pushDiscovered(field);
           });
+    }
+  }
+  if (!nested.empty()) {
+    auto* columns = luxir::arenaCreate<std::vector<ExtraColumn>>(req.arena, std::move(nested));
+    for (const auto& column : *columns) {
+      ReturnField rf{column.name, {}, nullptr, ReturnField::Kind::EXTRA, false};
+      rf.extra = &column;
+      picked.push_back(rf);
     }
   }
   if (!extraColumns.empty()) {

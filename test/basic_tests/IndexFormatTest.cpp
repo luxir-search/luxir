@@ -37,8 +37,8 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 12;
-constexpr uint64_t kReferenceDigest = 0xcb471306f973d8b2;
+constexpr uint64_t kReferenceVersion = 13;
+constexpr uint64_t kReferenceDigest = 0xa94e0da843e1036b;
 
 // A small index over every default field template's kind, with two segments
 // and a delete. Each segment is one request flushed by a single inverter.

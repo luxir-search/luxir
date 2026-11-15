@@ -83,16 +83,47 @@ private:
   RootField findRoot(std::string_view root) const;
   const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
   static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base,
-                                         InvalidStopWords invalidStopWords);
+                                         InvalidStopWords invalidStopWords,
+                                         std::string_view scopePath = {});
+
+  // Nested scopes (type: nested). Each declared path owns a child Schema over
+  // its own row space; child physical names are the short element field names.
+  // A child scope has no reserved fields and no further scopes (one level).
+  std::map<std::string, std::shared_ptr<Schema>, std::less<>> scopes_;
+  std::string scopePath_;
+  const Schema* parentScope_ = nullptr;
+  // Copy the root's binding and the "<path>.<field>" introductions into each
+  // child scope, after the root's own history changed.
+  void syncScopes();
 
 public:
   Schema() = default;
+  Schema(const Schema& other);
+  Schema& operator=(const Schema&) = delete;
+
+  // The child scope declared at `path`, or null.
+  const std::shared_ptr<Schema>* scope(std::string_view path) const {
+    auto it = scopes_.find(path);
+    return it == scopes_.end() ? nullptr : &it->second;
+  }
+  const auto& scopes() const { return scopes_; }
+  // Empty for the root scope.
+  const std::string& scopePath() const { return scopePath_; }
+  bool isScope() const { return !scopePath_.empty(); }
+  // The owner scope of a child scope (null for the root).
+  const Schema* parentScope() const { return parentScope_; }
+  // Splits "<path>.<field>" when <path> names a nested scope of this schema.
+  std::optional<std::pair<std::string_view, std::string_view>> scopedName(std::string_view name) const;
+
   std::shared_ptr<Schema> withHistory(SchemaBinding binding, const Schema* previous) const;
 
   // Ingest accepts logical document keys only. The returned primary handle
   // exposes the owner and its variants for the later ingest dispatcher.
   ResolvedFieldHandle resolveInput(std::string_view docKey) const;
+  // Request-name resolution. In a child scope, names are "<path>.<field>".
   ResolvedFieldHandle resolveFor(std::string_view name, OpClass op) const;
+  // Resolution inside this scope's own namespace (short physical roots).
+  ResolvedFieldHandle resolveForLocal(std::string_view name, OpClass op) const;
   // Already-resolved physical access: no defaults or __self aliases.
   FieldType* physical(std::string_view name) const;
 

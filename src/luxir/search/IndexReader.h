@@ -28,19 +28,43 @@ namespace luxir {
 class FieldType;
 class FilterCache;
 class OrdMap;
+class OwnerMap;
 class Schema;
 struct CommitSnapshot;
 
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
 private:
+  std::vector<uint64_t> ownedWords;                   // backing of a folded (nested scope) live set
   BitDocSet docSet;                                   // The actual bitset (memory mapped)
   std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
+  // Element-row liveness of nested scopes, folded from this owner live set.
+  mutable std::vector<std::pair<std::string, std::shared_ptr<LiveDocs>>> scopeLiveViews;
 
 public:
   LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
+
+  // An owning live set, for nested element rows derived from their owners.
+  LiveDocs(std::vector<uint64_t>&& words, int32_t maxDocCount, int32_t numLive)
+      : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.data(), maxDocCount), numLive) {}
+
+  // Element rows of a nested scope are live iff their owner row is. Null when
+  // every element row is live.
+  static std::shared_ptr<LiveDocs> foldScope(const LiveDocs& owners, const OwnerMap& map);
+
+  // The element-row live set of nested `path`, built once per owner live
+  // set. Null when every element row is live.
+  template <typename Build>
+  std::shared_ptr<LiveDocs> scopeLive(std::string_view path, Build&& build) const {
+    std::lock_guard lock(rankLiveMutex);
+    for (const auto& [name, view] : scopeLiveViews) {
+      if (name == path) return view;
+    }
+    scopeLiveViews.emplace_back(path, build());
+    return scopeLiveViews.back().second;
+  }
 
   LiveDocs(uint64_t* mappedMemory, int32_t maxDocCount, 
            std::shared_ptr<InputFile>&& file, int32_t numLive)
@@ -208,6 +232,10 @@ public:
   public:
     FieldSegments() = default;
     const PostingsReader::Field* at(size_t segment) const;
+    // The reader segment `segment` of these field records (null when absent).
+    Segment* segmentAt(size_t segment) const {
+      return record ? const_cast<Segment*>(&segments[segment]) : nullptr;
+    }
     const PostingsReader::Field* at(const Segment& segment) const {
       assert(!record || (segment.ord >= 0 && (size_t)segment.ord < size()
                          && &segments[segment.ord] == &segment));
@@ -327,6 +355,11 @@ private:
     std::string incarnation;
     // (segId, ord) of each segment, by segId.
     std::vector<std::pair<uint64_t, int32_t>> segOrds;
+    // Nested row spaces over these segments, built on first use and shared by
+    // every reader of this core.
+    std::mutex scopeMutex;
+    std::vector<std::pair<std::string, std::shared_ptr<PhysicalCore>>> scopeCores;
+    std::shared_ptr<PhysicalCore> scopeCore(std::string_view path);
 
     // The segment `segId`, or null.
     const Segment* segment(uint64_t segId) const;
@@ -357,6 +390,12 @@ private:
   std::vector<RetrievableField> retrievable;
   OnceFlag searchableOnce;
   std::vector<std::string> searchable;
+  // Nested scopes: child readers over this reader's segments (same ords), and
+  // for a child reader, its owner reader and path.
+  std::mutex scopesMutex_;
+  std::vector<std::pair<std::string, std::unique_ptr<IndexReader>>> scopes_;
+  IndexReader* parentScope_ = nullptr;
+  std::string scopePath_;
 
   // Opens the snapshot `manifest` (the newest durable root when null). Each
   // segment's PostingsReader comes from `published` (the publisher's open
@@ -398,6 +437,14 @@ public:
   std::span<Segment> segments() noexcept {
     return core->segs;
   }
+
+  // The reader of nested path `path`'s element rows: segments aligned by ord
+  // with this reader's, the path's child schema, element liveness folded from
+  // owner liveness, and no filter cache. Null when the schema has no such path.
+  IndexReader* scope(std::string_view path);
+  // The owner reader of a nested scope reader, or null for a root reader.
+  IndexReader* parentScope() const noexcept { return parentScope_; }
+  const std::string& scopePath() const noexcept { return scopePath_; }
 
   // Aux readers for entries in the parsed IndexInfo.aux_indexes (in the same
   // order).  Unknown-kind entries are omitted, so this list may be shorter

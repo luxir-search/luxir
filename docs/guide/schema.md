@@ -23,6 +23,7 @@ Choose a type based on how you want to search and use the values:
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+| `nested` | A list of owned sub-objects with typed child `fields` (product variants, document chunks), each element a row of its own. See [Nested documents](nested.md). |
 
 ### Decimals
 

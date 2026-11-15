@@ -15,6 +15,7 @@ api::Collapse diversifyKeySpec(const api::TopDocs& spec) {
   }
   api::Collapse keys;
   keys.field = cap.field;
+  keys.owner = cap.owner;
   keys.missing = cap.missing;
   return keys;
 }

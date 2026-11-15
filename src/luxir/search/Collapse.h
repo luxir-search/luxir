@@ -18,6 +18,7 @@
 #include "luxir/search/OrdMapStr.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/reader/OwnerMap.h"
 
 namespace luxir {
 
@@ -72,7 +73,16 @@ struct CollapsePlan {
           ValueNature nature = ValueNature::NUMBER)
       : name(std::move(name)), type(type), storage(storage), ords(std::move(ords)), segments(segments), nature(nature) {}
     bool ordinal() const { return storage == FieldType::Storage::TERMS; }
+    // The structural owner of a nested element row: (owner segment base +
+    // owner row), read from the scope's owner map. No column is declared.
+    bool owner = false;
   };
+  // A key over the owner of each element row of a nested scope reader.
+  static void addOwnerKey(CollapsePlan& plan) {
+    auto& field = plan.fields.emplace_back(std::string("root"), luxir::api::GroupComponent_::Type::INT,
+                                           FieldType::Storage::INT64, nullptr, IndexReader::FieldSegments());
+    field.owner = true;
+  }
   std::vector<Field> fields;
   luxir::api::Collapse_::MissingPolicy missing;
   IndexReader& reader;
@@ -147,6 +157,8 @@ class CollapseKeyReader {
     OrdMap::SegToGlobal mapping;
     std::optional<IntColReader> numbers;
     std::optional<IntColReader::Iterator> values;
+    const OwnerMap* owners = nullptr;
+    int64_t ownerBase = 0;
     bool dense = false;
   };
   const CollapsePlan& plan;
@@ -166,6 +178,12 @@ public:
     scratch.components.resize(plan.fields.size());
     auto& seg = plan.reader.segments()[(size_t)segment];
     for (size_t i = 0; i < columns.size(); i++) {
+      if (plan.fields[i].owner) {
+        columns[i].owners = &seg.postingsReader().owners();
+        columns[i].ownerBase = plan.reader.parentScope()->segments()[(size_t)segment].base;
+        columns[i].dense = true;
+        continue;
+      }
       auto* info = plan.fields[i].segments.at((size_t)segment);
       if (!info) continue;
       auto& postings = seg.postingsReader();
@@ -206,6 +224,8 @@ public:
           }
           component = {true, value};
         }
+      } else if (column.owners) {
+        component = {true, column.ownerBase + column.owners->owner(doc)};
       } else if (column.values) {
         // A missing doc can leave the sparse iterator on a future value.
         // Its forward-seek contract requires target > current.
@@ -339,12 +359,17 @@ private:
   class WalkColumn {
     std::optional<OrdWalk> ords;
     std::optional<NumberWalk<Iterator>> numbers;
+    const OwnerMap* owners = nullptr;
+    int64_t ownerBase = 0;
   public:
     WalkColumn(Column& column, DocSet* domain, int32_t maxDoc) {
       if (column.ords) ords.emplace(column, domain, maxDoc);
       else if (column.numbers) numbers.emplace(column);
+      owners = column.owners;
+      ownerBase = column.ownerBase;
     }
     CollapseKey::Component read(int32_t doc) {
+      if (owners) return {true, ownerBase + owners->owner(doc)};
       if (ords) {
         int64_t value = ords->read(doc);
         return value >= 0 ? CollapseKey::Component{true, value} : CollapseKey::Component{};
@@ -379,6 +404,10 @@ public:
             return value.present ? GroupIdentity{GroupIdentity::VALUE, value.value} : plan.missingIdentity(segment, doc);
           });
         });
+      } else if (info.owners) {
+        const OwnerMap* owners = info.owners;
+        int64_t base = info.ownerBase;
+        visit([owners, base](int32_t doc) LUXIR_INLINE -> int64_t { return base + owners->owner(doc); });
       } else visit([&](int32_t doc) { return plan.missingIdentity(segment, doc); });
       return;
     }

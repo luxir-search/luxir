@@ -856,6 +856,11 @@ private:
   // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  // Merges the nested row spaces of merge sources into scope segments of the
+  // output, following the owner merge; records the paths on `output`.
+  void mergeScopes(std::span<const std::shared_ptr<PostingsReader>> sources,
+                   std::span<const std::shared_ptr<LiveDocs>> liveDocs,
+                   PostingsWriter& output, const Schema& schema);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   // Builds outstanding active names and matches new in-flight selectors on the

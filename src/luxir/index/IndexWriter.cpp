@@ -26,6 +26,8 @@
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
+#include "OwnerMapWriter.h"
+#include "luxir/reader/OwnerMap.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 
@@ -2064,6 +2066,56 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
 // "fix" this into synchronization.
 //
+void IndexWriter::mergeScopes(std::span<const std::shared_ptr<PostingsReader>> sources,
+                              std::span<const std::shared_ptr<LiveDocs>> liveDocs,
+                              PostingsWriter& output, const Schema& schema) {
+  std::vector<std::string> paths;
+  for (const auto& source : sources) {
+    source->openScopes(dir, false, false);
+    for (const auto& path : source->scopePaths()) {
+      if (std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
+    }
+  }
+  std::ranges::sort(paths);
+  for (const auto& path : paths) {
+    const auto* childSchema = schema.scope(path);
+    if (childSchema == nullptr) continue;  // the path was removed from the schema
+    std::vector<std::shared_ptr<PostingsReader>> scopes;
+    std::vector<std::shared_ptr<LiveDocs>> scopeLive;
+    std::vector<PostingsReader*> scopePtrs;
+    std::vector<LiveDocs*> livePtrs;
+    // Merged owner order is source order, live owners only.
+    std::vector<int64_t> ends;
+    int64_t end = 0;
+    for (size_t i = 0; i < sources.size(); i++) {
+      auto scope = sources[i]->scopeReader(path);
+      const LiveDocs* owners = liveDocs[i].get();
+      for (int32_t owner = 0; owner < sources[i]->maxDoc(); owner++) {
+        if (owners && !owners->bitset().get(owner)) continue;
+        if (scope) {
+          auto [b, e] = scope->owners().range(owner);
+          end += e - b;
+        }
+        ends.push_back(end);
+      }
+      if (!scope || scope->maxDoc() == 0) continue;
+      auto live = owners ? LiveDocs::foldScope(*owners, scope->owners()) : nullptr;
+      scopePtrs.push_back(scope.get());
+      livePtrs.push_back(live.get());
+      scopes.push_back(std::move(scope));
+      scopeLive.push_back(std::move(live));
+    }
+    if (end == 0) continue;
+    PostingsWriter scopeWriter(dir, output.getSegId(), output.creatorEpoch, -1, nullptr, false, path);
+    SegmentMerger merger(scopePtrs, livePtrs, scopeWriter, *indexRamBudget, termPartitionMinBytes,
+                         termPartitionMinRangeBytes, termPartitionMaxRanges, **childSchema, storedDictionaries);
+    merger.merge();
+    assert(scopeWriter.getMaxDoc() == end);
+    writeOwnerMap(scopeWriter, scopeWriter.pool, ends);
+    if (scopeWriter.finish(&output.scopeFiles, &output.scopeDescriptors)) output.scopePaths.push_back(path);
+  }
+}
+
 std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
   auto pr = seg.sharedPostingsReader.load();
   if (!pr) {
@@ -2709,6 +2761,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> scopeRowSums;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
@@ -2743,6 +2796,22 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                       seg->name());
           continue;
         }
+        // Nested element rows carry the same doc-id limit in their own row
+        // spaces (counted with their dead rows, an upper bound).
+        postingsReader->openScopes(dir, false, false);
+        boost::unordered_flat_map<std::string, int64_t> scopeAdditions;
+        for (const auto& path : postingsReader->scopePaths()) {
+          auto scope = postingsReader->scopeReader(path);
+          int64_t rows = scope ? scope->maxDoc() : 0;
+          if (!MergeCostModel::docsFit(scopeRowSums[path], rows)) fits = false;
+          scopeAdditions[path] = rows;
+        }
+        if (!fits) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged nested row space would exceed MAX_SEGMENT_DOCS",
+                      seg->name());
+          continue;
+        }
+        for (const auto& [path, rows] : scopeAdditions) scopeRowSums[path] += rows;
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
@@ -2856,6 +2925,13 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();
 
+      phase = "scope_merge";
+      // Nested row spaces follow their owners: an element row survives iff its
+      // owner does (folded from the same live-docs snapshot as the owner
+      // merge), and keeps owner order, so an unmodified merger over the scope
+      // segments produces the merged scope with consecutive element runs.
+      mergeScopes(preaders, liveDocsVec, pwriter, *mergeSchema);
+
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
       auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc());
@@ -2869,6 +2945,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      for (auto& name : pwriter.scopeFiles) newSegInfo->unsyncedFiles.push_back(std::move(name));
+      for (auto& file : pwriter.scopeDescriptors) newSegInfo->files.push_back(std::move(file));
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 

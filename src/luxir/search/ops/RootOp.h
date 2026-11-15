@@ -92,8 +92,10 @@ public:
         // Start with live docs. This establishes the PrepareContext domain
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
-        // no deletes and no filters.
-        domains.push_back(DomainHandle::pinned(seg.liveDocSet(), op.req.reader));
+        // no deletes and no filters. A nested-scope inner request starts from
+        // the domain its owner request descended or projected.
+        DocSet* base = op.req.baseDomains.empty() ? seg.liveDocSet() : op.req.baseDomains[(size_t)seg.ord];
+        domains.push_back(DomainHandle::pinned(base, op.req.reader));
       }
 
       if (root.domainVariants.empty()) {

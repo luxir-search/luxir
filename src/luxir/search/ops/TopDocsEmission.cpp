@@ -15,7 +15,7 @@ void emitPage(const CollapsedPageSettings& settings,
   auto getDocList = [&calc](SearchResponse* resp) -> api::DocList& {
     return *calc.slotArm<api::DocList>(resp);
   };
-  DocEmission emission = calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
+  DocEmission emission = calc.underBucketSlot() || calc.getOp().req.singleResponse ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
   auto scoreDocs = collector.sort();
   constexpr bool metricOrder = requires { collector.key((size_t)0); };
   auto keyAt = [&](size_t slot) -> const CollapseKey& {
@@ -297,7 +297,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     auto getDocList = [&calc](SearchResponse* resp) -> luxir::api::DocList& {
       return *calc.slotArm<luxir::api::DocList>(resp);
     };
-    DocEmission emission = calc.underBucketSlot()
+    DocEmission emission = calc.underBucketSlot() || calc.getOp().req.singleResponse
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
     if (qr.diversify != nullptr) {
@@ -321,7 +321,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, false, false, {}, qr.decorators);
+        emission, {}, false, false, qr.rowColumns, qr.decorators);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -349,7 +349,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte, foundEstimated, {}, qr.decorators);
+        emission, {}, foundGte, foundEstimated, qr.rowColumns, qr.decorators);
     }
   }
 

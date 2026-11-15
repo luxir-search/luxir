@@ -759,6 +759,7 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
       if (node.opcode != ValueOpcode::AVG
           && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+          && program.program.nodes[first.array.node].scope.empty()
           && program.nodes[first.array.node].column->multiSet()) {
         // A set column holds the doc's values ascending, so min is the
         // first present element and max the last (a NaN reads as missing).
@@ -2123,6 +2124,17 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
                                 : ValueBounds::integer(segment.base,
                                                        segment.base + maxDoc - 1);
+    } else if (node.kind == ValueNodeKind::COLUMN && !node.scope.empty()) {
+      auto* scopeSegment = fields[index].segmentAt((size_t)segment.ord);
+      auto* fieldInfo = scopeSegment ? fields[index].at((size_t)segment.ord) : nullptr;
+      if (!fieldInfo) {
+        bound.bounds = ValueBounds::unbounded(node.type, true, true);
+      } else {
+        bound.column.emplace(scopeSegment->postingsReader(), *fieldInfo);
+        bound.iterator.emplace(*bound.column);
+        bound.owners = &scopeSegment->postingsReader().owners();
+        bound.bounds = ValueBounds::unbounded(node.type, true);
+      }
     } else if (node.kind == ValueNodeKind::COLUMN) {
       auto* fieldInfo = fields[index].at(segment);
       if (!fieldInfo) {
@@ -2250,6 +2262,30 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
   const ValueNode& node = program.nodes[index];
   BoundValueNode& bound = nodes[index];
   if (!bound.column) return ValueResult::missing(node.type);
+  if (bound.owners != nullptr) {
+    // The owner's element rows are contiguous, so their values are one
+    // contiguous value-rank range of the element column.
+    if (bound.cachedDoc != docid) {
+      auto [begin, end] = bound.owners->range(docid);
+      auto rankAt = [&](int32_t row) -> int64_t {
+        if (bound.iterator->docId() >= row) {
+          bound.iterator.reset();
+          bound.iterator.emplace(*bound.column);
+        }
+        int32_t found = bound.iterator->advance(row);
+        int64_t docRank = found == PostingsReader::END ? bound.column->docsWithValue() : bound.iterator->rank();
+        if (!bound.column->multiValued()) return docRank;
+        if (docRank >= bound.column->docsWithValue()) return bound.column->numValues();
+        return bound.column->getStartEndValueRank((int32_t)docRank).first;
+      };
+      bound.cachedDoc = docid;
+      bound.valueStart = begin < end ? rankAt(begin) : 0;
+      bound.valueEnd = begin < end ? rankAt(end) : 0;
+      bound.cachedPresent = bound.valueEnd > bound.valueStart;
+    }
+    if (!bound.cachedPresent) return ValueResult::missing(node.type);
+    return ValueResult::arrayValue(node.type, index, docid, score, bound.valueEnd - bound.valueStart);
+  }
   if (bound.cachedDoc != docid) {
     if (!bound.iterator || bound.iterator->docId() > docid) {
       bound.iterator.reset();

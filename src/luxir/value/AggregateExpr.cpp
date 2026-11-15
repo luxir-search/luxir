@@ -340,7 +340,8 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
       rootBinding.stringColumn->attachOrds(pool, segment.postingsReader());
       ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
     }
-    bool columnScan = root.kind == ValueNodeKind::COLUMN && (!strings || root.columnIndexed);
+    bool columnScan = root.kind == ValueNodeKind::COLUMN && root.scope.empty()
+        && (!strings || root.columnIndexed);
     bool bareColumn = columnScan && !strings && !valueArray(root.type);
     bindings.push_back({
         .values = values,

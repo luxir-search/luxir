@@ -85,6 +85,22 @@ public:
     return getSortableString(segId) + "." + epochString(epoch);
   }
 
+  // The data-file key of a nested path's row space inside a segment. It uses
+  // the segment overlay grammar (overlay name "n.<path>", generation 1, the
+  // creator epoch as writer epoch), so its files sort under the segment
+  // prefix, pass Manifest::indexFile / fileEpoch, and are reclaimed by the
+  // same dead-segment sweeps: "s<seg>.<epoch>__n.<path>_1.<epoch>_<fnum>".
+  static std::string scopeKey(uint64_t segId, uint64_t epoch, std::string_view scope) {
+    std::string key = segmentKey(segId, epoch);
+    if (scope.empty()) return key;
+    key.append("__n.").append(caseSafeName(scope));
+    key += '_';
+    key.append(getSortableString(1));
+    key += '.';
+    key.append(epochString(epoch));
+    return key;
+  }
+
   static std::string getIndexFileNamePrefix(uint64_t segId, uint64_t epoch) {
     return std::string(PREFIX_FNAME) + segmentKey(segId, epoch) + '_';
   }

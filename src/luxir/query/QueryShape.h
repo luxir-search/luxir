@@ -16,6 +16,7 @@
 #include "DisMaxQuery.h"
 #include "BooleanQuery.h"
 #include "PluginQueryBase.h"
+#include "ToParentQuery.h"
 
 namespace luxir {
 
@@ -37,6 +38,8 @@ inline bool logicalConsumesDomain(const Query& query) {
       return logicalConsumesDomain(*static_cast<const MinScoreQuery&>(query).getChild());
     case QueryKind::FORCE_PREPARE:
       return logicalConsumesDomain(*static_cast<const ForcePrepareQuery&>(query).getChild());
+    case QueryKind::TO_PARENT:
+      return logicalConsumesDomain(*static_cast<const ToParentQuery&>(query).getChild());
     case QueryKind::DIS_MAX:
       return std::ranges::any_of(
           static_cast<const DisMaxQuery&>(query).getDisjuncts(),
@@ -107,6 +110,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
     case QueryKind::DIS_MAX:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
@@ -151,6 +155,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
       return true;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -193,6 +198,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_POLYGON:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -242,6 +248,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -284,6 +291,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
       return membershipVerificationWork(
           *static_cast<const ConstantScoreQuery&>(query).getChild());
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
       return Query::VerificationWork::PRESENT;
     case QueryKind::DIS_MAX:
       return membershipVerificationWork(

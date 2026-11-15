@@ -659,6 +659,17 @@ struct StoredChunkFormat {
   }
 };
 
+// The logical root entry of a nested path (type: nested). It has no column or
+// postings in the owner's row space: the elements live in the path's own row
+// space (Schema::scope). When stored, the owner keeps the submitted list as
+// one encoded value so retrieval returns the original structure.
+class NestedFieldType : public FieldType {
+public:
+  NestedFieldType(std::string_view name, bool stored)
+    : FieldType(name, FieldType::BIN, stored ? FieldType::STORED : 0) {}
+  uint32_t capabilities() const override { return 0; }
+};
+
 // Describes a stored-fields resource (a per-segment column of compressed
 // whole-doc chunks).  Registered in the schema under the resource's own name
 // (e.g. "_stored_" for the default, "_stored_paragraphs_" for a named family).

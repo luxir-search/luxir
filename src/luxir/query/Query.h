@@ -74,6 +74,8 @@ enum class QueryKind : uint8_t {
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
+  // Nested scope change: owners of matching elements (ToParentQuery).
+  TO_PARENT,
   // Every query a plugin query type builds (QueryRegistry). Shape questions
   // get the conservative answers, as for TEST.
   PLUGIN,
@@ -1412,6 +1414,27 @@ public:
       if (warnings != nullptr) addWarning(*warnings, pool, code, message);
     }
 
+  private:
+    std::vector<std::pair<std::string, std::unique_ptr<PlanningContext>>> scopes;
+
+  public:
+    // Planning over the element rows of nested `path` (topReader.scope(path)):
+    // its own memos and filter-use registry (child keys use child-scope field
+    // names, and the scope reader has no shared cache), the request's pool,
+    // limits, warnings, memory tracker and profiles.
+    PlanningContext& scope(std::string_view path) {
+      for (auto& [name, child] : scopes) {
+        if (name == path) return *child;
+      }
+      IndexReader* reader = topReader.scope(path);
+      if (reader == nullptr) {
+        throw std::invalid_argument("unknown nested path '" + std::string(path) + "'");
+      }
+      auto child = std::make_unique<PlanningContext>(pool, *reader, limits, warnings, filterKeyContext,
+                                                     nullptr, &memoryTracker, profiles);
+      scopes.emplace_back(std::string(path), std::move(child));
+      return *scopes.back().second;
+    }
   };
 
   /// Gives execution construction access to per-segment field state while
@@ -1537,6 +1560,21 @@ public:
 
     void warn(std::string_view code, std::string_view message) {
       planning.warn(code, message);
+    }
+
+  private:
+    std::vector<std::pair<std::string, Context*>> scopes;
+
+  public:
+    // Execution construction over the element rows of nested `path`, borrowing
+    // planning.scope(path). Serial, like the rest of Context.
+    Context& scope(std::string_view path) {
+      for (auto& [name, child] : scopes) {
+        if (name == path) return *child;
+      }
+      auto* child = create(allocationArena, planning.scope(path));
+      scopes.emplace_back(std::string(path), child);
+      return *child;
     }
 
     // return number of segments

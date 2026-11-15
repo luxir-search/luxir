@@ -67,6 +67,9 @@ state, and commits are crash-safe on immutable segments.
 
 15. [Index replication](guide/replication.md) - following a source, discovery,
     pinned snapshots, resumable downloads, and installation status.
+16. [Nested documents](guide/nested.md) - lists of owned sub-objects:
+    correlated element queries, element-scope operations, sorting by element
+    values, and returning matching elements.
 
 ## Reference
 
@@ -80,6 +83,8 @@ state, and commits are crash-safe on immutable segments.
   execution, and native vector integration.
 - [Vector search design](design/vector-search.md) covers segment overlays and
   the ANN execution model.
+- [Nested documents design](design/nested-documents.md) covers per-path row
+  spaces, owner maps, merge, and how queries and operations change scope.
 - [Storage and object stores](design/storage.md) lays out the storage
   roadmap: object-store durability, nodes reading from the store through a
   local cache, and the publication contract both use.

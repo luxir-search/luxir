@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/OwnerMap.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,9 @@ struct ValueNode {
   bool columnIndexed = false;
   size_t sourcePos = 0;
   std::string_view text;
+  // A COLUMN over the elements of this nested path, from the owner's side:
+  // its value is the array of the owner's element values.
+  std::string_view scope;
   int64_t intValue = 0;
   double doubleValue = 0.0;
 };
@@ -93,8 +97,14 @@ public:
 
   void resolveFields(IndexReader& reader, std::span<IndexReader::FieldSegments> fields) const {
     for (size_t i = 0; i < nodes.size(); i++) {
-      fields[i] = nodes[i].kind == ValueNodeKind::COLUMN
-          ? reader.field(nodes[i].text) : IndexReader::FieldSegments{};
+      if (nodes[i].kind != ValueNodeKind::COLUMN) {
+        fields[i] = {};
+      } else if (!nodes[i].scope.empty()) {
+        auto* scope = reader.scope(nodes[i].scope);
+        fields[i] = scope ? scope->field(nodes[i].text) : IndexReader::FieldSegments{};
+      } else {
+        fields[i] = reader.field(nodes[i].text);
+      }
     }
   }
 
@@ -139,6 +149,7 @@ struct BoundValueNode {
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
   BoundStringColumn* stringColumn = nullptr;
+  const OwnerMap* owners = nullptr;  // nested element column (ValueNode::scope)
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;

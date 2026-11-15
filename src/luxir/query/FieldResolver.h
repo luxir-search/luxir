@@ -29,6 +29,7 @@ class FieldResolver {
   boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
 
 public:
+  Schema& resolverSchema() const noexcept { return schema; }
   explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
       : schema(schema), explanations(explanations) {}
 

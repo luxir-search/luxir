@@ -206,6 +206,7 @@ defaults and constraints are described in the comments and guides.
 - [`SystemStats`](#message-luxir.systemstats)
 - [`TcpStats`](#message-luxir.tcpstats)
 - [`TermFilter`](#message-luxir.termfilter)
+- [`ToParentQuery`](#message-luxir.toparentquery)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`TransportStats`](#message-luxir.transportstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
@@ -655,6 +656,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.get_count"></a>[`get_count`](#field-luxir.collapse.get_count) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
 | <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 | <a id="field-luxir.collapse.sort"></a>[`sort`](#field-luxir.collapse.sort) | 6 | [`SortSpec`](#message-luxir.sortspec) | repeated | Exhaustive group order by metrics in ops; missing/failed values last. Ties use the best member under the list sort, then document order. |
+| <a id="field-luxir.collapse.owner"></a>[`owner`](#field-luxir.collapse.owner) | 7 | `string` | singular | In a nested scope, "root" adds the element's owner as a structural key component (no key field is declared or decoded). |
 
 <a id="message-luxir.collectionactivitystats"></a>
 
@@ -885,6 +887,7 @@ A document cap, applied before paging in the list's ordinary rank order.
 |---|---|---|---|---|
 | <a id="field-luxir.diversify.field"></a>[`field`](#field-luxir.diversify.field) | 1 | `string` | repeated | One field or an exact tuple, as in Collapse. |
 | <a id="field-luxir.diversify.missing"></a>[`missing`](#field-luxir.diversify.missing) | 3 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+| <a id="field-luxir.diversify.owner"></a>[`owner`](#field-luxir.diversify.owner) | 4 | `string` | singular | "root": cap elements per owner, as in Collapse.owner |
 | <a id="field-luxir.diversify.max_per_key"></a>[`max_per_key`](#field-luxir.diversify.max_per_key) | 2 | `int64` | oneof [`kind`](#oneof-luxir.diversify.kind) | Positive cap; keeps each key's best documents. |
 
 <a id="message-luxir.doclist"></a>
@@ -923,6 +926,9 @@ Overrides an operation's incoming document set, including beneath facet and grou
 | <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches within live documents and the enclosing structural bucket identities. If absent, inherits the incoming domain. |
 | <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the owning list's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore matching queries above this operation. |
 | <a id="field-luxir.domain.filter"></a>[`filter`](#field-luxir.domain.filter) | 5 | [`Query`](#message-luxir.query) | repeated | Additional non-scoring constraints, ANDed with the inherited or reset domain. Entries and query must each specify a query kind. |
+| <a id="field-luxir.domain.to_children"></a>[`to_children`](#field-luxir.domain.to_children) | 6 | `string` | singular | Scope changes. to\_children: this operation runs over the elements of nested path to\_children whose owners are in the incoming domain (fields, queries, filters and sub-operations then address &lt;path&gt;.&lt;field&gt;). to\_parent: from a nested scope, run over the distinct owners of the incoming elements. Both exclude query; filter applies in the new scope. |
+| <a id="field-luxir.domain.to_parent"></a>[`to_parent`](#field-luxir.domain.to_parent) | 7 | `bool` | optional |  |
+| <a id="field-luxir.domain.from_match"></a>[`from_match`](#field-luxir.domain.from_match) | 8 | `string` | singular | Row operations only: the name of a to\_parent clause in the list's query. |
 
 <a id="message-luxir.error"></a>
 
@@ -1063,6 +1069,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.fields"></a>[`fields`](#field-luxir.fielddef.fields) | 41 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | NESTED only: the typed fields of each element. Each element of the list is a row in its own per-path row space, addressed in queries as &lt;field&gt;.&lt;child&gt;. Elements live and die with their document. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1862,6 +1869,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside any of several polygons |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
+| <a id="field-luxir.query.to_parent"></a>[`to_parent`](#field-luxir.query.to_parent) | 27 | [`ToParentQuery`](#message-luxir.toparentquery) | oneof [`kind`](#oneof-luxir.query.kind) | owners whose nested elements match, scored by a reducer |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2541,6 +2549,23 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 | <a id="field-luxir.termfilter.partition"></a>[`partition`](#field-luxir.termfilter.partition) | 6 | `uint32` | singular | Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes) modulo num\_partitions equals partition, so num\_partitions requests with partition 0..num\_partitions-1 together return every term once. Unset when num\_partitions is 0; otherwise partition must be below num\_partitions. |
 | <a id="field-luxir.termfilter.num_partitions"></a>[`num_partitions`](#field-luxir.termfilter.num_partitions) | 7 | `uint32` | singular |  |
 
+<a id="message-luxir.toparentquery"></a>
+
+### luxir.ToParentQuery
+
+Selects the owners of the elements of nested \`path\` that match \`query\`. Every clause of \`query\` evaluates on one element, so separate clauses must be satisfied by the same element; separate to\_parent clauses may be satisfied by different elements. Element fields are named &lt;path&gt;.&lt;field&gt;.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.toparentquery.path"></a>[`path`](#field-luxir.toparentquery.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.toparentquery.query"></a>[`query`](#field-luxir.toparentquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
+| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | optional | How the scores of an owner's matching elements combine: max (default), min, sum, avg, or none (owners score 0). |
+| <a id="field-luxir.toparentquery.min_children"></a>[`min_children`](#field-luxir.toparentquery.min_children) | 4 | `int32` | optional | Bounds on the number of matching elements per owner; unset = unbounded. |
+| <a id="field-luxir.toparentquery.max_children"></a>[`max_children`](#field-luxir.toparentquery.max_children) | 5 | `int32` | optional |  |
+| <a id="field-luxir.toparentquery.name"></a>[`name`](#field-luxir.toparentquery.name) | 6 | `string` | singular | Names this clause, for retrieving the elements it admitted. |
+
 <a id="message-luxir.topdocs"></a>
 
 ### luxir.TopDocs
@@ -2550,6 +2575,7 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.topdocs.decorate"></a>[`decorate`](#field-luxir.topdocs.decorate) | 25 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
+| <a id="field-luxir.topdocs.row_ops"></a>[`row_ops`](#field-luxir.topdocs.row_ops) | 26 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-row sub-operations over each returned row's own nested elements, returned as one value per row under the operation's name. Each is a top\_docs in the elements' scope; its domain is the row's elements of domain.to\_children, or (domain.from\_match) the elements a named to\_parent clause of this list's query admitted, scored by that clause. |
 | <a id="field-luxir.topdocs.query"></a>[`query`](#field-luxir.topdocs.query) | 1 | [`Query`](#message-luxir.query) | singular | unset selects all documents (browse / filter-only search) |
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
 | <a id="field-luxir.topdocs.offset"></a>[`offset`](#field-luxir.topdocs.offset) | 3 | `int64` | singular | Zero-based rank of the first returned document; must be &gt;= 0. Skip this many ranked matches, then return up to limit (-1: all remaining; 0: none). Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. Ignored as a Fusion source. |
@@ -2883,6 +2909,7 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.boolean"></a>[`BOOLEAN`](#value-luxir.fielddef.fieldclass.boolean) | 11 | true/false, stored as 0/1 in the int column |
 | <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
 | <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
+| <a id="value-luxir.fielddef.fieldclass.nested"></a>[`NESTED`](#value-luxir.fielddef.fieldclass.nested) | 30 | list of owned sub-objects with typed child fields (see fields) |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
