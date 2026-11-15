@@ -2197,7 +2197,7 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   EXPECT_EQ(2, emptyHit.hits);
 }
 
-TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
+TEST_F(SearchEngineTest, wholeCountKeepsCacheOffInertAndCachesCanonicalPreparedSources) {
   constexpr std::string_view cacheOffCollection = "whole_count_cache_off";
   CollectionHelper cacheOff(cacheOffCollection);
   auto disabled = std::make_shared<FilterCache>(
@@ -2231,15 +2231,20 @@ TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
       FilterCacheConfig{.minSegmentDocs = 0});
   prepared.getIndexWriter()->snapshots.readers.filterCache = preparedCache;
   ASSERT_TRUE(prepared.indexAll(docs, UpdateMessage::COMMIT).success);
-  for (int round = 0; round < 3; round++) {
-    WholeCountRun run = runWholeCount(
-        prepared.getSearchEngine(), preparedCollection, query,
-        false, true);
-    EXPECT_EQ(8, run.found);
-    EXPECT_EQ(0, run.hits + run.builds + run.bypasses + run.constants
-                     + run.fallbackSuppliers);
-  }
-  EXPECT_EQ(0u, preparedCache->entryCountForTest());
+  WholeCountRun bypass = runWholeCount(
+      prepared.getSearchEngine(), preparedCollection, query, false, true);
+  WholeCountRun build = runWholeCount(
+      prepared.getSearchEngine(), preparedCollection, query, false, true);
+  WholeCountRun hit = runWholeCount(
+      prepared.getSearchEngine(), preparedCollection, query, false, true);
+  EXPECT_EQ(8, bypass.found);
+  EXPECT_EQ(8, build.found);
+  EXPECT_EQ(8, hit.found);
+  EXPECT_EQ(1, bypass.bypasses);
+  EXPECT_EQ(1, bypass.fallbackSuppliers);
+  EXPECT_EQ(1, build.builds);
+  EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(1u, preparedCache->entryCountForTest());
 }
 
 TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
