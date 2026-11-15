@@ -273,7 +273,7 @@ private:
             argumentStart = cur->position();
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
             try {
-              input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
+              input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
             } catch (const std::runtime_error& error) {
               throw std::runtime_error(fmt::format(
                   "op '{}': {}", opts.opName, error.what()));
@@ -302,10 +302,6 @@ private:
     }
 
     ResolvedAggregate resolved;
-    if (input != nullptr) {
-      ResolvedValue value{input->root().type, input->root().nature};
-      if (convertValueNature(function.natures, {&value, 1}, 0)) input->rootNode = input->numericNode(input->rootNode);
-    }
     try {
       resolved = function.resolve(
           input == nullptr ? nullptr : &input->root(), trailing);

@@ -6,6 +6,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <numbers>
@@ -15,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "luxir/api/RequestFlags.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/value/ValueExprParser.h"
@@ -739,6 +741,121 @@ TEST_F(ValueScriptingTest, letBindsAValueOnce) {
   expectValues("let(t, when_dt, year(t))", {2024, 1970, std::nullopt, 2020, 1969});
   expectValues("let(p, loc_p, geo_lat(p))", eval("geo_lat(loc_p)"));
   expectValues("let(a, 1, let(a2, 2, a + a2)) + let(a, 10, a)", Values(DOCS, 13));
+}
+
+// Every dependency is used twice, so a tree walk would expand exponentially.
+static std::string sharedLetChain(std::string_view seed, int count, bool dates = false) {
+  std::string expression = fmt::format("let(v0, {}, ", seed);
+  for (int i = 1; i <= count; i++) {
+    expression += dates ? fmt::format("let(v{}, max(v{}, v{}), ", i, i - 1, i - 1)
+        : fmt::format("let(v{}, v{} + v{}, ", i, i - 1, i - 1);
+  }
+  expression += fmt::format("v{}", count);
+  expression.append(count + 1, ')');
+  return expression;
+}
+
+TEST_F(ValueScriptingTest, sharedLetChainsStayLinear) {
+  auto expression = sharedLetChain("def(x_i, 0)", 40);
+  expectValues(expression, {2.0 * (1LL << 40), -(double)(1LL << 40), 0,
+                            7.0 * (1LL << 40), 0});
+  auto program = parse(expression);
+  EXPECT_TRUE(program->structurallyEqual(*parse(expression)));
+  EXPECT_FALSE(program->structurallyEqual(*parse(sharedLetChain("def(y_i, 0)", 40))));
+  auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+  EXPECT_TRUE(bound->firstUnboundedNode().empty());
+  EXPECT_NO_THROW(bound->boundsForScore(ValueBounds::floating(0, 10)));
+  auto scored = parse(sharedLetChain("score", 40));
+  auto* scoredBound = scored->bind(pool, reader->segments()[0], scored->resolveFields(pool, *reader));
+  EXPECT_TRUE(scored->needsScore);
+  EXPECT_EQ("score", scoredBound->firstUnboundedNode());
+  EXPECT_EQ(1.5 * (1LL << 40), scoredBound->evalPoint(0, 1.5f).doubleValue);
+
+
+  auto dates = sharedLetChain("when_dt", 40, true);
+  auto dateProgram = parse(dates);
+  EXPECT_EQ("'when_dt' (DATE unit 'ms')", dateProgram->describeDateSources(dateProgram->rootNode));
+  auto req = localReq(helper.getSearchEngine());
+  auto flags = RequestFlags::fromNames(std::array<std::string_view, 1>{"date_iso"});
+  req->rawRequest().flags = flags.flags;
+  req->rawRequest().flags_set = flags.flagsSet;
+  req->collection("main").expr("date", "min(" + dates + ")");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ("1969-12-31T23:59:59.999Z", req->scalar<std::string_view>("date"));
+}
+
+TEST_F(ValueScriptingTest, letDepthIncludesSharedDependencies) {
+  // The grammar is only 50 calls deep, but the dependency path is over 128.
+  std::string expression = "let(v0, x_i, ";
+  for (int i = 1; i <= 50; i++) {
+    expression += fmt::format("let(v{}, max(max(max(v{}, v{}), v{}), v{}), ",
+                              i, i - 1, i - 1, i - 1, i - 1);
+  }
+  expression += "v50";
+  expression.append(51, ')');
+  expectError(expression, "nesting exceeds");
+  int budget = 5;
+  ValueExprOptions options{helper.collection().getSchema().get(), {}, &budget};
+  ValueExprParser parser(options, *arena);
+  EXPECT_THROW(parser.parse(sharedLetChain("x_i", 5)), std::runtime_error);
+  EXPECT_EQ(5, budget);
+  EXPECT_NO_THROW(parser.parse(sharedLetChain("x_i", 3)));
+  EXPECT_EQ(5, budget);
+  budget = 4;
+  EXPECT_NO_THROW(parser.parse("let(z, 1+1+1, hour(when_dt, z)+z)"));
+  EXPECT_EQ(4, budget);
+}
+
+TEST_F(ValueScriptingTest, letConstantsAndLazyValues) {
+  auto constant = parse("let(z, 5, z + z)");
+  ASSERT_TRUE(constant->constantScalar);
+  EXPECT_EQ(10, constant->constantScalar->intValue);
+  expectValues("let(z, 2 + 3, geotile(loc_p.lat, loc_p.lon, z))",
+               eval("geotile(loc_p.lat, loc_p.lon, 5)"));
+  expectConstant("let(unused, log(x_i), 7)", 7);
+  expectConstant("let(unused, log(-1), 7)", 7);
+  expectConstant("let(a, log(x_i), def(7, a))", 7);
+  expectValues("let(a, acos(x_i), if(x_i > 1, 7, a + a))",
+               {7, 2 * std::numbers::pi, std::nullopt, 7, std::numbers::pi});
+  auto unused = parse("let(a, score, 7)");
+  EXPECT_FALSE(unused->needsScore);
+  EXPECT_EQ(1u, unused->nodes.size());
+}
+
+TEST_F(ValueScriptingTest, sharedValuesUseDocumentAndScoreAcrossEvaluationPaths) {
+  auto program = parse("let(s, score + 1, sum(vals_ds * s) + s)");
+  auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+  EXPECT_EQ(102, bound->evalPoint(0, 1).doubleValue);
+  EXPECT_EQ(153, bound->evalSequentialPoint(0, 2).doubleValue);
+  std::array<int32_t, 4> docs{0, 0, 1, 0};
+  std::array<float, 4> scores{1, 2, 3, 1};
+  std::array<ValueResult, 4> results;
+  bound->evalBatch(docs, scores, results);
+  for (size_t i = 0; i < results.size(); i++) {
+    ASSERT_TRUE(results[i].valid);
+    EXPECT_EQ((std::array<double, 4>{102, 153, 284, 102})[i], results[i].doubleValue);
+  }
+  std::array<ScalarValueResult, 4> scalars;
+  bound->evalScalarBatch(docs, scalars);
+  for (size_t i = 0; i < scalars.size(); i++) {
+    ASSERT_TRUE(scalars[i].valid);
+    EXPECT_EQ(docs[i] == 1 ? 71 : 51, scalars[i].doubleValue);
+  }
+  // This scalar has just one incoming edge, but lazy array elements reuse it.
+  expectValues("let(k, x_i + 1, sum(vals_ds * k))", {150, 0, std::nullopt, std::nullopt, std::nullopt});
+  auto arrays = parse("vals_ds * let(s, score + 1, s + s)");
+  auto* arrayBound = arrays->bind(pool, reader->segments()[0], arrays->resolveFields(pool, *reader));
+  arrayBound->evalBatch(docs, scores, results);
+  for (size_t i = 0; i < results.size(); i++) {
+    EXPECT_EQ((std::array<double, 4>{40, 60, 560, 40})[i],
+              arrayBound->evalArrayElement(results[i].array, 0).doubleValue);
+  }
+  auto zero = parse("let(s, score + score, s + s)");
+  auto* zeroBound = zero->bind(pool, reader->segments()[0], zero->resolveFields(pool, *reader));
+  EXPECT_FALSE(std::signbit(zeroBound->evalPoint(0, 0.0f).doubleValue));
+  EXPECT_TRUE(std::signbit(zeroBound->evalPoint(0, -0.0f).doubleValue));
+  EXPECT_TRUE(parse("let(a, x_i, a + a)")->structurallyEqual(*parse("x_i + x_i")));
 }
 
 TEST_F(ValueScriptingTest, letScopeAndNameRules) {

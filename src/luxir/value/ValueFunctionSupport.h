@@ -5,7 +5,7 @@
 
 // Helpers shared by the value-function implementations: the core table in
 // ValueFunctionRegistry.cpp and the function families that register next to it
-// (math, dates, geo, hashing, local variables). Each family exports a constant
+// (math, dates, geo, hashing). Each family exports a constant
 // table through the accessors declared in ValueFunctionRegistry.h.
 
 #include <cmath>
@@ -118,7 +118,7 @@ inline void evalFunctionBatch(BoundValueProgram& program, const ValueNode& node,
                               std::span<ValueResult> results) {
   for (size_t i = 0; i < docids.size(); i++) {
     float score = scores.empty() ? 0.0f : scores[i];
-    results[i] = node.function->evalPoint(program, node, docids[i], score);
+    results[i] = program.evalNode((uint32_t)(&node - program.program.nodes.data()), docids[i], score);
   }
 }
 

@@ -11,6 +11,8 @@
 #include <random>
 #include <stdexcept>
 #include <utility>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -1845,27 +1847,6 @@ std::optional<ValueFunctionRegistry::DecimalComparison> ValueFunctionRegistry::d
   return DecimalComparison{function, *bound};
 }
 
-uint32_t ValueProgram::numericNode(uint32_t index) {
-  ValueNode node = nodes[index];
-  if (valueDecimal(node.nature)) {
-    ValueNode scale;
-    scale.intValue = valueDecimalScale(node.nature);
-    addNode(scale);
-    auto scaleIndex = rootNode;
-    node.kind = ValueNodeKind::FUNCTION;
-    node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
-    node.function = ValueFunctionRegistry::decimalDecoder();
-    node.opcode = ValueOpcode::NONE;
-    node.children = {index, scaleIndex};
-    node.childCount = 2;
-    node.text = node.function->name;
-  }
-  node.nature = ValueNature::NUMBER;
-  addNode(node);
-  constantScalar.reset();
-  return rootNode;
-}
-
 BucketScalar ValueFunction::bucket(
     std::span<const BucketScalar> args, ValueType type, ValueNature nature) const {
   for (size_t i = 0; i < args.size(); i++) {
@@ -1932,7 +1913,7 @@ const std::vector<ValueFunction>& allFunctions() {
   static const std::vector<ValueFunction> all = [] {
     std::vector<ValueFunction> out(std::begin(FUNCTIONS), std::end(FUNCTIONS));
     for (auto family : {valueMathFunctions(), valueDateFunctions(), valueGeoFunctions(),
-                        valueHashFunctions(), valueScopeFunctions()}) {
+                        valueHashFunctions()}) {
       out.insert(out.end(), family.begin(), family.end());
     }
     return out;
@@ -1979,25 +1960,60 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
 
 std::string ValueProgram::describeDateSources(uint32_t node) const {
   std::string result;
-  std::vector<std::string_view> fields;
-  auto visit = [&](auto&& self, uint32_t index) -> void {
+  std::unordered_set<std::string_view> fields;
+  walkNodes(node, [&](uint32_t index) {
     const ValueNode& value = nodes[index];
     if (value.kind == ValueNodeKind::COLUMN && valueDate(value.nature)
-        && std::ranges::find(fields, value.text) == fields.end()) {
-      fields.push_back(value.text);
+        && fields.insert(value.text).second) {
       if (!result.empty()) result += ", ";
       result += fmt::format("'{}' ({})", value.text, valueNatureName(value.nature));
     }
-    for (uint8_t i = 0; i < value.childCount; i++) self(self, value.children[i]);
-  };
-  visit(visit, node);
+  });
   return result;
 }
 
 bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
-  auto equalNode = [&](auto&& self, uint32_t leftIndex, uint32_t rightIndex) -> bool {
-    const ValueNode& left = nodes[leftIndex];
-    const ValueNode& right = other.nodes[rightIndex];
+  struct Key {
+    const ValueProgram* program;
+    uint32_t node;
+    std::array<uint32_t, VALUE_MAX_ARITY> children{};
+  };
+  auto hash = [](const Key& key) {
+    const ValueNode& node = key.program->nodes[key.node];
+    size_t out = 0;
+    auto add = [&](auto value) {
+      out ^= std::hash<decltype(value)>{}(value) + (size_t)0x9e3779b9 + (out << 6) + (out >> 2);
+    };
+    auto kind = node.kind == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : node.kind;
+    add((uint8_t)kind);
+    add((uint8_t)node.type);
+    add((uint8_t)node.nature);
+    if (kind == ValueNodeKind::CONSTANT) {
+      if (node.type == ValueType::INT64) add(node.intValue);
+      else if (node.type == ValueType::DOUBLE) add(std::bit_cast<uint64_t>(node.doubleValue));
+      else {
+        add(node.arraySize);
+        for (uint32_t i = 0; i < node.arraySize; i++) {
+          if (node.type == ValueType::INT64_ARRAY) add(key.program->intArrays[node.arrayOffset + i]);
+          else add(std::bit_cast<uint64_t>(key.program->doubleArrays[node.arrayOffset + i]));
+        }
+      }
+    } else if (kind == ValueNodeKind::COLUMN) {
+      add(node.text);
+      add((uint8_t)node.columnType);
+      add(node.columnMultiValued);
+      add(node.columnIndexed);
+    } else if (kind == ValueNodeKind::FUNCTION) {
+      add(node.function);
+      add((uint8_t)node.opcode);
+      add(node.childCount);
+      for (uint8_t i = 0; i < node.childCount; i++) add(key.children[i]);
+    }
+    return out;
+  };
+  auto equal = [](const Key& a, const Key& b) {
+    const ValueNode& left = a.program->nodes[a.node];
+    const ValueNode& right = b.program->nodes[b.node];
     auto kind = [](ValueNodeKind value) {
       return value == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : value;
     };
@@ -2013,10 +2029,10 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
         if (left.arraySize != right.arraySize) return false;
         for (uint32_t i = 0; i < left.arraySize; i++) {
           if (left.type == ValueType::INT64_ARRAY) {
-            if (intArrays[left.arrayOffset + i]
-                != other.intArrays[right.arrayOffset + i]) return false;
-          } else if (std::bit_cast<uint64_t>(doubleArrays[left.arrayOffset + i])
-              != std::bit_cast<uint64_t>(other.doubleArrays[right.arrayOffset + i])) {
+            if (a.program->intArrays[left.arrayOffset + i]
+                != b.program->intArrays[right.arrayOffset + i]) return false;
+          } else if (std::bit_cast<uint64_t>(a.program->doubleArrays[left.arrayOffset + i])
+              != std::bit_cast<uint64_t>(b.program->doubleArrays[right.arrayOffset + i])) {
             return false;
           }
         }
@@ -2025,14 +2041,11 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
         return left.text == right.text && left.columnType == right.columnType
             && left.columnMultiValued == right.columnMultiValued
             && left.columnIndexed == right.columnIndexed;
-      case ValueNodeKind::LOCAL:
-        return left.slot == right.slot && left.intValue == right.intValue
-            && left.arraySize == right.arraySize;
       case ValueNodeKind::FUNCTION:
         if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount || left.slot != right.slot) return false;
+            || left.childCount != right.childCount) return false;
         for (uint8_t i = 0; i < left.childCount; i++) {
-          if (!self(self, left.children[i], right.children[i])) return false;
+          if (a.children[i] != b.children[i]) return false;
         }
         return true;
       case ValueNodeKind::SCORE:
@@ -2044,7 +2057,39 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
     }
     return false;
   };
-  return equalNode(equalNode, rootNode, other.rootNode);
+  std::unordered_map<Key, uint32_t, decltype(hash), decltype(equal)> intern(0, hash, equal);
+  auto canonicalRoot = [&](const ValueProgram& program) {
+    std::vector<uint32_t> ids(program.nodes.size());
+    program.walkNodes(program.rootNode, [&](uint32_t index) {
+      Key key{&program, index};
+      const ValueNode& node = program.nodes[index];
+      for (uint8_t i = 0; i < node.childCount; i++) key.children[i] = ids[node.children[i]];
+      ids[index] = intern.try_emplace(key, (uint32_t)intern.size()).first->second;
+    });
+    return ids[program.rootNode];
+  };
+  uint32_t left = canonicalRoot(*this);
+  return left == canonicalRoot(other);
+}
+
+void ValueProgram::retainRoot() {
+  std::vector<bool> live(nodes.size());
+  walkNodes(rootNode, [&](uint32_t index) { live[index] = true; });
+  std::vector<uint32_t> remap(nodes.size());
+  uint32_t count = 0;
+  needsScore = false;
+  for (uint32_t i = 0; i < nodes.size(); i++) {
+    if (!live[i]) continue;
+    ValueNode node = nodes[i];
+    for (uint8_t child = 0; child < node.childCount; child++) {
+      node.children[child] = remap[node.children[child]];
+    }
+    remap[i] = count;
+    nodes[count++] = node;
+    needsScore = needsScore || node.kind == ValueNodeKind::SCORE;
+  }
+  rootNode = remap[rootNode];
+  nodes.resize(count);
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,
@@ -2055,8 +2100,7 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
     : program(program), segment(segment),
-      nodes(pool.make_span<BoundValueNode>(program.nodes.size())),
-      locals(pool.make_span<ValueResult>(program.localCount)) {
+      nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
@@ -2064,8 +2108,6 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
-    } else if (node.kind == ValueNodeKind::LOCAL) {
-      bound.bounds = ValueBounds::unbounded(node.type, true);
     } else if (node.kind == ValueNodeKind::DOCID) {
       int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
@@ -2111,6 +2153,25 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       }
     }
   }
+  std::vector<uint8_t> uses(program.nodes.size());
+  std::vector<bool> readsScore(program.nodes.size());
+  program.walkNodes(program.rootNode, [&](uint32_t index) {
+    const ValueNode& node = program.nodes[index];
+    readsScore[index] = node.kind == ValueNodeKind::SCORE;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      uint32_t child = node.children[i];
+      readsScore[index] = readsScore[index] || readsScore[child];
+      if (uses[child] < 2) uses[child]++;
+      // Lazy array evaluation revisits scalar operands for every element.
+      if (valueArray(node.type) && !valueArray(program.nodes[child].type)) uses[child] = 2;
+    }
+  });
+  for (uint32_t i = 0; i < nodes.size(); i++) {
+    if (uses[i] > 1) {
+      nodes[i].memo = pool.make<ValueMemo>();
+      nodes[i].memo->needsScore = readsScore[i];
+    }
+  }
   propagateBounds(ValueBounds::unbounded(ValueType::DOUBLE));
 }
 
@@ -2122,9 +2183,6 @@ void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
     if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = scoreBounds;
       bound.bounds.type = ValueType::DOUBLE;
-    } else if (node.kind == ValueNodeKind::LOCAL) {
-      bound.bounds = nodes[node.children[0]].bounds;
-      bound.bounds.type = node.type;
     } else if (node.kind == ValueNodeKind::FUNCTION) {
       std::array<ValueBounds, VALUE_MAX_ARITY> children{};
       for (uint8_t child = 0; child < node.childCount; child++) {
@@ -2157,12 +2215,11 @@ std::string_view BoundValueProgram::firstUnboundedNode() const {
       && !root.mayBeMissing && !root.alwaysMissing) {
     return {};
   }
-  std::vector<bool> visited(program.nodes.size());
-  auto visit = [&](auto&& self, uint32_t index) -> std::string_view {
-    if (visited[index]) return {};
-    visited[index] = true;
+  std::string_view blocker;
+  program.walkNodes(program.rootNode, [&](uint32_t index) -> uint32_t {
+    if (!blocker.empty()) return 0;
     const ValueBounds& value = nodes[index].bounds;
-    if (bounded(value) && !value.mayBeMissing && !value.alwaysMissing) return {};
+    if (bounded(value) && !value.mayBeMissing && !value.alwaysMissing) return 0u;
     const ValueNode& node = program.nodes[index];
     std::array<bool, VALUE_MAX_ARITY> contributes{};
     std::fill_n(contributes.begin(), node.childCount, true);
@@ -2180,14 +2237,18 @@ std::string_view BoundValueProgram::firstUnboundedNode() const {
       int shortCircuit = node.opcode == ValueOpcode::AND ? 0 : 1;
       contributes[1] = !left.alwaysMissing && boundsTruth(left) != shortCircuit;
     }
-    for (uint8_t child = 0; child < node.childCount; child++) {
-      if (!contributes[child]) continue;
-      std::string_view blocker = self(self, node.children[child]);
-      if (!blocker.empty()) return blocker;
+    uint32_t mask = 0;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      if (contributes[i]) mask |= 1u << i;
     }
-    return node.text;
-  };
-  return visit(visit, program.rootNode);
+    return mask;
+  }, [&](uint32_t index) {
+    const ValueBounds& value = nodes[index].bounds;
+    if (blocker.empty() && (!bounded(value) || value.mayBeMissing || value.alwaysMissing)) {
+      blocker = program.nodes[index].text;
+    }
+  });
+  return blocker;
 }
 
 ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float score) const {
@@ -2231,6 +2292,19 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
 }
 
 ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
+  ValueMemo* memo = nodes[index].memo;
+  if (memo == nullptr) return evalUncached(index, docid, score);
+  uint32_t scoreBits = memo->needsScore ? std::bit_cast<uint32_t>(score) : 0;
+  if (memo->docid != docid || memo->scoreBits != scoreBits) {
+    ValueResult result = evalUncached(index, docid, score);
+    memo->result = result;
+    memo->docid = docid;
+    memo->scoreBits = scoreBits;
+  }
+  return memo->result;
+}
+
+ValueResult BoundValueProgram::evalUncached(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   switch (node.kind) {
     case ValueNodeKind::CONSTANT:
@@ -2238,7 +2312,6 @@ ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float sco
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
     case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
-    case ValueNodeKind::LOCAL: return locals[node.slot];
     case ValueNodeKind::FUNCTION: return node.function->evalPoint(*this, node, docid, score);
   }
   throw std::runtime_error("invalid ValueExpr node");

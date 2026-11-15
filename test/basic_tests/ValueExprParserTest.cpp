@@ -128,11 +128,11 @@ TEST(ValueExprParserTest, flatInfixChainsConsumeAndRestoreNestingBudget) {
   EXPECT_NO_THROW(parser.parse(chain(8)));
   EXPECT_EQ(8, budget);
 
-  int siblingBudget = 4;
+  int siblingBudget = 5;
   ValueExprOptions siblingOptions{schema.get(), {}, &siblingBudget};
   ValueExprParser siblingParser(siblingOptions, *memory.arena);
   EXPECT_NO_THROW(siblingParser.parse("add(1+2+3+4,5+6+7+8)"));
-  EXPECT_EQ(4, siblingBudget);
+  EXPECT_EQ(5, siblingBudget);
 }
 
 TEST(ValueExprParserTest, logicalDateRules) {
@@ -334,4 +334,23 @@ TEST(ValueExprParserTest, dateUnitsPreserveIdentityAndSameUnitTrees) {
     expectParseError(parser, "sum(stamps)", "cannot reduce a DATE array");
     expectParseError(parser, "stamp+when_dt", "cannot add two DATE");
   }
+}
+
+TEST(ValueExprParserTest, resultCoercionUsesTheParserDepthBudget) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 2;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  int budget = 1;
+  ValueExprOptions options{schema.get(), {}, &budget};
+  ValueExprParser parser(options, *memory.arena);
+  EXPECT_NO_THROW(parser.parse("price"));
+  EXPECT_THROW(parser.parse("price", NaturePolicy::NUMBER), std::runtime_error);
+  EXPECT_EQ(1, budget);
+  budget = 2;
+  EXPECT_EQ(ValueType::DOUBLE, parser.parse("price", NaturePolicy::NUMBER)->root().type);
+  EXPECT_EQ(2, budget);
 }

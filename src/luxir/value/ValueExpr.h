@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <google/protobuf/arena.h>
@@ -33,8 +34,6 @@ enum class ValueNodeKind : uint8_t {
   SCORE,
   DOCID,
   FUNCTION,
-  // A let variable, read from the bound program's slot `slot`.
-  LOCAL,
 };
 
 struct ValueNode {
@@ -50,8 +49,6 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
-  // The slot of a let variable. LOCAL nodes read `slot`.
-  uint32_t slot = 0;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
@@ -75,8 +72,6 @@ public:
   std::pmr::vector<double> doubleArrays;
   std::optional<ValueResult> constantScalar;
   uint32_t rootNode = 0;
-  // Slots for let variables; each bound program allocates this many.
-  uint32_t localCount = 0;
   bool needsScore = false;
 
   explicit ValueProgram(google::protobuf::Arena& arena)
@@ -107,11 +102,39 @@ public:
     }
   }
 
+  // Nodes are appended after their dependencies. Walk reachable nodes once,
+  // in child order, with caller-selected edges and a postorder visitor.
+  template <class Children, class Visit>
+  void walkNodes(uint32_t root, Children&& children, Visit&& visit) const {
+    std::vector<bool> visited(nodes.size());
+    auto walk = [&](auto&& self, uint32_t index) -> void {
+      if (visited[index]) return;
+      visited[index] = true;
+      uint32_t mask = children(index);
+      const ValueNode& node = nodes[index];
+      for (uint8_t i = 0; i < node.childCount; i++) {
+        if (mask & (1u << i)) self(self, node.children[i]);
+      }
+      visit(index);
+    };
+    walk(walk, root);
+  }
+
+  template <class Visit>
+  void walkNodes(uint32_t root, Visit&& visit) const {
+    walkNodes(root, [&](uint32_t index) {
+      return (1u << nodes[index].childCount) - 1;
+    }, std::forward<Visit>(visit));
+  }
+
+  // Drop unused let values and remap child indices in dependency order.
+  // Lazy array references are created only after parsing.
+  void retainRoot();
+
   const ValueNode& root() const { return nodes[rootNode]; }
   ValueBounds constantBounds(uint32_t index) const;
   bool structurallyEqual(const ValueProgram& other) const;
   std::string describeDateSources(uint32_t node) const;
-  uint32_t numericNode(uint32_t node);
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
                           ValueFieldInfos fields) const;
 };
@@ -143,7 +166,17 @@ struct BoundStringColumn {
   }
 };
 
+struct ValueMemo {
+  ValueResult result;
+  int32_t docid = -1;
+  uint32_t scoreBits = 0;
+  bool needsScore = false;
+};
+
 struct BoundValueNode {
+  // Allocated only for nodes with repeated consumers (including scalar
+  // operands revisited by lazy array elements).
+  ValueMemo* memo = nullptr;
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
@@ -164,8 +197,6 @@ public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
   std::span<BoundValueNode> nodes;
-  // Values of the let variables while their scope is being evaluated.
-  std::span<ValueResult> locals;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment, ValueFieldInfos fields);
@@ -191,6 +222,7 @@ public:
   int64_t arraySize(uint32_t node, int32_t docid, float score);
 
 private:
+  ValueResult evalUncached(uint32_t node, int32_t docid, float score);
   ValueResult evalColumnSequential(uint32_t node, int32_t docid,
                                    float score);
   bool readColumnSequential(uint32_t node, int32_t docid, int64_t& raw);

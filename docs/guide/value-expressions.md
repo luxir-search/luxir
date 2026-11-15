@@ -162,10 +162,18 @@ Where each geo operation lives:
 let(name, value, body)
 ```
 
-`value` is evaluated once, `name` stands for it inside `body`, and the result is
-`body`. A variable holds one number (not an array), and keeps its type: an
-integer stays an integer, a date stays a date, a point stays a point. It shadows
-a column of the same name, and is not visible outside the `body`.
+`name` stands for `value` inside `body`, and the result is `body`. Both
+`value` and `body` must be numeric scalars (not arrays). Integers stay integers,
+and dates and geo points keep their nature; decimal and boolean values become
+numbers. A name shadows a column of the same name, cannot shadow another
+binding or a reserved name, and is not visible outside the `body`.
+
+A used value is evaluated at most once per document (and again if its score
+changes and the value depends on score). An unused value is not evaluated,
+including one used only in an untaken `if` or `def` branch. A constant binding
+remains a constant, so `let(z, 5, geotile(place.lat, place.lon, z))` is valid.
+Expression nesting and dependency depth are bounded by the parser's nesting
+budget; there is no separate limit on the number of bindings.
 
 `let` is not available inside aggregate (bucket) expressions.
 

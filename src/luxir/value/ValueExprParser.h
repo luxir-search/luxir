@@ -106,13 +106,9 @@ class ValueExprParser {
 
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
 
-  // A let variable, visible while its body is parsed.
   struct Binding {
     std::string_view name;
-    uint32_t slot = 0;
-    ValueType type = ValueType::INT64;
-    ValueNature nature = ValueNature::NUMBER;
-    uint32_t init = 0;  // LET: the node holding the value
+    uint32_t node;
   };
 
   const ValueExprOptions& opts;
@@ -121,20 +117,20 @@ class ValueExprParser {
   ValueProgram* program = nullptr;
   ValueConstantAnalysis constants;
   std::vector<Binding> bindings;
+  std::vector<int> depths;
+  int depthLimit = 0;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
 public:
   using Node = uint32_t;
 
-  static constexpr uint32_t MAX_LOCALS = 64;
-
   ValueExprParser(const ValueExprOptions& opts, google::protobuf::Arena& arena)
       : opts(opts), arena(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {}
 
-  ValueProgram* parse(std::string_view expression) {
+  ValueProgram* parse(std::string_view expression, NaturePolicy resultNatures = NaturePolicy::RAW) {
     Cursor cursor(expression);
-    ValueProgram* result = parsePartial(cursor);
+    ValueProgram* result = parsePartial(cursor, resultNatures);
     cursor.skipWs();
     if (!cursor.atEnd()) fail(cursor.position(), "unexpected trailing input");
     cur = nullptr;
@@ -144,20 +140,28 @@ public:
   // Parse one expression from the cursor's current absolute position and stop
   // before a caller-owned comma or close parenthesis. The caller and this
   // parser therefore share source positions without substring translation.
-  ValueProgram* parsePartial(Cursor& cursor) {
+  // Result coercions use the same node construction and depth accounting.
+  ValueProgram* parsePartial(Cursor& cursor, NaturePolicy resultNatures = NaturePolicy::RAW) {
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
     constants.clear();
     bindings.clear();
+    depths.clear();
+    depthLimit = *budget;
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
+    ResolvedValue result{program->root().type, program->root().nature};
+    if (convertValueNature(resultNatures, {&result, 1}, 0)) {
+      program->rootNode = numericNode(program->rootNode);
+    }
     if (program->root().nature == ValueNature::GEO_POINT) {
       fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance(), or geo_lat() and geo_lon()");
     }
     program->constantScalar = constants.scalar(program->rootNode);
+    program->retainRoot();
     return program;
   }
 
@@ -186,9 +190,20 @@ private:
   uint32_t append(ValueNode node) {
     program->addNode(node);
     uint32_t index = (uint32_t)program->nodes.size() - 1;
+    analyzeNode(index);
+    return index;
+  }
+
+  void analyzeNode(uint32_t index) {
+    const ValueNode& node = program->nodes[index];
+    int depth = 1;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      depth = std::max(depth, 1 + depths[node.children[i]]);
+    }
+    if (depth > depthLimit) fail(node.sourcePos, "expression nesting exceeds the supported depth");
+    depths.push_back(depth);
     constants.append(node, node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE
         ? std::optional<ValueBounds>(program->constantBounds(index)) : std::nullopt);
-    return index;
   }
 
   template <class Grammar>
@@ -212,7 +227,6 @@ private:
       node.type = ValueType::DOUBLE;
       node.sourcePos = pos;
       node.text = program->copyString(name);
-      program->needsScore = true;
       return append(node);
     }
     if (opts.sortIntrinsics && name == "_docid_") {
@@ -223,7 +237,7 @@ private:
       node.text = program->copyString(name);
       return append(node);
     }
-    if (const Binding* binding = findBinding(name)) return appendLocal(*binding, pos);
+    if (const Binding* binding = findBinding(name)) return binding->node;
     auto failAt = [&](size_t at, std::string_view message) { fail(at, message); };
     if (name == "params") {
       std::string_view variable =
@@ -465,13 +479,11 @@ private:
     auto natureConversions = function->natureConversions({resolvedArgs.data(), count});
     for (uint8_t i = 0; i < count; i++) {
       if (!natureConversions[i]) continue;
-      size_t start = program->nodes.size();
-      args[i] = program->numericNode(args[i]);
-      for (size_t n = start; n < program->nodes.size(); n++) constants.append(program->nodes[n]);
+      args[i] = numericNode(args[i]);
       resolvedArgs[i] = {program->nodes[args[i]].type, program->nodes[args[i]].nature};
     }
     for (uint8_t i = 0; i < count; i++) {
-      if (function->operands[i].constant && !foldConstant(args[i])) {
+      if (function->operands[i].constant && !constantOperand(args[i])) {
         fail(program->nodes[args[i]].sourcePos, fmt::format(
             "{}() argument {} must be a constant numeric scalar", function->name, i + 1));
       }
@@ -590,19 +602,6 @@ private:
     return nullptr;
   }
 
-  uint32_t appendLocal(const Binding& binding, size_t pos) {
-    ValueNode node;
-    node.kind = ValueNodeKind::LOCAL;
-    node.type = binding.type;
-    node.nature = binding.nature;
-    node.slot = binding.slot;
-    node.sourcePos = pos;
-    node.text = program->copyString(binding.name);
-    node.childCount = 1;
-    node.children[0] = binding.init;
-    return append(node);
-  }
-
   std::string_view parseBindingName() {
     cur->skipWs();
     size_t pos = cur->position();
@@ -615,11 +614,22 @@ private:
     return program->copyString(name);
   }
 
-  uint32_t allocateSlot(size_t pos) {
-    if (program->localCount >= MAX_LOCALS) {
-      fail(pos, fmt::format("an expression may declare at most {} variables", MAX_LOCALS));
+  uint32_t numericNode(uint32_t index) {
+    ValueNode node = program->nodes[index];
+    if (valueDecimal(node.nature)) {
+      ValueNode scale;
+      scale.intValue = valueDecimalScale(node.nature);
+      auto scaleIndex = append(scale);
+      node.kind = ValueNodeKind::FUNCTION;
+      node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
+      node.function = ValueFunctionRegistry::decimalDecoder();
+      node.opcode = ValueOpcode::NONE;
+      node.children = {index, scaleIndex};
+      node.childCount = 2;
+      node.text = node.function->name;
     }
-    return program->localCount++;
+    node.nature = ValueNature::NUMBER;
+    return append(node);
   }
 
   // A decimal or boolean value is a number to the rest of the expression.
@@ -633,9 +643,7 @@ private:
       fail(value.sourcePos, fmt::format("{} must be numeric", what));
     }
     if (valueDecimal(value.nature) || value.nature == ValueNature::BOOLEAN) {
-      size_t start = program->nodes.size();
-      node = program->numericNode(node);
-      for (size_t n = start; n < program->nodes.size(); n++) constants.append(program->nodes[n]);
+      node = numericNode(node);
     }
     return node;
   }
@@ -645,38 +653,27 @@ private:
     std::string_view name;
     uint32_t value = 0;
     uint32_t body = 0;
-    uint32_t slot = 0;
     grammar.parseArguments("let", pos, 3, 3, [&](uint8_t argument) {
       if (argument == 0) {
         name = parseBindingName();
       } else if (argument == 1) {
         value = numericScalar(grammar.parseExpression(), "the value of let()");
       } else {
-        slot = allocateSlot(pos);
-        const ValueNode& bound = program->nodes[value];
-        bindings.push_back({name, slot, bound.type, bound.nature, value});
+        bindings.push_back({name, value});
         body = numericScalar(grammar.parseExpression(), "the body of let()");
         bindings.pop_back();
       }
     });
-    ValueNode node;
-    node.kind = ValueNodeKind::FUNCTION;
-    node.function = ValueFunctionRegistry::find("let");
-    node.children[0] = value;
-    node.children[1] = body;
-    node.childCount = 2;
-    node.type = program->nodes[body].type;
-    node.nature = program->nodes[body].nature;
-    node.slot = slot;
-    node.sourcePos = pos;
-    node.text = node.function->name;
-    return append(node);
+    return body;
   }
 
-  bool foldConstant(uint32_t index) {
+  // Materialize this operand without rewriting a shared definition or
+  // invalidating the dependency depths of its existing parents.
+  bool constantOperand(uint32_t& index) {
     auto value = constants.scalar(index);
     if (!value.has_value()) return false;
-    ValueNode& node = program->nodes[index];
+    const ValueNode& node = program->nodes[index];
+    if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) return true;
     ValueNode literal;
     literal.type = value->type;
     literal.nature = node.nature;
@@ -684,7 +681,7 @@ private:
     literal.text = node.text;
     literal.intValue = value->intValue;
     literal.doubleValue = value->doubleValue;
-    node = literal;
+    index = append(literal);
     return true;
   }
 

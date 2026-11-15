@@ -154,6 +154,5 @@ std::span<const ValueFunction> valueMathFunctions();
 std::span<const ValueFunction> valueDateFunctions();
 std::span<const ValueFunction> valueGeoFunctions();
 std::span<const ValueFunction> valueHashFunctions();
-std::span<const ValueFunction> valueScopeFunctions();
 
 } // namespace luxir
