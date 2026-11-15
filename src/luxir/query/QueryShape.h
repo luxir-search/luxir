@@ -123,6 +123,9 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
 
 inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
   switch (query.getKind()) {
+    case QueryKind::TO_PARENT:
+      return canOmitWeightForCacheFirstMembership(
+          *static_cast<const ToParentQuery&>(query).getChild());
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query)
           .shapeCanOmitWeightForCacheFirstMembership();
@@ -157,7 +160,6 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
       return true;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::MIN_SCORE:
-    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;

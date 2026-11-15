@@ -48,18 +48,24 @@ public:
   class Weight final : public Query::Weight {
     IndexReader& source;
     Query::Weight* child;
+    FilterCache::Use* childUse;
     RowRelation& relation;
     bool maximum;
     float multiplier;
 
     Query::ScorerSupplier* supplier(MemPool& pool, IndexReader::Segment& segment,
-        Query::SegmentSource& childSource, DocSet* domain, Query::SupplierExecutionMode mode) {
+        const QueryPrep::PreparedSource& input, DocSet* domain, Query::SupplierExecutionMode mode) {
       if (mode != Query::SupplierExecutionMode::RAW_MEMBERSHIP && domain && domain->card() == 0) return nullptr;
       auto& leaf = source.segments()[(size_t)segment.ord];
       auto childMode = child->consumesDomain() ? mode : Query::SupplierExecutionMode::RAW_MEMBERSHIP;
-      auto* input = childSource.scorerSupplier(pool, leaf, childMode);
-      if (!input) return nullptr;
-      return relation.reduce(pool, (size_t)segment.ord, *input,
+      auto* supplier = childUse
+          ? QueryPrep::filterSupplier(pool, input, source, leaf,
+                allowsPruning() ? QueryPrep::FilterSupplierMode::DENSITY_ROUTED
+                    : QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE,
+                0, childMode)
+          : input.segmentSource().scorerSupplier(pool, leaf, childMode);
+      if (!supplier) return nullptr;
+      return relation.reduce(pool, (size_t)segment.ord, *supplier,
           mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : domain,
           maximum && needsScores(), multiplier);
     }
@@ -77,7 +83,7 @@ public:
             domains(domains.begin(), domains.end()) {}
       Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
           Query::SupplierExecutionMode mode) override {
-        return weight.supplier(pool, segment, child.segmentSource(),
+        return weight.supplier(pool, segment, child,
             mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr
                 : domains.empty() ? segment.liveDocSet() : domains[(size_t)segment.ord], mode);
       }
@@ -107,39 +113,44 @@ public:
           maximum(query.maximum), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
       child = query.child->createWeight(*childContext, maximum ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
-      traits = NEEDS_PREPARE | (child->getFlags() & CONSUMES_DOMAIN);
+      childUse = !child->needsScores() && !child->allowsPruning()
+          ? childContext->getFilterUse(*query.child) : nullptr;
+      traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
+      // Scored reduction keeps owner eligibility ahead of family scoring.
+      if (child->consumesDomain() || (maximum && needsScores())) traits |= NEEDS_PREPARE;
       if (!maximum || !needsScores()) traits |= IS_CONSTANT_SCORING;
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
     }
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& prepareContext) override {
-      QueryPrep::PreparedSource input;
-      input.weight = child;
       std::vector<DomainHandle> eligibility;
       std::vector<DocSet*> views;
-      if (child->needsPrepare()) {
-        if (child->consumesDomain()) {
-          eligibility.reserve(source.segments().size());
-          views.reserve(source.segments().size());
-          for (auto& leaf : source.segments()) {
-            auto& owner = prepareContext.reader.segments()[(size_t)leaf.ord];
-            auto* domain = prepareContext.domainPerSeg.empty() ? owner.liveDocSet()
-                : prepareContext.domainPerSeg[(size_t)leaf.ord];
-            eligibility.push_back(relation.expand((size_t)leaf.ord,
-                DomainHandle::borrowed(domain).scoped(owner)));
-            views.push_back(eligibility.back().get());
-          }
+      if (child->consumesDomain()) {
+        eligibility.reserve(source.segments().size());
+        views.reserve(source.segments().size());
+        for (auto& leaf : source.segments()) {
+          auto& owner = prepareContext.reader.segments()[(size_t)leaf.ord];
+          auto* domain = prepareContext.domainPerSeg.empty() ? owner.liveDocSet()
+              : prepareContext.domainPerSeg[(size_t)leaf.ord];
+          eligibility.push_back(relation.expand((size_t)leaf.ord,
+              DomainHandle::borrowed(domain).scoped(owner)));
+          views.push_back(eligibility.back().get());
         }
-        Query::Weight::PrepareContext childContext{source, views, prepareContext.parallel, prepareContext.warnings,
-            child->consumesDomain() ? Query::SupplierExecutionMode::ORDINARY
-                : Query::SupplierExecutionMode::RAW_MEMBERSHIP};
-        input.setPrepared(child->prepare(childContext));
       }
-      return std::make_unique<Prepared>(*this, std::move(input), prepareContext.domainPerSeg, std::move(eligibility));
+      Query::Weight::PrepareContext childContext{source, views, prepareContext.parallel, prepareContext.warnings,
+          child->consumesDomain() ? Query::SupplierExecutionMode::ORDINARY
+              : Query::SupplierExecutionMode::RAW_MEMBERSHIP};
+      std::array<Query::Weight*, 1> weights{child};
+      std::array<FilterCache::Use*, 1> uses{childUse};
+      auto inputs = QueryPrep::prepareFilterSources(weights, uses, childContext);
+      return std::make_unique<Prepared>(*this, std::move(inputs[0]), prepareContext.domainPerSeg, std::move(eligibility));
     }
     Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode mode) override {
-      return supplier(pool, segment, *child,
+      QueryPrep::PreparedSource input;
+      input.weight = child;
+      input.cacheUse = childUse;
+      return supplier(pool, segment, input,
           mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
     }
     Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {

@@ -1051,9 +1051,9 @@ public:
       return {true, std::move(docs), card};
     }
     assert(source == Source::WEIGHT && weight != nullptr);
-    if (weight->needsPrepare()) {
+    if (weight->needsPrepare() && isReaderStable()) {
       auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared);
-      if (!isReaderStable() || cached == nullptr) return {};
+      if (cached == nullptr) return {};
       DocSet* docs = cached->docSet(segment);
       if (cached->outcome()
           == ReaderStablePreparedWeight::CacheOutcome::HIT) {
@@ -1067,6 +1067,9 @@ public:
         true, DomainHandle::pinned(docs, lifetime).scoped(segment), (int64_t) docs->card()
       };
     }
+
+    if (weight->needsPrepare() && (prepared == nullptr
+        || prepared->domainDependence() != PreparedDomainDependence::QUERY_CANONICAL)) return {};
 
     assert(fieldSortCacheRoutes.empty()
            || (size_t)segment.ord < fieldSortCacheRoutes.size());
@@ -1113,7 +1116,7 @@ public:
             "whole membership publication requires a query-canonical source");
       }
       auto buildStart = std::chrono::steady_clock::now();
-      auto raw = materializeRawFilter(*weight, nullptr, segment);
+      auto raw = materializeRawFilter(*weight, prepared, segment);
       uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
       cacheUse->publishRaw(
           (size_t) segment.ord, probe, std::move(raw), buildCostNanos);

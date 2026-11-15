@@ -2130,10 +2130,10 @@ public:
     // reader domain. Preserve the landed probe there and let
     // probeReaderStable enforce the runtime domain gate. Fusion sources have
     // a different ownership shape and remain excluded.
-    bool readerStableWhole = weight != nullptr && weight->needsPrepare()
+    bool preparedWhole = weight != nullptr && weight->needsPrepare()
         && placement != TopDocsPlacement::FUSION_SOURCE
         && (pureCount || wholeFieldSort);
-    if (weight != nullptr && weight->needsPrepare() && !readerStableWhole) {
+    if (weight != nullptr && weight->needsPrepare() && !preparedWhole) {
       pureCount = false;
       wholeFieldSort = false;
     }
@@ -2178,7 +2178,7 @@ public:
         bool fieldSortFullyRouted = false;
         if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
-          if (wholeFieldSort && !readerStableWhole) {
+          if (wholeFieldSort && !preparedWhole) {
             wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
                 view()->segments().size());
             if (fieldSortBuildVetoed) {
@@ -2195,18 +2195,16 @@ public:
           // An accepted reader-stable value replaces the ANN preparation pass.
           // Its bounded kNN membership is also a valid ladder fallback, while
           // the numeric exact-domain driver still prices exact cardinality per
-          // segment.
+          // segment. Query-canonical prepared sources may publish raw segment
+          // membership through the same lane; preparation alone says nothing
+          // about key lifetime.
           if (acquireUse) {
-            wholeMembershipUse = readerStableWhole
-                ? qcontext->getFilterUse(
-                      *query, FilterKeyScope::READER_STABLE,
-                      FilterCache::AdmissionLane::WHOLE)
-                : qcontext->getFilterUse(
-                      *query, FilterCache::AdmissionLane::WHOLE);
+            wholeMembershipUse = qcontext->getFilterUse(
+                *query, FilterCache::AdmissionLane::WHOLE);
           }
         }
         // Field-sort constants are useful per segment even without a cache.
-        // Prepared membership still requires its reader-stable cache source.
+        // Prepared membership still requires a cache source and its runtime provenance check.
         if (!everySegmentConstant && wholeMembershipUse == nullptr
             && !fieldSortFullyRouted
             && !(wholeFieldSort && !wholeMembershipWeight->needsPrepare())) {
