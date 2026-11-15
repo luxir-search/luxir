@@ -504,4 +504,29 @@ TEST_F(NestedTest, toParentBesideASparseLeadVerifiesOnlyCandidates) {
 #endif
 }
 
+
+// A multi-valued int column where every document holds one value reads as
+// single-valued, and a merge with a segment holding arrays keeps both exact.
+TEST_F(NestedTest, multiValuedColumnsWithOneValueEachStayExactThroughMerges) {
+  schema(R"({"fields": {"n": {"type": "int", "multi": "array"}}})");
+  ASSERT_TRUE(index({R"({"id": "a", "n": 5})", R"({"id": "b", "n": [7]})", R"({"id": "c"})"}).success);
+  ASSERT_TRUE(index({R"({"id": "d", "n": [1, 9]})", R"({"id": "e", "n": 6})"}).success);
+  auto check = [&] {
+    auto inRange = ids(topDocs(R"({"range": {"field": "n", "gte": 5, "lte": 8}})"));
+    std::sort(inRange.begin(), inRange.end());
+    EXPECT_EQ(std::vector<std::string>({"a", "b", "e"}), inRange);
+    EXPECT_EQ(std::vector<std::string>({"d", "b", "e", "a"}), ids(R"J({"ops": {"q": {"top_docs": {"limit": -1,
+        "fields": ["id"], "query": {"range": {"field": "n", "gte": 0}}, "sort": [{"expr": "max(n)", "dir": "desc"}]}}}})J"));
+    EXPECT_NE(std::string::npos, search(R"({"ops": {"q": {"top_docs": {"limit": 0, "count_limit": -1,
+        "query": {"range": {"field": "n", "lte": 1}}}}}})").find(R"("found":1)"));
+  };
+  check();
+  CollectionHelper h = helper();
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(h.submit(merge).success);
+  ASSERT_EQ(1u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  check();
+}
+
 }  // namespace

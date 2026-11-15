@@ -117,6 +117,7 @@ private:
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   bool arrayMode = false;
+  bool oneValueEach = false;  // multi-valued layout, one value per document
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
@@ -155,6 +156,14 @@ public:
 
     if (fieldInfo.monoLoc.offset() > 0) {
       endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      // Writers list a document only when it holds a value, so as many
+      // values as documents means one value each: value rank == doc rank.
+      // Read such a column as single-valued (a declared multi-valued field
+      // that never received an array, as an ES-style mapping makes every
+      // field). The end value ranks stay readable for copying the column.
+      oneValueEach = nvals == docsWithField;
+      assert(!oneValueEach || nvals == 0
+             || (endValueRankReader->valueAt(0) == 1 && endValueRankReader->valueAt(nvals - 1) == nvals));
     }
   }
 
@@ -189,7 +198,10 @@ public:
     return docs;
   }
 
-  //get underlying endValueRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
+  // The underlying endValueRankReader, null if the column has no multi-valued
+  // layout. It is present for a column multiValued() reads as single-valued
+  // (one value per document), for consumers that copy the physical layout.
+  // Valid as long as IntColReader is valid.
    MonoReader* getEndValueRankReader() {
     return endValueRankReader ? &(*endValueRankReader) : nullptr;
   }
@@ -204,7 +216,7 @@ public:
   }
 
   bool multiValued() const {
-    return endValueRankReader.has_value();
+    return endValueRankReader.has_value() && !oneValueEach;
   }
   
   int64_t getMin() const {
