@@ -28,7 +28,7 @@ using namespace luxir;
 using namespace luxir::test;
 
 // The math, bitwise, date, geo and hash functions of the value language, its
-// local variables and bounded loops, and the Lucene expressions / Painless
+// local variables, and the Lucene expressions / Painless
 // spellings of columns and parameters.
 class ValueScriptingTest : public LuxirTest {
 protected:
@@ -227,12 +227,7 @@ std::pair<int, int> painlessGeohex(double lat, double lon) {
 // The three scripts as Luxir expressions. Painless emits strings; these return
 // one int64 per cell (a geohash is 5 bits per character, a geotile is
 // Elasticsearch's (zoom << 58) | (x << 29) | y, a hex cell is rx << 32 | rz).
-constexpr std::string_view GEOHASH_LOOP =
-    "let(lon, doc['loc_p'].lon, let(lat, doc['loc_p'].lat, "
-    "let(x, clamp(to_int(floor((lon + 180.0) / 360.0 * 8192)), 0, 8191), "
-    "let(y, clamp(to_int(floor((lat + 90.0) / 180.0 * 4096)), 0, 4095), "
-    "fold(h, 0, i, 25, (h << 1) | ((i & 1) == 0 "
-    "? (x >> (12 - (i >> 1))) & 1 : (y >> (11 - (i >> 1))) & 1))))))";
+constexpr std::string_view GEOHASH_SCRIPT = "geohash(loc_p.lat, loc_p.lon, 5)";
 
 constexpr std::string_view GEOTILE_SCRIPT =
     "let(lat, clamp(doc['loc_p'].lat, -85.0511287798066, 85.0511287798066), "
@@ -644,10 +639,10 @@ TEST_F(ValueScriptingTest, gridScriptsRunAsLuxirExpressions) {
   for (Point p : {Point{0, 40.7128, -74.006}, {1, -33.8688, 151.2093}, {3, -33.0, 175.0}}) {
     SCOPED_TRACE(p.doc);
     double la = lat(p.lat), lo = lon(p.lon);
-    // geohash: a loop that interleaves the longitude and latitude bits.
-    EXPECT_EQ(geohashKey(painlessGeohash(la, lo, 5)), evalInt(GEOHASH_LOOP, p.doc));
+    // The built-in geohash interleaves longitude and latitude bits.
+    EXPECT_EQ(geohashKey(painlessGeohash(la, lo, 5)), evalInt(GEOHASH_SCRIPT, p.doc));
     EXPECT_EQ(evalInt("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", p.doc),
-              evalInt(GEOHASH_LOOP, p.doc));
+              evalInt(GEOHASH_SCRIPT, p.doc));
     // geotile at zoom 5.
     Tile tile = painlessGeotile(la, lo, 5);
     int64_t expectedTile = ((int64_t)5 << 58) | ((int64_t)tile.x << 29) | tile.y;
@@ -660,7 +655,7 @@ TEST_F(ValueScriptingTest, gridScriptsRunAsLuxirExpressions) {
     EXPECT_EQ(rz, (int32_t)(key & 0xFFFFFFFF));
   }
   // A document without a point has no cell.
-  for (auto script : {GEOHASH_LOOP, GEOTILE_SCRIPT, GEOHEX_SCRIPT}) {
+  for (auto script : {GEOHASH_SCRIPT, GEOTILE_SCRIPT, GEOHEX_SCRIPT}) {
     auto values = eval(script);
     EXPECT_TRUE(values[0].has_value());
     EXPECT_FALSE(values[2].has_value());
@@ -723,7 +718,7 @@ TEST_F(ValueScriptingTest, hashBucketsAreStableAndEven) {
 }
 
 // ---------------------------------------------------------------------------
-// let and fold
+// let
 
 TEST_F(ValueScriptingTest, letBindsAValueOnce) {
   expectValues("let(a, x_i + 1, a * a)", {9, 0, std::nullopt, 64, 1});
@@ -760,61 +755,11 @@ TEST_F(ValueScriptingTest, letScopeAndNameRules) {
   expectValues("let(x_i, 5, x_i + 1)", Values(DOCS, 6));
 }
 
-TEST_F(ValueScriptingTest, foldIsABoundedLoop) {
-  expectConstant("fold(s, 0, i, 10, s + i)", 45);
-  expectConstant("fold(s, 1, i, 5, s * 2)", 32);
-  expectConstant("fold(s, 7, i, 0, s + 1)", 7);
-  expectConstant("fold(s, 0.0, i, 4, s + 0.5)", 2);
-  expectValues("fold(s, 0, i, 3, s + x_i)", {6, -3, std::nullopt, 21, 0});
-  expectValues("fold(s, 0.0, i, 4, s + def(v_d, 1))", {40, 520, 4, 2, 4});
-  // The accumulator may be missing: it carries the missing value like a column.
-  expectValues("fold(s, x_i, i, 2, def(s, 5) + 1)", {4, 1, 7, 9, 2});
-  // The loop counter and accumulator are ordinary scalars of the body.
-  expectConstant("fold(s, 0, i, 5, s + i * i)", 30);
-  // Loops nest, within a total budget.
-  expectConstant("fold(a, 0, i, 8, a + fold(b, 0, j, 8, b + 1))", 64);
-  expectConstant("fold(a, 0, i, 16, a + fold(b, 0, j, 16, b + 1))", 256);
-  // Variables from outside are visible inside; a name is only visible inside.
-  expectValues("let(k, 3, fold(s, 0, i, 4, s + k))", Values(DOCS, 12));
-  expectValues("fold(s, 0, i, 3, let(t, s + 1, t * 2))", Values(DOCS, 14));
-  // The number of steps is a constant: a literal, an expression or a parameter.
-  api::Val steps;
-  steps.kind = int64_t{6};
-  bindVar("steps", steps);
-  expectConstant("fold(s, 0, i, params.steps, s + 1)", 6);
-  expectConstant("fold(s, 0, i, 2 * 3, s + 1)", 6);
-  expectConstant("fold(s, 0, i, $steps, s + 1)", 6);
-  // A loop long enough for the bounds of its accumulator to matter.
-  expectConstant("fold(s, 1, i, 60, s * 2) % 1000", 1152921504606846976LL % 1000);
-}
-
-TEST_F(ValueScriptingTest, foldLimitsAndTypes) {
-  expectError("fold(s, 0, i, 257, s)", "from 0 to 256 steps");
-  expectError("fold(s, 0, i, -1, s)", "from 0 to 256 steps");
-  expectError("fold(a, 0, i, 100, fold(b, 0, j, 100, b + 1))", "at most 4096 steps in total");
-  expectError("fold(a, 0, i, 20, fold(b, 0, j, 20, fold(c, 0, k, 20, c + 1)))", "in total");
-  expectError("fold(s, 0, i, x_i, s)", "integer constant");
-  expectError("fold(s, 0, i, 1.5, s)", "integer constant");
-  expectError("fold(s, 0, i, 3, s + 0.5)", "start it from a double");
-  expectError("fold(s, 0, s, 3, s)", "different names");
-  expectError("fold(s, 0, i, 3)", "expects exactly 5 arguments");
-  expectError("fold(s, vals_ds, i, 3, s)", "must be a scalar");
-  expectError("fold(s, 0, i, 3, i + s) + i", "Field not found: i");
-  EXPECT_EQ(ValueType::DOUBLE, parse("fold(s, 0.5, i, 3, s)")->root().type);
-  EXPECT_EQ(ValueType::INT64, parse("fold(s, 0, i, 3, i)")->root().type);
-  // 256 steps is allowed, with a body that overflows reported as an error.
-  expectConstant("fold(s, 0, i, 256, s + 1)", 256);
-  expectError("fold(s, 1, i, 100, s * 2)", "overflowed int64");
-}
-
-TEST_F(ValueScriptingTest, loopsAndVariablesAreStructurallyComparable) {
+TEST_F(ValueScriptingTest, variablesAreStructurallyComparable) {
   auto equal = [&](std::string_view a, std::string_view b) {
     return parse(a)->structurallyEqual(*parse(b));
   };
   EXPECT_TRUE(equal("let(a, x_i, a + 1)", "let(a, x_i, a + 1)"));
-  EXPECT_TRUE(equal("fold(s, 0, i, 4, s + i)", "fold(s, 0, i, 4, s + i)"));
-  EXPECT_FALSE(equal("fold(s, 0, i, 4, s + i)", "fold(s, 0, i, 5, s + i)"));
-  EXPECT_FALSE(equal("fold(s, 0, i, 4, s + i)", "fold(s, 1, i, 4, s + i)"));
   EXPECT_FALSE(equal("let(a, x_i, a + 1)", "let(a, x_i, a + 2)"));
 }
 
@@ -894,7 +839,7 @@ TEST_F(ValueScriptingTest, sortsByTheNewFunctions) {
   auto cell = [](const Point& p) { return geohashKey(painlessGeohash(p.lat, p.lon, 5)); };
   EXPECT_EQ(order(cell, false), sorted("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", asc));
   EXPECT_EQ(order(cell, true), sorted("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", desc));
-  EXPECT_EQ(order(cell, false), sorted(GEOHASH_LOOP, asc));
+  EXPECT_EQ(order(cell, false), sorted(GEOHASH_SCRIPT, asc));
   auto tile = [](const Point& p) {
     Tile t = painlessGeotile(p.lat, p.lon, 5);
     return ((int64_t)t.x << 29) | t.y;

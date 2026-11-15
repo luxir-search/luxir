@@ -2030,8 +2030,7 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
             && left.arraySize == right.arraySize;
       case ValueNodeKind::FUNCTION:
         if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount || left.slot != right.slot
-            || left.counterSlot != right.counterSlot) return false;
+            || left.childCount != right.childCount || left.slot != right.slot) return false;
         for (uint8_t i = 0; i < left.childCount; i++) {
           if (!self(self, left.children[i], right.children[i])) return false;
         }
@@ -2124,17 +2123,8 @@ void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
       bound.bounds = scoreBounds;
       bound.bounds.type = ValueType::DOUBLE;
     } else if (node.kind == ValueNodeKind::LOCAL) {
-      // A let variable has the bounds of its value; a loop accumulator or
-      // counter carries the bounds the parser recorded for it (the counter's
-      // range, or unknown for an accumulator).
-      if (node.childCount == 1) {
-        bound.bounds = nodes[node.children[0]].bounds;
-        bound.bounds.type = node.type;
-      } else if (node.arraySize == 1 && node.intValue > 0) {
-        bound.bounds = ValueBounds::integer(0, node.intValue - 1);
-      } else {
-        bound.bounds = ValueBounds::unbounded(node.type, true);
-      }
+      bound.bounds = nodes[node.children[0]].bounds;
+      bound.bounds.type = node.type;
     } else if (node.kind == ValueNodeKind::FUNCTION) {
       std::array<ValueBounds, VALUE_MAX_ARITY> children{};
       for (uint8_t child = 0; child < node.childCount; child++) {

@@ -7,8 +7,7 @@ per-document input of aggregates (`sum(year(published_dt))`), and in LTR
 features. Its arithmetic, `def`, conditionals, array reducers, `random`, and
 decay functions are described in
 [Searching](searching.md#sort-expressions-in-detail). This page covers the rest
-of the language: operators, math, date parts, geo, hashing, local variables
-and bounded loops, and the spellings that make Lucene expressions and Painless
+of the language: operators, math, date parts, geo, hashing, local variables, and the spellings that make Lucene expressions and Painless
 scoring scripts portable.
 
 Everything here shares the rules of the base language:
@@ -79,14 +78,14 @@ expression.
 | `clamp(x, low, high)` | `min(max(x, low), high)`. Integers stay integers. |
 | `mod(a, b)` | The `%` operator. |
 | `to_int(x)` | Truncates toward zero to an int64. It is an error when the value does not fit. |
-| `to_double(x)` | An integer as a double, for example to start a `fold` accumulator. |
+| `to_double(x)` | An integer as a double. |
 
 `round`, `ceil`, `trunc`, and `rint` return doubles, like `floor`; use `to_int`
 where an integer is needed, for example before a shift.
 
 Bucket (aggregate) expressions such as `sum(x_i) % 4` or `sin(sum(x_i))` accept
 these math functions, operators, `pi()`, `e()`, `clamp`, `to_int`, and
-`to_double`. Date, geo, hash, `let`, and `fold` functions work per document, so
+`to_double`. Date, geo, hash, `let` functions work per document, so
 inside an aggregate they belong in its input: `sum(year(when_dt))`.
 
 ## Date parts
@@ -155,7 +154,7 @@ Where each geo operation lives:
 | Sort or bucket by a grid cell | `geohash` or `geotile`; the cell is an integer. Hexagonal cells are written with the language itself, below. |
 | A polygon test inside a score | Not available. Use a `geo_polygon` query as a clause. |
 
-## Local variables and bounded loops
+## Local variables
 
 `let` names a value so it is computed once:
 
@@ -168,36 +167,7 @@ let(name, value, body)
 integer stays an integer, a date stays a date, a point stays a point. It shadows
 a column of the same name, and is not visible outside the `body`.
 
-`fold` runs a loop:
-
-```
-fold(acc, init, i, n, body)
-```
-
-`acc` starts as `init`. Then, for `i` from 0 to `n - 1`, `acc` becomes `body`.
-The result is the final `acc`. For example, the sum of the first ten squares:
-
-```
-fold(s, 0, i, 10, s + i * i)
-```
-
-The loop is bounded so that no document costs more than the expression's size
-allows:
-
-- `n` is a constant integer (a literal, a constant expression, or a variable
-  such as `params.n`), from 0 to 256.
-- Loops nested in each other may run at most 4096 steps in total, so a loop of
-  16 inside a loop of 16 is fine and a loop of 100 inside a loop of 100 is not.
-- An expression declares at most 64 variables, counting each loop's `acc` and
-  `i`.
-- There is no recursion, no data-dependent end, and no way to write to a column.
-
-The accumulator is an integer when `init` is an integer. The body must then be
-an integer too; start from `0.0` for a double. A missing value flows through the
-variables as it does through a column (`def(acc, 0)` recovers it), and the
-result is the last `acc`, which may be missing.
-
-`let` and `fold` are not available inside aggregate (bucket) expressions.
+`let` is not available inside aggregate (bucket) expressions.
 
 ## Hashing
 
@@ -257,8 +227,8 @@ Differences to know about when porting:
   Painless `size() == 0 ? 0 : doc['f'].value` reads.
 - **Types.** Painless has statements, `if`/`else`, loops, strings, lists, maps,
   and user functions; Luxir has expressions only. `if` becomes `?:`, a
-  `while` loop becomes `fold` when its count is known, and a script that
-  builds a string must produce an integer key instead.
+  loop needs a built-in function or an expression without iteration. A script
+  that builds a string must produce an integer key instead.
 - **`/` is always floating point**, as in Lucene expressions; for integer
   division shift or truncate: `to_int(x / 4)` or `x >> 2`.
 - **No `emit`, no `_source`, no stored fields, no strings.**
@@ -271,15 +241,10 @@ computes it as an integer. The cell then sorts and groups like any number, and
 
 **Geohash**, 5 characters. The Painless version bisects the range with a
 `while` loop and emits a string. `geohash(lat, lon, 5)` returns the same cell as
-an integer. The same thing written with `fold`, interleaving the bits of the
-quantized longitude (13 bits) and latitude (12 bits):
+an integer:
 
 ```
-let(lon, doc['location'].lon, let(lat, doc['location'].lat,
-let(x, clamp(to_int(floor((lon + 180.0) / 360.0 * 8192)), 0, 8191),
-let(y, clamp(to_int(floor((lat + 90.0) / 180.0 * 4096)), 0, 4095),
-fold(h, 0, i, 25, (h << 1) | ((i & 1) == 0
-    ? (x >> (12 - (i >> 1))) & 1 : (y >> (11 - (i >> 1))) & 1))))))
+geohash(location.lat, location.lon, 5)
 ```
 
 **Geotile**, zoom 5. `geotile(lat, lon, 5)`, or in expression form:

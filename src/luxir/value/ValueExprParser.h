@@ -106,17 +106,13 @@ class ValueExprParser {
 
   static constexpr int DEFAULT_NESTING_BUDGET = 128;
 
-  // A let variable or a fold accumulator or counter, visible while the body that
-  // declares it is parsed.
+  // A let variable, visible while its body is parsed.
   struct Binding {
-    enum class Kind : uint8_t { LET, ACCUMULATOR, COUNTER };
     std::string_view name;
     uint32_t slot = 0;
     ValueType type = ValueType::INT64;
     ValueNature nature = ValueNature::NUMBER;
-    Kind kind = Kind::LET;
     uint32_t init = 0;  // LET: the node holding the value
-    int64_t steps = 0;  // COUNTER: the number of steps of its loop
   };
 
   const ValueExprOptions& opts;
@@ -125,19 +121,12 @@ class ValueExprParser {
   ValueProgram* program = nullptr;
   ValueConstantAnalysis constants;
   std::vector<Binding> bindings;
-  // The product of the step counts of the loops around the body being parsed.
-  int64_t loopWork = 1;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
 public:
   using Node = uint32_t;
 
-  // fold() runs a fixed number of steps: at most MAX_LOOP_STEPS for one loop and
-  // MAX_LOOP_WORK in total for loops nested in each other, so the cost of a
-  // document's evaluation is bounded by the size of the expression.
-  static constexpr int64_t MAX_LOOP_STEPS = 256;
-  static constexpr int64_t MAX_LOOP_WORK = 4096;
   static constexpr uint32_t MAX_LOCALS = 64;
 
   ValueExprParser(const ValueExprOptions& opts, google::protobuf::Arena& arena)
@@ -161,7 +150,6 @@ public:
     program = arenaCreate<ValueProgram>(arena, arena);
     constants.clear();
     bindings.clear();
-    loopWork = 1;
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
     ValueExprGrammar grammar(*this, *cur, *budget);
@@ -379,7 +367,6 @@ private:
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
     if (name == "let") return parseLet(grammar, pos);
-    if (name == "fold") return parseFold(grammar, pos);
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -594,7 +581,7 @@ private:
         ".avg, .sum, or a date part such as .date.year", spelling));
   }
 
-  // ---- let and fold ---------------------------------------------------------
+  // ---- let ---------------------------------------------------------
 
   const Binding* findBinding(std::string_view name) const {
     for (auto it = bindings.rbegin(); it != bindings.rend(); ++it) {
@@ -611,15 +598,8 @@ private:
     node.slot = binding.slot;
     node.sourcePos = pos;
     node.text = program->copyString(binding.name);
-    // propagateBounds reads these: a let variable has its value's bounds and a
-    // counter the range of its loop.
-    if (binding.kind == Binding::Kind::LET) {
-      node.childCount = 1;
-      node.children[0] = binding.init;
-    } else if (binding.kind == Binding::Kind::COUNTER) {
-      node.arraySize = 1;
-      node.intValue = binding.steps;
-    }
+    node.childCount = 1;
+    node.children[0] = binding.init;
     return append(node);
   }
 
@@ -674,7 +654,7 @@ private:
       } else {
         slot = allocateSlot(pos);
         const ValueNode& bound = program->nodes[value];
-        bindings.push_back({name, slot, bound.type, bound.nature, Binding::Kind::LET, value, 0});
+        bindings.push_back({name, slot, bound.type, bound.nature, value});
         body = numericScalar(grammar.parseExpression(), "the body of let()");
         bindings.pop_back();
       }
@@ -688,93 +668,6 @@ private:
     node.type = program->nodes[body].type;
     node.nature = program->nodes[body].nature;
     node.slot = slot;
-    node.sourcePos = pos;
-    node.text = node.function->name;
-    return append(node);
-  }
-
-  template <class Grammar>
-  uint32_t parseFold(Grammar& grammar, size_t pos) {
-    std::string_view accumulator;
-    std::string_view counter;
-    uint32_t init = 0;
-    uint32_t count = 0;
-    uint32_t body = 0;
-    uint32_t accumulatorSlot = 0;
-    uint32_t counterSlot = 0;
-    ValueType type = ValueType::INT64;
-    grammar.parseArguments("fold", pos, 5, 5, [&](uint8_t argument) {
-      switch (argument) {
-        case 0:
-          accumulator = parseBindingName();
-          break;
-        case 1: {
-          init = numericScalar(grammar.parseExpression(), "the initial value of fold()");
-          const ValueNode& value = program->nodes[init];
-          if (value.nature != ValueNature::NUMBER) {
-            fail(value.sourcePos, "the initial value of fold() must be a number");
-          }
-          type = value.type;
-          break;
-        }
-        case 2:
-          counter = parseBindingName();
-          if (counter == accumulator) {
-            fail(cur->position(), "the loop counter and the accumulator need different names");
-          }
-          break;
-        case 3: {
-          size_t at = cur->position();
-          count = grammar.parseExpression();
-          if (!foldConstant(count) || program->nodes[count].type != ValueType::INT64) {
-            fail(at, "the number of steps of fold() must be an integer constant");
-          }
-          break;
-        }
-        default: {
-          int64_t steps = program->nodes[count].intValue;
-          if (steps < 0 || steps > MAX_LOOP_STEPS) {
-            fail(pos, fmt::format("fold() runs from 0 to {} steps, not {}", MAX_LOOP_STEPS, steps));
-          }
-          int64_t outer = loopWork;
-          if (steps > 0 && outer > MAX_LOOP_WORK / steps) {
-            fail(pos, fmt::format("nested fold() loops may run at most {} steps in total",
-                                  MAX_LOOP_WORK));
-          }
-          accumulatorSlot = allocateSlot(pos);
-          counterSlot = allocateSlot(pos);
-          bindings.push_back({accumulator, accumulatorSlot, type, ValueNature::NUMBER,
-                              Binding::Kind::ACCUMULATOR, 0, 0});
-          bindings.push_back({counter, counterSlot, ValueType::INT64, ValueNature::NUMBER,
-                              Binding::Kind::COUNTER, 0, steps});
-          loopWork = outer * std::max<int64_t>(steps, 1);
-          body = numericScalar(grammar.parseExpression(), "the body of fold()");
-          loopWork = outer;
-          bindings.pop_back();
-          bindings.pop_back();
-          const ValueNode& result = program->nodes[body];
-          if (result.nature != ValueNature::NUMBER) {
-            fail(result.sourcePos, "the body of fold() must be a number");
-          }
-          if (type == ValueType::INT64 && result.type == ValueType::DOUBLE) {
-            fail(result.sourcePos,
-                 "the body of fold() is a double but the accumulator starts as an integer; "
-                 "start it from a double, for example 0.0");
-          }
-        }
-      }
-    });
-    ValueNode node;
-    node.kind = ValueNodeKind::FUNCTION;
-    node.function = ValueFunctionRegistry::find("fold");
-    node.children[0] = init;
-    node.children[1] = body;
-    node.children[2] = count;
-    node.childCount = 3;
-    node.type = type;
-    node.nature = ValueNature::NUMBER;
-    node.slot = accumulatorSlot;
-    node.counterSlot = counterSlot;
     node.sourcePos = pos;
     node.text = node.function->name;
     return append(node);

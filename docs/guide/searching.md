@@ -875,7 +875,7 @@ query.
 More operators and functions are in [Value expressions](value-expressions.md):
 the bitwise operators and `%`, trigonometry and rounding, calendar parts of dates
 (`year(d)`, `day_of_week(d)`), coordinates and distances between places,
-hashing for consistent sampling, `let` variables and bounded `fold` loops, and
+hashing for consistent sampling, `let` variables, and
 the Lucene expressions and Painless spellings `_score`, `params.x`, and
 `doc['x'].value`.
 

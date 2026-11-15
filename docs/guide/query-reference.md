@@ -497,7 +497,7 @@ and `linear_decay` decay functions; see
 [Searching](searching.md#sort-expressions-in-detail),
 [Decay functions](searching.md#decay-functions), and
 [Value expressions](value-expressions.md) for the bitwise operators, trigonometry,
-date parts, geo functions, hashing, `let`, and `fold`) and
+date parts, geo functions, hashing, and `let`) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is

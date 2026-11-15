@@ -33,7 +33,7 @@ enum class ValueNodeKind : uint8_t {
   SCORE,
   DOCID,
   FUNCTION,
-  // A let/fold variable, read from the bound program's slot `slot`.
+  // A let variable, read from the bound program's slot `slot`.
   LOCAL,
 };
 
@@ -50,10 +50,8 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
-  // let/fold: the slot of the bound variable (let) or accumulator (fold), and
-  // the loop counter's slot. LOCAL nodes read `slot`.
+  // The slot of a let variable. LOCAL nodes read `slot`.
   uint32_t slot = 0;
-  uint32_t counterSlot = 0;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
@@ -77,7 +75,7 @@ public:
   std::pmr::vector<double> doubleArrays;
   std::optional<ValueResult> constantScalar;
   uint32_t rootNode = 0;
-  // Slots for let/fold variables; each bound program allocates this many.
+  // Slots for let variables; each bound program allocates this many.
   uint32_t localCount = 0;
   bool needsScore = false;
 
@@ -166,7 +164,7 @@ public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
   std::span<BoundValueNode> nodes;
-  // Values of the let/fold variables while their scope is being evaluated.
+  // Values of the let variables while their scope is being evaluated.
   std::span<ValueResult> locals;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
