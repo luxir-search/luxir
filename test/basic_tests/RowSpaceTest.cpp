@@ -166,7 +166,7 @@ TEST_F(RowSpaceTest, ownershipRangesAndReverseSeekPreserveEmptyOwners) {
     EXPECT_EQ((std::pair<int32_t, int32_t>{2, 4}), shape->range(2));
     OwnershipShape::Cursor cursor(*shape);
     for (int32_t child : {0, 1, 2, 3, 0, 3}) {
-      EXPECT_EQ(OWNERS[child], cursor.owner(child));
+      EXPECT_EQ(OWNERS[child], cursor.owner(child).owner);
       EXPECT_EQ(OWNERS[child], shape->owner(child));
     }
   }
@@ -201,9 +201,96 @@ TEST_F(RowSpaceTest, ownershipSeeksAcrossMonoBlockBoundaries) {
   SegmentCore core(dir, 1, 1);
   const auto& shape = *core.ownership(Fixture::CHILD);
   OwnershipShape::Cursor cursor(shape);
-  for (int32_t child = 0; child < (int32_t)owners.size(); child += 7) EXPECT_EQ(owners[child], cursor.owner(child));
+  for (int32_t child = 0; child < (int32_t)owners.size(); child += 7) EXPECT_EQ(owners[child], cursor.owner(child).owner);
   for (int32_t parent : {parents - 1, 0, parents - 2}) {
     EXPECT_EQ((std::pair<int32_t, int32_t>{parent ? (int32_t)ends[parent - 1] : 0, (int32_t)ends[parent]}), shape.range(parent));
+  }
+}
+
+TEST_F(RowSpaceTest, ownershipSeeksSkipEmptyFamiliesAndRestart) {
+  const int32_t block = (int32_t)MonoReader::BLOCK_SIZE;
+  std::vector<int64_t> ends, owners;
+  for (int32_t parent = 0; parent < 18 * block + 3; parent++) {
+    int32_t count = parent == block - 1 ? 3 * block + 17
+        : parent >= 2 * block && parent < 12 * block ? 0 : parent % 11 == 0 ? 2 : 0;
+    owners.insert(owners.end(), count, parent);
+    ends.push_back((int64_t)owners.size());
+  }
+  std::vector<int32_t> children{0, (int32_t)ends[block - 2], (int32_t)ends[block - 2] + block,
+      (int32_t)ends[block - 1] - 1, (int32_t)ends[block], (int32_t)ends[2 * block - 1],
+      (int32_t)ends[14 * block], (int32_t)owners.size() - 1, 0,
+      (int32_t)ends[16 * block], (int32_t)ends[block - 2] + 2 * block};
+  for (int32_t i = 0; i < 64; i++) children.push_back(rng.rint(0, (int32_t)owners.size()));
+  for (bool reverse : {false, true}) {
+    RAMDir dir;
+    PostingsWriter writer(dir, 1, 1, (int32_t)ends.size());
+    auto optionalOwners = reverse ? std::optional<std::span<const int64_t>>(owners) : std::nullopt;
+    writer.finishSpace(writer.addSpace(Fixture::CHILD), (int32_t)owners.size(), Fixture::shape(writer, ends, optionalOwners));
+    writeUnversionedRuns(writer);
+    ASSERT_TRUE(writer.finish());
+    SegmentCore core(dir, 1, 1);
+    memtrack::AllocScope construction;
+    OwnershipShape::Cursor cursor(*core.ownership(Fixture::CHILD));
+    auto constructionBytes = construction.bytes();
+    if (memtrack::counting_enabled) { EXPECT_EQ(0, constructionBytes); }
+    for (int32_t child : children) {
+      memtrack::AllocScope allocations;
+      auto family = cursor.owner(child);
+      auto bytes = allocations.bytes();
+      if (memtrack::counting_enabled) { EXPECT_EQ(0, bytes); }
+      int32_t parent = (int32_t)(std::find_if(ends.begin(), ends.end(),
+          [&](int64_t end) { return end > child; }) - ends.begin());
+      EXPECT_EQ(parent, family.owner);
+      EXPECT_EQ(parent ? ends[parent - 1] : 0, family.first);
+      EXPECT_EQ(ends[parent], family.end);
+    }
+    for (int32_t parent : {0, 1, block - 1, block, 5 * block, 12 * block, 18 * block, 1, (int32_t)ends.size()}) {
+      EXPECT_EQ(parent ? ends[parent - 1] : 0, cursor.firstChild(parent));
+      if (parent < (int32_t)ends.size()) {
+        auto family = cursor.seek(parent);
+        EXPECT_EQ(parent, family.owner);
+        EXPECT_EQ(parent ? ends[parent - 1] : 0, family.first);
+        EXPECT_EQ(ends[parent], family.end);
+        EXPECT_EQ(family.end, cursor.firstChild(parent + 1));
+      }
+    }
+    EXPECT_EQ(0, cursor.owner(0).owner);
+  }
+}
+
+TEST_F(RowSpaceTest, composedOwnershipCursorReturnsDescendantFamily) {
+  const int32_t block = (int32_t)MonoReader::BLOCK_SIZE;
+  std::vector<int64_t> ends{block + 1, block + 1, 3 * block + 7, 3 * block + 8};
+  std::vector<int64_t> deep;
+  int64_t rows = 0;
+  for (int32_t parent = 0; parent < ends.back(); parent++) {
+    rows += parent > block && parent < 2 * block ? 0 : parent % 3;
+    deep.push_back(rows);
+  }
+  PostingsWriter writer(dir, 1, 1, (int32_t)ends.size());
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), (int32_t)ends.back(), Fixture::shape(writer, ends));
+  writer.finishSpace(writer.addSpace("items.deep"), (int32_t)deep.back(), Fixture::shape(writer, deep));
+  writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish());
+  SegmentCore core(dir, 1, 1);
+  OwnershipMapper mapper(core, "", "items.deep");
+  MemPool pool;
+  OwnershipMapper::Cursor cursor(mapper, pool);
+  for (int32_t child : {0, 7, (int32_t)deep[block], (int32_t)deep.back() - 1, 0, (int32_t)deep[2 * block]}) {
+    auto family = cursor.owner(child);
+    int32_t parent = 0;
+    while (deep[ends[parent] - 1] <= child) parent++;
+    EXPECT_EQ(parent, family.owner);
+    EXPECT_EQ(parent ? deep[ends[parent - 1] - 1] : 0, family.first);
+    EXPECT_EQ(deep[ends[parent] - 1], family.end);
+    EXPECT_EQ(family.first, cursor.firstChild(parent));
+    EXPECT_EQ(family.end, cursor.firstChild(parent + 1));
+  }
+  for (int32_t parent : {0, 1, 2, 3, 0, 2}) {
+    auto family = cursor.seek(parent);
+    EXPECT_EQ(parent, family.owner);
+    EXPECT_EQ(parent ? deep[ends[parent - 1] - 1] : 0, family.first);
+    EXPECT_EQ(deep[ends[parent] - 1], family.end);
   }
 }
 

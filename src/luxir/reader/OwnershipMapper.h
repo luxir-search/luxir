@@ -44,6 +44,19 @@ public:
 
   class Cursor {
     std::span<OwnershipShape::Cursor> cursors;
+    OwnershipShape::Family current{-1, 0, 0};
+
+    OwnershipShape::Family descend(OwnershipShape::Family family) {
+      current = family;
+      // The top family's range is in its immediate child space. Descend its
+      // boundaries through the same cursors to get the full descendant range.
+      for (size_t level = cursors.size(); level > 1;) {
+        auto& cursor = cursors[--level - 1];
+        current.first = cursor.firstChild(current.first);
+        current.end = cursor.firstChild(current.end);
+      }
+      return current;
+    }
 
   public:
     Cursor(const OwnershipMapper& mapper, MemPool& pool)
@@ -53,9 +66,24 @@ public:
         new (&cursors[index++]) OwnershipShape::Cursor(**it);
       }
     }
-    int32_t owner(int32_t child) {
-      for (auto& cursor : cursors) child = cursor.owner(child);
-      return child;
+    OwnershipShape::Family seek(int32_t owner) {
+      if (owner == current.owner) return current;
+      return descend(cursors.empty() ? OwnershipShape::Family{owner, owner, owner + 1}
+          : cursors.back().seek(owner));
+    }
+
+    int32_t firstChild(int32_t owner) {
+      if (owner == current.owner + 1) return current.end;
+      if (owner == current.owner) return current.first;
+      for (auto it = cursors.rbegin(); it != cursors.rend(); ++it) owner = it->firstChild(owner);
+      return owner;
+    }
+
+    OwnershipShape::Family owner(int32_t child) {
+      if (child >= current.first && child < current.end) return current;
+      OwnershipShape::Family family{child, child, child + 1};
+      for (auto& cursor : cursors) family = cursor.owner(family.owner);
+      return descend(family);
     }
   };
 };

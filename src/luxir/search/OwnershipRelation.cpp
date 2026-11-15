@@ -9,7 +9,6 @@ namespace luxir {
 
 class OwnershipRelation::Scorer final : public Query::Scorer {
   Query::Scorer& child;
-  const OwnershipMapper& mapper;
   OwnershipMapper::Cursor cursor;
   QueryPrep::DocSetScorer* domain;
   int32_t ownerCount;
@@ -21,7 +20,7 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
 public:
   Scorer(MemPool& pool, Query::Scorer& child, const OwnershipMapper& mapper,
          DocSet* domain, int32_t ownerCount, bool maximum, float multiplier)
-      : child(child), mapper(mapper), cursor(mapper, pool),
+      : child(child), cursor(mapper, pool),
         domain(domain ? pool.make<QueryPrep::DocSetScorer>(domain, ownerCount) : nullptr),
         ownerCount(ownerCount), maximum(maximum), multiplier(multiplier) {}
 
@@ -38,23 +37,25 @@ public:
       target = domain->docId() < target ? domain->advance(target) : domain->docId();
     }
     if (target >= ownerCount) return current = PostingsReader::END;
-    int32_t first = mapper.range(target).first;
+    auto family = cursor.seek(target);
     int32_t doc = child.docId();
-    if (doc < first) doc = child.advance(first);
+    if (doc < family.first) doc = child.advance(family.first);
     while (doc != PostingsReader::END) {
-      int32_t owner = cursor.owner(doc);
+      // A child inside the sought family needs no lookup.
+      if (doc >= family.end) family = cursor.owner(doc);
+      int32_t owner = family.owner;
       if (domain) {
         int32_t eligible = domain->docId() < owner ? domain->advance(owner) : domain->docId();
         if (eligible != owner) {
           if (eligible >= ownerCount) return current = PostingsReader::END;
-          doc = child.advance(mapper.range(eligible).first);
+          family = cursor.seek(eligible);
+          doc = child.advance(family.first);
           continue;
         }
       }
       value = maximum ? child.score() : 1.0f;
       if (maximum) {
-        auto range = mapper.range(owner);
-        while ((doc = child.next()) < range.second) value = std::max(value, child.score());
+        while ((doc = child.next()) < family.end) value = std::max(value, child.score());
       }
       value *= multiplier;
       return current = owner;
@@ -170,16 +171,16 @@ DomainHandle OwnershipRelation::project(size_t leaf, DomainHandle domain) {
     if (domain.get()) {
       int32_t lastOwner = -1;
       domain.get()->forEach([&](int32_t row) {
-        int32_t owner = cursor.owner(row);
+        int32_t owner = cursor.owner(row).owner;
         if (owner != lastOwner) builder.add(owner);
         lastOwner = owner;
       });
     } else {
       // All children still project to owners with nonempty families only.
       for (int32_t child = 0; child < source.maxDoc();) {
-        int32_t owner = cursor.owner(child);
-        builder.add(owner);
-        child = mapper->range(owner).second;
+        auto family = cursor.owner(child);
+        builder.add(family.owner);
+        child = family.end;
       }
     }
   }

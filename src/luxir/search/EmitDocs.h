@@ -545,7 +545,7 @@ inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<c
       OwnershipMapper mapper(core, "", reader.path());
       MemPool pool;
       OwnershipMapper::Cursor owners(mapper, pool);
-      for (auto index : indices) target[index] = (int64_t)cursor.birth(owners.owner(segDocs[index].docId()));
+      for (auto index : indices) target[index] = (int64_t)cursor.birth(owners.owner(segDocs[index].docId()).owner);
     }
   });
 }
