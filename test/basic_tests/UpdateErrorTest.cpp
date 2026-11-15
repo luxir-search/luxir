@@ -365,12 +365,12 @@ TEST_F(UpdateErrorTest, deleteAndRepeatedOverwriteInOneRequestKeepLastDocument) 
   EXPECT_TRUE(matchDocs(helper, "old").empty());
 }
 
-TEST_F(UpdateErrorTest, nestedInputIsRejectedWithoutDiscardingOtherRoots) {
+TEST_F(UpdateErrorTest, malformedNestedInputIsRejectedWithoutDiscardingOtherRoots) {
   CollectionHelper helper;
   CollectionHelper::UpdateBuilder input;
   input.addRaw([](auto& doc, auto& arena) {
     ASSERT_TRUE(luxir::api::read_json(doc,
-        R"({"id":"bad","items_nested":[{"color_s":"red"}]})", arena));
+        R"({"id":"bad","items_nested":[7]})", arena));
   });
   input.add(flatdoc("id", "good", "color_s", "red"));
   auto result = helper.submit(input);

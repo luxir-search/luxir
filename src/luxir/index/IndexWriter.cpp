@@ -243,14 +243,16 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     uint64_t bestSegId = 0;
     for (const auto& [id, seg] : segInfos) {
       auto readerCore = getSegmentCore(*seg);
-      auto* reader = &readerCore->rootReader();
-      const auto* field = reader->fieldInfo(name);
-      if (!field || !field->stored || field->stored->dictionary.empty()) continue;
-      auto bytes = field->columnMetaOff;
-      if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-        bestBytes = bytes;
-        bestSegId = id;
-        bestDictionary = field->stored->dictionary;
+      for (const auto& space : readerCore->spaces()) {
+        auto* reader = readerCore->spaceReader(space.path);
+        const auto* field = reader->fieldInfo(name);
+        if (!field || !field->stored || field->stored->dictionary.empty()) continue;
+        auto bytes = field->columnMetaOff;
+        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
+          bestBytes = bytes;
+          bestSegId = id;
+          bestDictionary = field->stored->dictionary;
+        }
       }
     }
     auto token = storedDictionaries.token(name, stored->format_);
@@ -1468,6 +1470,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                         inverter.getPostingsWriter().creatorEpoch,
                                         inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
+    if (inverter.hasChildRows()) segInfo->mergeLevel = SegInfo::NESTED_MERGE_LEVEL;
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2184,7 +2187,7 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
   std::vector<AuxInfo> built;
   try {
     phase = "merge_vector_overlay";
-    built = buildConcreteVectorOverlays(output, *pr, names, *schema,
+    built = buildConcreteVectorOverlays(output, *prCore, names, *schema,
                                         VectorIndexBuilder::BuildSite::MERGE,
                                         stagedOverlayFiles);
     output.unsyncedFiles.reserve(output.unsyncedFiles.size() + stagedOverlayFiles.size());
@@ -2213,7 +2216,7 @@ uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
 
 std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     SegInfo& seg,
-    PostingsReader& postingsReader,
+    SegmentCore& core,
     std::span<const std::string> overlayNames,
     const Schema& schema,
     VectorIndexBuilder::BuildSite buildSite,
@@ -2228,12 +2231,15 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     }
   }
 
-  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader, seg.creatorEpoch};
   for (const auto& overlayName : overlayNames) {
     if (existingNames.contains(overlayName)) {
       continue;
     }
 
+    auto fieldName = std::string_view(overlayName).substr(VectorIndexBuilder::NAME_PREFIX.size());
+    auto* reader = core.spaceReader(spaceParentPath(fieldName));
+    if (!reader) continue;
+    VectorIndexBuilder::SegInput input{seg.segId, reader, seg.creatorEpoch};
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
                           schema, overlayGen, writerEpoch, indexRamBudget);
@@ -2342,14 +2348,16 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
         auto prCore = getSegmentCore(*seg);
-        auto* pr = &prCore->rootReader();
-        VectorIndexBuilder::SegInput input{seg->segId, pr, seg->creatorEpoch};
-        VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                                   *schema, 0, writerEpoch);
+        std::vector<VectorIndexBuilder::SegInput> inputs;
+        inputs.reserve(prCore->spaces().size());
+        for (const auto& space : prCore->spaces()) {
+          inputs.emplace_back(seg->segId, prCore->spaceReader(space.path), seg->creatorEpoch);
+        }
+        VectorIndexBuilder matcher(dir, inputs, *schema, 0, writerEpoch);
         auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
         stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
                                         overlayNames.begin(), overlayNames.end());
-        auto built = buildConcreteVectorOverlays(*seg, *pr, overlayNames, *schema,
+        auto built = buildConcreteVectorOverlays(*seg, *prCore, overlayNames, *schema,
                                                  VectorIndexBuilder::BuildSite::COMMIT, stagedFiles);
         for (auto& info : built) {
           stagedOverlays.push_back({seg, std::move(info)});
@@ -2683,13 +2691,25 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         segs.reserve(segInfos.size());
         for (auto& [segId, seg] : segInfos) {
           unused(segId);
-          if (seg->liveDocs == 0) {
+          if (seg->liveDocs == 0 || seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) {
+            continue;
+          }
+          auto core = getSegmentCore(*seg);
+          if (core->spaces().size() > 1) {
+            mergePolicy->_excludeNested(seg.get());
             continue;
           }
           segs.push_back(seg.get());
         }
 
-        size_t target = (size_t)msg.maxSegments;
+        size_t blocked = 0;
+        for (const auto& [_, seg] : segInfos) {
+          if (seg->liveDocs > 0 && seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) blocked++;
+        }
+        size_t target = (size_t)msg.maxSegments > blocked ? (size_t)msg.maxSegments - blocked : 1;
+        if (blocked + (segs.empty() ? 0 : 1) > (size_t)msg.maxSegments) {
+          setForceMergeError(*msg.forcedBy, "max_segments cannot be reached while nested segments cannot be merged");
+        }
         if (segs.size() > target) {
           std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
             if (a->liveDocs != b->liveDocs) {
@@ -2734,6 +2754,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           continue;
         }
         auto postingsReaderCore = getSegmentCore(*seg);
+        if (postingsReaderCore->spaces().size() > 1) {
+          mergePolicy->_excludeNested(seg);
+          continue;
+        }
         auto* postingsReader = &postingsReaderCore->rootReader();
         MemPool metadataPool;
         FieldReader fields(*postingsReader);

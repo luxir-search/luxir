@@ -11,7 +11,7 @@ Choose a type based on how you want to search and use the values:
 
 | Type | Description and typical uses |
 |---|---|
-| `nested` | Structural object path; see [Nested paths](#nested-paths-and-qualified-field-names). Nested input values are currently rejected. |
+| `nested` | Structural object path; see [Nested paths](#nested-paths-and-qualified-field-names). Accepts an object, an array of objects, null or an empty array. |
 | `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
 | `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
@@ -1076,8 +1076,23 @@ Declare nested paths and their fields by flat qualified names, for example
 Each intermediate component must be a nested path. Global suffix templates
 also work under paths: `lines_nested.color_s` needs no explicit declaration
 in the default schema. A nested path cannot declare scalar value settings,
-variants, indexing, columns or storage. Nested input values are currently
-rejected; these declarations establish the schema and reader namespaces.
+variants, indexing, columns or storage. Supply the value as an object or array
+of objects; each object creates a child row, including an empty object. Null,
+an empty array and an absent field create no rows. Objects may contain nested
+paths recursively, up to 32 levels. Scalar values and non-object array elements
+are document errors. Any error in a child rejects its owning root document.
+
+For example, `{"id":"a","lines_nested":[{"color_s":"red"},{}]}` creates
+one root and two `lines_nested` rows. Supply leaf keys inside their objects;
+a dotted root key cannot create a child row. `field_map` and `drop_unmapped`
+apply to root keys only. Child keys are taken as written. Deleting or replacing
+a root also hides its old child rows. A child view returns its own values under
+local keys; a root's stored projection does not reconstruct nested objects.
+
+Nested bundles are currently skipped by merges. Root-only bundles can still
+merge; an unattainable forced `max_segments` target reports an error. Vector
+ANN overlays can be built on child fields using their qualified physical names,
+for example `vec.lines_nested.embedding_v`.
 
 Dots separate path components. Each component starts with an ASCII letter
 and contains letters, digits or underscores. A physical name, including

@@ -29,15 +29,24 @@ using IndexVal = luxir::api::Val;
 
 
 class CommitInfo;
+class NestedState;
 
 class Inverter {
 private:
   int currDoc = -1;  // the current document being indexed
+  SpaceOrdinal inputSpace = SpaceOrdinal::ROOT;
+  int32_t maxChildRows = 0;
   std::vector<int> deleted; // use a docstream for this?
   std::exception_ptr failure_;
 
 public:
   MemPool pool{&indexingArena()};
+
+private:
+  friend class NestedState;
+  std::unique_ptr<NestedState> nested;
+
+public:
 
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
   // string column RAMFiles). Handlers that hold such memory bump this via
@@ -107,15 +116,11 @@ public:
 
   Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
-           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
-      : Inverter(dir, segId, creatorEpoch, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
-                 ramBudget, std::move(dictionaryProvider)) {}
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {});
 
   Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
-           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
-      : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
-        storedDictionaryProvider(std::move(dictionaryProvider)),
-        ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {});
+  ~Inverter();
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
@@ -354,7 +359,10 @@ public:
 
   InputHandler& getIndexHandler(std::string_view name) {
     auto iter = inputHandlers.find(name);
-    if (iter != inputHandlers.end()) return *iter->second;
+    if (iter != inputHandlers.end()) {
+      if (iter->second->branches.front().handler->space != inputSpace) rejectInputSpace(name);
+      return *iter->second;
+    }
     return createInputHandler(name);
   }
 
@@ -423,9 +431,15 @@ public:
   // segment. Checked once at the end of an update batch, never mid-request: a
   // whole message stays in one inverter so within-request id overwrites resolve
   // in memory (see ProtoUpdateMessage::handle).
-  bool shouldFlush(size_t ramCap, size_t docCap) {
-    return memSize() > ramCap || (size_t)getMaxDoc() > docCap;
+  bool shouldFlush(size_t ramCap, size_t docCap);
+
+  // Counts stay below the hard limit, including retained rows of failed roots.
+  static bool rowsFit(uint64_t current, uint64_t added) {
+    return current < (uint64_t)PostingsReader::HARD_MAX_DOC
+        && added < (uint64_t)PostingsReader::HARD_MAX_DOC - current;
   }
+  bool hasChildRows() const;
+
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)
   /// returns true on success if anything was written.
@@ -470,16 +484,24 @@ public:
     auto it = storedFields_.find(StoredResourceKey::View{space, resourceName});
     if (it != storedFields_.end()) return *it->second;
     const auto& format = config ? config->format_ : StoredChunkFormat{};
+    // Four chunk buffers with growth headroom, doc offsets, and the codec context.
+    // This is a fixed estimate per child resource, independent of batch boundaries.
+    int64_t bytes = space == SpaceOrdinal::ROOT ? 0 : sizeof(StoredFieldsWriter)
+        + (int64_t)8 * format.chunkTarget + (int64_t)2 * format.maxDocsPerChunk * sizeof(int32_t)
+        + StoredChunkCompressor::contextBytes(format, format.chunkTarget);
     auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
     auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, space, resourceName, format, std::move(dictionary));
     auto [newIt, _] = storedFields_.emplace(StoredResourceKey{space, std::string(resourceName)}, std::move(writer));
+    if (bytes) addExtraRam(bytes);
     return *newIt->second;
   }
 
 private:
+  void requireInputSpace(std::string_view name) const;
+  [[noreturn]] void rejectInputSpace(std::string_view name) const;
   InputHandler& createInputHandler(std::string_view name);
   IndexHandler& createPhysicalHandler(std::string_view name,
-                                      const std::shared_ptr<FieldType>& fieldType);
+                                      const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space);
 
 };
 
