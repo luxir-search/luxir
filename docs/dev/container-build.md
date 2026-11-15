@@ -47,7 +47,8 @@ Explorer archive; ARM64 builds the GCC 16.2.0 release source with a recorded
 SHA-512 checksum in its own stage. CMake uses a checksum-verified native archive. Ubuntu packages receive current security updates when that
 apt layer is rebuilt; the Dockerfile is not a bit-for-bit reproducibility claim.
 The vcpkg source pin is `builtin-baseline` in [the manifest](../../deps/vcpkg.json).
-The FAISS and OpenBLAS overlays retain the upstream port structure and patches.
+The FAISS and OpenBLAS overlays retain the upstream port structure; OpenBLAS also
+keeps its upstream patches.
 The jemalloc overlay uses the release tarball, embeds allocator defaults, and
 enables profiling and debug checks; see [dependency settings](../../deps/README.txt).
 The copied port files use [vcpkg's MIT license](../../deps/ports/LICENSE.vcpkg).
