@@ -503,9 +503,9 @@ std::shared_ptr<IndexReader::SpaceState> IndexReader::PhysicalCore::space(std::s
       live = entry;
     }
     // Segment metadata remains the root manifest metadata. Row counts and
-    // readers belong to this space; overlays currently belong to the root.
+    // readers belong to this space; overlays are shared by the bundle.
     state->segs.emplace_back(std::shared_ptr(bundle.core), nullptr,
-        std::vector<std::shared_ptr<AuxReader>>{}, bundle.info,
+        std::vector(bundle.aux), bundle.info,
         state->totalMaxDoc, bundle.ord, postings, std::move(live));
     state->totalMaxDoc += state->segs.back().maxDoc();
   }

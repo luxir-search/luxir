@@ -246,6 +246,10 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   // Roll back this request's queued ids on rejection, preserving documents
   // already accumulated by earlier messages in the same inverter.
   try {
+    if (!Inverter::rowsFit((uint64_t)inverter.getMaxDoc(), req->docs.size())) {
+      releaseGuard.flushOnRelease = true;
+      throw DocumentError("Update exceeds the root row limit in the current buffer");
+    }
     // Process deletes before adds (shouldn't matter since we just queue deletes)
     if (!req->delete_ids.empty()) {
       for (const auto& id : req->delete_ids) {
