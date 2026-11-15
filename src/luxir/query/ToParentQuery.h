@@ -106,8 +106,7 @@ public:
           relation(query.relation),
           maximum(query.maximum), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      child = query.child->createWeight(*childContext, maximum ? flags & ~ALLOW_PRUNING
-          : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
+      child = query.child->createWeight(*childContext, maximum ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
       traits = NEEDS_PREPARE | (child->getFlags() & CONSUMES_DOMAIN);
       if (!maximum || !needsScores()) traits |= IS_CONSTANT_SCORING;
       assert(&context.topReader == &relation.one);

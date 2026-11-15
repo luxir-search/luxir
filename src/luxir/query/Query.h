@@ -804,6 +804,23 @@ public:
     return product;
   }
 
+  // The floor a child score must reach for its scaled score to reach `floor`.
+  // The scaled score is child * multiplier rounded to float, which reaches a
+  // floor from up to half an ulp below it. For a zero or subnormal floor that
+  // half ulp is an absolute 2^-150, which division by a multiplier under 1 can
+  // stretch past the one-ulp margin, so it is taken off the floor before
+  // dividing. The subtraction is exact in double for floors below 2^-97 and
+  // absorbed above that, where the one-ulp step down already covers the half
+  // ulp.
+  static float unscaleScoreFloor(float floor, float multiplier) {
+    assert(multiplier > 0.0f);
+    return multiplier == 1.0f
+        ? floor
+        : std::nextafter(
+              (float)(((double)floor - 0x1p-150) / (double)multiplier),
+              -std::numeric_limits<float>::infinity());
+  }
+
   /// The constant a uniform-scoring weight contributes: its boost product
   /// when scores are requested, 0 otherwise (built unscored means score 0
   /// and zero bounds). The serial logical pass has already validated the
