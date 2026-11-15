@@ -99,6 +99,16 @@ memory tracker and profiles but own their memos and filter-use registry.
   reduces each run onto its owner with no structure sized by rows. With
   `max` and no count bounds the collector floor passes to the element scorer
   (an owner cannot beat its best element). Counts disable that pruning.
+- Score bounds: `max`, `min` and `avg` lie within the element scores'
+  bounds, so they bound the owner score; a constant element query (a range,
+  a filter) makes the owner score constant, so a top-k beside it stops once
+  its page is full instead of sweeping every match.
+- Beside a sparser lead the child is planned for that lead's candidates'
+  share of the element rows. When it then verifies (two-phase), so does
+  `to_parent`: its approximation is the owner of the child's next
+  approximation element, and verification runs the child's own check over
+  that owner's elements only, so a rejected owner never scans the element
+  matches after it.
 - Prepare (kNN and other domain consumers) gets the owner domain descended
   to the live elements of eligible owners (`descendDomain`), so filters
   apply before candidate selection.

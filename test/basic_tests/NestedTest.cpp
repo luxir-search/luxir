@@ -455,4 +455,53 @@ TEST_F(NestedTest, constantToParentLetsATopKStopEarly) {
 #endif
 }
 
+
+// Beside a sparse lead, to_parent verifies only the candidates' elements
+// (two-phase) instead of streaming every element match up to each candidate.
+// Owner i is tagged "rare" when i % 100 == 0 and holds answers dated i % 11,
+// 50 and i % 13, none when i % 700 == 0.
+TEST_F(NestedTest, toParentBesideASparseLeadVerifiesOnlyCandidates) {
+  schema(R"({"fields": {"tag": "string",
+      "answers": {"type": "nested", "fields": {"date": {"type": "int", "multi": "array"}}}}})");
+  constexpr int32_t n = 3000;
+  CollectionHelper h = helper();
+  CollectionHelper::UpdateBuilder b;
+  for (int32_t i = 0; i < n; i++) {
+    std::string answers = i % 700 == 0 ? "[]" : "[{\"date\": " + std::to_string(i % 11) + "}, {\"date\": 50}, {\"date\": "
+        + std::to_string(i % 13) + "}]";
+    auto& text = retained.emplace_back(R"({"id": "q)" + std::to_string(i) + R"(", "tag": ")"
+                                       + (i % 100 == 0 ? "rare" : "common") + R"(", "answers": )" + answers + "}");
+    b.addRaw([&](api::Map& map, std::pmr::memory_resource& mr) { EXPECT_TRUE(api::read_json(map, text, mr)); });
+  }
+  b.commit();
+  ASSERT_TRUE(h.submit(b).success);
+
+  auto run = [&](std::string mode, std::string bounds) {
+    return scores(R"({"ops": {"q": {"top_docs": {"query": {"boolean": {"filter": [{"match": {"tag": "rare"}}],
+        "required": [{"to_parent": {"path": "answers", "score": ")" + mode + R"(")" + bounds + R"(,
+        "query": {"range": {"field": "answers.date", "lte": 5}}}}]}},
+        "limit": -1, "fields": ["id", "_score_"], "get_scores": true, "document_format": "rows"}}}})");
+  };
+  auto expected = [&](int32_t minChildren, int32_t maxChildren, bool sum) {
+    std::map<std::string, double> out;
+    for (int32_t i = 0; i < n; i += 100) {
+      int32_t count = i % 700 == 0 ? 0 : (i % 11 <= 5) + (i % 13 <= 5);
+      if (count >= std::max(1, minChildren) && count <= maxChildren) out["q" + std::to_string(i)] = sum ? count : 1;
+    }
+    return out;
+  };
+  EXPECT_EQ(expected(1, 2, false), run("avg", ""));
+  EXPECT_EQ(expected(1, 2, false), run("max", ""));
+  EXPECT_EQ(expected(1, 2, true), run("sum", ""));
+  EXPECT_EQ(expected(2, 2, true), run("sum", R"(, "min_children": 2)"));
+  EXPECT_EQ(expected(1, 1, true), run("sum", R"(, "max_children": 1)"));
+#ifndef NDEBUG
+  elementVerifications = 0;
+  NumericPredicateQuery::verificationObserver = countElementVerification;
+  EXPECT_EQ(expected(1, 2, false), run("avg", ""));
+  NumericPredicateQuery::verificationObserver = nullptr;
+  EXPECT_LT(elementVerifications, 200) << elementVerifications;  // 30 candidates, ~7700 elements
+#endif
+}
+
 }  // namespace

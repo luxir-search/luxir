@@ -56,9 +56,13 @@ private:
     float multiplier;
     bool scored;
     bool prune;
+    bool twoPhase;           // see verify()
     bool exhausted = false;  // a constant score fell below the collector floor
     int32_t doc = -1;
     int32_t pending = -1;  // child's current doc not yet reduced (-1: not started)
+    int32_t verified = -1;  // the owner verify() last decided
+    int32_t docEnd = 0;     // two-phase: the end of doc's element rows
+    bool verifiedMatch = false;
     float current = 0.0f;
     std::optional<float> constant;  // the score of every match, when uniform
     ScoreBounds bounds;
@@ -88,56 +92,119 @@ private:
       if (std::isfinite(bounds.lo)) bounds.lo = ownerScore(bounds.lo);
     }
 
+    // One owner's reduction over its matching elements.
+    struct Run {
+      int32_t count = 0;
+      double acc = 0.0;
+    };
+
+    Run startRun() const {
+      return {0, mode == ScoreMode::MIN ? std::numeric_limits<double>::infinity()
+                 : mode == ScoreMode::MAX ? -std::numeric_limits<double>::infinity() : 0.0};
+    }
+
+    void addMatch(Run& run) {
+      if (scored) {
+        float s = child->score();
+        switch (mode) {
+          case ScoreMode::MAX: run.acc = std::max(run.acc, (double)s); break;
+          case ScoreMode::MIN: run.acc = std::min(run.acc, (double)s); break;
+          case ScoreMode::SUM: case ScoreMode::AVG: run.acc += s; break;
+          case ScoreMode::NONE: break;
+        }
+      }
+      run.count++;
+    }
+
+    // Whether the run admits its owner; sets the owner's score when it does.
+    bool finishRun(const Run& run) {
+      if (run.count < minChildren || run.count > maxChildren) return false;
+      double value = 0.0;
+      if (scored) {
+        value = mode == ScoreMode::AVG ? run.acc / run.count : mode == ScoreMode::NONE ? 0.0 : run.acc;
+      }
+      current = (float)(value * multiplier);
+      return true;
+    }
+
     int32_t reduce(int32_t c) {
       while (c != PostingsReader::END) {
         int32_t owner = ownerOf.ownerOf(c);
-        int32_t count = 0;
-        double acc = mode == ScoreMode::MIN ? std::numeric_limits<double>::infinity()
-                   : mode == ScoreMode::MAX ? -std::numeric_limits<double>::infinity() : 0.0;
+        Run run = startRun();
         int32_t end = owners.begin(owner + 1);
         while (c != PostingsReader::END && c < end) {
-          if (scored) {
-            float s = child->score();
-            switch (mode) {
-              case ScoreMode::MAX: acc = std::max(acc, (double)s); break;
-              case ScoreMode::MIN: acc = std::min(acc, (double)s); break;
-              case ScoreMode::SUM: case ScoreMode::AVG: acc += s; break;
-              case ScoreMode::NONE: break;
-            }
-          }
-          count++;
+          addMatch(run);
           c = child->next();
         }
         pending = c;
-        if (count >= minChildren && count <= maxChildren) {
-          double value = 0.0;
-          if (scored) {
-            value = mode == ScoreMode::AVG ? acc / count : mode == ScoreMode::NONE ? 0.0 : acc;
-          }
-          current = (float)(value * multiplier);
-          return doc = owner;
-        }
+        if (finishRun(run)) return doc = owner;
       }
       pending = PostingsReader::END;
       return doc = PostingsReader::END;
     }
 
+    // Two-phase (a two-phase child, chosen when a sparser lead drives this
+    // clause): the approximation is the owner of the child's next
+    // approximation element, and verification confirms only that owner's
+    // elements, so a rejected owner never scans the elements after it. The
+    // child is driven only through its own two-phase protocol.
+    int32_t approximate(int32_t target) {
+      if (exhausted || target >= owners.ownerMaxDoc()) return doc = PostingsReader::END;
+      // Point lookups: the candidates of a sparse lead jump, which a bulk
+      // cursor pays for with a frame decode each.
+      auto [begin, end] = owners.range(target);
+      int32_t c = child->approximationDocId();
+      if (c < begin) c = child->approximationAdvance(begin);
+      if (c == PostingsReader::END) return doc = PostingsReader::END;
+      if (c < end) {
+        docEnd = end;
+        return doc = target;
+      }
+      doc = owners.owner(c);
+      docEnd = owners.range(doc).second;
+      return doc;
+    }
+
+    bool verify() {
+      if (verified == doc) return verifiedMatch;
+      verified = doc;
+      int32_t end = docEnd;
+      Run run = startRun();
+      for (int32_t c = child->approximationDocId(); c < end; c = child->approximationNext()) {
+        if (child->matches()) addMatch(run);
+      }
+      return verifiedMatch = finishRun(run);
+    }
+
+    int32_t nextVerified() {
+      if (doc == PostingsReader::END) return doc;
+      while (approximate(doc + 1) != PostingsReader::END) {
+        if (verify()) return doc;
+      }
+      return doc;
+    }
+
   public:
     Scorer(Query::Scorer* child, const OwnerMap& owners, ScoreMode mode, int32_t minChildren,
-           int32_t maxChildren, float multiplier, bool scored, bool prune)
+           int32_t maxChildren, float multiplier, bool scored, bool prune, bool twoPhase)
       : child(child), owners(owners), ownerOf(owners), mode(mode), minChildren(minChildren),
         maxChildren(maxChildren), multiplier(multiplier), scored(scored && mode != ScoreMode::NONE),
-        prune(prune) {
+        prune(prune), twoPhase(twoPhase) {
       initBounds();
     }
 
     int32_t next() override {
+      if (twoPhase) return nextVerified();
       if (pending == PostingsReader::END || exhausted) return doc = PostingsReader::END;
       return reduce(pending == -1 ? child->next() : pending);
     }
 
     int32_t advance(int32_t target) override {
       assert(doc < target);
+      if (twoPhase) {
+        if (approximate(target) == PostingsReader::END || verify()) return doc;
+        return nextVerified();
+      }
       if (pending == PostingsReader::END || exhausted) return doc = PostingsReader::END;
       int32_t begin = owners.begin(target);
       int32_t c = pending;
@@ -146,6 +213,21 @@ private:
     }
 
     int32_t docId() override { return doc; }
+
+    int32_t approximationNext() override {
+      if (!twoPhase) return next();
+      return doc == PostingsReader::END ? doc : approximate(doc + 1);
+    }
+    int32_t approximationAdvance(int32_t target) override {
+      return twoPhase ? approximate(target) : advance(target);
+    }
+    int32_t approximationDocId() override { return doc; }
+    bool matches() override { return !twoPhase || verify(); }
+    float matchCost() override {
+      if (!twoPhase) return 0.0f;
+      float perOwner = (float)owners.rows() / (float)std::max(1, owners.ownerMaxDoc());
+      return perOwner * std::max(1.0f, child->matchCost());
+    }
 
     float score() override { return current; }
 
@@ -181,6 +263,7 @@ private:
     class Plan final : public Query::ScorerPlan {
       Query::ScorerPlan* childPlan;
       const Supplier& supplier;
+      bool twoPhase;
 
     protected:
       Query::Scorer* buildScorer(MemPool& targetPool) override {
@@ -188,14 +271,50 @@ private:
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<Scorer>(childScorer, supplier.owners, supplier.mode, supplier.minChildren,
                                        supplier.maxChildren, supplier.multiplier, supplier.scored,
-                                       supplier.prune);
+                                       supplier.prune, twoPhase);
       }
 
     public:
       Plan(const Query::PlanContext& planContext, const Query::ScorerShape& shape, int64_t cost,
-           Query::ScorerPlan* childPlan, const Supplier& supplier)
-        : Query::ScorerPlan(planContext, shape, cost), childPlan(childPlan), supplier(supplier) {}
+           Query::ScorerPlan* childPlan, const Supplier& supplier, bool twoPhase)
+        : Query::ScorerPlan(planContext, shape, cost), childPlan(childPlan), supplier(supplier),
+          twoPhase(twoPhase) {}
     };
+
+    // The child's demand. A lead sparser than the owner rows reaches only
+    // its candidates' elements (their share of the element rows), but they
+    // spread over the whole element space, which a streamed child would
+    // scan to its end; so the child may choose to verify them instead.
+    // Otherwise the reduction pulls every matching element in order.
+    Query::PlanContext childContext(const Query::PlanContext& planContext) const {
+      Query::Demand demand = Query::Demand::fromLeadCost(std::numeric_limits<int64_t>::max());
+      const Query::Demand& owner = planContext.demand;
+      int32_t ownerRows = owners.ownerMaxDoc();
+      if (owner.candidates < ownerRows && ownerRows > 0) {
+        double perOwner = (double)owners.rows() / ownerRows;
+        auto scale = [&](double v) { return (int64_t)std::ceil(std::min(v * perOwner, (double)owners.rows())); };
+        demand = Query::Demand::fromCandidatesAndSpan(scale((double)owner.candidates), owners.rows());
+        demand.expectedCandidates = (double)scale(owner.expectedCandidates >= 0
+            ? std::min(owner.expectedCandidates, (double)owner.candidates) : (double)owner.candidates);
+      }
+      Query::PlanContext context = childSupplier->makePlanContext(demand);
+      context.demand.horizon = Query::ExecutionUse::PULL;
+      return context;
+    }
+
+    static Query::ScorerShape shape(bool twoPhase) {
+      return {
+        .matchState = Query::MatchState::UNKNOWN,
+        .directKind = Query::DirectScorerKind::OTHER,
+        .reportedTwoPhase = twoPhase ? Query::ReportedTwoPhase::YES : Query::ReportedTwoPhase::NO,
+        .windowFillClause = Query::ClauseShape::NONE,
+        .termDisjunctionClause = Query::ClauseShape::NONE,
+        .termConjunctionClause = Query::ClauseShape::NONE,
+        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+      };
+    }
 
   public:
     Supplier(Query::ScorerSupplier* childSupplier, const OwnerMap& owners, ScoreMode mode,
@@ -207,18 +326,8 @@ private:
     int64_t cost() override { return childSupplier->cost(); }
 
     Query::ScorerShape describeScorer(const Query::PlanContext& buildContext) const override {
-      unused(buildContext);
-      return {
-        .matchState = Query::MatchState::UNKNOWN,
-        .directKind = Query::DirectScorerKind::OTHER,
-        .reportedTwoPhase = Query::ReportedTwoPhase::NO,
-        .windowFillClause = Query::ClauseShape::NONE,
-        .termDisjunctionClause = Query::ClauseShape::NONE,
-        .termConjunctionClause = Query::ClauseShape::NONE,
-        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
-        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
-        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
-      };
+      return shape(childSupplier->describeScorer(childContext(buildContext)).reportedTwoPhase
+                   == Query::ReportedTwoPhase::YES);
     }
 
     Query::VerificationWork verificationWork(const Query::PlanContext& buildContext) const override {
@@ -227,14 +336,10 @@ private:
     }
 
     Query::ScorerPlan* resolve(MemPool& planPool, const Query::PlanContext& planContext) override {
-      // The reduction pulls every matching element of an owner in order.
-      Query::PlanContext childContext = childSupplier->makePlanContext(
-          Query::Demand::fromLeadCost(std::numeric_limits<int64_t>::max()));
-      childContext.demand.horizon = Query::ExecutionUse::PULL;
-      Query::ScorerPlan* childPlan = childSupplier->resolve(planPool, childContext);
+      Query::ScorerPlan* childPlan = childSupplier->resolve(planPool, childContext(planContext));
       assert(childPlan != nullptr);
-      return planPool.make<Plan>(planContext, describeScorer(planContext), childPlan->cost(), childPlan,
-                                 *this);
+      bool twoPhase = childPlan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
+      return planPool.make<Plan>(planContext, shape(twoPhase), childPlan->cost(), childPlan, *this, twoPhase);
     }
   };
 
