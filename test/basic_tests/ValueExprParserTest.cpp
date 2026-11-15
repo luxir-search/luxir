@@ -354,3 +354,18 @@ TEST(ValueExprParserTest, resultCoercionUsesTheParserDepthBudget) {
   EXPECT_EQ(ValueType::DOUBLE, parser.parse("price", NaturePolicy::NUMBER)->root().type);
   EXPECT_EQ(2, budget);
 }
+
+TEST(ValueExprParserTest, structuralEqualityIncludesPreparedFunctionState) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  auto* left = parser.parse("random()");
+  auto* right = parser.parse("random()");
+  // Give the independently prepared functions known seeds for this comparison.
+  left->nodes[left->rootNode].intValue = 1;
+  right->nodes[right->rootNode].intValue = 1;
+  EXPECT_TRUE(left->structurallyEqual(*right));
+  right->nodes[right->rootNode].intValue = 2;
+  EXPECT_FALSE(left->structurallyEqual(*right));
+}

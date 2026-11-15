@@ -238,17 +238,7 @@ private:
       return append(node);
     }
     if (const Binding* binding = findBinding(name)) return binding->node;
-    auto failAt = [&](size_t at, std::string_view message) { fail(at, message); };
-    if (name == "params") {
-      std::string_view variable =
-          value::lex::scanParamsAccessor(*cur, program->resource, failAt);
-      if (!variable.empty()) return parseVariableNamed(variable, pos);
-    }
-    if (name == "doc" && cur->peek() == '[') {
-      std::string_view field = value::lex::scanBracketedName(*cur, program->resource, failAt);
-      return parseAccessors(parseColumn(field, pos));
-    }
-    return parseAccessors(parseColumn(name, pos));
+    return parseColumn(name, pos);
   }
 
   uint32_t parseNumber() {
@@ -277,7 +267,6 @@ private:
     return parseVariableNamed(name, pos);
   }
 
-  // $name, params.name and params['name'] are the same variable.
   uint32_t parseVariableNamed(std::string_view name, size_t pos) {
     const auto* view = opts.vars.find(name);
     if (view == nullptr) {
@@ -347,6 +336,25 @@ private:
       fail(pos, e.what());
     }
     FieldType* field = target.fieldType;
+    const ValueFunction* componentFunction = nullptr;
+    size_t componentPos = pos;
+    cur->skipWs();
+    if (cur->consume('.')) {
+      componentPos = cur->position();
+      std::string_view component = value::lex::scanIdentifier(*cur);
+      // Resolve real child fields here before type components when the schema
+      // supports nested documents. Leaf capability checks follow resolution.
+      auto kind = field->type() == FieldType::DATE ? ValueFunction::Kind::DATE
+          : field->type() == FieldType::GEO_POINT ? ValueFunction::Kind::GEO_POINT
+          : ValueFunction::Kind::NUMERIC;
+      componentFunction = ValueFunctionRegistry::findComponent(kind, component);
+      cur->skipWs();
+      if (componentFunction == nullptr || cur->peek() == '.' || cur->peek() == '(') {
+        fail(componentPos, fmt::format(
+            "field '{}' of type {} permits one component; valid components: {}",
+            name, FieldType::typeName(field->type()), ValueFunctionRegistry::componentNames(kind)));
+      }
+    }
     try {
       field->requireCapability(FieldType::VALUE_EXPR, "value expression", name);
     } catch (const RequestError& e) {
@@ -374,7 +382,10 @@ private:
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
-    return append(node);
+    uint32_t index = append(node);
+    if (componentFunction == nullptr) return index;
+    std::array<uint32_t, VALUE_MAX_ARITY> args{index};
+    return appendFunction(componentFunction, componentPos, args, 1);
   }
 
   template <class Grammar>
@@ -415,7 +426,7 @@ private:
           *cur, program->resource,
           [&](size_t at, std::string_view message) { fail(at, message); });
     });
-    return parseAccessors(parseColumn(name, pos));
+    return parseColumn(name, pos);
   }
 
   void rewriteDecimalComparison(const ValueFunction*& function,
@@ -526,73 +537,6 @@ private:
     return append(node);
   }
 
-  // ---- accessors on a column: doc['f'].value, loc.lat, ts.date.year ----------
-
-  uint32_t parseAccessors(uint32_t node) {
-    for (;;) {
-      if (cur->peek() != '.' || !value::lex::identifierStart(cur->peekAt(1))) return node;
-      size_t pos = cur->position();
-      cur->advance();
-      std::string_view name = value::lex::scanIdentifier(*cur);
-      if (cur->peek() == '(' && cur->peekAt(1) == ')') cur->advance(2);
-      node = applyAccessor(node, name, pos);
-    }
-  }
-
-  uint32_t call(std::string_view function, size_t pos, std::initializer_list<uint32_t> args) {
-    std::array<uint32_t, VALUE_MAX_ARITY> nodes{};
-    std::copy(args.begin(), args.end(), nodes.begin());
-    return makeFunction(function, pos, std::span<const uint32_t>(nodes.data(), args.size()));
-  }
-
-  uint32_t appendInteger(int64_t value, size_t pos) {
-    ValueNode node;
-    node.kind = ValueNodeKind::CONSTANT;
-    node.type = ValueType::INT64;
-    node.intValue = value;
-    node.sourcePos = pos;
-    node.text = program->copyString(std::to_string(value));
-    return append(node);
-  }
-
-  // The Lucene expressions and Painless spellings of column access. A getter
-  // prefix is ignored (getYear() is year), and .date is a no-op step, so
-  // doc['ts'].date.getYear(), doc['ts'].date.year and ts.year are the same.
-  uint32_t applyAccessor(uint32_t node, std::string_view spelling, size_t pos) {
-    std::string key(spelling);
-    if (key.size() > 3 && key.starts_with("get") && key[3] >= 'A' && key[3] <= 'Z') {
-      key.erase(0, 3);
-      key[0] = (char)(key[0] - 'A' + 'a');
-    }
-    bool array = valueArray(program->nodes[node].type);
-    if (key == "value" || key == "date") return node;
-    if (key == "lat") return call("geo_lat", pos, {node});
-    if (key == "lon") return call("geo_lon", pos, {node});
-    if (key == "size" || key == "length") return call("count", pos, {node});
-    if (key == "empty") {
-      uint32_t count = call("count", pos, {node});
-      return call("eq", pos, {count, appendInteger(0, pos)});
-    }
-    if (key == "min" || key == "max" || key == "avg" || key == "sum") {
-      return array ? call(key, pos, {node}) : node;
-    }
-    static constexpr std::pair<std::string_view, std::string_view> DATE_PARTS[] = {
-        {"year", "year"}, {"monthOfYear", "month"}, {"month", "month"},
-        {"dayOfMonth", "day_of_month"}, {"dayOfWeek", "day_of_week"},
-        {"dayOfYear", "day_of_year"}, {"hourOfDay", "hour"}, {"hour", "hour"},
-        {"minuteOfHour", "minute"}, {"minute", "minute"}, {"secondOfMinute", "second"},
-        {"second", "second"}, {"millisOfSecond", "millis"}, {"millis", "millis"},
-        {"millisOfDay", "millis_of_day"}, {"weekOfWeekyear", "week_of_year"},
-        {"weekOfYear", "week_of_year"}, {"quarter", "quarter"},
-    };
-    for (const auto& [accessor, function] : DATE_PARTS) {
-      if (key == accessor) return call(function, pos, {node});
-    }
-    fail(pos, fmt::format(
-        "unknown accessor '.{}'; use .value, .lat, .lon, .size(), .length, .empty, .min, .max, "
-        ".avg, .sum, or a date part such as .date.year", spelling));
-  }
-
   // ---- let ---------------------------------------------------------
 
   const Binding* findBinding(std::string_view name) const {
@@ -607,7 +551,7 @@ private:
     size_t pos = cur->position();
     std::string_view name = value::lex::scanIdentifier(*cur);
     if (name.empty()) fail(pos, "expected a variable name");
-    for (std::string_view reserved : {"score", "_score", "_score_", "_docid_", "doc", "params", "col"}) {
+    for (std::string_view reserved : {"score", "_score", "_score_", "_docid_", "col"}) {
       if (name == reserved) fail(pos, fmt::format("'{}' cannot be used as a variable name", name));
     }
     if (findBinding(name) != nullptr) fail(pos, fmt::format("variable '{}' is already defined", name));

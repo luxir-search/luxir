@@ -1934,6 +1934,25 @@ std::span<const ValueFunction> ValueFunctionRegistry::entries() {
   return allFunctions();
 }
 
+const ValueFunction* ValueFunctionRegistry::findComponent(ValueFunction::Kind kind,
+                                                           std::string_view name) {
+  for (const ValueFunction& function : allFunctions()) {
+    if (!function.component.empty() && function.operands[0].kind == kind
+        && function.component == name) return &function;
+  }
+  return nullptr;
+}
+
+std::string ValueFunctionRegistry::componentNames(ValueFunction::Kind kind) {
+  std::string names;
+  for (const ValueFunction& function : allFunctions()) {
+    if (function.component.empty() || function.operands[0].kind != kind) continue;
+    if (!names.empty()) names += ", ";
+    names += function.component;
+  }
+  return names.empty() ? "none" : names;
+}
+
 std::string ValueFunctionRegistry::arrayReducerNames() {
   std::vector<std::string_view> names;
   std::array<ResolvedValue, 1> array{{
@@ -2006,6 +2025,9 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
     } else if (kind == ValueNodeKind::FUNCTION) {
       add(node.function);
       add((uint8_t)node.opcode);
+      add(node.intValue);
+      add(node.intValue2);
+      add(std::bit_cast<uint64_t>(node.doubleValue));
       add(node.childCount);
       for (uint8_t i = 0; i < node.childCount; i++) add(key.children[i]);
     }
@@ -2043,7 +2065,9 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
             && left.columnIndexed == right.columnIndexed;
       case ValueNodeKind::FUNCTION:
         if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount) return false;
+            || left.childCount != right.childCount || left.intValue != right.intValue
+            || left.intValue2 != right.intValue2
+            || std::bit_cast<uint64_t>(left.doubleValue) != std::bit_cast<uint64_t>(right.doubleValue)) return false;
         for (uint8_t i = 0; i < left.childCount; i++) {
           if (a.children[i] != b.children[i]) return false;
         }

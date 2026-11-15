@@ -98,6 +98,8 @@ struct ValueFunction {
   Prepare prepare = nullptr;
   NaturePolicy natures = NaturePolicy::NUMBER;
   uint8_t natureStart = 0;
+  // Optional field-path component on the type declared by operand zero.
+  std::string_view component = {};
 
   std::array<bool, VALUE_MAX_ARITY> natureConversions(std::span<const ResolvedValue> args) const {
     std::array<bool, VALUE_MAX_ARITY> convert{};
@@ -143,6 +145,8 @@ public:
   static const ValueFunction* find(std::string_view name);
   static std::span<const ValueFunction> entries();
   static std::string arrayReducerNames();
+  static const ValueFunction* findComponent(ValueFunction::Kind kind, std::string_view name);
+  static std::string componentNames(ValueFunction::Kind kind);
   static const ValueFunction* decimalDecoder();
   static std::optional<DecimalComparison> decimalComparison(const ValueFunction* function,
       int scale, const api::Val& literal, bool reverse);

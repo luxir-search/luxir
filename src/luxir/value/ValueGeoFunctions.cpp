@@ -72,8 +72,10 @@ struct Coordinate1 {
 template <double (*Coordinate)(int64_t), int Limit>
 constexpr ValueFunction coordinate(std::string_view name) {
   using F = Coordinate1<Coordinate, Limit>;
-  return {ValueOpcode::NONE, name, coordinateResolve, F::point, evalFunctionBatch, F::bounds,
-          F::element, 1, 1, {GEO_POINT}};
+  ValueFunction function{ValueOpcode::NONE, name, coordinateResolve, F::point, evalFunctionBatch, F::bounds,
+                         F::element, 1, 1, {GEO_POINT}};
+  function.component = name.substr(4); // geo_lat/geo_lon define lat/lon.
+  return function;
 }
 
 // ---------------------------------------------------------------------------

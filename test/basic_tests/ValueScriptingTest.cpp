@@ -30,8 +30,7 @@ using namespace luxir;
 using namespace luxir::test;
 
 // The math, bitwise, date, geo and hash functions of the value language, its
-// local variables, and the Lucene expressions / Painless
-// spellings of columns and parameters.
+// local variables and type-defined field components.
 class ValueScriptingTest : public LuxirTest {
 protected:
   using Values = std::vector<std::optional<double>>;
@@ -232,15 +231,15 @@ std::pair<int, int> painlessGeohex(double lat, double lon) {
 constexpr std::string_view GEOHASH_SCRIPT = "geohash(loc_p.lat, loc_p.lon, 5)";
 
 constexpr std::string_view GEOTILE_SCRIPT =
-    "let(lat, clamp(doc['loc_p'].lat, -85.0511287798066, 85.0511287798066), "
-    "let(lon, doc['loc_p'].lon, let(tiles, 1 << 5, "
+    "let(lat, clamp(loc_p.lat, -85.0511287798066, 85.0511287798066), "
+    "let(lon, loc_p.lon, let(tiles, 1 << 5, "
     "let(x, clamp(to_int(floor((lon + 180.0) / 360.0 * tiles)), 0, tiles - 1), "
     "let(s, sin(to_radians(lat)), "
     "let(y, clamp(to_int(floor((0.5 - log((1.0 + s) / (1.0 - s)) / (4.0 * pi())) * tiles)), "
     "0, tiles - 1), (5 << 58) | (x << 29) | y))))))";
 
 constexpr std::string_view GEOHEX_SCRIPT =
-    "let(lon, doc['loc_p'].lon, let(lat, doc['loc_p'].lat, "
+    "let(lon, loc_p.lon, let(lat, loc_p.lat, "
     "let(size, 180.0 / pow(sqrt(7), 5), "
     "let(q, (2.0 / 3.0 * lon) / size, "
     "let(r, (-1.0 / 3.0 * lon + sqrt(3.0) / 3.0 * lat) / size, "
@@ -406,48 +405,44 @@ TEST_F(ValueScriptingTest, scoreHasTwoSpellings) {
   EXPECT_EQ(ValueNodeKind::SCORE, parse("_score")->root().kind);
 }
 
-TEST_F(ValueScriptingTest, paramsAreVariables) {
+TEST_F(ValueScriptingTest, variablesUseDollarNames) {
   api::Val three;
   three.kind = int64_t{3};
-  api::Val half;
-  half.kind = 0.5;
   bindVar("w", three);
-  bindVar("half", half);
-  EXPECT_EQ(eval("x_i * $w"), eval("x_i * params.w"));
-  EXPECT_EQ(eval("x_i * $w"), eval("x_i * params['w']"));
-  EXPECT_EQ(eval("x_i * $w"), eval("x_i * params[\"w\"]"));
-  expectValues("x_i * params.w + params.half", {6.5, -2.5, std::nullopt, 21.5, 0.5});
-  expectError("params.nope", "undefined variable");
-  expectError("params['nope']", "undefined variable");
-  expectError("params[x_i]", "quoted name");
-  expectError("params['']", "empty");
+  expectValues("x_i * $w", {6, -3, std::nullopt, 21, 0});
 }
 
-TEST_F(ValueScriptingTest, docAccessMatchesColumns) {
-  EXPECT_EQ(eval("x_i + 1"), eval("doc['x_i'] + 1"));
-  EXPECT_EQ(eval("x_i + 1"), eval("doc[\"x_i\"].value + 1"));
-  EXPECT_EQ(eval("x_i + 1"), eval("col(\"x_i\").value + 1"));
-  EXPECT_EQ(eval("x_i + 1"), eval("x_i.value + 1"));
-  EXPECT_EQ(eval("log1p(def(doc['v_d'].value, 0))"), eval("log1p(def(v_d, 0))"));
-  // The root may itself be .value.
-  EXPECT_EQ(ValueNodeKind::COLUMN, parse("doc['x_i'].value")->root().kind);
-  expectError("doc['nope'].value", "Field not found");
-  expectError("doc[x_i]", "quoted name");
-  expectError("doc['x_i'].bogus", "unknown accessor");
-}
-
-TEST_F(ValueScriptingTest, multiValuedAccessors) {
-  expectValues("doc['vals_ds'].min", {10, 70, std::nullopt, std::nullopt, std::nullopt});
-  expectValues("doc['vals_ds'].max", {40, 70, std::nullopt, std::nullopt, std::nullopt});
-  expectValues("doc['vals_ds'].sum", {50, 70, std::nullopt, std::nullopt, std::nullopt});
-  expectValues("doc['vals_ds'].avg", {25, 70, std::nullopt, std::nullopt, std::nullopt});
-  expectValues("doc['vals_ds'].length", {2, 1, 0, 0, 0});
-  expectValues("doc['vals_ds'].size()", {2, 1, 0, 0, 0});
-  expectValues("doc['vals_ds'].empty", {0, 0, 1, 1, 1});
-  expectValues("doc['v_d'].empty", {0, 0, 1, 0, 1});
-  // On a single value the reducers are the value.
-  expectValues("doc['x_i'].max", {2, -1, std::nullopt, 7, 0});
-  expectValues("doc['loc_p'].empty", {0, 0, 1, 0, 1});
+TEST_F(ValueScriptingTest, fieldComponentsFollowTheColumnType) {
+  for (const ValueFunction& function : ValueFunctionRegistry::entries()) {
+    if (function.component.empty()) continue;
+    std::string_view field = function.operands[0].kind == ValueFunction::Kind::DATE ? "when_dt" : "loc_p";
+    auto expected = eval(fmt::format("{}({})", function.name, field));
+    EXPECT_EQ(expected, eval(fmt::format("{}.{}", field, function.component)));
+    EXPECT_EQ(expected, eval(fmt::format("col(\"{}\").{}", field, function.component)));
+  }
+  EXPECT_EQ(eval("max(geo_lat(locs_p))"), eval("max(locs_p.lat)"));
+  for (auto expression : {"x_i.lat", "x_i.year", "x_i.value", "x_i.min", "x_i.size()"}) {
+    expectError(expression, "field 'x_i' of type");
+    expectError(expression, "valid components: none");
+  }
+  for (auto expression : {"loc_p.year", "loc_p.lat.x", "col(\"loc_p\").lat.x", "loc_p.getLat()"}) {
+    expectError(expression, "field 'loc_p' of type geo_point");
+    expectError(expression, "valid components: lat, lon");
+  }
+  for (auto expression : {"when_dt.lat", "when_dt.date.year", "when_dt.getYear()", "when_dt.monthOfYear"}) {
+    expectError(expression, "field 'when_dt' of type date");
+    expectError(expression, "valid components: year, month, day_of_month");
+  }
+  expectError("let(t, when_dt, t.year)", "expected");
+  expectError("max(when_dt, when_dt).year", "trailing input");
+  // Parameter accessors are rejected by both expression parsers.
+  for (auto spelling : {"params.w", "params['w']"}) {
+    expectError(spelling, "Field not found");
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").expr("bad", std::string("sum(x_i) * ") + spelling, "w", int64_t{3});
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,25 +485,6 @@ TEST_F(ValueScriptingTest, dateOffsetsShiftTheCalendar) {
   expectError("epoch_millis(when_dt, 60)", "expects exactly 1 argument");
 }
 
-TEST_F(ValueScriptingTest, dateAccessorsUseLuceneAndJodaNames) {
-  EXPECT_EQ(eval("year(when_dt)"), eval("doc['when_dt'].date.year"));
-  EXPECT_EQ(eval("year(when_dt)"), eval("doc['when_dt'].date.getYear()"));
-  EXPECT_EQ(eval("month(when_dt)"), eval("doc['when_dt'].date.monthOfYear"));
-  EXPECT_EQ(eval("day_of_month(when_dt)"), eval("doc['when_dt'].date.dayOfMonth"));
-  EXPECT_EQ(eval("day_of_week(when_dt)"), eval("doc['when_dt'].date.getDayOfWeek()"));
-  EXPECT_EQ(eval("day_of_year(when_dt)"), eval("doc['when_dt'].date.dayOfYear"));
-  EXPECT_EQ(eval("hour(when_dt)"), eval("doc['when_dt'].date.hourOfDay"));
-  EXPECT_EQ(eval("minute(when_dt)"), eval("doc['when_dt'].date.minuteOfHour"));
-  EXPECT_EQ(eval("second(when_dt)"), eval("doc['when_dt'].date.secondOfMinute"));
-  EXPECT_EQ(eval("millis(when_dt)"), eval("doc['when_dt'].date.millisOfSecond"));
-  EXPECT_EQ(eval("millis_of_day(when_dt)"), eval("doc['when_dt'].date.millisOfDay"));
-  EXPECT_EQ(eval("week_of_year(when_dt)"), eval("when_dt.weekOfWeekyear"));
-  EXPECT_EQ(eval("year(when_dt)"), eval("when_dt.year"));
-  EXPECT_EQ(eval("year(when_dt) * 100 + month(when_dt)"),
-            eval("doc['when_dt'].year * 100 + doc['when_dt'].month"));
-  expectError("x_i.year", "not a DATE value");
-}
-
 // ---------------------------------------------------------------------------
 // Geo
 
@@ -517,17 +493,15 @@ TEST_F(ValueScriptingTest, geoCoordinates) {
   auto lon = [](double degrees) { return geo::decodeLongitude(geo::encodeLongitude(degrees)); };
   expectValues("geo_lat(loc_p)", {lat(40.7128), lat(-33.8688), std::nullopt, lat(-33), std::nullopt});
   expectValues("geo_lon(loc_p)", {lon(-74.006), lon(151.2093), std::nullopt, lon(175), std::nullopt});
-  EXPECT_EQ(eval("geo_lat(loc_p)"), eval("doc['loc_p'].lat"));
-  EXPECT_EQ(eval("geo_lon(loc_p)"), eval("doc['loc_p'].lon"));
   EXPECT_EQ(eval("geo_lat(loc_p)"), eval("loc_p.lat"));
-  EXPECT_EQ(eval("geo_lat(loc_p)"), eval("doc['loc_p'].getLat()"));
+  EXPECT_EQ(eval("geo_lon(loc_p)"), eval("loc_p.lon"));
   EXPECT_EQ(eval("geo_lon(loc_p)"), eval("col(\"loc_p\").lon"));
   // A multi-valued point gives arrays.
   expectValues("max(geo_lat(locs_p))", {lat(51.5), std::nullopt, std::nullopt, std::nullopt, std::nullopt});
-  expectValues("min(doc['locs_p'].lon)", {lon(-74), std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+  expectValues("min(locs_p.lon)", {lon(-74), std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectError("geo_lat(x_i)", "not a GEO_POINT value");
   expectError("loc_p", "GEO_POINT is not numeric");
-  expectError("x_i.lat", "not a GEO_POINT value");
+  expectError("x_i.lat", "valid components: none");
 }
 
 TEST_F(ValueScriptingTest, geoDistancesBetweenPoints) {
@@ -633,8 +607,8 @@ TEST_F(ValueScriptingTest, geotileMatchesTheStandardAlgorithm) {
   expectError("geotile(0, 0, 30)", "zoom must be an integer from 0 to 29");
 }
 
-// The three Painless grid scripts, as Luxir expressions over loc_p.
-TEST_F(ValueScriptingTest, gridScriptsRunAsLuxirExpressions) {
+// The three Painless grid calculations rewritten as Luxir expressions over loc_p.
+TEST_F(ValueScriptingTest, gridScriptsRewrittenAsLuxirExpressions) {
   auto lat = [](double degrees) { return geo::decodeLatitude(geo::encodeLatitude(degrees)); };
   auto lon = [](double degrees) { return geo::decodeLongitude(geo::encodeLongitude(degrees)); };
   struct Point { int32_t doc; double lat, lon; };
@@ -643,13 +617,13 @@ TEST_F(ValueScriptingTest, gridScriptsRunAsLuxirExpressions) {
     double la = lat(p.lat), lo = lon(p.lon);
     // The built-in geohash interleaves longitude and latitude bits.
     EXPECT_EQ(geohashKey(painlessGeohash(la, lo, 5)), evalInt(GEOHASH_SCRIPT, p.doc));
-    EXPECT_EQ(evalInt("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", p.doc),
+    EXPECT_EQ(evalInt("geohash(loc_p.lat, loc_p.lon, 5)", p.doc),
               evalInt(GEOHASH_SCRIPT, p.doc));
     // geotile at zoom 5.
     Tile tile = painlessGeotile(la, lo, 5);
     int64_t expectedTile = ((int64_t)5 << 58) | ((int64_t)tile.x << 29) | tile.y;
     EXPECT_EQ(expectedTile, evalInt(GEOTILE_SCRIPT, p.doc));
-    EXPECT_EQ(expectedTile, evalInt("geotile(doc['loc_p'].lat, doc['loc_p'].lon, 5)", p.doc));
+    EXPECT_EQ(expectedTile, evalInt("geotile(loc_p.lat, loc_p.lon, 5)", p.doc));
     // geohex at resolution 5.
     auto [rx, rz] = painlessGeohex(la, lo);
     int64_t key = evalInt(GEOHEX_SCRIPT, p.doc);
@@ -771,8 +745,7 @@ TEST_F(ValueScriptingTest, sharedLetChainsStayLinear) {
   EXPECT_EQ("score", scoredBound->firstUnboundedNode());
   EXPECT_EQ(1.5 * (1LL << 40), scoredBound->evalPoint(0, 1.5f).doubleValue);
 
-
-  auto dates = sharedLetChain("when_dt", 40, true);
+  auto dates = sharedLetChain("when_dt", 70, true);
   auto dateProgram = parse(dates);
   EXPECT_EQ("'when_dt' (DATE unit 'ms')", dateProgram->describeDateSources(dateProgram->rootNode));
   auto req = localReq(helper.getSearchEngine());
@@ -862,7 +835,7 @@ TEST_F(ValueScriptingTest, letScopeAndNameRules) {
   expectError("let(a, 1, a) + a", "Field not found: a");
   expectError("let(a, 1, let(a, 2, a))", "already defined");
   expectError("let(score, 1, score)", "cannot be used as a variable name");
-  expectError("let(doc, 1, 1)", "cannot be used as a variable name");
+  expectConstant("let(doc, 1, let(params, 2, doc + params))", 3);
   expectError("let(1, 1, 1)", "expected a variable name");
   expectError("let(a, vals_ds, a)", "must be a scalar");
   expectError("let(a, 1, vals_ds)", "must be a scalar");
@@ -903,8 +876,8 @@ TEST_F(ValueScriptingTest, rescoreUsesTheNewLanguage) {
   ASSERT_EQ(5u, bits.size());
   EXPECT_EQ((Ids{"a", "d"}), (Ids{bits[0], bits[1]}));
   EXPECT_EQ("b", bits[4]);
-  // doc[] and _score: d=17, a=7, c=e=3, b=1.
-  auto spelled = ids("rescore(body_w:alpha, expr=def(doc['x_i'].value, 0) * 2 + (_score > 0 ? 3 : 0))");
+  // _score: d=17, a=7, c=e=3, b=1.
+  auto spelled = ids("rescore(body_w:alpha, expr=def(x_i, 0) * 2 + (_score > 0 ? 3 : 0))");
   ASSERT_EQ(5u, spelled.size());
   EXPECT_EQ((Ids{"d", "a"}), (Ids{spelled[0], spelled[1]}));
   EXPECT_EQ("b", spelled[4]);
@@ -954,8 +927,8 @@ TEST_F(ValueScriptingTest, sortsByTheNewFunctions) {
     return ids;
   };
   auto cell = [](const Point& p) { return geohashKey(painlessGeohash(p.lat, p.lon, 5)); };
-  EXPECT_EQ(order(cell, false), sorted("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", asc));
-  EXPECT_EQ(order(cell, true), sorted("geohash(doc['loc_p'].lat, doc['loc_p'].lon, 5)", desc));
+  EXPECT_EQ(order(cell, false), sorted("geohash(loc_p.lat, loc_p.lon, 5)", asc));
+  EXPECT_EQ(order(cell, true), sorted("geohash(loc_p.lat, loc_p.lon, 5)", desc));
   EXPECT_EQ(order(cell, false), sorted(GEOHASH_SCRIPT, asc));
   auto tile = [](const Point& p) {
     Tile t = painlessGeotile(p.lat, p.lon, 5);
@@ -991,7 +964,7 @@ TEST_F(ValueScriptingTest, bucketExpressionsTakeTheMathAndBitFunctions) {
   root.expr("clamped", "clamp(sum(x_i), 0, 5)");
   root.expr("int", "to_int(sum(v_d))");
   root.expr("tau", "pi() * 2 + sum(x_i) * 0");
-  root.expr("weighted", "sum(x_i) * params.w", "w", int64_t{3});
+  root.expr("weighted", "sum(x_i) * $w", "w", int64_t{3});
   req->execute(-1);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   // sum(x_i) = 2 - 1 + 7 + 0 = 8; sum(v_d) = 140.5.

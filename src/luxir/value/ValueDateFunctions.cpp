@@ -170,8 +170,10 @@ struct DatePartFn {
 template <DatePart Part>
 constexpr ValueFunction part(std::string_view name, uint8_t maxArity) {
   using F = DatePartFn<Part>;
-  return {ValueOpcode::NONE, name, datePartResolve, F::point, evalFunctionBatch, F::bounds,
-          F::element, 1, maxArity, {DATE_VALUE, OFFSET}, nullptr, prepareDatePart};
+  ValueFunction function{ValueOpcode::NONE, name, datePartResolve, F::point, evalFunctionBatch, F::bounds,
+                         F::element, 1, maxArity, {DATE_VALUE, OFFSET}, nullptr, prepareDatePart};
+  function.component = name;
+  return function;
 }
 
 constexpr ValueFunction FUNCTIONS[] = {
