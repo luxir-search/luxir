@@ -14,6 +14,7 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   int32_t ownerCount;
   bool maximum;
   float multiplier;
+  int32_t childDoc;
   int32_t current = -1;
   float value = 0;
 
@@ -22,10 +23,16 @@ public:
          DocSet* domain, int32_t ownerCount, bool maximum, float multiplier)
       : child(child), cursor(mapper, pool),
         domain(domain ? pool.make<QueryPrep::DocSetScorer>(domain, ownerCount) : nullptr),
-        ownerCount(ownerCount), maximum(maximum), multiplier(multiplier) {}
+        ownerCount(ownerCount), maximum(maximum), multiplier(multiplier), childDoc(child.docId()) {}
 
   int32_t docId() override { return current; }
   float score() override { return value; }
+
+  void setMinCompetitiveScore(float floor) override {
+    if (maximum && multiplier > 0.0f) {
+      child.setMinCompetitiveScore(Query::unscaleScoreFloor(floor, multiplier));
+    }
+  }
 
   int32_t next() override {
     return current == PostingsReader::END ? current : advance(current + 1);
@@ -38,7 +45,7 @@ public:
     }
     if (target >= ownerCount) return current = PostingsReader::END;
     auto family = cursor.seek(target);
-    int32_t doc = child.docId();
+    int32_t doc = childDoc;
     if (doc < family.first) doc = child.advance(family.first);
     while (doc != PostingsReader::END) {
       // A child inside the sought family needs no lookup.
@@ -58,6 +65,8 @@ public:
         while ((doc = child.next()) < family.end) value = std::max(value, child.score());
       }
       value *= multiplier;
+      // A competitive next() can finish without moving the postings cursor.
+      childDoc = doc;
       return current = owner;
     }
     return current = PostingsReader::END;
