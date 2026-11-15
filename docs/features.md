@@ -240,8 +240,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   decay functions over numeric, date, and geo values. The same language has
   bitwise operators and `%`, trigonometry and rounding, calendar parts of
   dates, coordinates and distances between places, geohash and geotile keys,
-  hash functions for consistent sampling and `let` variables, with the Lucene expressions and Painless spellings `_score`,
-  `params.x`, and `doc['x'].value` ([value expressions](guide/value-expressions.md)). `rescore` takes an
+  hash functions for consistent sampling, `let` bindings, `$name` request
+  variables, `_score` as an alias of `score`, and typed field components such
+  as `loc.lat` and `ts.year` ([value expressions](guide/value-expressions.md)).
+  `rescore` takes an
   optional `min_score` cut-off (the `function_score` / `script_score`
   counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are

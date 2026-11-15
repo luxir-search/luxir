@@ -7,8 +7,8 @@ per-document input of aggregates (`sum(year(published_dt))`), and in LTR
 features. Its arithmetic, `def`, conditionals, array reducers, `random`, and
 decay functions are described in
 [Searching](searching.md#sort-expressions-in-detail). This page covers the rest
-of the language: operators, math, date parts, geo, hashing, local variables, and the spellings that make Lucene expressions and Painless
-scoring scripts portable.
+of the language: operators, math, date parts, geo, hashing, local variables,
+and how to rewrite Lucene expressions and Painless scoring scripts.
 
 Everything here shares the rules of the base language:
 
@@ -53,6 +53,29 @@ makes the value missing, as for `/`.
 
 Every operator has a function spelling: `mod`, `bit_and`, `bit_or`, `bit_xor`,
 `bit_not`, `shl`, `shr`, `ushr`.
+
+## Field paths and variables
+
+A field path starts with a bare column name or `col("name")`. A dot denotes a
+child of that field. DATE and GEO_POINT columns define these components:
+
+| Field type | Components | Equivalent function |
+|---|---|---|
+| DATE | `year`, `month`, `day_of_month`, `day_of_week`, `day_of_year`, `week_of_year`, `quarter`, `hour`, `minute`, `second`, `millis`, `millis_of_day`, `epoch_millis` | The function with the same name: `ts.year` is `year(ts)`. |
+| GEO_POINT | `lat`, `lon` | `loc.lat` is `geo_lat(loc)`; `loc.lon` is `geo_lon(loc)`. |
+
+Each field accepts at most one component: `col("ts").day_of_week` is valid;
+`loc.lat.x`, `price.lat`, and `ts.date.year` are errors. Other field types
+have no components. Components map over multi-valued columns, so use
+`max(places.lat)` or `min(times.year)` to obtain a scalar.
+
+DATE components use UTC. For a fixed offset use the function spelling,
+for example `hour(ts, 120)`. Components belong to field paths; they do not
+apply to arbitrary expressions or let-bound names. Use `year(t)` for a
+let-bound date.
+
+Request variables use `$name` in both per-document and bucket expressions.
+`score` and `_score` denote the query score.
 
 ## Math
 
@@ -138,7 +161,7 @@ A GEO_POINT column cannot be used as a number, but its coordinates can:
 | `geotile(lat, lon, zoom)` | The web mercator tile at zoom 0 to 29, packed like Elasticsearch: `(zoom << 58) \| (x << 29) \| y`. |
 
 `geohash` and `geotile` take latitude and longitude as numbers, so they combine
-with the accessors: `geohash(place.lat, place.lon, 5)`. A coordinate outside
+with field components: `geohash(place.lat, place.lon, 5)`. A coordinate outside
 [-90, 90] and [-180, 180] is an error.
 
 Where each geo operation lives:
@@ -163,10 +186,13 @@ let(name, value, body)
 ```
 
 `name` stands for `value` inside `body`, and the result is `body`. Both
-`value` and `body` must be numeric scalars (not arrays). Integers stay integers,
-and dates and geo points keep their nature; decimal and boolean values become
-numbers. A name shadows a column of the same name, cannot shadow another
-binding or a reserved name, and is not visible outside the `body`.
+`value` and `body` must be scalars (not arrays). Integers stay integers; dates
+and geo points keep their nature. A geo point must be consumed by a geo
+function rather than returned as the expression's numeric result. Decimal and
+boolean values become numbers. A name shadows a column of the same name,
+cannot shadow another binding or a reserved name, and is not visible outside
+the `body`. The reserved binding names are `score`, `_score`, `_score_`,
+`_docid_`, and `col`.
 
 A used value is evaluated at most once per document (and again if its score
 changes and the value depends on score). An unused value is not evaluated,
@@ -201,21 +227,14 @@ hash_bucket(account_id_l, 100, 7) < 10 ? 1.2 : 1
 
 boosts a fixed 10% of accounts.
 
-## Lucene expressions and Painless spellings
+## Porting Lucene expressions and Painless scripts
 
-Scoring scripts written for Lucene expressions or Painless can usually be pasted
-in with small changes. These are the same:
+Scoring scripts need rewriting to use Luxir expressions. The following
+functions and operators have direct equivalents:
 
 | Script | Luxir |
 |---|---|
 | `_score` | `_score` or `score` |
-| `params.w`, `params['w']`, `params["w"]` | `$w`, `params.w`, `params['w']` |
-| `doc['f'].value` | `f`, `doc['f']`, `doc['f'].value`, `col("f")` |
-| `doc['f'].empty` | `doc['f'].empty`, which is `count(f) == 0` |
-| `doc['f'].length`, `.size()` | `doc['f'].length`, `doc['f'].size()`, which is `count(f)` |
-| `doc['f'].min`, `.max`, `.avg`, `.sum` | the same; on a single value each is the value |
-| `doc['loc'].lat`, `.lon` | the same, or `geo_lat(loc)` and `geo_lon(loc)` |
-| `doc['d'].date.year`, `.getYear()`, `.monthOfYear`, `.dayOfWeek`, `.hourOfDay` | the same, or `year(d)`, `month(d)`, `day_of_week(d)`, `hour(d)` |
 | `Math.log(x)`, `Math.log10(x)`, `Math.pow(a, b)`, `Math.sqrt(x)` | `log(x)`, `log10(x)`, `pow(a, b)`, `sqrt(x)` |
 | `Math.round(x)`, `Math.floor(x)`, `Math.ceil(x)`, `Math.hypot(a, b)` | `round(x)`, `floor(x)`, `ceil(x)`, `hypot(a, b)` |
 | `Math.sin(x)` ... `Math.toRadians(x)` | `sin(x)` ... `to_radians(x)` |
@@ -223,16 +242,19 @@ in with small changes. These are the same:
 | Lucene `haversin(lat1, lon1, lat2, lon2)` (kilometers) | `haversin(lat1, lon1, lat2, lon2)` |
 | `x & 3`, `x >> 2`, `~x`, `x ? a : b`, `a && b` | the same |
 
-A `.value` on a column is the column itself; for a multi-valued column that is
-the array, so reduce it (`doc['f'].min`) as you would in the base language.
+Rewrite field reads as bare column names or `col("name")`, variables as `$name`,
+array reductions as function calls (`min(f)`, `sum(f)`, `count(f)`), and missing
+checks as `count(f) == 0`. Replace getter methods and camelCase date parts
+with the canonical functions or the field components listed above. The
+`doc[...]`, `params...`, `.value`, `.empty`, `.size()`, reducer properties,
+and `.date` forms are not accepted.
 
 Differences to know about when porting:
 
 - **Missing values.** Lucene expressions read a missing field as 0, and Painless
   throws unless the script checks `size() == 0`. Luxir carries "missing"
   through the arithmetic and gives the document no value. Write
-  `def(doc['f'].value, 0)` to get the Lucene behavior, which is also how a
-  Painless `size() == 0 ? 0 : doc['f'].value` reads.
+  `def(f, 0)` to read a missing field as zero.
 - **Types.** Painless has statements, `if`/`else`, loops, strings, lists, maps,
   and user functions; Luxir has expressions only. `if` becomes `?:`, a
   loop needs a built-in function or an expression without iteration. A script
@@ -258,8 +280,8 @@ geohash(location.lat, location.lon, 5)
 **Geotile**, zoom 5. `geotile(lat, lon, 5)`, or in expression form:
 
 ```
-let(lat, clamp(doc['location'].lat, -85.0511287798066, 85.0511287798066),
-let(lon, doc['location'].lon, let(tiles, 1 << 5,
+let(lat, clamp(location.lat, -85.0511287798066, 85.0511287798066),
+let(lon, location.lon, let(tiles, 1 << 5,
 let(x, clamp(to_int(floor((lon + 180.0) / 360.0 * tiles)), 0, tiles - 1),
 let(s, sin(to_radians(lat)),
 let(y, clamp(to_int(floor((0.5 - log((1.0 + s) / (1.0 - s)) / (4.0 * pi())) * tiles)),
@@ -274,7 +296,7 @@ The value is `(zoom << 58) | (x << 29) | y`. Take the tile back apart with
 The cell `rx/rz` becomes `rx << 32 | rz`:
 
 ```
-let(lon, doc['location'].lon, let(lat, doc['location'].lat,
+let(lon, location.lon, let(lat, location.lat,
 let(size, 180.0 / pow(sqrt(7), 5),
 let(q, (2.0 / 3.0 * lon) / size,
 let(r, (-1.0 / 3.0 * lon + sqrt(3.0) / 3.0 * lat) / size,

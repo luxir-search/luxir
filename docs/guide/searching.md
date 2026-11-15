@@ -875,9 +875,9 @@ query.
 More operators and functions are in [Value expressions](value-expressions.md):
 the bitwise operators and `%`, trigonometry and rounding, calendar parts of dates
 (`year(d)`, `day_of_week(d)`), coordinates and distances between places,
-hashing for consistent sampling, `let` variables, and
-the Lucene expressions and Painless spellings `_score`, `params.x`, and
-`doc['x'].value`.
+hashing for consistent sampling, `let` variables, `$name` request variables,
+`_score` as an alias of `score`, and typed field components such as `loc.lat`
+and `ts.year`.
 
 ### Decay functions
 
