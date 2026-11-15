@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -55,9 +56,37 @@ private:
     float multiplier;
     bool scored;
     bool prune;
+    bool exhausted = false;  // a constant score fell below the collector floor
     int32_t doc = -1;
     int32_t pending = -1;  // child's current doc not yet reduced (-1: not started)
     float current = 0.0f;
+    std::optional<float> constant;  // the score of every match, when uniform
+    ScoreBounds bounds;
+
+    // The owner score as reduce() computes it from an element score `s`
+    // shared by all of the owner's matching elements.
+    float ownerScore(float s) const { return (float)((double)s * multiplier); }
+
+    // max, min and avg of an owner's matching element scores lie within the
+    // element bounds, so they bound the owner's score too (sum does not).
+    void initBounds() {
+      if (!scored) {
+        constant = 0.0f;
+        bounds = ScoreBounds::exact(0.0f);
+        return;
+      }
+      if (mode == ScoreMode::SUM || !(multiplier >= 0.0f)) return;
+      if (auto c = child->constantContribution()) {
+        constant = ownerScore(*c);
+        bounds = ScoreBounds::exact(*constant);
+        return;
+      }
+      ScoreBounds b = child->getScoreBounds(PostingsReader::END);
+      bounds.hi = std::min(b.hi, child->getMaxScore(PostingsReader::END));
+      bounds.lo = b.lo;
+      if (std::isfinite(bounds.hi)) bounds.hi = ownerScore(bounds.hi);
+      if (std::isfinite(bounds.lo)) bounds.lo = ownerScore(bounds.lo);
+    }
 
     int32_t reduce(int32_t c) {
       while (c != PostingsReader::END) {
@@ -98,16 +127,18 @@ private:
            int32_t maxChildren, float multiplier, bool scored, bool prune)
       : child(child), owners(owners), ownerOf(owners), mode(mode), minChildren(minChildren),
         maxChildren(maxChildren), multiplier(multiplier), scored(scored && mode != ScoreMode::NONE),
-        prune(prune) {}
+        prune(prune) {
+      initBounds();
+    }
 
     int32_t next() override {
-      if (pending == PostingsReader::END) return doc = PostingsReader::END;
+      if (pending == PostingsReader::END || exhausted) return doc = PostingsReader::END;
       return reduce(pending == -1 ? child->next() : pending);
     }
 
     int32_t advance(int32_t target) override {
       assert(doc < target);
-      if (pending == PostingsReader::END) return doc = PostingsReader::END;
+      if (pending == PostingsReader::END || exhausted) return doc = PostingsReader::END;
       int32_t begin = owners.begin(target);
       int32_t c = pending;
       if (c < begin) c = begin == 0 ? child->next() : child->advance(begin);
@@ -118,7 +149,19 @@ private:
 
     float score() override { return current; }
 
+    std::optional<float> constantContribution() const override { return constant; }
+    float getMaxScore(int32_t upTo) override { unused(upTo); return bounds.hi; }
+    float getMaxScoreForSetup(int32_t upTo) override { unused(upTo); return bounds.hi; }
+    ScoreBounds getScoreBounds(int32_t upTo) override { unused(upTo); return bounds; }
+    int32_t advanceShallowForSetup(int32_t target) override {
+      unused(target);
+      return PostingsReader::END;
+    }
+
     void setMinCompetitiveScore(float floor) override {
+      // Ties at the floor stay competitive; above a uniform score nothing
+      // left can compete, so iteration ends (the current doc stays valid).
+      if (constant && floor > *constant) exhausted = true;
       if (!prune || !scored || multiplier <= 0.0f) return;
       child->setMinCompetitiveScore(
           MinScoreQuery::childFloor(floor, -std::numeric_limits<float>::infinity(), multiplier, true));
@@ -302,7 +345,10 @@ public:
       if (!prune) childFlags &= ~ALLOW_PRUNING;
       childWeight = query.child->createWeight(context.scope(query.path), childFlags, 1.0f);
       traits = childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
-      if (!scored) traits |= IS_CONSTANT_SCORING;
+      // max, min and avg of one uniform element score is that score.
+      if (!scored || (query.mode != ScoreMode::SUM && childWeight->isConstantScoring())) {
+        traits |= IS_CONSTANT_SCORING;
+      }
     }
 
     // The owner domain descends to the element rows of its owners: the

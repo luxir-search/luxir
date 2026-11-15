@@ -2362,6 +2362,8 @@ private:
   int32_t maxDoc;
   float minCompetitiveScore = std::numeric_limits<float>::lowest();
   double scoreBoundFactor = 1.0;
+  // At most two score addends: see boundBelowFloor.
+  bool exactScoreBound = false;
   int64_t skippedWindowCount = 0;
   int32_t candidateBatchSize;
   bool allTermScorers = false;
@@ -2678,8 +2680,7 @@ private:
   int32_t compactByRemainingBound(int32_t size, double remaining) {
     int32_t write = 0;
     for (int32_t i = 0; i < size; i++) {
-      if (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
-          < (double) minCompetitiveScore) {
+      if (boundBelowFloor((double) candScores[(size_t) i] + remaining)) {
         continue;
       }
       if (write != i) {
@@ -2691,17 +2692,27 @@ private:
     return write;
   }
 
+  // True when no match bounded by `bound` (a double sum of clause scores and
+  // their maxima) can reach the floor. One or two float addends round once,
+  // and fl(a + b) is order-free and monotone in each addend, so the bound
+  // rounded to float is exact: ties at a uniform score, whose floor sits one
+  // float above it, are rejected. More addends round per step and keep the
+  // relative slack.
+  bool boundBelowFloor(double bound) const LUXIR_INLINE {
+    if (exactScoreBound) return (float) bound < minCompetitiveScore;
+    return bound * scoreBoundFactor < (double) minCompetitiveScore;
+  }
+
   bool remainingBoundCanDrop(double remaining) const {
     return minCompetitiveScore > 0.0f
-        && remaining * scoreBoundFactor < (double) minCompetitiveScore;
+        && boundBelowFloor(remaining);
   }
 
   int32_t batchCompactByRemainingBound(
       int32_t size, double remaining) LUXIR_INLINE {
     for (int32_t i = 0; i < size; i++) {
       boundDrops[(size_t) i] =
-          (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
-           < (double) minCompetitiveScore);
+          boundBelowFloor((double) candScores[(size_t) i] + remaining);
     }
 
     int32_t write = 0;
@@ -2841,8 +2852,7 @@ private:
       int32_t doc = docs[(size_t) i];
       float sum = scores[(size_t) i];
       if constexpr (CheckBound) {
-        if (((double) sum + remaining) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
+        if (boundBelowFloor((double) sum + remaining)) {
           continue;
         }
       }
@@ -2876,8 +2886,7 @@ private:
       int32_t doc = candDocs[(size_t) i];
       float sum = candScores[(size_t) i];
       if constexpr (CheckBound) {
-        if (((double) sum + remaining) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
+        if (boundBelowFloor((double) sum + remaining)) {
           continue;
         }
       }
@@ -3095,8 +3104,7 @@ private:
         }
         // Keep all-term bulk bounds group-granular so candidate windows do
         // not pay for block-level refinement.
-        if (suffixMax[0] * scoreBoundFactor
-            < (double) this->minCompetitiveScore) {
+        if (boundBelowFloor(suffixMax[0])) {
           skippedWindowCount++;
           if (upTo >= max - 1) {
             out.max = max;
@@ -3270,8 +3278,7 @@ private:
         windowMax[c] = termClauseGetMaxScore(c, upTo);
         suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
       }
-      if (suffixMax[0] * scoreBoundFactor
-          < (double) this->minCompetitiveScore) {
+      if (boundBelowFloor(suffixMax[0])) {
         skippedWindowCount++;
         if (upTo >= max - 1) {
           out.max = max;
@@ -3333,8 +3340,7 @@ private:
           for (int32_t i = 0; i < n; i++) {
             int32_t doc = candDocs[(size_t) i];
             float sum = candScores[(size_t) i];
-            if (((double) sum + remaining) * scoreBoundFactor
-                < (double) this->minCompetitiveScore) {
+            if (boundBelowFloor((double) sum + remaining)) {
               continue;
             }
             if (scorerDoc < doc) scorerDoc = scorer->advance(doc);
@@ -4139,6 +4145,7 @@ public:
     // Bounds cover the same number of float additions as final scoring,
     // including every member contribution inside decomposed unions.
     scoreBoundFactor = 1.0 + (double) scoreAddends * 0x1p-24;
+    exactScoreBound = scoreAddends <= 2;
     if (allTermClauses && termClauses[0].members.size() > 1) {
       size_t memberCount = termClauses[0].members.size();
       leadGroupTerms = pool.make_span<BufferedTerm>(memberCount);

@@ -3,6 +3,7 @@
 
 #include "test/NestedFixture.h"
 #include "luxir/reader/OwnerMap.h"
+#include "luxir/query/NumericPredicateQuery.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -403,6 +404,55 @@ TEST_F(NestedTest, segmentsWithoutElementsServeEveryScopedOperation) {
   ASSERT_TRUE(h.submit(merge).success);
   ASSERT_EQ(1u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
   check();
+}
+
+
+#ifndef NDEBUG
+int64_t elementVerifications = 0;
+void countElementVerification(const NumericPredicateQuery&, int32_t) { elementVerifications++; }
+#endif
+
+// Questions tagged "t", each with answers dated i % 7 and 100.
+void indexAnswers(NestedFixture& f, int32_t n) {
+  f.schema(R"({"fields": {"tag": "string",
+      "answers": {"type": "nested", "fields": {"date": {"type": "int", "multi": "array"}}}}})");
+  CollectionHelper h = f.helper();
+  CollectionHelper::UpdateBuilder b;
+  for (int32_t i = 0; i < n; i++) {
+    auto& text = f.retained.emplace_back(R"({"id": "q)" + std::to_string(i) + R"(", "tag": "t", "answers": [{"date": )"
+                                         + std::to_string(i % 7) + R"(}, {"date": 100}]})");
+    b.addRaw([&](api::Map& map, std::pmr::memory_resource& mr) { EXPECT_TRUE(api::read_json(map, text, mr)); });
+  }
+  b.commit();
+  ASSERT_TRUE(h.submit(b).success);
+}
+
+// A to_parent of a constant element query scores every owner alike (max,
+// min and avg of one value), so beside a scored clause the top-k stops once
+// its page is full: later equal scores cannot compete.
+TEST_F(NestedTest, constantToParentLetsATopKStopEarly) {
+  indexAnswers(*this, 20000);
+  auto q = [](std::string mode, std::string extra) {
+    return R"({"ops": {"q": {"top_docs": {"query": {"boolean": {"required": [{"match": {"tag": "t"}},
+        {"to_parent": {"path": "answers", "score": ")" + mode + R"(", "query": {"range": {"field": "answers.date", "lte": 3}}}}]}},
+        "limit": 3, "fields": ["id", "_score_"], "get_scores": true, "document_format": "rows")" + extra + "}}}}";
+  };
+  for (std::string mode : {"avg", "max", "min", "none"}) {
+    auto got = scores(q(mode, ""));
+    std::vector<std::string> keys;
+    for (auto& [id, score] : got) keys.push_back(id);
+    EXPECT_EQ(std::vector<std::string>({"q0", "q1", "q2"}), keys) << mode;
+    EXPECT_EQ(got["q0"], got["q2"]) << mode;
+    EXPECT_NE(std::string::npos, search(q(mode, R"(, "count_limit": -1)")).find(R"("found":11429)")) << mode;
+  }
+#ifndef NDEBUG
+  elementVerifications = 0;
+  NumericPredicateQuery::verificationObserver = countElementVerification;
+  auto got = ids(q("avg", ""));
+  NumericPredicateQuery::verificationObserver = nullptr;
+  EXPECT_EQ(std::vector<std::string>({"q0", "q1", "q2"}), got);
+  EXPECT_LT(elementVerifications, 20000) << elementVerifications;  // of 40000 elements
+#endif
 }
 
 }  // namespace
