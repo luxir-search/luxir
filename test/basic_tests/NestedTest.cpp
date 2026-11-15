@@ -505,6 +505,62 @@ TEST_F(NestedTest, toParentBesideASparseLeadVerifiesOnlyCandidates) {
 }
 
 
+// Counting to_parent beside a sparse lead: owner i is tagged "rare" when
+// i % 100 == 0 and holds answers dated i and i + 1 (rows in date order, so
+// the element column's zones prove later owners empty), none when
+// i % 700 == 0. A bounded count reports its limit with relation gte or the
+// true count with eq; only candidates whose answers can lie inside the range
+// are verified, each by its first matching answer.
+TEST_F(NestedTest, toParentConjunctionCountsVerifyOnlyPossibleCandidates) {
+  schema(R"({"fields": {"tag": "string",
+      "answers": {"type": "nested", "fields": {"date": {"type": "int", "multi": "array"}}}}})");
+  constexpr int32_t n = 20000;
+  CollectionHelper h = helper();
+  CollectionHelper::UpdateBuilder b;
+  for (int32_t i = 0; i < n; i++) {
+    std::string answers = i % 700 == 0 ? "[]"
+        : "[{\"date\": " + std::to_string(i) + "}, {\"date\": " + std::to_string(i + 1) + "}]";
+    auto& text = retained.emplace_back(R"({"id": "q)" + std::to_string(i) + R"(", "tag": ")"
+                                       + (i % 100 == 0 ? "rare" : "common") + R"(", "answers": )" + answers + "}");
+    b.addRaw([&](api::Map& map, std::pmr::memory_resource& mr) { EXPECT_TRUE(api::read_json(map, text, mr)); });
+  }
+  b.commit();
+  ASSERT_TRUE(h.submit(b).success);
+
+  // rare owners 0, 100, ..., 5000 except the answerless multiples of 700.
+  constexpr int64_t total = 43;
+  auto request = [](int64_t countLimit, std::string mode) {
+    return R"({"ops": {"q": {"top_docs": {"query": {"boolean": {"required": [{"match": {"tag": "rare"}},
+        {"to_parent": {"path": "answers", "score": ")" + mode + R"(", "query": {"range": {"field": "answers.date", "lte": 5000}}}}]}},
+        "limit": 3, "fields": ["id"], "get_scores": true, "count_limit": )" + std::to_string(countLimit) + "}}}}";
+  };
+  for (std::string mode : {"avg", "sum", "none"}) {
+    for (int64_t limit : {-1L, 10L, total - 1, total, total + 1, 10000L}) {
+      auto json = search(request(limit, mode));
+      // A bounded count may stop at its limit (gte) or finish exact (eq).
+      bool gte = json.find(R"("found_gte":true)") != std::string::npos;
+      EXPECT_TRUE(!gte || (limit > 0 && limit <= total)) << mode << " " << limit << ": " << json;
+      std::string found = R"("found":)" + std::to_string(gte ? limit : total) + ",";
+      EXPECT_NE(std::string::npos, json.find(found)) << mode << " " << limit << ": " << json;
+    }
+    EXPECT_EQ(std::vector<std::string>({"q100", "q200", "q300"}), ids(request(10, mode))) << mode;
+  }
+  auto sums = scores(R"({"ops": {"q": {"top_docs": {"query": {"boolean": {"filter": [{"match": {"tag": "rare"}}],
+      "required": [{"to_parent": {"path": "answers", "score": "sum", "query": {"range": {"field": "answers.date", "lte": 5000}}}}]}},
+      "limit": -1, "fields": ["id", "_score_"], "get_scores": true, "document_format": "rows"}}}})");
+  EXPECT_EQ(total, (int64_t)sums.size());
+  EXPECT_EQ(2.0, sums["q100"]);
+  EXPECT_EQ(1.0, sums["q5000"]);
+#ifndef NDEBUG
+  elementVerifications = 0;
+  NumericPredicateQuery::verificationObserver = countElementVerification;
+  EXPECT_NE(std::string::npos, search(request(-1, "avg")).find(R"("found":43)"));
+  NumericPredicateQuery::verificationObserver = nullptr;
+  // 200 candidates and 400 answers; about 51 can match, verified by one answer each.
+  EXPECT_LT(elementVerifications, 100) << elementVerifications;
+#endif
+}
+
 // A multi-valued int column where every document holds one value reads as
 // single-valued, and a merge with a segment holding arrays keeps both exact.
 TEST_F(NestedTest, multiValuedColumnsWithOneValueEachStayExactThroughMerges) {

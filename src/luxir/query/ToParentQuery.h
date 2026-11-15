@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "MinScoreQuery.h"
@@ -48,6 +49,7 @@ private:
 
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
+    Query::MembershipProof* proof;  // two-phase: element rows the child cannot match
     const OwnerMap& owners;
     OwnerMap::OwnerCursor ownerOf;
     ScoreMode mode;
@@ -57,6 +59,7 @@ private:
     bool scored;
     bool prune;
     bool twoPhase;           // see verify()
+    bool firstMatchDecides = false;  // see verify()
     bool exhausted = false;  // a constant score fell below the collector floor
     int32_t doc = -1;
     int32_t pending = -1;  // child's current doc not yet reduced (-1: not started)
@@ -147,31 +150,51 @@ private:
     // clause): the approximation is the owner of the child's next
     // approximation element, and verification confirms only that owner's
     // elements, so a rejected owner never scans the elements after it. The
-    // child is driven only through its own two-phase protocol.
+    // child is driven only through its own two-phase protocol. A membership
+    // proof from the child (column zones) skips elements no value of which
+    // can match, so an owner whose elements all lie there is never verified
+    // and the approximation lands past such runs of owners at once.
     int32_t approximate(int32_t target) {
       if (exhausted || target >= owners.ownerMaxDoc()) return doc = PostingsReader::END;
       // Point lookups: the candidates of a sparse lead jump, which a bulk
       // cursor pays for with a frame decode each.
       auto [begin, end] = owners.range(target);
-      int32_t c = child->approximationDocId();
-      if (c < begin) c = child->approximationAdvance(begin);
-      if (c == PostingsReader::END) return doc = PostingsReader::END;
-      if (c < end) {
+      for (;;) {
+        if (proof != nullptr) {
+          int32_t possible = proof->nextPossible(begin);
+          if (possible == PostingsReader::END) return doc = PostingsReader::END;
+          if (possible >= end) {
+            target = owners.owner(possible);
+            std::tie(begin, end) = owners.range(target);
+          }
+          begin = possible;
+        }
+        int32_t c = child->approximationDocId();
+        if (c < begin) c = child->approximationAdvance(begin);
+        if (c == PostingsReader::END) return doc = PostingsReader::END;
+        if (c >= end) {
+          target = owners.owner(c);
+          std::tie(begin, end) = owners.range(target);
+          begin = c;
+          if (proof != nullptr) continue;
+        }
         docEnd = end;
         return doc = target;
       }
-      doc = owners.owner(c);
-      docEnd = owners.range(doc).second;
-      return doc;
     }
 
+    // When neither the count bounds nor the score depend on how many
+    // elements match, the first matching element decides the owner.
     bool verify() {
       if (verified == doc) return verifiedMatch;
       verified = doc;
       int32_t end = docEnd;
       Run run = startRun();
       for (int32_t c = child->approximationDocId(); c < end; c = child->approximationNext()) {
-        if (child->matches()) addMatch(run);
+        if (child->matches()) {
+          addMatch(run);
+          if (firstMatchDecides) break;
+        }
       }
       return verifiedMatch = finishRun(run);
     }
@@ -185,12 +208,14 @@ private:
     }
 
   public:
-    Scorer(Query::Scorer* child, const OwnerMap& owners, ScoreMode mode, int32_t minChildren,
-           int32_t maxChildren, float multiplier, bool scored, bool prune, bool twoPhase)
-      : child(child), owners(owners), ownerOf(owners), mode(mode), minChildren(minChildren),
+    Scorer(Query::Scorer* child, Query::MembershipProof* proof, const OwnerMap& owners, ScoreMode mode,
+           int32_t minChildren, int32_t maxChildren, float multiplier, bool scored, bool prune, bool twoPhase)
+      : child(child), proof(proof), owners(owners), ownerOf(owners), mode(mode), minChildren(minChildren),
         maxChildren(maxChildren), multiplier(multiplier), scored(scored && mode != ScoreMode::NONE),
         prune(prune), twoPhase(twoPhase) {
       initBounds();
+      firstMatchDecides = minChildren <= 1 && maxChildren == std::numeric_limits<int32_t>::max()
+          && (!this->scored || (constant && mode != ScoreMode::SUM));
     }
 
     int32_t next() override {
@@ -269,7 +294,8 @@ private:
       Query::Scorer* buildScorer(MemPool& targetPool) override {
         Query::Scorer* childScorer = childPlan->build(targetPool);
         if (childScorer == nullptr) return nullptr;
-        return targetPool.make<Scorer>(childScorer, supplier.owners, supplier.mode, supplier.minChildren,
+        Query::MembershipProof* proof = twoPhase ? childPlan->buildMembershipProof(targetPool) : nullptr;
+        return targetPool.make<Scorer>(childScorer, proof, supplier.owners, supplier.mode, supplier.minChildren,
                                        supplier.maxChildren, supplier.multiplier, supplier.scored,
                                        supplier.prune, twoPhase);
       }

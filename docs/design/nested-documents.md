@@ -108,7 +108,12 @@ memory tracker and profiles but own their memos and filter-use registry.
   `to_parent`: its approximation is the owner of the child's next
   approximation element, and verification runs the child's own check over
   that owner's elements only, so a rejected owner never scans the element
-  matches after it.
+  matches after it. A membership proof from the child (a column predicate's
+  block and leaf zones) skips element rows no value of which can match, so
+  owners whose elements all lie there are passed over without a lookup, and
+  when neither the count bounds nor the score depend on how many elements
+  match (no bounds; unscored, or a constant element score with `max`,
+  `min` or `avg`) the first matching element decides the owner.
 - Prepare (kNN and other domain consumers) gets the owner domain descended
   to the live elements of eligible owners (`descendDomain`), so filters
   apply before candidate selection.
