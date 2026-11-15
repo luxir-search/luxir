@@ -21,6 +21,12 @@ class OwnershipShape {
   std::optional<MonoReader> owners;
 
 public:
+  struct Family {
+    int32_t owner;
+    int32_t first;
+    int32_t end;
+  };
+
   OwnershipShape(SegmentCore& core, const OwnershipDescriptor& descriptor,
                  int32_t parentCount, int32_t childCount);
 
@@ -39,38 +45,66 @@ public:
   // seeks restart; no reverse map is materialized for either direction.
   class Cursor {
     const OwnershipShape& shape;
-    int32_t parent = 0;
-    int32_t first = 0;
-    int32_t end = 0;
+    Family current{-1, 0, 0};
 
   public:
     explicit Cursor(const OwnershipShape& shape) : shape(shape) {}
-    int32_t owner(int32_t child) {
+
+    Family seek(int32_t parent) {
+      assert(parent >= 0 && parent < shape.nParents);
+      if (parent == current.owner) return current;
+      if (parent == current.owner + 1) {
+        current = {parent, current.end, (int32_t)shape.ends.valueAt(parent)};
+      } else {
+        auto [first, end] = shape.range(parent);
+        current = {parent, first, end};
+      }
+      return current;
+    }
+
+    // Parent positions may include the boundary just past the last parent.
+    int32_t firstChild(int32_t parent) const {
+      assert(parent >= 0 && parent <= shape.nParents);
+      if (parent == current.owner + 1) return current.end;
+      if (parent == current.owner) return current.first;
+      if (parent == 0) return 0;
+      if (parent == shape.nParents) return shape.nChildren;
+      return (int32_t)shape.ends.valueAt(parent - 1);
+    }
+
+    Family owner(int32_t child) {
       assert(child >= 0 && child < shape.nChildren);
       // Siblings stay in the current range without decoding either column again.
-      if (child >= first && child < end) return parent;
+      if (child >= current.first && child < current.end) return current;
       if (shape.owners) {
-        int64_t value = shape.owners->valueAt(child);
-        assert(value >= 0 && value < shape.nParents);
-        parent = (int32_t)value;
+        int32_t parent = (int32_t)shape.owners->valueAt(child);
+        assert(parent >= 0 && parent < shape.nParents);
+        auto [first, end] = shape.range(parent);
+        current = {parent, first, end};
       } else {
-        if (child < first) parent = 0;
-        parent = (int32_t)screaming::gallopLowerBound(
-            parent, shape.nParents, (int64_t)child + 1,
-            [&](int64_t index) { return shape.ends.valueAt(index); });
+        int32_t parent = child < current.first ? 0 : current.owner + 1;
+        int32_t first = parent ? current.end : 0;
+        int32_t end = 0;
+        // Keep the gallop's bracket: its last lower and upper values are the
+        // adjacent ends of the resulting family, so neither needs rereading.
+        parent = (int32_t)screaming::gallopLowerBound(parent, shape.nParents, (int64_t)child + 1,
+            [&](int64_t index) {
+              int64_t value = shape.ends.valueAt(index);
+              if (value <= child) first = (int32_t)value;
+              else end = (int32_t)value;
+              return value;
+            });
         assert(parent < shape.nParents);
+        current = {parent, first, end};
       }
-      auto range = shape.range(parent);
-      first = range.first;
-      end = range.second;
-      assert(child >= first && child < end);
-      return parent;
+      assert(child >= current.first && child < current.end);
+      return current;
     }
   };
 };
 
 inline int32_t OwnershipShape::owner(int32_t child) const {
-  return Cursor(*this).owner(child);
+  return Cursor(*this).owner(child).owner;
 }
 
 } // namespace luxir
