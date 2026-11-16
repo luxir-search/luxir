@@ -152,9 +152,11 @@ Filter results of nested clauses are cached like other filters.
 
 ## Operations on children: `domain.to`
 
-Queries can reach into children implicitly. Everything else that reads fields
-(facets, sorts, collapse keys, value expressions, returned fields) reads the
-fields of its own view. To run an operation over children, move its domain:
+Queries can reach into children implicitly, and returned fields can reach
+children and owners (see [Returning nested values](#returning-nested-values)).
+Everything else that reads fields (facets, sorts, collapse keys, value
+expressions) reads the fields of its own view. To run an operation over
+children, move its domain:
 
 ```json
 {"query":"body_w:camera", "filter":["items:(color:red AND size:L)"],
@@ -195,13 +197,62 @@ belong to:
 
 Every name in a request is resolved in the view where it appears. In the
 `items` view, `color` is `items.color` and `parts.material:steel` joins
-matching parts back to items. A dot always descends; a name never reaches
-upward or sideways.
+matching parts back to items. A dot always descends. Only returned-field
+selectors can name an owner's field; no name reaches sideways.
 
 Returned keys are relative too. A child view returns its own values under
-local names, and `fields: ["*"]` selects only the fields of that view. A root
-document's returned fields do not include its nested values. The virtual
-`_version_` is available in child views and reports the owning root's version.
+local names, and `fields: ["*"]` selects only the fields of that view. The
+virtual `_version_` is available in child views and reports the owning root's
+version.
+
+## Returning nested values
+
+`fields` can return related rows without changing the query or the view of
+the result.
+
+| Selector | Returned value |
+|---|---|
+| `*` | the view's own fields; never descends into a nested path |
+| `items` | an array with one object per item, in row order, each with its whole subtree |
+| `items.color` | an array with one object per item holding its `color`; an empty object where it is missing |
+| `items.color`, `items.size` | one array, with both selections in each object |
+| `items.parts.material` | item objects holding part arrays that select `material` |
+| `items.*` | each item's own fields, without the nested paths below it |
+| `../name` | the immediate owner's field, under the key `../name` |
+| `../../name` | a field two levels up, under that key |
+| `/name` | the root document's field, under the key `/name` |
+| `../*`, `/*` | the owner's or root's own fields, each key prefixed as written |
+
+Return item data beside each root hit:
+
+```json
+{"ops":{"q":{"top_docs":{"query":"title_t:shirt",
+  "fields":["id","items.color","items.size","items.parts.material"]}}}}
+```
+
+Return the item color and the document id with each matching part:
+
+```json
+{"ops":{"q":{"domain":{"to":"items.parts"},"top_docs":{
+  "query":"material:steel","fields":["material","../color","/id"]}}}}
+```
+
+- A nested path is returned only when named. Its array holds all children of
+  the hit, including those that did not match the query.
+- The array is rebuilt from the indexed child rows with the same retrieval
+  rules as a query in that view. It is not a copy of the submitted value:
+  field order, unretrievable values and the difference between an absent,
+  null and empty list are not restored. An empty object is a row and comes
+  back as an empty object.
+- A document with no rows on the path has no such key in row output; column
+  output shows a null cell.
+- An upward selector names a field or a pattern. `..` above the root, a bare
+  `..` or `/`, and up then down (`../reviews.rating`) are rejected.
+- There is no cap on the number of children returned per hit. Large families
+  make large responses, and their size counts against the request memory
+  limit.
+- `_version_` on any row is its owning root's version. Scores of owners and
+  children are not returned.
 
 ## Chunks and vectors
 
@@ -232,8 +283,8 @@ of each child matter together.
 
 ## Not supported yet
 
-- Returning nested values with a root document, or a root's fields with a
-  child row.
+- Storing the submitted nested value verbatim.
+- Owner fields in sorts, facets, collapse keys and value expressions.
 - Score modes other than `max` and `none`, and bounds on the number of
   matching children.
 - kNN counted in distinct documents.
