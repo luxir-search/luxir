@@ -153,6 +153,12 @@ TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
 
   CollectionHelper helper("main");
   buildMergedIndex(helper);
+  CollectionHelper::UpdateBuilder nested;
+  nested.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"nested","items_nested":[{"text_w":"alpha beta","parts_nested":{"n_i":2}},{}]})", arena));
+  });
+  nested.commit(); ASSERT_TRUE(helper.submit(nested).success);
+  helper.getIndexWriter()->mergeSegments();
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());

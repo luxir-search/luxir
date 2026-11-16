@@ -310,9 +310,9 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
 
 FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
                         bool& hasRangeTable, bool& hasMidFieldTail) {
-  std::array<PostingsReader*, 2> readers = {
-      &left.reader->segments()[0].postingsReader(),
-      &right.reader->segments()[0].postingsReader()};
+  std::array<std::shared_ptr<SegmentCore>, 2> readers = {
+      left.reader->segments()[0].segmentCoreShared(),
+      right.reader->segments()[0].segmentCoreShared()};
   std::array<LiveDocs*, 2> liveDocs = {nullptr, nullptr};
   RAMDir outputDir;
   PostingsWriter writer(outputDir, 900, 1, -1);
@@ -329,10 +329,11 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   auto& outputReader = outputReaderCore.rootReader();
   VersionRuns::Cursor outputBirths(outputReader.core().versionRuns());
   int32_t base = 0;
-  for (auto* reader : readers) {
-    VersionRuns::Cursor inputBirths(reader->core().versionRuns());
-    for (int32_t doc = 0; doc < reader->maxDoc(); doc++) EXPECT_EQ(inputBirths.birth(doc), outputBirths.birth(base + doc));
-    base += reader->maxDoc();
+  for (const auto& core : readers) {
+    VersionRuns::Cursor inputBirths(core->versionRuns());
+    int32_t count = core->rootReader().maxDoc();
+    for (int32_t doc = 0; doc < count; doc++) EXPECT_EQ(inputBirths.birth(doc), outputBirths.birth(base + doc));
+    base += count;
   }
   MemPool pool;
   auto* fields = outputReader.fieldInfo("body");
@@ -588,10 +589,10 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   TestIndex sources;
   buildWideDictionarySources(sources, schema);
 
-  std::vector<PostingsReader*> readers;
+  std::vector<std::shared_ptr<SegmentCore>> readers;
   std::vector<LiveDocs*> liveDocs;
   for (auto& segment : sources.reader->segments()) {
-    readers.push_back(&segment.postingsReader());
+    readers.push_back(segment.segmentCoreShared());
     liveDocs.push_back(nullptr);
     SegFieldInfo info = readBodyInfo(sources.pool, segment);
     EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);

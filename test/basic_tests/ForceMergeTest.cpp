@@ -195,6 +195,11 @@ TEST_F(ForceMergeTest, mergeFailureReturnsErrorAndPreservesSources) {
   writer->mergePolicy->setMergeFactor(100);
   ASSERT_TRUE(addSegment(helper, "failure-a-", 2));
   ASSERT_TRUE(addSegment(helper, "failure-b-", 2));
+  CollectionHelper::UpdateBuilder nested;
+  nested.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"nested","items_nested":{"parts_nested":{"tag_s":"intact"}}})", arena));
+  });
+  nested.commit(); ASSERT_TRUE(helper.submit(nested).success);
   helper.commit({"vec.embedding_v"});
   ASSERT_TRUE(writer->testActiveVectorOverlayName("vec.embedding_v"));
 
@@ -211,9 +216,14 @@ TEST_F(ForceMergeTest, mergeFailureReturnsErrorAndPreservesSources) {
   EXPECT_FALSE(result.success);
   EXPECT_EQ(IndexResult::Status::ERROR, result.status);
   EXPECT_NE(std::string::npos, result.error_message.find("Data commit succeeded"));
-  EXPECT_EQ(2u, helper.durableSegmentCount());
-  EXPECT_EQ((std::vector<std::string>{"failure-a-0", "failure-a-1", "failure-b-0", "failure-b-1"}),
+  EXPECT_EQ(3u, helper.durableSegmentCount());
+  EXPECT_EQ((std::vector<std::string>{"failure-a-0", "failure-a-1", "failure-b-0", "failure-b-1", "nested"}),
             allIds(helper));
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs().exprQuery("items_nested.parts_nested.tag_s:intact").countLimit().limit(0);
+  req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_TRUE(commit(helper, 1).success);
+  EXPECT_EQ(1u, helper.durableSegmentCount());
 }
 
 TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecovers) {

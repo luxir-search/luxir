@@ -3,6 +3,9 @@
 
 #pragma once
 #include "luxir/reader/SegmentCore.h"
+#include "luxir/reader/OwnershipShape.h"
+#include <map>
+#include <set>
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
@@ -82,14 +85,14 @@ class SegmentMerger {
 
   struct Space {
     SpaceOrdinal ordinal;
-    std::span<PostingsReader*> preaders;
+    std::vector<PostingsReader*> preaders;
     std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
     std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
     std::vector<Segment> segs;
     int32_t maxDoc = 0;
 
-    Space(SpaceOrdinal ordinal, std::span<PostingsReader*> preaders, std::span<LiveDocs*> liveDocs)
-        : ordinal(ordinal), preaders(preaders), liveDocs(liveDocs) {}
+    explicit Space(SpaceOrdinal ordinal, std::span<LiveDocs*> liveDocs = {})
+        : ordinal(ordinal), liveDocs(liveDocs) {}
   };
 
   struct MergeFieldInfo {
@@ -574,7 +577,9 @@ class SegmentMerger {
     }
   };
 
+  std::span<const std::shared_ptr<SegmentCore>> cores;
   Space root;
+  std::vector<std::unique_ptr<Space>> children;
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
   // Current schema, for per-resource stored-fields formats.
@@ -588,6 +593,16 @@ class SegmentMerger {
 
 public:
 
+  size_t rowMapBytes() const {
+    size_t bytes = 0;
+    auto count = [&](const Space& space) {
+      for (const auto& seg : space.segs) bytes += seg.remap.capacity() * sizeof(int32_t);
+    };
+    count(root);
+    for (const auto& child : children) count(*child);
+    return bytes;
+  }
+
   int32_t mapDocId(size_t sourceOrd, int32_t localDocId) const {
     auto [docId, deleted] = root.segs[sourceOrd].remapDocId(localDocId);
     return deleted ? -1 : docId;
@@ -595,20 +610,22 @@ public:
 
 
 
-  SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
+  SegmentMerger(std::span<const std::shared_ptr<SegmentCore>> cores, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges, const Schema& schema,
                 StoredDictionaryRegistry& storedDictionaries)
-  : root{SpaceOrdinal::ROOT, preaders, liveDocs}, postingsWriter(postingsWriter), ramBudget(ramBudget),
+  : cores(cores), root(SpaceOrdinal::ROOT, liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     schema(schema), storedDictionaries(storedDictionaries),
-    estimatedOutputBytes(estimateOutputBytes(preaders)),
+    estimatedOutputBytes(estimateOutputBytes(cores)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
     termPartitionMaxRanges(termPartitionMaxRanges)
   {
-    assert(preaders.size() == liveDocs.size());
+    assert(cores.size() == liveDocs.size());
+    root.preaders.reserve(cores.size());
+    for (const auto& core : cores) root.preaders.push_back(&core->rootReader());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
     assert(termPartitionMaxRanges == MergeCostModel::DERIVED_TERM_RANGES
            || (termPartitionMaxRanges >= 2
@@ -621,11 +638,6 @@ public:
   }
 
   void merge() {
-    for (const auto* reader : root.preaders) {
-      if (reader->core().spaces().size() != 1 || reader->spaceOrdinal() != SpaceOrdinal::ROOT) {
-        throw std::invalid_argument("merging multi-space segment bundles is not supported");
-      }
-    }
     auto guard = MemPool::threadLocalPoolGuard();
     prepareSpace(root);
     // Set maxDoc to total number of live documents
@@ -634,8 +646,11 @@ public:
     MERGER_DEBUG("SegmentMerger: total live docs to merge: {}, estimated bytes: {}, stream budget: {}",
                  root.maxDoc, estimatedOutputBytes, streamBudget);
     writeRootVersions();
+    prepareChildren();
+    Signal::emit("mergeRowMaps", this);
     std::vector<MergeAdmissionDriver::Batch> batches;
     planFields(root, batches);
+    for (auto& child : children) planFields(*child, batches);
     std::sort(batches.begin(), batches.end(), MergeAdmissionDriver::longestFirst);
 
     MergeAdmissionDriver driver(*this, ramBudget, streamBudget, std::move(batches));
@@ -674,12 +689,90 @@ private:
     }
   }
 
+  void prepareChildren() {
+    std::set<std::string> paths;
+    for (const auto& core : cores) {
+      for (size_t i = 1; i < core->spaces().size(); i++) paths.insert(core->spaces()[i].path);
+    }
+    std::map<std::string, Space*, std::less<>> spaces;
+    for (const auto& path : paths) {
+      auto parentPath = spaceParentPath(path);
+      auto found = spaces.find(parentPath);
+      Space* parent = parentPath.empty() ? &root : found == spaces.end() ? nullptr : found->second;
+      if (!parent) continue;
+      auto space = std::make_unique<Space>(SpaceOrdinal::ROOT);
+      space->preaders.reserve(cores.size());
+      space->segs.reserve(cores.size());
+      space->fieldReaders.reserve(cores.size());
+      int64_t total = 0;
+      for (size_t i = 0; i < cores.size(); i++) {
+        auto* reader = cores[i]->spaceReader(path);
+        const auto& owner = parent->segs[i];
+        int32_t count = 0;
+        if (reader && owner.numLive) {
+          if (owner.numLive == owner.postingsReader->maxDoc()) count = reader->maxDoc();
+          else {
+            OwnershipShape::Cursor cursor(*cores[i]->ownership(path));
+            for (int32_t p = 0; p < owner.postingsReader->maxDoc(); p++) {
+              if (owner.remapDocId(p).second) continue;
+              auto family = cursor.seek(p);
+              count += family.end - family.first;
+            }
+          }
+        }
+        space->preaders.push_back(reader);
+        FieldReader* fields = nullptr;
+        if (count) {
+          space->fieldReaders.emplace_back(*reader);
+          fields = &space->fieldReaders.back();
+        }
+        space->segs.emplace_back(count ? reader : nullptr, fields, count, (int32_t)total, (int)i);
+        total += count;
+      }
+      if (!total) continue;
+      if (!MergeCostModel::docsFit(0, total)) throw std::runtime_error("merged row space exceeds row limit: " + path);
+      space->maxDoc = (int32_t)total;
+      space->ordinal = postingsWriter.addSpace(path);
+      auto output = postingsWriter.getOutputStream();
+      MonoWriter ends(postingsWriter.pool, *output);
+      int32_t end = 0, owners = 0;
+      for (size_t i = 0; i < cores.size(); i++) {
+        const auto& owner = parent->segs[i];
+        auto& child = space->segs[i];
+        auto* reader = space->preaders[i];
+        if (child.numLive && child.numLive != reader->maxDoc()) child.remap.assign(reader->maxDoc(), -1);
+        int32_t local = 0;
+        std::optional<OwnershipShape::Cursor> cursor;
+        if (reader) cursor.emplace(*cores[i]->ownership(path));
+        if (!owner.numLive) continue;
+        for (int32_t p = 0; p < owner.postingsReader->maxDoc(); p++) {
+          if (owner.remapDocId(p).second) continue;
+          auto family = cursor ? cursor->seek(p) : OwnershipShape::Family{p, 0, 0};
+          if (!child.remap.empty()) {
+            for (int32_t row = family.first; row < family.end; row++) child.remap[row] = local++;
+          } else local += family.end - family.first;
+          end += family.end - family.first;
+          ends.addInt64(end);
+          owners++;
+        }
+        assert(local == child.numLive);
+      }
+      unused(owners);
+      assert(owners == parent->maxDoc && end == space->maxDoc);
+      ends.finish();
+      postingsWriter.finishSpace(space->ordinal, space->maxDoc, {ends.blockLoc, ends.metaOff, {}, 0});
+      output.reset();
+      spaces.emplace(path, space.get());
+      children.push_back(std::move(space));
+    }
+  }
+
   void planFields(Space& space, std::vector<MergeAdmissionDriver::Batch>& batches) {
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
     std::vector<Segment*> segPtrs;
     segPtrs.reserve(space.segs.size());
     for (auto& seg : space.segs) {
-      if (seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
+      if (seg.fieldReader && seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
     }
     IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segPtrs);
 
@@ -731,10 +824,10 @@ private:
     }
   }
 
-  static uint64_t estimateOutputBytes(std::span<PostingsReader*> readers) {
+  static uint64_t estimateOutputBytes(std::span<const std::shared_ptr<SegmentCore>> cores) {
     uint64_t total = 0;
-    for (const auto* reader : readers) {
-      uint64_t bytes = reader->core().sizeInBytes();
+    for (const auto& core : cores) {
+      uint64_t bytes = core->sizeInBytes();
       total = bytes > std::numeric_limits<uint64_t>::max() - total
           ? std::numeric_limits<uint64_t>::max() : total + bytes;
     }
@@ -1576,6 +1669,7 @@ private:
       output.docsBase = docsOut.slocation();
       output.posBase = posOut.slocation();
       PostingsWriter::IndexFieldInfo rangeFieldInfo{};
+      rangeFieldInfo.space = space.ordinal;
       rangeFieldInfo.type = FieldType::TEXT;
       rangeFieldInfo.flags = flags;
 
@@ -2373,6 +2467,7 @@ private:
       auto base = seg.base;
 
       if (field == nullptr) {
+        if (seg.numLive == 0) continue;
         // If the field didn't exist for this segment, then output can't be dense.
         // If no docsWriter exists yet (because all full) we need to create one and fill it in up until base.
         if (docsWriter == nullptr) {

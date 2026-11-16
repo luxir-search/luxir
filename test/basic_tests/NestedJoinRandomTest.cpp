@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
+#include "luxir/index/SegmentMerger.h"
 #include <map>
 #include <set>
 #include "test/CollectionHelper.h"
@@ -308,42 +309,74 @@ TEST_F(NestedJoinRandomTest, doubleExclusionOfJoinKeepsAnExactScorerProtocol) {
 }
 
 TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
-  SCOPED_TRACE("seed=" + std::to_string(SEED));
-  std::cerr << "NestedJoinRandomTest seed=" << SEED << '\n';
-  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
-      .maxBytes = 4 * 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
-  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
-  for (int32_t id = 0; id < 64; id++) model.push_back(generate(id));
-  model[1].items = {{nextTag++, {"red"}, "S", "alpha", {"steel"}, 100},
-                    {nextTag++, {"blue"}, "L", "beta", {"wood"}, 600}};
-  model[2].items = {ItemModel{}}; model[4].items.clear(); model[4].present = false;
-  model[5].items.clear(); model[5].present = true;
-  for (int batch = 0; batch < 3; batch++) {
-    CollectionHelper::UpdateBuilder input;
-    for (int id = batch * 64 / 3; id < (batch + 1) * 64 / 3; id++) add(input, model[id]);
-    input.overwrite().commit(); ASSERT_TRUE(helper.submit(input).success);
-  }
-  ASSERT_EQ(3u, helper.durableSegmentCount());
-  std::vector<JoinCase> cases;
-  for (int i = 0; i < 4 * KINDS; i++) cases.push_back({i % KINDS, colors[random() % colors.size()],
-      sizes[random() % sizes.size()], materials[random() % materials.size()], 100, 500});
-  cases[0].color = "red"; cases[0].size = "L";
-  EXPECT_TRUE(matches(model[1], cases[0])); auto same = cases[0]; same.kind = 1; EXPECT_FALSE(matches(model[1], same));
-  for (int phase = 0; phase < 2; phase++) {
-    SCOPED_TRACE("phase=" + std::to_string(phase));
-    // Leave admitted raw memberships resident across the root mutations.
-    for (bool enabled : phase == 0 ? std::array{false, true} : std::array{true, false}) {
-      cache->resize(enabled ? 4 * 1024 * 1024 : 0);
-      auto hits = cache->counters().hits;
-      checkQueries(cases, enabled); checkDomains(); checkScores(false); checkScores(true);
-      if (enabled) { EXPECT_GT(cache->counters().hits, hits); EXPECT_GT(cache->counters().admissions, 0u); }
+  size_t peakMaps = 0;
+  Signal::listen("mergeRowMaps", [&](void* value, void*, void*) -> void* {
+    peakMaps = std::max(peakMaps, ((SegmentMerger*)value)->rowMapBytes());
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeRowMaps"); });
+  for (uint64_t seed : {SEED, (uint64_t)42, (uint64_t)0xdeadbeef}) {
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    std::cerr << "NestedJoinRandomTest seed=" << seed << '\n';
+    helper.clear(); model.clear(); nextTag = 0; state = seed;
+    helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+        .maxBytes = 4 * 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+    for (int32_t id = 0; id < 64; id++) model.push_back(generate(id));
+    model[1].items = {{nextTag++, {"red"}, "S", "alpha", {"steel"}, 100},
+                      {nextTag++, {"blue"}, "L", "beta", {"wood"}, 600}};
+    model[2].items = {ItemModel{}}; model[4].items.clear(); model[4].present = false;
+    model[5].items.clear(); model[5].present = true;
+    for (int batch = 0; batch < 3; batch++) {
+      CollectionHelper::UpdateBuilder input;
+      for (int id = batch * 64 / 3; id < (batch + 1) * 64 / 3; id++) add(input, model[id]);
+      input.overwrite().commit(); ASSERT_TRUE(helper.submit(input).success);
     }
-    if (phase != 0) break;
-    CollectionHelper::UpdateBuilder change;
-    for (int id : {0, 7, 8}) { change.remove(model[id].id); model[id].live = false; }
-    for (int id : {2, 11, 31, 11}) { model[id] = generate(id); add(change, model[id]); }
-    change.overwrite().commit(); ASSERT_TRUE(helper.submit(change).success);
+    ASSERT_EQ(3u, helper.durableSegmentCount());
+    std::vector<JoinCase> cases;
+    for (int i = 0; i < 4 * KINDS; i++) cases.push_back({i % KINDS, colors[random() % colors.size()],
+        sizes[random() % sizes.size()], materials[random() % materials.size()], 100, 500});
+    cases[0].color = "red"; cases[0].size = "L";
+    EXPECT_TRUE(matches(model[1], cases[0])); auto same = cases[0]; same.kind = 1; EXPECT_FALSE(matches(model[1], same));
+    for (int phase = 0; phase < 4; phase++) {
+      SCOPED_TRACE("phase=" + std::to_string(phase));
+      // Leave admitted raw memberships resident across the root mutations.
+      for (bool enabled : phase % 2 == 0 ? std::array{false, true} : std::array{true, false}) {
+        cache->resize(enabled ? 4 * 1024 * 1024 : 0);
+        auto hits = cache->counters().hits;
+        checkQueries(cases, enabled); checkDomains(); checkScores(false); checkScores(true);
+        if (enabled) { EXPECT_GT(cache->counters().hits, hits); EXPECT_GT(cache->counters().admissions, 0u); }
+      }
+      if (phase == 0 || phase == 2) {
+        CollectionHelper::UpdateBuilder merge;
+        merge.commit(true, phase == 0 ? 2 : 1);
+        ASSERT_TRUE(helper.submit(merge).success);
+        ASSERT_EQ(phase == 0 ? 2u : 1u, helper.durableSegmentCount());
+      } else if (phase == 1) {
+        CollectionHelper::UpdateBuilder change;
+        for (int id : {0, 7, 8}) { change.remove(model[id].id); model[id].live = false; }
+        for (int id : {2, 11, 31, 11}) { model[id] = generate(id); add(change, model[id]); }
+        change.overwrite().commit(); ASSERT_TRUE(helper.submit(change).success);
+      }
+
+    }
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    std::array<int32_t, 3> rows{};
+    for (const auto& root : model) if (root.live) {
+      rows[0]++; rows[1] += (int32_t)root.items.size();
+      for (const auto& item : root.items) rows[2] += (int32_t)item.parts.size();
+    }
+    const char* paths[]{"", "items_nested", "items_nested.parts_nested"};
+    for (size_t i = 0; i < rows.size(); i++) {
+      auto* space = reader->segments()[0].segmentCore().spaceReader(paths[i]);
+      ASSERT_NE(nullptr, space); EXPECT_EQ(rows[i], space->maxDoc());
+    }
+    EXPECT_EQ(reader->maxDoc(), reader->liveDocs());
   }
+  std::cerr << "NestedJoinRandomTest peak map bytes=" << peakMaps << '\n';
+  EXPECT_GT(peakMaps, 0u);
 }
 
 } // namespace

@@ -238,7 +238,7 @@ TEST_F(NestedIngestTest, rowBoundArithmeticCannotOverflow) {
   EXPECT_TRUE(Inverter::rowsFit(PostingsReader::MAX_SEGMENT_DOCS, 1));
 }
 
-TEST_F(NestedIngestTest, mergesSkipNestedBundlesAndReportAnUnreachableForcedTarget) {
+TEST_F(NestedIngestTest, mergesCompactNestedAndRootOnlyBundles) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
   writer->mergePolicy->setMergeFactor(2);
@@ -251,9 +251,8 @@ TEST_F(NestedIngestTest, mergesSkipNestedBundlesAndReportAnUnreachableForcedTarg
   CollectionHelper::UpdateBuilder force;
   force.commit(true, 1);
   auto result = helper.submit(force);
-  EXPECT_FALSE(result.success);
-  EXPECT_NE(std::string::npos, result.error_message.find("nested"));
-  EXPECT_EQ(2u, helper.durableSegmentCount());
+  EXPECT_TRUE(result.success);
+  EXPECT_EQ(1u, helper.durableSegmentCount());
   EXPECT_EQ(2, reader(helper)->view("items_nested")->maxDoc());
 }
 
@@ -301,6 +300,15 @@ TEST_F(NestedIngestTest, childOverlayBuildsOnItsOwnReaderAndServesAJoinedKnn) {
   auto child = root->view("items_nested");
   auto aux = child->segments()[0].getAuxReader("vec.items_nested.embedding_v");
   ASSERT_NE(nullptr, dynamic_cast<const VectorAuxReader*>(aux.get()));
+  ASSERT_TRUE(ingest(helper, {R"({"id":"c","items_nested":{"embedding_v":[20,0]}})"}).success);
+  ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  auto builds = VectorIndexBuilder::ivfMergeBuildCountForTests.load();
+  CollectionHelper::UpdateBuilder compact;
+  compact.commit(true, 1); ASSERT_TRUE(helper.submit(compact).success);
+  auto merged = reader(helper)->view("items_nested");
+  ASSERT_EQ(1u, merged->segments().size()); EXPECT_EQ(3, merged->maxDoc());
+  EXPECT_GT(VectorIndexBuilder::ivfMergeBuildCountForTests.load(), builds);
+  EXPECT_NE(nullptr, merged->segments()[0].getAuxReader("vec.items_nested.embedding_v"));
   auto req = localReq(helper.getSearchEngine());
   auto knn = qb::knn(req->mr, "embedding_v", {1.0f, 0.0f}, 1, 1);
   req->topDocs().countLimit().fields({"id"}).rawQuery() = qb::toParent(req->mr, "items_nested", knn);
@@ -311,7 +319,7 @@ TEST_F(NestedIngestTest, childOverlayBuildsOnItsOwnReaderAndServesAJoinedKnn) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "a")));
 }
 
-TEST_F(NestedIngestTest, reopenedBundlesKeepShapesAndStayOutsideAutomaticMerges) {
+TEST_F(NestedIngestTest, reopenedBundlesKeepShapesThroughAutomaticMerges) {
   auto path = std::filesystem::temp_directory_path() / ("luxir-nested-" + newUuid());
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   LuxirConfig config;
@@ -332,9 +340,14 @@ TEST_F(NestedIngestTest, reopenedBundlesKeepShapesAndStayOutsideAutomaticMerges)
   writer->updateGraph->wait_for_all();
   helper.commit();
   EXPECT_EQ(2u, helper.durableSegmentCount());
+  CollectionHelper::UpdateBuilder compact;
+  compact.commit(true, 1); ASSERT_TRUE(helper.submit(compact).success);
+  EXPECT_EQ(1u, helper.durableSegmentCount());
   EXPECT_EQ(1u, joined(helper, "old").size());
   ASSERT_TRUE(helper.deleteById("old", UpdateMessage::COMMIT).success);
   EXPECT_TRUE(joined(helper, "old").empty());
+  writer->mergeSegments();
+  EXPECT_EQ(nullptr, reader(helper)->segments()[0].segmentCore().spaceReader("items_nested"));
 }
 
 } // namespace
