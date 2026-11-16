@@ -9199,7 +9199,17 @@ class BooleanQuery::Weight final : public Query::Weight {
         return maskSupplierAccess(required);
       }
       if (hasUnknownElision(optionalShapeSuppliers, unboundedContext)) {
-        return maskSupplierAccess({});
+        auto shape = maskSupplierAccess({});
+        // A union of exact children stays exact even when resolving may
+        // elide some children or leave just one of them.
+        if ((!hasRequired || required.reportedTwoPhase == Query::ReportedTwoPhase::NO)
+            && std::all_of(optionalShapeSuppliers.begin(), optionalShapeSuppliers.end(), [&](auto* child) {
+              if (!child) return true;
+              auto member = child->describeScorer(unboundedContext);
+              return member.matchState == Query::MatchState::EMPTY
+                  || member.reportedTwoPhase == Query::ReportedTwoPhase::NO;
+            })) shape.reportedTwoPhase = Query::ReportedTwoPhase::NO;
+        return shape;
       }
 
       Query::ScorerShape optional =
@@ -9229,6 +9239,13 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (hasUnknownElision(prohibitedShapeSuppliers, unboundedContext)) {
+        // Excluding is exact to its parent. If the positive side is already
+        // exact, eliding an empty exclusion cannot change that protocol.
+        if (positive.reportedTwoPhase == Query::ReportedTwoPhase::NO) {
+          auto shape = opaqueShape(positive.matchState);
+          shape.competitiveFloorPays = positive.competitiveFloorPays;
+          return maskSupplierAccess(shape);
+        }
         return maskSupplierAccess({});
       }
       if (nonemptyCount(prohibitedShapeSuppliers, unboundedContext) != 0) {
