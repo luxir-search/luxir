@@ -171,6 +171,30 @@ TEST_F(BoundedCountTest, threeClauseCountInvariants) {
   }
 }
 
+// A scored conjunction's bounded count is counted apart from its ranking: hits
+// and scores are the uncounted ranking's, and the total is exact up to the
+// limit and the limit (gte) past it, across segments and deletes. The count
+// stops in the first segment that passes the limit.
+TEST_F(BoundedCountTest, conjunctionCountsApartFromRanking) {
+  std::string query = "body_w:alpha AND n_i:<1300";
+  ASSERT_TRUE(CollectionHelper("bounded").deleteByIds({"0", "1", "2"}, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    SkipStatsScope stats;
+    SkipStats::enabled = parallel == 1;
+    auto uncounted = run(search(query, 0), parallel);
+    for (int64_t limit : {(int64_t)-1, (int64_t)10, (int64_t)1296, (int64_t)1297, (int64_t)1298, (int64_t)10000}) {
+      SkipStats::reset();
+      auto bounded = run(search(query, limit), parallel);
+      bool gte = limit > 0 && limit < 1297;
+      EXPECT_EQ(gte, bounded->docList()->found_gte) << limit;
+      EXPECT_EQ(gte ? limit : 1297, bounded->getMatchCount()) << limit;
+      EXPECT_EQ(ranked(*uncounted), ranked(*bounded)) << limit;
+      if (parallel == 1 && limit == 10) { EXPECT_EQ(1, SkipStats::boundedCountSegments); }
+      if (parallel == 1 && limit == 10000) { EXPECT_EQ(4, SkipStats::boundedCountSegments); }
+    }
+  }
+}
+
 TEST_F(BoundedCountTest, exactFallbacksAndValidation) {
   std::string query = "body_w:beta OR body_w:gamma";
   for (std::string extra : {R"(,"ops":{"c":{"field_facet":{"field":"color_s"}}})",

@@ -122,6 +122,10 @@ public:
   // complete constant-scoring top-k requests, and disables the limit-only
   // bounded drain for parity tests.
   static inline bool disableConstantWindowCaptureForTests = false;
+  // A bounded count pass counts ranges of this many docids (several count
+  // windows), checking the shared total after each: a stop overshoots the
+  // limit by at most one range.
+  static inline int32_t boundedCountRangeDocsForTests = 1 << 16;
 
   enum class ConstantScoreDisposition : uint8_t {
     NOT_CONSTANT_TOP_K,
@@ -611,6 +615,9 @@ public:
   CollectionRequirements requirements;
   // The requested quantity stays in requirements; exact routes need no hold.
   bool boundedCount = false;
+  // Unscored membership for a bounded count counted apart from ranking (see
+  // boundedCountThenCollectTopK); null keeps the held-threshold collection.
+  Query::Weight* boundedCountWeight = nullptr;
   bool countLimitProven = false;
   // The request permits an estimate of this bounded count. The estimator
   // samples through the ranking weight, scored with pruning allowed, so lazy
@@ -658,7 +665,7 @@ public:
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, boundedCountWeight}) {
       if (source) source->releaseSegmentState(segment);
     }
     for (auto* source : filterWeights) source->releaseSegmentState(segment);
@@ -671,7 +678,7 @@ public:
 
   bool facetBucketSharesSegmentState() const override {
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, boundedCountWeight}) {
       if (source && source->hasReleasableSegmentState()) return true;
     }
     return std::ranges::any_of(filterWeights, [](const auto* source) {
@@ -741,6 +748,7 @@ public:
       };
       if (op.boundedCount) {
         scoreAccumulator.holdUntilHits(op.requirements.countLimit, op.countLimitProven);
+        boundedTotal.setLimit(op.requirements.countLimit);
       }
 
       if (op.subOps.size() > 0) {
@@ -787,6 +795,10 @@ public:
 
     AtomicMerger<MergeableCollector> collectorMerger;
     MaxScoreAccumulator scoreAccumulator;
+    // Split bounded counts: the shared total, and a threshold open from the
+    // first page for their ranking passes.
+    BoundedHitTotal boundedTotal;
+    MaxScoreAccumulator rankingAccumulator;
 
 
     // Calc pins finalized eligibility and its replayable prepared SegmentSource
@@ -1093,6 +1105,84 @@ public:
         int32_t maxDoc, bool allowPruning,
         BulkScorer* exactScorer = nullptr) {
       int64_t before = collector.totalHits();
+      rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
+               maxDoc, allowPruning, allowPruning ? &scoreAccumulator : nullptr,
+               exactScorer);
+      int64_t ranked = collector.totalHits() - before;
+      assert(count >= ranked);
+      collector.hitCount += count - ranked;
+    }
+
+    // This segment's matches added to the request's bounded total with the
+    // unscored weight, a docid range at a time. Returns the segment's exact
+    // count, or nullopt once the total passes the limit here or in another
+    // segment.
+    std::optional<int64_t> countBounded(
+        MemPool& pool, IndexReader::Segment& seg, DocSet* collectorFilter) {
+      int32_t rangeDocs = TopDocsReq::boundedCountRangeDocsForTests;
+      if (boundedTotal.exceeded()) return std::nullopt;
+      auto* countSupplier = thisOp().boundedCountWeight->scorerSupplier(pool, seg);
+      if (countSupplier == nullptr) return 0;
+      skipCount(SkipStats::boundedCountSegments);
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto plan = countSupplier->planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      BulkScorer* bulk = nullptr;
+      Query::Scorer* scorer = nullptr;
+      if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+        bulk = countSupplier->buildBulk(pool, plan);
+      } else {
+        countSupplier->recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext, plan);
+      }
+      if (bulk == nullptr) {
+        scorer = buildPullScorer(pool, *countSupplier);
+        if (scorer == nullptr) return 0;
+      }
+      int64_t count = 0;
+      int32_t maxDoc = seg.maxDoc();
+      for (int32_t min = 0; min < maxDoc;) {
+        int32_t max = (int32_t) std::min<int64_t>(maxDoc, (int64_t) min + rangeDocs);
+        int64_t matches = bulk != nullptr
+            ? countMatchesInRange(bulk, collectorFilter, min, max)
+            : countMatchesInRange(scorer, collectorFilter, min, max);
+        count += matches;
+        if (boundedTotal.add(matches)) {
+          if (max < maxDoc) skipCount(SkipStats::boundedCountStops);
+          return std::nullopt;
+        }
+        min = max;
+      }
+      return count;
+    }
+
+    // A bounded count apart from ranking: the count pass stops at the limit,
+    // and ranking prunes from its first page. The total is exact unless it
+    // passed the limit, which the emission reports as at least the limit.
+    void boundedCountThenCollectTopK(
+        MemPool& pool, int32_t segnum, IndexReader::Segment& seg,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        auto& collector) {
+      std::optional<int64_t> count = countBounded(pool, seg, collectorFilter);
+      int64_t before = collector.totalHits();
+      if (collector.topCount > 0) {
+        rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
+                 seg.maxDoc(), true, &rankingAccumulator);
+      }
+      if (!count) {
+        collector.countIncomplete = true;
+        return;
+      }
+      int64_t ranked = collector.totalHits() - before;
+      assert(*count >= ranked);
+      collector.hitCount += *count - ranked;
+    }
+
+    void rankTopK(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc, bool allowPruning,
+        MaxScoreAccumulator* accumulator, BulkScorer* exactScorer = nullptr) {
       if (rankingSupplier != nullptr) {
         Query::ScorerSupplier::BulkScorerContext bulkContext;
         auto plan = rankingSupplier->planBulk(
@@ -1109,21 +1199,16 @@ public:
         if (rankingBulk != nullptr) {
           collectTopKWindowed(
               segnum, rankingBulk, collectorFilter, collector,
-              allowPruning ? &scoreAccumulator : nullptr,
-              maxDoc, allowPruning, exactScorer);
+              accumulator, maxDoc, allowPruning, exactScorer);
         } else {
           auto* rankingScorer = buildPullScorer(pool, *rankingSupplier);
           if (rankingScorer != nullptr) {
             collectTopK(
                 segnum, rankingScorer, collectorFilter, nullptr,
-                collector, allowPruning,
-                allowPruning ? &scoreAccumulator : nullptr);
+                collector, allowPruning, accumulator);
           }
         }
       }
-      int64_t ranked = collector.totalHits() - before;
-      assert(count >= ranked);
-      collector.hitCount += count - ranked;
     }
 
     void countThenCollectTopK(
@@ -2551,6 +2636,11 @@ public:
               if (composedExactCountTopK) {
                 // countThenCollectTopK supplied both the exact hit count and
                 // competitively pruned ranking.
+              } else if (!Collapsed && op.boundedCountWeight != nullptr
+                         && builderPtr == nullptr && !captureSharedRaw) {
+                boundedCountThenCollectTopK(
+                    poolGuard.pool(), segnum, seg, supplier, collectorFilter,
+                    *scoreCollector);
               } else if (useSparseConstantPull) {
                 auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {

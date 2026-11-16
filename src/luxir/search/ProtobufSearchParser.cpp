@@ -2298,6 +2298,16 @@ public:
       qr->countLimitProven = minMatches >= requirements.countLimit;
     }
     qr->estimateCount = estimateCount && qr->boundedCount;
+    // A bounded count that metadata does not settle is counted apart from
+    // ranking: an unscored pass stops once the total passes the limit, and
+    // ranking prunes from its first page instead of holding its threshold
+    // until the limit is reached. Constant scoring keeps its windowed drain.
+    if (qr->boundedCount && !qr->countLimitProven && !qr->estimateCount
+        && !disableBoundedCountSplit && weight != nullptr && !weight->needsPrepare()
+        && weight->allowsPruning() && !weight->isConstantScoring()) {
+      qr->boundedCountWeight = query->createWeight(
+          *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+    }
     qr->headSort = std::move(headSort);
     qr->resultQuery = resultQuery;
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {

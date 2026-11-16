@@ -452,6 +452,25 @@ public:
   }
 };
 
+// A bounded hit count shared by every segment's count pass. Counting stops
+// once the total passes the limit; until then each segment's count is exact.
+class BoundedHitTotal {
+  int64_t limit = 0;
+  std::atomic<int64_t> counted{0};
+
+public:
+  void setLimit(int64_t value) { limit = value; }
+
+  bool exceeded() const {
+    return counted.load(std::memory_order_relaxed) > limit;
+  }
+
+  // Returns whether the total now passes the limit.
+  bool add(int64_t hits) {
+    return counted.fetch_add(hits, std::memory_order_relaxed) + hits > limit;
+  }
+};
+
 // One collection stream's view of a held hit threshold. Batches updates to
 // the shared counter; holding turns false once pruning opens for any stream.
 class HeldHitCounter {
