@@ -260,29 +260,42 @@ struct ValueBounds {
     return out;
   }
 
-  static ValueBounds integer(int64_t min, int64_t max, bool mayBeMissing = false) {
+  // Possible ranges carry no proof that either endpoint occurs.
+  static ValueBounds integerRange(int64_t min, int64_t max, bool mayBeMissing = false) {
     ValueBounds out;
     out.type = ValueType::INT64;
     out.certainty = BoundsCertainty::BOUNDED;
     out.mayBeMissing = mayBeMissing;
     out.intMin = min;
     out.intMax = max;
-    out.minAttained = true;
-    out.maxAttained = true;
     return out;
   }
 
-  static ValueBounds floating(double min, double max, bool mayBeMissing = false) {
+  static ValueBounds floatingRange(double min, double max, bool mayBeMissing = false) {
     ValueBounds out;
     out.type = ValueType::DOUBLE;
     out.certainty = BoundsCertainty::BOUNDED;
     out.mayBeMissing = mayBeMissing;
     out.doubleMin = min;
     out.doubleMax = max;
-    out.minAttained = true;
-    out.maxAttained = true;
     return out;
   }
+
+  // Use only for extrema actually observed together with column presence.
+  static ValueBounds observedInteger(int64_t min, int64_t max, bool mayBeMissing = false) {
+    ValueBounds out = integerRange(min, max, mayBeMissing);
+    out.minAttained = out.maxAttained = true;
+    return out;
+  }
+
+  static ValueBounds observedFloating(double min, double max, bool mayBeMissing = false) {
+    ValueBounds out = floatingRange(min, max, mayBeMissing);
+    out.minAttained = out.maxAttained = true;
+    return out;
+  }
+
+  static ValueBounds integerValue(int64_t value) { return observedInteger(value, value); }
+  static ValueBounds floatingValue(double value) { return observedFloating(value, value); }
 
   static ValueBounds invalid(ValueType type, BoundsInvalidity invalidity,
                              bool mayBeMissing = false) {

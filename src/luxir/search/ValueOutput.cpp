@@ -51,14 +51,14 @@ std::string_view IsoValueOutput::operator()(int64_t value) const {
 }
 
 std::string_view IsoValueOutput::operator()(double value) const {
-  double tick = std::floor(value);
-  bool inside = unit == DateUnit::MILLIS
-      ? tick >= (double)datetime_detail::kMinEpochMs && tick <= (double)datetime_detail::kMaxEpochMs
-      : insideNanos(tick);
+  auto tick = floorDateTick(value);
+  bool inside = tick && (unit == DateUnit::MILLIS
+      ? *tick >= datetime_detail::kMinEpochMs && *tick <= datetime_detail::kMaxEpochMs
+      : insideNanos((double)*tick));
   if (!inside) {
     throw RequestError("date_iso output for " + context.source + " is non-finite or outside the date range");
   }
-  return (*this)((int64_t)tick);
+  return (*this)(*tick);
 }
 
 } // namespace luxir

@@ -519,11 +519,7 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   options.opName = context.opName;
   options.nestingBudget = &context.nestingBudget;
   ValueProgram* program =
-      ValueExprParser(options, context.arena).parse(rescoreQuery.expr);
-  ResolvedValue result{program->root().type, program->root().nature};
-  if (convertValueNature(NaturePolicy::NUMBER, {&result, 1}, 0)) {
-    program->rootNode = program->numericNode(program->rootNode);
-  }
+      ValueExprParser(options, context.arena).parse(rescoreQuery.expr, NaturePolicy::NUMBER);
   ValueType rootType = program->root().type;
   if (valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
     throw std::runtime_error(

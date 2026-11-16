@@ -127,6 +127,11 @@ overflow is an evaluation error, while aggregate expressions use wider intermedi
 multiplication and division explicitly turn dates into numbers. Date averages
 and percentiles keep their double numeric lane, including fractional ticks.
 
+The calendar parts of a date (`year(d)`, `month(d)`, `day_of_week(d)`,
+`hour(d, offset_minutes)`, and the others) are value-expression functions; see
+[Value expressions](value-expressions.md#date-parts). They work in UTC or at a
+fixed offset; use a date histogram for calendar buckets in a named zone.
+
 ## Date math
 
 Anywhere a date is accepted in a query, date math is too. Both Solr and
