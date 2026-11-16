@@ -2359,6 +2359,19 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   auto replica = follower->getCollection("main");
   auto old = replica->getReaderManager().getReader();
   ASSERT_EQ(2u, old->segments().size());
+  auto leaderOld = source->getCollection("main")->getReaderManager().getReader();
+  {
+    CollectionHelper h(*source);
+    CollectionHelper::UpdateBuilder input;
+    input.commit(true, 1); ASSERT_TRUE(h.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  auto merged = replica->getReaderManager().getReader();
+  ASSERT_EQ(1u, merged->segments().size());
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
   auto before = replica->getShard()->getSnapshots().snapshot();
   {
     CollectionHelper h(*source);
@@ -2366,9 +2379,8 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   }
   ASSERT_TRUE(caughtUp());
   auto current = replica->getReaderManager().getReader();
-  ASSERT_EQ(2u, current->segments().size());
-  EXPECT_EQ(old->segments()[1].segmentCoreShared(), current->segments()[1].segmentCoreShared());
-  EXPECT_EQ(old->segments()[0].segmentCoreShared(), current->segments()[0].segmentCoreShared());
+  ASSERT_EQ(1u, current->segments().size());
+  EXPECT_EQ(merged->segments()[0].segmentCoreShared(), current->segments()[0].segmentCoreShared());
   auto child = current->view("items");
   EXPECT_NE(child->segments()[0].liveCountBounds().first, child->segments()[0].liveCountBounds().second);
   auto after = replica->getShard()->getSnapshots().snapshot();
@@ -2386,8 +2398,9 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
       {"deep",1},{"deep_group",1},{"rows",2},{"rows.up",2},{"parts",1},
       {"parts.up",1},{"parts.root",1},{"parts.two",1}};
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
-  EXPECT_EQ(1, child->segments()[0].liveCountBounds().first);
-  EXPECT_EQ(1, child->segments()[0].liveCountBounds().second);
+  EXPECT_EQ(2, child->segments()[0].liveCountBounds().first);
+  EXPECT_EQ(2, child->segments()[0].liveCountBounds().second);
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
   EXPECT_EQ(after->files, replica->getShard()->getSnapshots().snapshot()->files);
   EXPECT_EQ(after->files, source->getCollection("main")->getShard()->getSnapshots().snapshot()->files);
@@ -2410,7 +2423,8 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
     input.commit(); ASSERT_TRUE(h.submit(input).success);
   }
   ASSERT_TRUE(caughtUp());
-  child.reset(); current.reset(); old.reset(); replica.reset(); before.reset(); after.reset();
+  child.reset(); current.reset(); merged.reset(); old.reset(); leaderOld.reset();
+  replica.reset(); before.reset(); after.reset();
   stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
   for (auto* node : {source.get(), follower.get()}) {

@@ -2222,6 +2222,65 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
   EXPECT_EQ(0u, cache.metadataBytesUsed());
   EXPECT_EQ(0u, cache.bytesUsed());
   cache.validateForTest();
+
+  test::CollectionHelper helper("merged_nested_cache");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  auto shared = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
+  writer->snapshots.readers.filterCache = shared;
+  for (int batch = 0; batch < 2; batch++) {
+    test::CollectionHelper::UpdateBuilder input;
+    for (int i = 0; i < 8; i++) {
+      auto json = "{\"id\":\"" + std::to_string(batch * 8 + i)
+          + "\",\"items_nested\":{\"color_s\":\"" + (i % 2 ? "red" : "blue") + "\"}}";
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    }
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  auto count = [&](bool child) {
+    auto req = test::localReq(helper.getSearchEngine());
+    auto& op = req->collection("merged_nested_cache").topDocs().countLimit().limit(0);
+    if (child) {
+      op.allQuery().matchFilter("color_s", "red").rawOp().domain.emplace().to = "items_nested";
+    } else {
+      op.rawQuery() = test::qb::toParent(req->mr, "items_nested",
+          test::qb::match(req->mr, "color_s", "red"), "none");
+    }
+    req->execute(1); EXPECT_OK(req); EXPECT_EQ(8, req->getMatchCount());
+  };
+  for (int i = 0; i < 3; i++) { count(false); count(true); }
+  auto entries = shared->dump(10, nullptr);
+  ASSERT_EQ(2u, entries.size());
+  for (const auto& entry : entries) EXPECT_EQ(2u, entry.segmentsResident);
+  auto warm = shared->counters();
+  EXPECT_GT(warm.hits, 0u);
+  auto old = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, old->segments().size());
+  test::CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1); ASSERT_TRUE(helper.submit(merge).success);
+  auto merged = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, merged->segments().size());
+  for (const auto& segment : old->segments()) {
+    EXPECT_NE(segment.segInfo.seg_id, merged->segments()[0].segInfo.seg_id);
+  }
+  EXPECT_TRUE(shared->dump(10, nullptr).empty());
+  EXPECT_EQ(warm.purges + 4, shared->counters().purges);
+  EXPECT_EQ(0u, shared->bytesUsed());
+  // Admission history belongs to the key; the first new sighting builds a
+  // fresh slot under the merged segment identity, then both views hit it.
+  count(false); count(true);
+  auto rebuilt = shared->dump(10, nullptr);
+  ASSERT_EQ(entries.size(), rebuilt.size());
+  for (const auto& entry : rebuilt) {
+    EXPECT_EQ(1u, entry.segmentsResident);
+    EXPECT_TRUE(std::ranges::any_of(entries, [&](const auto& prior) { return prior.keyHash == entry.keyHash; }));
+  }
+  EXPECT_EQ(warm.builds + 2, shared->counters().builds);
+  auto hits = shared->counters().hits;
+  count(false); count(true);
+  EXPECT_GT(shared->counters().hits, hits);
+  shared->validateForTest();
 }
 
 // A metadata sweep started at the byte cap trims to the low watermark, so
