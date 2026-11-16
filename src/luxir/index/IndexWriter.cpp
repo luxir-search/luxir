@@ -267,8 +267,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
-  if (arena) arena->execute([this] { updateGraph.emplace(); });
-  else updateGraph.emplace();
+  if (arena) arena->execute([this] { updateGraph.emplace(updateContext); });
+  else updateGraph.emplace(updateContext);
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
