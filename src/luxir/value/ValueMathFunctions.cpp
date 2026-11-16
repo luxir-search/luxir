@@ -617,6 +617,49 @@ ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) 
   return out;
 }
 
+inline constexpr auto LOGN = [](double base, double value) {
+  if (!(base > 0 && base != 1 && value > 0)) return std::numeric_limits<double>::quiet_NaN();
+  return std::log(value) / std::log(base);
+};
+
+ValueBounds lognBounds(const ValueNode& node, std::span<const ValueBounds> args) {
+  const auto& base = args[0];
+  const auto& value = args[1];
+  if (base.alwaysMissing || value.alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
+  bool missing = base.mayBeMissing || value.mayBeMissing;
+  if (!singleton(base) || !bounded(value)) return Math2<LOGN>::bounds(node, args);
+  double b = boundMinAsDouble(base);
+  double low = boundMinAsDouble(value), high = boundMaxAsDouble(value);
+  bool baseObserved = base.minAttained || base.maxAttained;
+  bool valueObserved = value.minAttained || value.maxAttained;
+  if (!(b > 0 && b != 1)) {
+    bool paired = (baseObserved && !value.mayBeMissing)
+        || (valueObserved && !base.mayBeMissing);
+    return paired ? ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, missing)
+                  : ValueBounds::unbounded(node.type, missing);
+  }
+  auto pairedEndpoint = [&](bool attained) {
+    return (attained && !base.mayBeMissing)
+        || (singleton(value) && !value.mayBeMissing && baseObserved);
+  };
+  double a = LOGN(b, low), z = LOGN(b, high);
+  if (!std::isfinite(a) || !std::isfinite(z)) {
+    if ((!std::isfinite(a) && pairedEndpoint(value.minAttained))
+        || (!std::isfinite(z) && pairedEndpoint(value.maxAttained))) {
+      return constantDouble(node, !std::isfinite(a) && pairedEndpoint(value.minAttained) ? a : z, missing);
+    }
+    return ValueBounds::unbounded(node.type, missing);
+  }
+  ValueBounds out = boundedResult(node, a, z, missing);
+  out.minAttained = pairedEndpoint(value.minAttained);
+  out.maxAttained = pairedEndpoint(value.maxAttained);
+  if (b < 1) {
+    std::swap(out.doubleMin, out.doubleMax);
+    std::swap(out.minAttained, out.maxAttained);
+  }
+  return out;
+}
+
 constexpr ValueFunction FUNCTIONS[] = {
     unary<SIN, Curve::PERIODIC, -1.0, 1.0>("sin"),
     unary<COS, Curve::PERIODIC, -1.0, 1.0>("cos"),
@@ -649,6 +692,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     unary<TO_DEGREES>("to_degrees"),
     binary<ATAN2>("atan2"),
     binary<HYPOT>("hypot"),
+    binary<LOGN>("logn", ValueOpcode::NONE, lognBounds),
     constant<std::numbers::pi>("pi"),
     constant<std::numbers::e>("e"),
     integerBinary<BIT_AND>("bit_and"),

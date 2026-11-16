@@ -538,7 +538,10 @@ private:
     }
     std::string signedLiteral;
     api::Val literalValue;
-    if (source->kind == ValueNodeKind::CONSTANT && !source->text.empty()
+    auto numericText = source->text;
+    if (numericText.starts_with('-') || numericText.starts_with('+')) numericText.remove_prefix(1);
+    bool hex = numericText.starts_with("0x") || numericText.starts_with("0X");
+    if (source->kind == ValueNodeKind::CONSTANT && !source->text.empty() && !hex
         && (value::lex::digit(source->text.front()) || source->text.front() == '.'
             || source->text.front() == '-' || source->text.front() == '+')) {
       auto text = source->text;

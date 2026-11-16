@@ -1152,3 +1152,35 @@ TEST_F(ValueScriptingTest, failedConstantDependenciesStayLazyThroughLetChains) {
   EXPECT_DOUBLE_EQ(7, program->constantScalar->doubleValue);
   EXPECT_EQ(1, program->nodes.size());
 }
+
+TEST_F(ValueScriptingTest, lognUsesBaseThenValue) {
+  expectConstant("logn(2, 8)", 3);
+  expectConstant("logn(10, 1000)", 3);
+  expectConstant("logn(0.5, 4)", -2);
+  expectConstant("if(0, logn(1, 2), 7)", 7);
+  for (auto expression : {"logn(1, 2)", "logn(0, 2)", "logn(2, 0)", "logn(-2, 4)"}) {
+    expectError(expression, "logn");
+  }
+  expectValues("logn(2, def(x_i, 8) + 2)", {2, 0, std::log2(10), std::log2(9), 1});
+}
+
+TEST_F(ValueScriptingTest, hexLiteralsAreIntegerBitPatterns) {
+  expectConstant("0x1F", 31);
+  expectConstant("0XFE & 0xf", 14);
+  EXPECT_EQ(-1, evalInt("0xffffffffffffffff"));
+  EXPECT_EQ(INT64_MIN, evalInt("0x8000000000000000"));
+  EXPECT_EQ(1, evalInt("-0xffffffffffffffff"));
+  expectConstant("0x1 << 0x5", 32);
+  expectConstant("0xE + 1", 15);
+  for (auto expression : {"0x", "0xG", "0x10000000000000000", "-0x8000000000000000"}) {
+    EXPECT_THROW(parse(expression), std::runtime_error) << expression;
+  }
+  expectError("0x1 & 1.5", "integers");
+}
+
+TEST_F(ValueScriptingTest, lognDomainProofsNeedPairedValues) {
+  expectValues("logn(y_i, def(x_i, 1))", {std::log(2) / std::log(5), std::nullopt,
+                                        std::nullopt, std::nullopt, std::nullopt});
+  expectValues("logn(1, y_i + if(x_i == 2, 1/0, v_d))",
+               {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+}

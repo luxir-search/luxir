@@ -384,3 +384,17 @@ TEST(ValueExprParserTest, foldingPreservesExactDecimalLiteralSpelling) {
   EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(0.100000000000000001)")));
   EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(-(-0.100000000000000001))")));
 }
+
+TEST(ValueExprParserTest, hexComparisonsUseTheirIntegerValue) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 2;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  EXPECT_TRUE(parser.parse("price == 31")->structurallyEqual(*parser.parse("price == 0x1F")));
+  EXPECT_TRUE(parser.parse("price == -1")->structurallyEqual(*parser.parse("price == 0xffffffffffffffff")));
+}

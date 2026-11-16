@@ -56,6 +56,10 @@ as in Java and Painless. `%` returns an integer for two integers and a double
 otherwise; the sign follows the dividend (`-7 % 3` is `-1`), and a zero divisor
 makes the value missing, as for `/`.
 
+Hex integer literals start with `0x` or `0X`: `0x1F` is 31. Up to 64 bits
+are accepted as a two's-complement pattern, so `0xffffffffffffffff` is -1.
+Negation keeps its normal overflow check, including for hex literals.
+
 Every operator has a function spelling: `mod`, `bit_and`, `bit_or`, `bit_xor`,
 `bit_not`, `shl`, `shr`, `ushr`.
 
@@ -94,6 +98,7 @@ expression.
 | `atan2(y, x)` | The angle of the point (x, y). |
 | `sinh(x)` `cosh(x)` `tanh(x)` `asinh(x)` `acosh(x)` `atanh(x)` | Hyperbolic functions. |
 | `ln(x)`, `log2(x)`, `log10(x)` | Logarithms. `ln` is an alias of the natural logarithm `log`, with identical behavior. |
+| `logn(base, value)` | Logarithm of `value` to `base`, as in Lucene expressions. `base` must be positive and different from 1; `value` must be positive. |
 | `expm1(x)` | `exp(x) - 1`, accurate for small `x`. `exp`, `pow`, `sqrt`, and `log1p` are in the base language. |
 | `cbrt(x)` | Cube root. |
 | `hypot(a, b)` | `sqrt(a*a + b*b)` without intermediate overflow. |
