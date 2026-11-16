@@ -215,33 +215,29 @@ TEST(NestedMergeTest, childPartitionsAndStoredCopyAndReaddShareOneBundle) {
   req->execute(1); ASSERT_OK(req); EXPECT_EQ(192, req->getMatchCount());
 }
 
-TEST(NestedMergeTest, overflowingPhysicalCountsUseSurvivingRangesWithoutLargeMaps) {
-  for (bool published : {false, true}) {
-    SCOPED_TRACE(published);
-    CollectionHelper helper("nested_capacity");
-    helper.clear();
-    auto writer = helper.getIndexWriter(); writer->mergePolicy->setMergeFactor(1000);
-    auto& inv = writer->obtainInverter();
-    for (auto id : {"dead", "empty"}) { inv.startDoc(); inv.getIndexHandler("id").index(inv, std::string_view(id)); }
-    auto& output = inv.getPostingsWriter();
-    int64_t cap = PostingsReader::MAX_SEGMENT_DOCS;
-    auto child = output.addSpace("items_nested");
-    output.finishSpace(child, (int32_t)cap, RowSpaceFixture::shape(output, std::vector<int64_t>{cap, cap}));
-    writer->releaseInverter(inv, true); helper.commit();
-    CollectionHelper::UpdateBuilder input;
-    add(input, R"({"id":"live","items_nested":{}})"); input.commit(); ASSERT_TRUE(helper.submit(input).success);
-    ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
-    std::shared_ptr<IndexReader> pin;
-    if (published) pin = writer->snapshots.readers.getReader();
-    int exact = 0;
-    Signal::listen("mergeExactRows", [&](void*, void*, void*) -> void* { exact++; return nullptr; });
-    auto unlisten = scope_guard([] { Signal::unlisten("mergeExactRows"); });
-    merge(helper);
-    EXPECT_EQ(1, exact);
-    auto reader = writer->snapshots.readers.getReader();
-    ASSERT_EQ(1u, reader->segments().size()); EXPECT_EQ(2, reader->maxDoc());
-    EXPECT_EQ(1, reader->view("items_nested")->maxDoc());
-  }
+TEST(NestedMergeTest, physicalChildRowsPastTheLimitSkipTheMerge) {
+  CollectionHelper helper("nested_capacity");
+  helper.clear();
+  auto writer = helper.getIndexWriter(); writer->mergePolicy->setMergeFactor(1000);
+  auto& inv = writer->obtainInverter();
+  for (auto id : {"dead", "empty"}) { inv.startDoc(); inv.getIndexHandler("id").index(inv, std::string_view(id)); }
+  auto& output = inv.getPostingsWriter();
+  int64_t cap = PostingsReader::MAX_SEGMENT_DOCS;
+  auto child = output.addSpace("items_nested");
+  output.finishSpace(child, (int32_t)cap, RowSpaceFixture::shape(output, std::vector<int64_t>{cap, cap}));
+  writer->releaseInverter(inv, true); helper.commit();
+  CollectionHelper::UpdateBuilder input;
+  add(input, R"({"id":"live","items_nested":{}})"); input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  // The deleted root owns every row of the large space, but admission counts
+  // physical rows, so the two segments stay apart.
+  ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
+  merge(helper);
+  auto reader = writer->snapshots.readers.getReader();
+  EXPECT_EQ(2u, reader->segments().size());
+  EXPECT_EQ(2, reader->liveDocs());
+  auto req = localReq(helper.getSearchEngine());
+  req->collection(helper.collection().getId().name).topDocs().exprQuery("items_nested:*").countLimit().limit(0);
+  req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
 }
 
 } // namespace

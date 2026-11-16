@@ -889,8 +889,6 @@ private:
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
-  int64_t mergePathRows(std::unique_lock<std::mutex>& lock, std::span<SegInfo* const> candidates,
-                        std::span<SegInfo* const> selected, std::string_view path);
   bool mergeSegmentsBody(MergeMessage& msg);
 
 public:

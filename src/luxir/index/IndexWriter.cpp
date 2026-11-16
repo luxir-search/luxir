@@ -27,7 +27,6 @@
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
-#include "luxir/reader/OwnershipMapper.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 
@@ -2649,67 +2648,6 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 }
 
 
-int64_t IndexWriter::mergePathRows(std::unique_lock<std::mutex>& lock,
-                                 std::span<SegInfo* const> candidates,
-                                 std::span<SegInfo* const> selected, std::string_view path) {
-  struct Source {
-    SegInfo* info;
-    std::shared_ptr<SegmentCore> core;
-    std::shared_ptr<LiveDocs> live;
-    uint64_t generation, epoch;
-  };
-  std::vector<Source> sources;
-  sources.reserve(selected.size());
-  for (auto* seg : candidates) ++seg->preparationPins;
-  auto unpin = scope_guard([&] {
-    assert(lock.owns_lock());
-    for (auto* seg : selected) seg->mergeDiffLiveGen = -1;
-    for (auto* seg : candidates) --seg->preparationPins;
-  });
-  auto reader = snapshots.readers.indexReader.load(std::memory_order_acquire);
-  for (auto* seg : selected) {
-    auto& source = sources.emplace_back(seg, getSegmentCore(*seg), nullptr,
-        seg->liveGen, seg->liveEpochFor(seg->liveGen, writerEpoch));
-    if (!source.generation) continue;
-    auto* published = reader && reader->incarnation() == incarnation ? reader->findSegment(seg->segId) : nullptr;
-    if (published && published->segInfo.live_gen == source.generation) source.live = published->liveDocsShared();
-    else seg->mergeDiffLiveGen = (int64_t)source.generation;
-  }
-  lock.unlock();
-  int64_t count = 0;
-  try {
-    Signal::emit("mergeExactRows", (void*)&path);
-    for (auto& source : sources) {
-      if (!source.live && source.generation) {
-        source.live = LiveDocs::create(dir, source.info->segId, source.info->creatorEpoch,
-            source.generation, source.epoch, source.info->maxDoc, false, false);
-      }
-      auto* rows = source.core->spaceReader(path);
-      if (!rows) continue;
-      count += rows->maxDoc();
-      if (!source.live) continue;
-      OwnershipMapper mapper(*source.core, "", path);
-      const auto& bits = source.live->bitset();
-      for (int32_t word = 0; word < (int32_t)FixedBitSet::sizeInWords(bits.size()); word++) {
-        uint64_t dead = ~bits.words[word];
-        int32_t last = (int32_t)std::min((int64_t)(word + 1) * 64, (int64_t)bits.size());
-        if (last & 63) dead &= (1ULL << (last & 63)) - 1;
-        while (dead) {
-          int32_t root = word * 64 + (int32_t)std::countr_zero(dead);
-          dead &= dead - 1;
-          auto [first, end] = mapper.range(root);
-          count -= end - first;
-        }
-      }
-    }
-  } catch (...) {
-    lock.lock();
-    throw;
-  }
-  lock.lock();
-  return count;
-}
-
 // called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
 // Only one merge will be running at a time.
 // We do run concurrently with everything else, including commits and segment deletions.
@@ -2751,7 +2689,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // We grab the list of segments to merge with the lock held, but use them outside of the lock.
     // This is safe since the only place where segments are deleted is in a merge, and this has concurrency==1
     {
-      std::unique_lock<std::mutex> lock(indexMutex);
+      const std::lock_guard<std::mutex> lock(indexMutex);
       if (clientOrigin) {
         assert(msg.maxSegments > 0);
         segs.reserve(segInfos.size());
@@ -2801,7 +2739,6 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
-      bool countedPathRows = false;
       for (SegInfo* seg : segs) {
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
@@ -2834,15 +2771,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         std::vector<std::pair<std::string, int64_t>> nextRows;
         for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
           const auto& space = postingsReaderCore->spaces()[i];
+          // Physical rows bound the merged space from above: rows of deleted
+          // roots still count, so a merge that would fit once they are dropped
+          // can be skipped.
           int64_t next = pathRows[space.path] + space.maxDoc;
-          if (!MergeCostModel::docsFit(0, next)) {
-            auto selected = admitted;
-            selected.push_back(seg);
-            next = mergePathRows(lock, segs, selected, space.path);
-            countedPathRows = true;
-            std::erase_if(admitted, [&](auto* input) { return input->liveDocs == 0 || !segInfos.contains(input->segId); });
-            if (seg->liveDocs == 0 || !segInfos.contains(seg->segId)) { fits = false; break; }
-          }
           fits = MergeCostModel::docsFit(0, next)
               && ordsFit(*postingsReaderCore->spaceReader(space.path));
           nextRows.emplace_back(space.path, next);
@@ -2856,9 +2788,6 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
-      }
-      if (countedPathRows) {
-        std::erase_if(admitted, [&](auto* seg) { return seg->liveDocs == 0 || !segInfos.contains(seg->segId); });
       }
       segs.swap(admitted);
 
