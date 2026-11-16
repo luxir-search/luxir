@@ -24,7 +24,13 @@ constexpr double INF = std::numeric_limits<double>::infinity();
 // One double argument, one double result. A NaN or infinite result is an
 // evaluation error, as for log() and sqrt(). Array arguments map element-wise.
 // Low and High, when finite, are the proven range of every result.
-template <auto Fn, double Low = -INF, double High = INF>
+enum class Domain { ALL, NONNEGATIVE, POSITIVE, ABOVE_MINUS_ONE, UNIT, AT_LEAST_ONE, OPEN_UNIT };
+
+enum class Curve { INCREASING, DECREASING, COSH, PERIODIC };
+
+// Bounds use the same operation as point, batch, element and bucket kernels.
+// An endpoint outside the domain proves an error only when it is attained.
+template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF, Domain InputDomain = Domain::ALL>
 struct Math1 {
   static ValueResult apply(const ValueNode& node, const ValueResult& input, int32_t docid) {
     if (!input.valid) return ValueResult::missing(ValueType::DOUBLE);
@@ -38,8 +44,7 @@ struct Math1 {
     ValueResult input = program.evalNode(node.children[0], docid, score);
     if (!input.valid) return ValueResult::missing(node.type);
     if (valueArray(input.type)) {
-      return ValueResult::arrayValue(node.type, nodeIndex(program, node), docid, score,
-                                     input.array.size);
+      return ValueResult::arrayValue(node.type, nodeIndex(program, node), docid, score, input.array.size);
     }
     return apply(node, input, docid);
   }
@@ -47,24 +52,69 @@ struct Math1 {
   static ValueResult element(BoundValueProgram& program, const ValueNode& node,
                              const ValueArrayRef& array, int64_t index) {
     ValueResult value = program.evalNode(node.children[0], array.docid, array.score);
-    ValueResult item = valueArray(value.type) ? program.evalArrayElement(value.array, index) : value;
-    return apply(node, item, array.docid);
+    return apply(node, valueArray(value.type) ? program.evalArrayElement(value.array, index) : value, array.docid);
   }
 
   static ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) {
     const ValueBounds& input = args[0];
     if (input.alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-    if (singleton(input)) {
-      double out = Fn(boundMinAsDouble(input));
-      if (std::isfinite(out)) return constantDouble(node, out, input.mayBeMissing);
-      if (input.minAttained && input.maxAttained) {
-        return constantDouble(node, out, input.mayBeMissing);
+    if (!bounded(input)) {
+      if constexpr (InputDomain == Domain::ALL && std::isfinite(Low) && std::isfinite(High)) {
+        return boundedResult(node, Low, High, input.mayBeMissing);
       }
+      return ValueBounds::unbounded(node.type, input.mayBeMissing);
     }
-    if constexpr (std::isfinite(Low) && std::isfinite(High)) {
-      return boundedResult(node, Low, High, input.mayBeMissing);
+    double low = boundMinAsDouble(input), high = boundMaxAsDouble(input);
+    auto inside = [](double x) {
+      switch (InputDomain) {
+        case Domain::ALL: return true;
+        case Domain::NONNEGATIVE: return x >= 0;
+        case Domain::POSITIVE: return x > 0;
+        case Domain::ABOVE_MINUS_ONE: return x > -1;
+        case Domain::UNIT: return x >= -1 && x <= 1;
+        case Domain::AT_LEAST_ONE: return x >= 1;
+        case Domain::OPEN_UNIT: return x > -1 && x < 1;
+      }
+      std::unreachable();
+    };
+    bool lowDomain = !inside(low), highDomain = !inside(high);
+    double a = lowDomain ? std::numeric_limits<double>::quiet_NaN() : Fn(low);
+    double b = highDomain ? std::numeric_limits<double>::quiet_NaN() : Fn(high);
+    bool lowFailed = !std::isfinite(a), highFailed = !std::isfinite(b);
+    if (lowFailed || highFailed) {
+      if ((lowFailed && input.minAttained) || (highFailed && input.maxAttained)) {
+        double failed = lowFailed && input.minAttained ? a : b;
+        auto why = std::isnan(failed) ? BoundsInvalidity::DOMAIN_ERROR
+            : failed < 0 ? BoundsInvalidity::NEGATIVE_INFINITY : BoundsInvalidity::POSITIVE_INFINITY;
+        return ValueBounds::invalid(node.type, why, input.mayBeMissing);
+      }
+      return ValueBounds::unbounded(node.type, input.mayBeMissing);
     }
-    return ValueBounds::unbounded(node.type, input.mayBeMissing);
+    bool minAttained = input.minAttained, maxAttained = input.maxAttained;
+    if constexpr (Shape == Curve::PERIODIC) {
+      if (!singleton(input)) {
+        if constexpr (std::isfinite(Low) && std::isfinite(High)) {
+          return boundedResult(node, Low, High, input.mayBeMissing);
+        }
+        return ValueBounds::unbounded(node.type, input.mayBeMissing);
+      }
+    } else if constexpr (Shape == Curve::DECREASING) {
+      std::swap(a, b);
+      std::swap(minAttained, maxAttained);
+    } else if constexpr (Shape == Curve::COSH) {
+      minAttained = (a <= b && input.minAttained) || (b <= a && input.maxAttained);
+      maxAttained = (a >= b && input.minAttained) || (b >= a && input.maxAttained);
+      double lower = std::min(a, b), upper = std::max(a, b);
+      if (low <= 0 && high >= 0) {
+        lower = 1;
+        minAttained = (low == 0 && input.minAttained) || (high == 0 && input.maxAttained);
+      }
+      a = lower; b = upper;
+    }
+    ValueBounds out = boundedResult(node, a, b, input.mayBeMissing);
+    out.minAttained = minAttained;
+    out.maxAttained = maxAttained;
+    return out;
   }
 
   static BucketScalar bucket(std::span<const BucketScalar> args, ValueType, ValueNature) {
@@ -73,60 +123,83 @@ struct Math1 {
   }
 };
 
-template <auto Fn, double Low = -INF, double High = INF>
-constexpr ValueFunction unary(std::string_view name) {
-  using M = Math1<Fn, Low, High>;
-  return {ValueOpcode::NONE, name, unaryDouble, M::point, evalFunctionBatch, M::bounds,
-          M::element, 1, 1, {RAW}, M::bucket};
+template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF, Domain InputDomain = Domain::ALL>
+constexpr ValueFunction unary(std::string_view name, ValueOpcode opcode = ValueOpcode::NONE) {
+  using M = Math1<Fn, Shape, Low, High, InputDomain>;
+  return {opcode, name, unaryDouble, M::point, evalFunctionBatch, M::bounds, M::element, 1, 1, {RAW}, M::bucket};
 }
 
-// ---------------------------------------------------------------------------
-// Two scalar arguments, a double result.
 ResolvedValue binaryDoubleResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   requireScalars(args);
   return {ValueType::DOUBLE, ValueNature::NUMBER};
 }
 
-template <auto Fn>
+ResolvedValue binaryArrayDoubleResolve(std::span<const ResolvedValue> args) {
+  requireNumeric(args);
+  if (valueArray(args[0].type) && valueArray(args[1].type)) {
+    throw std::runtime_error("array-to-array arithmetic is not implicit; reduce one side first");
+  }
+  return {valueArray(args[0].type) || valueArray(args[1].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
+          ValueNature::NUMBER};
+}
+
+template <auto Fn, bool MapsArrays = false>
 struct Math2 {
-  static ValueResult point(BoundValueProgram& program, const ValueNode& node,
-                           int32_t docid, float score) {
-    ValueResult a = program.evalNode(node.children[0], docid, score);
-    ValueResult b = program.evalNode(node.children[1], docid, score);
-    if (!a.valid || !b.valid) return ValueResult::missing(node.type);
+  static ValueResult apply(const ValueNode& node, ValueResult a, ValueResult b, int32_t docid) {
+    if (!a.valid || !b.valid) return ValueResult::missing(ValueType::DOUBLE);
     double out = Fn(numberOf(a), numberOf(b));
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
     return ValueResult::floating(out);
   }
 
-  static ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) {
-    if (args[0].alwaysMissing || args[1].alwaysMissing) {
-      return ValueBounds::unbounded(node.type, true, true);
+  static ValueResult point(BoundValueProgram& program, const ValueNode& node, int32_t docid, float score) {
+    ValueResult a = program.evalNode(node.children[0], docid, score);
+    ValueResult b = program.evalNode(node.children[1], docid, score);
+    if constexpr (MapsArrays) {
+      if (!a.valid || !b.valid) return ValueResult::missing(node.type);
+      if (valueArray(node.type)) {
+        int64_t size = valueArray(a.type) ? a.array.size : b.array.size;
+        return ValueResult::arrayValue(node.type, nodeIndex(program, node), docid, score, size);
+      }
     }
-    bool mayBeMissing = args[0].mayBeMissing || args[1].mayBeMissing;
+    return apply(node, a, b, docid);
+  }
+
+  static ValueResult element(BoundValueProgram& program, const ValueNode& node,
+                             const ValueArrayRef& array, int64_t index) {
+    auto item = [&](uint32_t child) {
+      ValueResult value = program.evalNode(child, array.docid, array.score);
+      return valueArray(value.type) ? program.evalArrayElement(value.array, index) : value;
+    };
+    return apply(node, item(node.children[0]), item(node.children[1]), array.docid);
+  }
+
+  static ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) {
+    if (args[0].alwaysMissing || args[1].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
+    bool missing = args[0].mayBeMissing || args[1].mayBeMissing;
     if (singleton(args[0]) && singleton(args[1])) {
       double out = Fn(boundMinAsDouble(args[0]), boundMinAsDouble(args[1]));
-      bool attained = args[0].minAttained && args[0].maxAttained
-          && args[1].minAttained && args[1].maxAttained;
-      if (std::isfinite(out) || attained) return constantDouble(node, out, mayBeMissing);
+      bool attained = args[0].minAttained && args[1].minAttained
+          && (!args[0].mayBeMissing || !args[1].mayBeMissing);
+      if (std::isfinite(out) || attained) return constantDouble(node, out, missing);
     }
-    return ValueBounds::unbounded(node.type, mayBeMissing);
+    return ValueBounds::unbounded(node.type, missing);
   }
 
   static BucketScalar bucket(std::span<const BucketScalar> args, ValueType, ValueNature) {
-    if (!args[0].valid || !args[1].valid) {
-      return BucketScalar::missing(BucketValueType::DOUBLE, ValueNature::NUMBER);
-    }
+    if (!args[0].valid || !args[1].valid) return BucketScalar::missing(BucketValueType::DOUBLE, ValueNature::NUMBER);
     return bucketDouble(Fn(bucketNumber(args[0]), bucketNumber(args[1])));
   }
 };
 
-template <auto Fn>
-constexpr ValueFunction binary(std::string_view name) {
-  using M = Math2<Fn>;
-  return {ValueOpcode::NONE, name, binaryDoubleResolve, M::point, evalFunctionBatch, M::bounds,
-          evalScalarOnlyElement, 2, 2, {RAW, RAW}, M::bucket};
+template <auto Fn, bool MapsArrays = false>
+constexpr ValueFunction binary(std::string_view name, ValueOpcode opcode = ValueOpcode::NONE,
+                              ValueFunction::BoundsPropagate bounds = Math2<Fn, MapsArrays>::bounds) {
+  using M = Math2<Fn, MapsArrays>;
+  return {opcode, name, MapsArrays ? binaryArrayDoubleResolve : binaryDoubleResolve, M::point,
+          evalFunctionBatch, bounds, MapsArrays ? M::element : evalScalarOnlyElement,
+          2, 2, {RAW, RAW}, M::bucket};
 }
 
 // ---------------------------------------------------------------------------
@@ -338,16 +411,18 @@ ValueResult toIntPoint(BoundValueProgram& program, const ValueNode& node,
 ValueBounds toIntBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   const ValueBounds& input = args[0];
   if (input.alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-  if (singleton(input)) {
-    if (input.type == ValueType::INT64) return constantInteger(node, input.intMin, input.mayBeMissing);
-    if (fitsInt64(input.doubleMin)) {
-      return constantInteger(node, (int64_t)input.doubleMin, input.mayBeMissing);
-    }
-    if (input.minAttained && input.maxAttained) {
-      return ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, input.mayBeMissing);
-    }
+  if (!bounded(input)) return ValueBounds::unbounded(node.type, input.mayBeMissing);
+  if (input.type == ValueType::INT64) return input;
+  if (!fitsInt64(input.doubleMin) || !fitsInt64(input.doubleMax)) {
+    bool attained = (!fitsInt64(input.doubleMin) && input.minAttained)
+        || (!fitsInt64(input.doubleMax) && input.maxAttained);
+    return attained ? ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, input.mayBeMissing)
+                    : ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
-  return ValueBounds::unbounded(node.type, input.mayBeMissing);
+  auto out = ValueBounds::integerRange((int64_t)input.doubleMin, (int64_t)input.doubleMax, input.mayBeMissing);
+  out.minAttained = input.minAttained;
+  out.maxAttained = input.maxAttained;
+  return out;
 }
 
 BucketScalar toIntBucket(std::span<const BucketScalar> args, ValueType, ValueNature) {
@@ -467,7 +542,12 @@ inline constexpr auto TANH = [](double x) { return std::tanh(x); };
 inline constexpr auto ASINH = [](double x) { return std::asinh(x); };
 inline constexpr auto ACOSH = [](double x) { return std::acosh(x); };
 inline constexpr auto ATANH = [](double x) { return std::atanh(x); };
-inline constexpr auto LN = [](double x) { return std::log(x); };
+inline constexpr auto SQRT = [](double x) { return std::sqrt(x); };
+inline constexpr auto LOG1P = [](double x) { return std::log1p(x); };
+inline constexpr auto FLOOR = [](double x) { return std::floor(x); };
+inline constexpr auto EXP = [](double x) { return std::exp(x); };
+inline constexpr auto POW = [](double a, double b) { return std::pow(a, b); };
+inline constexpr auto LOG = [](double x) { return std::log(x); };
 inline constexpr auto LOG2 = [](double x) { return std::log2(x); };
 inline constexpr auto LOG10 = [](double x) { return std::log10(x); };
 inline constexpr auto EXPM1 = [](double x) { return std::expm1(x); };
@@ -489,29 +569,82 @@ inline constexpr auto HYPOT = [](double a, double b) { return std::hypot(a, b); 
 
 constexpr double HALF_PI = std::numbers::pi / 2.0;
 
+ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) {
+  const ValueBounds& base = args[0];
+  const ValueBounds& exponent = args[1];
+  if (invalid(base)) return retag(base, node.type);
+  if (invalid(exponent)) return retag(exponent, node.type);
+  bool mayMissing = base.mayBeMissing || exponent.mayBeMissing;
+  if (base.alwaysMissing || exponent.alwaysMissing) {
+    return ValueBounds::unbounded(node.type, true, true);
+  }
+  if (!bounded(base) || !bounded(exponent)) {
+    return ValueBounds::unbounded(node.type, mayMissing);
+  }
+  double amin = boundMinAsDouble(base);
+  double amax = boundMaxAsDouble(base);
+  double e = boundMinAsDouble(exponent);
+  if (e != boundMaxAsDouble(exponent)) return ValueBounds::unbounded(node.type, mayMissing);
+  double low;
+  double high;
+  bool exact = amin == amax;
+  if (exact) {
+    low = high = std::pow(amin, e);
+  } else if (e == 0.0) {
+    low = high = 1.0;
+  } else if (amin >= 0.0 && e > 0.0) {
+    low = std::pow(amin, e);
+    high = std::pow(amax, e);
+  } else if (amin > 0.0 && e < 0.0) {
+    low = std::pow(amax, e);
+    high = std::pow(amin, e);
+  } else {
+    return ValueBounds::unbounded(node.type, mayMissing);
+  }
+  if (!std::isfinite(low) || !std::isfinite(high)) {
+    if (exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing)) {
+      return ValueBounds::invalid(
+          node.type, std::isnan(low) ? BoundsInvalidity::NAN_VALUE
+                                     : BoundsInvalidity::POSITIVE_INFINITY,
+          mayMissing);
+    }
+    return ValueBounds::unbounded(node.type, mayMissing);
+  }
+  ValueBounds out = ValueBounds::floatingRange(low, high, mayMissing);
+  out.type = node.type;
+  out.minAttained = exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing);
+  out.maxAttained = out.minAttained;
+  return out;
+}
+
 constexpr ValueFunction FUNCTIONS[] = {
-    unary<SIN, -1.0, 1.0>("sin"),
-    unary<COS, -1.0, 1.0>("cos"),
-    unary<TAN>("tan"),
-    unary<ASIN, -HALF_PI, HALF_PI>("asin"),
-    unary<ACOS, 0.0, std::numbers::pi>("acos"),
-    unary<ATAN, -HALF_PI, HALF_PI>("atan"),
+    unary<SIN, Curve::PERIODIC, -1.0, 1.0>("sin"),
+    unary<COS, Curve::PERIODIC, -1.0, 1.0>("cos"),
+    unary<TAN, Curve::PERIODIC>("tan"),
+    unary<ASIN, Curve::INCREASING, -INF, INF, Domain::UNIT>("asin"),
+    unary<ACOS, Curve::DECREASING, -INF, INF, Domain::UNIT>("acos"),
+    unary<ATAN, Curve::INCREASING, -HALF_PI, HALF_PI>("atan"),
     unary<SINH>("sinh"),
-    unary<COSH, 1.0, INF>("cosh"),
-    unary<TANH, -1.0, 1.0>("tanh"),
+    unary<COSH, Curve::COSH, 1.0, INF>("cosh"),
+    unary<TANH, Curve::INCREASING, -1.0, 1.0>("tanh"),
     unary<ASINH>("asinh"),
-    unary<ACOSH>("acosh"),
-    unary<ATANH>("atanh"),
-    unary<LN>("ln"),
-    unary<LOG2>("log2"),
-    unary<LOG10>("log10"),
-    unary<EXPM1, -1.0, INF>("expm1"),
+    unary<ACOSH, Curve::INCREASING, -INF, INF, Domain::AT_LEAST_ONE>("acosh"),
+    unary<ATANH, Curve::INCREASING, -INF, INF, Domain::OPEN_UNIT>("atanh"),
+    unary<LOG, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log", ValueOpcode::LOG),
+    unary<LOG1P, Curve::INCREASING, -INF, INF, Domain::ABOVE_MINUS_ONE>("log1p", ValueOpcode::LOG1P),
+    unary<SQRT, Curve::INCREASING, -INF, INF, Domain::NONNEGATIVE>("sqrt", ValueOpcode::SQRT),
+    unary<FLOOR>("floor", ValueOpcode::FLOOR),
+    unary<EXP>("exp", ValueOpcode::EXP),
+    binary<POW, true>("pow", ValueOpcode::POW, powBounds),
+    unary<LOG2, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log2"),
+    unary<LOG10, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log10"),
+    unary<EXPM1, Curve::INCREASING, -1.0, INF>("expm1"),
     unary<CBRT>("cbrt"),
     unary<CEIL>("ceil"),
     unary<ROUND>("round"),
     unary<RINT>("rint"),
     unary<TRUNC>("trunc"),
-    unary<SIGNUM, -1.0, 1.0>("signum"),
+    unary<SIGNUM, Curve::INCREASING, -1.0, 1.0>("signum"),
     unary<TO_RADIANS>("to_radians"),
     unary<TO_DEGREES>("to_degrees"),
     binary<ATAN2>("atan2"),

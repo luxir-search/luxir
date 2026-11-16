@@ -88,7 +88,7 @@ expression.
 | `asin(x)` `acos(x)` `atan(x)` | Inverse trigonometry. `asin` and `acos` need `x` in [-1, 1]. |
 | `atan2(y, x)` | The angle of the point (x, y). |
 | `sinh(x)` `cosh(x)` `tanh(x)` `asinh(x)` `acosh(x)` `atanh(x)` | Hyperbolic functions. |
-| `ln(x)`, `log2(x)`, `log10(x)` | Logarithms. `log(x)` is the natural logarithm, like `ln`. |
+| `ln(x)`, `log2(x)`, `log10(x)` | Logarithms. `ln` is an alias of the natural logarithm `log`, with identical behavior. |
 | `expm1(x)` | `exp(x) - 1`, accurate for small `x`. `exp`, `pow`, `sqrt`, and `log1p` are in the base language. |
 | `cbrt(x)` | Cube root. |
 | `hypot(a, b)` | `sqrt(a*a + b*b)` without intermediate overflow. |

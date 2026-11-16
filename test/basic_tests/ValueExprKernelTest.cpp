@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -801,4 +802,49 @@ TEST_F(ValueExprKernelTest, disjointOperandsDoNotProveOverflow) {
     EXPECT_FALSE(bound->evalPoint(0, 0).valid);
     EXPECT_FALSE(bound->evalPoint(1, 0).valid);
   }
+}
+
+TEST_F(ValueExprKernelTest, monotonicMathUsesIntervalBounds) {
+  for (auto name : {"sqrt", "log", "ln", "log1p", "floor", "exp", "ceil", "round", "rint", "trunc",
+                    "cbrt", "log2", "log10", "expm1", "to_radians", "to_degrees", "asin", "acos",
+                    "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "signum"}) {
+    const auto* fn = ValueFunctionRegistry::find(name);
+    ASSERT_NE(nullptr, fn);
+    ValueNode node;
+    node.type = ValueType::DOUBLE;
+    node.opcode = fn->opcode;
+    std::array<ValueBounds, 1> input{ValueBounds::observedFloating(0.1, 0.9)};
+    if (std::string_view(name) == "acosh") input[0] = ValueBounds::observedFloating(1.1, 1.9);
+    auto out = fn->bounds(node, input);
+    ASSERT_EQ(BoundsCertainty::BOUNDED, out.certainty) << name;
+    EXPECT_LE(out.doubleMin, out.doubleMax) << name;
+    EXPECT_TRUE(out.minAttained) << name;
+    EXPECT_TRUE(out.maxAttained) << name;
+  }
+  EXPECT_EQ(ValueFunctionRegistry::find("log"), ValueFunctionRegistry::find("ln"));
+  for (auto [name, low, high] : {std::tuple{"sqrt", -1.0, 1.0}, {"log", 0.0, 1.0},
+                                {"log2", 0.0, 1.0}, {"log10", 0.0, 1.0}, {"log1p", -1.0, 1.0},
+                                {"asin", -2.0, 0.0}, {"acos", 0.0, 2.0}, {"atanh", 0.0, 1.0},
+                                {"acosh", 0.0, 2.0}, {"exp", 0.0, 1000.0}, {"expm1", 0.0, 1000.0}}) {
+    const auto* fn = ValueFunctionRegistry::find(name);
+    ValueNode node; node.type = ValueType::DOUBLE; node.opcode = fn->opcode;
+    std::array<ValueBounds, 1> input{ValueBounds::floatingRange(low, high)};
+    EXPECT_EQ(BoundsCertainty::UNBOUNDED, fn->bounds(node, input).certainty) << name;
+    bool highFails = std::string_view(name) == "acos" || std::string_view(name) == "atanh"
+        || std::string_view(name) == "exp" || std::string_view(name) == "expm1";
+    input[0].minAttained = !highFails;
+    input[0].maxAttained = highFails;
+    EXPECT_EQ(BoundsCertainty::INVALID, fn->bounds(node, input).certainty) << name;
+    input[0].minAttained = highFails;
+    input[0].maxAttained = !highFails;
+    EXPECT_EQ(BoundsCertainty::UNBOUNDED, fn->bounds(node, input).certainty) << name;
+  }
+  ValueNode squareRoot;
+  squareRoot.type = ValueType::DOUBLE;
+  std::array<ValueBounds, 1> mixed{ValueBounds::floatingRange(-1, std::numeric_limits<double>::infinity())};
+  mixed[0].maxAttained = true;
+  auto out = ValueFunctionRegistry::find("sqrt")->bounds(squareRoot, mixed);
+  EXPECT_EQ(BoundsCertainty::INVALID, out.certainty);
+  EXPECT_EQ(BoundsInvalidity::POSITIVE_INFINITY, out.invalidity);
+
 }

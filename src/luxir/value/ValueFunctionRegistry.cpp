@@ -168,12 +168,6 @@ ResolvedValue truthResolve(std::span<const ResolvedValue> args) {
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
-ResolvedValue powResolve(std::span<const ResolvedValue> args) {
-  ValueType type = binaryNumericType(args);
-  return {valueArray(type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
-          ValueNature::NUMBER};
-}
-
 ResolvedValue ifResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   requireScalars(args);
@@ -324,11 +318,11 @@ ScalarKernelValue<Int> evalUnaryKernel(
     switch (opcode) {
       case ValueOpcode::NEG: output = -value; break;
       case ValueOpcode::ABS: output = std::abs(value); break;
-      case ValueOpcode::SQRT: output = std::sqrt(value); break;
-      case ValueOpcode::LOG: output = std::log(value); break;
-      case ValueOpcode::LOG1P: output = std::log1p(value); break;
-      case ValueOpcode::FLOOR: output = std::floor(value); break;
-      case ValueOpcode::EXP: output = std::exp(value); break;
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
+      case ValueOpcode::FLOOR:
+      case ValueOpcode::EXP:
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::ADD:
@@ -437,7 +431,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::DIV: output = a / b; break;
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
-      case ValueOpcode::POW: output = std::pow(a, b); break;
+      case ValueOpcode::POW: throw std::logic_error("pow uses its specialized kernel");
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::NEG:
@@ -530,7 +524,7 @@ ScalarKernelValue<int64_t> kernelValue(const ValueResult& value) {
       : integerKernelValue<int64_t>(value.intValue);
 }
 
-ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResult right,
+ValueResult evalBinaryScalar(const ValueNode& node, const ValueResult& left, const ValueResult& right,
                              int32_t docid) {
   ScalarKernelValue<int64_t> result = evalBinaryKernel(
       node.opcode, kernelValue(left), kernelValue(right),
@@ -546,7 +540,7 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
                          : ValueResult::integer(result.intValue);
 }
 
-ValueResult evalUnaryScalar(const ValueNode& node, ValueResult input,
+ValueResult evalUnaryScalar(const ValueNode& node, const ValueResult& input,
                             int32_t docid) {
   ScalarKernelValue<int64_t> result = evalUnaryKernel(
       node.opcode, kernelValue(input), node.type == ValueType::DOUBLE);
@@ -621,10 +615,7 @@ BucketScalar evalIfBucket(std::span<const BucketScalar> args, ValueType type, Va
 }
 
 bool unaryOpcode(ValueOpcode opcode) {
-  return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS
-      || opcode == ValueOpcode::SQRT || opcode == ValueOpcode::LOG
-      || opcode == ValueOpcode::LOG1P || opcode == ValueOpcode::FLOOR
-      || opcode == ValueOpcode::EXP || opcode == ValueOpcode::NOT;
+  return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS || opcode == ValueOpcode::NOT;
 }
 
 bool reducerOpcode(ValueOpcode opcode) {
@@ -697,80 +688,32 @@ ValueResult evalCountElement(BoundValueProgram& program, const ValueNode& node,
   return invalidReducerElement(program, node, array, index);
 }
 
-ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
-                              int32_t docid, float score) {
+ValueResult evalDefPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
-  if (node.opcode == ValueOpcode::DEF) {
-    ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
-    if (selected.valid && valueArray(node.type)) {
-      return ValueResult::arrayValue(
-          node.type, (uint32_t)(&node - program.program.nodes.data()), docid, score,
-          selected.array.size);
-    }
-    return promote(selected, node.type);
+  ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
+  if (selected.valid && valueArray(node.type)) {
+    return ValueResult::arrayValue(
+        node.type, (uint32_t)(&node - program.program.nodes.data()), docid, score,
+        selected.array.size);
   }
+  return promote(selected, node.type);
+}
 
-  if (reducerOpcode(node.opcode)) {
-    bool reducer = node.childCount == 1;
-    if (reducer) {
-      if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
-      if (node.opcode != ValueOpcode::AVG
-          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
-          && program.nodes[first.array.node].column->multiSet()) {
-        // A set column holds the doc's values ascending, so min is the
-        // first present element and max the last (a NaN reads as missing).
-        bool fromEnd = node.opcode == ValueOpcode::MAX;
-        for (int64_t i = 0; i < first.array.size; i++) {
-          ValueResult next = program.evalArrayElement(
-              first.array, fromEnd ? first.array.size - 1 - i : i);
-          if (next.valid) return promote(next, node.type);
-        }
-        return ValueResult::missing(node.type);
-      }
-      ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
-      double sum = 0.0;
-      __int128 intSum = 0;
-      int64_t present = 0;
-      for (int64_t i = 0; i < first.array.size; i++) {
-        ValueResult next = program.evalArrayElement(first.array, i);
-        if (!next.valid) continue;
-        if (node.opcode == ValueOpcode::AVG) {
-          if (next.type == ValueType::DOUBLE) sum += next.doubleValue;
-          else intSum += (__int128)next.intValue;
-        } else if (!aggregate.valid) {
-          aggregate = next;
-        } else if (node.type == ValueType::DOUBLE) {
-          double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
-                                                        : (double)aggregate.intValue;
-          double b = next.type == ValueType::DOUBLE ? next.doubleValue : (double)next.intValue;
-          aggregate = ValueResult::floating(
-              node.opcode == ValueOpcode::MIN ? std::min(a, b) : std::max(a, b));
-        } else {
-          aggregate.intValue = node.opcode == ValueOpcode::MIN
-              ? std::min(aggregate.intValue, next.intValue)
-              : std::max(aggregate.intValue, next.intValue);
-        }
-        present++;
-      }
-      if (present == 0) return ValueResult::missing(node.type);
-      if (node.opcode == ValueOpcode::AVG) {
-        double out = (sum + (double)intSum) / (double)present;
-        if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
-        return ValueResult::floating(out);
-      }
-      return promote(aggregate, node.type);
-    }
+ValueResult evalUnaryPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
+  if (!first.valid) return ValueResult::missing(node.type);
+  if (valueArray(first.type)) {
+    return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
+                                   docid, score, first.array.size);
   }
+  return evalUnaryScalar(node, first, docid);
+}
 
-  if (unaryOpcode(node.opcode)) {
-    if (!first.valid) return ValueResult::missing(node.type);
-    if (valueArray(first.type)) {
-      return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
-                                     docid, score, first.array.size);
-    }
-    return evalUnaryScalar(node, first, docid);
-  }
-
+ValueResult evalBinaryPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
   ValueResult second = program.evalNode(node.children[1], docid, score);
   if (valueArray(node.type)) {
     if (!first.valid || !second.valid) return ValueResult::missing(node.type);
@@ -779,6 +722,63 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
                                    docid, score, size);
   }
   return evalBinaryScalar(node, first, second, docid);
+}
+
+ValueResult evalReducerPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
+  if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
+  if (node.opcode != ValueOpcode::AVG
+      && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+      && program.nodes[first.array.node].column->multiSet()) {
+    // A set column holds the doc's values ascending, so min is the
+    // first present element and max the last (a NaN reads as missing).
+    bool fromEnd = node.opcode == ValueOpcode::MAX;
+    for (int64_t i = 0; i < first.array.size; i++) {
+      ValueResult next = program.evalArrayElement(
+          first.array, fromEnd ? first.array.size - 1 - i : i);
+      if (next.valid) return promote(next, node.type);
+    }
+    return ValueResult::missing(node.type);
+  }
+  ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
+  double sum = 0.0;
+  __int128 intSum = 0;
+  int64_t present = 0;
+  for (int64_t i = 0; i < first.array.size; i++) {
+    ValueResult next = program.evalArrayElement(first.array, i);
+    if (!next.valid) continue;
+    if (node.opcode == ValueOpcode::AVG) {
+      if (next.type == ValueType::DOUBLE) sum += next.doubleValue;
+      else intSum += (__int128)next.intValue;
+    } else if (!aggregate.valid) {
+      aggregate = next;
+    } else if (node.type == ValueType::DOUBLE) {
+      double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
+                                                    : (double)aggregate.intValue;
+      double b = next.type == ValueType::DOUBLE ? next.doubleValue : (double)next.intValue;
+      aggregate = ValueResult::floating(
+          node.opcode == ValueOpcode::MIN ? std::min(a, b) : std::max(a, b));
+    } else {
+      aggregate.intValue = node.opcode == ValueOpcode::MIN
+          ? std::min(aggregate.intValue, next.intValue)
+          : std::max(aggregate.intValue, next.intValue);
+    }
+    present++;
+  }
+  if (present == 0) return ValueResult::missing(node.type);
+  if (node.opcode == ValueOpcode::AVG) {
+    double out = (sum + (double)intSum) / (double)present;
+    if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
+    return ValueResult::floating(out);
+  }
+  return promote(aggregate, node.type);
+}
+
+ValueResult evalMinMaxPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  return node.childCount == 1 ? evalReducerPoint(program, node, docid, score)
+                             : evalBinaryPoint(program, node, docid, score);
 }
 
 bool truthyResult(const ValueResult& value) {
@@ -1035,21 +1035,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     return out;
   }
 
-  if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
-      || (node.opcode == ValueOpcode::LOG && low <= 0.0)
-      || (node.opcode == ValueOpcode::LOG1P && low <= -1.0)) {
-    return ValueBounds::unbounded(node.type, input.mayBeMissing);
-  }
-
   double outLow = 0.0;
   double outHigh = 0.0;
   switch (node.opcode) {
@@ -1063,25 +1048,10 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
       outHigh = std::max(std::abs(low), std::abs(high));
       break;
     case ValueOpcode::SQRT:
-      outLow = std::sqrt(low);
-      outHigh = std::sqrt(high);
-      break;
     case ValueOpcode::LOG:
-      outLow = std::log(low);
-      outHigh = std::log(high);
-      break;
     case ValueOpcode::LOG1P:
-      outLow = std::log1p(low);
-      outHigh = std::log1p(high);
-      break;
     case ValueOpcode::FLOOR:
-      outLow = std::floor(low);
-      outHigh = std::floor(high);
-      break;
     case ValueOpcode::EXP:
-      outLow = std::exp(low);
-      outHigh = std::exp(high);
-      break;
     case ValueOpcode::NONE:
     case ValueOpcode::DEF:
     case ValueOpcode::ADD:
@@ -1514,54 +1484,6 @@ ValueBounds logicalBounds(const ValueNode& node, std::span<const ValueBounds> ar
   return truthBounds(rightTruth, mayMissing);
 }
 
-ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) {
-  const ValueBounds& base = args[0];
-  const ValueBounds& exponent = args[1];
-  if (invalid(base)) return retag(base, node.type);
-  if (invalid(exponent)) return retag(exponent, node.type);
-  bool mayMissing = base.mayBeMissing || exponent.mayBeMissing;
-  if (base.alwaysMissing || exponent.alwaysMissing) {
-    return ValueBounds::unbounded(node.type, true, true);
-  }
-  if (!bounded(base) || !bounded(exponent)) {
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  double amin = boundMinAsDouble(base);
-  double amax = boundMaxAsDouble(base);
-  double e = boundMinAsDouble(exponent);
-  if (e != boundMaxAsDouble(exponent)) return ValueBounds::unbounded(node.type, mayMissing);
-  double low;
-  double high;
-  bool exact = amin == amax;
-  if (exact) {
-    low = high = std::pow(amin, e);
-  } else if (e == 0.0) {
-    low = high = 1.0;
-  } else if (amin >= 0.0 && e > 0.0) {
-    low = std::pow(amin, e);
-    high = std::pow(amax, e);
-  } else if (amin > 0.0 && e < 0.0) {
-    low = std::pow(amax, e);
-    high = std::pow(amin, e);
-  } else {
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  if (!std::isfinite(low) || !std::isfinite(high)) {
-    if (exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing)) {
-      return ValueBounds::invalid(
-          node.type, std::isnan(low) ? BoundsInvalidity::NAN_VALUE
-                                     : BoundsInvalidity::POSITIVE_INFINITY,
-          mayMissing);
-    }
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  ValueBounds out = ValueBounds::floatingRange(low, high, mayMissing);
-  out.type = node.type;
-  out.minAttained = exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing);
-  out.maxAttained = out.minAttained;
-  return out;
-}
-
 ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   const ValueBounds& condition = args[0];
   if (invalid(condition)) return retag(condition, node.type);
@@ -1719,72 +1641,54 @@ constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
 constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
 
 constexpr ValueFunction FUNCTIONS[] = {
-    {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::DEF, "def", defResolve, evalDefPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, LAZY_SHARED}, nullptr, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::ADD, "add", addResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::ADD, 2>},
-    {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::SUB, "sub", subResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::SUB, 2>},
-    {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MUL, "mul", mulResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {RAW, RAW},
      evalBucketOperation<ValueOpcode::MUL, 2>},
-    {ValueOpcode::DIV, "div", divResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::DIV, "div", divResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {RAW, RAW},
      evalBucketOperation<ValueOpcode::DIV, 2>},
-    {ValueOpcode::NEG, "neg", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NEG, "neg", unaryDemote, evalUnaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NEG, 1>},
-    {ValueOpcode::ABS, "abs", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::ABS, "abs", unaryDemote, evalUnaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::ABS, 1>},
-    {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::SQRT, 1>},
-    {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::LOG, 1>},
-    {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::LOG1P, 1>},
-    {ValueOpcode::FLOOR, "floor", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::FLOOR, 1>},
-    {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MIN, "min", minMaxResolve, evalMinMaxPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::MIN, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MAX, "max", minMaxResolve, evalMinMaxPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::MAX, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::AVG, "avg", avgResolve, evalReducerPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
      sumBounds, evalSumElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
      evalFunctionBatch, countBounds, evalCountElement, 1, 1, {ANY_VALUE}, nullptr},
-    {ValueOpcode::EXP, "exp", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::EXP, 1>},
-    {ValueOpcode::POW, "pow", powResolve, evalFunctionPoint, evalFunctionBatch,
-     powBounds, evalFunctionElement, 2, 2, {RAW, RAW},
-     evalBucketOperation<ValueOpcode::POW, 2>},
-    {ValueOpcode::LT, "lt", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::LT, "lt", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::LT, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::LE, "lte", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::LE, "lte", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::LE, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::GT, "gt", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::GT, "gt", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::GT, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::GE, "gte", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::GE, "gte", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::GE, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::EQ, "eq", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::EQ, "eq", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::EQ, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::NE, "ne", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NE, "ne", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::NE, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::AND, "and", truthResolve, evalLogicalPoint, evalFunctionBatch,
@@ -1793,7 +1697,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::OR, "or", truthResolve, evalLogicalPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, LAZY_RAW},
      evalBucketOperation<ValueOpcode::OR, 2>},
-    {ValueOpcode::NOT, "not", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NOT, "not", truthResolve, evalUnaryPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NOT, 1>},
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
@@ -1982,6 +1886,7 @@ const std::vector<ValueFunction>& allFunctions() {
 } // namespace
 
 const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
+  if (name == "ln") name = "log";
   for (const ValueFunction& function : allFunctions()) {
     if (function.name == name) return &function;
   }
