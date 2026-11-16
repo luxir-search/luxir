@@ -11,7 +11,7 @@ Choose a type based on how you want to search and use the values:
 
 | Type | Description and typical uses |
 |---|---|
-| `nested` | Structural object path; see [Nested paths](#nested-paths-and-qualified-field-names). Accepts an object, an array of objects, null or an empty array. |
+| `nested` | Structural object path; see [Nested documents](nested.md). Accepts an object, an array of objects, null or an empty array. |
 | `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
 | `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
@@ -1076,35 +1076,16 @@ Declare nested paths and their fields by flat qualified names, for example
 Each intermediate component must be a nested path. Global suffix templates
 also work under paths: `lines_nested.color_s` needs no explicit declaration
 in the default schema. A nested path cannot declare scalar value settings,
-variants, indexing, columns or storage. Supply the value as an object or array
-of objects; each object creates a child row, including an empty object. Null,
-an empty array and an absent field create no rows. Objects may contain nested
-paths recursively, up to 32 levels. Scalar values and non-object array elements
-are document errors. Any error in a child rejects its owning root document.
-
-For example, `{"id":"a","lines_nested":[{"color_s":"red"},{}]}` creates
-one root and two `lines_nested` rows. Supply leaf keys inside their objects;
-a dotted root key cannot create a child row. `field_map` and `drop_unmapped`
-apply to root keys only. Child keys are taken as written. Deleting or replacing
-a root also hides its old child rows. A child view returns its own values under
-local keys; a root's stored projection does not reconstruct nested objects.
-
-Segments with nested rows merge like any others, and the child rows of
-deleted roots are dropped with them. A merge level counts a segment's largest
-row space. A segment is left out of a merge that would take one row space past
-the per-segment row limit; that check counts physical rows, including those of
-deleted roots. Vector ANN overlays can be built on child fields using their
-qualified physical names, for example `vec.lines_nested.embedding_v`.
+variants, indexing, columns or storage. Objects may contain nested paths
+recursively, up to 32 levels.
 
 Dots separate path components. Each component starts with an ASCII letter
 and contains letters, digits or underscores. A physical name, including
 a generated `__variant` suffix, must fit in 127 bytes.
 
-Request field names are relative to their view. In the `items` view,
-`color` resolves to `items.color`; there is no spelling for an upward
-reference. Returned keys are relative too, and `fields: ["*"]` selects
-only fields in that view. The virtual `_version_` is available in child
-views and reports the owning root's birth version. Explicit `to_parent`
-query paths and Domain `to` descent paths are relative to the current view.
-Queries may reference descendant fields implicitly; other consumers must run
-in the field's own view. See [queries over nested rows](searching.md#queries-over-nested-rows).
+Vector ANN overlays can be built on child fields using their qualified
+physical names, for example `vec.lines_nested.embedding_v`.
+
+Request field names are relative to their view: in the `items` view, `color`
+resolves to `items.color`. See [Nested documents](nested.md) for indexing,
+queries, operations on child rows, and limits.

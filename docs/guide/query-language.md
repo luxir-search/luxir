@@ -582,5 +582,5 @@ once, requiring the same item. Scalar-field groups still distribute their
 field over bare terms; a nested-path group establishes a view instead.
 `items:*` tests for at least one item row. Paths and field names are relative
 to the current view, so `items:(parts:(material:steel))` descends twice.
-See [queries over nested rows](searching.md#queries-over-nested-rows) for
-structured equivalents, negation, filters, facets and Domain navigation.
+See [Nested documents](nested.md) for structured equivalents, negation,
+filters, facets and Domain navigation.
