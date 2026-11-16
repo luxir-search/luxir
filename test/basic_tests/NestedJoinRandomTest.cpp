@@ -37,6 +37,7 @@ protected:
   CollectionHelper helper;
   static constexpr int KINDS = 13;
   static constexpr uint64_t SEED = 0x9e3779b97f4a7c15ULL;
+  static constexpr std::string_view RANKED = "body_w:(alpha OR beta^0.001 OR gamma^0.001)";
   uint64_t state = SEED;
   int64_t nextTag = 0;
   std::vector<RootModel> model;
@@ -71,6 +72,10 @@ protected:
 
   static std::string json(const RootModel& root) {
     std::string out = "{\"id\":\"" + root.id + "\",\"owner_i\":" + (root.eligible ? "1" : "0");
+    out += ",\"body_w\":\"gamma";
+    int32_t ordinal = std::stoi(root.id.substr(1));
+    for (int32_t i = 0; i < 64; i++) out += i <= ordinal ? " alpha" : " beta";
+    out += '"';
     if (root.present || !root.items.empty()) {
       out += ",\"items_nested\":[";
       for (size_t i = 0; i < root.items.size(); i++) {
@@ -179,6 +184,12 @@ protected:
   }
 
   void checkQueries(const std::vector<JoinCase>& queries, bool cached) {
+    auto body = localReq(helper.getSearchEngine());
+    body->topDocs().exprQuery(RANKED).getScores()
+        .countLimit().limit(-1).fields({"id"});
+    body->execute(1); ASSERT_OK(body);
+    auto bodyDocs = body->getDocs();
+    auto bodyScores = std::get<api::ColFloat>(body->docList()->columns.find("_score_")->kind).v;
     for (size_t i = 0; i < queries.size(); i++) {
       const auto& q = queries[i]; int32_t position = (int32_t)(i / KINDS);
       Ids expected;
@@ -202,10 +213,30 @@ protected:
         if (position == 1) op.allQuery().filter(query);
         if (position == 2) op.rawQuery() = qb::boolean(req->mr, {qb::all()}, {}, {query});
         if (position == 3) op.rawQuery() = qb::boolean(req->mr, {qb::match(req->mr, "owner_i", "1"), query});
+        if (position == 1 && q.kind == 1) {
+          req->topDocs("ranked").exprQuery(RANKED)
+              .getScores().limit(5).fields({"id"}).filter(query);
+        }
         req->execute(1); ASSERT_OK(req);
         Ids actual;
         for (const auto& doc : req->getDocs()) actual.insert(std::get<std::string>(*find(doc, "id")));
         EXPECT_EQ(expected, actual); EXPECT_EQ((int64_t)expected.size(), req->getMatchCount());
+        if (position == 1 && q.kind == 1) {
+          auto ranked = req->getDocs("ranked");
+          std::vector<size_t> selected;
+          for (size_t n = 0; n < bodyDocs.size() && selected.size() < 5; n++) {
+            if (expected.contains(std::get<std::string>(*find(bodyDocs[n], "id")))) selected.push_back(n);
+          }
+          ASSERT_EQ(selected.size(), ranked.size());
+          if (!ranked.empty()) {
+            auto scores = std::get<api::ColFloat>(req->docList("ranked")->columns.find("_score_")->kind).v;
+            for (size_t n = 0; n < ranked.size(); n++) {
+              EXPECT_EQ(std::get<std::string>(*find(bodyDocs[selected[n]], "id")),
+                  std::get<std::string>(*find(ranked[n], "id")));
+              EXPECT_FLOAT_EQ(bodyScores[selected[n]], scores[n]);
+            }
+          }
+        }
       }
     }
   }
