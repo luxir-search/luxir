@@ -3872,9 +3872,26 @@ TEST_F(IndexWriterTest, lateApplicationCarriesOntoMergingOutput) {
 TEST_F(IndexWriterTest, mergeRetriesLiveDocsDiffBeforeSwap) {
   test::CollectionHelper helper("merge_diff_retry");
   auto writer = helper.getIndexWriter();
-  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")},
-                              UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(helper.index(test::flatdoc("id", "keep"), UpdateMessage::COMMIT).success);
+  writer->mergePolicy->setMergeFactor(100);
+  for (auto ids : {std::vector<std::string>{"a", "b"}, std::vector<std::string>{"keep"}}) {
+    test::CollectionHelper::UpdateBuilder input;
+    for (const auto& id : ids) {
+      auto json = "{\"id\":\"" + id + "\",\"items_nested\":{\"parts_nested\":{\"tag_s\":\"live\"}}}";
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    }
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  auto pinned = writer->snapshots.readers.getReader();
+  auto countParts = [&](std::shared_ptr<IndexReader> reader = {}) {
+    auto req = test::localReq(helper.getSearchEngine());
+    req->collection("merge_diff_retry").topDocs().exprQuery("items_nested.parts_nested.tag_s:live").countLimit().limit(0);
+    req->topDocs("rows").allQuery().countLimit().limit(0).rawOp().domain.emplace().to = "items_nested.parts_nested";
+    if (reader) req->execute(std::move(reader), false); else req->execute(1);
+    EXPECT_OK(req);
+    EXPECT_EQ(req->getMatchCount(), req->getMatchCount("rows"));
+    return req->getMatchCount();
+  };
+  EXPECT_EQ(3, countParts());
   std::latch diff(1), release(1), retry(1), releaseRetry(1);
   std::atomic<int> attempts = 0;
   Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
@@ -3887,10 +3904,12 @@ TEST_F(IndexWriterTest, mergeRetriesLiveDocsDiffBeforeSwap) {
   auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
   diff.wait();
   EXPECT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  EXPECT_EQ(2, countParts());
   release.count_down();
   retry.wait();
   EXPECT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
   EXPECT_TRUE(helper.deleteById("keep", UpdateMessage::COMMIT).success);
+  EXPECT_EQ(0, countParts());
   EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
   releaseRetry.count_down();
   merge.get();
@@ -3898,6 +3917,8 @@ TEST_F(IndexWriterTest, mergeRetriesLiveDocsDiffBeforeSwap) {
   EXPECT_EQ(3, attempts.load());
   EXPECT_EQ(0, writer->snapshots.readers.getReader()->liveDocs());
   EXPECT_TRUE(writer->segInfos.empty());
+  EXPECT_EQ(0, countParts());
+  EXPECT_EQ(3, countParts(pinned));
   test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
 }
 
