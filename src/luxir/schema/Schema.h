@@ -95,6 +95,7 @@ public:
   // exposes the owner and its variants for the later ingest dispatcher.
   ResolvedFieldHandle resolveInput(std::string_view docKey) const;
   ResolvedFieldHandle resolveFor(std::string_view name, OpClass op) const;
+  bool isNestedPath(std::string_view path) const;
   void requirePath(std::string_view path) const;
   static std::string qualify(std::string_view path, std::string_view name);
   // Already-resolved physical access: no defaults or __self aliases.

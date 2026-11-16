@@ -1551,6 +1551,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req, IndexReade
         pushExplicit(f);
         continue;
       }
+      resolver.requireLocalPattern(f);
       forEachFieldPattern(catalog, f, [&](const auto& field) { return relative(field.name); },
           [](const auto& field) { return field.derived; }, [&](const auto& field) {
             if (taken.insert(relative(field.name)).second) pushDiscovered(field);

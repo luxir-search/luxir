@@ -348,10 +348,8 @@ struct from<JSON, luxir::api::Domain> {
                 value.query, ctx, vit, vend);
           } else if (key == "apply_parent_filters") {
             util::from_json<O>(value.apply_parent_filters, ctx, vit, vend);
-          } else if (key == "to_children") {
-            util::from_json<O>(value.to_children, ctx, vit, vend);
-          } else if (key == "to_parent") {
-            util::from_json<O>(value.to_parent, ctx, vit, vend);
+          } else if (key == "to") {
+            util::from_json<O>(value.to, ctx, vit, vend);
           } else if (key == "filter") {
             decltype(auto) filters =
                 ::hpp_proto::detail::as_modifiable(ctx, value.filter);

@@ -115,8 +115,7 @@ struct OpParseContext {
 
 struct SearchParserImpl {
   SearchRequest& req;
-  const std::shared_ptr<IndexReader>* scopedView;
-  FieldResolver fields;
+  ParseView parseView;
   OpParseContext options;
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
@@ -217,10 +216,10 @@ public:
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
 
-  const std::shared_ptr<IndexReader>& view() const { return *scopedView; }
+  const std::shared_ptr<IndexReader>& view() const { return parseView.reader(); }
 
   explicit SearchParserImpl(SearchRequest& req)
-    : req(req), scopedView(&req.reader), fields(*req.schema, req.resolvedFields, req.reader->path()), maxOpDepth(req.searchConfig.max_op_depth) {
+    : req(req), parseView(*req.schema, req.resolvedFields, &req.reader, &req), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
   // Every planning context of the request draws on one multi-term budget.
@@ -231,11 +230,9 @@ public:
   // All request parse paths share the operator rules and field resolver.
   ParseContext createParseContext(std::string_view name) {
     ParseContext parseContext{req.requestPool, *req.schema, req.arena,
-        coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
+        coerceContext(*req.timeZone), name, &req.warnings, &parseView, &req.engine.getNode()};
     parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
     parseContext.collapse = enclosingCollapse;
-    parseContext.reader = view().get();
-    parseContext.request = &req;
     return parseContext;
   }
 
@@ -411,38 +408,66 @@ public:
     groupExprStats(currOp, placement, destination ? *destination : currOp.subOps);
   }
 
+  std::string domainPath(std::string_view to) {
+    if (to == "/") return {};
+    if (to.empty()) throw RequestError("domain.to requires a path, .., or /");
+    if (to == ".." || to.starts_with("../")) {
+      size_t levels = 0;
+      for (;;) {
+        auto slash = to.find('/');
+        if (to.substr(0, slash) != "..") {
+          throw RequestError("domain.to requires .. at every upward step; sibling paths such as '../name' are reserved");
+        }
+        ++levels;
+        if (slash == std::string_view::npos) break;
+        to.remove_prefix(slash + 1);
+      }
+      std::string path(view()->path());
+      while (levels--) {
+        if (path.empty()) throw RequestError("domain.to cannot move above the root view");
+        auto dot = path.rfind('.');
+        path.resize(dot == std::string::npos ? 0 : dot);
+      }
+      return path;
+    }
+    if (to.find('/') != std::string_view::npos) {
+      throw RequestError("domain.to uses dots to descend; '/' only separates .. steps or names the root view");
+    }
+    return parseView.fields.resolvePath(to).physicalName;
+  }
+
+  bool movesView(const api::Domain& domain) {
+    return domain.to && domainPath(*domain.to) != view()->path();
+  }
+
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
     auto inherited = options;
     options = inherited.child(searchOp, name);
     auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
-    auto* previousView = scopedView;
     auto* previousCollapse = enclosingCollapse;
     auto* previousMeasure = inheritedFacetMeasure;
     auto* previousList = owningList;
     auto restoreScope = scope_guard([&]() noexcept {
-      scopedView = previousView;
       enclosingCollapse = previousCollapse;
       inheritedFacetMeasure = previousMeasure;
       owningList = previousList;
     });
     InputDomainPlan* input = nullptr;
-    if (searchOp.domain && (searchOp.domain->to_children || searchOp.domain->to_parent)) {
+    std::optional<ParseView::Scope> viewScope;
+    if (searchOp.domain && movesView(*searchOp.domain)) {
       const auto& domain = *searchOp.domain;
-      if (domain.to_children && domain.to_parent) throw RequestError("domain cannot expand and project together");
-      const auto& destination = req.pinView(domain.to_children
-          ? fields.resolvePath(*domain.to_children).physicalName : *domain.to_parent);
+      const auto& destination = req.pinView(domainPath(*domain.to));
       bool descending = destination->path().size() > view()->path().size();
-      if (descending != domain.to_children.has_value()) throw RequestError("domain transform has the wrong direction");
       input = arenaCreate<InputDomainPlan>(req.arena);
       input->mapping = {&req.ownershipRelation(descending ? *destination : *view(),
           descending ? *view() : *destination),
           descending ? RowRelation::Direction::EXPAND : RowRelation::Direction::PROJECT};
-      scopedView = &destination;
+
       enclosingCollapse = nullptr;
       inheritedFacetMeasure = nullptr;
       owningList = nullptr;
-      auto fieldScope = fields.scopedPath(destination->path());
+      viewScope.emplace(parseView, destination->path());
       auto context = createParseContext(name);
       auto parsed = parseDomain(domain, name, context);
       input->applyParentFilters = parsed.applyParentFilters;
@@ -459,7 +484,6 @@ public:
         input->variants.buildWeights(*weights, *input->planning, 0);
       }
     }
-    auto fieldScope = fields.scopedPath(view()->path());
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
@@ -551,7 +575,7 @@ public:
       },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
-        options.fieldResolver = &fields;
+        options.fieldResolver = &parseView.fields;
         options.shareProducers = !disableAggregateSharingForTests;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
@@ -621,7 +645,7 @@ public:
         req.arena, *view(), spec.missing, getNumber);
     std::unordered_set<std::string> resolved;
     for (std::string_view name : spec.field) {
-      auto field = fields.resolveLocal(name, OpClass::VALUE);
+      auto field = parseView.fields.resolveLocal(name, OpClass::VALUE);
       auto& type = *field.fieldType;
       if (type.multiValued() || !type.hasColumn()) {
         throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
@@ -718,7 +742,7 @@ public:
                                      context, termFilter.partition, termFilter.num_partitions));
     }
     QueryBuilder builder(req.requestPool, *req.schema, coerceContext(*req.timeZone),
-                         facetName, &req.warnings, &fields);
+                         facetName, &req.warnings, &parseView.fields);
     FacetTermFilterSpec spec;
     // Errors name the term_filter field they came from.
     auto within = [&](std::string_view name, auto&& build) {
@@ -776,7 +800,7 @@ public:
       const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = parseView.fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
@@ -811,7 +835,7 @@ public:
     if (preparedSelected == nullptr && !selectedValues.empty()) {
       CoerceContext selectionContext = coerceContext(*req.timeZone);
       QueryBuilder builder(req.requestPool, *req.schema,
-                           selectionContext, facetName, &req.warnings, &fields);
+                           selectionContext, facetName, &req.warnings, &parseView.fields);
       ownedSelected = builder.canonicalizeFieldValues(
           target, selectedValues, true);
       preparedSelected = &ownedSelected;
@@ -884,7 +908,7 @@ public:
       OpsPlacement placement) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = parseView.fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     bool dataBounds = facetReq.bounds == api::RangeFacet_::Bounds::DATA;
     if (!dataBounds && facetReq.bounds != api::RangeFacet_::Bounds::EXPLICIT) {
@@ -1144,7 +1168,7 @@ public:
     out.rankNeedsScores = false;
     for (const auto& sortSpec : sorts) {
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
-      options.fieldResolver = &fields;
+      options.fieldResolver = &parseView.fields;
       options.opName = "sort";
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
       const ValueNode& root = program->root();
@@ -1265,7 +1289,7 @@ public:
       auto restoreCoercion = scope_guard([&]() noexcept {
         parseContext.coerceContext = inheritedCoercion;
       });
-      if (child.domain->to_children || child.domain->to_parent) {
+      if (movesView(*child.domain)) {
         if (child.domain->apply_parent_filters.has_value() && !child.domain->query) {
           throw RequestError("domain.apply_parent_filters requires domain.query");
         }
@@ -1512,7 +1536,7 @@ public:
       const auto* queryProto = std::get_if<api::QueryFacet>(&child.kind);
       if (fieldProto == nullptr && rangeProto == nullptr
           && queryProto == nullptr) continue;
-      if (child.domain && (child.domain->to_children || child.domain->to_parent)) {
+      if (child.domain && movesView(*child.domain)) {
         const auto& selected = fieldProto ? fieldProto->selected
             : rangeProto ? rangeProto->selected : queryProto->selected;
         if (selected && !ValueSequence(*selected, "facet '" + std::string(key) + "': selected").empty()) {
@@ -1543,9 +1567,9 @@ public:
         if (selected.empty()) continue;
 
         QueryBuilder builder(req.requestPool, *req.schema,
-                             parseContext.coerceContext, key, &req.warnings, &fields);
+                             parseContext.coerceContext, key, &req.warnings, &parseView.fields);
         CanonicalValueSet canonical = builder.canonicalizeFieldValues(
-            fields.resolveLocal(fieldProto->field, OpClass::VALUE), selected, true);
+            parseView.fields.resolveLocal(fieldProto->field, OpClass::VALUE), selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
         preparedFacets.emplace(

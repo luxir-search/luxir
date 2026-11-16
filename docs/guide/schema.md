@@ -1103,5 +1103,6 @@ Request field names are relative to their view. In the `items` view,
 reference. Returned keys are relative too, and `fields: ["*"]` selects
 only fields in that view. The virtual `_version_` is available in child
 views and reports the owning root's birth version. Explicit `to_parent`
-query paths and Domain `to_children` paths are relative to the current view;
-Domain `to_parent` names its target by full path.
+query paths and Domain `to` descent paths are relative to the current view.
+Queries may reference descendant fields implicitly; other consumers must run
+in the field's own view. See [queries over nested rows](searching.md#queries-over-nested-rows).

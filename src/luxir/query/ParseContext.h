@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -10,7 +11,7 @@
 #include <google/protobuf/arena.h>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/query/Warnings.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/MemPool.h"
@@ -28,11 +29,7 @@ class SearchRequest;
 // budget and operator rules. This is the request-scoped parse/build context
 // from the query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
-  SearchRequest* request = nullptr;
   const CollapsePlan* collapse = nullptr;
-  // The searched reader, when there is one: wildcard field lists reuse its
-  // schema-specific search catalog.
-  IndexReader* reader = nullptr;
   // Null for offline parsing; request parsers pass their engine's node.
   LuxirNode* node = nullptr;
   MemPool& pool;
@@ -60,7 +57,8 @@ struct ParseContext {
   // Request-facing constructors require this explicitly so adding a parser
   // call site cannot silently fall back to UTC.
   CoerceContext coerceContext;
-  FieldResolver localFields;
+  std::optional<ParseView> localView;
+  ParseView& view;
   FieldResolver& fields;
   std::map<const api::Val*, std::pair<std::string_view, size_t>> exactSources;
 
@@ -68,10 +66,12 @@ struct ParseContext {
                const CoerceContext& coerceContext,
                std::string_view opName,
                std::vector<api::Warning>* warnings = nullptr,
-               FieldResolver* fields = nullptr, LuxirNode* node = nullptr)
+               ParseView* view = nullptr, LuxirNode* node = nullptr)
     : node(node), pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
-      coerceContext(coerceContext), localFields(schema),
-      fields(fields ? *fields : localFields) {}
+      coerceContext(coerceContext),
+      localView(view ? std::nullopt : std::optional<ParseView>(std::in_place, schema)),
+      view(view ? *view : *localView),
+      fields(this->view.fields) {}
 
   // code must be a string with static storage duration (a literal).
   // Repeats are dropped.

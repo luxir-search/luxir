@@ -1159,6 +1159,11 @@ Schema::RootField Schema::findRoot(std::string_view root) const {
   return findComponent(root);
 }
 
+bool Schema::isNestedPath(std::string_view path) const {
+  auto root = findRoot(path);
+  return root.primary && (*root.primary)->type() == FieldType::NESTED;
+}
+
 void Schema::requirePath(std::string_view path) const {
   if (path.empty()) return;
   auto root = findRoot(path);
@@ -1220,7 +1225,8 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
-  if ((*root.primary)->type() == FieldType::NESTED && op != OpClass::PRIMARY) {
+  if ((*root.primary)->type() == FieldType::NESTED
+      && op != OpClass::PRIMARY && op != OpClass::SEARCH && op != OpClass::EXISTS) {
     throw RequestError("Nested path has no scalar value: " + std::string(rootName), "invalid_field");
   }
   std::string_view label = "self";
