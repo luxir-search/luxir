@@ -414,10 +414,21 @@ private:
   }
 
   uint32_t parseColumn(std::string_view name, size_t pos) {
+    // A dot after a nested path continues the field name; after any other
+    // field it introduces a type component.
+    if (cur->peek() == '.') {
+      std::string_view view = opts.fieldResolver ? opts.fieldResolver->path() : std::string_view{};
+      if (opts.schema->isNestedPath(view.empty() ? std::string(name) : Schema::qualify(view, name))) {
+        while (cur->consume('.')) {
+          if (value::lex::scanIdentifier(*cur).empty()) fail(pos, "expected a field component after '.'");
+        }
+        name = cur->slice(pos, cur->position());
+      }
+    }
     ResolvedFieldHandle target;
     try {
       target = opts.fieldResolver ? opts.fieldResolver->resolveLocal(name, OpClass::VALUE, opts.opName)
-          : opts.schema->resolveFor(name, OpClass::VALUE);
+          : FieldResolver(*opts.schema).resolveLocal(name, OpClass::VALUE, opts.opName);
     } catch (const RequestError& e) {
       fail(pos, e.what());
     }

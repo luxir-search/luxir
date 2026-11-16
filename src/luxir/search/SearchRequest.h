@@ -168,6 +168,7 @@ public:
   const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
   RowRelation& ownershipRelation(IndexReader& many, IndexReader& one);
   Query::PlanningContext* createPlanningContext(IndexReader& view);
+  size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }
 
   ExecutionProfileOpState* addExecutionProfileOp(std::string_view name) {
     if (!proto.profile) return nullptr;

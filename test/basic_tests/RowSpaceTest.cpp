@@ -965,10 +965,10 @@ TEST_F(ScopedRowSpaceTest, preparedPredicateChildKeepsRawMembershipAcrossDeletes
 TEST_F(ScopedRowSpaceTest, transformedDomainsListFacetAndProjectDistinctOwners) {
   auto req = request();
   auto& children = req->topDocs().allQuery().countLimit().fields({"number", "payload"});
-  children.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  children.rawOp().domain.emplace().to = Fixture::CHILD;
   children.facet("labels", "label").mincount(1);
   auto& owners = children.topDocs("owners").allQuery().countLimit().fields({"number"});
-  owners.rawOp().domain.emplace().to_parent = "";
+  owners.rawOp().domain.emplace().to = "/";
   req->topDocs("roots").allQuery().countLimit().limit(0);
   req->execute(root);
   ASSERT_OK(req);
@@ -983,7 +983,7 @@ TEST_F(ScopedRowSpaceTest, transformedDomainsListFacetAndProjectDistinctOwners) 
 TEST_F(ScopedRowSpaceTest, transformedDomainFeedsAChildFieldFacetDirectly) {
   auto req = request();
   auto& facet = req->facet("labels", "label").mincount(1);
-  facet.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  facet.rawOp().domain.emplace().to = Fixture::CHILD;
   req->execute(root);
   ASSERT_OK(req);
   auto* labels = (*req->responses[0]->proto.ops.find("labels"))->facetResult();
@@ -994,7 +994,7 @@ TEST_F(ScopedRowSpaceTest, inheritedOwnerDomainExcludesWholeFamilies) {
   auto req = request();
   auto& owners = req->topDocs().matchQuery("number", "101").countLimit().limit(0);
   auto& children = owners.topDocs("children").allQuery().countLimit().fields({"number"});
-  children.rawOp().domain.emplace().to_children = Fixture::CHILD;
+  children.rawOp().domain.emplace().to = Fixture::CHILD;
   req->execute(root, false);
   ASSERT_OK(req);
   EXPECT_EQ(3, req->getMatchCount());
@@ -1007,7 +1007,7 @@ TEST_F(ScopedRowSpaceTest, transformedResetKeepsItsRootBucket) {
   auto& roots = req->facet("numbers", "number").mincount(1);
   auto& children = roots.topDocs("children").allQuery().countLimit().limit(0);
   auto& domain = children.rawOp().domain.emplace();
-  domain.to_children = Fixture::CHILD;
+  domain.to = Fixture::CHILD;
   auto* query = (api::Query*)req->mr.allocate(sizeof(api::Query), alignof(api::Query));
   new (query) api::Query(qb::all());
   domain.query = query;
@@ -1027,7 +1027,7 @@ TEST_F(ScopedRowSpaceTest, transformedResetReappliesOwnerFiltersInTheirOwnSpace)
   auto& labels = owners.facet("labels", "label").mincount(0);
   auto& children = labels.topDocs("children").allQuery().countLimit().limit(0);
   auto& domain = children.rawOp().domain.emplace();
-  domain.to_children = Fixture::CHILD;
+  domain.to = Fixture::CHILD;
   domain.apply_parent_filters = true;
   auto* query = (api::Query*)req->mr.allocate(sizeof(api::Query), alignof(api::Query));
   new (query) api::Query(qb::all());
@@ -1041,13 +1041,13 @@ TEST_F(ScopedRowSpaceTest, transformedResetReappliesOwnerFiltersInTheirOwnSpace)
   EXPECT_EQ(4, *lists[0].docList()->found);
 }
 
-TEST_F(ScopedRowSpaceTest, jsonSurfaceCrossesViewsAndKeepsEmptyParentPath) {
+TEST_F(ScopedRowSpaceTest, jsonSurfaceCrossesViewsAndProjectsToRoot) {
   auto req = request();
   ASSERT_TRUE(api::read_json(req->rawRequest(), R"json({"ops":{
     "q":{"top_docs":{"query":{"to_parent":{"path":"items","score":"none",
       "query":{"match":{"field":"body","val":"shared"}}}},"count_limit":-1,"limit":0}},
-    "children":{"domain":{"to_children":"items"},"top_docs":{"count_limit":-1,"limit":0,
-      "ops":{"owners":{"domain":{"to_parent":""},"top_docs":{"count_limit":-1,"limit":0}}}}}
+    "children":{"domain":{"to":"items"},"top_docs":{"count_limit":-1,"limit":0,
+      "ops":{"owners":{"domain":{"to":"/"},"top_docs":{"count_limit":-1,"limit":0}}}}}
   }})json", req->mr));
   req->execute(root);
   ASSERT_OK(req);
@@ -1140,7 +1140,7 @@ TEST_F(ScopedRowSpaceTest, relativeJoinAndExpansionPathsStartAtTheCurrentView) {
   auto req = request();
   req->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr, "deep", qb::all());
   auto& deeper = req->topDocs("deeper").allQuery().countLimit().limit(0);
-  deeper.rawOp().domain.emplace().to_children = "deep";
+  deeper.rawOp().domain.emplace().to = "deep";
   req->execute(root->view(Fixture::CHILD));
   ASSERT_OK(req);
   EXPECT_EQ(8, req->getMatchCount());

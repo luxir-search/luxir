@@ -5,7 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/schema/Schema.h"
-#include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/store/OutputStream.h"
@@ -2237,17 +2237,18 @@ TEST_F(SchemaTest, nestedPathRejectsValueSettings) {
 TEST_F(SchemaTest, relativeResolutionMemosAreScopedAndRestoreTheirView) {
   auto s = schemaJson(R"({"fields":{"items":"nested","items.parts":"nested",
     "items.code":"string","items.parts.code":"int","code":"text"}})");
-  FieldResolver fields(*s);
+  ParseView view(*s);
+  auto& fields = view.fields;
   auto* root = &fields.resolve("code", OpClass::PRIMARY);
   {
-    auto scope = fields.scopedPath("items");
+    auto scope = view.scoped("items");
     auto* item = &fields.resolve("code", OpClass::PRIMARY);
     EXPECT_EQ("items.code", item->physicalName);
     EXPECT_NE(root, item);
     EXPECT_EQ("items.parts.code", fields.resolve("parts.code", OpClass::PRIMARY).physicalName);
     EXPECT_THROW(fields.resolveLocal("parts.code", OpClass::PRIMARY), RequestError);
     {
-      auto deeper = fields.scopedPath("items.parts");
+      auto deeper = view.scoped("items.parts");
       EXPECT_EQ("items.parts.code", fields.resolve("code", OpClass::PRIMARY).physicalName);
       auto copy = fields.resolve("code", OpClass::PRIMARY);
       EXPECT_EQ("items.parts", copy.path);

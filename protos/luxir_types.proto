@@ -1028,10 +1028,8 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
-  // Expand into this descendant path, or project onto this ancestor path.
-  // The empty ancestor path identifies root rows.
-  optional string to_children = 6;
-  optional string to_parent = 7;
+  // Relative descendant path, .. steps to ancestors, or / for root documents.
+  optional string to = 6;
   // If present, replaces the incoming domain with this query's matches
   // within live documents and the enclosing structural bucket identities.
   // If absent, inherits the incoming domain.

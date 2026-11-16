@@ -937,8 +937,7 @@ struct Fusion {                                                  // needs TopDoc
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
-  std::optional<std::string_view> to_children;
-  std::optional<std::string_view> to_parent;
+  std::optional<std::string_view> to;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
   std::optional<bool> apply_parent_filters;

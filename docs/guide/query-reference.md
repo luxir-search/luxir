@@ -248,7 +248,7 @@ also set a `domain`:
 ```
 
 `domain.query` replaces the incoming document set with that query's matches
-across the collection. Without it, the operation inherits its incoming set.
+across the operation's view. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
 query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
@@ -809,3 +809,19 @@ in their own guides:
 - Fuzzy expansion truncation at `max_expansions` is not reported in the response.
 - Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
   [Expansion limits](#expansion-limits).
+
+
+## Nested row queries and domains
+
+A single-field leaf naming a descendant field implicitly uses to_parent with
+score max; each leaf joins independently. Wrap a Boolean child in
+`{"to_parent":{"path":"items","query":{...}}}` for a same-item query.
+Its optional `score` is `max` (default) or `none`. An exists query on a nested
+path joins all rows of that path. Query strings additionally support nested
+field groups, such as `items:(color:red AND size:L)`.
+
+Operations move between views through `domain.to`: relative dotted descent,
+`..` or `../..` ascent, and `/` for root documents. Mixed upward/downward
+paths are reserved. Non-query field consumers must run in their field's own
+view. See [queries over nested rows](searching.md#queries-over-nested-rows)
+for examples and the precise query/consumer distinction.

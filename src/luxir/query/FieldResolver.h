@@ -22,6 +22,7 @@ namespace luxir {
 // not allocate: the memos find by string_view, and the node map keeps the
 // returned handles at stable addresses while later clauses add entries.
 class FieldResolver {
+  friend class ParseView;
   using Handles = boost::unordered_node_map<std::string, ResolvedFieldHandle,
                                             PackedTermHash, PackedTermEqual>;
   Schema& schema;
@@ -55,20 +56,6 @@ public:
                          std::string_view path = {})
       : schema(schema), explanations(explanations) { setPath(path); }
 
-  class Scope {
-    FieldResolver& fields;
-    std::string_view previous;
-
-  public:
-    Scope(FieldResolver& fields, std::string_view path) : fields(fields), previous(fields.viewPath) {
-      fields.setPath(path);
-    }
-    ~Scope() { fields.setPath(previous); }
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
-  };
-
-  Scope scopedPath(std::string_view path) { return Scope(*this, path); }
   std::string_view path() const { return viewPath; }
 
   const ResolvedFieldHandle& resolvePath(std::string_view name) {
@@ -110,9 +97,23 @@ public:
     const auto& target = resolve(name, op, context);
     if (target.path != viewPath && target.physicalName != "_version_") {
       throw RequestError("Field '" + std::string(name) + "'" + where()
-          + " requires a query or operation in nested path '" + target.path + "'");
+          + " belongs to nested path '" + target.path
+          + "'; the operation must run in that view through Domain 'to'");
     }
     return target;
+  }
+
+  void requireLocalPattern(std::string_view pattern) {
+    auto dot = pattern.rfind('.');
+    if (dot == std::string_view::npos) return;
+    auto prefix = pattern.substr(0, dot);
+    if (prefix.find_first_of("*?") != std::string_view::npos) {
+      throw RequestError("Wildcard nested paths are not supported: " + std::string(pattern));
+    }
+    const auto& path = resolvePath(prefix);
+    throw RequestError("Field pattern '" + std::string(pattern) + "'" + where()
+        + " names nested path '" + path.physicalName
+        + "'; the operation must run in that view through Domain 'to'");
   }
 
   // Adds a line to ?explain=resolved (a no-op outside explain), e.g. what a

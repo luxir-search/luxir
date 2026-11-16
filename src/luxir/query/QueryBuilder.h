@@ -32,6 +32,7 @@
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/search/IndexReader.h"
@@ -962,12 +963,12 @@ public:
   // Wildcard lists include explicit selectors in this physical-target budget.
   static constexpr size_t MAX_PATTERN_FIELDS = 64;
 
-private:
   struct ResolvedWeightedField {
     const ResolvedFieldHandle* target;
     float weight;
   };
 
+private:
   // Multi-field searches omit only values that cannot coerce to this field.
   // Keep all query construction on the strict match/range path.
   Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
@@ -991,16 +992,17 @@ private:
     return createMatchQueryImpl(target, retainTermWindow(*window, buf), op, minMatch, weight, false);
   }
 
+public:
   // Expand selectors, resolve search bindings, and keep the largest weight
   // per physical target. Sort before analysis so request order never matters.
-  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
+  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested, ParseView& view) {
     bool patterns = std::ranges::any_of(requested, [](const auto& field) {
       return field.field.find('*') != std::string_view::npos;
     });
     std::vector<ResolvedWeightedField> resolved;
     boost::unordered_flat_map<std::string_view, size_t, PackedTermHash, PackedTermEqual> seen;
     auto add = [&](std::string_view name, float weight) {
-      const auto& target = fields.resolveLocal(name, OpClass::SEARCH, opName);
+      const auto& target = fields.resolve(name, OpClass::SEARCH, opName);
       auto [entry, inserted] = seen.try_emplace(target.physicalName, resolved.size());
       if (inserted) {
         if (patterns && resolved.size() == MAX_PATTERN_FIELDS) {
@@ -1020,7 +1022,7 @@ private:
         assert(reader->schema().get() == &schema);
         catalog = reader->searchableFields();
       } else {
-        schemaNames = schema.searchableFields();
+        schemaNames = schema.searchableFields({}, fields.path());
         catalog = schemaNames;
       }
     }
@@ -1028,7 +1030,26 @@ private:
       if (field.field.find('*') == std::string_view::npos) {
         add(field.field, field.weight);
       } else {
-        forEachFieldPattern(catalog, field.field,
+        auto pattern = field.field;
+        auto dot = pattern.rfind('.');
+        std::optional<ParseView::Scope> scope;
+        std::vector<std::string> nestedNames;
+        auto names = catalog;
+        if (dot != std::string_view::npos) {
+          auto prefix = pattern.substr(0, dot);
+          if (prefix.find('*') != std::string_view::npos) {
+            throw RequestError("Wildcard nested paths are not supported: " + std::string(pattern));
+          }
+          const auto& path = fields.resolvePath(prefix);
+          scope.emplace(view, path.physicalName);
+          pattern.remove_prefix(dot + 1);
+          if (view.get()) names = view.get()->searchableFields();
+          else {
+            nestedNames = schema.searchableFields({}, fields.path());
+            names = nestedNames;
+          }
+        }
+        forEachFieldPattern(names, pattern,
             [](const auto& name) { return std::string_view(name); },
             [](const auto& name) { return name.find("__") != std::string_view::npos; },
             [&](const auto& name) { add(name, field.weight); });
@@ -1061,7 +1082,7 @@ public:
   // Fields with the same expanded analyzer definition and long-term policy share
   // one analysis pass and one BM25F query per term. Group order follows physical
   // field order, independent of request order and the query text.
-  Query* createMultiMatchCombined(std::span<const WeightedField> requested,
+  Query* createMultiMatchCombined(std::span<const ResolvedWeightedField> resolved,
                                   std::string_view text, Operator op, int minMatch,
                                   float tie = 1.0f) {
     struct Group {
@@ -1070,7 +1091,6 @@ public:
       std::span<float> weights;
       size_t count;
     };
-    auto resolved = resolveWeightedFields(requested);
     auto groups = pool.make_span<Group>(resolved.size());
     auto groupIndices = pool.make_span<size_t>(resolved.size());
     size_t numGroups = 0;
@@ -1133,23 +1153,14 @@ public:
   }
 
   // Each field contributes its own match or phrase score multiplied by its weight.
-  Query* createMultiMatchPerField(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch,
-                                  float tie = 1.0f, std::optional<int32_t> phraseSlop = {}) {
-    auto resolved = resolveWeightedFields(requested);
-    auto clauses = pool.make_span<Query*>(resolved.size());
-    size_t count = 0;
-    for (size_t i = 0; i < resolved.size(); i++) {
-      const auto& target = *resolved[i].target;
-      if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
-        clauses[count++] = createPhraseQuery(
-            target, std::span<const std::string_view>(&text, 1), {}, *phraseSlop, resolved[i].weight);
-      } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
-        clauses[count++] = query;
-      }
+  Query* createMultiMatchField(const ResolvedWeightedField& field,
+                              std::string_view text, Operator op, int minMatch,
+                              std::optional<int32_t> phraseSlop = {}) {
+    if (phraseSlop && field.target->fieldType->type() == FieldType::TEXT) {
+      return createPhraseQuery(*field.target, std::span<const std::string_view>(&text, 1),
+          {}, *phraseSlop, field.weight);
     }
-    if (count == 0) return matchNoDocs();
-    return DisMaxQuery::make(pool, clauses.first(count), tie);
+    return tryCreateMatchQuery(*field.target, text, op, minMatch, field.weight);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for

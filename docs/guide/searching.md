@@ -1343,3 +1343,120 @@ preparation without collecting results. See
 - `max_parallel` supports `-1`, `0`, and `1`; higher values are reserved.
 - Only string field facets and `knn` queries emit profile entries; other
   operations run unprofiled under `profile: true`.
+
+
+## Queries over nested rows
+
+Nested rows preserve the relationship between fields of each structured child.
+For example, declare these flat schema entries (or use `_nested`, `_s`, and
+other suffix templates):
+
+```json
+{"fields":{"items":"nested","items.color":"string","items.size":"string",
+           "items.parts":"nested","items.parts.material":"string"}}
+```
+
+These two documents differ in whether one item has both properties:
+
+```json
+{"id":"a","items":[{"color":"red","size":"S"},{"color":"blue","size":"L"}]}
+{"id":"b","items":[{"color":"red","size":"L"}]}
+```
+
+`items.color:red AND items.size:L` matches both documents. Each leaf query
+independently joins its matching items back to the documents: some item is
+red, and some item is L. `items:(color:red AND size:L)` matches only b. The
+field group parses in the items view and joins that whole query once, so the
+same item must satisfy both clauses. Unlike a group on a scalar field such
+as `title_t:(red OR blue)`, a nested-path group does not distribute over its
+clauses. One clause, `items:(color:red)`, is the same query as
+`items.color:red`.
+
+The structured equivalent of the same-item group is the existing to_parent
+query; field names and the path are relative to the view where they appear:
+
+```json
+{"to_parent":{"path":"items","score":"max","query":{
+  "boolean":{"required":[{"match":{"field":"color","val":"red"}},
+                           {"match":{"field":"size","val":"L"}}]}
+}}}
+```
+
+`score` defaults to `max`, the best matching child's score. `none` returns a
+constant score and has the same filter membership. Implicit references use
+max, including when the entire leaf is a phrase or an analyzed multi-term
+match. Structured match, any_of, phrase, range, prefix, wildcard, regex,
+fuzzy, exists, geo and kNN queries follow the same rule as expressions.
+A kNN leaf selects k eligible child rows, which may belong to fewer than k
+owners. Use combined multi_match only within one view; per_field mode can
+combine individually joined fields from different views.
+
+`items:*`, or `{"exists":{"field":"items"}}`, means "has at least one
+item row". An empty object is a row and matches; an absent/null/empty-array
+path does not. A root delete also hides its child rows. `NOT items.color:red`
+means no item is red; `items:(NOT color:red)` means some item is not red,
+which can be true even when another item is red. With no items, only the
+first form matches.
+
+A join filter beside a root query keeps root relevance independent of the
+child restriction:
+
+```json
+{"query":"body_w:camera", "filter":["items:(color:red AND size:L)"],
+ "fields":["id"], "count_limit":-1}
+```
+
+To facet on items of those matching documents, move the facet's Domain:
+
+```json
+{"query":"body_w:camera", "filter":["items:(color:red AND size:L)"],
+ "ops":{"colors":{"domain":{"to":"items"},
+                  "field_facet":{"field":"color"}}}}
+```
+
+That facet counts item rows of the selected documents, including their
+other items. To restrict the rows themselves, add `domain.filter`, resolved
+in the destination view, for example `"filter":["color:red AND size:L"]`.
+Sorts, facets, collapse keys, value expressions, and returned-field selectors
+cannot read descendant fields from an ancestor. Run the operation in that
+view through Domain `to`. A child projection returns local names and
+`fields:["*"]` includes only its own fields.
+
+Domain has one navigation key, `to`:
+
+| value | destination |
+|---|---|
+| `items` or `items.parts` | a descendant of the current view |
+| `..` | the immediate owner view |
+| `../..` | two owner levels up |
+| `/` | collection root documents, including when already there |
+
+The slash separates `..` steps only. `../reviews` is reserved and rejected;
+use separate operations to address different child paths. `..` above the
+root is an error, and an empty `to` is an error. A permitted path with no
+indexed rows is an empty view. Domain query/filter expressions use names in
+the destination view. Other Domain settings retain their normal reset and
+filter-routing semantics.
+
+For example, below an operation over items.parts, these sub-operations
+project matching parts to their immediate items and to their root documents:
+
+```json
+{"domain":{"to":"items.parts"},"top_docs":{"limit":0,"ops":{
+  "items":{"domain":{"to":".."},"top_docs":{"count_limit":-1,"limit":0}},
+  "documents":{"domain":{"to":"/"},"top_docs":{"count_limit":-1,"limit":0}}
+}}}
+```
+
+A dot always descends; names never reach upward or sideways. In the items
+view, `parts.material:steel` joins matching parts back to items. The nested
+group `items:(parts:(material:steel) AND color:red)` selects documents with a
+red item that has a steel part. Wildcards can select leaf fields within a
+literal path in multi_match (`items.te*`); wildcard path components are not
+supported. Unqualified `*` field discovery stays local.
+
+Text chunks are another use: `chunks_nested:(text_wl:"quick fox")` requires
+the phrase within one chunk. Terms split across sibling chunks do not form
+a phrase. An explicit to_parent with the same phrase is equivalent. Ordinary
+multi-valued vectors already support plain chunking; use nested rows when
+vectors or text belong to structured children whose other fields matter.

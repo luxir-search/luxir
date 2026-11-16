@@ -62,7 +62,7 @@ TEST_F(NestedIngestTest, shapesDepthsAndLocalStoredValuesUseOrdinaryViews) {
   auto inner = qb::toParent(req->mr, "deep_nested", phrase, "none");
   req->topDocs().countLimit().fields({"id"}).rawQuery() = qb::toParent(req->mr, "items_nested", inner, "none");
   auto& rows = req->topDocs("rows").allQuery().countLimit().fields({"*"});
-  rows.rawOp().domain.emplace().to_children = "items_nested";
+  rows.rawOp().domain.emplace().to = "items_nested";
   req->execute();
   ASSERT_OK(req);
   EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", "e")));
