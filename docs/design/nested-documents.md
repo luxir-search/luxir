@@ -114,15 +114,17 @@ memory tracker and profiles but own their memos and filter-use registry.
   when neither the count bounds nor the score depend on how many elements
   match (no bounds; unscored, or a constant element score with `max`,
   `min` or `avg`) the first matching element decides the owner.
-- In a membership conjunction (an unscored count or domain) a verifying
-  `to_parent` is a candidate filter: the lead's candidates arrive a window
-  at a time (`intersectCandidateBits`). Their owner ranges are read first,
-  then the element rows of a batch of owners go to the child as one
-  candidate mask, after the child's membership proof clears rows that
-  cannot match, and an owner keeps its bit when its surviving rows meet the
-  count bounds. The child's proof also projects onto owner rows
-  (`OwnerProof`), so the conjunction skips owners, and whole windows of
-  them, none of whose elements can match.
+- In a membership conjunction (an unscored count or domain, the count pass
+  of a bounded count) a verifying `to_parent` is a candidate filter: the
+  lead's candidates arrive a window at a time (`intersectCandidateBits`).
+  Their owner ranges are read first, then the element rows of a batch of
+  owners go to the child as one candidate mask, after the child's membership
+  proof clears rows that cannot match, and an owner keeps its bit when its
+  surviving rows meet the count bounds. The child's proof also projects onto
+  owner rows (`OwnerProof`), so the conjunction skips owners, and whole
+  windows of them, none of whose elements can match. A bounded count
+  (`count_limit` N) counts with this unscored conjunction apart from
+  ranking, and stops once more than N owners match.
 - Prepare (kNN and other domain consumers) gets the owner domain descended
   to the live elements of eligible owners (`descendDomain`), so filters
   apply before candidate selection.

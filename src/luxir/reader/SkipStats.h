@@ -205,6 +205,10 @@ struct SkipStats {
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
+  // Bounded counts counted apart from ranking: segments whose count pass
+  // ran, and passes stopped by the limit before their segment's end.
+  static inline int64_t boundedCountSegments = 0;
+  static inline int64_t boundedCountStops = 0;
   // to_parent candidate filters: owner batches decided together.
   static inline int64_t toParentCandidateBatches = 0;
   static inline int64_t bulkBuiltThenRejected = 0;
@@ -545,6 +549,8 @@ struct SkipStats {
     exactCountTopKProfitabilityRejects = 0;
     exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
+    boundedCountSegments = 0;
+    boundedCountStops = 0;
     toParentCandidateBatches = 0;
     bulkBuiltThenRejected = 0;
     bulkBuiltThenRejectedWrapperRoute = 0;

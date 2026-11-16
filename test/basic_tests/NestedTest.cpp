@@ -6,6 +6,7 @@
 #include "test/NestedFixture.h"
 #include "luxir/reader/OwnerMap.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/NumericPredicateQuery.h"
 
 using namespace luxir;
@@ -562,6 +563,64 @@ TEST_F(NestedTest, toParentConjunctionCountsVerifyOnlyPossibleCandidates) {
   // 200 candidates and 400 answers; about 51 can match, verified by one answer each.
   EXPECT_LT(elementVerifications, 100) << elementVerifications;
 #endif
+}
+
+// Bounded counts of tag AND to_parent count apart from ranking, over two
+// segments with deletes: owner i is tagged "t" when i % 3 == 0 and holds
+// answers dated i % 50 and 60, none when i % 7 == 0. The total is exact up to
+// the limit and the limit (gte) past it; hits and scores are the uncounted
+// ranking's; a small limit stops counting inside the first segment.
+TEST_F(NestedTest, boundedToParentCountsStopAtTheLimit) {
+  schema(R"({"fields": {"tag": "string",
+      "answers": {"type": "nested", "fields": {"date": {"type": "int", "multi": "array"}}}}})");
+  auto add = [&](int32_t from, int32_t to) {
+    CollectionHelper h = helper();
+    CollectionHelper::UpdateBuilder b;
+    for (int32_t i = from; i < to; i++) {
+      std::string answers = i % 7 == 0 ? "[]" : "[{\"date\": " + std::to_string(i % 50) + "}, {\"date\": 60}]";
+      auto& text = retained.emplace_back(R"({"id": "q)" + std::to_string(i) + R"(", "tag": ")"
+                                         + (i % 3 == 0 ? "t" : "u") + R"(", "answers": )" + answers + "}");
+      b.addRaw([&](api::Map& map, std::pmr::memory_resource& mr) { EXPECT_TRUE(api::read_json(map, text, mr)); });
+    }
+    b.commit();
+    ASSERT_TRUE(h.submit(b).success);
+  };
+  add(0, 20000);
+  add(20000, 22000);
+  ASSERT_TRUE(helper().deleteByIds({"q3", "q6", "q9"}, UpdateMessage::COMMIT).success);
+  int64_t total = 0;
+  for (int32_t i = 12; i < 22000; i += 3) total += i % 7 != 0 && i % 50 <= 9;
+
+  auto request = [](std::string mode, std::string count) {
+    return R"({"max_parallel": 1, "ops": {"q": {"top_docs": {"query": {"boolean": {"required": [{"match": {"tag": "t"}},
+        {"to_parent": {"path": "answers", "score": ")" + mode + R"(", "query": {"range": {"field": "answers.date", "lte": 9}}}}]}},
+        "limit": 5, "fields": ["id", "_score_"], "get_scores": true, "document_format": "rows")" + count + "}}}}";
+  };
+  for (std::string mode : {"avg", "max", "sum", "none"}) {
+    auto uncounted = scores(request(mode, ""));
+    EXPECT_EQ(5u, uncounted.size());
+    for (int64_t limit : {-1L, 10L, total - 1, total, total + 1, 10000L}) {
+      std::string count = R"(, "count_limit": )" + std::to_string(limit);
+      auto json = search(request(mode, count));
+      bool gte = limit > 0 && limit < total;
+      EXPECT_EQ(gte, json.find(R"("found_gte":true)") != std::string::npos) << mode << " " << limit << ": " << json;
+      std::string found = R"("found":)" + std::to_string(gte ? limit : total) + ",";
+      EXPECT_NE(std::string::npos, json.find(found)) << mode << " " << limit << ": " << json;
+      EXPECT_EQ(uncounted, scores(request(mode, count))) << mode << " " << limit;
+    }
+  }
+  // Counting stops in the range where the total passes the limit: within the
+  // large segment, or in the small one with the large one never counted.
+  TopDocsReq::boundedCountRangeDocsForTests = 4096;
+  SkipStatsScope stats;
+  search(request("avg", R"(, "count_limit": 10)"));
+  EXPECT_TRUE(SkipStats::boundedCountStops == 1 || SkipStats::boundedCountSegments == 1)
+      << SkipStats::boundedCountStops << " " << SkipStats::boundedCountSegments;
+  SkipStats::reset();
+  search(request("avg", R"(, "count_limit": 10000)"));
+  EXPECT_EQ(2, SkipStats::boundedCountSegments);
+  EXPECT_EQ(0, SkipStats::boundedCountStops);
+  TopDocsReq::boundedCountRangeDocsForTests = 1 << 16;
 }
 
 // Unscored counts of tag AND to_parent decide candidate owners in batches,
