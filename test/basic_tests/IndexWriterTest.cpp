@@ -4130,18 +4130,43 @@ TEST_F(IndexWriterTest, mergeLevelsBreakAtExactPowersOfMergeFactor) {
   auto& policy = *writer.mergePolicy;
   for (int32_t factor = 2; factor <= 32; factor++) {
     policy.setMergeFactor(factor);
-    EXPECT_EQ(0, policy._mergeLevelForMaxDoc(0));
+    EXPECT_EQ(0, policy._mergeLevelForRows(0));
     int32_t level = 0;
     for (int64_t bound = factor; bound <= INT32_MAX; bound *= factor) {
       level++;
-      EXPECT_EQ(level - 1, policy._mergeLevelForMaxDoc((int32_t)bound - 1)) << "factor=" << factor;
-      EXPECT_EQ(level, policy._mergeLevelForMaxDoc((int32_t)bound)) << "factor=" << factor;
+      EXPECT_EQ(level - 1, policy._mergeLevelForRows((int32_t)bound - 1)) << "factor=" << factor;
+      EXPECT_EQ(level, policy._mergeLevelForRows((int32_t)bound)) << "factor=" << factor;
     }
-    EXPECT_EQ(level, policy._mergeLevelForMaxDoc(INT32_MAX)) << "factor=" << factor;
+    EXPECT_EQ(level, policy._mergeLevelForRows(INT32_MAX)) << "factor=" << factor;
   }
   policy.setMergeFactor(0);
   EXPECT_EQ(2, policy.mergeFactor);
-  EXPECT_EQ(1, policy._mergeLevelForMaxDoc(2));
+  EXPECT_EQ(1, policy._mergeLevelForRows(2));
+}
+
+TEST_F(IndexWriterTest, rootLevelSequenceAndMergeSizeArithmetic) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(snapshots);
+  auto& policy = *writer.mergePolicy;
+  policy.setMergeFactor(10);
+  const std::pair<int32_t, int32_t> sequence[] = {
+      {0, 0}, {1, 0}, {9, 0}, {10, 1}, {99, 1}, {100, 2}, {999, 2}, {1000, 3}, {INT32_MAX, 9}};
+  for (auto [rows, level] : sequence) {
+    SegInfo segment(1, 1, rows);
+    policy._prepareUpdate(&segment);
+    policy._update(&segment);
+    EXPECT_EQ(level, segment.mergeLevel);
+    EXPECT_EQ(rows, segment.estimatedLiveMergeRows());
+    policy._remove(&segment);
+  }
+  SegInfo nested(1, 1, PostingsReader::MAX_SEGMENT_DOCS / 2);
+  nested.mergeRows = PostingsReader::MAX_SEGMENT_DOCS;
+  nested.liveDocs = nested.maxDoc - 1;
+  EXPECT_EQ(PostingsReader::MAX_SEGMENT_DOCS - 3, nested.estimatedLiveMergeRows());
+  policy._update(&nested);
+  EXPECT_EQ(9, nested.mergeLevel);
+  policy._remove(&nested);
 }
 
 TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {

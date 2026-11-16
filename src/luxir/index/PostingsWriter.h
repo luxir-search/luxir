@@ -420,6 +420,12 @@ public:
     return descriptor->maxDoc;
   }
 
+  int32_t getMaxSpaceRows() const {
+    int32_t count = maxDoc;
+    for (const auto& space : spaceDescriptors) count = std::max(count, space.maxDoc);
+    return count;
+  }
+
   // Declare a child space before its fields. Ownership streams use the same
   // allocator as field data and are relocated by the same finalize pass.
   SpaceOrdinal addSpace(std::string_view path) {

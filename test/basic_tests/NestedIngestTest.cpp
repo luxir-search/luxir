@@ -3,6 +3,7 @@
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
@@ -247,7 +248,8 @@ TEST_F(NestedIngestTest, mergesCompactNestedAndRootOnlyBundles) {
   ASSERT_TRUE(ingest(helper, {R"({"id":"b"})"}).success);
   writer->updateGraph->wait_for_all();
   helper.commit();
-  EXPECT_EQ(2u, helper.durableSegmentCount());
+  // The two root-only sources merge to level 1, joining the two-child source.
+  EXPECT_EQ(1u, helper.durableSegmentCount());
   CollectionHelper::UpdateBuilder force;
   force.commit(true, 1);
   auto result = helper.submit(force);
@@ -323,17 +325,22 @@ TEST_F(NestedIngestTest, reopenedBundlesKeepShapesThroughAutomaticMerges) {
   auto path = std::filesystem::temp_directory_path() / ("luxir-nested-" + newUuid());
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
   LuxirConfig config;
+  config.index.merge_factor = 2;
   config.store.backend = "fs";
   config.store.data_dir = path;
   {
     LuxirNode node(config);
     CollectionHelper helper(node);
-    ASSERT_TRUE(ingest(helper, {R"({"id":"old","items_nested":{"label_s":"old"}})"}).success);
+    ASSERT_TRUE(ingest(helper, {R"({"id":"old","items_nested":[{"label_s":"old"},{},{},{},{},{},{},{},{},{}]})"}).success);
   }
   LuxirNode node(config);
   CollectionHelper helper(node);
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(2);
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, info.info.segments.size());
+  EXPECT_EQ(10, info.info.segments[0].merge_rows);
+  ASSERT_EQ(1u, writer->stats(true, false).segmentStats.size());
+  EXPECT_EQ(3, writer->stats(true, false).segmentStats[0].mergeLevel);
   EXPECT_EQ(1u, joined(helper, "old").size());
   ASSERT_TRUE(ingest(helper, {R"({"id":"a"})"}).success);
   ASSERT_TRUE(ingest(helper, {R"({"id":"b"})"}).success);
