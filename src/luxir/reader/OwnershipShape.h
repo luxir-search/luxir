@@ -41,6 +41,32 @@ public:
   }
   int32_t owner(int32_t child) const;
 
+  // Boundary positions first..end enclose owners [first, end). Position 0
+  // precedes the first family and has the synthetic child offset zero.
+  void readBoundaries(int32_t first, int32_t end, std::span<int64_t> out) const {
+    assert(first >= 0 && first <= end && end <= nParents);
+    assert(out.size() == (size_t)(end - first) + 1);
+    if (first == 0) {
+      out[0] = 0;
+      ends.readValues(0, out.subspan(1));
+    } else {
+      ends.readValues(first - 1, out);
+    }
+  }
+
+  // Translate increasing parent boundary positions to child positions in
+  // place. Repeated positions share a value; each visited frame decodes once.
+  void projectBoundaries(std::span<int64_t> boundaries) const {
+    MonoReader::BulkValues decoded(ends);
+    for (auto& position : boundaries) {
+      assert(position >= 0 && position <= nParents);
+      if (position == 0) continue;
+      int64_t index = position - 1;
+      if (index != decoded.index()) decoded.advance(index);
+      position = decoded.value();
+    }
+  }
+
   // Retains the parent position for increasing child arrivals. Backwards
   // seeks restart; no reverse map is materialized for either direction.
   class Cursor {

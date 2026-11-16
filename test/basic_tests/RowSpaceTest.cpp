@@ -207,6 +207,52 @@ TEST_F(RowSpaceTest, ownershipSeeksAcrossMonoBlockBoundaries) {
   }
 }
 
+TEST_F(RowSpaceTest, ownershipBoundaryRunsMatchRangesAcrossFrames) {
+  const int32_t parents = 2 * (int32_t)MonoReader::BLOCK_SIZE + 37;
+  std::vector<int64_t> ends, deep;
+  int64_t children = 0, parts = 0;
+  for (int32_t parent = 0; parent < parents; parent++) {
+    int32_t count = parent < 4 || parent >= parents - 4 ? 0
+        : parent == 131 ? 3 * (int32_t)MonoReader::BLOCK_SIZE + 9 : parent % 5;
+    for (int32_t i = 0; i < count; i++, children++) {
+      parts += children % 7 == 0 ? 0 : children % 3;
+      deep.push_back(parts);
+    }
+    ends.push_back(children);
+  }
+  PostingsWriter writer(dir, 1, 1, parents);
+  writer.finishSpace(writer.addSpace(Fixture::CHILD), (int32_t)children, Fixture::shape(writer, ends));
+  writer.finishSpace(writer.addSpace("items.deep"), (int32_t)parts, Fixture::shape(writer, deep));
+  writeUnversionedRuns(writer); ASSERT_TRUE(writer.finish());
+  SegmentCore core(dir, 1, 1);
+  const auto& shape = *core.ownership(Fixture::CHILD);
+  OwnershipMapper mapper(core, "", "items.deep");
+  for (auto [first, end] : std::vector<std::pair<int32_t, int32_t>>{
+      {0, 0}, {0, 1}, {0, 128}, {0, 4096}, {127, 129}, {128, 256},
+      {129, 4131}, {4095, parents}, {0, parents}, {parents - 1, parents}, {parents, parents}}) {
+    SCOPED_TRACE(::testing::Message() << first << '/' << end);
+    std::vector<int64_t> run((size_t)(end - first) + 1);
+    memtrack::AllocScope allocation;
+    shape.readBoundaries(first, end, run);
+    auto bytes = allocation.bytes();
+    if (memtrack::counting_enabled) { EXPECT_EQ(0, bytes); }
+    for (int32_t owner = first; owner < end; owner++) {
+      auto range = shape.range(owner);
+      EXPECT_EQ(range.first, run[(size_t)(owner - first)]);
+      EXPECT_EQ(range.second, run[(size_t)(owner - first) + 1]);
+    }
+    EXPECT_EQ(first ? ends[(size_t)first - 1] : 0, run.front());
+    mapper.readBoundaries(first, end, run);
+    for (int32_t owner = first; owner < end; owner++) {
+      auto range = mapper.range(owner);
+      EXPECT_EQ(range.first, run[(size_t)(owner - first)]);
+      EXPECT_EQ(range.second, run[(size_t)(owner - first) + 1]);
+    }
+    int64_t boundary = first ? ends[(size_t)first - 1] : 0;
+    EXPECT_EQ(boundary ? deep[(size_t)boundary - 1] : 0, run.front());
+  }
+}
+
 TEST_F(RowSpaceTest, ownershipSeeksSkipEmptyFamiliesAndRestart) {
   const int32_t block = (int32_t)MonoReader::BLOCK_SIZE;
   std::vector<int64_t> ends, owners;
