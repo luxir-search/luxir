@@ -98,6 +98,7 @@ struct ValueFunction {
   Prepare prepare = nullptr;
   NaturePolicy natures = NaturePolicy::NUMBER;
   uint8_t natureStart = 0;
+  bool pure = true;
   // Optional field-path component on the type declared by operand zero.
   std::string_view component = {};
 

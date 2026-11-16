@@ -23,6 +23,11 @@ Everything here shares the rules of the base language:
   parts map element-wise over an array, which a reducer then consumes:
   `max(geo_lat(places))`.
 
+Pure expressions that do not depend on the document or score are evaluated
+while parsing and replaced by literals when evaluation succeeds. This includes
+`pi()/180`, `1 << 5`, and `pow(sqrt(7), 5)`. A failing constant expression stays
+lazy, so `if(0, log(-1), 7)` returns 7. Random functions are never folded.
+
 ## Operators
 
 From the loosest to the tightest:

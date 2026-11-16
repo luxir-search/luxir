@@ -822,7 +822,7 @@ ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
                             int32_t docid, float score) {
   uint64_t key;
   if (node.childCount == 0) {
-    key = (uint64_t)(program.segment.base + docid);
+    key = (uint64_t)(program.segment->base + docid);
   } else {
     ValueResult value = program.evalNode(node.children[1], docid, score);
     if (!value.valid) return ValueResult::missing(node.type);
@@ -1703,7 +1703,7 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
      ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket, nullptr, NaturePolicy::SAME, 1},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
-     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom},
+     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom, NaturePolicy::NUMBER, 0, false},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
      evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3,
      {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, prepareGeoDistance},
@@ -1847,6 +1847,7 @@ ValueBounds ValueFunction::bounds(
 
 ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   const ValueNode& node = nodes[index];
+  if (node.kind == ValueNodeKind::MISSING) return ValueBounds::unbounded(node.type, true, true);
   if (node.type == ValueType::INT64) return ValueBounds::integerValue(node.intValue);
   if (node.type == ValueType::DOUBLE) return ValueBounds::floatingValue(node.doubleValue);
   if (node.arraySize == 0) {
@@ -2035,6 +2036,7 @@ bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
           if (a.children[i] != b.children[i]) return false;
         }
         return true;
+      case ValueNodeKind::MISSING:
       case ValueNodeKind::SCORE:
       case ValueNodeKind::DOCID:
         return true;
@@ -2102,13 +2104,14 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
-    : program(program), segment(segment),
+    : program(program), segment(&segment),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
     if (node.flags & ValueNode::SHARED) bound.memo = pool.make<ValueMemo>();
-    if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
+    if (node.kind == ValueNodeKind::MISSING || node.kind == ValueNodeKind::CONSTANT
+        || node.kind == ValueNodeKind::VARIABLE) {
       bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
@@ -2292,11 +2295,12 @@ ValueResult BoundValueProgram::evalShared(uint32_t index, const ValueNode& node,
 ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   switch (node.kind) {
+    case ValueNodeKind::MISSING: return ValueResult::missing(node.type);
     case ValueNodeKind::CONSTANT:
     case ValueNodeKind::VARIABLE: return evalConstant(index, docid, score);
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
-    case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
+    case ValueNodeKind::DOCID: return ValueResult::integer(segment->base + docid);
     case ValueNodeKind::FUNCTION:
       if (node.flags & ValueNode::SHARED) return evalShared(index, node, docid, score);
       return node.function->evalPoint(*this, node, docid, score);
@@ -2439,7 +2443,7 @@ void BoundValueProgram::evalBatch(std::span<const int32_t> docids,
 
 ValueResult BoundValueProgram::evalArrayElement(const ValueArrayRef& array, int64_t element) {
   const ValueNode& node = program.nodes[array.node];
-  if (element < 0 || element >= array.size) throw std::runtime_error("ValueExpr array index out of range");
+  if (element < 0 || element >= array.size) throw ValueEvaluationError("ValueExpr array index out of range");
   if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
     if (node.type == ValueType::INT64_ARRAY) {
       return ValueResult::integer(program.intArrays[node.arrayOffset + element]);

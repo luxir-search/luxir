@@ -1094,3 +1094,61 @@ TEST_F(ValueScriptingTest, hashIntegerConstantsKeepAll64Bits) {
   expectError("xxhash64(1, 9223372036854775808.0)", "integer constant");
   expectConstant("1 << 9007199254740993", 2);
 }
+
+TEST_F(ValueScriptingTest, successfulPureSubtreesBecomeLiterals) {
+  std::array<double, 2> weights{2, 3};
+  bindVar("weights", api::Val{api::ArrDouble{weights}});
+  for (auto expression : {"pi()/180", "1 << 5", "pow(sqrt(7), 5)", "if(0, log(-1), 7)",
+                          "def(1/0, 7)", "if(0, score, 7)", "def(7, score)", "0 && score", "1 || score",
+                          "sum($weights)", "count($weights)"}) {
+    auto* program = parse(expression);
+    EXPECT_EQ(ValueNodeKind::CONSTANT, program->root().kind) << expression;
+    EXPECT_EQ(1, program->nodes.size()) << expression;
+  }
+  EXPECT_EQ(ValueNodeKind::CONSTANT, parse("sqrt($weights)")->root().kind);
+  expectConstant("count($weights/0)", 0);
+  expectConstant("sum(sqrt($weights))", std::sqrt(2) + std::sqrt(3));
+  for (auto expression : {"log(-1)", "random()", "floor(random())", "if(x_i, log(-1), 7)"}) {
+    EXPECT_EQ(ValueNodeKind::FUNCTION, parse(expression)->root().kind) << expression;
+  }
+  expectValues("let(unused, log(-1), x_i)", {2, -1, std::nullopt, 7, 0});
+  expectConstant("if(0, log(-1), 7)", 7);
+  expectConstant("def(7, log(-1))", 7);
+  auto* date = parse("when_dt + (pi()/pi()+0.5)");
+  EXPECT_EQ(ValueNature::DATE_MS, date->root().nature);
+  EXPECT_EQ(ValueNodeKind::CONSTANT, date->nodes[date->root().children[1]].kind);
+  expectValues("epoch_millis(when_dt + (pi()/pi()+0.5))",
+               {(double)T_A + 1, 1, std::nullopt, (double)T_D + 1, 0});
+  auto* missing = parse("1/0");
+  EXPECT_EQ(ValueNodeKind::MISSING, missing->root().kind);
+  EXPECT_FALSE(missing->constantScalar);
+  EXPECT_TRUE(parse("pow(sqrt(7), 5)")->structurallyEqual(*parse("pow(sqrt(7), 5)")));
+}
+
+TEST_F(ValueScriptingTest, constantArraysKeepOnlyTheMaterializedResult) {
+  std::array<double, 32> weights;
+  weights.fill(0.5);
+  bindVar("weights", api::Val{api::ArrDouble{weights}});
+  auto nested = [](std::string expression) {
+    for (int i = 0; i < 40; i++) expression = "sin(" + expression + ")";
+    return expression;
+  };
+  auto* folded = parse(nested("$weights"));
+  EXPECT_EQ(ValueNodeKind::CONSTANT, folded->root().kind);
+  EXPECT_EQ(2 * weights.size(), folded->doubleArrays.size());
+  weights.back() = -1;
+  auto* failed = parse(nested("log($weights)"));
+  EXPECT_EQ(ValueNodeKind::FUNCTION, failed->root().kind);
+  EXPECT_EQ(weights.size(), failed->doubleArrays.size());
+}
+
+TEST_F(ValueScriptingTest, failedConstantDependenciesStayLazyThroughLetChains) {
+  std::string expression = "let(v0, log(-1), ";
+  for (int i = 1; i <= 70; i++) expression += fmt::format("let(v{}, v{}+v{}, ", i, i - 1, i - 1);
+  expression += "if(0, v70, 7)";
+  expression.append(71, ')');
+  auto* program = parse(expression);
+  ASSERT_TRUE(program->constantScalar);
+  EXPECT_DOUBLE_EQ(7, program->constantScalar->doubleValue);
+  EXPECT_EQ(1, program->nodes.size());
+}

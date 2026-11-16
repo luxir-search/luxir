@@ -29,6 +29,7 @@ namespace luxir {
 
 enum class ValueNodeKind : uint8_t {
   CONSTANT,
+  MISSING,
   VARIABLE,
   COLUMN,
   SCORE,
@@ -196,11 +197,15 @@ class BoundValueProgram {
 
 public:
   const ValueProgram& program;
-  IndexReader::Segment& segment;
+  IndexReader::Segment* segment;
   std::span<BoundValueNode> nodes;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment, ValueFieldInfos fields);
+
+  // Used by parse-time constant analysis. Independence is established before
+  // evaluation; document-dependent nodes are never evaluated through this ctor.
+  explicit BoundValueProgram(const ValueProgram& program) : program(program), segment(nullptr) {}
 
   ValueResult evalPoint(int32_t docid, float score);
   // Aggregate/facet scans call this with monotonically increasing document

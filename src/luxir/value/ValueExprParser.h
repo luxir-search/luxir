@@ -38,69 +38,154 @@ struct ValueExprOptions {
 
 class ValueExprParser {
   class ValueConstantAnalysis {
-    std::vector<std::optional<ValueBounds>> bounds;
-    std::vector<ValueType> types;
+    enum class State : uint8_t { DEPENDENT, ARRAY, VALUE, FAILED };
+    struct Constant {
+      ValueResult value;
+      State state = State::DEPENDENT;
+      bool independent() const { return state != State::DEPENDENT; }
+    };
+    std::vector<Constant> constants;
+    std::optional<BoundValueProgram> evaluator;
 
-  public:
-    void clear() {
-      bounds.clear();
-      types.clear();
+    std::optional<ValueResult> fold(ValueProgram& program, uint32_t index) {
+      ValueNode& node = program.nodes[index];
+      ValueResult result;
+      std::vector<int64_t> integers;
+      std::vector<double> doubles;
+      try {
+        result = evaluator->evalNode(index, 0, 0);
+        if (result.valid && valueArray(result.type)) {
+          for (int64_t i = 0; i < result.array.size; i++) {
+            auto element = evaluator->evalArrayElement(result.array, i);
+            // Literal arrays have no missing-element representation.
+            if (!element.valid) return std::nullopt;
+            if (element.type == ValueType::INT64) integers.push_back(element.intValue);
+            else doubles.push_back(element.doubleValue);
+          }
+        }
+      } catch (const ValueEvaluationError&) {
+        // Keep errors lazy: an unused result or untaken branch must not fail.
+        return std::nullopt;
+      }
+      if (node.kind == ValueNodeKind::FUNCTION) {
+        ValueNode literal;
+        literal.kind = result.valid ? ValueNodeKind::CONSTANT : ValueNodeKind::MISSING;
+        literal.type = node.type;
+        literal.nature = node.nature;
+        literal.sourcePos = node.sourcePos;
+        literal.text = node.text;
+        if (node.opcode == ValueOpcode::NEG) {
+          const auto& input = program.nodes[node.children[0]];
+          auto text = input.text;
+          if (input.kind == ValueNodeKind::CONSTANT && !text.empty()
+              && (value::lex::digit(text.front()) || text.front() == '.'
+                  || text.front() == '-' || text.front() == '+')) {
+            std::string signedText;
+            if (text.front() == '-') signedText = text.substr(1);
+            else {
+              if (text.front() == '+') text.remove_prefix(1);
+              signedText = "-";
+              signedText += text;
+            }
+            literal.text = program.copyString(signedText);
+          }
+        }
+        literal.intValue = result.intValue;
+        literal.doubleValue = result.doubleValue;
+        if (result.valid && valueArray(result.type)) {
+          literal.arraySize = (uint32_t)result.array.size;
+          if (node.type == ValueType::INT64_ARRAY) {
+            literal.arrayOffset = (uint32_t)program.intArrays.size();
+            program.intArrays.insert(program.intArrays.end(), integers.begin(), integers.end());
+          } else {
+            literal.arrayOffset = (uint32_t)program.doubleArrays.size();
+            program.doubleArrays.insert(program.doubleArrays.end(), doubles.begin(), doubles.end());
+          }
+        }
+        node = literal;
+      }
+      return result;
     }
 
-    void append(const ValueNode& node, std::optional<ValueBounds> literal = std::nullopt) {
-      uint32_t index = (uint32_t)bounds.size();
-      std::optional<ValueBounds> result = literal;
-      if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
-        if (node.type == ValueType::INT64) {
-          result = ValueBounds::integerValue(node.intValue);
-        } else if (node.type == ValueType::DOUBLE) {
-          result = ValueBounds::floatingValue(node.doubleValue);
-        }
-      } else if (node.kind == ValueNodeKind::FUNCTION) {
-        std::array<ValueBounds, VALUE_MAX_ARITY> children;
-        bool independent = true;
+  public:
+    void reset(ValueProgram& program) {
+      constants.clear();
+      evaluator.emplace(program);
+    }
+
+    void append(ValueProgram& program, uint32_t index) {
+      const ValueNode& node = program.nodes[index];
+      bool pure = node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE
+          || node.kind == ValueNodeKind::MISSING;
+      uint32_t required = 0;
+      if (node.kind == ValueNodeKind::FUNCTION) {
+        pure = node.function->pure;
         for (uint8_t child = 0; child < node.childCount; child++) {
-          const auto& childBounds = bounds[node.children[child]];
-          if (!childBounds.has_value()) {
-            independent = false;
-            children[child] = ValueBounds::unbounded(
-                types[node.children[child]], true);
-            continue;
-          }
-          children[child] = *childBounds;
+          pure = pure && constants[node.children[child]].independent();
+          if (!node.function->operands[child].lazy) required |= 1u << child;
         }
-        ValueBounds value = node.function->bounds(
-            node, std::span<const ValueBounds>(children.data(), node.childCount));
-        if (value.certainty == BoundsCertainty::INVALID) {
-          if (value.invalidNode == UINT32_MAX) value.invalidNode = index;
-          result = value;
-        } else if (independent) {
-          result = value;
+        if (node.function->pure && node.childCount
+            && constants[node.children[0]].state == State::VALUE && !valueArray(node.type)) {
+          const auto& first = constants[node.children[0]].value;
+          bool truth = first.type == ValueType::DOUBLE ? first.doubleValue != 0 : first.intValue != 0;
+          switch (node.opcode) {
+            case ValueOpcode::IF:
+              pure = !first.valid || constants[node.children[truth ? 1 : 2]].independent();
+              required = first.valid ? 1u | (1u << (truth ? 1 : 2)) : 1u;
+              break;
+            case ValueOpcode::DEF:
+              pure = first.valid || constants[node.children[1]].independent();
+              required = first.valid ? 1u : 3u;
+              break;
+            case ValueOpcode::AND:
+              pure = !first.valid || !truth || constants[node.children[1]].independent();
+              required = !first.valid || !truth ? 1u : 3u;
+              break;
+            case ValueOpcode::OR:
+              pure = !first.valid || truth || constants[node.children[1]].independent();
+              required = !first.valid || truth ? 1u : 3u;
+              break;
+            default: break;
+          }
         }
       }
-      bounds.push_back(result);
-      types.push_back(node.type);
+      Constant result;
+      if (pure) {
+        // Failed dependencies remain unfolded, but are never retried through
+        // each parent of a DAG. Only operands that will be selected contribute.
+        bool failed = false;
+        for (uint8_t child = 0; child < node.childCount; child++) {
+          failed = failed || ((required & (1u << child))
+              && constants[node.children[child]].state == State::FAILED);
+        }
+        if (failed) result.state = State::FAILED;
+        else if (valueArray(node.type)) result.state = State::ARRAY;
+        else if (node.type != ValueType::COLUMN_ONLY) {
+          auto value = fold(program, index);
+          result.state = value ? State::VALUE : State::FAILED;
+          if (value) result.value = *value;
+        }
+      }
+      constants.push_back(result);
+    }
+
+    void finishArrays(ValueProgram& program) {
+      // Materialize only surviving pure array roots. Folding each intermediate
+      // array at append would retain depth * array-size data in the arena.
+      program.walkNodes(program.rootNode, [&](uint32_t index) {
+        const ValueNode& node = program.nodes[index];
+        if (constants[index].independent() && valueArray(node.type) && node.kind == ValueNodeKind::FUNCTION) {
+          if (constants[index].state != State::FAILED) (void)fold(program, index);
+          return 0u;
+        }
+        return (1u << node.childCount) - 1;
+      }, [](uint32_t) {});
     }
 
     std::optional<ValueResult> scalar(uint32_t index) const {
-      const auto& rootBounds = bounds[index];
-      ValueType rootType = rootBounds.has_value() ? rootBounds->type : ValueType::COLUMN_ONLY;
-      if (!rootBounds.has_value()
-          || rootBounds->certainty != BoundsCertainty::BOUNDED
-          || rootBounds->mayBeMissing || rootBounds->alwaysMissing
-          || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
-        return std::nullopt;
-      }
-      if (rootType == ValueType::INT64
-          && rootBounds->intMin == rootBounds->intMax) {
-        return ValueResult::integer(rootBounds->intMin);
-      }
-      if (rootType == ValueType::DOUBLE
-          && rootBounds->doubleMin == rootBounds->doubleMax
-          && std::isfinite(rootBounds->doubleMin)) {
-        return ValueResult::floating(rootBounds->doubleMin);
-      }
-      return std::nullopt;
+      const auto& value = constants[index];
+      return value.state == State::VALUE && value.value.valid
+          ? std::optional<ValueResult>(value.value) : std::nullopt;
     }
   };
 
@@ -145,7 +230,7 @@ public:
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
-    constants.clear();
+    constants.reset(*program);
     bindings.clear();
     depths.clear();
     depthLimit = *budget;
@@ -160,6 +245,7 @@ public:
     if (program->root().nature == ValueNature::GEO_POINT) {
       fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance(), or geo_lat() and geo_lon()");
     }
+    constants.finishArrays(*program);
     program->constantScalar = constants.scalar(program->rootNode);
     program->retainRoot();
     return program;
@@ -195,6 +281,7 @@ private:
   }
 
   void analyzeNode(uint32_t index) {
+    constants.append(*program, index);
     const ValueNode& node = program->nodes[index];
     int depth = 0;
     for (uint8_t i = 0; i < node.childCount; i++) {
@@ -202,8 +289,7 @@ private:
     }
     if (depth > depthLimit) fail(node.sourcePos, "expression nesting exceeds the supported depth");
     depths.push_back(depth);
-    constants.append(node, node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE
-        ? std::optional<ValueBounds>(program->constantBounds(index)) : std::nullopt);
+
   }
 
   template <class Grammar>
@@ -614,23 +700,7 @@ private:
     return body;
   }
 
-  // Materialize this operand without rewriting a shared definition or
-  // invalidating the dependency depths of its existing parents.
-  bool constantOperand(uint32_t& index) {
-    auto value = constants.scalar(index);
-    if (!value.has_value()) return false;
-    const ValueNode& node = program->nodes[index];
-    if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) return true;
-    ValueNode literal;
-    literal.type = value->type;
-    literal.nature = node.nature;
-    literal.sourcePos = node.sourcePos;
-    literal.text = node.text;
-    literal.intValue = value->intValue;
-    literal.doubleValue = value->doubleValue;
-    index = append(literal);
-    return true;
-  }
+  bool constantOperand(uint32_t index) const { return constants.scalar(index).has_value(); }
 
 };
 

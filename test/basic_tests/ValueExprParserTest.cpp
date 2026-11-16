@@ -71,7 +71,7 @@ TEST(ValueExprParserTest, infixPrecedenceParenthesesAndUnary) {
   ValueExprOptions options{schema.get(), {}};
   ValueExprParser parser(options, *memory.arena);
 
-  ValueProgram* precedence = parser.parse("price_i + 2 * 3");
+  ValueProgram* precedence = parser.parse("price_i + quantity_i * 3");
   EXPECT_EQ(ValueOpcode::ADD, precedence->root().opcode);
   EXPECT_EQ(ValueOpcode::MUL,
             precedence->nodes[precedence->root().children[1]].opcode);
@@ -368,4 +368,19 @@ TEST(ValueExprParserTest, structuralEqualityIncludesPreparedFunctionState) {
   EXPECT_TRUE(left->structurallyEqual(*right));
   right->nodes[right->rootNode].intValue = 2;
   EXPECT_FALSE(left->structurallyEqual(*right));
+}
+
+TEST(ValueExprParserTest, foldingPreservesExactDecimalLiteralSpelling) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 18;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  auto* expected = parser.parse("price > -0.100000000000000001");
+  EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(0.100000000000000001)")));
+  EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(-(-0.100000000000000001))")));
 }
