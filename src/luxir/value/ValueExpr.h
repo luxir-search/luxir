@@ -20,6 +20,7 @@
 #include "luxir/schema/FieldType.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/MemPool.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/ValueFunctionRegistry.h"
 #include "luxir/value/ValueTypes.h"
@@ -147,6 +148,24 @@ struct BoundValueNode {
   bool cachedPresent = false;
 };
 
+// One step of a program's fused form (BoundValueProgram::prepareFused). Each
+// step writes the register of its program node.
+struct FusedValueStep {
+  enum class Kind : uint8_t {
+    COLUMN, DEF_COLUMN, SCORE, UNARY, BINARY, GEO_DISTANCE, GEO_DECAY, DECAY,
+  };
+  Kind kind = Kind::SCORE;
+  ValueOpcode opcode = ValueOpcode::NONE;
+  bool integerInput = false;  // DECAY: the input column holds integers
+  uint32_t node = 0;
+  uint32_t a = 0;  // operand register, or the column node
+  uint32_t b = 0;
+  geo::HaversinOrigin origin;
+  ValueResult decayOrigin;
+  double scale = 1.0;
+  double offset = 0.0;
+};
+
 class BoundValueProgram {
   ValueBounds cachedScoreBounds;
   bool boundsCached = false;
@@ -155,6 +174,11 @@ public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
   std::span<BoundValueNode> nodes;
+  // The fused form (prepareFused); empty steps mean there is none.
+  std::span<FusedValueStep> fusedSteps;
+  std::span<double> fusedRegisters;
+  std::span<int64_t> fusedRaw;
+  bool fusedSequential = false;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment, ValueFieldInfos fields);
@@ -166,6 +190,19 @@ public:
   bool evalSequentialInt64(int32_t docid, int64_t& value);
   bool evalSequentialDouble(int32_t docid, double& value);
   ValueResult evalNode(uint32_t node, int32_t docid, float score);
+  // Test seam: make prepareFused refuse every program.
+  static inline bool disableFusedForTests = false;
+  // Flattens a scalar numeric program into steps over double registers, with
+  // the per-document dispatch and constant lookups gone. False when the
+  // program has a node the steps do not cover. `sequential` selects the bulk
+  // column decoder, for callers visiting a large share of the documents.
+  bool prepareFused(MemPool& pool, bool sequential);
+  bool fusedReady() const { return !fusedSteps.empty(); }
+  // The program's value for a document, in ascending document order, computed
+  // with the same arithmetic as evalPoint. False for anything but a plain
+  // finite result (a missing value, a failed operation): evalPoint then
+  // decides what the document gets.
+  bool evalFused(int32_t docid, float score, double& out);
   void evalBatch(std::span<const int32_t> docids, std::span<const float> scores,
                  std::span<ValueResult> results);
   void evalScalarBatch(std::span<const int32_t> docids,
@@ -180,6 +217,9 @@ public:
   int64_t arraySize(uint32_t node, int32_t docid, float score);
 
 private:
+  bool compileFused(uint32_t node, std::span<uint8_t> seen, uint32_t& count);
+  bool positionFused(uint32_t node, int32_t docid, int64_t& start, int64_t& end);
+  int64_t fusedValueAt(uint32_t node, int64_t rank);
   ValueResult evalColumnSequential(uint32_t node, int32_t docid,
                                    float score);
   bool readColumnSequential(uint32_t node, int32_t docid, int64_t& raw);
