@@ -47,11 +47,14 @@ TEST_F(OrdCollectorTest, basic) {
 // A stream placed past 2 GiB cannot carry the tag bit; the collector must fail
 // rather than tag it with the top bit cleared and later read 2 GiB lower.
 TEST_F(OrdCollectorTest, streamPastTagBitThrows) {
+#ifndef NDEBUG
+  GTEST_SKIP() << "debug pools scribble every allocation, which would touch 2 GiB";
+#endif
   MemPool pool;
   OrdCollector oc(pool, 2);
   oc.add(0, 1);
   oc.add(0, 2);  // a stream below 2 GiB still works
-  // Untouched blocks are only reserved, so this is cheap.
+  // Release pools leave unwritten blocks untouched, so this is cheap.
   while (pool.bbAddress() < 0x80000000u) pool.allocateBBP(MemPool::BYTE_BLOCK_SIZE / 2);
   oc.add(1, 1);
   EXPECT_THROW(oc.add(1, 2), std::length_error);
