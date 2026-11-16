@@ -130,8 +130,10 @@ public:
     }, std::forward<Visit>(visit));
   }
 
-  // Drop unused let values and remap child indices in dependency order.
-  // Lazy array references are created only after parsing.
+  // Reduce the program to the nodes the root needs, one per distinct value
+  // and numbered in postorder from the root. A repeated subexpression becomes
+  // one shared node, exactly like a let value, and structurallyEqual() is a
+  // comparison of node vectors. Every program must pass through here.
   void retainRoot();
 
   const ValueNode& root() const { return nodes[rootNode]; }

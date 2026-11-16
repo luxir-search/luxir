@@ -328,8 +328,9 @@ TEST(ValueExprParserTest, dateUnitsPreserveIdentityAndSameUnitTrees) {
       root.childCount = 2;
       root.nature = std::string_view(name) == "sub" ? ValueNature::NUMBER : nature;
       expected->addNode(root);
+      expected->retainRoot();
       auto* parsed = parser.parse(std::string(name) + "(stamp," + (offset ? "1)" : "stamp)"));
-      EXPECT_EQ(3u, parsed->nodes.size());
+      EXPECT_EQ(offset ? 3u : 2u, parsed->nodes.size());
       EXPECT_TRUE(parsed->structurallyEqual(*expected)) << name;
     }
     for (auto expression : {"stamp-1", "def(stamp,0)", "avg(stamps)", "min(stamps)"}) {

@@ -1915,133 +1915,132 @@ std::string ValueProgram::describeDateSources(uint32_t node) const {
   return result;
 }
 
-bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
-  struct Key {
-    const ValueProgram* program;
-    uint32_t node;
-    std::array<uint32_t, VALUE_MAX_ARITY> children{};
+namespace {
+
+// A variable is its value: two programs that differ only in how a constant was
+// spelled are the same program.
+ValueNodeKind identityKind(const ValueNode& node) {
+  return node.kind == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : node.kind;
+}
+
+// Identity of one node given the identity of its children, which the caller
+// has already reduced to node indices that are equal exactly when the child
+// values are.
+size_t nodeHash(const ValueProgram& program, const ValueNode& node) {
+  size_t out = 0;
+  auto add = [&](auto value) {
+    out ^= std::hash<decltype(value)>{}(value) + (size_t)0x9e3779b9 + (out << 6) + (out >> 2);
   };
-  auto hash = [](const Key& key) {
-    const ValueNode& node = key.program->nodes[key.node];
-    size_t out = 0;
-    auto add = [&](auto value) {
-      out ^= std::hash<decltype(value)>{}(value) + (size_t)0x9e3779b9 + (out << 6) + (out >> 2);
-    };
-    auto kind = node.kind == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : node.kind;
-    add((uint8_t)kind);
-    add((uint8_t)node.type);
-    add((uint8_t)node.nature);
-    if (kind == ValueNodeKind::CONSTANT) {
-      if (node.type == ValueType::INT64) add(node.intValue);
-      else if (node.type == ValueType::DOUBLE) add(std::bit_cast<uint64_t>(node.doubleValue));
-      else {
-        add(node.arraySize);
-        for (uint32_t i = 0; i < node.arraySize; i++) {
-          if (node.type == ValueType::INT64_ARRAY) add(key.program->intArrays[node.arrayOffset + i]);
-          else add(std::bit_cast<uint64_t>(key.program->doubleArrays[node.arrayOffset + i]));
+  auto kind = identityKind(node);
+  add((uint8_t)kind);
+  add((uint8_t)node.type);
+  add((uint8_t)node.nature);
+  if (kind == ValueNodeKind::CONSTANT) {
+    if (node.type == ValueType::INT64) add(node.intValue);
+    else if (node.type == ValueType::DOUBLE) add(std::bit_cast<uint64_t>(node.doubleValue));
+    else {
+      add(node.arraySize);
+      for (uint32_t i = 0; i < node.arraySize; i++) {
+        if (node.type == ValueType::INT64_ARRAY) add(program.intArrays[node.arrayOffset + i]);
+        else add(std::bit_cast<uint64_t>(program.doubleArrays[node.arrayOffset + i]));
+      }
+    }
+  } else if (kind == ValueNodeKind::COLUMN) {
+    add(node.text);
+    add((uint8_t)node.columnType);
+    add(node.columnMultiValued);
+    add(node.columnIndexed);
+  } else if (kind == ValueNodeKind::FUNCTION) {
+    add(node.function);
+    add((uint8_t)node.opcode);
+    add(node.intValue);
+    add(node.intValue2);
+    add(std::bit_cast<uint64_t>(node.doubleValue));
+    add(node.childCount);
+    for (uint8_t i = 0; i < node.childCount; i++) add(node.children[i]);
+  }
+  return out;
+}
+
+bool nodeEqual(const ValueProgram& a, const ValueNode& left,
+               const ValueProgram& b, const ValueNode& right) {
+  if (identityKind(left) != identityKind(right)
+      || left.type != right.type || left.nature != right.nature) return false;
+  switch (identityKind(left)) {
+    case ValueNodeKind::CONSTANT:
+      if (left.type == ValueType::INT64) return left.intValue == right.intValue;
+      if (left.type == ValueType::DOUBLE) {
+        return std::bit_cast<uint64_t>(left.doubleValue)
+            == std::bit_cast<uint64_t>(right.doubleValue);
+      }
+      if (left.arraySize != right.arraySize) return false;
+      for (uint32_t i = 0; i < left.arraySize; i++) {
+        if (left.type == ValueType::INT64_ARRAY) {
+          if (a.intArrays[left.arrayOffset + i] != b.intArrays[right.arrayOffset + i]) return false;
+        } else if (std::bit_cast<uint64_t>(a.doubleArrays[left.arrayOffset + i])
+            != std::bit_cast<uint64_t>(b.doubleArrays[right.arrayOffset + i])) {
+          return false;
         }
       }
-    } else if (kind == ValueNodeKind::COLUMN) {
-      add(node.text);
-      add((uint8_t)node.columnType);
-      add(node.columnMultiValued);
-      add(node.columnIndexed);
-    } else if (kind == ValueNodeKind::FUNCTION) {
-      add(node.function);
-      add((uint8_t)node.opcode);
-      add(node.intValue);
-      add(node.intValue2);
-      add(std::bit_cast<uint64_t>(node.doubleValue));
-      add(node.childCount);
-      for (uint8_t i = 0; i < node.childCount; i++) add(key.children[i]);
-    }
-    return out;
-  };
-  auto equal = [](const Key& a, const Key& b) {
-    const ValueNode& left = a.program->nodes[a.node];
-    const ValueNode& right = b.program->nodes[b.node];
-    auto kind = [](ValueNodeKind value) {
-      return value == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : value;
-    };
-    if (kind(left.kind) != kind(right.kind)
-        || left.type != right.type || left.nature != right.nature) return false;
-    switch (kind(left.kind)) {
-      case ValueNodeKind::CONSTANT:
-        if (left.type == ValueType::INT64) return left.intValue == right.intValue;
-        if (left.type == ValueType::DOUBLE) {
-          return std::bit_cast<uint64_t>(left.doubleValue)
-              == std::bit_cast<uint64_t>(right.doubleValue);
-        }
-        if (left.arraySize != right.arraySize) return false;
-        for (uint32_t i = 0; i < left.arraySize; i++) {
-          if (left.type == ValueType::INT64_ARRAY) {
-            if (a.program->intArrays[left.arrayOffset + i]
-                != b.program->intArrays[right.arrayOffset + i]) return false;
-          } else if (std::bit_cast<uint64_t>(a.program->doubleArrays[left.arrayOffset + i])
-              != std::bit_cast<uint64_t>(b.program->doubleArrays[right.arrayOffset + i])) {
-            return false;
-          }
-        }
-        return true;
-      case ValueNodeKind::COLUMN:
-        return left.text == right.text && left.columnType == right.columnType
-            && left.columnMultiValued == right.columnMultiValued
-            && left.columnIndexed == right.columnIndexed;
-      case ValueNodeKind::FUNCTION:
-        if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount || left.intValue != right.intValue
-            || left.intValue2 != right.intValue2
-            || std::bit_cast<uint64_t>(left.doubleValue) != std::bit_cast<uint64_t>(right.doubleValue)) return false;
-        for (uint8_t i = 0; i < left.childCount; i++) {
-          if (a.children[i] != b.children[i]) return false;
-        }
-        return true;
-      case ValueNodeKind::MISSING:
-      case ValueNodeKind::SCORE:
-      case ValueNodeKind::DOCID:
-        return true;
-      case ValueNodeKind::VARIABLE:
-        assert(false);
-        return false;
-    }
-    return false;
-  };
-  std::unordered_map<Key, uint32_t, decltype(hash), decltype(equal)> intern(0, hash, equal);
-  auto canonicalRoot = [&](const ValueProgram& program) {
-    std::vector<uint32_t> ids(program.nodes.size());
-    program.walkNodes(program.rootNode, [&](uint32_t index) {
-      Key key{&program, index};
-      const ValueNode& node = program.nodes[index];
-      for (uint8_t i = 0; i < node.childCount; i++) key.children[i] = ids[node.children[i]];
-      ids[index] = intern.try_emplace(key, (uint32_t)intern.size()).first->second;
-    });
-    return ids[program.rootNode];
-  };
-  uint32_t left = canonicalRoot(*this);
-  return left == canonicalRoot(other);
+      return true;
+    case ValueNodeKind::COLUMN:
+      return left.text == right.text && left.columnType == right.columnType
+          && left.columnMultiValued == right.columnMultiValued
+          && left.columnIndexed == right.columnIndexed;
+    case ValueNodeKind::FUNCTION:
+      return left.function == right.function && left.opcode == right.opcode
+          && left.childCount == right.childCount && left.intValue == right.intValue
+          && left.intValue2 == right.intValue2
+          && std::bit_cast<uint64_t>(left.doubleValue) == std::bit_cast<uint64_t>(right.doubleValue)
+          && std::equal(left.children.begin(), left.children.begin() + left.childCount,
+                        right.children.begin());
+    case ValueNodeKind::MISSING:
+    case ValueNodeKind::SCORE:
+    case ValueNodeKind::DOCID:
+      return true;
+    case ValueNodeKind::VARIABLE:
+      assert(false);
+      return false;
+  }
+  return false;
+}
+
+} // namespace
+
+bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
+  // retainRoot() left each program with one node per distinct value, numbered
+  // in postorder from the root, so equal programs have equal node vectors.
+  return std::ranges::equal(nodes, other.nodes, [&](const ValueNode& left, const ValueNode& right) {
+    return nodeEqual(*this, left, other, right);
+  });
 }
 
 void ValueProgram::retainRoot() {
-  std::vector<bool> live(nodes.size());
-  walkNodes(rootNode, [&](uint32_t index) { live[index] = true; });
+  std::vector<ValueNode> kept;
+  auto hash = [&](uint32_t index) { return nodeHash(*this, kept[index]); };
+  auto equal = [&](uint32_t left, uint32_t right) {
+    return nodeEqual(*this, kept[left], *this, kept[right]);
+  };
+  std::unordered_set<uint32_t, decltype(hash), decltype(equal)> distinct(0, hash, equal);
   std::vector<uint32_t> remap(nodes.size());
-  uint32_t count = 0;
-  needsScore = false;
-  for (uint32_t i = 0; i < nodes.size(); i++) {
-    if (!live[i]) continue;
-    ValueNode node = nodes[i];
+  walkNodes(rootNode, [&](uint32_t index) {
+    ValueNode node = nodes[index];
     for (uint8_t child = 0; child < node.childCount; child++) {
       node.children[child] = remap[node.children[child]];
     }
-    remap[i] = count;
-    nodes[count++] = node;
-    needsScore = needsScore || node.kind == ValueNodeKind::SCORE;
-  }
+    kept.push_back(node);
+    auto [found, added] = distinct.insert((uint32_t)kept.size() - 1);
+    if (!added) kept.pop_back();
+    remap[index] = *found;
+  });
   rootNode = remap[rootNode];
-  nodes.resize(count);
+  assert(rootNode + 1 == kept.size());
+  nodes.assign(kept.begin(), kept.end());
+  needsScore = false;
   std::vector<uint8_t> uses(nodes.size());
   for (ValueNode& node : nodes) {
     node.flags = node.kind == ValueNodeKind::SCORE ? ValueNode::READS_SCORE : 0;
+    needsScore = needsScore || node.kind == ValueNodeKind::SCORE;
     for (uint8_t i = 0; i < node.childCount; i++) {
       uint32_t child = node.children[i];
       node.flags |= nodes[child].flags & ValueNode::READS_SCORE;

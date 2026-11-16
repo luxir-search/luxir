@@ -849,6 +849,21 @@ TEST_F(ValueScriptingTest, sharedValuesUseDocumentAndScoreAcrossEvaluationPaths)
   EXPECT_TRUE(parse("let(a, x_i, a + a)")->structurallyEqual(*parse("x_i + x_i")));
 }
 
+TEST_F(ValueScriptingTest, repeatedSubexpressionsShareOneNode) {
+  auto repeated = parse("sqrt(x_i) * sqrt(x_i) + sqrt(x_i)");
+  ASSERT_EQ(4u, repeated->nodes.size());
+  EXPECT_EQ(ValueOpcode::SQRT, repeated->nodes[1].opcode);
+  EXPECT_TRUE(repeated->nodes[1].flags & ValueNode::SHARED);
+  EXPECT_TRUE(repeated->structurallyEqual(*parse("let(v, sqrt(x_i), v * v + v)")));
+  // Binding order is not part of the value.
+  EXPECT_TRUE(parse("let(a, sqrt(x_i), let(b, exp(x_i), b - a))")
+      ->structurallyEqual(*parse("exp(x_i) - sqrt(x_i)")));
+  EXPECT_FALSE(parse("sqrt(x_i) - exp(x_i)")->structurallyEqual(*parse("exp(x_i) - sqrt(x_i)")));
+  // Each unseeded random() draws its own seed; a seeded one is a function of its key.
+  EXPECT_EQ(3u, parse("random() + random()")->nodes.size());
+  EXPECT_EQ(4u, parse("random(7, x_i) + random(7, x_i)")->nodes.size());
+}
+
 TEST_F(ValueScriptingTest, letScopeAndNameRules) {
   expectError("let(a, 1, a) + a", "Field not found: a");
   expectError("let(a, 1, let(a, 2, a))", "already defined");

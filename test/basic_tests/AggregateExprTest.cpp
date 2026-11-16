@@ -1591,6 +1591,7 @@ TEST_F(AggregateExprTest, producerInputsCompareResolvedConstantsStructurally) {
     for (uint8_t i = 0; i < node.childCount; i++) node.children[i]++;
   }
   input.rootNode++;
+  input.retainRoot();
   EXPECT_TRUE(left->producers[0].sameState(right->producers[0]));
   otherIntegers[1]--;
   EXPECT_EQ(2u, parse("cardinality($a) + cardinality($b)")->producers.size());
