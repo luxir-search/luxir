@@ -104,18 +104,34 @@ public:
         maximum(maximum), multiplier(multiplier) {}
 
   int64_t cost() override { return std::min(child.cost(), (int64_t)ownerCount); }
+  // The child is built for the windows this scorer walks, whatever the
+  // owner side consumes.
+  static Query::PlanContext childContext(Query::PlanContext context) {
+    context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+    return context;
+  }
+  // An exact scorer exactly when the child has one.
   Query::ScorerShape describeScorer(const Query::PlanContext& context) const override {
     Query::ScorerShape shape;
+    shape.matchState = child.describeScorer(childContext(context)).matchState;
+    shape.directKind = Query::DirectScorerKind::OTHER;
     shape.reportedTwoPhase = Query::ReportedTwoPhase::NO;
+    shape.windowFillClause = shape.termDisjunctionClause = shape.termConjunctionClause = Query::ClauseShape::NONE;
+    shape.independentTerm = Query::IndependentTermAccess::UNSUPPORTED;
+    shape.docsOnly = Query::DocsOnlyAccess::UNSUPPORTED;
+    shape.directDocSet = Query::DirectDocSetAccess::UNSUPPORTED;
     shape.membershipConsumption = context.membershipConsumption == Query::MembershipConsumption::EITHER
         ? Query::MembershipConsumption::WINDOWS : context.membershipConsumption;
     return shape;
   }
+  Query::UnresolvedSupplierCause unresolvedScorerCause(const Query::PlanContext& context) const override {
+    return child.unresolvedScorerCause(childContext(context));
+  }
+  bool fillExpansionMemo(const Query::PlanContext& context) override {
+    return child.fillExpansionMemo(childContext(context));
+  }
   Query::ScorerPlan* resolve(MemPool& pool, const Query::PlanContext& context) override {
-    auto childContext = context;
-    childContext.membershipConsumption = Query::MembershipConsumption::WINDOWS;
-    auto* plan = child.resolve(pool, childContext);
-    return pool.make<Plan>(*this, context, *plan);
+    return pool.make<Plan>(*this, context, *child.resolve(pool, childContext(context)));
   }
 };
 
