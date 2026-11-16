@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/SegmentCore.h"
+#include "luxir/index/SegmentMerger.h"
+#include <oneapi/tbb/task_arena.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -144,6 +146,35 @@ uint64_t buildReferenceDigest() {
   return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
 }
 
+uint64_t buildMergedReferenceDigest() {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  buildReferenceIndex(ch);
+  auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
+  std::vector<PostingsReader*> inputs;
+  std::vector<LiveDocs*> live;
+  for (const auto& segment : reader->segments()) {
+    inputs.push_back(&segment.postingsReader());
+    live.push_back(segment.liveDocs());
+  }
+  RAMDir output;
+  IndexRamBudget budget;
+  budget.setTotalBytes(1);
+  StoredDictionaryRegistry dictionaries;
+  PostingsWriter writer(output, 3, 1);
+  SegmentMerger merger(inputs, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
+  oneapi::tbb::task_arena serial(1);
+  serial.execute([&] { merger.merge(); });
+  std::vector<FileDescriptor> files;
+  EXPECT_TRUE(writer.finish(nullptr, &files));
+  std::vector<uint64_t> fingerprints;
+  for (const auto& file : files) {
+    fingerprints.push_back(file.size);
+    fingerprints.push_back(file.xxh3);
+  }
+  return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
+}
+
 // Copies every file of the reference index's first segment into a RAM
 // directory, letting `mutate` change file 0.
 std::unique_ptr<RAMDir> copySegment(Directory& source, const std::function<void(std::string&)>& mutate) {
@@ -184,6 +215,12 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
   EXPECT_EQ(digest, kReferenceDigest) << std::format(
       "The bytes Luxir writes changed (digest {:#x}). Bump IndexFormat::VERSION, "
       "then update kReferenceVersion and kReferenceDigest.", digest);
+}
+
+TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
+  auto digest = buildMergedReferenceDigest();
+  ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
+  EXPECT_EQ(0x060891e1a79722f8ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
