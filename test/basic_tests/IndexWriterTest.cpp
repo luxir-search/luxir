@@ -3709,8 +3709,13 @@ TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
 TEST_F(IndexWriterTest, applicationFinishingAfterMergeCarriesToOutput) {
   test::CollectionHelper helper("late_merge_delete");
   auto writer = helper.getIndexWriter();
-  ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(helper.index(test::flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  for (auto id : {"a", "b"}) {
+    test::CollectionHelper::UpdateBuilder input;
+    std::string json = std::string("{\"id\":\"") + id + "\",\"items_nested\":{\"parts_nested\":{\"tag_s\":\"" + id + "\"}}}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  auto pinned = writer->snapshots.readers.getReader();
   std::latch diff(1), releaseMerge(1), application(1), releaseApplication(1), swapped(1);
   Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
     diff.count_down(); releaseMerge.wait(); return nullptr;
@@ -3742,6 +3747,14 @@ TEST_F(IndexWriterTest, applicationFinishingAfterMergeCarriesToOutput) {
   writer->updateGraph->wait_for_all();
   EXPECT_EQ(1, writer->snapshots.readers.getReader()->liveDocs());
   EXPECT_EQ(0, writer->stats(false).retainedDeleteBytes);
+  auto view = writer->snapshots.readers.getReader()->view("items_nested.parts_nested");
+  EXPECT_EQ(2, view->maxDoc()); EXPECT_EQ(1, view->liveDocs());
+  EXPECT_EQ(2, pinned->view("items_nested.parts_nested")->liveDocs());
+  auto req = test::localReq(helper.getSearchEngine());
+  req->collection("late_merge_delete").topDocs().exprQuery("items_nested.parts_nested.tag_s:b").countLimit().limit(0);
+  req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+  writer->mergeSegments();
+  EXPECT_EQ(1, writer->snapshots.readers.getReader()->view("items_nested.parts_nested")->maxDoc());
   test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
 }
 

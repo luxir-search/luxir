@@ -27,6 +27,7 @@
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
+#include "luxir/reader/OwnershipMapper.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 
@@ -1470,7 +1471,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                         inverter.getPostingsWriter().creatorEpoch,
                                         inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
-    if (inverter.hasChildRows()) segInfo->mergeLevel = SegInfo::NESTED_MERGE_LEVEL;
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2045,6 +2045,13 @@ std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
 
 namespace {
 
+std::vector<VectorIndexBuilder::SegInput> vectorInputs(SegInfo& seg, SegmentCore& core) {
+  std::vector<VectorIndexBuilder::SegInput> inputs;
+  inputs.reserve(core.spaces().size());
+  for (const auto& space : core.spaces()) inputs.emplace_back(seg.segId, core.spaceReader(space.path), seg.creatorEpoch);
+  return inputs;
+}
+
 bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
   if (!overlayName.starts_with(VectorIndexBuilder::NAME_PREFIX)) return false;
   overlayName.remove_prefix(VectorIndexBuilder::NAME_PREFIX.size());
@@ -2168,10 +2175,9 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
   phase = "merged_postings_reader";
   Signal::emit("mergedPostingsReader", &output);
   auto prCore = getSegmentCore(output);
-  auto* pr = &prCore->rootReader();
   if (!selectors.empty()) {
-    VectorIndexBuilder::SegInput input{output.segId, pr, output.creatorEpoch};
-    VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+    auto inputs = vectorInputs(output, *prCore);
+    VectorIndexBuilder matcher(dir, inputs,
                                *schema, 0, writerEpoch);
     for (const auto& name : matcher.matchingOverlayNames(selectors)) {
       if (!attempted.contains(name)) wanted.emplace(name);
@@ -2348,11 +2354,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
         auto prCore = getSegmentCore(*seg);
-        std::vector<VectorIndexBuilder::SegInput> inputs;
-        inputs.reserve(prCore->spaces().size());
-        for (const auto& space : prCore->spaces()) {
-          inputs.emplace_back(seg->segId, prCore->spaceReader(space.path), seg->creatorEpoch);
-        }
+        auto inputs = vectorInputs(*seg, *prCore);
         VectorIndexBuilder matcher(dir, inputs, *schema, 0, writerEpoch);
         auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
         stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
@@ -2644,6 +2646,67 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 }
 
 
+int64_t IndexWriter::mergePathRows(std::unique_lock<std::mutex>& lock,
+                                 std::span<SegInfo* const> candidates,
+                                 std::span<SegInfo* const> selected, std::string_view path) {
+  struct Source {
+    SegInfo* info;
+    std::shared_ptr<SegmentCore> core;
+    std::shared_ptr<LiveDocs> live;
+    uint64_t generation, epoch;
+  };
+  std::vector<Source> sources;
+  sources.reserve(selected.size());
+  for (auto* seg : candidates) ++seg->preparationPins;
+  auto unpin = scope_guard([&] {
+    assert(lock.owns_lock());
+    for (auto* seg : selected) seg->mergeDiffLiveGen = -1;
+    for (auto* seg : candidates) --seg->preparationPins;
+  });
+  auto reader = snapshots.readers.indexReader.load(std::memory_order_acquire);
+  for (auto* seg : selected) {
+    auto& source = sources.emplace_back(seg, getSegmentCore(*seg), nullptr,
+        seg->liveGen, seg->liveEpochFor(seg->liveGen, writerEpoch));
+    if (!source.generation) continue;
+    auto* published = reader && reader->incarnation() == incarnation ? reader->findSegment(seg->segId) : nullptr;
+    if (published && published->segInfo.live_gen == source.generation) source.live = published->liveDocsShared();
+    else seg->mergeDiffLiveGen = (int64_t)source.generation;
+  }
+  lock.unlock();
+  int64_t count = 0;
+  try {
+    Signal::emit("mergeExactRows", (void*)&path);
+    for (auto& source : sources) {
+      if (!source.live && source.generation) {
+        source.live = LiveDocs::create(dir, source.info->segId, source.info->creatorEpoch,
+            source.generation, source.epoch, source.info->maxDoc, false, false);
+      }
+      auto* rows = source.core->spaceReader(path);
+      if (!rows) continue;
+      count += rows->maxDoc();
+      if (!source.live) continue;
+      OwnershipMapper mapper(*source.core, "", path);
+      const auto& bits = source.live->bitset();
+      for (int32_t word = 0; word < (int32_t)FixedBitSet::sizeInWords(bits.size()); word++) {
+        uint64_t dead = ~bits.words[word];
+        int32_t last = (int32_t)std::min((int64_t)(word + 1) * 64, (int64_t)bits.size());
+        if (last & 63) dead &= (1ULL << (last & 63)) - 1;
+        while (dead) {
+          int32_t root = word * 64 + (int32_t)std::countr_zero(dead);
+          dead &= dead - 1;
+          auto [first, end] = mapper.range(root);
+          count -= end - first;
+        }
+      }
+    }
+  } catch (...) {
+    lock.lock();
+    throw;
+  }
+  lock.lock();
+  return count;
+}
+
 // called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
 // Only one merge will be running at a time.
 // We do run concurrently with everything else, including commits and segment deletions.
@@ -2685,31 +2748,19 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // We grab the list of segments to merge with the lock held, but use them outside of the lock.
     // This is safe since the only place where segments are deleted is in a merge, and this has concurrency==1
     {
-      const std::lock_guard<std::mutex> lock(indexMutex);
+      std::unique_lock<std::mutex> lock(indexMutex);
       if (clientOrigin) {
         assert(msg.maxSegments > 0);
         segs.reserve(segInfos.size());
         for (auto& [segId, seg] : segInfos) {
           unused(segId);
-          if (seg->liveDocs == 0 || seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) {
-            continue;
-          }
-          auto core = getSegmentCore(*seg);
-          if (core->spaces().size() > 1) {
-            mergePolicy->_excludeNested(seg.get());
+          if (seg->liveDocs == 0) {
             continue;
           }
           segs.push_back(seg.get());
         }
 
-        size_t blocked = 0;
-        for (const auto& [_, seg] : segInfos) {
-          if (seg->liveDocs > 0 && seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) blocked++;
-        }
-        size_t target = (size_t)msg.maxSegments > blocked ? (size_t)msg.maxSegments - blocked : 1;
-        if (blocked + (segs.empty() ? 0 : 1) > (size_t)msg.maxSegments) {
-          setForceMergeError(*msg.forcedBy, "max_segments cannot be reached while nested segments cannot be merged");
-        }
+        size_t target = (size_t)msg.maxSegments;
         if (segs.size() > target) {
           std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
             if (a->liveDocs != b->liveDocs) {
@@ -2745,8 +2796,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
+      bool countedPathRows = false;
       for (SegInfo* seg : segs) {
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
@@ -2754,39 +2807,56 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           continue;
         }
         auto postingsReaderCore = getSegmentCore(*seg);
-        if (postingsReaderCore->spaces().size() > 1) {
-          mergePolicy->_excludeNested(seg);
-          continue;
-        }
-        auto* postingsReader = &postingsReaderCore->rootReader();
         MemPool metadataPool;
-        FieldReader fields(*postingsReader);
         boost::unordered_flat_map<std::string, int64_t> additions;
-        bool fits = true;
-        while (fields.readNextField()) {
-          SegFieldInfo info;
-          fields.readFieldInfo(info);
-          if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
-              (info.flags & FieldType::INDEX_DOCS) == 0 ||
-              (info.flags & FieldType::MULTI_VALUED) == 0) {
-            continue;
+        auto ordsFit = [&](PostingsReader& reader) {
+          FieldReader fields(reader);
+          while (fields.readNextField()) {
+            SegFieldInfo info{};
+            fields.readFieldInfo(info);
+            if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
+                (info.flags & FieldType::INDEX_DOCS) == 0 ||
+                (info.flags & FieldType::MULTI_VALUED) == 0) {
+              continue;
+            }
+            std::string name((std::string_view)info.fieldname);
+            int64_t next = additions[name] + info.nTerms;
+            if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
+              return false;
+            }
+            additions[name] = next;
           }
-          std::string name((std::string_view)info.fieldname);
-          int64_t next = additions[name] + info.nTerms;
-          if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
-            fits = false;
-            break;
+          return true;
+        };
+        bool fits = ordsFit(postingsReaderCore->rootReader());
+        std::vector<std::pair<std::string, int64_t>> nextRows;
+        for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
+          const auto& space = postingsReaderCore->spaces()[i];
+          int64_t next = pathRows[space.path] + space.maxDoc;
+          if (!MergeCostModel::docsFit(0, next)) {
+            auto selected = admitted;
+            selected.push_back(seg);
+            next = mergePathRows(lock, segs, selected, space.path);
+            countedPathRows = true;
+            std::erase_if(admitted, [&](auto* input) { return input->liveDocs == 0 || !segInfos.contains(input->segId); });
+            if (seg->liveDocs == 0 || !segInfos.contains(seg->segId)) { fits = false; break; }
           }
-          additions[name] = next;
+          fits = MergeCostModel::docsFit(0, next)
+              && ordsFit(*postingsReaderCore->spaceReader(space.path));
+          nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
-          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged ord dictionary would exceed the safety limit",
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space or ord dictionary would exceed the safety limit",
                       seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
+      }
+      if (countedPathRows) {
+        std::erase_if(admitted, [&](auto* seg) { return seg->liveDocs == 0 || !segInfos.contains(seg->segId); });
       }
       segs.swap(admitted);
 
@@ -2878,13 +2948,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
 
     phase = "prepare_merge_inputs";
-    // Merge cursors borrow the root space readers from the pinned cores.
-    std::vector<PostingsReader*> preaderPtrs;
-    preaderPtrs.reserve(sourceCores.size());
-    for (auto& sourceCore : sourceCores) {
-      preaderPtrs.push_back(&sourceCore->rootReader());
-    }
-
+    // Merge cursors borrow the space readers from the pinned cores.
     {
       PostingsWriter pwriter(dir, outputSegId, writerEpoch);
 
@@ -2892,7 +2956,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // Do the actual merge.  The current schema chooses each stored-fields
       // resource's output format.
       auto mergeSchema = getSchema();
-      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
+      SegmentMerger merger(sourceCores, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();

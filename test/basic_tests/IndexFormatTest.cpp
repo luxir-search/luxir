@@ -151,10 +151,10 @@ uint64_t buildMergedReferenceDigest() {
   CollectionHelper ch(node, "main");
   buildReferenceIndex(ch);
   auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
-  std::vector<PostingsReader*> inputs;
+  std::vector<std::shared_ptr<SegmentCore>> inputs;
   std::vector<LiveDocs*> live;
   for (const auto& segment : reader->segments()) {
-    inputs.push_back(&segment.postingsReader());
+    inputs.push_back(segment.segmentCoreShared());
     live.push_back(segment.liveDocs());
   }
   RAMDir output;

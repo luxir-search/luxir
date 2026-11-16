@@ -56,8 +56,6 @@ public:
     uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
-    // Nested bundles stay outside levelCounts until their merger is available.
-    static constexpr int32_t NESTED_MERGE_LEVEL = -2;
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
@@ -255,7 +253,6 @@ public:
     // Reserve any merge-policy storage needed by _update(seg) before the
     // caller mutates segment ownership.  Call with indexMutex locked.
     void _prepareUpdate(SegInfo* seg) {
-      if (seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) return;
       int32_t mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
       if (mergeLevel >= (int)levelCounts.size()) {
         levelCounts.resize(mergeLevel + 1);
@@ -271,7 +268,6 @@ public:
 
       if (seg != nullptr) {
         segCount++;
-        if (seg->mergeLevel == SegInfo::NESTED_MERGE_LEVEL) return -1;
 
         // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
         seg->mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
@@ -295,11 +291,6 @@ public:
 
 
       return mergeLevel;
-    }
-
-    void _excludeNested(SegInfo* seg) {
-      if (seg->mergeLevel >= 0) levelCounts[seg->mergeLevel]--;
-      seg->mergeLevel = SegInfo::NESTED_MERGE_LEVEL;
     }
 
     // Call with indexMutex locked.
@@ -891,6 +882,8 @@ private:
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
+  int64_t mergePathRows(std::unique_lock<std::mutex>& lock, std::span<SegInfo* const> candidates,
+                        std::span<SegInfo* const> selected, std::string_view path);
   bool mergeSegmentsBody(MergeMessage& msg);
 
 public:

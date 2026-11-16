@@ -356,21 +356,33 @@ TEST_F(RowSpaceTest, ownershipStreamsStayInTheSharedFileInventory) {
   EXPECT_EQ(bytes, core.sizeInBytes());
 }
 
-TEST_F(RowSpaceTest, multiSpaceMergeFailsBeforeWritingFields) {
+TEST_F(RowSpaceTest, multiSpaceMergePreservesRowsAndShape) {
   RAMDir dir, output;
-  Fixture::write(dir, 1, ROOTS, CHILDREN, ENDS);
-  SegmentCore core(dir, 1, 1);
-  std::vector<PostingsReader*> readers{&core.rootReader()};
+  {
+    PostingsWriter source(dir, 1, 1, (int32_t)ROOTS.size());
+    Fixture::fields(source, SpaceOrdinal::ROOT, "", ROOTS, std::vector<uint8_t>{1, 1, 1});
+    auto child = source.addSpace(Fixture::CHILD);
+    source.finishSpace(child, (int32_t)CHILDREN.size(), Fixture::shape(source, ENDS));
+    Fixture::fields(source, child, Fixture::CHILD, CHILDREN, std::vector<uint8_t>{2, 2, 1});
+    writeUnversionedRuns(source); ASSERT_TRUE(source.finish());
+  }
+  auto core = std::make_shared<SegmentCore>(dir, 1, 1);
+  std::vector<std::shared_ptr<SegmentCore>> readers{core};
   std::vector<LiveDocs*> live{nullptr};
   PostingsWriter writer(output, 2, 1);
   IndexRamBudget budget;
   Schema schema;
   StoredDictionaryRegistry dictionaries;
   SegmentMerger merger(readers, live, writer, budget, INT64_MAX, 1, 4, schema, dictionaries);
-  EXPECT_THROW(merger.merge(), std::invalid_argument);
-  std::vector<Directory::FileInfo> files;
-  output.listFiles(files);
-  EXPECT_TRUE(files.empty());
+  merger.merge();
+  ASSERT_TRUE(writer.finish());
+  SegmentCore merged(output, 2, 1);
+  EXPECT_EQ(core->rootReader().maxDoc(), merged.rootReader().maxDoc());
+  ASSERT_NE(nullptr, merged.spaceReader(Fixture::CHILD));
+  EXPECT_EQ((int32_t)CHILDREN.size(), merged.spaceReader(Fixture::CHILD)->maxDoc());
+  for (int32_t p = 0; p < (int32_t)ROOTS.size(); p++) {
+    EXPECT_EQ(core->ownership(Fixture::CHILD)->range(p), merged.ownership(Fixture::CHILD)->range(p));
+  }
 }
 
 TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
