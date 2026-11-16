@@ -12388,6 +12388,17 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       if (optionalSources.empty() && prohibitedSources.empty()
           && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+        // An unscored count or domain over required clauses alone is
+        // membership like a filtered count body: per-clause demand lets a
+        // verifying clause (a column check beside a term) take the lead's
+        // candidates in batches, and its proofs skip whole windows.
+        if (!needsScores && isMembershipWindowUse(use)
+            && !disableRequiredCountMembershipForTests) {
+          BulkPlan membership = planConjunctionBulk(
+              use, ConjunctionMode::EXHAUSTIVE,
+              countRouteMask(!disableFilterClauseCountForTests), {}, bulkContext);
+          if (membership.available == BulkAnswer::YES) return membership;
+        }
         return planConjunctionBulk(
             use, ConjunctionMode::SCORED_BODY,
             routeBit(ConjunctionRoute::GENERIC), {}, bulkContext);
