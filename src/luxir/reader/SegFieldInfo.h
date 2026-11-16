@@ -111,8 +111,9 @@ struct SegFieldInfo {
   int64_t valDocMetaOff;
 
   // Indexed STRING/ID fields declared without a column (column: false) keep
-  // only postings and the docs-with-field set; segments written before a
-  // schema change may disagree, so column readers check per segment.
+  // only postings and the docs-with-field set. A schema cannot add the column
+  // back to an existing field, but a field dropped and declared again can
+  // still meet such segments, so column readers check per segment.
   bool hasOrdColumn() const { return ordFormat != ORD_NONE; }
 
   // `info` for column reads: null (no values in this segment) for an indexed
