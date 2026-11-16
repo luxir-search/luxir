@@ -756,6 +756,9 @@ public:
   // Test hook: route unscored filter suppliers by density instead of admitting
   // exact filters as exhaustive conjunction clauses.
   static inline bool disableFilterClauseCountForTests = false;
+  // Plans unscored required-only conjunctions as scored bodies, as before
+  // they took exhaustive membership windows.
+  static inline bool disableRequiredCountMembershipForTests = false;
   // Test hook: route exact scored filter suppliers by density instead of
   // admitting exact filters as exhaustive conjunction clauses.
   static inline bool disableExactFilterCachePolicyForTests = false;
