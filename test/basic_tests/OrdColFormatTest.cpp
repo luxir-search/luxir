@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <numeric>
@@ -18,7 +17,6 @@
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/SortField.h"
-#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -982,37 +980,23 @@ TEST_F(OrdColFormatTest, indexedStringColumnCanBeDroppedButNotAdded) {
     field.column = column;
     schema.set(helper.collection());
   };
-  setColumn(false);
-  ASSERT_TRUE(helper.index(flatdoc("id", "a", "tag", "old"), UpdateMessage::COMMIT).success);
   setColumn(true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "tag", "old"), UpdateMessage::COMMIT).success);
+  setColumn(false);
   ASSERT_TRUE(helper.index(flatdoc("id", "b", "tag", "new"), UpdateMessage::COMMIT).success);
-  for (int merge = 0; merge < 2; merge++) {
-    auto req = localReq(helper.getSearchEngine());
-    auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "tag"});
-    qb::sort(top, "id", qb::ASC);
-    top.facet("f", "tag").limit(-1).mincount(1);
-    req->execute(false);
-    ASSERT_OK(req);
-    const auto* docs = req->docList("q");
-    ASSERT_NE(nullptr, docs);
-    const auto& ids = std::get<api::ColStr>(docs->ops.at("f")->facetResult()->bucket_ids->kind).v;
-    // The merged segment has a source without a column, so it has none.
-    EXPECT_EQ(merge ? std::vector<std::string>{} : std::vector<std::string>{"new"},
-              std::vector<std::string>(ids.begin(), ids.end()));
-    auto exists = localReq(helper.getSearchEngine());
-    exists->collection("main").topDocs("q").existsQuery("tag").countLimit();
-    exists->execute(false);
-    ASSERT_OK(exists);
-    EXPECT_EQ(2, exists->getMatchCount("q"));
-    if (!merge) {
-      CollectionHelper::UpdateBuilder update;
-      update.commit(true, 1);
-      ASSERT_TRUE(helper.submit(update).success);
-    }
-  }
+  EXPECT_THROW(setColumn(true), SchemaError);
+
+  CollectionHelper::UpdateBuilder update;
+  update.commit(true, 1);
+  ASSERT_TRUE(helper.submit(update).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_FALSE(reader->segments()[0].postingsReader().fieldInfo("tag")->hasOrdColumn());
+  auto exists = localReq(helper.getSearchEngine());
+  exists->collection("main").topDocs("q").existsQuery("tag").countLimit();
+  exists->execute(false);
+  ASSERT_OK(exists);
+  EXPECT_EQ(2, exists->getMatchCount("q"));
 }
 
 TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {

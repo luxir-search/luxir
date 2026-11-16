@@ -44,10 +44,6 @@ struct MergeCostModel {
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
   static constexpr int32_t MAX_TERM_RANGES_CAP = 64;
   static constexpr int32_t DERIVED_TERM_RANGES = 0;
-  // The OrdCollector pool tags stream addresses in 31 bits and fails past
-  // 2 GiB; SET ord column merges replay the source columns well before
-  // SegmentMerger::ordCollectorPoolBound (an overestimate) gets there.
-  static constexpr int64_t ORD_REPLAY_MIN_BYTES = 1LL << 30;
   static constexpr int64_t MAX_MERGED_ORD_TERMS =
       (int64_t)std::numeric_limits<int32_t>::max() - (1 << 20);
 

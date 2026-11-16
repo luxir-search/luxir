@@ -2864,8 +2864,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       auto mergeSchema = getSchema();
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges, *mergeSchema, storedDictionaries,
-                           ordReplayMinBytes);
+                           termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();
 
       phase = "new_segment_info";
