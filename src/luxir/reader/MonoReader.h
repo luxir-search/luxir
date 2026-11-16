@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <span>
+
 #include "luxir/codec/NumColumn.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/store/OutputStream.h"
@@ -40,6 +43,29 @@ public:
   // defined as zero.
   [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
     return values.valuesAt(index);
+  }
+
+  // Decode a contiguous run. Full frames go straight to the destination;
+  // only partial edge frames need a temporary and a copy.
+  void readValues(int64_t index, std::span<int64_t> out) const {
+    assert(index >= 0 && index <= numValues());
+    assert(out.size() <= (uint64_t)(numValues() - index));
+    int64_t frame[MonoColumn::BULK_SIZE];
+    while (!out.empty()) {
+      uint32_t count;
+      size_t copied;
+      if (index % MonoColumn::BULK_SIZE == 0 && out.size() >= MonoColumn::BULK_SIZE) {
+        values.decodeFrame(index, out.data(), count);
+        copied = count;
+      } else {
+        int64_t start = values.decodeFrame(index, frame, count);
+        size_t offset = (size_t)(index - start);
+        copied = std::min(out.size(), (size_t)count - offset);
+        std::copy_n(frame + offset, copied, out.data());
+      }
+      index += (int64_t)copied;
+      out = out.subspan(copied);
+    }
   }
 
   class BulkValues {

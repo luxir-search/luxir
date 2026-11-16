@@ -42,6 +42,19 @@ public:
     return range(owner, owner + 1);
   }
 
+  // Compose one boundary run into the descendant space without retaining
+  // intermediate rows or decoding the gaps between sampled frames.
+  void readBoundaries(int32_t first, int32_t end, std::span<int64_t> out) const {
+    assert(first >= 0 && first <= end);
+    assert(out.size() == (size_t)(end - first) + 1);
+    if (shapes.empty()) {
+      for (auto& boundary : out) boundary = first++;
+      return;
+    }
+    shapes[0]->readBoundaries(first, end, out);
+    for (size_t level = 1; level < shapes.size(); level++) shapes[level]->projectBoundaries(out);
+  }
+
   class Cursor {
     std::span<OwnershipShape::Cursor> cursors;
     OwnershipShape::Family current{-1, 0, 0};
