@@ -19,9 +19,6 @@ namespace {
 
 using namespace valuefn;
 
-constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
-constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
-
 uint64_t bitsOf(const ValueResult& value) {
   return value.type == ValueType::DOUBLE ? std::bit_cast<uint64_t>(value.doubleValue)
                                          : (uint64_t)value.intValue;

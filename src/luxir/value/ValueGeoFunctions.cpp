@@ -18,11 +18,6 @@ namespace {
 
 using namespace valuefn;
 
-constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
-constexpr ValueFunction::Operand GEO_POINT{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
-constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
-
 constexpr double PI = std::numbers::pi;
 constexpr double DEGREES_TO_RADIANS = 0.017453292519943295;
 
@@ -114,7 +109,7 @@ double bearingDegrees(double lat1, double lon1, double lat2, double lon2) {
   double x = std::cos(phi1) * std::sin(phi2) - std::sin(phi1) * std::cos(phi2) * std::cos(delta);
   double degrees = std::atan2(y, x) / DEGREES_TO_RADIANS;
   degrees = std::fmod(degrees + 360.0, 360.0);
-  return degrees >= 360.0 ? 0.0 : degrees;
+  return degrees;
 }
 
 template <double (*Fn)(double, double, double, double), int64_t Max>

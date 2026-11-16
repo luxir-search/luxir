@@ -23,10 +23,12 @@ Everything here shares the rules of the base language:
   parts map element-wise over an array, which a reducer then consumes:
   `max(geo_lat(places))`.
 
-Pure expressions that do not depend on the document or score are evaluated
-while parsing and replaced by literals when evaluation succeeds. This includes
-`pi()/180`, `1 << 5`, and `pow(sqrt(7), 5)`. A failing constant expression stays
-lazy, so `if(0, log(-1), 7)` returns 7. Random functions are never folded.
+Pure scalar expressions that do not depend on the document or score are
+evaluated while parsing and replaced by literals when evaluation succeeds.
+This includes `pi()/180`, `1 << 5`, and `pow(sqrt(7), 5)`. Fully present constant
+arrays are also materialized once. Arrays containing missing elements remain
+lazy, although a scalar consumer can still fold. A failing constant expression
+stays lazy, so `if(0, log(-1), 7)` returns 7. Random functions are never folded.
 
 ## Operators
 
@@ -66,7 +68,8 @@ Every operator has a function spelling: `mod`, `bit_and`, `bit_or`, `bit_xor`,
 ## Field paths and variables
 
 A field path starts with a bare column name or `col("name")`. A dot denotes a
-child of that field and must be adjacent to both path names (no whitespace). DATE and GEO_POINT columns define these components:
+child of that field and must be adjacent to both path names (no whitespace).
+DATE and GEO_POINT columns define these components:
 
 | Field type | Components | Equivalent function |
 |---|---|---|
@@ -223,8 +226,8 @@ budget; there is no separate limit on the number of bindings.
 
 These functions give a document a stable pseudo-random number, for consistent
 sampling and bucketing (an A/B split, a percentage rollout, a spread of a
-tie). The argument is a number, hashed by its 64-bit pattern: integer-lane values (including dates)
-use their integer bits; double-lane values (including fractional dates) use
+tie). The argument is a number, hashed by its 64-bit pattern. Integer-lane
+values (including dates) use their integer bits; double-lane values (including fractional dates) use
 their IEEE 754 bits, so `-0.0` and `0.0` differ.
 
 | Function | Result |
@@ -235,8 +238,8 @@ their IEEE 754 bits, so `-0.0` and `0.0` differ.
 | `hash_combine(a, b)` | Mixes two integers, in order: `hash_combine(a, b)` differs from `hash_combine(b, a)`. |
 
 `seed` is an integer constant and defaults to 0. Integer seeds and bucket
-counts preserve all 64 bits; they do not pass through floating point. Results of `xxhash64` and
-`murmur64` use all 64 bits and can be negative; take a bucket with
+counts preserve all 64 bits; they do not pass through floating point. Results
+of `xxhash64` and `murmur64` use all 64 bits and can be negative; take a bucket with
 `hash_bucket`. Hashing a string column is not available.
 
 ```

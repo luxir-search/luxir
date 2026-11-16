@@ -689,7 +689,7 @@ ValueResult evalCountElement(BoundValueProgram& program, const ValueNode& node,
 }
 
 ValueResult evalDefPoint(BoundValueProgram& program, const ValueNode& node,
-                            int32_t docid, float score) {
+                         int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
   ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
   if (selected.valid && valueArray(node.type)) {
@@ -701,7 +701,7 @@ ValueResult evalDefPoint(BoundValueProgram& program, const ValueNode& node,
 }
 
 ValueResult evalUnaryPoint(BoundValueProgram& program, const ValueNode& node,
-                            int32_t docid, float score) {
+                           int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
   if (!first.valid) return ValueResult::missing(node.type);
   if (valueArray(first.type)) {
@@ -725,7 +725,7 @@ ValueResult evalBinaryPoint(BoundValueProgram& program, const ValueNode& node,
 }
 
 ValueResult evalReducerPoint(BoundValueProgram& program, const ValueNode& node,
-                            int32_t docid, float score) {
+                             int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
   if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
   if (node.opcode != ValueOpcode::AVG
@@ -1587,8 +1587,6 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
   return out;
 }
 
-constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
-
 ValueResult decodeDecimalResult(ValueResult value, const DecimalScale& scale) {
   if (!value.valid) return ValueResult::missing(ValueType::DOUBLE);
   return ValueResult::floating(value.type == ValueType::DOUBLE ? scale(value.doubleValue) : scale(value.intValue));
@@ -1630,15 +1628,6 @@ BucketScalar evalDecimalBucket(std::span<const BucketScalar> args, ValueType typ
   auto scale = DECIMAL_SCALES[(size_t)args[1].intValue];
   return BucketScalar::floating(input.type == BucketValueType::DOUBLE ? scale(input.doubleValue) : scale(input.intValue));
 }
-
-constexpr ValueFunction::Operand ANY_VALUE{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
-constexpr ValueFunction::Operand GEO_POINT{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
-constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
-constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
-constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
-constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalDefPoint, evalFunctionBatch,
@@ -1721,30 +1710,7 @@ constexpr ValueFunction FUNCTIONS[] = {
      prepareDecay<DecayShape::LINEAR>},
 };
 
-consteval std::string_view unsetOperandUnitFunction() {
-  for (const ValueFunction& function : FUNCTIONS) {
-    for (uint8_t i = 0; i < function.maxArity; i++) {
-      if (function.operands[i].unit == ValueFunction::DateUnit::UNSET) {
-        return function.name;
-      }
-    }
-  }
-  return {};
-}
-
-static_assert(unsetOperandUnitFunction().empty(), unsetOperandUnitFunction());
-
-consteval std::string_view constantBucketOperandFunction() {
-  for (const ValueFunction& function : FUNCTIONS) {
-    if (function.evalBucketScalar == nullptr) continue;
-    for (uint8_t i = 0; i < function.maxArity; i++) {
-      if (function.operands[i].constant) return function.name;
-    }
-  }
-  return {};
-}
-
-static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunction());
+static_assert(badOperandFlags(FUNCTIONS).empty(), badOperandFlags(FUNCTIONS));
 
 [[noreturn]] void throwBindInvalid(const ValueProgram& program, const ValueNode& node,
                                    const ValueBounds& bounds) {
@@ -1872,16 +1838,10 @@ namespace {
 
 // The core table followed by every family table, in one stable sequence so a
 // function's address is the same whichever way it is looked up.
-const std::vector<ValueFunction>& allFunctions() {
-  static const std::vector<ValueFunction> all = [] {
-    std::vector<ValueFunction> out(std::begin(FUNCTIONS), std::end(FUNCTIONS));
-    for (auto family : {valueMathFunctions(), valueDateFunctions(), valueGeoFunctions(),
-                        valueHashFunctions()}) {
-      out.insert(out.end(), family.begin(), family.end());
-    }
-    return out;
-  }();
-  return all;
+ValueFunctionRegistry::Entries allFunctions() {
+  static const std::array<std::span<const ValueFunction>, 5> tables{
+      FUNCTIONS, valueMathFunctions(), valueDateFunctions(), valueGeoFunctions(), valueHashFunctions()};
+  return ValueFunctionRegistry::Entries{std::span<const std::span<const ValueFunction>>(tables)};
 }
 
 } // namespace
@@ -1894,7 +1854,7 @@ const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
   return nullptr;
 }
 
-std::span<const ValueFunction> ValueFunctionRegistry::entries() {
+ValueFunctionRegistry::Entries ValueFunctionRegistry::entries() {
   return allFunctions();
 }
 

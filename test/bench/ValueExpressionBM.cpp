@@ -102,6 +102,7 @@ void BM_ValuePoint(benchmark::State& state, const char* expression,
 
 void BM_ValueRequest(benchmark::State& state, const char* expression, bool rescore) {
   ValueFixture data;
+  tbb::global_control serial{tbb::global_control::max_allowed_parallelism, 1};
   for (auto _ : state) {
     auto req = localReq(data.helper.getSearchEngine());
     auto& top = req->collection("value_expression_bm").topDocs("q").limit(10).countLimit(0);

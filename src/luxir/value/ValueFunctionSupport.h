@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -22,6 +23,18 @@
 #include "luxir/value/ValueFunctionRegistry.h"
 
 namespace luxir::valuefn {
+
+inline constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
+inline constexpr ValueFunction::Operand ANY_VALUE{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
+inline constexpr ValueFunction::Operand GEO_POINT{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
+inline constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
+inline constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
+inline constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
+inline constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
+inline constexpr ValueFunction::Operand DATE_VALUE{
+    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::DATE};
 
 inline void requireNumeric(std::span<const ResolvedValue> args) {
   for (const ResolvedValue& arg : args) {
@@ -167,8 +180,7 @@ inline ValueBounds unknownResult(const ValueNode& node, std::span<const ValueBou
   return ValueBounds::unbounded(node.type, mayBeMissing, alwaysMissing);
 }
 
-// The constant a double-valued function of constant operands produces, or the
-// proof that it cannot produce a finite value.
+// Bounds for a known double result, including a proven non-finite endpoint.
 inline ValueBounds constantDouble(const ValueNode& node, double value, bool mayBeMissing) {
   if (std::isnan(value)) {
     return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, mayBeMissing);

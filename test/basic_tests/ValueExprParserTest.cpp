@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <unordered_set>
 
 #include <array>
 #include <string>
@@ -264,7 +265,10 @@ TEST(ValueExprParserTest, rejectsNonFiniteVariablesAndExcessiveDepth) {
 TEST(ValueExprParserTest, registryEntriesAreComplete) {
   auto entries = ValueFunctionRegistry::entries();
   ASSERT_FALSE(entries.empty());
+  std::unordered_set<std::string_view> names;
   for (const ValueFunction& function : entries) {
+    EXPECT_TRUE(names.insert(function.name).second) << function.name;
+    EXPECT_EQ(&function, ValueFunctionRegistry::find(function.name));
     EXPECT_NE(nullptr, function.resolve) << function.name;
     EXPECT_NE(nullptr, function.evalPoint) << function.name;
     EXPECT_NE(nullptr, function.evalBatch) << function.name;

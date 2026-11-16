@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <ranges>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -144,7 +145,8 @@ public:
     int64_t bound;
   };
   static const ValueFunction* find(std::string_view name);
-  static std::span<const ValueFunction> entries();
+  using Entries = std::ranges::join_view<std::span<const std::span<const ValueFunction>>>;
+  static Entries entries();
   static std::string arrayReducerNames();
   static const ValueFunction* findComponent(ValueFunction::Kind kind, std::string_view name);
   static std::string componentNames(ValueFunction::Kind kind);

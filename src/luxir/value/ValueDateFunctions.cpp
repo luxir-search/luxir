@@ -17,10 +17,6 @@ namespace {
 
 using namespace valuefn;
 
-constexpr ValueFunction::Operand DATE_VALUE{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::DATE};
-constexpr ValueFunction::Operand OFFSET{ValueFunction::DateUnit::RAW, false, true};
-
 enum class DatePart : uint8_t {
   YEAR, MONTH, DAY_OF_MONTH, DAY_OF_WEEK, DAY_OF_YEAR, HOUR, MINUTE, SECOND,
   MILLIS, MILLIS_OF_DAY, WEEK_OF_YEAR, QUARTER, EPOCH_MILLIS,
@@ -172,7 +168,7 @@ template <DatePart Part>
 constexpr ValueFunction part(std::string_view name, uint8_t maxArity) {
   using F = DatePartFn<Part>;
   ValueFunction function{ValueOpcode::NONE, name, datePartResolve, F::point, evalFunctionBatch, F::bounds,
-                         F::element, 1, maxArity, {DATE_VALUE, OFFSET}, nullptr, prepareDatePart};
+                         F::element, 1, maxArity, {DATE_VALUE, CONSTANT_RAW}, nullptr, prepareDatePart};
   function.component = name;
   return function;
 }

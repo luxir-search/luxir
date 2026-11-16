@@ -17,7 +17,6 @@ namespace {
 
 using namespace valuefn;
 
-constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
 constexpr double INF = std::numeric_limits<double>::infinity();
 
 // ---------------------------------------------------------------------------
@@ -30,7 +29,8 @@ enum class Curve { INCREASING, DECREASING, COSH, PERIODIC };
 
 // Bounds use the same operation as point, batch, element and bucket kernels.
 // An endpoint outside the domain proves an error only when it is attained.
-template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF, Domain InputDomain = Domain::ALL>
+template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF,
+          Domain InputDomain = Domain::ALL>
 struct Math1 {
   static ValueResult apply(const ValueNode& node, const ValueResult& input, int32_t docid) {
     if (!input.valid) return ValueResult::missing(ValueType::DOUBLE);
@@ -84,9 +84,7 @@ struct Math1 {
     if (lowFailed || highFailed) {
       if ((lowFailed && input.minAttained) || (highFailed && input.maxAttained)) {
         double failed = lowFailed && input.minAttained ? a : b;
-        auto why = std::isnan(failed) ? BoundsInvalidity::DOMAIN_ERROR
-            : failed < 0 ? BoundsInvalidity::NEGATIVE_INFINITY : BoundsInvalidity::POSITIVE_INFINITY;
-        return ValueBounds::invalid(node.type, why, input.mayBeMissing);
+        return constantDouble(node, failed, input.mayBeMissing);
       }
       return ValueBounds::unbounded(node.type, input.mayBeMissing);
     }
@@ -123,7 +121,8 @@ struct Math1 {
   }
 };
 
-template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF, Domain InputDomain = Domain::ALL>
+template <auto Fn, Curve Shape = Curve::INCREASING, double Low = -INF, double High = INF,
+          Domain InputDomain = Domain::ALL>
 constexpr ValueFunction unary(std::string_view name, ValueOpcode opcode = ValueOpcode::NONE) {
   using M = Math1<Fn, Shape, Low, High, InputDomain>;
   return {opcode, name, unaryDouble, M::point, evalFunctionBatch, M::bounds, M::element, 1, 1, {RAW}, M::bucket};
