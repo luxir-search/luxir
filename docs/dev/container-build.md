@@ -111,6 +111,9 @@ On x86, change only the engine target for a separate experiment:
 ```
 
 Dependencies stay at the image baseline. FAISS and OpenBLAS contain runtime-selected kernels.
+The x86-64 OpenBLAS kernels are Nehalem, Sandy Bridge, Haswell, Zen, and the
+AVX-512 cores; kernels for CPUs older than x86-64-v2 are left out, and the
+Bulldozer family runs the Sandy Bridge kernels.
 The OpenBLAS overlay includes C LAPACK with 32-bit LAPACK integers and keeps
 BLAS single-threaded, with locking for concurrent callers. Its ASan build
 excludes AVX-512 OpenBLAS kernels because GCC cannot instrument their inline
