@@ -1089,10 +1089,12 @@ apply to root keys only. Child keys are taken as written. Deleting or replacing
 a root also hides its old child rows. A child view returns its own values under
 local keys; a root's stored projection does not reconstruct nested objects.
 
-Nested bundles are currently skipped by merges. Root-only bundles can still
-merge; an unattainable forced `max_segments` target reports an error. Vector
-ANN overlays can be built on child fields using their qualified physical names,
-for example `vec.lines_nested.embedding_v`.
+Segments with nested rows merge like any others, and the child rows of
+deleted roots are dropped with them. A merge level counts a segment's largest
+row space. A segment is left out of a merge that would take one row space past
+the per-segment row limit; that check counts physical rows, including those of
+deleted roots. Vector ANN overlays can be built on child fields using their
+qualified physical names, for example `vec.lines_nested.embedding_v`.
 
 Dots separate path components. Each component starts with an ASCII letter
 and contains letters, digits or underscores. A physical name, including
