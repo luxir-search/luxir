@@ -47,34 +47,12 @@ struct ValueFixture {
   }
 };
 
-// The PR's specialized unary dispatch, measured against the core opcode
-// dispatch with identical operations and operands. Only the root point kernel
-// changes; this is an implementation experiment, not a public function.
-template <double (*Fn)(double)>
-ValueResult specializedUnary(BoundValueProgram& program, const ValueNode& node,
-                              int32_t docid, float score) {
-  ValueResult input = program.evalNode(node.children[0], docid, score);
-  if (!input.valid) return ValueResult::missing(node.type);
-  if (valueArray(input.type)) return ValueResult::arrayValue(
-      node.type, valuefn::nodeIndex(program, node), docid, score, input.array.size);
-  double value = Fn(valuefn::numberOf(input));
-  if (!std::isfinite(value)) valuefn::runtimeInvalid(node, docid, "produced NaN or infinity");
-  return ValueResult::floating(value);
-}
-
-void BM_ValuePoint(benchmark::State& state, const char* expression,
-                    ValueFunction::EvalPoint alternative = nullptr, bool batch = false) {
+void BM_ValuePoint(benchmark::State& state, const char* expression, bool batch = false) {
   ValueFixture data;
   tbb::global_control serial{tbb::global_control::max_allowed_parallelism, 1};
   google::protobuf::Arena arena;
   ValueExprOptions options{data.helper.collection().getSchema().get(), {}};
   auto* program = ValueExprParser(options, arena).parse(expression);
-  ValueFunction function;
-  if (alternative != nullptr) {
-    function = *program->root().function;
-    function.evalPoint = alternative;
-    program->nodes[program->rootNode].function = &function;
-  }
   MemPool pool;
   auto* bound = program->bind(pool, data.reader->segments()[0], program->resolveFields(pool, *data.reader));
   if (!bound->evalPoint(0, 0).valid) {
@@ -119,19 +97,15 @@ void BM_ValueRequest(benchmark::State& state, const char* expression, bool resco
 }
 
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, sqrt, "sqrt(x_d)");
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, sqrt_specialized, "sqrt(x_d)", specializedUnary<std::sqrt>);
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, log, "log(x_d)");
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, log_specialized, "log(x_d)", specializedUnary<std::log>);
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, floor, "floor(x_d)");
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, floor_specialized, "floor(x_d)", specializedUnary<std::floor>);
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, exp, "exp(x_d)");
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, exp_specialized, "exp(x_d)", specializedUnary<std::exp>);
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, ceil, "ceil(x_d)");
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, arithmetic, "(x_d * 1.1 + 2) * 0.9 + x_d");
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, shared, "let(v, sqrt(x_d), v * v + v)");
 LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, array, "sum(sqrt(xs_ds))");
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, batch_sqrt, "sqrt(x_d)", nullptr, true);
-LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, batch_floor, "floor(x_d)", nullptr, true);
+LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, batch_sqrt, "sqrt(x_d)", true);
+LUXIR_BENCHMARK_CAPTURE(BM_ValuePoint, batch_floor, "floor(x_d)", true);
 LUXIR_BENCHMARK_CAPTURE(BM_ValueRequest, sort_sqrt, "sqrt(x_d)", false);
 LUXIR_BENCHMARK_CAPTURE(BM_ValueRequest, sort_floor, "floor(x_d)", false);
 LUXIR_BENCHMARK_CAPTURE(BM_ValueRequest, rescore_sqrt, "sqrt(x_d)", true);
