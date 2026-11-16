@@ -1226,7 +1226,8 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
   if ((*root.primary)->type() == FieldType::NESTED
-      && op != OpClass::PRIMARY && op != OpClass::SEARCH && op != OpClass::EXISTS) {
+      && op != OpClass::PRIMARY && op != OpClass::SEARCH && op != OpClass::EXISTS
+      && op != OpClass::RETRIEVE) {
     throw RequestError("Nested path has no scalar value: " + std::string(rootName), "invalid_field");
   }
   std::string_view label = "self";

@@ -2394,6 +2394,8 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  auto originalProjection = nested_test::retrieval(*source);
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower));
   auto replica = follower->getCollection("main");
   auto old = replica->getReaderManager().getReader();
   ASSERT_EQ(2u, old->segments().size());
@@ -2409,6 +2411,9 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*source, leaderOld));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
+  EXPECT_EQ(nested_test::retrieval(*source), nested_test::retrieval(*follower));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
   auto before = replica->getShard()->getSnapshots().snapshot();
   {
@@ -2438,6 +2443,9 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().first);
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().second);
+  auto deletedProjection = nested_test::retrieval(*source);
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
   EXPECT_EQ(after->files, replica->getShard()->getSnapshots().snapshot()->files);
@@ -2465,6 +2473,8 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   replica.reset(); before.reset(); after.reset();
   stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*source));
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
   for (auto* node : {source.get(), follower.get()}) {
     EXPECT_EQ(FieldType::NESTED, node->getCollection("main")->getSchema()->resolveFor("items", OpClass::PRIMARY).fieldType->type());
     auto req = localReq(node->getSearchEngine());

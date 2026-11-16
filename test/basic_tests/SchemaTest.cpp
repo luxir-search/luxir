@@ -2272,6 +2272,11 @@ TEST_F(SchemaTest, nestedSchemaHistoryPersistsAndReportsStructuralPaths) {
   ASSERT_TRUE(api::read_json(def, R"({"fields":{"items":"nested","items.color_s":"string"}})", arena));
   auto first = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
   EXPECT_EQ("\"nested\"", first->signatures().at("items").properties.at("type"));
+  EXPECT_TRUE(first->isNestedPath("items"));
+  EXPECT_TRUE(first->isNestedPath("lines_nested"));
+  EXPECT_FALSE(first->isNestedPath("items.color_s"));
+  EXPECT_FALSE(first->isNestedPath("unknown"));
+  EXPECT_EQ(FieldType::NESTED, first->resolveFor("items", OpClass::RETRIEVE).fieldType->type());
   ASSERT_TRUE(api::read_json(def, R"({"fields":{"items.parts_nested.weight_i":"int"}})", arena));
   auto next = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
   EXPECT_EQ(first->introduction("items"), next->introduction("items"));

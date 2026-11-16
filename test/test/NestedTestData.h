@@ -83,6 +83,35 @@ inline Counts local(LuxirNode& node, std::shared_ptr<IndexReader> reader = {}) {
   return counts;
 }
 
+inline constexpr std::string_view RETRIEVAL_QUERY = R"({"ops":{
+  "q":{"top_docs":{"query":"id:b","fields":["id","items"],"document_format":"rows"}},
+  "p":{"domain":{"to":"items.parts"},"top_docs":{"query":"material:steel","fields":["/id","../color"],"document_format":"rows"}}
+}})";
+
+inline std::vector<std::string> captureRetrieval(const api::SearchResponse& response) {
+  std::vector<std::string> values;
+  EXPECT_FALSE(response.error);
+  if (response.error) return values;
+  const auto& row = response.ops.at("q")->docList()->docs[0];
+  const auto& item = std::get<api::Map>(std::get<api::ArrVal>(row.fields.at("items")->kind).v[0].kind);
+  const auto& part = std::get<api::Map>(std::get<api::ArrVal>(item.fields.at("parts")->kind).v[0].kind);
+  values.push_back(std::string(row.fields.at("id")->asString()) + ':'
+      + std::string(item.fields.at("color")->asString()) + ':' + std::string(part.fields.at("material")->asString()));
+  for (const auto& owner : response.ops.at("p")->docList()->docs) {
+    values.push_back(std::string(owner.fields.at("/id")->asString()) + ':' + std::string(owner.fields.at("../color")->asString()));
+  }
+  std::sort(values.begin(), values.end());
+  return values;
+}
+
+inline std::vector<std::string> retrieval(LuxirNode& node, std::shared_ptr<IndexReader> reader = {}) {
+  auto req = localReq(node.getSearchEngine());
+  EXPECT_TRUE(api::read_json(req->rawRequest(), RETRIEVAL_QUERY, req->mr));
+  if (reader) req->execute(std::move(reader), false); else req->execute(1);
+  EXPECT_OK(req);
+  return captureRetrieval(req->responses.back()->proto);
+}
+
 inline const Counts INITIAL{{"notes",2},{"part_notes",2},{"implicit",2},{"group",1},{"explicit",2},{"exists",3},
     {"deep",2},{"deep_group",2},{"rows",4},{"rows.up",3},{"parts",3},
     {"parts.up",3},{"parts.root",2},{"parts.two",2}};

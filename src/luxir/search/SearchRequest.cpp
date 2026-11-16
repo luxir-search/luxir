@@ -14,6 +14,7 @@ namespace luxir {
 
 const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path) {
   if (path == reader->path()) return reader;
+  const std::lock_guard lock(mutex);
   if (!scopedStates) scopedStates = std::make_unique<std::map<std::string, ScopedState, std::less<>>>();
   auto found = scopedStates->find(path);
   if (found != scopedStates->end()) return found->second.reader;
@@ -26,6 +27,7 @@ const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path
 const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader& scoped) {
   if (&scoped == reader.get()) return filterUses;
   pinView(scoped.path());
+  const std::lock_guard lock(mutex);
   return scopedStates->find(scoped.path())->second.uses;
 }
 
@@ -34,6 +36,7 @@ RowRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& on
   if (pinView(many.path()).get() != &many || pinView(one.path()).get() != &one) {
     throw RequestError("relation views must belong to this request");
   }
+  const std::lock_guard lock(mutex);
   auto& state = scopedStates->find(&many == reader.get() ? one.path() : many.path())->second;
   auto key = std::pair{std::string(many.path()), std::string(one.path())};
   auto found = state.relations.find(key);

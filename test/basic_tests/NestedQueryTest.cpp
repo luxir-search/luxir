@@ -252,15 +252,13 @@ TEST_F(NestedQueryTest, invalidDomainAndNonDescendantNamesAreRejected) {
 }
 
 TEST_F(NestedQueryTest, ancestorConsumersRequireADomainAndLocalConsumersWork) {
-  for (int32_t kind = 0; kind < 7; kind++) {
+  for (int32_t kind : {0, 1, 2, 3, 6}) {
     auto req = localReq(helper.getSearchEngine());
     auto& op = req->topDocs().allQuery().limit(0);
     if (kind == 0) qb::sort(op, "items.price", qb::ASC);
     if (kind == 1) req->facet("f", "items.color");
     if (kind == 2) req->expr("e", "sum(items.price)");
     if (kind == 3) op.rawQuery() = qb::rescore(req->mr, qb::all(), "col(\"items.price\")");
-    if (kind == 4) op.fields({"items.color"});
-    if (kind == 5) op.fields({"items.*"});
     if (kind == 6) {
       ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"ops":{"q":{"top_docs":{"collapse":{"field":["items.color"]}}}}})", req->mr));
     }
