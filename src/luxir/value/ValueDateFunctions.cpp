@@ -159,7 +159,7 @@ struct DatePartFn {
     if constexpr (range.low == INT64_MIN) {
       return ValueBounds::unbounded(node.type, args[0].mayBeMissing);
     } else {
-      ValueBounds out = ValueBounds::integer(range.low, range.high, args[0].mayBeMissing);
+      ValueBounds out = ValueBounds::integerRange(range.low, range.high, args[0].mayBeMissing);
       out.type = node.type;
       out.minAttained = false;
       out.maxAttained = false;

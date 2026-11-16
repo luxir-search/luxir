@@ -139,7 +139,7 @@ inline ResolvedValue unaryDouble(std::span<const ResolvedValue> args) {
 // operands.
 inline ValueBounds boundedResult(const ValueNode& node, double low, double high,
                                  bool mayBeMissing, bool alwaysMissing = false) {
-  ValueBounds out = ValueBounds::floating(low, high, mayBeMissing);
+  ValueBounds out = ValueBounds::floatingRange(low, high, mayBeMissing);
   out.type = node.type;
   out.alwaysMissing = alwaysMissing;
   out.minAttained = false;
@@ -168,13 +168,15 @@ inline ValueBounds constantDouble(const ValueNode& node, double value, bool mayB
         value < 0 ? BoundsInvalidity::NEGATIVE_INFINITY : BoundsInvalidity::POSITIVE_INFINITY,
         mayBeMissing);
   }
-  ValueBounds out = ValueBounds::floating(value, value, mayBeMissing);
+  ValueBounds out = mayBeMissing ? ValueBounds::floatingRange(value, value, true)
+      : ValueBounds::floatingValue(value);
   out.type = node.type;
   return out;
 }
 
 inline ValueBounds constantInteger(const ValueNode& node, int64_t value, bool mayBeMissing) {
-  ValueBounds out = ValueBounds::integer(value, value, mayBeMissing);
+  ValueBounds out = mayBeMissing ? ValueBounds::integerRange(value, value, true)
+      : ValueBounds::integerValue(value);
   out.type = node.type;
   return out;
 }

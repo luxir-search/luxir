@@ -22,6 +22,7 @@
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
@@ -565,7 +566,7 @@ TEST_F(ValueScriptingTest, geoBoxTestsEncodedCoordinatesAndWrapsTheDateline) {
   expectValues("geo_in_box(locs_p, 50, -1, 52, 1)", {1, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectValues("geo_in_box(locs_p, 0, 0, 1, 1)", {0, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectValues("geo_in_box(loc_p, 40, -75, 41, -73) ? 2.5 : 1", {2.5, 1, std::nullopt, 1, std::nullopt});
-  expectError("geo_in_box(loc_p, 41, -75, 40, -73)", "min_lat");
+  expectError("geo_in_box(loc_p, 41, -75, 40, -73)", "minimum latitude");
   expectError("geo_in_box(loc_p, 0, 0, 91, 0)", "latitude");
   expectError("geo_in_box(loc_p, 0, -181, 1, 0)", "longitude");
   expectError("geo_in_box(loc_p, x_i, 0, 1, 0)", "constant");
@@ -755,7 +756,7 @@ TEST_F(ValueScriptingTest, sharedLetChainsStayLinear) {
   EXPECT_FALSE(program->structurallyEqual(*parse(sharedLetChain("def(y_i, 0)", 40))));
   auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
   EXPECT_TRUE(bound->firstUnboundedNode().empty());
-  EXPECT_NO_THROW(bound->boundsForScore(ValueBounds::floating(0, 10)));
+  EXPECT_NO_THROW(bound->boundsForScore(ValueBounds::floatingRange(0, 10)));
   auto scored = parse(sharedLetChain("score", 40));
   auto* scoredBound = scored->bind(pool, reader->segments()[0], scored->resolveFields(pool, *reader));
   EXPECT_TRUE(scored->needsScore);
@@ -1017,5 +1018,63 @@ TEST_F(ValueScriptingTest, perDocumentOnlyFunctionsAreRejectedOnBuckets) {
     EXPECT_FALSE(bad->ok());
     EXPECT_NE(std::string(bad->errorMsg()).find("per-document value function"), std::string::npos)
         << bad->errorMsg();
+  }
+}
+
+TEST_F(ValueScriptingTest, geoBoxesMatchTheActualQueryAtEncodedEdges) {
+  CollectionHelper boxes("box_function_test");
+  SchemaBuilder schema;
+  auto& loc = schema.field("loc_p");
+  loc.type = api::FieldDef::FieldClass::GEO_POINT;
+  loc.index = api::FieldDef::IndexMode::RANGE;
+  loc.column = true;
+  loc.multi = api::FieldDef::MultiMode::DEFAULT;
+  schema.set(boxes.collection());
+  std::vector<std::string> points{"40.7128,-74.006", "-33,175", "-90,-180", "90,180",
+                                 "0,-180", "0,179.99", "0,-179.99", "0,0", "0,0.00000001"};
+  for (size_t i = 0; i < points.size(); i++) {
+    boxes.index(flatdoc("id_s", std::to_string(i), "loc_p", points[i]), UpdateMessage::NO_COMMIT);
+  }
+  boxes.index(flatdoc("id_s", "9", "loc_p", vecs("0,175", "0,-175")), UpdateMessage::COMMIT);
+  auto r = boxes.getIndexWriter()->snapshots.readers.getReader();
+  for (auto box : {geo::BoundingBox{40, 41, -74.006, -74.006}, {-1, 1, 1e-8, 2e-8},
+                   {90, 90, -180, 180}, {-90, 90, 180, 180}, {-90, 90, 180, -170},
+                   {-90, 90, 170, -170}, {-90, 90, -180, 180}, {1e-8, 2e-8, -180, 180},
+                   {0, 0, 0, 0}, {-90, 90, 179.999999999, 180}}) {
+    auto req = localReq(boxes.getSearchEngine());
+    auto& top = req->collection("box_function_test").topDocs("q").fields({"id_s"}).limit(-1);
+    top.rawQuery() = qb::geoBox(top.mr(), "loc_p", box.minLat, box.maxLat, box.minLon, box.maxLon);
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    std::array<bool, 10> expected{};
+    for (const auto& doc : req->getDocs()) {
+      expected[(size_t)std::stoi(std::get<std::string>(*find(doc, "id_s")))] = true;
+    }
+    std::string expression = fmt::format("geo_in_box(loc_p, {:.17g}, {:.17g}, {:.17g}, {:.17g})",
+                                         box.minLat, box.minLon, box.maxLat, box.maxLon);
+    ValueExprOptions options{boxes.collection().getSchema().get(), {}};
+    auto* program = ValueExprParser(options, *arena).parse(expression);
+    auto* bound = program->bind(pool, r->segments()[0], program->resolveFields(pool, *r));
+    for (int32_t doc = 0; doc < 10; doc++) {
+      EXPECT_EQ(expected[doc], bound->evalPoint(doc, 0).intValue != 0) << expression << " doc " << doc;
+    }
+  }
+}
+
+TEST_F(ValueScriptingTest, possibleGeoBoundsDoNotProveDomainErrors) {
+  for (auto [expression, doc] : {std::pair{"sqrt(geo_lat(loc_p))", 0},
+                                 {"log(geo_lon(loc_p))", 1}, {"log1p(geo_lat(loc_p))", 0},
+                                 {"log(geo_in_box(loc_p, 40, -75, 41, -73))", 0}}) {
+    auto* program = parse(expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_TRUE(bound->evalPoint(doc, 0).valid) << expression;
+  }
+}
+
+TEST_F(ValueScriptingTest, distanceFunctionsValidateConstantCoordinates) {
+  for (auto function : {"arc_distance", "haversin", "plane_distance", "geo_bearing"}) {
+    for (auto args : {"91, 0, 0, 0", "0, 181, 0, 0", "0, 0, -91, 0", "0, 0, 0, -181"}) {
+      EXPECT_THROW(parse(fmt::format("{}({})", function, args)), std::runtime_error);
+    }
   }
 }

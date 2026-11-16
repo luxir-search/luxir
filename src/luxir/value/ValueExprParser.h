@@ -52,9 +52,9 @@ class ValueExprParser {
       std::optional<ValueBounds> result = literal;
       if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
         if (node.type == ValueType::INT64) {
-          result = ValueBounds::integer(node.intValue, node.intValue);
+          result = ValueBounds::integerValue(node.intValue);
         } else if (node.type == ValueType::DOUBLE) {
-          result = ValueBounds::floating(node.doubleValue, node.doubleValue);
+          result = ValueBounds::floatingValue(node.doubleValue);
         }
       } else if (node.kind == ValueNodeKind::FUNCTION) {
         std::array<ValueBounds, VALUE_MAX_ARITY> children;

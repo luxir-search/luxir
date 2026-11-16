@@ -441,7 +441,7 @@ TEST_F(ValueExprKernelTest, lazyInvaliditySurvivesUntilItsBranchIsSelected) {
     auto* program = parseValue(memory, *schema, expression);
     auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
     EXPECT_EQ("score", bound->firstUnboundedNode());
-    auto bounds = bound->boundsForScore(ValueBounds::floating(2, 3));
+    auto bounds = bound->boundsForScore(ValueBounds::floatingRange(2, 3));
     EXPECT_EQ(BoundsCertainty::BOUNDED, bounds.certainty);
     EXPECT_TRUE(bound->firstUnboundedNode().empty());
     bound->boundsForScore(ValueBounds::unbounded(ValueType::DOUBLE));
@@ -449,9 +449,9 @@ TEST_F(ValueExprKernelTest, lazyInvaliditySurvivesUntilItsBranchIsSelected) {
   }
   auto* logarithm = parseValue(memory, *schema, "log(score)");
   auto* bound = logarithm->bind(pool, reader->segments()[0], logarithm->resolveFields(pool, *reader));
-  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floating(2, 3)).certainty);
-  EXPECT_THROW(bound->boundsForScore(ValueBounds::floating(-1, -1)), ValueEvaluationError);
-  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floating(2, 3)).certainty);
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floatingRange(2, 3)).certainty);
+  EXPECT_THROW(bound->boundsForScore(ValueBounds::floatingValue(-1)), ValueEvaluationError);
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floatingRange(2, 3)).certainty);
 }
 
 TEST_F(ValueExprKernelTest, strictInvalidityKeepsTheOriginalDiagnostic) {
@@ -486,7 +486,7 @@ TEST_F(ValueExprKernelTest, strictInvalidityKeepsTheOriginalDiagnostic) {
       ValueNode node;
       node.type = ValueType::DOUBLE;
       std::array<ValueBounds, VALUE_MAX_ARITY> args;
-      args.fill(ValueBounds::floating(1, 1));
+      args.fill(ValueBounds::floatingValue(1));
       args[operand] = ValueBounds::invalid(ValueType::DOUBLE, BoundsInvalidity::DOMAIN_ERROR);
       args[operand].invalidNode = 42;
       auto result = function.bounds(node, {args.data(), function.maxArity});
@@ -508,7 +508,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   ValueProgram* program = parseValue(memory, *schema, "add(score,x_i)");
   auto bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, bound->bounds(program->rootNode).certainty);
-  ValueBounds scoreInterval = ValueBounds::floating(-2.0, 3.0);
+  ValueBounds scoreInterval = ValueBounds::floatingRange(-2.0, 3.0);
   scoreInterval.minAttained = false;
   scoreInterval.maxAttained = false;
   const ValueBounds& composed = bound->boundsForScore(scoreInterval);
@@ -524,7 +524,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   auto squareRootBound = squareRoot->bind(pool, segment, squareRoot->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             squareRootBound->bounds(squareRoot->rootNode).certainty);
-  ValueBounds nonNegativeScore = ValueBounds::floating(0.0, 4.0);
+  ValueBounds nonNegativeScore = ValueBounds::floatingRange(0.0, 4.0);
   nonNegativeScore.minAttained = false;
   nonNegativeScore.maxAttained = false;
   const ValueBounds& squareRootBounds =
@@ -532,7 +532,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   ASSERT_EQ(BoundsCertainty::BOUNDED, squareRootBounds.certainty);
   EXPECT_DOUBLE_EQ(0.0, squareRootBounds.doubleMin);
   EXPECT_DOUBLE_EQ(2.0, squareRootBounds.doubleMax);
-  ValueBounds negativeScore = ValueBounds::floating(-1.0, -1.0);
+  ValueBounds negativeScore = ValueBounds::floatingValue(-1.0);
   EXPECT_THROW(squareRootBound->boundsForScore(negativeScore),
                std::runtime_error);
   EXPECT_THROW(squareRootBound->evalPoint(0, -1.0f), std::runtime_error);
@@ -553,7 +553,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   logNode.type = ValueType::DOUBLE;
   logNode.opcode = ValueOpcode::LOG;
   logNode.text = "log";
-  std::array<ValueBounds, 1> logInput{ValueBounds::integer(0, 10)};
+  std::array<ValueBounds, 1> logInput{ValueBounds::observedInteger(0, 10)};
   ValueBounds invalid = logarithm->boundsPropagate(logNode, logInput);
   EXPECT_EQ(BoundsCertainty::INVALID, invalid.certainty);
   EXPECT_EQ(BoundsInvalidity::DOMAIN_ERROR, invalid.invalidity);
@@ -576,7 +576,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   multiplyNode.opcode = ValueOpcode::MUL;
   multiplyNode.text = "mul";
   std::array<ValueBounds, 2> factors{
-      ValueBounds::floating(1e308, 1e308), ValueBounds::floating(2.0, 2.0)};
+      ValueBounds::floatingValue(1e308), ValueBounds::floatingValue(2.0)};
   ValueBounds infinite = multiply->boundsPropagate(multiplyNode, factors);
   EXPECT_EQ(BoundsCertainty::INVALID, infinite.certainty);
   EXPECT_EQ(BoundsInvalidity::POSITIVE_INFINITY, infinite.invalidity);
@@ -778,4 +778,27 @@ TEST_F(ValueExprKernelTest, nativeDateUnitUsesExistingScalarArrayBatchAndBoundsL
   EXPECT_EQ(ValueType::DOUBLE, average->root().type);
   auto* avg = average->bind(pool, segment, average->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(2.5, avg->evalPoint(0, 0).doubleValue);
+}
+
+TEST(ValueBoundsTest, rangesRequireAnExplicitAttainmentProof) {
+  EXPECT_FALSE(ValueBounds::integerRange(0, 1).minAttained);
+  EXPECT_FALSE(ValueBounds::floatingRange(-90, 90).maxAttained);
+  EXPECT_TRUE(ValueBounds::integerValue(0).minAttained);
+  EXPECT_TRUE(ValueBounds::observedFloating(-1, 1, true).maxAttained);
+}
+
+TEST_F(ValueExprKernelTest, disjointOperandsDoNotProveOverflow) {
+  CollectionHelper helper;
+  helper.index(flatdoc("left_d", 1e308), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("right_d", 1e308), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto expression : {"left_d * right_d", "pow(left_d, right_d)"}) {
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_FALSE(bound->evalPoint(0, 0).valid);
+    EXPECT_FALSE(bound->evalPoint(1, 0).valid);
+  }
 }

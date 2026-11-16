@@ -977,7 +977,7 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
 ValueBounds promoteBounds(ValueBounds bounds, ValueType type) {
   if (valueDouble(type) && !valueDouble(bounds.type)
       && bounded(bounds)) {
-    ValueBounds promoted = ValueBounds::floating(
+    ValueBounds promoted = ValueBounds::floatingRange(
         (double)bounds.intMin, (double)bounds.intMax, bounds.mayBeMissing);
     promoted.type = type;
     promoted.alwaysMissing = bounds.alwaysMissing;
@@ -1001,28 +1001,36 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   double high = boundMaxAsDouble(input);
   if ((node.opcode == ValueOpcode::NEG || node.opcode == ValueOpcode::ABS)
       && !valueDouble(node.type)) {
-    if (input.intMin == std::numeric_limits<int64_t>::min() && input.minAttained) {
-      return ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW,
-                                  input.mayBeMissing);
+    if (input.intMin == std::numeric_limits<int64_t>::min()) {
+      return input.minAttained
+          ? ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, input.mayBeMissing)
+          : ValueBounds::unbounded(node.type, input.mayBeMissing);
     }
     ValueBounds out;
     if (node.opcode == ValueOpcode::NEG) {
-      out = ValueBounds::integer(-input.intMax, -input.intMin,
+      out = ValueBounds::integerRange(-input.intMax, -input.intMin,
                                  input.mayBeMissing);
     }
-    else if (input.intMin >= 0) out = ValueBounds::integer(input.intMin, input.intMax,
+    else if (input.intMin >= 0) out = ValueBounds::integerRange(input.intMin, input.intMax,
                                                            input.mayBeMissing);
-    else if (input.intMax <= 0) out = ValueBounds::integer(-input.intMax, -input.intMin,
+    else if (input.intMax <= 0) out = ValueBounds::integerRange(-input.intMax, -input.intMin,
                                                            input.mayBeMissing);
-    else out = ValueBounds::integer(0, std::max(-input.intMin, input.intMax),
+    else out = ValueBounds::integerRange(0, std::max(-input.intMin, input.intMax),
                                     input.mayBeMissing);
     out.type = node.type;
     if (node.opcode == ValueOpcode::NEG) {
       out.minAttained = input.maxAttained;
       out.maxAttained = input.minAttained;
-    } else if (input.intMin < 0 && input.intMax > 0) {
+    } else if (input.intMin >= 0) {
+      out.minAttained = input.minAttained;
+      out.maxAttained = input.maxAttained;
+    } else if (input.intMax <= 0) {
+      out.minAttained = input.maxAttained;
+      out.maxAttained = input.minAttained;
+    } else {
       out.minAttained = false;
-      out.maxAttained = input.minAttained || input.maxAttained;
+      out.maxAttained = (-input.intMin == out.intMax && input.minAttained)
+          || (input.intMax == out.intMax && input.maxAttained);
     }
     return out;
   }
@@ -1109,19 +1117,39 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     }
     return ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
-  ValueBounds out = ValueBounds::floating(outLow, outHigh, input.mayBeMissing);
+  ValueBounds out = ValueBounds::floatingRange(outLow, outHigh, input.mayBeMissing);
   out.type = node.type;
   if (node.opcode == ValueOpcode::NEG) {
     out.minAttained = input.maxAttained;
     out.maxAttained = input.minAttained;
+  } else if (node.opcode == ValueOpcode::ABS && high <= 0.0) {
+    out.minAttained = input.maxAttained;
+    out.maxAttained = input.minAttained;
   } else if (node.opcode == ValueOpcode::ABS && low < 0.0 && high > 0.0) {
     out.minAttained = false;
-    out.maxAttained = input.minAttained || input.maxAttained;
+    out.maxAttained = (std::abs(low) == outHigh && input.minAttained)
+        || (std::abs(high) == outHigh && input.maxAttained);
   } else {
     out.minAttained = input.minAttained;
     out.maxAttained = input.maxAttained;
   }
   return out;
+}
+
+template <class T, class Eval>
+void attainBinaryBounds(ValueBounds& out, const ValueBounds& left, const ValueBounds& right,
+                        T amin, T amax, T bmin, T bmax, T low, T high, Eval eval) {
+  bool fixed = (amin == amax && !left.mayBeMissing) || (bmin == bmax && !right.mayBeMissing);
+  if (!fixed) return;
+  std::array<T, 2> a{amin, amax}, b{bmin, bmax};
+  std::array<bool, 2> aPresent{left.minAttained, left.maxAttained};
+  std::array<bool, 2> bPresent{right.minAttained, right.maxAttained};
+  for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+    if (!aPresent[i] || !bPresent[j]) continue;
+    auto value = eval(a[i], b[j]);
+    out.minAttained = out.minAttained || value == low;
+    out.maxAttained = out.maxAttained || value == high;
+  }
 }
 
 ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
@@ -1194,16 +1222,24 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     }
     if (low < std::numeric_limits<int64_t>::min() ||
         high > std::numeric_limits<int64_t>::max()) {
-      bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained;
+      bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained
+          && (!left.mayBeMissing || !right.mayBeMissing);
       return exact ? ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, mayMissing)
                    : ValueBounds::unbounded(node.type, mayMissing);
     }
-    ValueBounds out = ValueBounds::integer((int64_t)low, (int64_t)high, mayMissing);
+    ValueBounds out = ValueBounds::integerRange((int64_t)low, (int64_t)high, mayMissing);
     out.type = node.type;
-    bool leftFixed = amin == amax && !left.mayBeMissing;
-    bool rightFixed = bmin == bmax && !right.mayBeMissing;
-    out.minAttained = left.minAttained && right.minAttained && (leftFixed || rightFixed);
-    out.maxAttained = left.maxAttained && right.maxAttained && (leftFixed || rightFixed);
+    attainBinaryBounds(out, left, right, (__int128)amin, (__int128)amax, (__int128)bmin,
+                       (__int128)bmax, low, high, [&](auto a, auto b) {
+      switch (node.opcode) {
+        case ValueOpcode::ADD: return a + b;
+        case ValueOpcode::SUB: return a - b;
+        case ValueOpcode::MUL: return a * b;
+        case ValueOpcode::MIN: return std::min(a, b);
+        case ValueOpcode::MAX: return std::max(a, b);
+        default: throw std::logic_error("invalid integer bounds operation");
+      }
+    });
     return out;
   }
 
@@ -1280,16 +1316,24 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
   if ((!std::isfinite(low) || !std::isfinite(high))
       && node.opcode != ValueOpcode::MIN
       && node.opcode != ValueOpcode::MAX) {
-    bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained;
+    bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained
+          && (!left.mayBeMissing || !right.mayBeMissing);
     return exact ? ValueBounds::invalid(node.type, BoundsInvalidity::POSITIVE_INFINITY, mayMissing)
                  : ValueBounds::unbounded(node.type, mayMissing);
   }
-  ValueBounds out = ValueBounds::floating(low, high, mayMissing);
+  ValueBounds out = ValueBounds::floatingRange(low, high, mayMissing);
   out.type = node.type;
-  bool leftFixed = amin == amax && !left.mayBeMissing;
-  bool rightFixed = bmin == bmax && !right.mayBeMissing;
-  out.minAttained = left.minAttained && right.minAttained && (leftFixed || rightFixed);
-  out.maxAttained = left.maxAttained && right.maxAttained && (leftFixed || rightFixed);
+  attainBinaryBounds(out, left, right, amin, amax, bmin, bmax, low, high, [&](double a, double b) {
+    switch (node.opcode) {
+      case ValueOpcode::ADD: return a + b;
+      case ValueOpcode::SUB: return a - b;
+      case ValueOpcode::MUL: return a * b;
+      case ValueOpcode::DIV: return a / b;
+      case ValueOpcode::MIN: return std::min(a, b);
+      case ValueOpcode::MAX: return std::max(a, b);
+      default: throw std::logic_error("invalid floating bounds operation");
+    }
+  });
   return out;
 }
 
@@ -1312,15 +1356,19 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
       return ValueBounds::unbounded(node.type, mayMissing, alwaysMissing);
     }
     if (valueDouble(node.type)) {
-      ValueBounds out = ValueBounds::floating(
+      ValueBounds out = ValueBounds::floatingRange(
           std::min(boundMinAsDouble(first), boundMinAsDouble(fallback)),
           std::max(boundMaxAsDouble(first), boundMaxAsDouble(fallback)), mayMissing);
       out.type = node.type;
+      out.minAttained = out.doubleMin == boundMinAsDouble(first) && first.minAttained;
+      out.maxAttained = out.doubleMax == boundMaxAsDouble(first) && first.maxAttained;
       return out;
     }
-    ValueBounds out = ValueBounds::integer(std::min(first.intMin, fallback.intMin),
+    ValueBounds out = ValueBounds::integerRange(std::min(first.intMin, fallback.intMin),
                                            std::max(first.intMax, fallback.intMax), mayMissing);
     out.type = node.type;
+    out.minAttained = out.intMin == first.intMin && first.minAttained;
+    out.maxAttained = out.intMax == first.intMax && first.maxAttained;
     return out;
   }
   if (unaryOpcode(node.opcode)) {
@@ -1329,6 +1377,9 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
   if (reducerOpcode(node.opcode) && node.childCount == 1) {
     ValueBounds out = args[0];
     out.type = node.type;
+    bool oneValue = singleton(args[0]);
+    out.minAttained = args[0].minAttained && (node.opcode == ValueOpcode::MIN || oneValue);
+    out.maxAttained = args[0].maxAttained && (node.opcode == ValueOpcode::MAX || oneValue);
     if (node.opcode == ValueOpcode::AVG) {
       if (bounded(out)) {
         out.doubleMin = boundMinAsDouble(args[0]);
@@ -1350,15 +1401,15 @@ ValueBounds sumBounds(const ValueNode& node,
 ValueBounds countBounds(const ValueNode& node,
                         std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
-  if (args[0].alwaysMissing) return ValueBounds::integer(0, 0);
+  if (args[0].alwaysMissing) return ValueBounds::integerValue(0);
   if (!valueArray(args[0].type) && args[0].type != ValueType::COLUMN_ONLY) {
-    if (!args[0].mayBeMissing) return ValueBounds::integer(1, 1);
-    ValueBounds out = ValueBounds::integer(0, 1);
+    if (!args[0].mayBeMissing) return ValueBounds::integerValue(1);
+    ValueBounds out = ValueBounds::integerRange(0, 1);
     out.minAttained = false;
     out.maxAttained = false;
     return out;
   }
-  ValueBounds out = ValueBounds::integer(
+  ValueBounds out = ValueBounds::integerRange(
       0, std::numeric_limits<int64_t>::max());
   out.minAttained = false;
   out.maxAttained = false;
@@ -1377,8 +1428,11 @@ int boundsTruth(const ValueBounds& bounds) {
 }
 
 ValueBounds truthBounds(int truth, bool mayBeMissing) {
-  if (truth >= 0) return ValueBounds::integer(truth, truth, mayBeMissing);
-  ValueBounds out = ValueBounds::integer(0, 1, mayBeMissing);
+  if (truth >= 0) {
+    auto out = mayBeMissing ? ValueBounds::integerRange(truth, truth, true) : ValueBounds::integerValue(truth);
+    return out;
+  }
+  ValueBounds out = ValueBounds::integerRange(0, 1, mayBeMissing);
   out.minAttained = false;
   out.maxAttained = false;
   return out;
@@ -1493,7 +1547,7 @@ ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) 
     return ValueBounds::unbounded(node.type, mayMissing);
   }
   if (!std::isfinite(low) || !std::isfinite(high)) {
-    if (exact && base.minAttained && exponent.minAttained) {
+    if (exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing)) {
       return ValueBounds::invalid(
           node.type, std::isnan(low) ? BoundsInvalidity::NAN_VALUE
                                      : BoundsInvalidity::POSITIVE_INFINITY,
@@ -1501,9 +1555,9 @@ ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) 
     }
     return ValueBounds::unbounded(node.type, mayMissing);
   }
-  ValueBounds out = ValueBounds::floating(low, high, mayMissing);
+  ValueBounds out = ValueBounds::floatingRange(low, high, mayMissing);
   out.type = node.type;
-  out.minAttained = exact && base.minAttained && exponent.minAttained;
+  out.minAttained = exact && base.minAttained && exponent.minAttained && (!base.mayBeMissing || !exponent.mayBeMissing);
   out.maxAttained = out.minAttained;
   return out;
 }
@@ -1515,6 +1569,7 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   auto branch = [&](const ValueBounds& bounds) {
     ValueBounds out = promoteBounds(lazyOperand(bounds), node.type);
     out.mayBeMissing = out.mayBeMissing || condition.mayBeMissing;
+    if (condition.mayBeMissing) out.minAttained = out.maxAttained = false;
     return out;
   };
   int truth = boundsTruth(condition);
@@ -1528,6 +1583,7 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (then.alwaysMissing || otherwise.alwaysMissing) {
     ValueBounds out = then.alwaysMissing ? otherwise : then;
     out.mayBeMissing = true;
+    out.minAttained = out.maxAttained = false;
     return out;
   }
   bool mayMissing = then.mayBeMissing || otherwise.mayBeMissing;
@@ -1535,9 +1591,9 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
     return ValueBounds::unbounded(node.type, mayMissing);
   }
   ValueBounds out = valueDouble(node.type)
-      ? ValueBounds::floating(std::min(then.doubleMin, otherwise.doubleMin),
+      ? ValueBounds::floatingRange(std::min(then.doubleMin, otherwise.doubleMin),
                               std::max(then.doubleMax, otherwise.doubleMax), mayMissing)
-      : ValueBounds::integer(std::min(then.intMin, otherwise.intMin),
+      : ValueBounds::integerRange(std::min(then.intMin, otherwise.intMin),
                              std::max(then.intMax, otherwise.intMax), mayMissing);
   out.type = node.type;
   out.minAttained = false;
@@ -1552,7 +1608,7 @@ ValueBounds randomBounds(const ValueNode& node, std::span<const ValueBounds> arg
     if (args[1].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
     mayMissing = args[1].mayBeMissing;
   }
-  ValueBounds out = ValueBounds::floating(0.0, 1.0 - 0x1p-24, mayMissing);
+  ValueBounds out = ValueBounds::floatingRange(0.0, 1.0 - 0x1p-24, mayMissing);
   out.minAttained = false;
   out.maxAttained = false;
   return out;
@@ -1561,7 +1617,7 @@ ValueBounds randomBounds(const ValueNode& node, std::span<const ValueBounds> arg
 ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
   if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-  ValueBounds out = ValueBounds::floating(
+  ValueBounds out = ValueBounds::floatingRange(
       0.0, geo::EARTH_MEAN_RADIUS_METERS * 2.0 * std::asin(1.0), args[0].mayBeMissing);
   out.type = node.type;
   out.minAttained = false;
@@ -1571,9 +1627,9 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 
 ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   const ValueBounds& input = args[0];
-  if (input.alwaysMissing) return ValueBounds::floating(1.0, 1.0);
+  if (input.alwaysMissing) return ValueBounds::floatingValue(1.0);
   if (!bounded(input)) {
-    ValueBounds out = ValueBounds::floating(0.0, 1.0);
+    ValueBounds out = ValueBounds::floatingRange(0.0, 1.0);
     out.minAttained = out.maxAttained = false;
     return out;
   }
@@ -1599,7 +1655,7 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
     near = 0.0;
     nearAttained = false;
   }
-  ValueBounds out = ValueBounds::floating(decayScore(node, far, scale), decayScore(node, near, scale));
+  ValueBounds out = ValueBounds::floatingRange(decayScore(node, far, scale), decayScore(node, near, scale));
   out.minAttained = farAttained && !valueArray(input.type);
   out.maxAttained = nearAttained;
   if (input.mayBeMissing && out.doubleMax != 1.0) {
@@ -1637,9 +1693,11 @@ ValueBounds decimalBounds(const ValueNode& node, std::span<const ValueBounds> ar
   const auto& input = args[0];
   if (!bounded(input)) return ValueBounds::unbounded(node.type, input.mayBeMissing, input.alwaysMissing);
   auto scale = DECIMAL_SCALES[args[1].intMin];
-  auto out = ValueBounds::floating(scale(boundMinAsDouble(input)), scale(boundMaxAsDouble(input)), input.mayBeMissing);
+  auto out = ValueBounds::floatingRange(scale(boundMinAsDouble(input)), scale(boundMaxAsDouble(input)), input.mayBeMissing);
   out.type = node.type;
   out.alwaysMissing = input.alwaysMissing;
+  out.minAttained = input.minAttained;
+  out.maxAttained = input.maxAttained;
   return out;
 }
 
@@ -1885,8 +1943,8 @@ ValueBounds ValueFunction::bounds(
 
 ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   const ValueNode& node = nodes[index];
-  if (node.type == ValueType::INT64) return ValueBounds::integer(node.intValue, node.intValue);
-  if (node.type == ValueType::DOUBLE) return ValueBounds::floating(node.doubleValue, node.doubleValue);
+  if (node.type == ValueType::INT64) return ValueBounds::integerValue(node.intValue);
+  if (node.type == ValueType::DOUBLE) return ValueBounds::floatingValue(node.doubleValue);
   if (node.arraySize == 0) {
     ValueBounds out = ValueBounds::unbounded(node.type, true, true);
     return out;
@@ -1894,13 +1952,13 @@ ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   if (node.type == ValueType::INT64_ARRAY) {
     auto begin = intArrays.begin() + node.arrayOffset;
     auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-    ValueBounds out = ValueBounds::integer(*min, *max);
+    ValueBounds out = ValueBounds::observedInteger(*min, *max);
     out.type = node.type;
     return out;
   }
   auto begin = doubleArrays.begin() + node.arrayOffset;
   auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-  ValueBounds out = ValueBounds::floating(*min, *max);
+  ValueBounds out = ValueBounds::observedFloating(*min, *max);
   out.type = node.type;
   return out;
 }
@@ -2152,7 +2210,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
     } else if (node.kind == ValueNodeKind::DOCID) {
       int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
-                                : ValueBounds::integer(segment.base,
+                                : ValueBounds::observedInteger(segment.base,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
       auto* fieldInfo = fields[index].at(segment);
@@ -2173,15 +2231,15 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
         } else if (node.columnType == FieldType::FLOAT) {
           double min = (double)sortableInt32ToFloat((int32_t)encoded.min);
           double max = (double)sortableInt32ToFloat((int32_t)encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
+          bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else if (node.columnType == FieldType::DOUBLE) {
           double min = sortableInt64ToDouble(encoded.min);
           double max = sortableInt64ToDouble(encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
+          bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else {
-          bound.bounds = ValueBounds::integer(encoded.min, encoded.max, missing);
+          bound.bounds = ValueBounds::observedInteger(encoded.min, encoded.max, missing);
           bound.bounds.type = node.type;
         }
         if (valueDouble(node.type) && bounded(bound.bounds)

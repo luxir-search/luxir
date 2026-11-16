@@ -227,7 +227,7 @@ ValueBounds bitNotBounds(const ValueNode& node, std::span<const ValueBounds> arg
   if (singleton(args[0])) return constantInteger(node, ~args[0].intMin, args[0].mayBeMissing);
   if (bounded(args[0])) {
     // ~x reverses the order, so the interval maps to [~max, ~min] without overflow.
-    ValueBounds out = ValueBounds::integer(~args[0].intMax, ~args[0].intMin, args[0].mayBeMissing);
+    ValueBounds out = ValueBounds::integerRange(~args[0].intMax, ~args[0].intMin, args[0].mayBeMissing);
     out.type = node.type;
     out.minAttained = args[0].maxAttained;
     out.maxAttained = args[0].minAttained;
@@ -371,7 +371,7 @@ ValueBounds toDoubleBounds(const ValueNode& node, std::span<const ValueBounds> a
   const ValueBounds& input = args[0];
   if (input.alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
   if (!bounded(input)) return ValueBounds::unbounded(node.type, input.mayBeMissing);
-  ValueBounds out = ValueBounds::floating(boundMinAsDouble(input), boundMaxAsDouble(input),
+  ValueBounds out = ValueBounds::floatingRange(boundMinAsDouble(input), boundMaxAsDouble(input),
                                           input.mayBeMissing);
   out.type = node.type;
   out.minAttained = input.minAttained;
@@ -421,9 +421,9 @@ ValueBounds clampBounds(const ValueNode& node, std::span<const ValueBounds> args
     auto clamped = [&](int64_t value) { return std::min(std::max(value, low), high); };
     int64_t min = bounded(args[0]) ? clamped(args[0].intMin) : clamped(INT64_MIN);
     int64_t max = bounded(args[0]) ? clamped(args[0].intMax) : clamped(INT64_MAX);
-    ValueBounds out = ValueBounds::integer(min, max, mayBeMissing);
+    ValueBounds out = ValueBounds::integerRange(min, max, mayBeMissing);
     out.type = node.type;
-    out.minAttained = out.maxAttained = bounded(args[0]) && singleton(args[0]);
+    out.minAttained = out.maxAttained = !mayBeMissing && bounded(args[0]) && singleton(args[0]);
     return out;
   }
   double low = boundMinAsDouble(args[1]);
@@ -431,9 +431,9 @@ ValueBounds clampBounds(const ValueNode& node, std::span<const ValueBounds> args
   auto clamped = [&](double value) { return std::min(std::max(value, low), high); };
   double min = bounded(args[0]) ? clamped(boundMinAsDouble(args[0])) : clamped(-INF);
   double max = bounded(args[0]) ? clamped(boundMaxAsDouble(args[0])) : clamped(INF);
-  ValueBounds out = ValueBounds::floating(min, max, mayBeMissing);
+  ValueBounds out = ValueBounds::floatingRange(min, max, mayBeMissing);
   out.type = node.type;
-  out.minAttained = out.maxAttained = bounded(args[0]) && singleton(args[0]);
+  out.minAttained = out.maxAttained = !mayBeMissing && bounded(args[0]) && singleton(args[0]);
   return out;
 }
 

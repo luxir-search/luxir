@@ -165,6 +165,11 @@ A GEO_POINT column cannot be used as a number, but its coordinates can:
 with field components: `geohash(place.lat, place.lon, 5)`. A coordinate outside
 [-90, 90] and [-180, 180] is an error.
 
+Constant coordinates in distance and bearing functions are checked when the
+expression is parsed. Box endpoints are quantized to the same inclusive encoded
+intervals as the query; a box containing no representable point is empty,
+including singleton +90 latitude and singleton +180 longitude.
+
 Where each geo operation lives:
 
 | You want | Use |

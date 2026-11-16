@@ -84,7 +84,7 @@ ValueResult bucketPoint(BoundValueProgram& program, const ValueNode& node,
 
 ValueBounds bucketBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-  ValueBounds out = ValueBounds::integer(0, node.intValue2 - 1, args[0].mayBeMissing);
+  ValueBounds out = ValueBounds::integerRange(0, node.intValue2 - 1, args[0].mayBeMissing);
   out.type = node.type;
   out.minAttained = out.maxAttained = false;
   return out;

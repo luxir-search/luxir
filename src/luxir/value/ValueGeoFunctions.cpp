@@ -63,7 +63,7 @@ struct Coordinate1 {
 
   static ValueBounds bounds(const ValueNode& node, std::span<const ValueBounds> args) {
     if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-    ValueBounds out = ValueBounds::floating(-Limit, Limit, args[0].mayBeMissing);
+    ValueBounds out = ValueBounds::floatingRange(-Limit, Limit, args[0].mayBeMissing);
     out.type = node.type;
     return out;
   }
@@ -143,11 +143,20 @@ struct Pair4 {
   }
 };
 
+void prepareCoordinates(ValueNode&, std::span<const ValueNode* const> args) {
+  for (size_t i = 0; i < args.size(); i++) {
+    const ValueNode& arg = *args[i];
+    if (arg.kind != ValueNodeKind::CONSTANT && arg.kind != ValueNodeKind::VARIABLE) continue;
+    if (i % 2 == 0) geo::checkLatitude(numberOf(arg));
+    else geo::checkLongitude(numberOf(arg));
+  }
+}
+
 template <double (*Fn)(double, double, double, double), int64_t Max>
 constexpr ValueFunction pair(std::string_view name) {
   using F = Pair4<Fn, Max>;
   return {ValueOpcode::NONE, name, pairResolve, F::point, evalFunctionBatch, F::bounds,
-          evalScalarOnlyElement, 4, 4, {RAW, RAW, RAW, RAW}};
+          evalScalarOnlyElement, 4, 4, {RAW, RAW, RAW, RAW}, nullptr, prepareCoordinates};
 }
 
 // ---------------------------------------------------------------------------
@@ -166,23 +175,13 @@ void prepareBox(ValueNode& node, std::span<const ValueNode* const> args) {
   double minLon = numberOf(*args[2]);
   double maxLat = numberOf(*args[3]);
   double maxLon = numberOf(*args[4]);
-  geo::checkLatitude(minLat);
-  geo::checkLatitude(maxLat);
-  geo::checkLongitude(minLon);
-  geo::checkLongitude(maxLon);
-  if (minLat > maxLat) throw std::runtime_error("min_lat must not exceed max_lat");
-  node.intValue = geo::pack(geo::encodeLatitudeCeil(minLat), geo::encodeLatitude(maxLat));
-  node.intValue2 = geo::pack(geo::encodeLongitudeCeil(minLon), geo::encodeLongitude(maxLon));
+  geo::EncodedBox box(minLat, maxLat, minLon, maxLon);
+  node.intValue = box.packedLatitudes();
+  node.intValue2 = box.packedLongitudes();
 }
 
-bool insideBox(const ValueNode& node, int64_t packed) {
-  int32_t minLat = geo::unpackLatitude(node.intValue);
-  int32_t maxLat = geo::unpackLongitude(node.intValue);
-  int32_t lat = geo::unpackLatitude(packed);
-  int32_t lon = geo::unpackLongitude(packed);
-  return lat >= minLat && lat <= maxLat
-      && geo::longitudeInRange(lon, geo::unpackLatitude(node.intValue2),
-                               geo::unpackLongitude(node.intValue2));
+bool insideBox(const ValueNode& node, int64_t point) {
+  return geo::EncodedBox::fromPacked(node.intValue, node.intValue2).contains(point);
 }
 
 ValueResult boxPoint(BoundValueProgram& program, const ValueNode& node,
@@ -199,7 +198,7 @@ ValueResult boxPoint(BoundValueProgram& program, const ValueNode& node,
 
 ValueBounds boxBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-  ValueBounds out = ValueBounds::integer(0, 1, args[0].mayBeMissing);
+  ValueBounds out = ValueBounds::integerRange(0, 1, args[0].mayBeMissing);
   out.type = node.type;
   return out;
 }
