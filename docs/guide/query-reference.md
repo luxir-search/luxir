@@ -823,5 +823,5 @@ field groups, such as `items:(color:red AND size:L)`.
 Operations move between views through `domain.to`: relative dotted descent,
 `..` or `../..` ascent, and `/` for root documents. Mixed upward/downward
 paths are reserved. Non-query field consumers must run in their field's own
-view. See [queries over nested rows](searching.md#queries-over-nested-rows)
-for examples and the precise query/consumer distinction.
+view. See [Nested documents](nested.md) for examples and the precise
+query/consumer distinction.
