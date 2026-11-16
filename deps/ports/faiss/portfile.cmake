@@ -7,6 +7,7 @@ vcpkg_from_github(
     PATCHES
         dispatch-features.diff  # AVX2/AVX-512 levels also need FMA, F16C and POPCNT
         rabitq-negative-l2.diff  # keep negative 1-bit L2 estimates; see vector-search.md
+        rabitq-neon.diff  # 1-bit kernels measured faster than upstream on Neoverse N1
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
