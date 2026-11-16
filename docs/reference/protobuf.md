@@ -206,6 +206,7 @@ defaults and constraints are described in the comments and guides.
 - [`SystemStats`](#message-luxir.systemstats)
 - [`TcpStats`](#message-luxir.tcpstats)
 - [`TermFilter`](#message-luxir.termfilter)
+- [`ToParentQuery`](#message-luxir.toparentquery)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`TransportStats`](#message-luxir.transportstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
@@ -920,6 +921,7 @@ Overrides an operation's incoming document set, including beneath facet and grou
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.domain.to"></a>[`to`](#field-luxir.domain.to) | 6 | `string` | optional | Relative descendant path, .. steps to ancestors, or / for root documents. |
 | <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches within live documents and the enclosing structural bucket identities. If absent, inherits the incoming domain. |
 | <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the owning list's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore matching queries above this operation. |
 | <a id="field-luxir.domain.filter"></a>[`filter`](#field-luxir.domain.filter) | 5 | [`Query`](#message-luxir.query) | repeated | Additional non-scoring constraints, ANDed with the inherited or reset domain. Entries and query must each specify a query kind. |
@@ -1118,6 +1120,8 @@ Cached field metadata payload, excluding allocator overhead and unused hash-tabl
 | <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.live_views"></a>[`live_views`](#field-luxir.fieldmetadatastats.live_views) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.live_view_bytes"></a>[`live_view_bytes`](#field-luxir.fieldmetadatastats.live_view_bytes) | 11 | `uint64` | singular |  |
 
 <a id="message-luxir.fieldvariants"></a>
 
@@ -1862,6 +1866,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside any of several polygons |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
+| <a id="field-luxir.query.to_parent"></a>[`to_parent`](#field-luxir.query.to_parent) | 27 | [`ToParentQuery`](#message-luxir.toparentquery) | oneof [`kind`](#oneof-luxir.query.kind) | reduces child matches onto their owners |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2541,6 +2546,18 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 | <a id="field-luxir.termfilter.partition"></a>[`partition`](#field-luxir.termfilter.partition) | 6 | `uint32` | singular | Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes) modulo num\_partitions equals partition, so num\_partitions requests with partition 0..num\_partitions-1 together return every term once. Unset when num\_partitions is 0; otherwise partition must be below num\_partitions. |
 | <a id="field-luxir.termfilter.num_partitions"></a>[`num_partitions`](#field-luxir.termfilter.num_partitions) | 7 | `uint32` | singular |  |
 
+<a id="message-luxir.toparentquery"></a>
+
+### luxir.ToParentQuery
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.toparentquery.path"></a>[`path`](#field-luxir.toparentquery.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.toparentquery.query"></a>[`query`](#field-luxir.toparentquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
+| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | none (constant score) or max. Unset selects max. |
+
 <a id="message-luxir.topdocs"></a>
 
 ### luxir.TopDocs
@@ -2883,6 +2900,7 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.boolean"></a>[`BOOLEAN`](#value-luxir.fielddef.fieldclass.boolean) | 11 | true/false, stored as 0/1 in the int column |
 | <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
 | <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
+| <a id="value-luxir.fielddef.fieldclass.nested"></a>[`NESTED`](#value-luxir.fielddef.fieldclass.nested) | 14 | structural path of nested object rows |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
