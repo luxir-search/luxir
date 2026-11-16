@@ -1078,3 +1078,19 @@ TEST_F(ValueScriptingTest, distanceFunctionsValidateConstantCoordinates) {
     }
   }
 }
+
+TEST_F(ValueScriptingTest, hashIntegerConstantsKeepAll64Bits) {
+  uint64_t bits = 1;
+  for (int64_t seed : {INT64_C(9007199254740993), INT64_MAX, INT64_MIN}) {
+    EXPECT_EQ((int64_t)XXH64(&bits, sizeof bits, (uint64_t)seed),
+              evalInt(fmt::format("xxhash64(1, {})", seed)));
+    EXPECT_EQ((int64_t)Hash::MurmurHash64A(&bits, sizeof bits, (uint64_t)seed),
+              evalInt(fmt::format("murmur64(1, {})", seed)));
+  }
+  EXPECT_EQ((int64_t)(XXH64(&bits, sizeof bits, 0) % (uint64_t)INT64_MAX),
+            evalInt("hash_bucket(1, 9223372036854775807)"));
+  EXPECT_EQ((int64_t)(XXH64(&bits, sizeof bits, 0) % UINT64_C(9007199254740993)),
+            evalInt("hash_bucket(1, 9007199254740993)"));
+  expectError("xxhash64(1, 9223372036854775808.0)", "integer constant");
+  expectConstant("1 << 9007199254740993", 2);
+}

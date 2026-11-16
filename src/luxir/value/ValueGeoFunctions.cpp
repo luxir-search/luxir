@@ -226,11 +226,11 @@ void checkCoordinates(const ValueNode& node, double lat, double lon, int32_t doc
 
 void prepareCell(int64_t low, int64_t high, std::string_view what, ValueNode& node,
                  std::span<const ValueNode* const> args) {
-  double value = numberOf(*args[2]);
-  if (value != std::floor(value) || value < (double)low || value > (double)high) {
+  auto value = integerConstant(*args[2]);
+  if (!value || *value < low || *value > high) {
     throw std::runtime_error(fmt::format("{} must be an integer from {} to {}", what, low, high));
   }
-  node.intValue = (int64_t)value;
+  node.intValue = *value;
 }
 
 void prepareGeohash(ValueNode& node, std::span<const ValueNode* const> args) {

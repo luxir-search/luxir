@@ -76,14 +76,14 @@ void prepareDatePart(ValueNode& node, std::span<const ValueNode* const> args) {
   node.intValue2 = args[0]->nature == ValueNature::DATE_NS ? 1 : 0;
   node.intValue = 0;
   if (args.size() > 1) {
-    double minutes = numberOf(*args[1]);
-    if (minutes != std::floor(minutes)
-        || std::abs(minutes) > datetime_detail::kMaxLiteralOffsetMinutes) {
+    auto minutes = integerConstant(*args[1]);
+    if (!minutes || *minutes < -datetime_detail::kMaxLiteralOffsetMinutes
+        || *minutes > datetime_detail::kMaxLiteralOffsetMinutes) {
       throw std::runtime_error(fmt::format(
           "the offset must be a whole number of minutes between -{} and {}",
           datetime_detail::kMaxLiteralOffsetMinutes, datetime_detail::kMaxLiteralOffsetMinutes));
     }
-    node.intValue = (int64_t)minutes;
+    node.intValue = *minutes;
   }
 }
 

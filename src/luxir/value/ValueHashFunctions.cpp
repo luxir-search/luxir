@@ -3,8 +3,8 @@
 
 // Hash functions of the value language, for consistent bucketing and sampling:
 // xxhash64(x), murmur64(x), hash_combine(a, b) and hash_bucket(x, n). The
-// input is a number, hashed by its 64-bit pattern: an integer or DATE value by
-// its two's complement bits, a double by its IEEE 754 bits (so -0.0 and 0.0
+// input is a number, hashed by its 64-bit pattern: an integer-lane value (including DATE) by
+// its two's complement bits, a double-lane value by its IEEE 754 bits (so -0.0 and 0.0
 // hash differently). Results are int64 and may be negative.
 
 #include <bit>
@@ -34,11 +34,9 @@ ResolvedValue hashResolve(std::span<const ResolvedValue> args) {
 }
 
 int64_t constantInt(const ValueNode& operand, std::string_view what) {
-  double value = numberOf(operand);
-  if (value != std::floor(value) || !(value >= -0x1p63 && value < 0x1p63)) {
-    throw std::runtime_error(fmt::format("{} must be an integer constant", what));
-  }
-  return (int64_t)value;
+  auto value = integerConstant(operand);
+  if (!value) throw std::runtime_error(fmt::format("{} must be an integer constant", what));
+  return *value;
 }
 
 // node.intValue is the seed; hash_bucket also keeps the bucket count in

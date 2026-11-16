@@ -213,8 +213,9 @@ budget; there is no separate limit on the number of bindings.
 
 These functions give a document a stable pseudo-random number, for consistent
 sampling and bucketing (an A/B split, a percentage rollout, a spread of a
-tie). The argument is a number, hashed by its 64-bit pattern: integers and dates
-by their value, doubles by their IEEE 754 bits, so `-0.0` and `0.0` differ.
+tie). The argument is a number, hashed by its 64-bit pattern: integer-lane values (including dates)
+use their integer bits; double-lane values (including fractional dates) use
+their IEEE 754 bits, so `-0.0` and `0.0` differ.
 
 | Function | Result |
 |---|---|
@@ -223,7 +224,8 @@ by their value, doubles by their IEEE 754 bits, so `-0.0` and `0.0` differ.
 | `hash_bucket(x, n)`, `hash_bucket(x, n, seed)` | An integer in [0, n), evenly spread by `x`. `n` is a positive constant. |
 | `hash_combine(a, b)` | Mixes two integers, in order: `hash_combine(a, b)` differs from `hash_combine(b, a)`. |
 
-`seed` is an integer constant and defaults to 0. Results of `xxhash64` and
+`seed` is an integer constant and defaults to 0. Integer seeds and bucket
+counts preserve all 64 bits; they do not pass through floating point. Results of `xxhash64` and
 `murmur64` use all 64 bits and can be negative; take a bucket with
 `hash_bucket`. Hashing a string column is not available.
 

@@ -91,6 +91,16 @@ inline double numberOf(const ValueNode& node) {
   return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
 }
 
+// Integer constants retain their native lane. Only doubles need integrality
+// and range checks before narrowing.
+inline std::optional<int64_t> integerConstant(const ValueNode& node) {
+  if (node.type == ValueType::INT64) return node.intValue;
+  if (node.type != ValueType::DOUBLE) return std::nullopt;
+  double value = node.doubleValue;
+  if (value != std::floor(value) || !(value >= -0x1p63 && value < 0x1p63)) return std::nullopt;
+  return (int64_t)value;
+}
+
 inline ValueResult promote(ValueResult value, ValueType type) {
   if (!value.valid) return ValueResult::missing(type);
   if (valueArray(type)) {
