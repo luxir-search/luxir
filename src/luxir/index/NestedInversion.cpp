@@ -85,8 +85,13 @@ void NestedState::index(NestedPath& path, const IndexVal& val) {
 void NestedState::finish() {
   assert(active == nullptr);
   auto& writer = inverter.postingsWriter;
+  std::vector<const NestedPath*> ordered;
+  ordered.reserve(paths.size());
   for (const auto& [_, path] : paths) {
-    if (path->rows == 0) continue;
+    if (path->rows != 0) ordered.push_back(path.get());
+  }
+  std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) { return a->ordinal < b->ordinal; });
+  for (const auto* path : ordered) {
     int32_t parents = path->parent ? path->parent->rows : inverter.getMaxDoc();
     size_t blocks = ((size_t)parents + NumColumnFormat::BLOCK_SIZE - 1) / NumColumnFormat::BLOCK_SIZE;
     inverter.noteFlushWorkspace(sizeof(MonoWriter) + 2 * NumColumnFormat::BLOCK_SIZE * sizeof(int64_t)
