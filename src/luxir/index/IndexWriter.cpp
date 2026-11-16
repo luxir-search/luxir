@@ -698,6 +698,17 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
       throw SchemaError(std::format("Cannot change unit of existing date field '{}': {} -> {}",
           name, oldUnit->second, newUnit->second));
     }
+    // Existing segments hold only the postings of an indexed string written
+    // without a column, and ARRAY sequences cannot be rebuilt from those.
+    auto* type = schema->getFieldTypePtr(name);
+    auto oldColumn = old->second.properties.find("column");
+    if (type && FieldType::storage(type->type()) == FieldType::Storage::TERMS && type->indexed()
+        && type->hasColumn() && oldColumn != old->second.properties.end()
+        && oldColumn->second == "false") {
+      throw SchemaError(std::format(
+          "Cannot add a column to existing indexed string field '{}'; reindex into a new field",
+          name));
+    }
   }
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;

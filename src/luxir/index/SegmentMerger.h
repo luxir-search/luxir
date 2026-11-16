@@ -24,6 +24,7 @@
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -41,6 +42,7 @@
 // #define MERGER_DEBUG LOG_DEBUG
 
 #include "luxir/util/Signal.h"
+#include "luxir/reader/DocsReader.h"
 
 namespace luxir {
 
@@ -785,7 +787,11 @@ private:
     int64_t numValues = 0;
     int64_t docsWithField = 0;
     int64_t synthesizedPointValues = 0;
+    bool ordColumn = true;
+    bool replay = false;
     for (const auto& field : fields) {
+      ordColumn = ordColumn && mergesOrdColumn(field.segFieldInfo);
+      replay = replay || replaysOrdColumn(field.segFieldInfo);
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
       if (field.segFieldInfo.pointsMetaOff == 0) {
@@ -798,12 +804,11 @@ private:
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues) : 0;
 
-    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0) {
-      // Ord columns hold the term-order -> doc-order transposition in RAM until the
-      // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
-      // up front, plus a pool delta stream per multi-valued doc.  This is the
-      // heavy class the budget exists for.
-      if (allFlags & FieldType::MULTI_ARRAY) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
+        && ordColumn) {
+      // Multi-valued columns are replayed from the source columns and hold
+      // only per-source term ord maps.
+      if (replay) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
         // Mapped source runs stream directly; only maps and codec plans grow.
@@ -812,12 +817,10 @@ private:
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
             + MergeCostModel::LIGHT_BYTES + pointsBytes;
       }
-      // A doc's first value takes its ords[maxDoc] slot.  A multi-valued doc
-      // spills into a pool delta stream: about 40 bytes for its header and
-      // first slice, then a few bytes per further value.
-      int64_t spilledValues = std::max<int64_t>(0, numValues - docsWithField);
-      int64_t multiValuedDocs = std::min(spilledValues, docsWithField);
-      return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
+      // Single-valued columns hold the term-order -> doc-order transposition
+      // in RAM until the postings pass finishes: OrdCollector's
+      // ords[mergedMaxDoc] (int32).
+      return (int64_t)postingsWriter.getMaxDoc() * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
@@ -1302,7 +1305,7 @@ private:
   // A replayable, doc-ordered source for the writer's count/plan/encode passes.
   // Only one source column/cursor is live at a time. Sequence payloads stay on
   // disk rather than being copied into another merge-time collector.
-  class MergedArrayOrds {
+  class MergedSourceOrds {
     std::span<MergeFieldInfo*> fields;
     const std::vector<std::vector<uint32_t>>& maps;
     int32_t maxDoc;
@@ -1345,7 +1348,7 @@ private:
     }
 
   public:
-    MergedArrayOrds(std::span<MergeFieldInfo*> fields,
+    MergedSourceOrds(std::span<MergeFieldInfo*> fields,
                     const std::vector<std::vector<uint32_t>>& maps, int32_t maxDoc)
         : fields(fields), maps(maps), maxDoc(maxDoc) {
       for (auto* field : fields) {
@@ -1379,9 +1382,52 @@ private:
     }
   };
 
-  // ARRAY columns cannot be reconstructed from DOCS-only postings. Keep their
-  // term map/replay workspace and walks out of the SET merge instantiation.
-  void LUXIR_NOINLINE mergeArrayOrdColumn(
+  // Writes the merged docs-with-field set of an indexed field without a
+  // column from each source's set, in merged doc order.
+  void mergeDocsWithField(std::span<MergeFieldInfo*> compactFields,
+                          PostingsWriter::IndexFieldInfo& output, MemPool& pool) {
+    auto forEachDoc = [&](auto&& accept) {
+      for (auto* field : compactFields) {
+        const Segment& seg = *field->seg;
+        DocsReader docs(*seg.postingsReader, field->segFieldInfo);
+        auto emit = [&](int32_t doc) {
+          auto [mapped, deleted] = seg.remapDocId(doc);
+          if (!deleted) accept(mapped);
+        };
+        if (!docs.hasBitset()) {
+          for (int32_t doc = 0; doc < docs.numDocs(); doc++) emit(doc);
+          continue;
+        }
+        screaming::BitSet::Iterator it(docs.bitset());
+        for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) emit(doc);
+      }
+    };
+    int32_t numDocs = 0;
+    forEachDoc([&](int32_t) { numDocs++; });
+    output.numValues = output.sumDocFreq;
+    DocsWithValWriter::write(pool, postingsWriter, output, numDocs, forEachDoc);
+  }
+
+  // An indexed TERMS field keeps an ord column only when every source has one
+  // and declares it (COLUMN_STORED): column: false drops it, and a schema
+  // change never needs a column rebuilt for sources written without one.
+  static bool mergesOrdColumn(const SegFieldInfo& info) {
+    return info.hasOrdColumn() && (info.flags & FieldType::COLUMN_STORED) != 0;
+  }
+
+  // A source with a multi-valued ord column (ARRAY, or SET holding a
+  // multi-valued doc) sends the merge to mergeOrdColumnByReplay.
+  static bool replaysOrdColumn(const SegFieldInfo& info) {
+    return (info.flags & FieldType::MULTI_ARRAY) != 0 || info.numValues > info.docsWithField;
+  }
+
+  // Rebuilds a multi-valued ord column doc-major from the source ord columns
+  // through per-source term ord maps, holding one map entry per source term
+  // rather than every doc's ords. ARRAY sequences cannot be reconstructed from
+  // DOCS-only postings at all; SET columns could be uninverted from them, but
+  // the sources already hold the doc-major order, so replaying them is faster
+  // and its workspace does not grow with the values.
+  void LUXIR_NOINLINE mergeOrdColumnByReplay(
       std::span<MergeFieldInfo*> fields, PostingsWriter::IndexFieldInfo& output,
       MemPool& pool) {
     std::vector<std::vector<uint32_t>> ordMaps;
@@ -1392,8 +1438,8 @@ private:
         std::nullopt, std::nullopt, pool, &ordMaps);
     textWriter.endField();
 
-    MergedArrayOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
-    BasicOrdColWriter<MergedArrayOrds> writer(pool, postingsWriter, output, ords);
+    MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
+    BasicOrdColWriter<MergedSourceOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
   }
 
@@ -1704,6 +1750,10 @@ private:
     allFlags &= ~FieldType::SEGMENT_MARKERS;
     auto storage = FieldType::storage(type);
     bool isText = storage == FieldType::Storage::TEXT;
+    bool isIndexedTerms = storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS);
+    bool isOrdCol = isIndexedTerms
+        && std::ranges::all_of(compactFields, [](auto* f) { return mergesOrdColumn(f->segFieldInfo); });
+    if (isIndexedTerms && !isOrdCol) allFlags &= ~FieldType::COLUMN_STORED;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
       int64_t serialCost = estimateCost(mergeFieldInfos);
@@ -1745,10 +1795,9 @@ private:
                                            normDocsWithField, numNormDocsWithField);
     }
 
-    // if this is an indexed string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (storage == FieldType::Storage::TERMS) && (allFlags & FieldType::INDEX_DOCS);
-    if (isOrdCol && (allFlags & FieldType::MULTI_ARRAY)) {
-      mergeArrayOrdColumn(compactFields, outputFieldInfo, pool);
+    if (isOrdCol && std::ranges::any_of(compactFields, [](auto* f) {
+          return replaysOrdColumn(f->segFieldInfo); })) {
+      mergeOrdColumnByReplay(compactFields, outputFieldInfo, pool);
       return;
     }
     std::optional<OrdCollector> ordCollector;
@@ -1782,6 +1831,8 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
+    } else if (isIndexedTerms) {
+      mergeDocsWithField(compactFields, outputFieldInfo, pool);
     } else if (isText) {
       NormsWriter::writeValues(pool, postingsWriter, outputFieldInfo, preparedNorms,
                                normDocsWithField);

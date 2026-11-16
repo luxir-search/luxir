@@ -806,6 +806,11 @@ public:
               + std::string(facetField) + "' is column-only (not indexed); string facets "
               "require an indexed field");
         }
+        if (!ftype->hasColumn()) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': field '"
+              + std::string(facetField) + "' has no column (column: false); string facets "
+              "read the column");
+        }
         std::optional<FacetTermFilterSpec> termFilter;
         if (facetReq.term_filter.has_value()) {
           termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);

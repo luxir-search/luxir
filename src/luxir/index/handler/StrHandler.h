@@ -159,6 +159,27 @@ public:
       docsWithField.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
     }
 
+    if (!fieldType->hasColumn()) {
+      // column: false keeps the postings and the docs-with-field set (exists,
+      // scoring) but no ord column.
+      textWriter.startField(&fieldInfo);
+      for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
+        auto term = terms[tnum];
+        textWriter.startTerm(term);
+        term.val().forEachDoc(termsHash.getMemPool(), [&](int rank) {
+          textWriter.addDoc(full ? rank : rankToDoc[rank], 1);
+        });
+        textWriter.endTerm(term);
+      }
+      textWriter.endField();
+      termsHash.free();
+      inverter.noteFlushWorkspace(rankToDoc.capacity() * sizeof(int32_t));
+      fieldInfo.numValues = fieldInfo.sumDocFreq;
+      DocsWithValWriter::write(guard.pool(), inverter.postingsWriter, fieldInfo, nDocsWithField,
+                               [&](auto&& accept) { for (int32_t doc : rankToDoc) accept(doc); });
+      return;
+    }
+
     std::conditional_t<Array, std::vector<uint32_t>, std::monostate> termToOrd;
     if constexpr (Array) {
       arrayValues.finish(inverter.pool);
