@@ -162,7 +162,8 @@ public:
 
   virtual ~SearchRequest();
 
-  // Parsing pins each additional view once. The map has no allocation until
+  // Parsing and returned fields pin each additional view once, under mutex.
+  // The map has no allocation until
   // a request crosses a space boundary; registry identities never cross it.
   const std::shared_ptr<IndexReader>& pinView(std::string_view path);
   const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
