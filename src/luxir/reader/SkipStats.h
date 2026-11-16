@@ -205,6 +205,8 @@ struct SkipStats {
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
+  // to_parent candidate filters: owner batches decided together.
+  static inline int64_t toParentCandidateBatches = 0;
   static inline int64_t bulkBuiltThenRejected = 0;
   static inline int64_t bulkBuiltThenRejectedWrapperRoute = 0;
   static inline int64_t bulkBuiltThenRejectedMandOptTwoPhase = 0;
@@ -543,6 +545,7 @@ struct SkipStats {
     exactCountTopKProfitabilityRejects = 0;
     exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
+    toParentCandidateBatches = 0;
     bulkBuiltThenRejected = 0;
     bulkBuiltThenRejectedWrapperRoute = 0;
     bulkBuiltThenRejectedMandOptTwoPhase = 0;

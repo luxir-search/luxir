@@ -1,8 +1,11 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <tuple>
+
 #include "test/NestedFixture.h"
 #include "luxir/reader/OwnerMap.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/query/NumericPredicateQuery.h"
 
 using namespace luxir;
@@ -559,6 +562,58 @@ TEST_F(NestedTest, toParentConjunctionCountsVerifyOnlyPossibleCandidates) {
   // 200 candidates and 400 answers; about 51 can match, verified by one answer each.
   EXPECT_LT(elementVerifications, 100) << elementVerifications;
 #endif
+}
+
+// Unscored counts of tag AND to_parent decide candidate owners in batches,
+// including the count bounds and an owner with more answers than one batch
+// spans. Owner i (tagged "t" when i % 10 == 0) holds answers dated i % 11, 50
+// and i % 13, none when i % 700 == 0; "big" holds 17000 answers dated k % 20.
+TEST_F(NestedTest, toParentCountsDecideCandidateBatches) {
+  schema(R"({"fields": {"tag": "string",
+      "answers": {"type": "nested", "fields": {"date": {"type": "int", "multi": "array"}}}}})");
+  constexpr int32_t n = 6000;
+  CollectionHelper h = helper();
+  CollectionHelper::UpdateBuilder b;
+  auto addDoc = [&](std::string text) {
+    auto& kept = retained.emplace_back(std::move(text));
+    b.addRaw([&](api::Map& map, std::pmr::memory_resource& mr) { EXPECT_TRUE(api::read_json(map, kept, mr)); });
+  };
+  for (int32_t i = 0; i < n; i++) {
+    std::string answers = i % 700 == 0 ? "[]" : "[{\"date\": " + std::to_string(i % 11) + "}, {\"date\": 50}, {\"date\": "
+        + std::to_string(i % 13) + "}]";
+    addDoc(R"({"id": "q)" + std::to_string(i) + R"(", "tag": ")" + (i % 10 == 0 ? "t" : "u") + R"(", "answers": )" + answers + "}");
+    if (i == n / 2) {
+      std::string big = "[";
+      for (int32_t k = 0; k < 17000; k++) big += (k ? ", " : "") + std::string("{\"date\": ") + std::to_string(k % 20) + "}";
+      addDoc(R"({"id": "big", "tag": "t", "answers": )" + big + "]}");
+    }
+  }
+  b.commit();
+  ASSERT_TRUE(h.submit(b).success);
+
+  auto expected = [&](int32_t minChildren, int32_t maxChildren) {
+    int64_t count = 0;
+    for (int32_t i = 0; i < n; i += 10) {
+      int32_t matching = i % 700 == 0 ? 0 : (i % 11 <= 5) + (i % 13 <= 5);
+      count += matching >= minChildren && matching <= maxChildren;
+    }
+    return count + (5100 >= minChildren && 5100 <= maxChildren);  // big: 6 of every 20 dates are <= 5
+  };
+  auto count = [&](std::string bounds, int64_t limit) {
+    return search(R"({"max_parallel": 1, "ops": {"q": {"top_docs": {"query": {"boolean": {"required": [{"match": {"tag": "t"}},
+        {"to_parent": {"path": "answers", "score": "none")" + bounds + R"(,
+        "query": {"range": {"field": "answers.date", "lte": 5}}}}]}},
+        "limit": 0, "count_limit": )" + std::to_string(limit) + "}}}}");
+  };
+  SkipStatsScope stats;
+  for (auto [bounds, minChildren, maxChildren] : {std::tuple{std::string(""), 1, 1 << 30},
+                                                 {R"(, "min_children": 2)", 2, 1 << 30},
+                                                 {R"(, "max_children": 1)", 1, 1},
+                                                 {R"(, "min_children": 2, "max_children": 2)", 2, 2}}) {
+    std::string found = R"("found":)" + std::to_string(expected(minChildren, maxChildren)) + ",";
+    EXPECT_NE(std::string::npos, count(bounds, -1).find(found)) << bounds << " " << found;
+  }
+  EXPECT_GT(SkipStats::toParentCandidateBatches, 0);
 }
 
 // A multi-valued int column where every document holds one value reads as

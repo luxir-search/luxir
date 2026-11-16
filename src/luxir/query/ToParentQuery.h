@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -15,6 +18,7 @@
 #include "Query.h"
 #include "QueryPrep.h"
 #include "luxir/reader/OwnerMap.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
@@ -48,6 +52,13 @@ private:
   bool countBounded() const { return minChildren > 1 || maxChildren < std::numeric_limits<int32_t>::max(); }
 
   class Scorer final : public Query::Scorer {
+  public:
+    // Candidate batches (intersectCandidateBits): owners per batch, and the
+    // element rows one batch spans.
+    static constexpr int32_t kBatchOwners = 256;
+    static constexpr int32_t kBatchElementWords = 256;
+
+  private:
     Query::Scorer* child;
     Query::MembershipProof* proof;  // two-phase: element rows the child cannot match
     const OwnerMap& owners;
@@ -69,6 +80,7 @@ private:
     float current = 0.0f;
     std::optional<float> constant;  // the score of every match, when uniform
     ScoreBounds bounds;
+    std::span<uint64_t> elementBits;  // two-phase: one candidate batch's element rows
 
     // The owner score as reduce() computes it from an element score `s`
     // shared by all of the owner's matching elements.
@@ -199,6 +211,69 @@ private:
       return verifiedMatch = finishRun(run);
     }
 
+    // Whether the matching element count admits an owner, by count alone.
+    bool admits(int32_t count) const { return count >= minChildren && count <= maxChildren; }
+
+    // One owner's element rows [begin, end) counted through the child's
+    // two-phase protocol; stops once more matches cannot change the answer.
+    int32_t countMatching(int32_t begin, int32_t end) {
+      if (proof != nullptr && proof->nextPossible(begin) >= end) return 0;
+      int32_t c = child->approximationDocId();
+      if (c < begin) c = child->approximationAdvance(begin);
+      int32_t count = 0;
+      for (; c < end; c = child->approximationNext()) {
+        if (!child->matches()) continue;
+        count++;
+        if (count >= minChildren && maxChildren == std::numeric_limits<int32_t>::max()) break;
+      }
+      return count;
+    }
+
+    static void setRange(std::span<uint64_t> words, int32_t begin, int32_t end) {
+      for (int32_t i = begin; i < end;) {
+        int32_t bit = i & 63;
+        int32_t n = std::min(64 - bit, end - i);
+        uint64_t mask = n == 64 ? ~0ULL : ((1ULL << n) - 1) << bit;
+        words[(size_t)(i >> 6)] |= mask;
+        i += n;
+      }
+    }
+
+    static int32_t countRange(std::span<const uint64_t> words, int32_t begin, int32_t end) {
+      int32_t count = 0;
+      for (int32_t i = begin; i < end;) {
+        int32_t bit = i & 63;
+        int32_t n = std::min(64 - bit, end - i);
+        uint64_t mask = n == 64 ? ~0ULL : ((1ULL << n) - 1) << bit;
+        count += std::popcount(words[(size_t)(i >> 6)] & mask);
+        i += n;
+      }
+      return count;
+    }
+
+    // Decides a batch of candidate owners at once: their element rows go to
+    // the child as one candidate mask (after the membership proof clears rows
+    // that cannot match), so element values are read in one pass over rows
+    // in order, and each owner keeps its bit when the count of its surviving
+    // rows admits it.
+    void decideBatch(std::span<uint64_t> words, int32_t base, const int32_t* batch,
+                     const int32_t* begins, const int32_t* ends, int32_t n) {
+      if (n == 0) return;
+      skipCount(SkipStats::toParentCandidateBatches);
+      int32_t elementBase = begins[0] & ~63;
+      int32_t span = ends[n - 1] - elementBase;
+      auto bits = elementBits.first((size_t)((span + 63) >> 6));
+      std::fill(bits.begin(), bits.end(), 0);
+      for (int32_t i = 0; i < n; i++) setRange(bits, begins[i] - elementBase, ends[i] - elementBase);
+      if (proof != nullptr) proof->intersect(bits, elementBase);
+      child->intersectCandidateBits(bits, elementBase);
+      for (int32_t i = 0; i < n; i++) {
+        if (admits(countRange(bits, begins[i] - elementBase, ends[i] - elementBase))) continue;
+        int32_t bit = batch[i] - base;
+        words[(size_t)(bit >> 6)] &= ~(1ULL << (bit & 63));
+      }
+    }
+
     int32_t nextVerified() {
       if (doc == PostingsReader::END) return doc;
       while (approximate(doc + 1) != PostingsReader::END) {
@@ -209,10 +284,11 @@ private:
 
   public:
     Scorer(Query::Scorer* child, Query::MembershipProof* proof, const OwnerMap& owners, ScoreMode mode,
-           int32_t minChildren, int32_t maxChildren, float multiplier, bool scored, bool prune, bool twoPhase)
+           int32_t minChildren, int32_t maxChildren, float multiplier, bool scored, bool prune, bool twoPhase,
+           std::span<uint64_t> elementBits = {})
       : child(child), proof(proof), owners(owners), ownerOf(owners), mode(mode), minChildren(minChildren),
         maxChildren(maxChildren), multiplier(multiplier), scored(scored && mode != ScoreMode::NONE),
-        prune(prune), twoPhase(twoPhase) {
+        prune(prune), twoPhase(twoPhase), elementBits(elementBits) {
       initBounds();
       firstMatchDecides = minChildren <= 1 && maxChildren == std::numeric_limits<int32_t>::max()
           && (!this->scored || (constant && mode != ScoreMode::SUM));
@@ -247,7 +323,56 @@ private:
       return twoPhase ? approximate(target) : advance(target);
     }
     int32_t approximationDocId() override { return doc; }
+    // Membership windows: the approximation alone, so the other clauses can
+    // reject a candidate before its elements are read.
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      if (!twoPhase) return advanceWindow(min, max);
+      if (min >= max) return max;
+      return doc < min ? approximate(min) : doc;
+    }
     bool matches() override { return !twoPhase || verify(); }
+
+    // A candidate filter's batch: owner ranges are read for every candidate
+    // first, then their element rows are verified together (decideBatch),
+    // instead of one owner at a time behind a chain of dependent reads.
+    void intersectCandidateBits(std::span<uint64_t> words, int32_t base) override {
+      if (!twoPhase || elementBits.empty()) {
+        Query::Scorer::intersectCandidateBits(words, base);
+        return;
+      }
+      constexpr int32_t kBatchRows = kBatchElementWords * 64 - 64;
+      int32_t batch[kBatchOwners];
+      int32_t begins[kBatchOwners];
+      int32_t ends[kBatchOwners];
+      int32_t n = 0;
+      for (size_t w = 0; w < words.size(); w++) {
+        for (uint64_t candidates = words[w]; candidates != 0; candidates &= candidates - 1) {
+          int32_t bit = (int32_t)std::countr_zero(candidates);
+          int32_t owner = base + (int32_t)(w * 64) + bit;
+          auto [begin, end] = owners.range(owner);
+          if (end - begin > kBatchRows) {
+            // Too many elements for a batch: decide this owner alone.
+            decideBatch(words, base, batch, begins, ends, n);
+            n = 0;
+            if (!admits(countMatching(begin, end))) words[w] &= ~(1ULL << bit);
+            continue;
+          }
+          if (begin == end && minChildren > 0) {
+            words[w] &= ~(1ULL << bit);
+            continue;
+          }
+          if (n == kBatchOwners || (n > 0 && end - (begins[0] & ~63) > kBatchRows)) {
+            decideBatch(words, base, batch, begins, ends, n);
+            n = 0;
+          }
+          batch[n] = owner;
+          begins[n] = begin;
+          ends[n] = end;
+          n++;
+        }
+      }
+      decideBatch(words, base, batch, begins, ends, n);
+    }
     float matchCost() override {
       if (!twoPhase) return 0.0f;
       float perOwner = (float)owners.rows() / (float)std::max(1, owners.ownerMaxDoc());
@@ -275,6 +400,35 @@ private:
     }
   };
 
+  // Owner rows none of whose element rows the child's membership proof
+  // admits: lets a membership conjunction skip such owners (and whole
+  // windows of them) before any candidate reaches verification.
+  class OwnerProof final : public Query::MembershipProof {
+    Query::MembershipProof& child;
+    const OwnerMap& owners;
+
+  protected:
+    Range nextRange(int32_t target) override {
+      constexpr int32_t END = PostingsReader::END;
+      if (target >= owners.ownerMaxDoc()) return {END, END};
+      int32_t row = owners.begin(target);
+      int32_t possible = row >= owners.rows() ? END : child.nextPossible(row);
+      if (possible == END || possible >= owners.rows()) return {END, END};
+      int32_t begin = std::max(target, owners.owner(possible));
+      int32_t endRow = child.possibleEnd();
+      int32_t end = endRow >= owners.rows() ? owners.ownerMaxDoc() : owners.owner(endRow - 1) + 1;
+      return {begin, std::max(end, begin + 1)};
+    }
+
+  public:
+    OwnerProof(Query::MembershipProof& child, const OwnerMap& owners) : child(child), owners(owners) {}
+
+    void reset() override {
+      Query::MembershipProof::reset();
+      child.reset();
+    }
+  };
+
   class Supplier final : public Query::ScorerSupplier {
     Query::ScorerSupplier* childSupplier;
     const OwnerMap& owners;
@@ -295,12 +449,24 @@ private:
         Query::Scorer* childScorer = childPlan->build(targetPool);
         if (childScorer == nullptr) return nullptr;
         Query::MembershipProof* proof = twoPhase ? childPlan->buildMembershipProof(targetPool) : nullptr;
+        // A candidate filter decides batches of owners (intersectCandidateBits).
+        std::span<uint64_t> elementBits;
+        if (twoPhase && shape().membershipConsumption == Query::MembershipConsumption::CANDIDATES) {
+          elementBits = targetPool.make_span<uint64_t>(Scorer::kBatchElementWords);
+        }
         return targetPool.make<Scorer>(childScorer, proof, supplier.owners, supplier.mode, supplier.minChildren,
                                        supplier.maxChildren, supplier.multiplier, supplier.scored,
-                                       supplier.prune, twoPhase);
+                                       supplier.prune, twoPhase, elementBits);
       }
 
     public:
+      Query::MembershipProof* buildMembershipProof(MemPool& targetPool) override {
+        if (!twoPhase) return nullptr;
+        Query::MembershipProof* childProof = childPlan->buildMembershipProof(targetPool);
+        if (childProof == nullptr) return nullptr;
+        return targetPool.make<OwnerProof>(*childProof, supplier.owners);
+      }
+
       Plan(const Query::PlanContext& planContext, const Query::ScorerShape& shape, int64_t cost,
            Query::ScorerPlan* childPlan, const Supplier& supplier, bool twoPhase)
         : Query::ScorerPlan(planContext, shape, cost), childPlan(childPlan), supplier(supplier),
@@ -328,17 +494,30 @@ private:
       return context;
     }
 
-    static Query::ScorerShape shape(bool twoPhase) {
+    // A verifying to_parent serves a membership conjunction as a candidate
+    // filter: it takes the lead's candidates a window at a time
+    // (intersectCandidateBits) instead of producing windows of its own.
+    static Query::MembershipConsumption consumption(const Query::PlanContext& context, bool twoPhase) {
+      using Consumption = Query::MembershipConsumption;
+      if (context.membershipConsumption != Consumption::EITHER) return context.membershipConsumption;
+      return twoPhase ? Consumption::CANDIDATES : Consumption::WINDOWS;
+    }
+
+    static Query::ScorerShape shape(bool twoPhase, Query::MembershipConsumption consumption) {
       return {
         .matchState = Query::MatchState::UNKNOWN,
         .directKind = Query::DirectScorerKind::OTHER,
         .reportedTwoPhase = twoPhase ? Query::ReportedTwoPhase::YES : Query::ReportedTwoPhase::NO,
-        .windowFillClause = Query::ClauseShape::NONE,
+        // A candidate filter is exact over any candidate mask (the default
+        // window fill verifies each document through advanceWindow).
+        .windowFillClause = consumption == Query::MembershipConsumption::CANDIDATES
+            ? Query::ClauseShape::DIRECT : Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
         .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        .membershipConsumption = consumption,
       };
     }
 
@@ -352,8 +531,9 @@ private:
     int64_t cost() override { return childSupplier->cost(); }
 
     Query::ScorerShape describeScorer(const Query::PlanContext& buildContext) const override {
-      return shape(childSupplier->describeScorer(childContext(buildContext)).reportedTwoPhase
-                   == Query::ReportedTwoPhase::YES);
+      bool twoPhase = childSupplier->describeScorer(childContext(buildContext)).reportedTwoPhase
+          == Query::ReportedTwoPhase::YES;
+      return shape(twoPhase, consumption(buildContext, twoPhase));
     }
 
     Query::VerificationWork verificationWork(const Query::PlanContext& buildContext) const override {
@@ -365,7 +545,8 @@ private:
       Query::ScorerPlan* childPlan = childSupplier->resolve(planPool, childContext(planContext));
       assert(childPlan != nullptr);
       bool twoPhase = childPlan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES;
-      return planPool.make<Plan>(planContext, shape(twoPhase), childPlan->cost(), childPlan, *this, twoPhase);
+      return planPool.make<Plan>(planContext, shape(twoPhase, consumption(planContext, twoPhase)),
+                                 childPlan->cost(), childPlan, *this, twoPhase);
     }
   };
 
