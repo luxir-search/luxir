@@ -578,6 +578,7 @@ class SegmentMerger {
   };
 
   std::span<const std::shared_ptr<SegmentCore>> cores;
+  IndexRamBudget::Guard rowMapsRam;
   Space root;
   std::vector<std::unique_ptr<Space>> children;
   PostingsWriter& postingsWriter;
@@ -647,6 +648,7 @@ public:
                  root.maxDoc, estimatedOutputBytes, streamBudget);
     writeRootVersions();
     prepareChildren();
+    assert(rowMapsRam.size() == (int64_t)rowMapBytes());
     Signal::emit("mergeRowMaps", this);
     std::vector<MergeAdmissionDriver::Batch> batches;
     planFields(root, batches);
@@ -661,7 +663,20 @@ public:
   }
 
 private:
-  static void prepareSpace(Space& space) {
+  void reserveRowMap(std::vector<int32_t>& map, int32_t count) {
+    assert(map.empty() && map.capacity() == 0);
+    // One reservation grows before each allocation. Parent maps determine
+    // child sizes, and both stay charged until the merger releases its maps.
+    int64_t bytes = (int64_t)count * sizeof(int32_t);
+    if (rowMapsRam) rowMapsRam.forceResize(rowMapsRam.size() + bytes);
+    else rowMapsRam = ramBudget.forceAcquire(bytes);
+    map.reserve(count);
+    if (map.capacity() != (size_t)count) {
+      rowMapsRam.forceResize(rowMapsRam.size() + (int64_t)(map.capacity() - count) * sizeof(int32_t));
+    }
+  }
+
+  void prepareSpace(Space& space) {
     space.segs.reserve(space.preaders.size());
     space.fieldReaders.reserve(space.preaders.size());  // This is important since we take pointers to these! Pool allocate later...
 
@@ -684,7 +699,11 @@ private:
     // Now build the docId maps based on liveDocs, then release the liveDocs.
     for (size_t i = 0; i < space.segs.size(); i++) {
       auto& seg = space.segs[i];
-      buildDocIdMapping(seg.postingsReader->maxDoc(), space.liveDocs[i], seg.remap);
+      auto* live = space.liveDocs[i];
+      if (live && live->numLive() != seg.postingsReader->maxDoc()) {
+        reserveRowMap(seg.remap, seg.postingsReader->maxDoc());
+        buildDocIdMapping(seg.postingsReader->maxDoc(), live, seg.remap);
+      }
       // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
     }
   }
@@ -740,7 +759,10 @@ private:
         const auto& owner = parent->segs[i];
         auto& child = space->segs[i];
         auto* reader = space->preaders[i];
-        if (child.numLive && child.numLive != reader->maxDoc()) child.remap.assign(reader->maxDoc(), -1);
+        if (child.numLive && child.numLive != reader->maxDoc()) {
+          reserveRowMap(child.remap, reader->maxDoc());
+          child.remap.assign(reader->maxDoc(), -1);
+        }
         int32_t local = 0;
         std::optional<OwnershipShape::Cursor> cursor;
         if (reader) cursor.emplace(*cores[i]->ownership(path));
