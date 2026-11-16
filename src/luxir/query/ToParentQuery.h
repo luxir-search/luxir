@@ -113,7 +113,8 @@ public:
           maximum(query.maximum), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
       child = query.child->createWeight(*childContext, maximum ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
-      childUse = !child->needsScores() && !child->allowsPruning()
+      // Every row of the path is not a set worth materializing or caching.
+      childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
       traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       // Scored reduction keeps owner eligibility ahead of family scoring.
