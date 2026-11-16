@@ -115,7 +115,8 @@ inside an aggregate they belong in its input: `sum(year(when_dt))`.
 
 A date value carries its unit (milliseconds or nanoseconds), and the functions
 below read the calendar parts of it in UTC. Each takes one DATE value, either
-unit, and returns an integer. Multi-valued dates map element-wise.
+unit, and returns an integer. Fractional ticks round toward earlier time
+before calendar extraction. Multi-valued dates map element-wise.
 
 | Function | Result |
 |---|---|

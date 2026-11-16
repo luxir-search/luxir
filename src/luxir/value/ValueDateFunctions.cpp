@@ -71,7 +71,7 @@ int isoWeek(int year, int dayOfYear, int isoWeekday) {
 }
 
 // node.intValue2 holds the unit of the DATE operand (1 for nanoseconds) and
-// node.intValue the fixed offset in milliseconds; prepare() sets both.
+// node.intValue the fixed offset in minutes; prepare() sets both.
 void prepareDatePart(ValueNode& node, std::span<const ValueNode* const> args) {
   node.intValue2 = args[0]->nature == ValueNature::DATE_NS ? 1 : 0;
   node.intValue = 0;
@@ -79,10 +79,11 @@ void prepareDatePart(ValueNode& node, std::span<const ValueNode* const> args) {
     double minutes = numberOf(*args[1]);
     if (minutes != std::floor(minutes)
         || std::abs(minutes) > datetime_detail::kMaxLiteralOffsetMinutes) {
-      throw std::runtime_error(
-          "the offset must be a whole number of minutes between -1439 and 1439");
+      throw std::runtime_error(fmt::format(
+          "the offset must be a whole number of minutes between -{} and {}",
+          datetime_detail::kMaxLiteralOffsetMinutes, datetime_detail::kMaxLiteralOffsetMinutes));
     }
-    node.intValue = (int64_t)minutes * 60000;
+    node.intValue = (int64_t)minutes;
   }
 }
 
@@ -93,12 +94,9 @@ int64_t datePart(const ValueNode& node, int64_t raw, int32_t docid) {
     unused(docid);
     return millis;
   } else {
-    // The civil calendar is only defined for the supported year range.
-    if (millis < datetime_detail::kMinEpochMs - node.intValue
-        || millis > datetime_detail::kMaxEpochMs - node.intValue) {
-      runtimeInvalid(node, docid, "is outside the supported calendar range");
-    }
-    millis += node.intValue;
+    auto civil = civilFromInstant(millis, TimeZone::fixed((int)node.intValue));
+    if (!civil) runtimeInvalid(node, docid, "is outside the supported calendar range");
+    millis = civil->millis;
     int64_t days = floorDiv(millis, datetime_detail::kMsPerDay);
     int64_t millisOfDay = millis - days * datetime_detail::kMsPerDay;
     if constexpr (Part == DatePart::MILLIS_OF_DAY) return millisOfDay;
@@ -131,7 +129,10 @@ template <DatePart Part>
 struct DatePartFn {
   static ValueResult apply(const ValueNode& node, const ValueResult& input, int32_t docid) {
     if (!input.valid) return ValueResult::missing(ValueType::INT64);
-    return ValueResult::integer(datePart<Part>(node, input.intValue, docid));
+    auto tick = input.type == ValueType::INT64
+        ? std::optional<int64_t>(input.intValue) : floorDateTick(input.doubleValue);
+    if (!tick) runtimeInvalid(node, docid, "is non-finite or outside the int64 date range");
+    return ValueResult::integer(datePart<Part>(node, *tick, docid));
   }
 
   static ValueResult point(BoundValueProgram& program, const ValueNode& node,

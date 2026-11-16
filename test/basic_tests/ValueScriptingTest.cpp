@@ -73,7 +73,7 @@ protected:
     stamp.unit = api::FieldDef::DateUnit::NS;
     b.set(helper.collection());
     helper.index(flatdoc("id_s", "a", "body_w", "alpha", "x_i", 2, "y_i", 5, "v_d", 10.0,
-                         "vals_ds", vec(10.0, 40.0), "when_dt", T_A, "stamp", T_A * 1000000,
+                         "vals_ds", vec(10.0, 40.0), "when_dt", T_A, "when_dts", vec_i(T_A, T_A + 1), "stamp", T_A * 1000000,
                          "loc_p", "40.7128,-74.006", "locs_p", vecs("40.7,-74", "51.5,0")),
                  UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id_s", "b", "body_w", "alpha", "x_i", -1, "v_d", 130.0,
@@ -83,7 +83,7 @@ protected:
     helper.index(flatdoc("id_s", "d", "body_w", "alpha", "x_i", 7, "v_d", 0.5,
                          "when_dt", T_D, "loc_p", "-33,175"),
                  UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id_s", "e", "body_w", "alpha", "x_i", 0, "when_dt", T_E),
+    helper.index(flatdoc("id_s", "e", "body_w", "alpha", "x_i", 0, "when_dt", T_E, "when_dts", vec_i(-2, -1)),
                  UpdateMessage::COMMIT);
     reader = helper.getIndexWriter()->snapshots.readers.getReader();
   }
@@ -474,6 +474,17 @@ TEST_F(ValueScriptingTest, dateParts) {
   expectValues("year(stamp)", {2024, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectValues("epoch_millis(stamp)", {(double)T_A, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectValues("millis(stamp)", {456, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+}
+
+TEST_F(ValueScriptingTest, datePartsFloorFractionalTicks) {
+  expectValues("year(when_dt + 0.5)", {2024, 1970, std::nullopt, 2020, 1969});
+  expectValues("epoch_millis(when_dt + 0.5)", {(double)T_A, 0, std::nullopt, (double)T_D, -1});
+  expectValues("epoch_millis(avg(when_dts))", {(double)T_A, std::nullopt, std::nullopt, std::nullopt, -2});
+  expectValues("max(year(when_dts + 0.5))", {2024, std::nullopt, std::nullopt, std::nullopt, 1969});
+  expectValues("year(def(stamp, -0.5))", {2024, 1969, 1969, 1969, 1969});
+  expectValues("epoch_millis(def(stamp, -0.5))", {(double)T_A, -1, -1, -1, -1});
+  expectError("year(when_dt + 1e308)", "outside the int64 date range");
+  expectError("epoch_millis(when_dt - 1e308)", "outside the int64 date range");
 }
 
 TEST_F(ValueScriptingTest, dateOffsetsShiftTheCalendar) {
