@@ -1950,7 +1950,7 @@ std::string ValueFunctionRegistry::componentNames(ValueFunction::Kind kind) {
     if (!names.empty()) names += ", ";
     names += function.component;
   }
-  return names.empty() ? "none" : names;
+  return names;
 }
 
 std::string ValueFunctionRegistry::arrayReducerNames() {
@@ -2114,6 +2114,22 @@ void ValueProgram::retainRoot() {
   }
   rootNode = remap[rootNode];
   nodes.resize(count);
+  std::vector<uint8_t> uses(nodes.size());
+  for (ValueNode& node : nodes) {
+    node.flags = node.kind == ValueNodeKind::SCORE ? ValueNode::READS_SCORE : 0;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      uint32_t child = node.children[i];
+      node.flags |= nodes[child].flags & ValueNode::READS_SCORE;
+      if (uses[child] < 2) uses[child]++;
+      // Lazy array callbacks revisit scalar operands for every element.
+      if (valueArray(node.type) && !valueArray(nodes[child].type)) uses[child] = 2;
+    }
+  }
+  for (uint32_t i = 0; i < nodes.size(); i++) {
+    // Columns already cache their document cursor; other leaves are cheaper
+    // to evaluate directly than to look up a memo.
+    if (uses[i] > 1 && nodes[i].kind == ValueNodeKind::FUNCTION) nodes[i].flags |= ValueNode::SHARED;
+  }
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,
@@ -2128,6 +2144,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
+    if (node.flags & ValueNode::SHARED) bound.memo = pool.make<ValueMemo>();
     if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
       bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
@@ -2175,25 +2192,6 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
           bound.bounds = ValueBounds::unbounded(node.type, true);
         }
       }
-    }
-  }
-  std::vector<uint8_t> uses(program.nodes.size());
-  std::vector<bool> readsScore(program.nodes.size());
-  program.walkNodes(program.rootNode, [&](uint32_t index) {
-    const ValueNode& node = program.nodes[index];
-    readsScore[index] = node.kind == ValueNodeKind::SCORE;
-    for (uint8_t i = 0; i < node.childCount; i++) {
-      uint32_t child = node.children[i];
-      readsScore[index] = readsScore[index] || readsScore[child];
-      if (uses[child] < 2) uses[child]++;
-      // Lazy array evaluation revisits scalar operands for every element.
-      if (valueArray(node.type) && !valueArray(program.nodes[child].type)) uses[child] = 2;
-    }
-  });
-  for (uint32_t i = 0; i < nodes.size(); i++) {
-    if (uses[i] > 1) {
-      nodes[i].memo = pool.make<ValueMemo>();
-      nodes[i].memo->needsScore = readsScore[i];
     }
   }
   propagateBounds(ValueBounds::unbounded(ValueType::DOUBLE));
@@ -2315,20 +2313,20 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
       node, bound.iterator->values().valueAt(bound.valueStart));
 }
 
-ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
-  ValueMemo* memo = nodes[index].memo;
-  if (memo == nullptr) return evalUncached(index, docid, score);
-  uint32_t scoreBits = memo->needsScore ? std::bit_cast<uint32_t>(score) : 0;
-  if (memo->docid != docid || memo->scoreBits != scoreBits) {
-    ValueResult result = evalUncached(index, docid, score);
-    memo->result = result;
-    memo->docid = docid;
-    memo->scoreBits = scoreBits;
+ValueResult BoundValueProgram::evalShared(uint32_t index, const ValueNode& node,
+                                         int32_t docid, float score) {
+  ValueMemo& memo = *nodes[index].memo;
+  uint32_t scoreBits = node.flags & ValueNode::READS_SCORE ? std::bit_cast<uint32_t>(score) : 0;
+  if (memo.docid != docid || memo.scoreBits != scoreBits) {
+    ValueResult result = node.function->evalPoint(*this, node, docid, score);
+    memo.result = result;
+    memo.docid = docid;
+    memo.scoreBits = scoreBits;
   }
-  return memo->result;
+  return memo.result;
 }
 
-ValueResult BoundValueProgram::evalUncached(uint32_t index, int32_t docid, float score) {
+ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   switch (node.kind) {
     case ValueNodeKind::CONSTANT:
@@ -2336,7 +2334,9 @@ ValueResult BoundValueProgram::evalUncached(uint32_t index, int32_t docid, float
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
     case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
-    case ValueNodeKind::FUNCTION: return node.function->evalPoint(*this, node, docid, score);
+    case ValueNodeKind::FUNCTION:
+      if (node.flags & ValueNode::SHARED) return evalShared(index, node, docid, score);
+      return node.function->evalPoint(*this, node, docid, score);
   }
   throw std::runtime_error("invalid ValueExpr node");
 }

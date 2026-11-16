@@ -423,13 +423,19 @@ TEST_F(ValueScriptingTest, fieldComponentsFollowTheColumnType) {
   EXPECT_EQ(eval("max(geo_lat(locs_p))"), eval("max(locs_p.lat)"));
   for (auto expression : {"x_i.lat", "x_i.year", "x_i.value", "x_i.min", "x_i.size()"}) {
     expectError(expression, "field 'x_i' of type");
-    expectError(expression, "valid components: none");
+    expectError(expression, "has no components");
   }
-  for (auto expression : {"loc_p.year", "loc_p.lat.x", "col(\"loc_p\").lat.x", "loc_p.getLat()"}) {
+  for (auto expression : {"loc_p.year", "loc_p.getLat()"}) {
     expectError(expression, "field 'loc_p' of type geo_point");
     expectError(expression, "valid components: lat, lon");
   }
-  for (auto expression : {"when_dt.lat", "when_dt.date.year", "when_dt.getYear()", "when_dt.monthOfYear"}) {
+  for (auto expression : {"loc_p.lat.x", "col(\"loc_p\").lat.x"}) {
+    expectError(expression, "only one component may follow");
+  }
+  expectError("when_dt .year", "trailing input");
+  expectError("when_dt. year", "immediately follow");
+  expectError("col(\"when_dt\") .year", "trailing input");
+  for (auto expression : {"when_dt.lat", "when_dt.getYear()", "when_dt.monthOfYear"}) {
     expectError(expression, "field 'when_dt' of type date");
     expectError(expression, "valid components: year, month, day_of_month");
   }
@@ -501,7 +507,7 @@ TEST_F(ValueScriptingTest, geoCoordinates) {
   expectValues("min(locs_p.lon)", {lon(-74), std::nullopt, std::nullopt, std::nullopt, std::nullopt});
   expectError("geo_lat(x_i)", "not a GEO_POINT value");
   expectError("loc_p", "GEO_POINT is not numeric");
-  expectError("x_i.lat", "valid components: none");
+  expectError("x_i.lat", "has no components");
 }
 
 TEST_F(ValueScriptingTest, geoDistancesBetweenPoints) {
@@ -771,7 +777,7 @@ TEST_F(ValueScriptingTest, letDepthIncludesSharedDependencies) {
   int budget = 5;
   ValueExprOptions options{helper.collection().getSchema().get(), {}, &budget};
   ValueExprParser parser(options, *arena);
-  EXPECT_THROW(parser.parse(sharedLetChain("x_i", 5)), std::runtime_error);
+  EXPECT_THROW(parser.parse(sharedLetChain("x_i", 6)), std::runtime_error);
   EXPECT_EQ(5, budget);
   EXPECT_NO_THROW(parser.parse(sharedLetChain("x_i", 3)));
   EXPECT_EQ(5, budget);

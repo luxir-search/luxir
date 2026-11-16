@@ -57,7 +57,7 @@ Every operator has a function spelling: `mod`, `bit_and`, `bit_or`, `bit_xor`,
 ## Field paths and variables
 
 A field path starts with a bare column name or `col("name")`. A dot denotes a
-child of that field. DATE and GEO_POINT columns define these components:
+child of that field and must be adjacent to both path names (no whitespace). DATE and GEO_POINT columns define these components:
 
 | Field type | Components | Equivalent function |
 |---|---|---|

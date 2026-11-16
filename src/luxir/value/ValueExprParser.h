@@ -196,7 +196,7 @@ private:
 
   void analyzeNode(uint32_t index) {
     const ValueNode& node = program->nodes[index];
-    int depth = 1;
+    int depth = 0;
     for (uint8_t i = 0; i < node.childCount; i++) {
       depth = std::max(depth, 1 + depths[node.children[i]]);
     }
@@ -338,7 +338,6 @@ private:
     FieldType* field = target.fieldType;
     const ValueFunction* componentFunction = nullptr;
     size_t componentPos = pos;
-    cur->skipWs();
     if (cur->consume('.')) {
       componentPos = cur->position();
       std::string_view component = value::lex::scanIdentifier(*cur);
@@ -347,13 +346,17 @@ private:
       auto kind = field->type() == FieldType::DATE ? ValueFunction::Kind::DATE
           : field->type() == FieldType::GEO_POINT ? ValueFunction::Kind::GEO_POINT
           : ValueFunction::Kind::NUMERIC;
+      if (component.empty()) fail(componentPos, "a component must immediately follow the dot");
+      std::string valid = ValueFunctionRegistry::componentNames(kind);
+      if (valid.empty()) fail(componentPos, fmt::format(
+          "field '{}' of type {} has no components", name, FieldType::typeName(field->type())));
       componentFunction = ValueFunctionRegistry::findComponent(kind, component);
-      cur->skipWs();
-      if (componentFunction == nullptr || cur->peek() == '.' || cur->peek() == '(') {
-        fail(componentPos, fmt::format(
-            "field '{}' of type {} permits one component; valid components: {}",
-            name, FieldType::typeName(field->type()), ValueFunctionRegistry::componentNames(kind)));
-      }
+      if (componentFunction == nullptr) fail(componentPos, fmt::format(
+          "unknown component '{}' for field '{}' of type {}; valid components: {}",
+          component, name, FieldType::typeName(field->type()), valid));
+      if (cur->peek() == '.') fail(cur->position(), fmt::format(
+          "only one component may follow field '{}'", name));
+      if (cur->peek() == '(') fail(cur->position(), "field components do not take parentheses");
     }
     try {
       field->requireCapability(FieldType::VALUE_EXPR, "value expression", name);

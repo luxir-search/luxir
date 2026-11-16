@@ -118,7 +118,7 @@ inline void evalFunctionBatch(BoundValueProgram& program, const ValueNode& node,
                               std::span<ValueResult> results) {
   for (size_t i = 0; i < docids.size(); i++) {
     float score = scores.empty() ? 0.0f : scores[i];
-    results[i] = program.evalNode((uint32_t)(&node - program.program.nodes.data()), docids[i], score);
+    results[i] = node.function->evalPoint(program, node, docids[i], score);
   }
 }
 

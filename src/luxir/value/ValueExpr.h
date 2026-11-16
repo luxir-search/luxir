@@ -49,6 +49,8 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
+  enum Flag : uint8_t { SHARED = 1, READS_SCORE = 2 };
+  uint8_t flags = 0;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
@@ -170,7 +172,6 @@ struct ValueMemo {
   ValueResult result;
   int32_t docid = -1;
   uint32_t scoreBits = 0;
-  bool needsScore = false;
 };
 
 struct BoundValueNode {
@@ -222,7 +223,7 @@ public:
   int64_t arraySize(uint32_t node, int32_t docid, float score);
 
 private:
-  ValueResult evalUncached(uint32_t node, int32_t docid, float score);
+  ValueResult evalShared(uint32_t index, const ValueNode& node, int32_t docid, float score);
   ValueResult evalColumnSequential(uint32_t node, int32_t docid,
                                    float score);
   bool readColumnSequential(uint32_t node, int32_t docid, int64_t& raw);
