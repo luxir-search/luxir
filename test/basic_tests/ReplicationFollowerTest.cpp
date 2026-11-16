@@ -6,6 +6,7 @@
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
+#include "test/NestedTestData.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
@@ -2340,4 +2341,85 @@ TEST_F(ReplicationFollowerTest, promoteRefusesAnUnreadableDirectory) {
   EXPECT_NE(std::string::npos, refused.second.find("check the path or finish an interrupted copy")) << refused.second;
   EXPECT_EQ(std::string::npos, refused.second.find("reindex"));
 }
+
+TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSchema) {
+  startSource();
+  {
+    CollectionHelper h(*source);
+    nested_test::setSchema(h.collection());
+    for (int batch = 0; batch < 2; batch++) {
+      CollectionHelper::UpdateBuilder input;
+      for (int i = batch * 2; i < batch * 2 + 2; i++) nested_test::add(input, nested_test::DOCS[i]);
+      input.commit(); ASSERT_TRUE(h.submit(input).success);
+    }
+  }
+  startFollower(); ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  auto replica = follower->getCollection("main");
+  auto old = replica->getReaderManager().getReader();
+  ASSERT_EQ(2u, old->segments().size());
+  auto before = replica->getShard()->getSnapshots().snapshot();
+  {
+    CollectionHelper h(*source);
+    ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  auto current = replica->getReaderManager().getReader();
+  ASSERT_EQ(2u, current->segments().size());
+  EXPECT_EQ(old->segments()[1].segmentCoreShared(), current->segments()[1].segmentCoreShared());
+  EXPECT_EQ(old->segments()[0].segmentCoreShared(), current->segments()[0].segmentCoreShared());
+  auto child = current->view("items");
+  EXPECT_NE(child->segments()[0].liveCountBounds().first, child->segments()[0].liveCountBounds().second);
+  auto after = replica->getShard()->getSnapshots().snapshot();
+  uint64_t bytes = 0; size_t files = 0;
+  for (const auto& file : after->files) {
+    if (std::ranges::find(before->files, file) != before->files.end()) continue;
+    bytes += file.size; ++files;
+    EXPECT_NE(std::string::npos, file.name.find("__L")) << file.name;
+  }
+  EXPECT_EQ(1u, files);
+  std::pmr::monotonic_buffer_resource arena;
+  api::ReplicationStatus stats; follower->getFollower()->stats(stats, arena);
+  ASSERT_EQ(1u, stats.collections.size()); EXPECT_EQ(bytes, stats.collections[0].bytes_downloaded);
+  const nested_test::Counts deleted{{"notes",1},{"part_notes",1},{"implicit",1},{"group",1},{"explicit",1},{"exists",2},
+      {"deep",1},{"deep_group",1},{"rows",2},{"rows.up",2},{"parts",1},
+      {"parts.up",1},{"parts.root",1},{"parts.two",1}};
+  EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(1, child->segments()[0].liveCountBounds().first);
+  EXPECT_EQ(1, child->segments()[0].liveCountBounds().second);
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
+  EXPECT_EQ(after->files, replica->getShard()->getSnapshots().snapshot()->files);
+  EXPECT_EQ(after->files, source->getCollection("main")->getShard()->getSnapshots().snapshot()->files);
+  {
+    CollectionHelper h(*source);
+    SchemaBuilder schema;
+    schema.field("later").type = api::FieldDef::FieldClass::NESTED;
+    auto& code = schema.field("later.code");
+    code.type = api::FieldDef::FieldClass::STRING; code.stored = true; code.column = false;
+    schema.set(h.collection());
+    auto req = localReq(source->getSearchEngine());
+    req->topDocs().exprQuery("later:*").countLimit().limit(0);
+    req->execute(1); ASSERT_OK(req); EXPECT_EQ(0, req->getMatchCount());
+    ASSERT_TRUE(caughtUp());
+    auto empty = localReq(follower->getSearchEngine());
+    empty->topDocs().allQuery().countLimit().limit(0).rawOp().domain.emplace().to = "later";
+    empty->execute(1); ASSERT_OK(empty); EXPECT_EQ(0, empty->getMatchCount());
+    CollectionHelper::UpdateBuilder input;
+    nested_test::add(input, R"({"id":"late","later":{"code":"stored"}})");
+    input.commit(); ASSERT_TRUE(h.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  child.reset(); current.reset(); old.reset(); replica.reset(); before.reset(); after.reset();
+  stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  for (auto* node : {source.get(), follower.get()}) {
+    EXPECT_EQ(FieldType::NESTED, node->getCollection("main")->getSchema()->resolveFor("items", OpClass::PRIMARY).fieldType->type());
+    auto req = localReq(node->getSearchEngine());
+    req->topDocs().allQuery().countLimit().fields({"code"}).rawOp().domain.emplace().to = "later";
+    req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+    EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("code", "stored")));
+  }
+}
+
 }
