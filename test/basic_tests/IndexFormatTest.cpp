@@ -96,6 +96,7 @@ uint64_t referenceDigest(Directory& dir) {
   std::vector<std::vector<api::FileDescriptor>> files;
   for (auto& segment : segments) {
     EXPECT_TRUE(segment.overlays.empty());
+    EXPECT_FALSE(segment.merge_rows.has_value());
     segment.commit_time = 0;
     segment.schema = {};
     auto& kept = files.emplace_back();

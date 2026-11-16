@@ -2342,6 +2342,44 @@ TEST_F(ReplicationFollowerTest, promoteRefusesAnUnreadableDirectory) {
   EXPECT_EQ(std::string::npos, refused.second.find("reindex"));
 }
 
+TEST_F(ReplicationFollowerTest, largestSpaceMergeRowsTravelWithManifest) {
+  sourceConfig.index.merge_factor = 10;
+  startSource();
+  {
+    CollectionHelper helper(*source);
+    CollectionHelper::UpdateBuilder input;
+    nested_test::add(input, R"({"id":"a","items_nested":[{},{},{},{},{},{},{},{},{},{},{},{}]})");
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  }
+  startFollower(); ASSERT_TRUE(caughtUp());
+  auto check = [&](size_t segments) {
+    auto leader = source->getCollection("main")->getShard()->getSnapshots().snapshot();
+    auto replica = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+    EXPECT_EQ(*leader->bytes, *replica->bytes);
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = Manifest::decode(replica->bytes, arena);
+    ASSERT_EQ(segments, info.segments.size());
+    EXPECT_EQ(12, info.segments[0].merge_rows);
+    if (segments == 2) { EXPECT_FALSE(info.segments[1].merge_rows); }
+    auto writer = source->getCollection("main")->getShard()->getIndexWriter();
+    auto stats = writer->stats(true, false);
+    ASSERT_EQ(segments, stats.segmentStats.size());
+    auto nested = std::ranges::find(stats.segmentStats, info.segments[0].seg_id, &IndexWriter::SegmentStats::segId);
+    ASSERT_NE(stats.segmentStats.end(), nested);
+    EXPECT_EQ(1, nested->mergeLevel);
+  };
+  check(2);
+  {
+    CollectionHelper helper(*source);
+    CollectionHelper::UpdateBuilder input;
+    input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp()); check(1);
+  stopFollower(); stopSource(); startSource(); startFollower();
+  ASSERT_TRUE(caughtUp()); check(1);
+}
+
 TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSchema) {
   startSource();
   {

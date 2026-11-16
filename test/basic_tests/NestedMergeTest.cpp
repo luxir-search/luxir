@@ -3,6 +3,7 @@
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/SchemaBuilder.h"
 #include "test/QueryBuild.h"
@@ -68,6 +69,53 @@ std::vector<Doc> result(CollectionHelper& helper, std::string_view path, std::st
   std::sort(docs.begin(), docs.end(), [&](const auto& a, const auto& b) { return key(a) < key(b); });
   EXPECT_EQ((int64_t)docs.size(), req->getMatchCount());
   return docs;
+}
+
+TEST(NestedMergeTest, largestSpaceSizesLevelsAndSurvivingOutput) {
+  CollectionHelper helper("nested_levels");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(10);
+  auto rows = [](int32_t count) {
+    std::string out = "[";
+    for (int32_t i = 0; i < count; i++) out += i ? ",{}" : "{}";
+    return out + ']';
+  };
+  auto input = [&](std::initializer_list<std::string> docs) {
+    CollectionHelper::UpdateBuilder batch;
+    for (const auto& doc : docs) add(batch, doc);
+    batch.commit(); ASSERT_TRUE(helper.submit(batch).success);
+  };
+  input({"{\"id\":\"dead\",\"left_nested\":" + rows(100) + ",\"right_nested\":[{}]}",
+         "{\"id\":\"a\",\"left_nested\":[{}],\"right_nested\":" + rows(30) + "}"});
+  input({"{\"id\":\"b\",\"right_nested\":" + rows(20) + "}"});
+  input({R"({"id":"c"})"});
+  auto sizes = [&] {
+    std::vector<int32_t> counts;
+    auto info = readDurableIndexInfo(writer->dir);
+    auto stats = writer->stats(true, false);
+    for (const auto& seg : info.info.segments) {
+      auto count = seg.merge_rows.value_or(seg.max_doc);
+      counts.push_back(count);
+      auto found = std::ranges::find(stats.segmentStats, seg.seg_id, &IndexWriter::SegmentStats::segId);
+      EXPECT_NE(stats.segmentStats.end(), found);
+      if (found != stats.segmentStats.end()) {
+        EXPECT_EQ(writer->mergePolicy->_mergeLevelForRows(count), found->mergeLevel);
+      }
+    }
+    std::sort(counts.begin(), counts.end());
+    return counts;
+  };
+  EXPECT_EQ((std::vector<int32_t>{1, 20, 101}), sizes());
+  ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
+  merge(helper, 2);
+  EXPECT_EQ((std::vector<int32_t>{20, 101}), sizes());
+  merge(helper);
+  EXPECT_EQ((std::vector<int32_t>{50}), sizes());
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ(3, reader->maxDoc());
+  EXPECT_EQ(1, reader->view("left_nested")->maxDoc());
+  EXPECT_EQ(50, reader->view("right_nested")->maxDoc());
 }
 
 TEST(NestedMergeTest, allRepresentationsAndOwnershipMatchFreshSurvivors) {

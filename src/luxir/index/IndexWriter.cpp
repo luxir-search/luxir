@@ -204,6 +204,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
+      seg.mergeRows = segment.merge_rows.value_or(segment.max_doc);
       seg.schema = SchemaBinding(segment.schema);
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
@@ -1471,6 +1472,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                         inverter.getPostingsWriter().creatorEpoch,
                                         inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
+    segInfo->mergeRows = inverter.getPostingsWriter().getMaxSpaceRows();
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2586,6 +2588,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.creator_epoch = seg.creatorEpoch;
     wire.live_epoch = seg.liveEpoch;
     wire.max_doc = seg.maxDoc;
+    if (seg.mergeRows != seg.maxDoc) wire.merge_rows = seg.mergeRows;
     wire.live_gen = seg.liveGen;
     wire.min_version = seg.minVersion;
     wire.max_version = seg.maxVersion;
@@ -2763,9 +2766,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         size_t target = (size_t)msg.maxSegments;
         if (segs.size() > target) {
           std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-            if (a->liveDocs != b->liveDocs) {
-              return a->liveDocs < b->liveDocs;
-            }
+            auto aRows = a->estimatedLiveMergeRows(), bRows = b->estimatedLiveMergeRows();
+            if (aRows != bRows) return aRows < bRows;
             return a->segId < b->segId;
           });
           segs.resize(segs.size() - target + 1);
@@ -2974,6 +2976,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
