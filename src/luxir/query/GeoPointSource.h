@@ -25,6 +25,8 @@ struct GeoPointSource {
   using Reader = BasicBKDReader<PointTraits>;
 
   static constexpr double BOX_MATCH_COST = 2.0;
+  static constexpr double BOX_TEST_POINTS = luxir::BOX_TEST_POINTS;
+  static constexpr double VERIFY_POINTS = PointsMaterialize::VERIFY_POINTS;
   // Testing one point of a crossing leaf against a box, in point emissions.
   // Measured by forcing the BKD for lone boxes under a 35-candidate lead
   // (5M docs, one segment, 2026-10-28): 0.69 ns per emitted point, 1.3 ns
@@ -70,28 +72,6 @@ struct GeoPointSource {
       auto& values, int64_t pointRank) {
     int64_t packed = values.valueAt(pointRank);
     return {geo::unpackLatitude(packed), geo::unpackLongitude(packed)};
-  }
-
-  static void validatePointCount(const Reader& bkd, const IntColReader& column,
-                                 std::string_view queryName) {
-    if (bkd.pointCount() != pointCount(column)) {
-      throw std::runtime_error(std::string(queryName) + ": points/column value count mismatch");
-    }
-  }
-
-  // A box test is two value compares; other relations scale it by their
-  // average test. Multiple points increase the scorer's verification work.
-  static float matchCost(const IntColReader& column, BKDPointCost cost) {
-    float point = (float)(BOX_MATCH_COST * (1.0 + cost.average / BOX_TEST_POINTS));
-    if (onePointPerDoc(column)) return point;
-    int64_t docs = column.docsWithValue();
-    return docs > 0 ? point * (float)pointCount(column) / (float)docs : point;
-  }
-
-  // Verifying a candidate costs a column check plus the relation's average
-  // test extra. The arm comparison uses this flat price for multivalued fields.
-  static double verifyPoints(BKDPointCost cost) {
-    return PointsMaterialize::VERIFY_POINTS + cost.average;
   }
 };
 

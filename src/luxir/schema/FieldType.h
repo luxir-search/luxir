@@ -195,7 +195,12 @@ public:
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
   // Segment flags describe physical structures; schema roles stay in the schema.
-  flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+  flag_type segmentFlags() const {
+    flag_type flags = flags_ & ~(ABSTRACT | DERIVED);
+    // Intervals are logically single-valued; their endpoint column is a pair array.
+    if (type_ == INTERVAL) flags |= MULTI_VALUED | MULTI_ARRAY;
+    return flags;
+  }
   virtual uint32_t segmentTypeFlags() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
@@ -516,9 +521,12 @@ public:
 // The segment column is laid out like a multi-valued int column with two
 // values per document (min, max), so merges, deletes and the column scans
 // reuse that machinery. INDEX_RANGE adds a 2-D points index over (min, max)
-// (RangeBKDWriter).
+// (BasicBKDWriter<BKDInt64Traits>).
 class RangeFieldType : public FieldType {
 public:
+  static constexpr uint32_t ELEMENT_FLAGS_SHIFT = 2;
+  static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_FLAGS_SHIFT) - 1;
+
   // Encoded inclusive bounds; lo > hi never escapes encodeBounds.
   struct Bounds {
     int64_t lo;
@@ -531,14 +539,25 @@ public:
 
   RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
 
+  static Type elementTypeFromFlags(uint32_t flags) {
+    switch (flags & ELEMENT_KIND_MASK) {
+      case 0: return INT;
+      case 1: return DOUBLE;
+      case 2: return DATE;
+      default: throw std::runtime_error("Unknown range element kind");
+    }
+  }
+
   FieldType::Type elementType() const { return element->type(); }
   uint32_t capabilities() const override { return MATCH | RANGE; }
-  // The element type is persisted so segments and schema signatures tell
-  // long_range, double_range and date_range apart: 0, 1 and 2.
+  // Low bits encode the element kind (long, double, date); upper bits carry
+  // the element's persisted parameters.
   uint32_t segmentTypeFlags() const override {
-    return elementType() == FieldType::DOUBLE ? 1u : elementType() == FieldType::DATE ? 2u : 0u;
+    uint32_t kind = elementType() == DOUBLE ? 1u : elementType() == DATE ? 2u : 0u;
+    return kind | (element->segmentTypeFlags() << ELEMENT_FLAGS_SHIFT);
   }
   void signatureProps(SignatureProps& out) const override {
+    element->signatureProps(out);
     out["type"] = "\"" + std::string(typeName()) + "\"";
   }
 

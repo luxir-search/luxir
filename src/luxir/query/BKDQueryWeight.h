@@ -10,6 +10,8 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 
 #include <boost/sort/spreadsort/integer_sort.hpp>
 
@@ -60,8 +62,14 @@ public:
   }
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
+  // A box test is two value compares; other relations scale it by their
+  // average test. Multiple points increase the scorer's verification work.
   float matchCost() override {
-    return PointSource::matchCost(reader, relation.pointCost());
+    float point = (float)(PointSource::BOX_MATCH_COST
+        * (1.0 + relation.pointCost().average / PointSource::BOX_TEST_POINTS));
+    if (PointSource::onePointPerDoc(reader)) return point;
+    int64_t docs = reader.docsWithValue();
+    return docs > 0 ? point * (float)PointSource::pointCount(reader) / (float)docs : point;
   }
 
   int32_t next() override {
@@ -199,9 +207,10 @@ public:
           + (PointSource::CROSSING_POINTS + relation.pointCost().exact) * (double)crossingPoints;
     }
 
-    // The source prices a column check and the relation's average test.
+    // Verifying a candidate costs a column check plus the relation's average
+    // test extra. The arm comparison uses this flat price for multivalued fields.
     double verifyPoints() const {
-      return PointSource::verifyPoints(relation.pointCost());
+      return PointSource::VERIFY_POINTS + relation.pointCost().average;
     }
 
     // Verify or produce the BKD. A consumer that fills windows over an
@@ -400,7 +409,10 @@ public:
         (uint64_t)reader->docsWithValue(), PointSource::pointCount(*reader)};
     if (info->pointsMetaOff != 0) {
       bkd = targetPool.make<Reader>(segment.postingsReader(), *info);
-      PointSource::validatePointCount(*bkd, *reader, QueryType::QUERY_NAME);
+      if (bkd->pointCount() != PointSource::pointCount(*reader)) {
+        throw std::runtime_error(std::string(QueryType::QUERY_NAME)
+            + ": points/column value count mismatch");
+      }
       Relation relation = query.makeRelation();
       estimate = bkd->estimateIntersect(relation);
       if (estimate.upperBound == 0) return nullptr;

@@ -14,7 +14,6 @@
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
 #include "BKDWriter.h"
-#include "RangeBKDWriter.h"
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "StoredDictionaryRegistry.h"
@@ -1991,7 +1990,7 @@ private:
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
-      std::vector<RangeBKDWriter::Point> rangePoints;
+      std::vector<BasicBKDWriter<BKDInt64Traits>::Point> rangePoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
       bool rebuildRange = hasRangePoints(type, allFlags);
       mergeIntCol(space, sortedFields, postingsWriter, outputFieldInfo,
@@ -2000,7 +1999,7 @@ private:
       if (rebuildRange) {
         if (!rangePoints.empty()) {
           auto output = postingsWriter.getOutputStream();
-          RangeBKDWriter writer(*output);
+          BasicBKDWriter<BKDInt64Traits> writer(*output);
           auto data = writer.write(rangePoints);
           assert(data.pointCount * 2 == (uint64_t)outputFieldInfo.numValues);
           outputFieldInfo.pointsLoc = data.pointsLoc;
@@ -2479,7 +2478,7 @@ private:
                    PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
                    std::vector<BKDWriter::Point>* geoPoints,
-                   std::vector<RangeBKDWriter::Point>* rangePoints) {
+                   std::vector<BasicBKDWriter<BKDInt64Traits>::Point>* rangePoints) {
     assert(sortedFields.size() == space.segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();

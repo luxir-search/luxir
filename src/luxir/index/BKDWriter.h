@@ -340,6 +340,27 @@ private:
   }
 
 public:
+  // Peak workspace beyond the input points. Vector capacities have 2x
+  // headroom; pipeline tokens cover encoding scratch as well as queued leaves.
+  static uint64_t workspaceBytes(uint64_t points) {
+    uint64_t leaves = points / DEFAULT_MAX_POINTS_PER_LEAF
+        + (points % DEFAULT_MAX_POINTS_PER_LEAF != 0);
+    if (leaves == 0) return 0;
+    uint64_t directory = (leaves - 1) * sizeof(InnerNode)
+        + leaves * 4 * sizeof(Scalar) + (leaves + 1) * sizeof(uint64_t);
+    uint32_t size = DEFAULT_MAX_POINTS_PER_LEAF;
+    uint64_t docs = BKDForCodec::byteSize(size, 31);
+    uint64_t payload = docs + 2 * CoordinateCodec::byteSize(size, std::numeric_limits<Unsigned>::digits);
+    uint64_t scratch = (uint64_t)size * (sizeof(uint32_t) + sizeof(Unsigned))
+        + docs + CoordinateCodec::encodeScratchBytes(size);
+    // Admission can run outside the eventual execution arena. Its affinity
+    // width bounds every arena width used by emit(), so the estimate covers
+    // the largest pipeline that can execute this writer.
+    uint64_t tokens = std::min(leaves, (uint64_t)4 * computeWidth(oneapi::tbb::info::default_concurrency()));
+    return 64 * 1024 + 2 * directory
+        + tokens * (sizeof(EncodedLeaf) + 2 * (payload + scratch));
+  }
+
   explicit BasicBKDWriter(OutputStream& out) : BasicBKDWriter(out, Options{}) {}
 
   BasicBKDWriter(OutputStream& out, Options options)

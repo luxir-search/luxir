@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "luxir/api/build.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -237,4 +238,87 @@ TEST_F(RangeFieldTest, invalidValuesAndSchemas) {
   other.type = FieldClass::DATE_RANGE;
   other.index = IndexMode::MATCH;
   EXPECT_ANY_THROW(matched.set(helper.collection()));
+}
+
+TEST_F(RangeFieldTest, pairFlagsCountShortcutAndSparseVerification) {
+  ASSERT_TRUE(indexJson({DOCS[0], DOCS[1], DOCS[2], DOCS[3], DOCS[4], DOCS[5]}).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  auto* info = segment.postingsReader().fieldInfo("bkd");
+  ASSERT_NE(nullptr, info);
+  EXPECT_FALSE(helper.collection().getSchema()->getFieldTypePtr("bkd")->multiValued());
+  EXPECT_TRUE(info->flags & FieldType::MULTI_VALUED);
+  EXPECT_TRUE(info->flags & FieldType::MULTI_ARRAY);
+  IntColReader column(segment.postingsReader(), *info);
+  EXPECT_TRUE(column.multiValued());
+  EXPECT_FALSE(column.multiSet());
+  EXPECT_TRUE(RangePointSource::onePointPerDoc(*info));
+  EXPECT_TRUE(RangePointSource::onePointPerDoc(column));
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  RangeFieldQuery query("bkd", RangeFieldQuery::Relation::INTERSECTS, 18, 22);
+  auto* weight = query.createWeight(context, 0);
+  EXPECT_EQ(Query::CountHow::INDEX_WALK, weight->countShortcut(segment, nullptr).how);
+  EXPECT_EQ(3, countForTests(weight, segment));
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  ASSERT_NE(nullptr, supplier);
+  auto* plan = resolveScorerPlanForTests(pool, *supplier, 0);
+  EXPECT_EQ(Query::ReportedTwoPhase::YES, plan->shape().reportedTwoPhase);
+  EXPECT_FALSE(plan->shape().verificationPoints.has_value());
+  SkipStatsScope stats;
+  auto* scorer = plan->build(pool);
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 5}), docs);
+  EXPECT_EQ(1, SkipStats::rangeFieldSparseVerifyArms);
+}
+
+TEST_F(RangeFieldTest, mergeIndexedAndColumnOnlyInputs) {
+  ASSERT_TRUE(indexJson({DOCS[0]}).success);
+  SchemaBuilder changed;
+  auto& field = changed.field("bkd");
+  field.type = FieldClass::LONG_RANGE;
+  field.index = IndexMode::NONE;
+  changed.set(helper.collection());
+  ASSERT_TRUE(indexJson({DOCS[1], DOCS[2]}).success);
+  auto writer = helper.getIndexWriter();
+  auto before = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, before->segments().size());
+  EXPECT_GT(before->field("bkd").at(0)->pointsMetaOff, 0);
+  EXPECT_EQ(0, before->field("bkd").at(1)->pointsMetaOff);
+  EXPECT_EQ((Ids{"a", "b"}), both(R"("gte":18,"lte":22)"));
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  auto merged = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, merged->segments().size());
+  EXPECT_GT(merged->field("bkd").at(0)->pointsMetaOff, 0);
+  EXPECT_EQ((Ids{"a", "b"}), both(R"("gte":18,"lte":22)"));
+  EXPECT_EQ((Ids{"b"}), both(R"("gte":12,"lte":35)", "within"));
+}
+
+TEST_F(RangeFieldTest, elementTypeFlagsAndSignatures) {
+  constexpr uint32_t dateKind = 2;
+  uint32_t nanos = dateKind | (1u << RangeFieldType::ELEMENT_FLAGS_SHIFT);
+  EXPECT_EQ(nanos, FieldType::typeParameters(FieldType::INTERVAL, nanos));
+  EXPECT_EQ("type 'date_range'", FieldType::describeType(FieldType::INTERVAL, dateKind));
+  EXPECT_EQ("type 'date_range' with element type 'date' unit 'ns'",
+            FieldType::describeType(FieldType::INTERVAL, nanos));
+  EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL, RangeFieldType::ELEMENT_KIND_MASK), std::runtime_error);
+  EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL, 1u << RangeFieldType::ELEMENT_FLAGS_SHIFT), std::runtime_error);
+  EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL,
+      dateKind | (2u << RangeFieldType::ELEMENT_FLAGS_SHIFT)), std::runtime_error);
+  RangeFieldType date("when", FieldType::DATE);
+  FieldType::SignatureProps props;
+  date.signatureProps(props);
+  EXPECT_EQ("\"date_range\"", props.at("type"));
+  EXPECT_EQ("\"ms\"", props.at("unit"));
+  EXPECT_EQ(dateKind, date.segmentTypeFlags());
+  SchemaBuilder schema;
+  auto& field = schema.field("spans");
+  field.type = FieldClass::DATE_RANGE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  EXPECT_ANY_THROW(schema.set(helper.collection()));
 }

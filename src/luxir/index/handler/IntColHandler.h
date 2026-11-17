@@ -10,7 +10,6 @@
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IntColWriter.h"
 #include "luxir/index/PointsWriter.h"
-#include "luxir/index/RangeBKDWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/NumericUtils.h"
@@ -97,9 +96,9 @@ inline void writePoints(PostingsWriter& postingsWriter,
 
 inline void writeRangePoints(PostingsWriter& postingsWriter,
                              PostingsWriter::IndexFieldInfo& fieldInfo,
-                             std::vector<RangeBKDWriter::Point>& points) {
+                             std::vector<BasicBKDWriter<BKDInt64Traits>::Point>& points) {
   auto output = postingsWriter.getOutputStream();
-  RangeBKDWriter writer(*output);
+  BasicBKDWriter<BKDInt64Traits> writer(*output);
   auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
@@ -210,7 +209,8 @@ public:
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
+            + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
@@ -344,7 +344,6 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
-    if (fieldType->type() == FieldType::INTERVAL) fieldInfo.flags |= FieldType::MULTI_VALUED;
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -370,9 +369,10 @@ public:
     if (fieldType->rangeIndexed()) {
       if (fieldType->type() == FieldType::INTERVAL) {
         // Values alternate min, max; each doc holds length / 2 points.
-        std::vector<RangeBKDWriter::Point> points;
+        std::vector<BasicBKDWriter<BKDInt64Traits>::Point> points;
         points.reserve((size_t)numVals / 2);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(RangeBKDWriter::Point));
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BasicBKDWriter<BKDInt64Traits>::Point)
+            + BasicBKDWriter<BKDInt64Traits>::workspaceBytes(points.capacity()));
         bool low = true;
         int64_t min = 0;
         longStream.visitValues(inverter.pool, [&](int64_t value) {
@@ -396,7 +396,8 @@ public:
       } else if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
+            + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
