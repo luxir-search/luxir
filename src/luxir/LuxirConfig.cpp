@@ -6,6 +6,7 @@
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
 #include "luxir/reader/SegmentCore.h"
+#include "luxir/query/KnnQuery.h"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -321,6 +322,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "materializes whole, once per file (0 = never)")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("64MB");
+  app.add_option("--knn.scan-window-bytes", knn.scan_window_bytes,
+                 "Flat kNN scans read a lazy (remote) vector file in windows of this size, "
+                 "whole vectors, fetching the next while scoring one")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::PositiveNumber)
+      ->default_str("8MB");
 }
 
 void LuxirConfig::resolveRamBudgets() {
@@ -390,6 +397,7 @@ void LuxirConfig::apply() const {
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
   SegmentCore::maxMaterializeBytes.store(reader.max_materialize_bytes, std::memory_order_relaxed);
+  KnnQuery::tuning.scanWindowBytes = knn.scan_window_bytes;
 }
 
 } // namespace luxir
