@@ -29,10 +29,11 @@ class SegmentCore {
   struct StreamSlot {
     std::atomic<bool> ready{false};
     std::mutex mutex;  // serializes the one materialization of this file only
+    bool warned = false;  // a large lazy materialization was logged (under mutex)
     InputStream stream;
   };
   std::unique_ptr<StreamSlot[]> streams;
-  InputStream materializeStream(uint32_t fnum);
+  InputStream materializeStream(uint32_t fnum, std::string_view caller);
 
   // The part of file 0 that describes the fields of every space: field
   // metadata, offsets tables, counts and the segment info. Opening a segment
@@ -89,6 +90,17 @@ public:
     return total;
   }
 
+  // A lazy file larger than this that is materialized whole (getInputStream)
+  // is logged once per file, so the readers that still take whole files on
+  // remote storage are visible. Set from reader.max-materialize-bytes; zero
+  // logs none.
+  static inline std::atomic<uint64_t> maxMaterializeBytes{64ULL << 20};
+  // Lazy files over maxMaterializeBytes materialized so far, node-wide.
+  static inline std::atomic<int64_t> largeMaterializations{0};
+
+  // The data file's name, for messages.
+  std::string fileName(uint32_t fnum) const;
+
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
     assert(files[fnum] != nullptr);
@@ -97,11 +109,22 @@ public:
 
   // Bulk readers use this: it hands out the whole file, so on a lazy file the
   // first call materializes it. Open-time reads go through getFile()->rangeStream().
-  InputStream getInputStream(uint32_t fnum) {
+  // `caller` (a field name, say) names the reader in the large-materialization warning.
+  InputStream getInputStream(uint32_t fnum, std::string_view caller = {}) {
     assert(fnum < files.size());
     assert(files[fnum] != nullptr);
     StreamSlot& slot = streams[fnum];
-    if (!slot.ready.load(std::memory_order_acquire)) [[unlikely]] return materializeStream(fnum);
+    if (!slot.ready.load(std::memory_order_acquire)) [[unlikely]] return materializeStream(fnum, caller);
+    return slot.stream;
+  }
+
+  // The whole-file stream when it exists already (a resident file, or a lazy
+  // one some reader materialized); never materializes.
+  std::optional<InputStream> residentStream(uint32_t fnum) const {
+    assert(fnum < files.size());
+    assert(files[fnum] != nullptr);
+    const StreamSlot& slot = streams[fnum];
+    if (!slot.ready.load(std::memory_order_acquire)) return std::nullopt;
     return slot.stream;
   }
 
@@ -110,8 +133,8 @@ public:
   int64_t fieldCatalogStart() const noexcept { return catalogStart; }
 
   // return an InputStream positioned on the current location specified
-  InputStream getInputStreamSeek(seg_location sloc) {
-    InputStream is = getInputStream(sloc.filenum());
+  InputStream getInputStreamSeek(seg_location sloc, std::string_view caller = {}) {
+    InputStream is = getInputStream(sloc.filenum(), caller);
     is.seek(sloc.offset());
     return is;
   }

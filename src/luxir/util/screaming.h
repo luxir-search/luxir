@@ -520,6 +520,14 @@ public:
     return nBuckets == 0;
   }
 
+  // Serialized size of a set with nBuckets buckets whose last descriptor is
+  // `last` (ignored when there are none): what precedes its end, so a reader
+  // can fetch exactly the set's bytes by range.
+  static uint64_t serializedBytes(uint16_t nBuckets, const BucketDescriptor& last) {
+    uint64_t bytes = sizeof(uint16_t) + (uint64_t)nBuckets * sizeof(BucketDescriptor);
+    return nBuckets == 0 ? bytes : bytes + last.offset + (uint64_t)blockBytes(last);
+  }
+
   class Iterator {
     const BitSet *set;  // could also try making a direct copy so there's no indirection?
     int32_t curr = -1;
