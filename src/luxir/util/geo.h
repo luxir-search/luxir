@@ -127,8 +127,9 @@ inline bool longitudeInRange(int32_t longitude, int32_t minLongitude,
       : longitude >= minLongitude || longitude <= maxLongitude;
 }
 
-// Inclusive encoded box. Empty quantized boxes use a reversed latitude
-// interval, so the point predicate stays the same for empty and nonempty boxes.
+// Inclusive encoded box. An empty quantized box is one fixed value with a
+// reversed latitude interval, so the point predicate stays the same for empty
+// and nonempty boxes.
 struct EncodedBox {
   int32_t latMin;
   int32_t latMax;
@@ -155,8 +156,10 @@ public:
     lonMin = encodeLongitudeCeil(minLon);
     lonMax = encodeLongitude(maxLon);
     if (noPoints || latMax < latMin || (!wraps && lonMax < lonMin)) {
+      // One representation, so every empty box is the same query.
       latMin = 1;
       latMax = 0;
+      lonMin = lonMax = 0;
     }
   }
 
