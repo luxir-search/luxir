@@ -93,8 +93,10 @@ double arcKilometers(double lat1, double lon1, double lat2, double lon2) {
 }
 
 // Equirectangular approximation: cheap, and accurate for short distances.
+// Longitude takes the short way round, so neighbors across the dateline are near.
 double planeMeters(double lat1, double lon1, double lat2, double lon2) {
-  double x = (lon2 - lon1) * DEGREES_TO_RADIANS * std::cos((lat2 + lat1) / 2.0 * DEGREES_TO_RADIANS);
+  double lon = std::remainder(lon2 - lon1, 360.0);
+  double x = lon * DEGREES_TO_RADIANS * std::cos((lat2 + lat1) / 2.0 * DEGREES_TO_RADIANS);
   double y = (lat2 - lat1) * DEGREES_TO_RADIANS;
   return std::sqrt(x * x + y * y) * geo::EARTH_MEAN_RADIUS_METERS;
 }

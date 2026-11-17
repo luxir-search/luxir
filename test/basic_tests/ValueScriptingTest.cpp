@@ -547,6 +547,10 @@ TEST_F(ValueScriptingTest, geoDistancesBetweenPoints) {
   auto plane = eval("plane_distance(10, 20, 10.01, 20.01)");
   auto arc = eval("arc_distance(10, 20, 10.01, 20.01)");
   EXPECT_NEAR(*arc[0], *plane[0], *arc[0] * 1e-3);
+  // Neighbors across the dateline are near, not a world apart.
+  auto planeWrap = eval("plane_distance(10, 179.995, 10.01, -179.995)");
+  auto arcWrap = eval("arc_distance(10, 179.995, 10.01, -179.995)");
+  EXPECT_NEAR(*arcWrap[0], *planeWrap[0], *arcWrap[0] * 1e-3);
   expectConstant("arc_distance(10, 20, 10, 20)", 0);
   expectConstant("arc_distance(0, 0, 0, 180)", std::numbers::pi * geo::EARTH_MEAN_RADIUS_METERS, 1e-3);
   // Bearings: east, north, south, west.
