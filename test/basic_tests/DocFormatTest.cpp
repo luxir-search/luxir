@@ -266,6 +266,25 @@ TEST_F(DocFormatTest, defaultProjectionScorePlacementFollowsFormat) {
   }
 }
 
+TEST_F(DocFormatTest, zeroScoresArePresentInAScoreColumn) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  auto req = localReq(ch.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"ops":{"q":{"top_docs":{
+    "query":{"constant_score":{"score":0,"query":{"all":true}}},
+    "fields":["id"],"get_scores":true,"limit":-1}}}})", req->mr));
+  req->execute(1);
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  const auto& scores = std::get<api::ColFloat>(dl->columns.find("_score_")->kind);
+  ASSERT_EQ(3u, scores.v.size());
+  for (float score : scores.v) {
+    EXPECT_EQ(0.0f, score);
+    EXPECT_NE(scores.missing_val, score);
+  }
+}
+
 // Discovery reads each segment's own metadata, so a dynamic field held by
 // only one segment appears only on that segment's documents.  Vector columns
 // are never part of the default projection; naming one returns it.

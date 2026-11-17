@@ -1292,6 +1292,9 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
     for (int i = 0; i < columnSize; i++) {
       scores[i] = getScore(batchStart + i);
     }
+    // Every hit has a score, so the sentinel is a value no hit scored.
+    std::vector<uint8_t> present((size_t)columnSize, 1);
+    floatColProto.missing_val = pickMissingVal<ColEmit<float>>({scores, (size_t)columnSize}, present);
   }
 
   loadFields(tg, loaders, runs);
