@@ -18,37 +18,43 @@
 #include <oneapi/tbb/parallel_pipeline.h>
 #include <oneapi/tbb/task_arena.h>
 
-#include "luxir/codec/Codec.h"
+#include "luxir/index/BKDPointTraits.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/util/thread.h"
 
 namespace luxir {
 
-// Typed two-dimensional int32 BKD. A future dimensionality or scalar width is
-// a distinct format specialization, even though the bootstrap records both.
-class BKDWriter {
+// Two-dimensional BKD with typed coordinate layouts and payloads.
+template <class PointTraits>
+class BasicBKDWriter {
 public:
+  using Scalar = typename PointTraits::Scalar;
+  using Unsigned = typename PointTraits::Unsigned;
+  using CoordinateCodec = typename PointTraits::CoordinateCodec;
+  using InnerNode = typename PointTraits::InnerNode;
+  using LeafHeader = typename PointTraits::LeafHeader;
+
   static constexpr uint32_t MAGIC = PointsWriter::MAGIC;
   static constexpr uint16_t VERSION = 1;
-  static constexpr uint8_t FORMAT_KIND = 2;
+  static constexpr uint8_t FORMAT_KIND = PointTraits::FORMAT_KIND;
   static constexpr uint32_t FLAGS = 0;
-  static constexpr uint8_t BYTES_PER_DIM = 4;
+  static constexpr uint8_t BYTES_PER_DIM = sizeof(Scalar);
   static constexpr uint8_t NUM_INDEX_DIMS = 2;
   static constexpr uint8_t NUM_DATA_DIMS = 2;
   static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF =
       PointsWriter::DEFAULT_MAX_POINTS_PER_LEAF;
   // pointCount is at offset 24, and the fixed bootstrap ends at offset 32.
   static constexpr uint32_t FIXED_HEADER_SIZE = 32;
-  static constexpr uint32_t LEAF_HEADER_SIZE = 32;
+  static constexpr uint32_t LEAF_HEADER_SIZE = sizeof(LeafHeader);
   static constexpr uint8_t DOC_CONTIG = PointsWriter::DOC_CONTIG;
   static constexpr uint8_t DOC_FOR = PointsWriter::DOC_FOR;
   static constexpr uint8_t DOC_BITSET = PointsWriter::DOC_BITSET;
   static constexpr uint32_t SPAWN_MIN_POINTS = 32768;
 
   struct Point {
-    int32_t lat;
-    int32_t lon;
+    Scalar dim0;
+    Scalar dim1;
     int32_t docid;
 
     bool operator==(const Point&) const = default;
@@ -81,45 +87,16 @@ public:
     uint64_t pointCount;
   };
 
-  // Logical nodes are 1-indexed in heap order. Stored entry nodeId - 1 holds
-  // nodeId, so there is no unused on-disk entry zero.
-  struct __attribute__((packed)) InnerNode {
-    int32_t splitValue;
-    uint8_t splitDim;
-    uint8_t reserved8;
-    uint16_t reserved16;
-  };
-
-  struct __attribute__((packed)) LeafHeader {
-    uint16_t count;
-    uint8_t docCodec;
-    uint8_t docBits;
-    uint8_t latBits;
-    uint8_t lonBits;
-    uint16_t reserved;
-    uint32_t docBase;
-    uint32_t docBytes;
-    int32_t latMin;
-    int32_t lonMin;
-    uint32_t latBytes;
-    uint32_t reserved2;
-  };
-
   static_assert(sizeof(FixedHeader) == FIXED_HEADER_SIZE);
   static_assert(offsetof(FixedHeader, pointCount) == 24);
-  static_assert(sizeof(InnerNode) == 8);
-  static_assert(offsetof(InnerNode, splitDim) == 4);
-  static_assert(sizeof(LeafHeader) == LEAF_HEADER_SIZE);
-  static_assert(offsetof(LeafHeader, docBase) == 8);
-  static_assert(offsetof(LeafHeader, latMin) == 16);
 
 private:
   struct EncodedLeaf {
     uint32_t leaf;
     LeafHeader header;
     std::vector<char> docs;
-    std::vector<char> lat;
-    std::vector<char> lon;
+    std::vector<char> dim0;
+    std::vector<char> dim1;
   };
 
   OutputStream& out;
@@ -129,10 +106,10 @@ private:
   uint64_t totalPoints = 0;
   uint32_t totalLeaves = 0;
   std::vector<InnerNode> innerNodes;
-  std::vector<int32_t> minLat;
-  std::vector<int32_t> maxLat;
-  std::vector<int32_t> minLon;
-  std::vector<int32_t> maxLon;
+  std::vector<Scalar> min0;
+  std::vector<Scalar> max0;
+  std::vector<Scalar> min1;
+  std::vector<Scalar> max1;
   std::vector<uint64_t> leafPointers;
 
   static uint32_t numLeftLeaves(uint32_t leaves) {
@@ -142,58 +119,42 @@ private:
          + std::min(leaves - floorPower, floorPower / 2);
   }
 
-  static std::pair<uint32_t, uint32_t>
+  static std::pair<Unsigned, Unsigned>
   dimSpans(std::span<const Point> points) {
-    int32_t minLat = points.front().lat;
-    int32_t maxLat = minLat;
-    int32_t minLon = points.front().lon;
-    int32_t maxLon = minLon;
+    Scalar min0 = points.front().dim0;
+    Scalar max0 = min0;
+    Scalar min1 = points.front().dim1;
+    Scalar max1 = min1;
     for (const Point& point : points) {
-      minLat = std::min(minLat, point.lat);
-      maxLat = std::max(maxLat, point.lat);
-      minLon = std::min(minLon, point.lon);
-      maxLon = std::max(maxLon, point.lon);
+      min0 = std::min(min0, point.dim0);
+      max0 = std::max(max0, point.dim0);
+      min1 = std::min(min1, point.dim1);
+      max1 = std::max(max1, point.dim1);
     }
-    return {(uint32_t)maxLat - (uint32_t)minLat,
-            (uint32_t)maxLon - (uint32_t)minLon};
+    return {(Unsigned)max0 - (Unsigned)min0,
+            (Unsigned)max1 - (Unsigned)min1};
   }
 
   static bool lessByDim(const Point& a, const Point& b, uint8_t dim) {
-    int32_t aDim = dim == 0 ? a.lat : a.lon;
-    int32_t bDim = dim == 0 ? b.lat : b.lon;
+    Scalar aDim = dim == 0 ? a.dim0 : a.dim1;
+    Scalar bDim = dim == 0 ? b.dim0 : b.dim1;
     if (aDim != bDim) return aDim < bDim;
-    int32_t aOther = dim == 0 ? a.lon : a.lat;
-    int32_t bOther = dim == 0 ? b.lon : b.lat;
+    Scalar aOther = dim == 0 ? a.dim1 : a.dim0;
+    Scalar bOther = dim == 0 ? b.dim1 : b.dim0;
     if (aOther != bOther) return aOther < bOther;
     return a.docid < b.docid;
   }
 
-  static void encode(std::span<uint32_t> values, uint8_t bits,
-                     std::vector<char>& target) {
-    uint64_t bytes = LuxirSIMDFor::byteSize((uint32_t)values.size(), bits);
-    if (bytes > std::numeric_limits<uint32_t>::max()) {
-      throw std::overflow_error("BKDWriter: encoded leaf exceeds uint32");
-    }
-    target.resize((size_t)bytes);
-    uint32_t encodedSize = (uint32_t)target.size();
-    IndexCodec::numericCodec.encodeWithMeta(
-        values.data(), (uint32_t)values.size(), target.data(), encodedSize, 0,
-        bits);
-    if (encodedSize != bytes) {
-      throw std::runtime_error("BKDWriter: codec byte length mismatch");
-    }
-  }
-
   static void encodeDimension(std::span<const Point> points, uint8_t dim,
-                              int32_t min, uint8_t bits,
-                              std::vector<uint32_t>& scratch,
+                              Scalar min, uint8_t bits,
+                              std::vector<Unsigned>& scratch,
                               std::vector<char>& target) {
     scratch.resize(points.size());
     for (size_t i = 0; i < points.size(); i++) {
-      int32_t value = dim == 0 ? points[i].lat : points[i].lon;
-      scratch[i] = (uint32_t)value - (uint32_t)min;
+      Scalar value = dim == 0 ? points[i].dim0 : points[i].dim1;
+      scratch[i] = (Unsigned)value - (Unsigned)min;
     }
-    encode(scratch, bits, target);
+    CoordinateCodec::encode(scratch, bits, target);
   }
 
   static void encodeDocids(std::span<const Point> points, LeafHeader& header,
@@ -231,7 +192,7 @@ private:
       maxDocid = std::max(maxDocid, docid);
     }
     header.docBits = (uint8_t)std::bit_width(maxResidual);
-    encode(scratch, header.docBits, encodedDocs);
+    BKDForCodec::encode(scratch, header.docBits, encodedDocs);
 
     uint64_t firstWord = (uint64_t)docBase >> 6;
     uint64_t lastWord = (uint64_t)maxDocid >> 6;
@@ -255,25 +216,25 @@ private:
                                           uint32_t leaf) {
     if (points.empty()) throw std::logic_error("BKDWriter: empty leaf");
 
-    int32_t loLat = points.front().lat;
-    int32_t hiLat = loLat;
-    int32_t loLon = points.front().lon;
-    int32_t hiLon = loLon;
+    Scalar lo0 = points.front().dim0;
+    Scalar hi0 = lo0;
+    Scalar lo1 = points.front().dim1;
+    Scalar hi1 = lo1;
     for (const Point& point : points) {
-      loLat = std::min(loLat, point.lat);
-      hiLat = std::max(hiLat, point.lat);
-      loLon = std::min(loLon, point.lon);
-      hiLon = std::max(hiLon, point.lon);
+      lo0 = std::min(lo0, point.dim0);
+      hi0 = std::max(hi0, point.dim0);
+      lo1 = std::min(lo1, point.dim1);
+      hi1 = std::max(hi1, point.dim1);
     }
-    minLat[leaf] = loLat;
-    maxLat[leaf] = hiLat;
-    minLon[leaf] = loLon;
-    maxLon[leaf] = hiLon;
+    min0[leaf] = lo0;
+    max0[leaf] = hi0;
+    min1[leaf] = lo1;
+    max1[leaf] = hi1;
 
     std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
       if (a.docid != b.docid) return a.docid < b.docid;
-      if (a.lat != b.lat) return a.lat < b.lat;
-      return a.lon < b.lon;
+      if (a.dim0 != b.dim0) return a.dim0 < b.dim0;
+      return a.dim1 < b.dim1;
     });
 
     auto encoded = std::make_unique<EncodedLeaf>(
@@ -281,8 +242,8 @@ private:
     LeafHeader& header = encoded->header;
     header.count = (uint16_t)points.size();
     header.reserved = 0x1111;
-    header.latMin = loLat;
-    header.lonMin = loLon;
+    header.min0 = lo0;
+    header.min1 = lo1;
     header.reserved2 = 0x11111111;
     std::vector<uint32_t> scratch;
     std::vector<uint64_t> docWords;
@@ -290,13 +251,14 @@ private:
                  encoded->docs);
     header.docBytes = (uint32_t)encoded->docs.size();
 
-    uint32_t latRange = (uint32_t)hiLat - (uint32_t)loLat;
-    uint32_t lonRange = (uint32_t)hiLon - (uint32_t)loLon;
-    header.latBits = (uint8_t)std::bit_width(latRange);
-    header.lonBits = (uint8_t)std::bit_width(lonRange);
-    encodeDimension(points, 0, loLat, header.latBits, scratch, encoded->lat);
-    encodeDimension(points, 1, loLon, header.lonBits, scratch, encoded->lon);
-    header.latBytes = (uint32_t)encoded->lat.size();
+    Unsigned range0 = (Unsigned)hi0 - (Unsigned)lo0;
+    Unsigned range1 = (Unsigned)hi1 - (Unsigned)lo1;
+    header.bits0 = (uint8_t)std::bit_width(range0);
+    header.bits1 = (uint8_t)std::bit_width(range1);
+    std::vector<Unsigned> residuals;
+    encodeDimension(points, 0, lo0, header.bits0, residuals, encoded->dim0);
+    encodeDimension(points, 1, lo1, header.bits1, residuals, encoded->dim1);
+    header.bytes0 = (uint32_t)encoded->dim0.size();
     return encoded;
   }
 
@@ -310,18 +272,18 @@ private:
       throw std::logic_error("BKDWriter: invalid derived tree partition");
     }
 
-    auto [latSpan, lonSpan] = dimSpans(points);
+    auto [dim0Span, dim1Span] = dimSpans(points);
     // Equal spans alternate away from the parent's split dimension. At the
-    // root lastSplitDim is lon, so an equal root chooses lat.
-    uint8_t splitDim = latSpan == lonSpan
+    // root lastSplitDim is dim1, so an equal root chooses dim0.
+    uint8_t splitDim = dim0Span == dim1Span
         ? (uint8_t)(lastSplitDim ^ 1)
-        : (latSpan > lonSpan ? 0 : 1);
+        : (dim0Span > dim1Span ? 0 : 1);
     std::nth_element(points.begin(), points.begin() + leftPoints, points.end(),
                      [splitDim](const Point& a, const Point& b) {
                        return lessByDim(a, b, splitDim);
                      });
-    int32_t splitValue = splitDim == 0
-        ? points[leftPoints].lat : points[leftPoints].lon;
+    Scalar splitValue = splitDim == 0
+        ? points[leftPoints].dim0 : points[leftPoints].dim1;
     if (nodeId == 0 || nodeId > innerNodes.size()) {
       throw std::logic_error("BKDWriter: invalid heap node id");
     }
@@ -372,15 +334,15 @@ private:
                   (uint64_t)(out.size() - pointsStart);
               out.write(&encoded->header, sizeof(encoded->header));
               out.write(encoded->docs.data(), encoded->docs.size());
-              out.write(encoded->lat.data(), encoded->lat.size());
-              out.write(encoded->lon.data(), encoded->lon.size());
+              out.write(encoded->dim0.data(), encoded->dim0.size());
+              out.write(encoded->dim1.data(), encoded->dim1.size());
             }));
   }
 
 public:
-  explicit BKDWriter(OutputStream& out) : BKDWriter(out, Options{}) {}
+  explicit BasicBKDWriter(OutputStream& out) : BasicBKDWriter(out, Options{}) {}
 
-  BKDWriter(OutputStream& out, Options options)
+  BasicBKDWriter(OutputStream& out, Options options)
       : out(out), pointsStart(out.size()), options(options) {
     static_assert(std::endian::native == std::endian::little);
     if (options.maxPointsPerLeaf == 0) {
@@ -404,10 +366,10 @@ public:
     }
     totalLeaves = (uint32_t)leafCount64;
     innerNodes.resize(totalLeaves - 1);
-    minLat.resize(totalLeaves);
-    maxLat.resize(totalLeaves);
-    minLon.resize(totalLeaves);
-    maxLon.resize(totalLeaves);
+    min0.resize(totalLeaves);
+    max0.resize(totalLeaves);
+    min1.resize(totalLeaves);
+    max1.resize(totalLeaves);
     leafPointers.resize((size_t)totalLeaves + 1);
 
     partition(points, totalLeaves, 1, 1);
@@ -422,15 +384,17 @@ public:
     out.write(&header, sizeof(header));
     out.align(MAX_ALIGN);
     out.write(innerNodes.data(), innerNodes.size() * sizeof(InnerNode));
-    out.write(minLat.data(), minLat.size() * sizeof(int32_t));
-    out.write(maxLat.data(), maxLat.size() * sizeof(int32_t));
-    out.write(minLon.data(), minLon.size() * sizeof(int32_t));
-    out.write(maxLon.data(), maxLon.size() * sizeof(int32_t));
+    out.write(min0.data(), min0.size() * sizeof(Scalar));
+    out.write(max0.data(), max0.size() * sizeof(Scalar));
+    out.write(min1.data(), min1.size() * sizeof(Scalar));
+    out.write(max1.data(), max1.size() * sizeof(Scalar));
     out.write(leafPointers.data(), leafPointers.size() * sizeof(uint64_t));
     finished = true;
     return {seg_location(out.streamNumber, pointsStart), (int64_t)metaOffset,
             totalPoints, totalLeaves};
   }
 };
+
+using BKDWriter = BasicBKDWriter<BKDInt32Traits>;
 
 } // namespace luxir

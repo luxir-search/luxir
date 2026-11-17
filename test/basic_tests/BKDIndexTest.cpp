@@ -59,10 +59,10 @@ void expectRoundTrip(std::span<const Point> points,
     std::vector<std::tuple<int32_t, int32_t, int32_t>> expected;
     std::vector<std::tuple<int32_t, int32_t, int32_t>> actual;
     for (const Point& point : points) {
-      expected.emplace_back(point.lat, point.lon, point.docid);
+      expected.emplace_back(point.dim0, point.dim1, point.docid);
     }
     for (const BKDReader::Point& point : reader.readAll()) {
-      actual.emplace_back(point.lat, point.lon, point.docid);
+      actual.emplace_back(point.dim0, point.dim1, point.docid);
     }
     std::sort(expected.begin(), expected.end());
     std::sort(actual.begin(), actual.end());
@@ -337,8 +337,8 @@ TEST_F(BKDIndexTest, randomizedBoxOracleWrappedBoundsAndCount) {
     boxes.emplace_back(INT32_MIN, INT32_MAX, INT32_MIN, INT32_MAX);
     boxes.emplace_back(geo::encodeLatitude(-10), geo::encodeLatitude(10),
                        geo::encodeLongitude(170), geo::encodeLongitude(-170));
-    boxes.emplace_back(points[5].lat, points[5].lat,
-                       points[5].lon, points[5].lon);
+    boxes.emplace_back(points[5].dim0, points[5].dim0,
+                       points[5].dim1, points[5].dim1);
     boxes.emplace_back(geo::encodeLatitude(89), geo::encodeLatitude(89),
                        geo::encodeLongitude(0), geo::encodeLongitude(0));
     boxes.emplace_back(geo::encodeLatitude(-90), geo::encodeLatitude(90),
@@ -361,13 +361,13 @@ TEST_F(BKDIndexTest, randomizedBoxOracleWrappedBoundsAndCount) {
     int32_t tightCrosses = 0;
     std::set<std::array<int32_t, 4>> tightBounds;
     for (uint32_t leaf = 0; leaf < reader.leafCount(); leaf++) {
-      tightBounds.insert({reader.leafMinLat(leaf), reader.leafMaxLat(leaf),
-                          reader.leafMinLon(leaf), reader.leafMaxLon(leaf)});
+      tightBounds.insert({reader.leafMin0(leaf), reader.leafMax0(leaf),
+                          reader.leafMin1(leaf), reader.leafMax1(leaf)});
     }
     for (const BKDBoxRelation& box : boxes) {
       std::vector<int32_t> expected;
       for (const Point& point : points) {
-        if (box.matches(point.lat, point.lon)) expected.push_back(point.docid);
+        if (box.matches(point.dim0, point.dim1)) expected.push_back(point.docid);
       }
       std::sort(expected.begin(), expected.end());
 
@@ -423,7 +423,7 @@ TEST_F(BKDIndexTest, insideSubtreeCountsFromFullLeaves) {
       auto check = [&](auto&& relation) {
         uint64_t expected = 0;
         for (const Point& point : points) {
-          expected += relation.matches(point.lat, point.lon);
+          expected += relation.matches(point.dim0, point.dim1);
         }
         EXPECT_EQ(expected, reader.countIntersect(relation, scratch).exactCount);
         auto estimate = reader.estimateIntersect(relation);
@@ -439,12 +439,12 @@ TEST_F(BKDIndexTest, insideSubtreeCountsFromFullLeaves) {
       for (int32_t i = 0; i + 1 < size; i += 3) {
         const Point& a = points[i];
         const Point& b = points[size - 1 - i];
-        check(BKDBoxRelation(std::min(a.lat, b.lat), std::max(a.lat, b.lat),
-                             std::min(a.lon, b.lon), std::max(a.lon, b.lon)));
-        double latA = geo::decodeLatitude(a.lat);
-        double lonA = geo::decodeLongitude(a.lon);
+        check(BKDBoxRelation(std::min(a.dim0, b.dim0), std::max(a.dim0, b.dim0),
+                             std::min(a.dim1, b.dim1), std::max(a.dim1, b.dim1)));
+        double latA = geo::decodeLatitude(a.dim0);
+        double lonA = geo::decodeLongitude(a.dim1);
         double radius = geo::haversinMeters(latA, lonA,
-            geo::decodeLatitude(b.lat), geo::decodeLongitude(b.lon));
+            geo::decodeLatitude(b.dim0), geo::decodeLongitude(b.dim1));
         check(BKDDistanceRelation(latA, lonA, radius));
         check(BKDDistanceRelation(latA, lonA, 4000000.0 + i * 100000.0));
       }
