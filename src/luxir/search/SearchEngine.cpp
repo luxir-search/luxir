@@ -177,6 +177,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
+  if (req.waitCancellation.stop_possible()) req.io.stop = req.waitCancellation.get_token();
   metrics().start(metricActivity(MetricStage::SEARCH));
   if (!req.proto.min_commit.empty()) {
     try {

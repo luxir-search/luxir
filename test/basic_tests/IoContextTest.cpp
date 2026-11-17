@@ -309,11 +309,14 @@ TEST(IoContextTest, boundWorkRestoresTheContextOfTheThreadThatRunsIt) {
   IoContext io = context(3, &counters);
   io.deadline = std::chrono::steady_clock::now();
   io.fillCache = false;
+  std::stop_source cancel;
+  io.stop = cancel.get_token();
   auto shared = io.shared();
   EXPECT_EQ(3u, shared.queryId);
   EXPECT_EQ(&counters, shared.counters);
   EXPECT_FALSE(shared.hasDeadline());
   EXPECT_TRUE(shared.fillCache);
+  EXPECT_FALSE(shared.stop.stop_possible());
 }
 
 // A search over a collection on lazily read storage reports the requests and

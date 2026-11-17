@@ -4,8 +4,10 @@
 #pragma once
 
 #include <cassert>
+#include <condition_variable>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <tbb/task_arena.h>
 #include <tbb/task_group.h>
@@ -30,6 +32,10 @@ class SharedLazyBuild {
   tbb::task_group group{context};
   Pointer value;
   std::exception_ptr error;
+  // Set once value or error is, for waiters bounded by their request.
+  std::mutex finishedMutex;
+  std::condition_variable_any finishedChanged;
+  bool finished = false;
 
 #ifndef NDEBUG
   struct ActiveBuild;
@@ -74,6 +80,11 @@ public:
       } catch (...) {
         error = std::current_exception();
       }
+      {
+        std::lock_guard lock(finishedMutex);
+        finished = true;
+      }
+      finishedChanged.notify_all();
     });
   }
 
@@ -83,10 +94,26 @@ public:
     return result();
   }
 
+  // Waits for the builder's outcome. A waiter working for a request with a
+  // deadline or a stop token waits no longer than its request: it leaves
+  // with a fetch_timeout or cancelled error while the build goes on for the
+  // others.
   Pointer wait() {
     checkRecursion();
     Signal::emit("sharedLazyBuildWait", this);
-    group.wait();
+    const IoContext* io = IoContext::current();
+    if (!io || (!io->hasDeadline() && !io->stop.stop_possible())) {
+      group.wait();
+      return result();
+    }
+    std::unique_lock lock(finishedMutex);
+    auto done = [this] { return finished; };
+    if (!(io->hasDeadline() ? finishedChanged.wait_until(lock, io->stop, io->deadline, done)
+                            : finishedChanged.wait(lock, io->stop, done))) {
+      if (io->stopRequested()) throw RequestCancelledError();
+      throw ApiError(ErrorKind::UNAVAILABLE, "fetch_timeout",
+                     "the request's deadline passed while it waited for a build shared with other requests");
+    }
     return result();
   }
 };

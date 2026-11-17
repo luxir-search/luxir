@@ -7,8 +7,11 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <stop_token>
 #include <string_view>
 #include <utility>
+
+#include "ApiError.h"
 
 namespace luxir {
 
@@ -69,12 +72,14 @@ inline constinit thread_local const IoContext* currentIoContext = nullptr;
 ///   if (const auto* io = luxir::IoContext::current()) {
 ///     if (!io->fillCache) ...;                // a scan: do not admit into a cache
 ///     if (io->remaining() < hedgeAfter) ...;  // little time left: hedge now
+///     if (io->stopRequested()) ...;           // the client is gone: stop waiting
 ///     io->countFetch(bytes);                  // a request the layer issued itself
 ///   }
 ///
 /// A context is a small value: tasks copy it, so a nested IoScope over a
 /// modified copy (a scan inside a request, say) is cheap and never outlived.
-/// Only `counters` points at request-owned state.
+/// Only `counters` points at request-owned state, and `stop` shares the
+/// request's stop state.
 struct IoContext {
   using Clock = std::chrono::steady_clock;
 
@@ -86,8 +91,15 @@ struct IoContext {
   std::string_view requestId;
   // When the client stops waiting; Clock::time_point::max() when it set no
   // deadline. A hint for hedging and for giving up on a slow request early:
-  // core never fails a read on it.
+  // core never fails a read on it. Fetches ahead of a search pass it as
+  // their ReadDeadline, and a wait on work shared with other requests (a
+  // SharedLazyBuild) ends at it. A layer may read it here as its own fetch
+  // deadline.
   Clock::time_point deadline = Clock::time_point::max();
+  // Requested when the client cancelled the request or the server is
+  // stopping; empty when nothing can cancel it. Core checks it between the
+  // stages of a search; a layer may stop waiting for a fetch on it.
+  std::stop_token stop;
   // False when the reads should not fill a cache: they are expected not to
   // repeat (a scan or a bulk export), so admitting them would evict data that
   // will be read again. A hint; a read must return the same bytes either way.
@@ -105,6 +117,7 @@ struct IoContext {
   }
 
   bool hasDeadline() const { return deadline != Clock::time_point::max(); }
+  bool stopRequested() const { return stop.stop_requested(); }
   /// Time left before the deadline (negative once passed); max() without one.
   Clock::duration remaining(Clock::time_point now = Clock::now()) const {
     return hasDeadline() ? deadline - now : Clock::duration::max();
@@ -126,13 +139,21 @@ struct IoContext {
 
   /// The context for work shared with other requests (a SharedLazyBuild):
   /// its reads still count for the request that does them, but no one
-  /// request's deadline or fill hint applies to a result everyone takes.
+  /// request's deadline, cancellation or fill hint applies to a result
+  /// everyone takes.
   IoContext shared() const {
     IoContext io = *this;
     io.deadline = Clock::time_point::max();
+    io.stop = {};
     io.fillCache = true;
     return io;
   }
+};
+
+/// The request was cancelled (IoContext::stop) before it finished.
+class RequestCancelledError : public ApiError {
+public:
+  RequestCancelledError() : ApiError(ErrorKind::UNAVAILABLE, "cancelled", "the request was cancelled") {}
 };
 
 /// Installs a context on this thread for the scope and restores the previous

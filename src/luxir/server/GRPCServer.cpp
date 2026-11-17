@@ -777,10 +777,10 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       left < std::chrono::hours(24 * 365)) {
     req.io.deadline = startTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(left);
   }
-  if (!req.proto.min_commit.empty()) {
-    call.enableWaitCancellation();
-    req.waitCancellation = call.waitCancellation;
-  }
+  // A client cancel (or a server stop) ends the request's waits: a min_commit
+  // wait, a fetch ahead, a wait on a shared build (IoContext::stop).
+  call.enableWaitCancellation();
+  req.waitCancellation = call.waitCancellation;
   // Every search leaves this completion-queue thread for the task arena (see
   // SearchEngine::Receiver): gRPC offers a connection's new calls to its
   // preferred cq first, so a query run here would serialize the concurrent
