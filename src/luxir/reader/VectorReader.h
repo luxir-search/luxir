@@ -18,16 +18,41 @@ namespace luxir {
 /// For single-valued fields, vectorAt(docRank) returns one span per doc.
 /// For multi-valued, valueRange(docRank) gives [startValueRank, endValueRank) and
 /// vectorAtRank(r) returns the r-th vector in the flat per-segment list.
+///
+/// Values::DEFERRED (query paths) never materializes a lazy vector file:
+/// vectorAtRank() then fetches the one vector, and a scan reads window(begin,
+/// end) runs, declaring the next one with windowRange() ahead of use.  WHOLE
+/// (the default) maps the whole column, which on a lazy file fetches all of it.
 class VectorReader {
   StrColReader strCol_;
   int32_t dims_;
 
 public:
-  VectorReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-    : strCol_(postingsReader, fieldInfo),
+  using Values = StrColReader::Values;
+
+  VectorReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo, Values values = Values::WHOLE)
+    : strCol_(postingsReader, fieldInfo, values),
       dims_(strCol_.fixedValueSize() / (int32_t)sizeof(float)) {
     assert(strCol_.isFixedSize());
     assert(strCol_.fixedValueSize() % (int32_t)sizeof(float) == 0);
+  }
+
+  /// True when vectors are read by range from a lazy file.
+  bool deferred() const { return strCol_.valuesDeferred(); }
+
+  /// The file holding the vectors.
+  InputFile* file() const { return strCol_.valuesFile(); }
+
+  /// Bytes per vector.
+  int64_t vectorBytes() const { return strCol_.fixedValueSize(); }
+
+  /// File range of vector ranks [begin, end), for prefetchRanges().
+  ByteRange windowRange(int64_t begin, int64_t end) const { return strCol_.valuesRange(begin, end); }
+
+  /// Vectors [begin, end) as one contiguous block, valid while the file lives:
+  /// a slice of the mapping on a resident file, one range read when deferred.
+  const float* window(int64_t begin, int64_t end) const {
+    return (const float*)strCol_.valuesWindow(begin, end).ptr();
   }
 
   int32_t dims() const { return dims_; }
