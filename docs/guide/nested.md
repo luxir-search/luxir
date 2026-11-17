@@ -39,6 +39,13 @@ qualified names; a dot separates path components:
   underscores. A physical name, including a generated `__variant` suffix, must
   fit in 127 bytes.
 
+A nested path stores a reverse map from each child row to its owner, about
+one byte per child row. It speeds up joins led by a selective child query,
+whose matching rows are scattered across owners. `"items": {"type": "nested",
+"reverse_map": false}` leaves it out; each nested path has its own setting and
+a template can carry it. A change applies to segments written afterwards,
+merges included, and never changes results.
+
 See [Schema and fields](schema.md#nested-paths-and-qualified-field-names) for
 where these declarations sit in a schema.
 

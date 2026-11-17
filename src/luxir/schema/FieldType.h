@@ -292,7 +292,10 @@ public:
 
 class NestedFieldType final : public FieldType {
 public:
-  explicit NestedFieldType(std::string_view name) : FieldType(name, NESTED, 0) {}
+  bool reverseMap;
+
+  explicit NestedFieldType(std::string_view name, bool reverseMap = true)
+      : FieldType(name, NESTED, 0), reverseMap(reverseMap) {}
 };
 
 class TextFieldType : public FieldType {

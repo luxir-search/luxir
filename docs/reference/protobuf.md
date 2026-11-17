@@ -182,6 +182,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
+- [`RowSpaceStats`](#message-luxir.rowspacestats)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
@@ -1066,6 +1067,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.reverse_map"></a>[`reverse_map`](#field-luxir.fielddef.reverse_map) | 30 | `bool` | optional | NESTED only. Store child-to-owner row lookups in segments written later. Unset inherits, else true. Changing it does not rewrite existing segments. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -2142,6 +2144,19 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
+<a id="message-luxir.rowspacestats"></a>
+
+### luxir.RowSpaceStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rowspacestats.path"></a>[`path`](#field-luxir.rowspacestats.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.rowspacestats.max_doc"></a>[`max_doc`](#field-luxir.rowspacestats.max_doc) | 2 | `int32` | singular | physical child rows, including rows of deleted roots |
+| <a id="field-luxir.rowspacestats.ends_bytes"></a>[`ends_bytes`](#field-luxir.rowspacestats.ends_bytes) | 3 | `uint64` | singular | payload, alignment and block directory |
+| <a id="field-luxir.rowspacestats.owners_bytes"></a>[`owners_bytes`](#field-luxir.rowspacestats.owners_bytes) | 4 | `uint64` | singular | zero when the reverse map is absent |
+
 <a id="message-luxir.rrffusion"></a>
 
 ### luxir.RrfFusion
@@ -2301,6 +2316,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.merge_level"></a>[`merge_level`](#field-luxir.segmentstats.merge_level) | 12 | `uint32` | singular |  |
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.segmentstats.spaces"></a>[`spaces`](#field-luxir.segmentstats.spaces) | 15 | [`RowSpaceStats`](#message-luxir.rowspacestats) | repeated | non-root spaces; bytes already included in the segment |
 
 <a id="message-luxir.servicestats"></a>
 

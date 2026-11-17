@@ -42,6 +42,13 @@ public:
     return range(owner, owner + 1);
   }
 
+  // Random lookups use each level's reverse map when present. Forward walks
+  // use Cursor to retain family boundaries instead.
+  int32_t owner(int32_t child) const {
+    for (auto it = shapes.rbegin(); it != shapes.rend(); ++it) child = (*it)->owner(child);
+    return child;
+  }
+
   // Compose one boundary run into the descendant space without retaining
   // intermediate rows or decoding the gaps between sampled frames.
   void readBoundaries(int32_t first, int32_t end, std::span<int64_t> out) const {

@@ -9,6 +9,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 
 namespace luxir::test {
 namespace {
@@ -407,6 +408,12 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
     std::cerr << "NestedJoinRandomTest seed=" << seed << '\n';
     helper.clear(); model.clear(); nextTag = 0; state = seed;
     helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    auto setting = [&](bool reverse) {
+      SchemaBuilder schema;
+      auto& outer = schema.templ("_nested"); outer.type = api::FieldDef::FieldClass::NESTED; outer.reverse_map = reverse;
+      auto& inner = schema.field("items_nested.parts_nested"); inner.type = api::FieldDef::FieldClass::NESTED; inner.reverse_map = !reverse;
+      schema.set(helper.collection());
+    };
     auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
         .maxBytes = 4 * 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
     helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -416,6 +423,7 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
     model[2].items = {ItemModel{}}; model[4].items.clear(); model[4].present = false;
     model[5].items.clear(); model[5].present = true;
     for (int batch = 0; batch < 3; batch++) {
+      setting(batch % 2 != 0);
       CollectionHelper::UpdateBuilder input;
       for (int id = batch * 64 / 3; id < (batch + 1) * 64 / 3; id++) add(input, model[id]);
       input.overwrite().commit(); ASSERT_TRUE(helper.submit(input).success);
@@ -441,6 +449,7 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
         ASSERT_TRUE(helper.submit(merge).success);
         ASSERT_EQ(phase == 0 ? 2u : 1u, helper.durableSegmentCount());
       } else if (phase == 1) {
+        setting(true);
         CollectionHelper::UpdateBuilder change;
         for (int id : {0, 7, 8}) { change.remove(model[id].id); model[id].live = false; }
         for (int id : {2, 11, 31, 11}) { model[id] = generate(id); add(change, model[id]); }

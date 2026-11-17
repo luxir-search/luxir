@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "NestedInversion.h"
+#include "OwnershipWriter.h"
 #include "luxir/schema/ValCoerce.h"
 
 namespace luxir {
@@ -93,11 +94,9 @@ void NestedState::finish() {
   std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) { return a->ordinal < b->ordinal; });
   for (const auto* path : ordered) {
     int32_t parents = path->parent ? path->parent->rows : inverter.getMaxDoc();
-    size_t blocks = ((size_t)parents + NumColumnFormat::BLOCK_SIZE - 1) / NumColumnFormat::BLOCK_SIZE;
-    inverter.noteFlushWorkspace(sizeof(MonoWriter) + 2 * NumColumnFormat::BLOCK_SIZE * sizeof(int64_t)
-        + 2 * blocks * (sizeof(NumBlockInfo) + sizeof(NumBlockZone)));
-    auto out = writer.getOutputStream();
-    MonoWriter ends(writer.pool, *out);
+    const auto& type = (const NestedFieldType&)*inverter.schema->resolveInput(std::string_view(path->name)).fieldType;
+    inverter.noteFlushWorkspace(OwnershipWriter::workspaceBytes(parents, path->rows, type.reverseMap));
+    OwnershipWriter shape(writer, type.reverseMap);
     auto* event = path->first;
     int32_t end = 0;
     for (int32_t row = 0; row < parents; row++) {
@@ -105,11 +104,10 @@ void NestedState::finish() {
         end = event->end;
         event = event->next;
       }
-      ends.addInt64(end);
+      shape.addEnd(end);
     }
     assert(event == nullptr && end == path->rows);
-    ends.finish();
-    writer.finishSpace(path->ordinal, path->rows, {ends.blockLoc, ends.metaOff, {}, 0});
+    writer.finishSpace(path->ordinal, path->rows, shape.finish());
   }
 }
 

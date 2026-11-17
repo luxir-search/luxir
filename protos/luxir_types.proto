@@ -2175,6 +2175,14 @@ message SegmentStats {
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
+  repeated RowSpaceStats spaces = 15; // non-root spaces; bytes already included in the segment
+}
+
+message RowSpaceStats {
+  string path = 1;
+  int32 max_doc = 2; // physical child rows, including rows of deleted roots
+  uint64 ends_bytes = 3; // payload, alignment and block directory
+  uint64 owners_bytes = 4; // zero when the reverse map is absent
 }
 
 message AuxStats {
@@ -2584,6 +2592,10 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only. Store child-to-owner row lookups in segments written later.
+  // Unset inherits, else true. Changing it does not rewrite existing segments.
+  optional bool reverse_map = 30;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

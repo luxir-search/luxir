@@ -7,6 +7,7 @@
 
 #include "MonoReader.h"
 #include "Space.h"
+#include "SkipStats.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
@@ -19,6 +20,13 @@ class OwnershipShape {
   int32_t nChildren;
   MonoReader ends;
   std::optional<MonoReader> owners;
+
+  int32_t reverseOwner(int32_t child) const {
+    skipCount(SkipStats::ownershipReverseReads);
+    int32_t parent = (int32_t)owners->valueAt(child);
+    assert(parent >= 0 && parent < nParents);
+    return parent;
+  }
 
 public:
   struct Family {
@@ -33,6 +41,8 @@ public:
   int32_t parentCount() const noexcept { return nParents; }
   int32_t childCount() const noexcept { return nChildren; }
   bool hasReverseMap() const noexcept { return owners.has_value(); }
+  uint64_t endsBytes() const { return ends.sizeInBytes(); }
+  uint64_t ownersBytes() const { return owners ? owners->sizeInBytes() : 0; }
   std::pair<int32_t, int32_t> range(int32_t parent) const {
     assert(parent >= 0 && parent < nParents);
     auto result = ends.valuesAt(parent);
@@ -83,9 +93,16 @@ public:
     }
   }
 
-  // Retains the parent position for increasing child arrivals. Backwards
-  // seeks restart; no reverse map is materialized for either direction.
+  // Retains the parent position for increasing child arrivals. A row just
+  // past the current family steps forward through ends; any other lookup
+  // reads the persisted reverse map when available, and gallops otherwise.
   class Cursor {
+    // hugin, 18.2M answer rows, 2026-11-17: for a join led by one author's
+    // 33K scattered rows the point read costs 1.7 ms where the gallop costs
+    // 4.0 ms, and no threshold from 1 to 4 rows differs; a dense walk loses
+    // 7% if its next-row steps read the map.
+    static constexpr int32_t NEAR_ROWS = 2;
+
     const OwnershipShape& shape;
     Family current{-1, 0, 0};
 
@@ -118,9 +135,8 @@ public:
       assert(child >= 0 && child < shape.nChildren);
       // Siblings stay in the current range without decoding either column again.
       if (child >= current.first && child < current.end) return current;
-      if (shape.owners) {
-        int32_t parent = (int32_t)shape.owners->valueAt(child);
-        assert(parent >= 0 && parent < shape.nParents);
+      if (shape.owners && (current.owner < 0 || child < current.first || child - current.end >= NEAR_ROWS)) {
+        int32_t parent = shape.reverseOwner(child);
         auto [first, end] = shape.range(parent);
         current = {parent, first, end};
       } else {
@@ -146,6 +162,8 @@ public:
 };
 
 inline int32_t OwnershipShape::owner(int32_t child) const {
+  assert(child >= 0 && child < nChildren);
+  if (owners) return reverseOwner(child);
   return Cursor(*this).owner(child).owner;
 }
 

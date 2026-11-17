@@ -38,6 +38,8 @@ struct SkipStats {
   // Documents pulled by collapsed bounded constant-score collection (added
   // per pull), and retained-group remap probes (per segment switch).
   static inline int64_t collapseDocsVisited = 0;
+  // Point reads of persisted child-to-owner columns, excluding family reuse.
+  static inline int64_t ownershipReverseReads = 0;
   // Candidate-family boundary work, accumulated once per owner window.
   static inline int64_t joinBoundaryPointFamilies = 0;
   static inline int64_t joinBoundaryRuns = 0;
@@ -415,6 +417,7 @@ struct SkipStats {
     docBlocksDecoded = 0;
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;
+    ownershipReverseReads = 0;
     joinBoundaryPointFamilies = 0;
     joinBoundaryRuns = 0;
     joinCandidatesVisited = 0;
