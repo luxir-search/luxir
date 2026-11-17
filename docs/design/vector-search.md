@@ -483,7 +483,8 @@ IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
 tests the selector through a virtual call) and a branch-misprediction term
 proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
 selector test does not branch; per codec score (PQ
-subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup; per coarse
+subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
+a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
 dimension. RaBitQ re-quantizes the query residual for every list, so its list
 setup scales with dimensions; 1-bit and extended codes have separate unit costs

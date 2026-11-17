@@ -26,40 +26,40 @@ struct KnnPlanner {
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
               PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD,
-              SCORER_DIM, SCORER_LIST_DIM, NUM_UNITS };
+              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
     "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words",
-    "scorer_dims", "scorer_list_dims"};
+    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
-    // Forced-arm fit after selector devirtualization, munin at 3.3 GHz:
-    // SIFT 1M (128-d L2), miracl 1M (768-d cosine), 4/16 segments, RaBitQ-1/2
-    // and PQ, 8 selectivities x 4 correlations. Predicted/actual on 384 IVF
-    // rows: p10/median/p90/max = 0.93/1.00/1.06/1.29; 384 exact rows: p10/p90
-    // = 0.80/1.18. Fitted ns divided by NS_PER_DIM; keep unidentified seeds
+    // Forced-arm fit on munin at 3.3 GHz with FAISS 1.16.0 and AVX-512: SIFT 1M
+    // (128-d L2) and miracl 1M (768-d cosine), 4 and 16 segments, 8 selectivities
+    // x 4 correlations, forced IVF for PQ, RaBitQ-2, and RaBitQ-1 under both
+    // kernels. Predicted/actual on 2432 IVF rows: p10/median/p90/max =
+    // 0.92/1.00/1.07/1.28, and no codec or corpus group is outside 0.85-1.32.
+    // The exact arm is the earlier fit: 256 exact rows, p10/median/p90 =
+    // 0.78/0.95/1.18. Fitted ns divided by NS_PER_DIM; keep unidentified seeds
     // for rank visits, flat probes, sparse/multi maps, resolve/bit/array probes,
     // fold words and entry-none. PQ_LIST_SETUP counts precomputed L2 lists x subquantizers.
     // PQ_TABLE_DIM is seeded at EXACT_DIM cost, not fitted.
-    // Open: IVF_REQUEST's shared 180.6 us remains unexplained by profiles.
-    // ONE_BIT_DIM and RABITQ_LIST_DIM price FAISS's distance computer, which
-    // extended codes keep. SCORER_* price RaBitQScorer on 1-bit codes. They are
-    // not a munin refit but those two values scaled by the scorer's ratio to the
-    // computer on one machine at 768 dims and 4 query bits: 0.75x per code and
-    // 0.055x per list, from forced full scans of Cohere 1M at nlist 1000 and 4000.
-    // Forced filtered IVF at 0.1-30% selectivity then predicts 1.43x actual, where
-    // the computer predicted 1.56x. Its selector test does not branch, so the
-    // scorer pays no ENTRY_MISPREDICT.
+    // Open: IVF_REQUEST's shared 144 us remains unexplained by profiles.
+    // ONE_BIT_* and RABITQ_LIST_DIM price FAISS's distance computer, which
+    // extended codes keep. SCORER_* price RaBitQScorer on 1-bit codes. A scored
+    // code costs a constant plus its dimensions: popcounts are cheap beside
+    // reaching the code, so per-dimension units alone overprice wide vectors.
+    // The scorer's selector test does not branch, so it pays no ENTRY_MISPREDICT.
     static constexpr double NS_PER_DIM = 0.135;
-    Work units{1, 0.281 / NS_PER_DIM, 227 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
-               1, 1.01 / NS_PER_DIM, 2.23 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
-               9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.45 / NS_PER_DIM, 0,
-               0.0297 / NS_PER_DIM, 0.218 / NS_PER_DIM, 39.7 / NS_PER_DIM, 1, 18.3 / NS_PER_DIM,
-               0.1125 / NS_PER_DIM, 25000 / NS_PER_DIM, 180600 / NS_PER_DIM,
-               4.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
-               0.0224 / NS_PER_DIM, 1.0 / NS_PER_DIM};
+    Work units{1, 0.338 / NS_PER_DIM, 195 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
+               1, 0.889 / NS_PER_DIM, 3.02 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
+               9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.392 / NS_PER_DIM, 0,
+               0.0125 / NS_PER_DIM, 0.170 / NS_PER_DIM, 25.5 / NS_PER_DIM, 1, 0.473 / NS_PER_DIM,
+               0.0377 / NS_PER_DIM, 1690 / NS_PER_DIM, 144300 / NS_PER_DIM,
+               5.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
+               0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
+               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
@@ -221,9 +221,12 @@ struct KnnPlanner {
       p.linear[PQ_SUBCODE] = (double)s.eligibleVectors * s.pqM;
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
     } else {
+      p.linear[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)s.eligibleVectors;
       p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
-      if (s.rabitqBits > 1)
-        p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
+      if (s.rabitqBits > 1) {
+        p.linear[EXTRA_BIT_CODE] = (double)s.eligibleVectors * costs.extraBitSurvival(s.dims);
+        p.linear[EXTRA_BIT_DIM] = p.linear[EXTRA_BIT_CODE] * (s.rabitqBits - 1) * s.dims;
+      }
     }
     if (s.codec == Codec::PQ) {
       p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
@@ -455,7 +458,9 @@ struct KnnPlanner {
     f[RESOLVE_MONO] = (double)w.resolveMono;
     f[BIT_PROBE] = (double)w.bitProbes; f[ARRAY_STEP] = (double)w.arraySteps;
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
+    f[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)w.oneBitScores;
     f[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
+    f[EXTRA_BIT_CODE] = (double)w.extraBitScores;
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
     f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;
     f[PQ_TABLE_DIM] = s.codec == Codec::PQ && s.pqPerListTable ? (double)w.listSetups * (1 << s.pqBits) * s.dims : 0;
