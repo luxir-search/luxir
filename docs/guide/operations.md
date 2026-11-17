@@ -824,6 +824,15 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.fetch-ahead-max-bytes` caps what one search fetches ahead of its
+  reads on storage that fetches lazily, such as object storage (default
+  `256MB`; `0` is unlimited). Before it plans and runs, a search declares the
+  term dictionary regions and segment open ranges it will read and fetches
+  them in a few concurrent rounds. Past the cap, the rest is read on demand
+  as the search touches it. A fetch that has not finished by the request's
+  deadline fails the search with `UNAVAILABLE` and reason `fetch_timeout`,
+  which a client may retry once the data is warm. A cancelled request stops
+  at the next round.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

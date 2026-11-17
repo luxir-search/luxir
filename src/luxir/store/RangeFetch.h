@@ -20,8 +20,8 @@ struct ByteRange {
   uint64_t length = 0;
 };
 
-// When a fetch must have finished. The engine sets no search deadline yet, so
-// most callers pass kNoReadDeadline.
+// When a fetch must have finished: a search passes its request's deadline
+// (IoContext::fetchDeadline), and work for no request passes kNoReadDeadline.
 using ReadDeadline = std::chrono::steady_clock::time_point;
 inline constexpr ReadDeadline kNoReadDeadline = ReadDeadline::max();
 

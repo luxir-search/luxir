@@ -7,6 +7,7 @@
 
 #include "luxir/query/Query.h"
 #include "luxir/query/SummaryView.h"
+#include "luxir/util/IoContext.h"
 
 namespace luxir {
 
@@ -89,7 +90,10 @@ void QueryPruning::fetchMembershipProbes(IndexReader& reader, std::string_view f
     for (const auto& read : reads) {
       try {
         // A range that did not arrive is read on first touch.
-        read.file->fetchRanges(read.ranges, kNoReadDeadline, [&finished](std::exception_ptr) { finished.count_down(); });
+        // Bounded by the request's deadline (none outside a request).
+        const auto* io = IoContext::current();
+        read.file->fetchRanges(read.ranges, io ? io->fetchDeadline() : kNoReadDeadline,
+                               [&finished](std::exception_ptr) { finished.count_down(); });
       } catch (...) {
         finished.count_down();
       }

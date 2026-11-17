@@ -191,6 +191,10 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Bytes one request may fetch ahead of its reads on storage that fetches
+  // lazily (term dictionaries, segment opens), across its rounds; what is
+  // left out is read on demand. Zero is unlimited.
+  uint64_t fetch_ahead_max_bytes = 256ULL << 20;
   // Term-dictionary expansion guards for prefix, wildcard, regex, string
   // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
   // request can never raise or disable them.

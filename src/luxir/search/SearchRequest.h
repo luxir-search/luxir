@@ -95,7 +95,10 @@ public:
   // A transport sets the deadline and fill hint before dispatch; queryId,
   // requestId and counters are set by the constructor and submitBody.
   IoContext io;
-  uint64_t flags = 0;             // effective packed options, resolved during parsing
+  // Bytes the request's fetch-ahead rounds declared so far, against
+  // search.fetch_ahead_max_bytes.
+  uint64_t fetchAheadBytes = 0;
+  uint64_t flags = 0;            // effective packed options, resolved during parsing
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.
   MultiTermBudget multiTermBudget;

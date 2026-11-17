@@ -303,6 +303,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.fetch-ahead-max-bytes", search.fetch_ahead_max_bytes,
+                 "Bytes one request may fetch ahead of its reads on lazily fetched storage; "
+                 "the rest is read on demand (0 = unlimited)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("256MB");
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
                  "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "

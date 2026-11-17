@@ -107,16 +107,14 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ow
   }
   if (mayDefer) {
     // Term membership overlays decide which dictionaries need fetching, so
-    // their ranges come first.
-    ReadSet probes;
-    try {
-      declareTermProbes(req.proto, *req.schema, *req.reader, probes);
-    } catch (const std::exception& e) {
-      LOG_DEBUG("declaring term probes failed: {}", e.what());  // they are read as they are used
-      probes.clear();
-    }
-    auto resume = [this, &req, execution] { fetchTermReads(req, true, req.tg, execution); };
-    if (fetchAhead(req, std::move(probes), ownTg, std::move(resume))) return;
+    // their ranges come first. A declare that fails is no failed search:
+    // the reads happen as they are used.
+    auto declare = [&req](ReadSet& reads) { declareTermProbes(req.proto, *req.schema, *req.reader, reads); };
+    auto resume = [this, &req, execution](std::exception_ptr failure) {
+      if (failure) return abandon(req, failure, nullptr, *execution);
+      fetchTermReads(req, true, req.tg, execution);
+    };
+    if (fetchAhead(req, std::move(declare), ownTg, std::move(resume))) return;
   }
   fetchTermReads(req, mayDefer, ownTg, execution);
 }
@@ -124,18 +122,17 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ow
 void SearchEngine::fetchTermReads(SearchRequest& req, bool mayDefer, FanoutScope* ownTg,
                                   std::shared_ptr<MetricScope> execution) {
   if (mayDefer) {
+    // A resumed request runs on whichever thread completed the fetch.
+    IoScope io(&req.io);
     // Parsing seeks terms in the segments it may match: fetch the term
     // dictionaries first, so those seeks read resident bytes.
-    ReadSet reads;
-    try {
-      declareTermReads(req.proto, *req.schema, *req.reader, reads);
-    } catch (const std::exception& e) {
-      LOG_DEBUG("declaring term reads failed: {}", e.what());  // parse reads them as it goes
-      reads.clear();
-    }
+    auto declare = [&req](ReadSet& reads) { declareTermReads(req.proto, *req.schema, *req.reader, reads); };
     // Resumed under the fan-out scope fetchAhead made, which plan's own round may leave behind.
-    auto resume = [this, &req, execution] { plan(req, true, req.tg, execution); };
-    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+    auto resume = [this, &req, execution](std::exception_ptr failure) {
+      if (failure) return abandon(req, failure, nullptr, *execution);
+      plan(req, true, req.tg, execution);
+    };
+    if (fetchAhead(req, std::move(declare), ownTg, std::move(resume))) return;
   }
   plan(req, mayDefer, ownTg, execution);
 }
@@ -162,31 +159,65 @@ void SearchEngine::plan(SearchRequest& req, bool mayDefer, FanoutScope* ownTg,
     return;
   }
   if (mayDefer) {
-    ReadSet reads;
-    req.reader->declareMaterialize(segments, reads);
-    auto resume = [this, &req, root, segments, execution] { execute(req, root, segments, *execution); };
-    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+    auto declare = [&req, segments](ReadSet& reads) { req.reader->declareMaterialize(segments, reads); };
+    auto resume = [this, &req, root, segments, execution](std::exception_ptr failure) {
+      if (failure) return abandon(req, failure, root, *execution);
+      execute(req, root, segments, *execution);
+    };
+    if (fetchAhead(req, std::move(declare), ownTg, std::move(resume))) return;
   }
   execute(req, root, segments, *execution);
 }
 
-bool SearchEngine::fetchAhead(SearchRequest& req, ReadSet reads, FanoutScope* ownTg, std::function<void()> resume) {
+std::exception_ptr SearchEngine::fetchFailure(const SearchRequest& req, const std::exception_ptr& error) {
+  if (req.io.stopRequested()) return std::make_exception_ptr(RequestCancelledError());
+  if (!error || isFetchNotResident(error)) return nullptr;
+  try {
+    std::rethrow_exception(error);
+  } catch (const FetchTimeoutError&) {
+    // Past the request's deadline: what is still missing would not arrive in
+    // time either, and the client may retry once the store caught up.
+    return error;
+  } catch (const std::exception& e) {
+    // A failed fetch is no failed search: the reads that need the bytes
+    // fetch again and report what they find, as they would without it.
+    LOG_DEBUG("fetch ahead of a search failed: {}", e.what());
+  } catch (...) {}
+  return nullptr;
+}
+
+bool SearchEngine::fetchAhead(SearchRequest& req, Declare declare, FanoutScope* ownTg, Resume resume,
+                              bool prerequisitesFetched) {
+  ReadSet reads;
+  reads.prerequisitesFetched = prerequisitesFetched;
+  try {
+    declare(reads);
+  } catch (const std::exception& e) {
+    LOG_DEBUG("declaring the reads ahead of a search failed: {}", e.what());  // they are read as they are used
+    reads.clear();
+  }
+  // One more round at most: parts read their prerequisites on it.
+  bool again = reads.again && !prerequisitesFetched;
+  // The request's fetch ahead is capped across its rounds; what the cap
+  // leaves out is read on demand.
+  uint64_t max = searchConfig().fetch_ahead_max_bytes;
+  if (max > 0) {
+    uint64_t left = max > req.fetchAheadBytes ? max - req.fetchAheadBytes : 0;
+    if (uint64_t dropped = reads.truncate(left)) {
+      LOG_DEBUG("fetch ahead of request_id='{}' is capped at {} bytes; {} bytes are left to read on demand",
+                req.proto.request_id, max, dropped);
+    }
+  }
   if (reads.empty()) return false;
+  req.fetchAheadBytes += reads.bytes();
   // The fetch may finish on a worker after this thread returned: the request
   // must not point at the caller's fan-out scope then. Nothing ran in it yet.
   bool tookTg = ownTg && req.tg == ownTg;
   if (tookTg) req.tg = nullptr;
   auto countdown = FetchCountdown::create(node.getTaskArena(),
-      [this, &req, resume = std::move(resume)](std::exception_ptr error) {
-        // A failed fetch is no failed search: the reads that need the bytes
-        // fetch again and report what they find, as they would without it.
-        if (error && !isFetchNotResident(error)) {
-          try {
-            std::rethrow_exception(error);
-          } catch (const std::exception& e) {
-            LOG_DEBUG("fetch ahead of a search failed: {}", e.what());
-          } catch (...) {}
-        }
+      [this, &req, declare, resume, again](std::exception_ptr error) {
+        IoScope io(&req.io);
+        auto failure = fetchFailure(req, error);
         // Isolated like enqueueSubmit; the resumed request gets the fan-out
         // scope run() would have made, on this worker's stack.
         oneapi::tbb::this_task_arena::isolate([&] {
@@ -199,7 +230,9 @@ bool SearchEngine::fetchAhead(SearchRequest& req, ReadSet reads, FanoutScope* ow
           std::optional<FanoutCreditScope> credit;
           if (req.tg) credit.emplace();
           try {
-            resume();
+            // A part that declared only its prerequisites declares the rest now.
+            if (!failure && again && fetchAhead(req, declare, req.tg, resume, true)) return;
+            resume(failure);
           } catch (...) {
             // The countdown swallows a throw, which would strand the request:
             // the continuation's own failure paths reply, so this is a throw
@@ -210,17 +243,34 @@ bool SearchEngine::fetchAhead(SearchRequest& req, ReadSet reads, FanoutScope* ow
           }
         });
       });
-  countdown->fetch(reads, kNoReadDeadline);
+  // Past the request's deadline a fetch reports FetchTimeoutError.
+  countdown->fetch(reads, req.io.fetchDeadline());
   reads.clear();
   if (!countdown->arm()) return true;  // resumes on a worker; req may be gone
   if (tookTg) req.tg = ownTg;
-  return false;
+  if (auto failure = fetchFailure(req, countdown->failure())) {
+    resume(failure);
+    return true;
+  }
+  return again && fetchAhead(req, std::move(declare), ownTg, std::move(resume), true);
+}
+
+void SearchEngine::abandon(SearchRequest& req, std::exception_ptr failure, RootOp* root, MetricScope& execution) {
+  try {
+    std::rethrow_exception(failure);
+  } catch (std::exception& e) {
+    failBody(req, e, ErrorKind::UNAVAILABLE);
+  }
+  finishBody(req, root, execution);
 }
 
 void SearchEngine::execute(SearchRequest& req, RootOp* root, const SegmentMask& segments, MetricScope& execution) {
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   try {
+    // A client that left before the segments materialize gets nothing more read.
+    if (req.io.stopRequested()) throw RequestCancelledError();
     req.reader->materialize(segments);
+    if (req.io.stopRequested()) throw RequestCancelledError();
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and

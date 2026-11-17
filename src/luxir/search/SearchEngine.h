@@ -29,12 +29,26 @@ class SearchEngine {
   // Parses and plans, then (after the materialize round) executes.
   void fetchTermReads(SearchRequest& req, bool mayDefer, FanoutScope* ownTg, std::shared_ptr<MetricScope> execution);
   void plan(SearchRequest& req, bool mayDefer, FanoutScope* ownTg, std::shared_ptr<MetricScope> execution);
-  // Fetches `reads` ahead of the work that needs them. False when they
-  // completed inline (local files): the caller goes on. True when the request
-  // was handed over: `resume` runs on an arena worker once they finish, under
-  // the fan-out scope run() would have made, and the caller must not touch
-  // the request again.
-  bool fetchAhead(SearchRequest& req, ReadSet reads, FanoutScope* ownTg, std::function<void()> resume);
+  // Declares the reads of a fetch round.
+  using Declare = std::function<void(ReadSet&)>;
+  // Goes on with the request after a fetch round, under the fan-out scope
+  // run() would have made; with a failure, fails it instead.
+  using Resume = std::function<void(std::exception_ptr failure)>;
+  // Fetches what `declare` declares ahead of the work that needs it, capped
+  // by search.fetch_ahead_max_bytes across the request's rounds and bounded
+  // by its deadline. When a part declared only a prerequisite (ReadSet::again)
+  // a second round declares the rest. False when the rounds completed inline
+  // (local files): the caller goes on. True when the request was handed
+  // over: `resume` runs on an arena worker once they finish (or here, inline,
+  // with a failure), and the caller must not touch the request again.
+  bool fetchAhead(SearchRequest& req, Declare declare, FanoutScope* ownTg, Resume resume,
+                  bool prerequisitesFetched = false);
+  // What fails a request after a fetch round: a cancel, or a fetch past the
+  // deadline (FetchTimeoutError). Any other fetch error is no failed search:
+  // the reads that need the bytes fetch again and report what they find.
+  static std::exception_ptr fetchFailure(const SearchRequest& req, const std::exception_ptr& error);
+  // Fails the request with `failure` after a fetch round, then finishBody().
+  void abandon(SearchRequest& req, std::exception_ptr failure, RootOp* root, MetricScope& execution);
   // Materializes the segments and runs the calculators, then finishBody().
   void execute(SearchRequest& req, RootOp* root, const SegmentMask& segments, MetricScope& execution);
   // Records a failure on the request after draining its fan-out scope.
