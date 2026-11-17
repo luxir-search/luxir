@@ -71,11 +71,14 @@ TEST_F(JoinWindowTest, exposureSelectsPullOrWindowedFilteredRanking) {
         auto* plan = supplier->resolve(pool, planContext);
         EXPECT_EQ(Query::MatchState::NONEMPTY, plan->shape().matchState);
         EXPECT_EQ(Query::DirectScorerKind::OTHER, plan->shape().directKind);
-        EXPECT_EQ(Query::ReportedTwoPhase::NO, plan->shape().reportedTwoPhase);
-        EXPECT_EQ(!maximum && candidates == N ? Query::ClauseShape::DIRECT : Query::ClauseShape::NONE,
+        bool probing = !maximum && (consumption == Query::MembershipConsumption::CANDIDATES || candidates == 1);
+        EXPECT_EQ(probing ? Query::ReportedTwoPhase::YES : Query::ReportedTwoPhase::NO,
+            plan->shape().reportedTwoPhase);
+        EXPECT_EQ(!maximum && ((probing && consumption != Query::MembershipConsumption::WINDOWS) || candidates == N) ? Query::ClauseShape::DIRECT : Query::ClauseShape::NONE,
             plan->shape().windowFillClause);
         EXPECT_EQ(shape.windowFillClause, plan->shape().windowFillClause);
-        EXPECT_EQ(consumption == Query::MembershipConsumption::EITHER ? Query::MembershipConsumption::WINDOWS
+        EXPECT_EQ(consumption == Query::MembershipConsumption::EITHER
+            ? (probing ? Query::MembershipConsumption::CANDIDATES : Query::MembershipConsumption::WINDOWS)
             : consumption, plan->shape().membershipConsumption);
         if (!maximum && candidates == 1 && consumption == Query::MembershipConsumption::WINDOWS) {
           // Explicit window consumption remains valid when it is not advertised.

@@ -14,6 +14,12 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   QueryPrep::DocSetScorer* domain;
   int32_t ownerCount;
   bool maximum;
+  bool probing;
+  Query::MembershipProof* proof;
+  int32_t childCount;
+  OwnershipShape::Family family{-1, 0, 0};
+  int32_t verified = -1;
+  bool accepted = false;
   float multiplier;
   int32_t childDoc;
   int32_t current = -1;
@@ -21,6 +27,50 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   ScoreBounds bounds;
   std::span<uint64_t> childBits;
   std::span<int64_t> boundaries;
+  std::span<uint64_t> candidates;
+  std::span<int32_t> candidateOwners;
+  static constexpr int32_t CANDIDATE_ROWS = 4 * DocsEnumMeta::L1_DOCS;
+
+  int32_t approximateOwner(int32_t target, int32_t end) {
+    end = std::min(end, ownerCount);
+    while (target < end) {
+      if (domain) target = domain->advanceWindow(target, end);
+      if (target >= end) break;
+      family = cursor.seek(target);
+      int32_t row = proof ? proof->nextPossible(family.first) : family.first;
+      if (row < family.end) return current = target;
+      if (target + 1 == end) break;
+      if (row >= childCount) return current = PostingsReader::END;
+      target = cursor.owner(row).owner;
+    }
+    return current = end == ownerCount ? PostingsReader::END : end;
+  }
+
+  bool verifyOwner() {
+    if (verified != current) {
+      verified = current;
+      accepted = current < ownerCount && child.advanceWindow(family.first, family.end) < family.end;
+      value = multiplier;
+    }
+    return accepted;
+  }
+
+  static void setRange(std::span<uint64_t> words, int32_t first, int32_t end) {
+    while (first < end) {
+      int32_t stop = std::min(end, (first | 63) + 1);
+      words[(size_t)first >> 6] |= (~0ULL << (first & 63)) & (~0ULL >> (63 - ((stop - 1) & 63)));
+      first = stop;
+    }
+  }
+
+  static bool any(std::span<uint64_t> words, int32_t first, int32_t end) {
+    while (first < end) {
+      int32_t stop = std::min(end, (first | 63) + 1);
+      if (words[(size_t)first >> 6] & ((~0ULL << (first & 63)) & (~0ULL >> (63 - ((stop - 1) & 63))))) return true;
+      first = stop;
+    }
+    return false;
+  }
 
   int32_t advanceChild(int32_t target) {
     return maximum ? child.advance(target) : child.advanceWindow(target, PostingsReader::END);
@@ -82,14 +132,17 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
 public:
   Scorer(MemPool& pool, Query::Scorer& child, const OwnershipMapper& mapper,
          DocSet* domain, int32_t ownerCount, Reduction reduction, float multiplier,
-         const Query::ScorerShape& childShape)
+         const Query::ScorerShape& childShape, bool probing, Query::MembershipProof* proof, int32_t childCount)
       : child(child), mapper(mapper), cursor(mapper, pool),
         domain(domain ? pool.make<QueryPrep::DocSetScorer>(domain, ownerCount) : nullptr),
-        ownerCount(ownerCount), maximum(reduction == Reduction::MAXIMUM), multiplier(multiplier), childDoc(child.docId()),
+        ownerCount(ownerCount), maximum(reduction == Reduction::MAXIMUM), probing(probing), proof(proof),
+        childCount(childCount), multiplier(multiplier), childDoc(child.docId()),
         childBits(reduction != Reduction::MAXIMUM && childShape.windowFillClause == Query::ClauseShape::DIRECT
             ? pool.make_span<uint64_t>(DocsEnumMeta::L1_DOCS / 64) : std::span<uint64_t>{}),
         boundaries(reduction != Reduction::MAXIMUM ? pool.make_span<int64_t>((size_t)std::min(ownerCount, DocsEnumMeta::L1_DOCS) + 1)
-            : std::span<int64_t>{}) {
+            : std::span<int64_t>{}),
+        candidates(probing ? pool.make_span<uint64_t>(CANDIDATE_ROWS / 64) : std::span<uint64_t>{}),
+        candidateOwners(probing ? pool.make_span<int32_t>(DocsEnumMeta::L1_DOCS) : std::span<int32_t>{}) {
     if (reduction == Reduction::CONSTANT) {
       auto score = child.constantContribution();
       if (!score) {
@@ -134,8 +187,29 @@ public:
     return current == PostingsReader::END ? current : advance(current + 1);
   }
 
+  int32_t approximationDocId() override { return current; }
+  int32_t approximationNext() override {
+    if (current == PostingsReader::END) return current;
+    return probing ? approximateOwner(current + 1, ownerCount) : next();
+  }
+  int32_t approximationAdvance(int32_t target) override {
+    return probing ? approximateOwner(target, ownerCount) : advance(target);
+  }
+  bool matches() override { return !probing || verifyOwner(); }
+
+  int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+    return probing ? approximateOwner(min, max) : advanceWindow(min, max);
+  }
+
   int32_t advance(int32_t target) override {
     assert(target > current);
+    if (probing) {
+      while (approximateOwner(target, ownerCount) < ownerCount) {
+        if (verifyOwner()) return current;
+        target = current + 1;
+      }
+      return current;
+    }
     if (domain) {
       target = domain->docId() < target ? domain->advance(target) : domain->docId();
     }
@@ -169,12 +243,27 @@ public:
   }
 
   int32_t advanceWindow(int32_t min, int32_t max) override {
-    if (maximum) return Query::Scorer::advanceWindow(min, max);
     if (min >= max) return max;
+    if (maximum) return Query::Scorer::advanceWindow(min, max);
+    if (probing) {
+      while (min < max && approximateOwner(min, max) < max) {
+        if (verifyOwner()) return current;
+        min = current + 1;
+      }
+      return current = std::max(current, max >= ownerCount ? PostingsReader::END : max);
+    }
     if (min >= ownerCount) return current = PostingsReader::END;
     max = std::min(max, ownerCount);
     if (domain) min = domain->advanceWindow(min, max);
     if (min >= max) return current = min;
+    if (max == min + 1) {
+      auto candidate = cursor.seek(min);
+      if (child.advanceWindow(candidate.first, candidate.end) < candidate.end) {
+        value = multiplier;
+        return current = min;
+      }
+      return current = max == ownerCount ? PostingsReader::END : max;
+    }
     int32_t end = cursor.firstChild(max);
     int32_t row = cursor.firstChild(min);
     while ((row = child.advanceWindow(row, end)) < end) {
@@ -203,10 +292,98 @@ public:
     }
   }
 
+  void intersectCandidateBits(std::span<uint64_t> words, int32_t start) override {
+    if (maximum || candidates.empty()) return Query::Scorer::intersectCandidateBits(words, start);
+    // Boundary scratch is owner-window sized; child scratch is independent
+    // of family size. Oversized families use the bounded single-owner probe.
+    int32_t end = std::min(ownerCount, start + (int32_t)words.size() * 64);
+    for (int32_t lo = start; lo < end;) {
+      int32_t hi = lo + std::min(DocsEnumMeta::L1_DOCS, end - lo);
+      size_t count = 0;
+      for (size_t w = (size_t)(lo - start) / 64; w < (size_t)(hi - start + 63) / 64; w++) {
+        uint64_t bits = words[w];
+        while (bits) {
+          int32_t bit = (int32_t)std::countr_zero(bits);
+          int32_t owner = start + (int32_t)(w * 64) + bit;
+          if (domain && domain->advanceWindow(owner, owner + 1) != owner) words[w] &= ~(1ULL << bit);
+          else candidateOwners[count++] = owner;
+          bits &= bits - 1;
+        }
+      }
+      if (count == 1) {
+        int32_t owner = candidateOwners[0];
+        auto candidate = cursor.seek(owner);
+        if ((proof && proof->nextPossible(candidate.first) >= candidate.end)
+            || child.advanceWindow(candidate.first, candidate.end) >= candidate.end) {
+          int32_t offset = owner - start;
+          words[(size_t)offset >> 6] &= ~(1ULL << (offset & 63));
+        }
+      } else if (count) {
+        int32_t firstOwner = candidateOwners[0];
+        int32_t lastOwner = candidateOwners[count - 1] + 1;
+        auto run = boundaries.first((size_t)(lastOwner - firstOwner) + 1);
+        mapper.readBoundaries(firstOwner, lastOwner, run);
+        auto firstRow = [&](size_t candidate) { return (int32_t)run[(size_t)(candidateOwners[candidate] - firstOwner)]; };
+        auto endRow = [&](size_t candidate) { return (int32_t)run[(size_t)(candidateOwners[candidate] - firstOwner) + 1]; };
+        auto reject = [&](size_t candidate) {
+          int32_t offset = candidateOwners[candidate] - start;
+          words[(size_t)offset >> 6] &= ~(1ULL << (offset & 63));
+        };
+        for (size_t first = 0; first < count;) {
+          int32_t base = firstRow(first);
+          if (endRow(first) - base > CANDIDATE_ROWS) {
+            int32_t limit = endRow(first);
+            if ((proof && proof->nextPossible(base) >= limit) || child.advanceWindow(base, limit) >= limit) reject(first);
+            first++;
+            continue;
+          }
+          size_t stop = first + 1;
+          while (stop < count && endRow(stop) - base <= CANDIDATE_ROWS) stop++;
+          int32_t limit = endRow(stop - 1);
+          auto bits = candidates.first((size_t)(limit - base + 63) / 64);
+          std::fill(bits.begin(), bits.end(), 0);
+          for (size_t i = first; i < stop; i++) setRange(bits, firstRow(i) - base, endRow(i) - base);
+          if (proof) proof->intersect(bits, base);
+          child.intersectCandidateBits(bits, base);
+          for (size_t i = first; i < stop; i++) {
+            if (!any(bits, firstRow(i) - base, endRow(i) - base)) reject(i);
+          }
+          first = stop;
+        }
+      }
+      lo = hi;
+    }
+    current = end == ownerCount ? PostingsReader::END : end;
+  }
+
   [[gnu::cold]] void prepareMembership() override {
     if (!maximum) child.prepareMembership();
   }
 };
+
+namespace {
+class OwnerProof final : public Query::MembershipProof {
+  Query::MembershipProof& child;
+  OwnershipMapper::Cursor cursor;
+  int32_t owners;
+  int32_t children;
+
+  Range nextRange(int32_t target) override {
+    if (target >= owners) return {PostingsReader::END, PostingsReader::END};
+    auto family = cursor.seek(target);
+    int32_t row = child.nextPossible(family.first);
+    if (row >= children) return {PostingsReader::END, PostingsReader::END};
+    int32_t first = row < family.end ? target : cursor.owner(row).owner;
+    int32_t last = cursor.owner(std::min(children, child.possibleEnd()) - 1).owner + 1;
+    return {first, last};
+  }
+
+public:
+  OwnerProof(MemPool& pool, Query::MembershipProof& child, const OwnershipMapper& mapper,
+             int32_t owners, int32_t children)
+      : child(child), cursor(mapper, pool), owners(owners), children(children) {}
+};
+} // namespace
 
 class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
   Query::ScorerSupplier& child;
@@ -229,68 +406,62 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
   class Plan final : public Query::ScorerPlan {
     Supplier& supplier;
     Query::ScorerPlan& child;
+    bool probing;
 
     Query::Scorer* buildScorer(MemPool& pool) override {
       auto* scorer = child.build(pool);
       return scorer ? pool.make<Scorer>(pool, *scorer, supplier.mapper, supplier.domain,
-          supplier.ownerCount, supplier.reduction, supplier.multiplier, child.shape()) : nullptr;
+          supplier.ownerCount, supplier.reduction, supplier.multiplier, child.shape(), probing,
+          probing ? child.buildMembershipProof(pool) : nullptr, supplier.childCount) : nullptr;
     }
 
   public:
     Plan(Supplier& supplier, const Query::PlanContext& context, const Query::ScorerShape& shape,
-         Query::ScorerPlan& child)
+         Query::ScorerPlan& child, bool probing)
         : Query::ScorerPlan(context, shape, supplier.cost()),
-          supplier(supplier), child(child) {}
+          supplier(supplier), child(child), probing(probing) {}
+
+    Query::MembershipProof* buildMembershipProof(MemPool& pool) override {
+      auto* proof = child.buildMembershipProof(pool);
+      return proof ? pool.make<OwnerProof>(pool, *proof, supplier.mapper, supplier.ownerCount, supplier.childCount) : nullptr;
+    }
   };
 
-  // The child is built for the windows this scorer walks, whatever the
-  // owner side consumes.
-  static Query::PlanContext childContext(Query::PlanContext context) {
-    context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+  Query::PlanContext childContext(Query::PlanContext context, Query::MembershipConsumption consumption) const {
+    if (reduction == Reduction::MAXIMUM) {
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      return context;
+    }
+    auto scale = [&](int64_t count) {
+      if (!ownerCount) return (int64_t)0;
+      return std::min<int64_t>(childCount, (count >= ownerCount ? (int64_t)childCount
+          : (count * childCount + ownerCount - 1) / ownerCount));
+    };
+    context.demand.candidates = scale(context.demand.candidates);
+    context.demand.span = scale(context.demand.span);
+    context.expectedSpan = scale(context.expectedSpan);
+    if (context.demand.expectedCandidates >= 0 && ownerCount) {
+      context.demand.expectedCandidates *= (double)childCount / ownerCount;
+    }
+    context.membershipConsumption = consumption;
+    // Some opaque suppliers only expose window consumption. Their bounded
+    // protocol still verifies a family without exposing a candidate arm.
+    if (consumption == Query::MembershipConsumption::CANDIDATES
+        && child.describeScorer(context).membershipConsumption != consumption) {
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+    }
     return context;
   }
 
-  // An exact scorer exactly when the child has one.
-  //
-  // The join picks its own arm here, from the demand its consumer quotes,
-  // because the Boolean's filter gates compare cardinalities and do not read
-  // what a filter costs to produce: a join advertised as a filler
-  // unconditionally is filled over the whole span beside a selective body.
-  // NumericPredicateQuery's supplier selects its arm the same way.
-  //
-  // Known limits of deciding on this side:
-  //  - The probe constants are the consumer's cost per candidate, guessed
-  //    from here.
-  //  - The candidate estimate is the body's cost, not what survives pruning,
-  //    so ranked bodies that prune hard (a required clause with boosts, an
-  //    intersection of unions) can fill where probing would be cheaper.
-  //  - Consumers quote span differently (an exclusion quotes its candidates,
-  //    a window fill quotes windows), which the exposure estimate below
-  //    papers over.
-  //  - The choice is only filler or not; what the consumer does with a
-  //    non-filler is not this supplier's to pick.
-  // The decision belongs in the consumer once it prices fillers: this
-  // supplier would then quote fill and probe work and select nothing.
-  Query::ScorerShape selectScorer(const Query::PlanContext& context) const {
-    Query::ScorerShape shape;
-    shape.matchState = child.describeScorer(childContext(context)).matchState;
-    shape.directKind = Query::DirectScorerKind::OTHER;
-    shape.reportedTwoPhase = Query::ReportedTwoPhase::NO;
-    shape.windowFillClause = Query::ClauseShape::NONE;
-    shape.termDisjunctionClause = shape.termConjunctionClause = Query::ClauseShape::NONE;
-    shape.independentTerm = Query::IndependentTermAccess::UNSUPPORTED;
-    shape.docsOnly = Query::DocsOnlyAccess::UNSUPPORTED;
-    shape.directDocSet = Query::DirectDocSetAccess::UNSUPPORTED;
-    shape.membershipConsumption = context.membershipConsumption == Query::MembershipConsumption::EITHER
-        ? Query::MembershipConsumption::WINDOWS : context.membershipConsumption;
-    if (reduction == Reduction::MAXIMUM || ownerCount == 0) return shape;
+  bool fillsProfitably(const Query::PlanContext& context) const {
+    if (!ownerCount) return false;
     const auto& demand = context.demand;
     double candidates = demand.expectedCandidates;
     if (candidates < 0) {
-      if (demand.candidates == std::numeric_limits<int64_t>::max()) return shape;
+      if (demand.candidates == std::numeric_limits<int64_t>::max()) return false;
       candidates = (double)demand.candidates;
     }
-    if (!std::isfinite(candidates)) return shape;
+    if (!std::isfinite(candidates)) return false;
     candidates = std::clamp(candidates, 0.0, (double)std::min<int64_t>(demand.candidates, ownerCount));
     // The context has a span, not its positions. Estimate the mapped child
     // exposure at the same fraction; never inspect ownership during planning.
@@ -303,8 +474,64 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
     double fill = OWNER_FILL_INSTRUCTIONS * owners + production * owners / ownerCount;
     double probe = candidates * (demand.horizon == Query::ExecutionUse::COUNT_WINDOWS
         ? COUNT_PROBE_INSTRUCTIONS : RANKED_PROBE_INSTRUCTIONS);
-    if (fill < probe) shape.windowFillClause = Query::ClauseShape::DIRECT;
-    return shape;
+    return fill < probe;
+  }
+
+  bool probe(const Query::PlanContext& context) const {
+    using Consumption = Query::MembershipConsumption;
+    if (reduction == Reduction::MAXIMUM) return false;
+    if (context.membershipConsumption == Consumption::CANDIDATES) return true;
+    if (context.membershipConsumption == Consumption::EITHER) {
+      auto shape = child.describeScorer(childContext(context, Consumption::EITHER));
+      if (shape.membershipConsumption == Consumption::CANDIDATES) return true;
+      // A priced child chose production over verification. Opaque children
+      // without candidate quotes retain the cardinality fallback.
+      if (child.quoteMembership(childContext(context, Consumption::CANDIDATES))) return false;
+      return context.demand.candidates < std::min<int64_t>(ownerCount, child.cost());
+    }
+    return context.demand.candidates < std::min<int64_t>(ownerCount, child.cost())
+        && (context.demand.horizon == Query::ExecutionUse::PULL || !fillsProfitably(context));
+  }
+
+  struct Selection {
+    Query::PlanContext childContext;
+    Query::ScorerShape shape;
+    bool probing;
+  };
+
+  // Candidate consumers choose verification through the child's scaled
+  // demand. Explicit window consumers still need the fill/probe comparison:
+  // their filter gates price cardinality rather than membership production.
+  // The latter estimate uses the body's cost, not its post-pruning survivors,
+  // and window exposure rather than known positions. A consumer-side price
+  // comparison would remove both guesses.
+  Selection selectScorer(const Query::PlanContext& context) const {
+    bool probing = probe(context);
+    Selection selection{childContext(context, probing ? Query::MembershipConsumption::CANDIDATES
+        : Query::MembershipConsumption::WINDOWS), {}, probing};
+    auto& shape = selection.shape;
+    shape.matchState = child.describeScorer(selection.childContext).matchState;
+    shape.directKind = Query::DirectScorerKind::OTHER;
+    shape.reportedTwoPhase = probing ? Query::ReportedTwoPhase::YES : Query::ReportedTwoPhase::NO;
+    shape.windowFillClause = Query::ClauseShape::NONE;
+    shape.termDisjunctionClause = shape.termConjunctionClause = Query::ClauseShape::NONE;
+    shape.independentTerm = Query::IndependentTermAccess::UNSUPPORTED;
+    shape.docsOnly = Query::DocsOnlyAccess::UNSUPPORTED;
+    shape.directDocSet = Query::DirectDocSetAccess::UNSUPPORTED;
+    shape.membershipConsumption = context.membershipConsumption == Query::MembershipConsumption::EITHER
+        ? (probing ? Query::MembershipConsumption::CANDIDATES : Query::MembershipConsumption::WINDOWS)
+        : context.membershipConsumption;
+    if (probing && shape.membershipConsumption == Query::MembershipConsumption::CANDIDATES) {
+      shape.windowFillClause = Query::ClauseShape::DIRECT;
+      return selection;
+    }
+    if (reduction == Reduction::MAXIMUM || ownerCount == 0 || probing) return selection;
+    if (context.membershipConsumption == Query::MembershipConsumption::EITHER) {
+      shape.windowFillClause = Query::ClauseShape::DIRECT;
+      return selection;
+    }
+    if (fillsProfitably(context)) shape.windowFillClause = Query::ClauseShape::DIRECT;
+    return selection;
   }
 
 public:
@@ -316,17 +543,18 @@ public:
   int64_t cost() override { return std::min(child.cost(), (int64_t)ownerCount); }
 
   Query::ScorerShape describeScorer(const Query::PlanContext& context) const override {
-    return selectScorer(context);
+    return selectScorer(context).shape;
   }
   Query::UnresolvedSupplierCause unresolvedScorerCause(const Query::PlanContext& context) const override {
-    return child.unresolvedScorerCause(childContext(context));
+    return child.unresolvedScorerCause(selectScorer(context).childContext);
   }
   bool fillExpansionMemo(const Query::PlanContext& context) override {
-    return child.fillExpansionMemo(childContext(context));
+    return child.fillExpansionMemo(selectScorer(context).childContext);
   }
   Query::ScorerPlan* resolve(MemPool& pool, const Query::PlanContext& context) override {
-    return pool.make<Plan>(*this, context, selectScorer(context),
-        *child.resolve(pool, childContext(context)));
+    auto selected = selectScorer(context);
+    return pool.make<Plan>(*this, context, selected.shape,
+        *child.resolve(pool, selected.childContext), selected.probing);
   }
 };
 
