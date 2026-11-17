@@ -1143,15 +1143,18 @@ public:
       int32_t maxDoc = seg.maxDoc();
       for (int32_t min = 0; min < maxDoc;) {
         int32_t max = (int32_t) std::min<int64_t>(maxDoc, (int64_t) min + rangeDocs);
-        int64_t matches = bulk != nullptr
-            ? countMatchesInRange(bulk, collectorFilter, min, max)
-            : countMatchesInRange(scorer, collectorFilter, min, max);
+        int64_t matches = 0;
+        int32_t next = max;
+        if (bulk != nullptr) next = bulk->countNextWindow(matches, nullptr, collectorFilter, min, max);
+        else matches = countMatchesInRange(scorer, collectorFilter, min, max);
+        if (next == PostingsReader::END) next = max;
+        assert(next > min);
         count += matches;
         if (boundedTotal.add(matches)) {
-          if (max < maxDoc) skipCount(SkipStats::boundedCountStops);
+          if (next < maxDoc) skipCount(SkipStats::boundedCountStops);
           return std::nullopt;
         }
-        min = max;
+        min = next;
       }
       return count;
     }
@@ -1165,7 +1168,7 @@ public:
         auto& collector) {
       std::optional<int64_t> count = countBounded(pool, seg, collectorFilter);
       int64_t before = collector.totalHits();
-      if (collector.topCount > 0) {
+      if (collector.topCount > 0 && (!count || *count > 0)) {
         rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
                  seg.maxDoc(), true, &rankingAccumulator);
       }

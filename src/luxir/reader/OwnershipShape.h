@@ -41,6 +41,22 @@ public:
   }
   int32_t owner(int32_t child) const;
 
+  // hugin, 18.2M answer rows, 2026-11-16: a family point read costs
+  // about 4 ns; decoding costs 0.7 ns/value plus 1.2 ns per gathered family.
+  // Count complete frames, including partial edges, rather than charging
+  // only the requested values. Single families always use point access.
+  static bool preferPointRanges(int32_t first, int32_t end, size_t count) {
+    if (count <= 1) return true;
+    int64_t firstValue = first ? first - 1 : 0;
+    int64_t lastValue = end - 1;
+    int64_t decoded = (lastValue / MonoReader::BULK_SIZE - firstValue / MonoReader::BULK_SIZE + 1)
+        * MonoReader::BULK_SIZE;
+    constexpr double POINT_FAMILY_NS = 4.0;
+    constexpr double DECODE_VALUE_NS = 0.7;
+    constexpr double GATHER_FAMILY_NS = 1.2;
+    return POINT_FAMILY_NS * count <= DECODE_VALUE_NS * decoded + GATHER_FAMILY_NS * count;
+  }
+
   // Boundary positions first..end enclose owners [first, end). Position 0
   // precedes the first family and has the synthetic child offset zero.
   void readBoundaries(int32_t first, int32_t end, std::span<int64_t> out) const {
@@ -76,7 +92,7 @@ public:
   public:
     explicit Cursor(const OwnershipShape& shape) : shape(shape) {}
 
-    Family seek(int32_t parent) {
+    [[gnu::always_inline]] Family seek(int32_t parent) {
       assert(parent >= 0 && parent < shape.nParents);
       if (parent == current.owner) return current;
       if (parent == current.owner + 1) {

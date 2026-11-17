@@ -75,15 +75,18 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
     EXPECT_GT(SkipStats::numericPredicateSparseVerifyArms, 0);
     EXPECT_EQ(0, SkipStats::numericPredicateScanArms);
     int32_t verified = 0;
+    bool sparse = true;
     NumericVerificationObserver observer([&](int32_t row) {
       ASSERT_GE(row, 0); ASSERT_LT((size_t)row, rootOfRow.size());
-      EXPECT_EQ(0, rootOfRow[(size_t)row] % 17);
+      if (sparse) { EXPECT_EQ(0, rootOfRow[(size_t)row] % 17); }
       EXPECT_NE(17, rootOfRow[(size_t)row]);
       verified++;
     });
     std::array<uint64_t, N / 64> bits{};
     for (int32_t owner = 0; owner < N; owner += 17) bits[(size_t)owner >> 6] |= 1ULL << (owner & 63);
     scorer->intersectCandidateBits(bits, 0);
+    EXPECT_EQ(0, SkipStats::joinBoundaryRuns);
+    EXPECT_GT(SkipStats::joinBoundaryPointFamilies, 0);
     for (int32_t owner = 0; owner < N; owner++) {
       bool expected = owner % 17 == 0 && owner != 17 && owner % 11 != 0 && (high == 101 || owner % 5);
       EXPECT_EQ(expected, (bits[(size_t)owner >> 6] & (1ULL << (owner & 63))) != 0) << owner;
@@ -109,6 +112,17 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
     }
     EXPECT_GT(verified, 0);
     EXPECT_LE(verified, 2 * (int32_t)rootOfRow.size());
+    sparse = false;
+    SkipStats::reset();
+    auto* dense = supplier->resolve(pool, planContext)->build(pool);
+    std::fill(bits.begin(), bits.end(), ~0ULL);
+    dense->intersectCandidateBits(bits, 0);
+    EXPECT_GT(SkipStats::joinBoundaryRuns, 0);
+    EXPECT_EQ(0, SkipStats::joinBoundaryPointFamilies);
+    for (int32_t owner = 0; owner < N; owner++) {
+      bool expected = owner != 17 && owner % 11 != 0 && (high == 101 || owner % 5);
+      EXPECT_EQ(expected, (bits[(size_t)owner >> 6] & (1ULL << (owner & 63))) != 0) << owner;
+    }
   }
 }
 

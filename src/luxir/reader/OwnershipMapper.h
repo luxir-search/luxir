@@ -79,7 +79,7 @@ public:
         new (&cursors[index++]) OwnershipShape::Cursor(**it);
       }
     }
-    OwnershipShape::Family seek(int32_t owner) {
+    [[gnu::always_inline]] OwnershipShape::Family seek(int32_t owner) {
       if (owner == current.owner) return current;
       return descend(cursors.empty() ? OwnershipShape::Family{owner, owner, owner + 1}
           : cursors.back().seek(owner));

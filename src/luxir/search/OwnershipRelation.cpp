@@ -310,15 +310,20 @@ public:
           bits &= bits - 1;
         }
       }
-      if (count == 1) {
-        int32_t owner = candidateOwners[0];
-        auto candidate = cursor.seek(owner);
-        if ((proof && proof->nextPossible(candidate.first) >= candidate.end)
-            || child.advanceWindow(candidate.first, candidate.end) >= candidate.end) {
-          int32_t offset = owner - start;
-          words[(size_t)offset >> 6] &= ~(1ULL << (offset & 63));
+      if (SkipStats::enabled) SkipStats::joinCandidatesVisited += (int64_t)count;
+      if (count && OwnershipShape::preferPointRanges(candidateOwners[0], candidateOwners[count - 1] + 1, count)) {
+        if (SkipStats::enabled) SkipStats::joinBoundaryPointFamilies += (int64_t)count;
+        for (size_t i = 0; i < count; i++) {
+          int32_t owner = candidateOwners[i];
+          auto candidate = cursor.seek(owner);
+          if ((proof && proof->nextPossible(candidate.first) >= candidate.end)
+              || child.advanceWindow(candidate.first, candidate.end) >= candidate.end) {
+            int32_t offset = owner - start;
+            words[(size_t)offset >> 6] &= ~(1ULL << (offset & 63));
+          }
         }
       } else if (count) {
+        skipCount(SkipStats::joinBoundaryRuns);
         int32_t firstOwner = candidateOwners[0];
         int32_t lastOwner = candidateOwners[count - 1] + 1;
         auto run = boundaries.first((size_t)(lastOwner - firstOwner) + 1);

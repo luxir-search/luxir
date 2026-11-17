@@ -19,6 +19,7 @@ class MonoReader {
 
 public:
   static constexpr uint32_t BLOCK_SIZE = MonoColumn::BLOCK_SIZE;
+  static constexpr uint32_t BULK_SIZE = MonoColumn::BULK_SIZE;
   static constexpr int64_t ENDINDEX = MonoColumn::ENDINDEX;
   using BlockInfo = NumBlockInfo;
 

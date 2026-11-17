@@ -33,6 +33,10 @@ struct SkipStats {
   // Documents pulled by collapsed bounded constant-score collection (added
   // per pull), and retained-group remap probes (per segment switch).
   static inline int64_t collapseDocsVisited = 0;
+  // Candidate-family boundary work, accumulated once per owner window.
+  static inline int64_t joinBoundaryPointFamilies = 0;
+  static inline int64_t joinBoundaryRuns = 0;
+  static inline int64_t joinCandidatesVisited = 0;
   static inline int64_t collapseRemapProbes = 0;
   // Full 128-value tfreq block decodes. StreamVByte tails are excluded because
   // their docs/freq streams have no independently skippable block boundary.
@@ -405,6 +409,9 @@ struct SkipStats {
     docBlocksDecoded = 0;
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;
+    joinBoundaryPointFamilies = 0;
+    joinBoundaryRuns = 0;
+    joinCandidatesVisited = 0;
     collapseRemapProbes = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;

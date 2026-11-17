@@ -266,3 +266,35 @@ TEST_F(BoundedCountTest, jsonAndDocHeaders) {
   auto exactBody = renderSearchResponseBody(exact->responses[0]->proto, true);
   EXPECT_EQ(std::string::npos, exactBody.find("found_gte")) << exactBody;
 }
+
+TEST_F(BoundedCountTest, stopsAtABulkWindowAndDoesNotRankAProvenEmptySegment) {
+  CollectionHelper helper("bounded_windows");
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 0});
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < 20000; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "tag_s", "lead", "parity_s", i % 2 ? "odd" : "even",
+        "n_i", (int64_t)(i % 2 ? 100 : 0)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto execute = [&](std::string query, int64_t count) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("bounded_windows");
+    req->topDocs().exprQuery(query).limit(10).countLimit(count).getScores().fields({"id"});
+    req->execute(1); EXPECT_OK(req);
+    return req;
+  };
+  auto exact = execute("tag_s:lead AND n_i:[0 TO 10]", -1);
+  SkipStatsScope stats;
+  auto bounded = execute("tag_s:lead AND n_i:[0 TO 10]", 10);
+  EXPECT_EQ(ranked(*exact), ranked(*bounded));
+  EXPECT_EQ(1, SkipStats::boundedCountSegments);
+  EXPECT_EQ(1, SkipStats::boundedCountStops);
+  EXPECT_EQ(1, SkipStats::conjDenseCountWindows);
+  SkipStats::reset();
+  auto empty = execute("parity_s:odd AND n_i:[0 TO 10]", 10000);
+  EXPECT_EQ(0, empty->getMatchCount());
+  EXPECT_FALSE(empty->docList()->found_gte);
+  EXPECT_EQ(1, SkipStats::boundedCountSegments);
+  EXPECT_EQ(1, SkipStats::numericPredicateSparseVerifyArms + SkipStats::numericPredicateScanArms
+      + SkipStats::numericPredicateZoneArms);
+}
