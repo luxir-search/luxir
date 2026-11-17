@@ -110,9 +110,8 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
 }
 
 TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
-  // The relation verifies child rows lazily for the owners it visits, so a
-  // miss must not build a set over every row of the path, however often the
-  // same child recurs.
+  // A join does not start raw per-segment child population, however often
+  // the same child recurs. Its owner membership can still populate.
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -124,7 +123,7 @@ TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
   // Only the three whole-join keys may build, one value per segment each; a
   // child set would add one more build per query.
   EXPECT_EQ(3u, cache->counters().builds);
-  // A recurring child is only peeked at: no claim, no attempt.
+  // A recurring raw child takes no build claim and counts no build attempt.
   EXPECT_EQ(3u, cache->counters().buildAttempts);
   cache->validateForTest();
 }

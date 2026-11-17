@@ -1902,6 +1902,101 @@ TEST(FilterCacheTest, zeroHitEvictionBackoffBoundsOrderedReplay) {
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
+TEST(FilterCacheTest, borrowingMissPreservesPopulationBackoff) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey victim("borrow-victim");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, victim, 1, 1));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, FilterKey("borrow-winner"), 2, 100'000));
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(victim);
+  ASSERT_TRUE(use->wasAdmitted());
+  auto before = cache.counters();
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            use->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+  auto after = cache.counters();
+  EXPECT_EQ(before.misses + 1, after.misses);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.thrashBuildSkips, after.thrashBuildSkips);
+  // The first dead build still owes both ordinary population bypasses.
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0).kind());
+  }
+  EXPECT_EQ(before.thrashBuildSkips + 2, cache.counters().thrashBuildSkips);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, use->probe(0).kind());
+  EXPECT_EQ(before.buildAttempts + 1, cache.counters().buildAttempts);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("borrowed-value");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, key, 1, 1));
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  DocSet* borrowed;
+  {
+    auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+    borrowed = hit.docSet();
+  }
+  auto hits = cache.counters().hits;
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, FilterKey("replacement"), 2, 100'000));
+  ASSERT_EQ(1u, cache.counters().evictions);
+  auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+  EXPECT_EQ(borrowed, hit.docSet());
+  EXPECT_TRUE(borrowed->get(1));
+  EXPECT_EQ(1, borrowed->card());
+  EXPECT_EQ(hits, cache.counters().hits); // request-local pin
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, borrowingAndPopulationShareOneRequestValue) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterCache::UseRegistry request(cache, 1, segments);
+  FilterKey key("same-request");
+  auto* borrowing = request.get(key);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            borrowing->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+  auto* ordinary = request.get(key);
+  EXPECT_EQ(borrowing, ordinary);
+  auto build = ordinary->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+  ordinary->publishRaw(0, build, docs(100, {7}), 1);
+  auto hit = borrowing->probe(0, FilterCache::Population::BORROW_ONLY);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+  EXPECT_TRUE(hit.docSet()->get(7));
+  EXPECT_EQ(1u, cache.counters().buildAttempts);
+  EXPECT_EQ(1u, cache.counters().builds);
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, evictionBackoffRecoversAndHitResetsDebt) {
   size_t charge = bitDocs(4096, 1)->ramBytesUsed();
   FilterCacheConfig config = testConfig();
@@ -2250,8 +2345,8 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
     req->execute(1); EXPECT_OK(req); EXPECT_EQ(8, req->getMatchCount());
   };
   for (int i = 0; i < 3; i++) { count(false); count(true); }
-  // to_parent only borrows its child set; the child-domain view builds it, so
-  // one entry serves both views.
+  // Only owner membership is resident: to_parent does not populate its raw
+  // child set, and the child-view term count resolves from metadata.
   auto entries = shared->dump(10, nullptr);
   ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) EXPECT_EQ(2u, entry.segmentsResident);
