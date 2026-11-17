@@ -32,6 +32,7 @@ service Admin {
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse) {}
   rpc RenameCollection(RenameCollectionRequest) returns (RenameCollectionResponse) {}
   rpc SwapCollections(SwapCollectionsRequest) returns (SwapCollectionsResponse) {}
+  rpc SplitCollection(SplitCollectionRequest) returns (SplitCollectionResponse) {}
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   rpc CacheControl(CacheControlRequest) returns (CacheControlResponse) {}
 }

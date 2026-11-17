@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Collections.h"
+#include <format>
+#include <thread>
 #include "Promotion.h"
+#include "luxir/api/index_files.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
@@ -592,6 +595,154 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
   if (!createdHere) throw CollectionExistsError("collection '" + key.label() + "' already exists");
   // The collection this call built, even if a removal has since replaced it.
   return created;
+}
+
+namespace {
+// The segments each part of a split keeps, by segment id.
+using SplitPlan = std::vector<std::set<uint64_t>>;
+
+// Whole segments, largest first, each to the part with the fewest documents.
+SplitPlan planBySegments(const api::IndexInfo& info, size_t parts) {
+  std::vector<const api::SegmentInfo*> segments;
+  for (const auto& seg : info.segments) if (seg.live_docs > 0) segments.push_back(&seg);
+  if (segments.size() < parts) {
+    throw RequestError(std::format("a split into {} collections needs at least {} segments with documents; the collection has {}",
+                                   parts, parts, segments.size()));
+  }
+  std::ranges::sort(segments, [](const auto* a, const auto* b) {
+    return a->live_docs != b->live_docs ? a->live_docs > b->live_docs : a->seg_id < b->seg_id;
+  });
+  SplitPlan plan(parts);
+  std::vector<uint64_t> docs(parts);
+  for (const auto* seg : segments) {
+    auto part = (size_t)(std::ranges::min_element(docs) - docs.begin());
+    plan[part].insert(seg->seg_id);
+    docs[part] += (uint64_t)seg->live_docs;
+  }
+  return plan;
+}
+
+// Keeps the planned segments. The composition changed, so index-scope aux
+// indexes, which cover the whole source, are dropped.
+SnapshotEdit keepSegments(const std::set<uint64_t>& keep) {
+  return [&keep](api::IndexInfo& info, Directory&, uint64_t, std::pmr::memory_resource& mr) {
+    std::span<const api::SegmentInfo> kept;
+    auto* out = api::build::allocArray(kept, keep.size(), mr);
+    size_t n = 0;
+    for (const auto& seg : info.segments) if (keep.contains(seg.seg_id)) out[n++] = seg;
+    assert(n == keep.size());
+    info.segments = kept;
+    info.aux_indexes = {};
+    info.core_gen++;
+  };
+}
+}
+
+std::vector<Collections::SplitPart> Collections::split(const CollectionId& from, std::span<const CollectionId> to) {
+  validate(from);
+  if (to.size() < 2 || to.size() > kMaxSplitParts) {
+    throw RequestError(std::format("a split needs 2 to {} target collections", kMaxSplitParts));
+  }
+  std::set<std::string_view> names;
+  for (const auto& id : to) {
+    validate(id);
+    if (id.tenant != from.tenant) throw RequestError("split targets must be in the tenant of the split collection");
+    if (id.name == from.name || !names.insert(id.name).second) {
+      throw RequestError("split targets must be distinct and differ from the split collection");
+    }
+  }
+  auto source = map.get(from);
+  if (!source) throw CollectionNotFoundError("collection '" + from.label() + "' does not exist");
+  auto shard = source->getShard();
+  if (!shard || source->isFailed()) throw CollectionUnavailableError("collection '" + from.label() + "' is unavailable");
+  if (!shard->iw) throw ReadOnlyError("collection '" + from.label() + "' is not written by this node");
+
+  // Every acknowledged update is in the snapshot. Its pin keeps the files
+  // linkable while the parts are made; each step refreshes it.
+  shard->iw->commit();
+  auto snapshot = shard->snapshots->acquire();
+  if (!snapshot) throw CollectionUnavailableError("collection '" + from.label() + "' has no snapshot");
+  auto refreshPin = [&] {
+    if (!shard->snapshots->touch(snapshot->id, 1)) {
+      throw CollectionUnavailableError("the snapshot of '" + from.label() + "' being split expired; retry the split");
+    }
+  };
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(snapshot->bytes, arena);
+  auto plan = planBySegments(info, to.size());
+  Manifest manifest;
+  manifest.bytes = snapshot->bytes;
+  manifest.generation = manifest.highestGeneration = snapshot->id.index_gen;
+  for (const auto& target : to) {
+    if (map.get(target)) throw CollectionExistsError("collection '" + target.label() + "' already exists");
+  }
+
+  // Copy every part outside the catalog lock. A reserved incarnation is
+  // discarded at writer startup, so a crash here leaves nothing behind.
+  auto& storage = catalog(from.tenant);
+  std::vector<std::pair<std::string, std::string>> reserved;
+  // Returns the parts whose removal failed.
+  auto discard = [&]() noexcept {
+    std::vector<size_t> failed;
+    for (size_t i = 0; i < reserved.size(); i++) {
+      try {
+        storage.retire(reserved[i].first, reserved[i].second);
+        storage.removeIncarnation(reserved[i].second);
+      } catch (const std::exception& e) {
+        LOG_WARN("Cannot remove split part '{}': {}", reserved[i].first, e.what());
+        failed.push_back(i);
+      }
+    }
+    return failed;
+  };
+  try {
+    for (size_t i = 0; i < to.size(); i++) {
+      refreshPin();
+      reserved.emplace_back(to[i].name, copySnapshotAs(storage, to[i].name, snapshot->id.incarnation, manifest, keepSegments(plan[i])));
+    }
+    refreshPin();
+  } catch (...) {
+    discard();
+    throw;
+  }
+
+  // One catalog update activates every part, so a restart finds all or none.
+  // Parts are registered only once every one of them is open.
+  std::vector<std::unique_ptr<Transition>> transitions;
+  std::vector<std::shared_ptr<Collection>> created;
+  try {
+    for (const auto& target : to) {
+      transitions.push_back(std::make_unique<Transition>(*this, target));
+      if (map.get(target)) throw CollectionExistsError("collection '" + target.label() + "' already exists");
+    }
+    storage.activate(reserved);
+    for (size_t i = 0; i < to.size(); i++) created.push_back(initWriter(to[i], {}, false, storage.owned(reserved[i].second)));
+  } catch (...) {
+    for (const auto& collection : created) {
+      try { collection->shard->iw->close(); }
+      catch (const std::exception& e) { LOG_WARN("Cannot close split part '{}': {}", collection->getId().label(), e.what()); }
+    }
+    // As a failed create: a part that could not be removed stays unavailable
+    // until deleted, rather than reappearing at the next start.
+    for (size_t i : discard()) unavailable(to[i], "split failed and its cleanup failed");
+    throw;
+  }
+  std::vector<SplitPart> parts;
+  for (size_t i = 0; i < to.size(); i++) {
+    // The transitions turn away other creators; one may still be leaving.
+    while (!map.insert(to[i], created[i])) {
+      if (map.get(to[i])) throw std::logic_error("collection '" + to[i].label() + "' registered during its split");
+      std::this_thread::yield();
+    }
+    registered(to[i], created[i]);
+    SplitPart part{to[i], created[i]};
+    for (const auto& seg : info.segments) {
+      if (plan[i].contains(seg.seg_id)) { part.docs += (uint64_t)seg.live_docs; part.segments++; }
+    }
+    LOG_INFO("Created collection {} from {} segments of {}", to[i].label(), part.segments, from.label());
+    parts.push_back(std::move(part));
+  }
+  return parts;
 }
 
 void Collections::remove(const CollectionId& key, bool mustExist) {

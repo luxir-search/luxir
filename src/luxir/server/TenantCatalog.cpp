@@ -363,6 +363,28 @@ void TenantCatalog::activate(std::string_view name, std::string_view id, std::st
   });
 }
 
+void TenantCatalog::activate(std::span<const std::pair<std::string, std::string>> names) {
+  mutate([&](State& state) {
+    std::vector<Entry*> selected;
+    for (const auto& [name, id] : names) {
+      for (const auto& entry : state.entries) {
+        if (entry.name == name && entry.state == "active") throw CollectionExistsError("collection '" + name + "' already exists");
+      }
+      auto entry = std::ranges::find(state.entries, id, &Entry::id);
+      if (entry == state.entries.end() || entry->name != name || entry->state != "reserved") {
+        throw std::runtime_error("activation requires a reserved incarnation");
+      }
+      requireOwner(*entry);
+      selected.push_back(&*entry);
+    }
+    for (auto* entry : selected) {
+      entry->state = "active";
+      entry->retired_ms.reset();
+    }
+    return !selected.empty();
+  });
+}
+
 uint64_t TenantCatalog::rename(std::string_view from, std::string_view to) {
   Collections::validateName(from); Collections::validateName(to);
   if (from == to) throw InvalidCollectionNameError("rename requires different names");

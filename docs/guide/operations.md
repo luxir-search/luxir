@@ -263,6 +263,41 @@ with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
 its broken on-disk state.
 
+### Splitting a collection
+
+`POST /collections/_split` (gRPC `luxir.Admin/SplitCollection`) divides a
+collection's documents among new collections of the same tenant, so a
+collection that keeps growing can be served, merged and retired in parts, or
+handed to other nodes:
+
+```sh
+curl -s localhost:9400/collections/_split -d '{"from":"logs","parts":2}'
+```
+
+```json
+{"from":"logs","parts":[{"name":"logs_0","docs":5120344,"segments":7},{"name":"logs_1","docs":5098771,"segments":8}]}
+```
+
+`parts` names the new collections `<from>_0`, `<from>_1`, and so on; `to`
+names them explicitly instead. Every name must be free. Either all parts are
+created or none is.
+
+- The source commits first, and the parts hold exactly that commit. The source
+  is not changed: delete it, or keep it, when the parts are in place. Updates
+  it accepts after the split began are in no part, so stop writing to it first.
+- Each part receives whole segments, largest first, each to the part with the
+  fewest documents so far. The collection needs at least as many segments with
+  documents as there are parts. Segment files are linked, not copied, on
+  backends that support hard links, so a split takes about as long as a commit
+  and needs no extra space until the parts merge.
+- A part keeps the source's schema and continues its update versions; it is
+  an ordinary collection and accepts updates, schema changes and merges of its
+  own.
+- Which part holds a document depends on the segment it landed in, not on its
+  ID. Use a segment split for data that is no longer updated (logs, events,
+  closed periods), or send each later update or delete to every part.
+- A follower downloads each part in full, since it is a new collection.
+
 ## Visibility policy
 
 Updates become visible to searches at commit. An

@@ -866,6 +866,10 @@ struct RenameCollectionRequest { std::string_view from; std::string_view to; std
 struct RenameCollectionResponse { std::string_view from; std::string_view to; };
 struct SwapCollectionsRequest { std::string_view a; std::string_view b; std::string_view tenant; };
 struct SwapCollectionsResponse { std::string_view a; std::string_view b; };
+struct SplitCollectionRequest {
+  std::string_view from; std::span<const std::string_view> to; std::string_view tenant; uint32_t parts = 0; };
+struct SplitCollectionPart { uint64_t docs = 0; std::string_view name; uint32_t segments = 0; };
+struct SplitCollectionResponse { std::string_view from; std::span<const SplitCollectionPart> parts; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
@@ -1258,6 +1262,7 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
+LUXIR_TD(SplitCollectionRequest) LUXIR_TD(SplitCollectionPart) LUXIR_TD(SplitCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
@@ -1306,6 +1311,7 @@ LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(RenameCollectionRequest) LUXIR_ENTRY(RenameCollectionResponse) LUXIR_ENTRY(SwapCollectionsRequest) LUXIR_ENTRY(SwapCollectionsResponse)
+LUXIR_ENTRY(SplitCollectionRequest) LUXIR_ENTRY(SplitCollectionPart) LUXIR_ENTRY(SplitCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)

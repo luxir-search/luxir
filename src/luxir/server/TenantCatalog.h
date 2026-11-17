@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <span>
 #include "luxir/store/DirectoryFactory.h"
 #include "luxir/store/CollectionId.h"
 #include "luxir/store/IncarnationState.h"
@@ -86,6 +87,8 @@ public:
   // A supplied source id resumes a follower candidate or its active incarnation.
   std::string reserve(std::string_view name, std::string_view sourceId = {}, bool exclusive = false);
   void activate(std::string_view name, std::string_view id, std::string_view replacing = {});
+  // Selects reserved incarnations of free names, by name, in one update.
+  void activate(std::span<const std::pair<std::string, std::string>> names);
   void retire(std::string_view name, std::string_view id = {});
   void remove(std::string_view name);
   void removeIncarnation(std::string_view id);
