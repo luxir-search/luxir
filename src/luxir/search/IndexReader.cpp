@@ -288,7 +288,7 @@ template <class Value>
 void SegmentPart<Value>::declareReads(ReadSet& reads) {
   if (peek() || isUnreadable()) return;
   std::lock_guard filesLock(filesMutex);
-  if (files && !peek()) files->declareReads(reads);
+  if (files && !peek()) declareOpen(*files, reads);
 }
 
 void Segment::declareReads(ReadSet& reads) const {
