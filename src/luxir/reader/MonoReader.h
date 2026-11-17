@@ -23,8 +23,10 @@ public:
   static constexpr int64_t ENDINDEX = MonoColumn::ENDINDEX;
   using BlockInfo = NumBlockInfo;
 
+  /// `deferred` reads a lazy file's column by range instead of materializing
+  /// the file (a vector column's mono columns share the file with its values).
   MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
-             int64_t nValues);
+             int64_t nValues, bool deferred = false);
 
   MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff,
              int64_t nValues) {
