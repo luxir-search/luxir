@@ -243,7 +243,7 @@ private:
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
 
   static bool numericQueryable(FieldType& ft) {
-    return ft.supports(FieldType::MATCH) && FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
+    return ft.supports(FieldType::MATCH) && (FieldType::isNumericColumn(ft.type()) || ft.type() == FieldType::INTERVAL) && ft.hasColumn();
   }
 
   FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {

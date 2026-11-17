@@ -103,6 +103,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
       return Query::ScoreProfile::automatic(1.0f);
     case QueryKind::TERM:
@@ -155,6 +156,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
       return true;
@@ -200,6 +202,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
     case QueryKind::TO_PARENT:
@@ -251,6 +254,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::MIN_SCORE:
     case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
@@ -311,6 +315,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
     case QueryKind::RESCORE:

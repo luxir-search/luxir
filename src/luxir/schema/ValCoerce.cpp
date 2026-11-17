@@ -103,6 +103,9 @@ std::optional<int64_t> parseScaledDecimal(const api::Val& value, int32_t scale,
 
 } // namespace luxir::coerce
 
+#include <limits>
+#include <memory>
+
 namespace luxir {
 
 int64_t FieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
@@ -487,6 +490,66 @@ std::string_view StrFieldType::coerceTerm(const api::Val& val, std::string_view 
 std::string_view IdFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
                                          std::span<char> buf) const {
   return coerce::toText(val, fieldName, buf);
+}
+
+static std::shared_ptr<FieldType> rangeElement(std::string_view name, FieldType::Type type) {
+  switch (type) {
+    case FieldType::INT: return std::make_shared<IntFieldType>(name);
+    case FieldType::DOUBLE: return std::make_shared<DoubleFieldType>(name);
+    case FieldType::DATE: return std::make_shared<DateFieldType>(name);
+    default: throw std::invalid_argument("range fields hold INT, DOUBLE or DATE endpoints");
+  }
+}
+
+RangeFieldType::RangeFieldType(std::string_view name, FieldType::Type elementType, int flags)
+  : FieldType(name, FieldType::INTERVAL, flags), element(rangeElement(name, elementType)) {}
+
+std::string_view RangeFieldType::typeName() const {
+  switch (elementType()) {
+    case FieldType::DOUBLE: return "double_range";
+    case FieldType::DATE: return "date_range";
+    default: return "long_range";
+  }
+}
+
+std::optional<RangeFieldType::Bounds> RangeFieldType::encodeBounds(
+    const api::Val* gte, const api::Val* gt, const api::Val* lte, const api::Val* lt,
+    std::string_view fieldName, const CoerceContext& context) const {
+  bool hasGte = gte && !coerce::isNull(*gte);
+  bool hasGt = gt && !coerce::isNull(*gt);
+  bool hasLte = lte && !coerce::isNull(*lte);
+  bool hasLt = lt && !coerce::isNull(*lt);
+  if (hasGte && hasGt) {
+    throw RequestError(fmt::format("range on '{}' sets both gte and gt", fieldName), "invalid_value");
+  }
+  if (hasLte && hasLt) {
+    throw RequestError(fmt::format("range on '{}' sets both lte and lt", fieldName), "invalid_value");
+  }
+
+  // Coerce every supplied bound before deciding emptiness, so a malformed
+  // bound is always an error. Each bound's half-line window already steps an
+  // exclusive bound by one encoded unit and rounds a DATE literal by its granule.
+  Bounds bounds{std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
+  bool empty = false;
+  auto lower = [&](const api::Val& value, LiteralUse use) {
+    auto window = element->coerceIntWindow(value, use, fieldName, context);
+    bounds.unroundedNow |= window.unroundedNow;
+    if (window.empty()) empty = true;
+    bounds.lo = window.lo;
+  };
+  auto upper = [&](const api::Val& value, LiteralUse use) {
+    auto window = element->coerceIntWindow(value, use, fieldName, context);
+    bounds.unroundedNow |= window.unroundedNow;
+    if (window.empty()) empty = true;
+    bounds.hi = window.hi;
+  };
+  if (hasGte) lower(*gte, LiteralUse::GTE);
+  if (hasGt) lower(*gt, LiteralUse::GT);
+  if (hasLte) upper(*lte, LiteralUse::LTE);
+  if (hasLt) upper(*lt, LiteralUse::LT);
+  if (empty) return std::nullopt;
+  if (bounds.lo > bounds.hi) return std::nullopt;
+  return bounds;
 }
 
 } // namespace luxir

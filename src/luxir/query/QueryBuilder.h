@@ -26,6 +26,7 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermPattern.h"
@@ -943,6 +944,11 @@ public:
         "Match query", target.physicalName);
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    if (fieldType.type() == FieldType::INTERVAL) {
+      // Exact match on a range field: the intervals containing the value.
+      if (coerce::isNull(val)) return matchNoDocs();
+      return createRangeQuery(target, &val, nullptr, &val, nullptr);
+    }
     if (FieldType::isNumericColumn(fieldType.type())) {
       if (coerce::isNull(val)) return matchNoDocs();
       requireNumericColumn(target);
@@ -1175,17 +1181,33 @@ public:
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
   // term bytes, TEXT bounds fold like the field folds (normalizeMultiterm),
   // and exact bounds obey the post-normalization length limit.
+  //
+  // Range fields build a RangeFieldQuery comparing each stored interval with
+  // the query interval by `relation`; other fields accept only INTERSECTS.
   Query* createRangeQuery(std::string_view field,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
-    return createRangeQuery(fields.resolveLocal(field, OpClass::VALUE, opName), gte, gt, lte, lt);
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
+    return createRangeQuery(fields.resolveLocal(field, OpClass::VALUE, opName), gte, gt, lte, lt, relation);
   }
 
   Query* createRangeQuery(const ResolvedFieldHandle& target,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    if (fieldType.type() == FieldType::INTERVAL) {
+      auto bounds = ((RangeFieldType&)fieldType).encodeBounds(gte, gt, lte, lt, field, coerceContext);
+      if (!bounds) return matchNoDocs();
+      return pool.make<RangeFieldQuery>(field, relation, bounds->lo, bounds->hi,
+          bounds->unroundedNow ? FilterKeyScope::REQUEST_STABLE
+                               : FilterKeyScope::SEGMENT_STABLE);
+    }
+    if (relation != RangeFieldQuery::Relation::INTERSECTS) {
+      throw std::runtime_error(std::format(
+          "Range query relation applies only to range fields; '{}' is not one", field));
+    }
     fieldType.requireCapability(FieldType::RANGE, "Range query", field);
     bool numeric = FieldType::isNumericColumn(fieldType.type());
     if (numeric) requireNumericColumn(target);

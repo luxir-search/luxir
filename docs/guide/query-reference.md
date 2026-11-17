@@ -438,6 +438,29 @@ prefix rule. Case-insensitive matching does not shorten the measured literal.
 Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
 See [Operations](operations.md) for the server settings.
 
+### Range fields
+
+On a `long_range`, `double_range`, or `date_range` field, the query compares
+each stored interval with the query interval. `relation` picks the test:
+
+| `relation` | A document matches when its interval |
+|---|---|
+| `intersects` (default) | overlaps the query interval |
+| `contains` | covers the whole query interval |
+| `within` | lies inside the query interval |
+
+```json
+{"range":{"field":"open_hours","gte":9,"lte":17,"relation":"contains"}}
+```
+
+Bounds coerce like the field's endpoint type; date bounds round to the
+granule they name, as on a `date` field. An open query side is unbounded, and
+so is an open stored end: `{"gte":50}` contains every value from 50 up. A
+`match` on a range field, and `field:[a TO b]` in the
+[query language](query-language.md), are `intersects` queries; `match` with
+one value finds the intervals containing it. `relation` is rejected on other
+field types.
+
 ## Constant score and boost
 
 Replace every child score while retaining its match set:

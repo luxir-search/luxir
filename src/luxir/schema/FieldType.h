@@ -59,7 +59,10 @@ public:
     BOOLEAN,  // true/false; column-stored as 0/1
     DECIMAL,  // fixed-point number; scale in type flags
     IP,       // 16-byte address term
-    NESTED    // structural row-space declaration, never a physical field
+    NESTED,   // structural row-space declaration, never a physical field
+    // [min, max] interval (RangeFieldType); the column holds two encoded
+    // int64 values per document, min then max.
+    INTERVAL
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
@@ -70,7 +73,7 @@ public:
       case STRING: case ID: case IP: return Storage::TERMS;
       case TEXT: return Storage::TEXT;
       case BIN: return Storage::BIN;
-      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: return Storage::INT64;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: case INTERVAL: return Storage::INT64;
       case VECTOR: return Storage::VECTOR;
     }
     throw std::invalid_argument("Unknown field storage type");
@@ -79,7 +82,7 @@ public:
   // Ordered scalar values in the shared int64 column: numeric queries,
   // field sorts and one-dimensional points all use this storage family.
   static constexpr bool isNumericColumn(Type type) {
-    return storage(type) == Storage::INT64 && type != GEO_POINT;
+    return storage(type) == Storage::INT64 && type != GEO_POINT && type != INTERVAL;
   }
 
   static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
@@ -500,6 +503,55 @@ public:
 
   ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
   uint32_t capabilities() const override { return VALUE_EXPR; }
+};
+
+// An interval of INT, DOUBLE or DATE endpoints. Each endpoint is stored with
+// its element type's column encoding (raw int64, sortable double bits, epoch
+// millis), so encoded order is value order and both [min, max] and query
+// bounds compare as plain int64. An open end stores the int64 extreme.
+//
+// The segment column is laid out like a multi-valued int column with two
+// values per document (min, max), so merges, deletes and the column scans
+// reuse that machinery. INDEX_RANGE adds a 2-D points index over (min, max)
+// (RangeBKDWriter).
+class RangeFieldType : public FieldType {
+public:
+  // Encoded inclusive bounds; lo > hi never escapes encodeBounds.
+  struct Bounds {
+    int64_t lo;
+    int64_t hi;
+    bool unroundedNow = false; // a DATE bound came from unrounded NOW math
+  };
+
+  // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
+  const std::shared_ptr<FieldType> element;
+
+  RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
+
+  FieldType::Type elementType() const { return element->type(); }
+  uint32_t capabilities() const override { return MATCH | RANGE; }
+  // The element type is persisted so segments and schema signatures tell
+  // long_range, double_range and date_range apart: 0, 1 and 2.
+  uint32_t segmentTypeFlags() const override {
+    return elementType() == FieldType::DOUBLE ? 1u : elementType() == FieldType::DATE ? 2u : 0u;
+  }
+  void signatureProps(SignatureProps& out) const override {
+    out["type"] = "\"" + std::string(typeName()) + "\"";
+  }
+
+  // The schema type name: long_range, double_range or date_range.
+  std::string_view typeName() const;
+
+  // Folds {gte|gt, lte|lt} (any may be null for an open side) into inclusive
+  // encoded bounds; an exclusive bound steps one encoded unit. DATE endpoints
+  // round by the granule a literal names, like a DATE range query: gte/gt use
+  // the window start/end and lte/lt the window end/start. Returns nullopt for
+  // an empty interval. Throws on both gte and gt (or lte and lt) and on
+  // uncoercible values.
+  std::optional<Bounds> encodeBounds(const api::Val* gte, const api::Val* gt,
+                                     const api::Val* lte, const api::Val* lt,
+                                     std::string_view fieldName,
+                                     const CoerceContext& context = {}) const;
 };
 
 // Unique id field
