@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <string_view>
 #include <optional>
 #include "DocsReader.h"
@@ -41,9 +42,9 @@ public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
   StrColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) :
     docs(postingsReader, fieldInfo),
-    valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
+    valuesIS(postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
-    valuesInput(postingsReader.getFile(fieldInfo.columnLoc.filenum())),
+    valuesInput(postingsReader.core().getFile(fieldInfo.columnLoc.filenum())),
     valuesFileOffset((size_t)fieldInfo.columnLoc.offset()),
     arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0),
     docsWithField(fieldInfo.docsWithField),

@@ -19,7 +19,9 @@ namespace luxir {
 // ChecksumMismatchError). Returns the reserved incarnation; activation is separate.
 // Promotion and recovery both start a new identity this way. Markers naming
 // files of the copied manifest are durable in the new incarnation on return.
-std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest, bool verify = false);
+// If supplied, claimed receives the new lifetime for opening its writer.
+std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest,
+                          bool verify = false, IncarnationState* claimed = nullptr);
 
 // Offline promotion of a follower data directory to an independent writer:
 // every selected collection gets a new identity. Resumable: each target is

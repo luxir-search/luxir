@@ -7,6 +7,7 @@
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "Prometheus.h"
 
 #include <cassert>
@@ -1595,6 +1596,8 @@ private:
         json.string("version", build.version);
         json.string("source_commit", build.sourceCommit);
         json.string("cpu_target", build.cpuTarget);
+        json.string("faiss_simd", kernelInfo().faissSimd);
+        json.string("blas_core", kernelInfo().blasCore);
         respondJson(http::status::ok, json.finish());
         break;
       }
@@ -4385,6 +4388,7 @@ void HttpServer::armReplicationExpiry() {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
         }
         node.getReplication().expire();
+        node.collections().expireRetirements();
         Signal::emit("replicationExpiryTick");
       } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
       net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });

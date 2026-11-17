@@ -28,7 +28,7 @@ def configure(tree, build, *extra):
 
 def check(tree, build, expected):
     run('cmake', '--build', str(build), cwd=tree)
-    assert run(str(build / 'info'), cwd=tree) == f'1.2.3 {expected} test'
+    assert run(str(build / 'info'), cwd=tree) == f'1.2.3-dev {expected} test'
 
 
 def packaged_fresh(build):
@@ -49,6 +49,7 @@ def fixture(repo, *init):
     project(BuildMetadata VERSION 1.2.3 LANGUAGES CXX)
     set(CMAKE_CXX_STANDARD 17)
     set(_luxir_cpu_name test)
+    set(LUXIR_VERSION "${PROJECT_VERSION}-dev")
     include(BuildInfo.cmake)
     add_executable(info main.cpp "${CMAKE_CURRENT_BINARY_DIR}/BuildInfo.cpp")
     target_include_directories(info PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -456,6 +456,26 @@ TEST_F(DisjTwoPhaseTest, scoredConjunctionRoutesPlainAndMatchesLegacyBits) {
   }
 }
 
+// A range inside one zone cannot say whether it matches before it runs, but
+// its scorer is exact, and so is a Boolean that excludes or unions it.
+TEST_F(DisjTwoPhaseTest, unknownEmptinessKeepsAnExactProtocolUnderExclusion) {
+  helper.clear();
+  CollectionHelper::UpdateBuilder input;
+  for (int64_t i = 0; i < 300; i++) input.add(flatdoc("id", std::to_string(i), "n_i", i));
+  input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  auto req = localReq(helper.getSearchEngine());
+  auto range = [&](int64_t low, int64_t high) {
+    return qb::range(req->mr, "n_i", qb::valI64(req->mr, low), nullptr, qb::valI64(req->mr, high), nullptr);
+  };
+  auto excluded = qb::boolean(req->mr, {qb::all()}, {}, {range(10, 20)});
+  req->topDocs().countLimit().rawQuery() = qb::boolean(req->mr, {qb::all()}, {}, {excluded});
+  auto either = qb::boolean(req->mr, {}, {range(10, 20), range(40, 50)});
+  req->topDocs("union").countLimit().rawQuery() = qb::boolean(req->mr, {qb::all()}, {}, {either});
+  req->execute(1); ASSERT_OK(req);
+  EXPECT_EQ(11, req->getMatchCount());
+  EXPECT_EQ(278, req->getMatchCount("union"));
+}
+
 TEST_F(DisjTwoPhaseTest, prohibitedDisjunctionDefersThroughMandNot) {
   RequestRun deferred = runProhibited(false);
   RequestRun eager = runProhibited(true);

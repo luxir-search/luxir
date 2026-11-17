@@ -199,10 +199,10 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   EXPECT_EQ(ValueOpcode::ABS,
             parseAggregate(memory, *schema, "abs(sum(price_i))")
                 ->root().function->opcode);
-  EXPECT_EQ(ValueOpcode::FLOOR,
+  EXPECT_EQ("floor",
             parseAggregate(memory, *schema,
                            "floor(sum(price_i) / sum(foo_i))")
-                ->root().function->opcode);
+                ->root().function->name);
 
   AggregateProgram* nested =
       parseAggregate(memory, *schema, "avg(avg(prices_is))");
@@ -1161,7 +1161,7 @@ TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults
     expectParseError(memory, *schema, expression, "integer in [0, 40000]");
   }
   expectParseError(memory, *schema, "cardinality(x_sc)", "indexed STRING or ID");
-  expectParseError(memory, *schema, "cardinality(x_t)", "TEXT");
+  expectParseError(memory, *schema, "cardinality(x_t)", "value expression is not supported on text field");
   expectParseError(memory, *schema, "cardinality(x_i, x_i)", "numeric constants");
   expectParseError(memory, *schema, "percentile_rank(x_is, 1)", "one scalar per document");
   expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");
@@ -1591,6 +1591,7 @@ TEST_F(AggregateExprTest, producerInputsCompareResolvedConstantsStructurally) {
     for (uint8_t i = 0; i < node.childCount; i++) node.children[i]++;
   }
   input.rootNode++;
+  input.retainRoot();
   EXPECT_TRUE(left->producers[0].sameState(right->producers[0]));
   otherIntegers[1]--;
   EXPECT_EQ(2u, parse("cardinality($a) + cardinality($b)")->producers.size());

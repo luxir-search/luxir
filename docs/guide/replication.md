@@ -81,8 +81,8 @@ Host: localhost:9500
 }
 ```
 
-`follower` is the name the writer knows this follower by, its host and HTTP
-port. Set `--replication.follower-id` when hostnames are not unique.
+`follower` is the name the writer knows this follower by: its
+[node identity](operations.md#node-identity), configured with `--node.id`.
 
 The examples below use these two nodes.
 
@@ -330,7 +330,6 @@ All replication settings use `--replication.` (configuration keys use underscore
 | Setting | Default | Purpose |
 |---|---:|---|
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
-| `follower-id` | host:port | Name the source knows this follower by |
 | `tenants` | empty (all) | Comma-separated tenant subscription |
 | `peers` | empty | Comma-separated nodes serving file copies, tried before the source |
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |

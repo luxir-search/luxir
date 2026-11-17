@@ -4,6 +4,7 @@
 #include "luxir/analysis/AnalysisRegistry.h"
 
 #include <memory_resource>
+#include <set>
 #include <stdexcept>
 
 namespace luxir {
@@ -64,6 +65,22 @@ void addTo(Map& map, bool frozen, std::string_view kind, std::string name, Maker
   map.emplace(std::move(name), std::move(maker));
 }
 
+void checkParamKeys(const api::Val& value, std::string_view kind, std::string_view name) {
+  if (auto* object = std::get_if<api::Map>(&value.kind)) {
+    std::set<std::string_view> seen;
+    for (const auto& [key, param] : object->fields) {
+      if (!seen.insert(key).second) {
+        throw std::invalid_argument(std::string(kind) + " '" + std::string(name) +
+                                    "': duplicate parameter '" + std::string(key) +
+                                    "'; parameter names must be unique");
+      }
+      checkParamKeys(*param, kind, name);
+    }
+  } else if (auto* array = std::get_if<api::ArrVal>(&value.kind)) {
+    for (const auto& item : array->v) checkParamKeys(item, kind, name);
+  }
+}
+
 template <class Map>
 const auto& findMaker(const Map& map, const api::AnalyzerComponent& def, std::string_view kind,
                       std::string_view plural) {
@@ -76,6 +93,7 @@ const auto& findMaker(const Map& map, const api::AnalyzerComponent& def, std::st
     throw std::invalid_argument("unknown " + std::string(kind) + " '" + std::string(def.name) + "'; valid " +
                                 std::string(plural) + ": " + joined(keysOf(map)));
   }
+  if (!def.params.empty()) checkParamKeys(api::Val{api::Map{def.params}}, kind, def.name);
   return it->second;
 }
 

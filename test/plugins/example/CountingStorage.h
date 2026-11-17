@@ -58,6 +58,7 @@ public:
   std::shared_ptr<StorageCounters> counters = std::make_shared<StorageCounters>();
 
   using DelegatingDirFactory::DelegatingDirFactory;
+  bool exclusive() const override { return delegate->exclusive(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     return std::make_shared<CountingDirectory>(delegate->directory(root, path, std::move(options)), counters, viewLabel(root, path));
   }
@@ -70,6 +71,7 @@ public:
 
   explicit CountingRamBackend(const StorageContext& ctx)
       : DelegatingDirFactory(StorageRegistry::global().makeBackend("ram", ctx)) {}
+  bool exclusive() const override { return true; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     counters->add("open", viewLabel(root, path));
     return delegate->directory(root, path, std::move(options));

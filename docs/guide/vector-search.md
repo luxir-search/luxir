@@ -357,9 +357,21 @@ one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket. A boolean's `filter` and
 `prohibited` clauses both apply inside the vector search of its `required`
 and `optional` kNN clauses: a required kNN beside `prohibited: [X]` returns
-`k` neighbors that do not match `X`. Other scoring clauses beside the kNN
-(another `required` clause, or `optional` clauses made a constraint through
-`min_match`) still intersect with its top `k` afterwards.
+`k` neighbors that do not match `X`. Required clauses that add no score
+(`range`, `prefix`, `wildcard`, `regex`, `exists`, geo, and `any_of`) act like
+`filter` clauses: a required kNN beside them returns `k` neighbors that match
+them, and an `optional` kNN beside them picks its neighbors among their
+matches. Grouping does not matter: the `filter`, `prohibited`, and non-scoring
+required clauses of a boolean nested under `required` or `filter` (also inside
+`boost` or `constant_score`) constrain the kNN the same way. Clauses inside an
+`optional` group do not, even when `min_match` makes the group necessary.
+
+Required clauses that score, including a `match` on one term, intersect with
+the kNN's top `k` after the vector search. Wrapping a constraint itself in
+`constant_score` asks for this post-filter behavior; wrapping a nested boolean
+does not hide the constraints inside it. To constrain the vector search by a
+term, use `any_of` or put it in `filter`. Optional clauses made a constraint
+through `min_match` also intersect afterwards.
 
 ## Hybrid search
 
@@ -919,6 +931,19 @@ that bounded override with default RaBitQ intervals on your workload. Setting `n
 reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
 the search exhaustive over IVF lists, but bounded estimates or empirical
 intervals still decide which values are rescored.
+
+To see a query's initial budget and actual work, send `profile: true` and read the
+`knn(<field>)` op: `coverage` (fraction of live vectors in probed lists),
+`initial_nprobe` against `reference_nlist`, per-segment `lists_probed` against
+`segment_nlist`, and `terminal_reads`. See
+[profiling](searching.md#request-level-controls). Recall itself needs ground truth from an
+`exact: true` run of the same queries; the engine does not report it.
+
+Measure recall with queries drawn from the application's real query
+distribution. Synthetic query vectors far from the data, for example with
+uniform random components, sit at nearly equal distance from every list and
+every code, so IVF coverage and 1-bit interval selection both lose their
+discrimination.
 
 `exact: true` uses a path that guarantees the true top-k and does not
 consult overlays. Everything else about

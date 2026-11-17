@@ -196,7 +196,9 @@ or clear it in either word. It affects HTTP JSON rendering only, and binary
 gRPC responses retain their integer types. Bit 3 is `estimate_count`: lists in
 its scope with an unset or positive `count_limit` may estimate `found` (see
 [counts](searching.md#counts-are-opt-in-exact-estimated-or-bounded)). Clearing
-it on an op stops its subops inheriting it. Unknown bits are rejected in either
+it on an op stops its subops inheriting it. Bit 4 is `decimal_scaled`: decimal
+literals and results use raw scaled units, at request or operation level
+(see [Decimals](schema.md#decimals)). Unknown bits are rejected in either
 word. Bits absent from `flags_set` have no effect on inheritance.
 
 `RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the

@@ -32,7 +32,7 @@ class RescoreQuery final : public Query {
         || bounds.lo > bounds.hi) {
       return ValueBounds::unbounded(ValueType::DOUBLE);
     }
-    ValueBounds out = ValueBounds::floating((double)bounds.lo, (double)bounds.hi);
+    ValueBounds out = ValueBounds::floatingRange((double)bounds.lo, (double)bounds.hi);
     out.minAttained = bounds.lo == bounds.hi;
     out.maxAttained = bounds.lo == bounds.hi;
     return out;
@@ -453,6 +453,8 @@ public:
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight;

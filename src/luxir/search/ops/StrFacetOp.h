@@ -360,12 +360,12 @@ public:
 
   // ProtobufSearchParser resolves the OrdMap and passes it in
   // (see TopDocsReq's ctor comment).
-  StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
+  StrFacetOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
     std::span<const std::string_view> selected,
     std::optional<FacetTermFilterSpec> termFilterSpec = std::nullopt) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
   ordMap(std::move(ordMap)) {
     if (!selected.empty() || termFilterSpec) {
@@ -632,15 +632,15 @@ public:
         inlineOps(((StrFacetOp&)op).inlineSubOps),
         feedOps(((StrFacetOp&)op).subOps.begin(),
                 ((StrFacetOp&)op).subOps.end()),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
-        inlineDriver(op.req.reader->segments().size(),
+        inlineDriver(op.view->segments().size(),
                      [this](std::unique_ptr<MergeableFieldFacetInline> m){ facetResult2(std::move(m)); }) {
       // An inline-all candidate always starts with feed ops, so this also
       // covers its gather.
       assert(!thisOp().inlineAllCandidate || !feedOps.empty());
-      if (!feedOps.empty()) input.resize(op.req.reader->segments().size());
-      topTermsSegments.resize(op.req.reader->segments().size());
+      if (!feedOps.empty()) input.resize(op.view->segments().size());
+      topTermsSegments.resize(op.view->segments().size());
       inlineDriver.setCreator([this]() {
         return createInlineData(inlineOps,
             thisOp().ordMap ? thisOp().ordMap->numOrds() : 0);
@@ -670,6 +670,7 @@ public:
       int64_t totalDomainSize = 0;
       inlineExpectedValues = inlineOps.empty() ? -1 : 0;
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        domains[segnum].assertScope(thisOp().reader.segments()[segnum]);
         int32_t maxDoc = thisOp().reader.segments()[segnum].maxDoc();
         int64_t domainSize = domains[segnum].get() != nullptr
             ? domains[segnum].get()->card() : maxDoc;
@@ -755,7 +756,7 @@ public:
       }
 
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get();
+      DocSet* domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
       if (!feedOps.empty()) input[(size_t)segnum] = std::move(domainHandle);
 
       if (profileRun != nullptr) {
@@ -1671,7 +1672,7 @@ public:
 
         for (size_t i = 0; i < numBuckets; i++) {
           domains[segnum * numBuckets + i] =
-              DomainHandle(builders[i].build());
+              DomainHandle(builders[i].build()).scoped(segment);
         }
       }
       return domains;
@@ -1785,7 +1786,7 @@ public:
       if (ordColumnDomains) built = ordColumnBucketDomains(buckets);
 
       FacetBucketBlockExecutor::execute<std::string_view>(
-          *this, children, buckets, *op.req.reader,
+          *this, children, buckets, *op.view,
           FacetBucketProducer::INDEPENDENT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
@@ -1840,7 +1841,7 @@ public:
 
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
-                         *child.req.reader, child.segInfos);
+                         *child.view, child.segInfos);
       // term_filter: one term-tier pass over every row's ords, and one
       // ascending accepted-ord stream for every row's zero-count padding.
       std::optional<FacetOrdFilter::Selection> selection;
@@ -1871,7 +1872,7 @@ public:
         }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));
-        emitBuckets(facetResultProto, countVec, mr);
+        child.emitFieldBuckets(facetResultProto, countVec, mr);
         if (child.missing) {
           facetResultProto.missing = missingCounts[(size_t)owner];
         }
@@ -1995,7 +1996,7 @@ public:
       int64_t routedDocs = 0;
       int64_t routedValues = 0;
 
-      auto* parentInfo = source.segInfos.at((size_t)segnum);
+      auto* parentInfo = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
       if (!parentInfo) return;
       auto* childFieldInfo = child.fieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;
@@ -2142,7 +2143,7 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
-    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
+    if (inputDomain != nullptr || bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
         || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;

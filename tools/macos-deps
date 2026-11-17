@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+# Publish or restore the prebuilt macOS release dependencies: /opt/vcpkg at the
+# manifest baseline with its installed tree, as one keyed artifact in the
+# development image's registry package. No Actions or vcpkg binary cache.
+#   macos-deps publish | restore
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mode=${1:?publish or restore}
+registry=$(printf '%s' "${REGISTRY:-ghcr.io/${GITHUB_REPOSITORY_OWNER:?}/luxir-dev}" | tr '[:upper:]' '[:lower:]')
+key=$(python3 tools/benchmarks/deps-key.py . macos)
+ref=$registry:$key-macos-arm64
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+printf '{}\n' > "$work/auth.json"
+registry_oras() { oras "$@" --registry-config "$work/auth.json"; }
+revision=$(python3 -c 'import json; print(json.load(open("deps/vcpkg.json"))["builtin-baseline"])')
+case $mode in
+  publish)
+    [[ $(sw_vers -productVersion) == 15.* ]] || {
+      echo 'Publish on macOS 15: Homebrew static runtimes carry the build OS baseline' >&2; exit 1;
+    }
+    printf '%s' "${GH_TOKEN:?}" | registry_oras login ghcr.io -u "${GITHUB_ACTOR:?}" --password-stdin
+    if registry_oras manifest fetch --descriptor "$ref" >/dev/null 2>&1; then
+      echo "Already published: $ref"; exit 0
+    fi
+    [[ ! -e /opt/vcpkg ]] || { echo '/opt/vcpkg must be absent for a cold publish' >&2; exit 1; }
+    sudo mkdir -p /opt/vcpkg /opt/luxir-deps
+    sudo chown "$(id -un):$(id -gn)" /opt/vcpkg /opt/luxir-deps
+    git init -q /opt/vcpkg
+    git -C /opt/vcpkg fetch -q --depth 1 https://github.com/microsoft/vcpkg.git "$revision"
+    git -C /opt/vcpkg checkout -q --detach FETCH_HEAD
+    /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+    VCPKG_BINARY_SOURCES=clear LUXIR_DEPS_VARIANTS=native-release deps/make_deps.sh
+    cp -R deps/vcpkg.json deps/vcpkg-configuration.json deps/ports deps/triplets /opt/luxir-deps/
+    # Keep only the installed tree and pinned toolchain checkout. Drop caches,
+    # downloads and build products before making a second compressed copy.
+    rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/packages /opt/vcpkg/downloads
+    COPYFILE_DISABLE=1 tar -czf "$work/deps.tar.gz" -C /opt vcpkg luxir-deps
+    (cd "$work" && registry_oras push "$ref" --artifact-type application/vnd.luxir.macos-deps.v1 \
+      --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY:?}" \
+      deps.tar.gz:application/gzip)
+    ;;
+  restore)
+    mkdir -p build
+    [[ ! -e /opt/vcpkg && ! -e /opt/luxir-deps ]] || {
+      echo 'Restore requires absent /opt/vcpkg and /opt/luxir-deps' >&2; exit 1;
+    }
+    digest=$(registry_oras manifest fetch --descriptor "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+    registry_oras pull "$registry@$digest" -o "$work"
+    sudo tar -xzf "$work/deps.tar.gz" -C /opt
+    [[ $(git -C /opt/vcpkg rev-parse HEAD) == "$revision" ]]
+    python3 - "$digest" > build/macos-builder.json <<'PY'
+import json, subprocess, sys
+identity = subprocess.check_output(['bash', 'tools/macos-toolchain', 'identity'], text=True).strip()
+print(json.dumps({'kind': 'native', 'dependency_digest': sys.argv[1], 'toolchain': identity}))
+PY
+    ;;
+  *) exit 2 ;;
+esac
