@@ -13,6 +13,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/SchemaCache.h"
 #include "luxir/store/FileIOException.h"
+#include "luxir/store/RangeFetch.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
@@ -22,8 +23,10 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <algorithm>
 #include <bit>
+#include <condition_variable>
 #include <format>
 #include <map>
+#include <mutex>
 #include <memory_resource>
 #include <span>
 #include <system_error>
@@ -40,6 +43,49 @@ std::string segmentAuxKey(uint64_t segId, std::string_view name) {
   key.push_back(':');
   key.append(name);
   return key;
+}
+
+// Fetches every file whole in one concurrent batch and waits for the batch,
+// up to `deadline`, so the reads that follow find their bytes resident. A
+// file that is resident already (mapped or in memory) completes inline. A
+// fetch that fails is left to the read, which fails or fetches as it would
+// have. A batch still running at the deadline throws FetchTimeoutError and
+// goes on: what it fetches is there for the next open.
+void fetchWhole(const std::vector<std::shared_ptr<InputFile>>& files, ReadDeadline deadline) {
+  struct Batch {
+    std::mutex mutex;
+    std::condition_variable done;
+    size_t pending = 0;
+    std::vector<std::shared_ptr<InputFile>> files;  // held until every fetch finished
+  };
+  if (files.empty()) return;
+  auto batch = std::make_shared<Batch>();
+  batch->files = files;
+  batch->pending = files.size();
+  for (const auto& file : files) {
+    auto once = std::make_shared<std::atomic<bool>>(false);
+    auto finish = [batch, once](std::exception_ptr) {
+      if (once->exchange(true)) return;
+      std::lock_guard lock(batch->mutex);
+      if (--batch->pending != 0) return;
+      batch->files.clear();
+      batch->done.notify_all();
+    };
+    try {
+      ByteRange whole{0, (uint64_t)file->size()};
+      file->fetchRanges(std::span(&whole, 1), deadline, finish);
+    } catch (...) {
+      finish(std::current_exception());
+    }
+  }
+  std::unique_lock lock(batch->mutex);
+  auto finished = [&] { return batch->pending == 0; };
+  if (deadline == kNoReadDeadline) {
+    batch->done.wait(lock, finished);
+  } else if (!batch->done.wait_until(lock, deadline, finished)) {
+    throw FetchTimeoutError(std::format("{} of {} segment summaries still fetching at the deadline",
+                                        batch->pending, files.size()));
+  }
 }
 
 std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
@@ -573,6 +619,44 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       }
       lastCommitTime = commitTimeUs;
 
+      // A segment's summary is carried over when the segment's files and the
+      // summary's own descriptor are unchanged; any other is read below.
+      auto summaryCarried = [&](const PhysicalCore::Bundle* prevSeg, const PhysicalCore::SegmentFiles* prevFiles,
+                                const PhysicalCore::SegmentFiles& files, size_t overlay) {
+        return prevSeg && prevSeg->summary && !files.files.empty() && prevFiles->files == files.files
+            && std::ranges::find(prevFiles->overlays, files.overlays[overlay]) != prevFiles->overlays.end();
+      };
+      // Open the summaries to read and fetch them all at once, so that on a
+      // remote store their reads cost one concurrent round trip, not one per
+      // segment. The loop takes each file opened here, or the failure to
+      // open it, as if it had opened the file itself.
+      struct Opened {
+        std::shared_ptr<InputFile> file;
+        std::exception_ptr error;
+      };
+      boost::unordered_flat_map<std::string_view, Opened> summaryFiles;
+      {
+        std::vector<std::shared_ptr<InputFile>> fetching;
+        for (size_t i = 0; i < indexInfo.segments.size(); i++) {
+          const auto& segment = indexInfo.segments[i];
+          const auto* prevSeg = previous ? previous->bundle(segment.seg_id) : nullptr;
+          const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+          for (size_t j = 0; j < segment.overlays.size(); j++) {
+            const auto& info = segment.overlays[j];
+            if (info.kind != SegmentSummary::OVERLAY_KIND || info.files.empty()) continue;
+            if (summaryCarried(prevSeg, prevFiles, core->segmentFiles[i], j)) continue;
+            auto& opened = summaryFiles[std::string_view(info.files.front().name)];
+            try {
+              opened.file = dir.openFile(info.files.front().name, true);
+            } catch (...) {
+              opened.error = std::current_exception();
+            }
+            if (opened.file) fetching.push_back(opened.file);
+          }
+        }
+        fetchWhole(fetching, kNoReadDeadline);
+      }
+
       segs.reserve(indexInfo.segments.size());
       for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
         const auto& segment = indexInfo.segments[i];
@@ -666,8 +750,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             // without materializing anything. A segment's summary is written
             // once with it: reuse the previous snapshot's copy when the
             // segment's files and the summary's own descriptor are unchanged.
-            if (prevSeg && prevSeg->summary && !files.files.empty() && prevFiles->files == files.files
-                && std::ranges::find(prevFiles->overlays, files.overlays[(size_t)j]) != prevFiles->overlays.end()) {
+            if (summaryCarried(prevSeg, prevFiles, files, (size_t)j)) {
               summary = prevSeg->summary;
               continue;
             }
@@ -675,7 +758,14 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             // any segment file while missingFileOK, then skipped.
             std::shared_ptr<InputFile> file;
             try {
-              file = dir.openFile(info.files.front().name, true);
+              auto found = summaryFiles.find(std::string_view(info.files.front().name));
+              if (found == summaryFiles.end()) {
+                file = dir.openFile(info.files.front().name, true);
+              } else if (found->second.error) {
+                std::rethrow_exception(found->second.error);
+              } else {
+                file = found->second.file;
+              }
             } catch (const std::exception& e) {
               if (!missingFileOK) LOG_WARN("Segment summary not opened for seg={}: {}", segId, e.what());
             }
