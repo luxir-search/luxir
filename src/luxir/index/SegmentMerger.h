@@ -8,6 +8,7 @@
 #include <set>
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
+#include "OwnershipWriter.h"
 #include "MergeCostModel.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
@@ -753,8 +754,10 @@ private:
       if (!MergeCostModel::docsFit(0, total)) throw std::runtime_error("merged row space exceeds row limit: " + path);
       space->maxDoc = (int32_t)total;
       space->ordinal = postingsWriter.addSpace(path);
-      auto output = postingsWriter.getOutputStream();
-      MonoWriter ends(postingsWriter.pool, *output);
+      const auto* type = dynamic_cast<const NestedFieldType*>(schema.getFieldTypePtr(path));
+      bool reverseMap = !type || type->reverseMap;
+      auto shapeRam = ramBudget.forceAcquire(OwnershipWriter::workspaceBytes(parent->maxDoc, space->maxDoc, reverseMap));
+      OwnershipWriter shape(postingsWriter, reverseMap);
       int32_t end = 0, owners = 0;
       for (size_t i = 0; i < cores.size(); i++) {
         const auto& owner = parent->segs[i];
@@ -775,16 +778,14 @@ private:
             for (int32_t row = family.first; row < family.end; row++) child.remap[row] = local++;
           } else local += family.end - family.first;
           end += family.end - family.first;
-          ends.addInt64(end);
+          shape.addEnd(end);
           owners++;
         }
         assert(local == child.numLive);
       }
       unused(owners);
       assert(owners == parent->maxDoc && end == space->maxDoc);
-      ends.finish();
-      postingsWriter.finishSpace(space->ordinal, space->maxDoc, {ends.blockLoc, ends.metaOff, {}, 0});
-      output.reset();
+      postingsWriter.finishSpace(space->ordinal, space->maxDoc, shape.finish());
       spaces.emplace(path, space.get());
       children.push_back(std::move(space));
     }

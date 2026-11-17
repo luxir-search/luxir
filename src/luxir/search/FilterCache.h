@@ -101,6 +101,11 @@ public:
     WHOLE
   };
 
+  enum class Population : uint8_t {
+    ALLOW,
+    BORROW_ONLY
+  };
+
   struct SegmentIdentity {
     uint64_t segId;
     int32_t maxDoc;
@@ -404,7 +409,10 @@ public:
   public:
     ~Use();
 
-    Probe probe(size_t segmentOrd);
+    // BORROW_ONLY counts a miss but takes no build claim, counts no build
+    // attempt and spends no backoff. Both policies take the request slot's
+    // resolving claim and may wait for a resolver in the same request.
+    Probe probe(size_t segmentOrd, Population population = Population::ALLOW);
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg);
 

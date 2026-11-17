@@ -68,6 +68,7 @@ struct ResolvedField {
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
+  bool reverseMap = true;
 };
 
 struct ResolvedOwnership {
@@ -300,6 +301,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.reverseMap = def.reverse_map.value_or(parentResolved.reverseMap);
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
                                               : parentResolved.geoIgnoreMalformed;
@@ -446,6 +448,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
       || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
     throw SchemaError("Nested path cannot have value settings: " + name);
   }
+  if (def.reverse_map && r.type != FieldClass::NESTED) {
+    throw SchemaError("reverse_map is only valid for nested fields (field: " + name + ")");
+  }
   if (analyzerSet(def) && r.type != FieldClass::TEXT) {
     throw SchemaError("analyzer is only valid for text fields (field: " + name + ")");
   }
@@ -550,7 +555,7 @@ struct FieldCompiler {
           || r.geoIgnoreMalformed || r.geoIgnoreZValue || derived) {
         throw SchemaError("Nested path cannot have value settings: " + std::string(name));
       }
-      auto type = std::make_shared<NestedFieldType>(name);
+      auto type = std::make_shared<NestedFieldType>(name, r.reverseMap);
       if (r.isTemplate) type->flags_ |= FieldType::ABSTRACT;
       return type;
     }

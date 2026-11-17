@@ -36,6 +36,8 @@ public:
     return values.numValues();
   }
 
+  uint64_t sizeInBytes() const { return values.blockBytes(); }
+
   [[nodiscard]] int64_t valueAt(int64_t index) const {
     return values.valueAt(index);
   }

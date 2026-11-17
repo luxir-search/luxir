@@ -18,6 +18,7 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/util/Cursor.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
@@ -34,6 +35,7 @@ struct ValueExprOptions {
   bool sortIntrinsics = true;
   FieldResolver* fieldResolver = nullptr;
   std::string_view opName = {};
+  ParseView* view = nullptr;
 };
 
 class ValueExprParser {
@@ -413,17 +415,18 @@ private:
     // field it introduces a type component.
     if (cur->peek() == '.') {
       std::string_view view = opts.fieldResolver ? opts.fieldResolver->path() : std::string_view{};
-      if (opts.schema->isNestedPath(view.empty() ? std::string(name) : Schema::qualify(view, name))) {
-        while (cur->consume('.')) {
-          if (value::lex::scanIdentifier(*cur).empty()) fail(pos, "expected a field component after '.'");
-        }
-        name = cur->slice(pos, cur->position());
+      while (cur->peek() == '.' && opts.schema->isNestedPath(
+          view.empty() ? std::string(name) : Schema::qualify(view, name))) {
+        cur->advance();
+        auto component = value::lex::scanIdentifier(*cur);
+        if (component.empty()) fail(pos, "expected a field component after '.'");
+        name = program->copyString(fmt::format("{}.{}", name, component));
       }
     }
     ResolvedFieldHandle target;
     try {
-      target = opts.fieldResolver ? opts.fieldResolver->resolveLocal(name, OpClass::VALUE, opts.opName)
-          : FieldResolver(*opts.schema).resolveLocal(name, OpClass::VALUE, opts.opName);
+      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
+          : FieldResolver(*opts.schema).resolve(name, OpClass::VALUE, opts.opName);
     } catch (const RequestError& e) {
       fail(pos, e.what());
     }
@@ -433,8 +436,6 @@ private:
     if (cur->consume('.')) {
       componentPos = cur->position();
       std::string_view component = value::lex::scanIdentifier(*cur);
-      // Resolve real child fields here before type components when the schema
-      // supports nested documents. Leaf capability checks follow resolution.
       auto kind = field->type() == FieldType::DATE ? ValueFunction::Kind::DATE
           : field->type() == FieldType::GEO_POINT ? ValueFunction::Kind::GEO_POINT
           : ValueFunction::Kind::NUMERIC;
@@ -464,13 +465,23 @@ private:
     ValueNode node;
     node.kind = ValueNodeKind::COLUMN;
     node.columnType = field->type();
-    node.columnMultiValued = field->multiValued();
+    auto ownerPath = opts.fieldResolver ? opts.fieldResolver->path() : std::string_view{};
+    bool descendant = target.path != ownerPath;
+    if (descendant) {
+      if (!opts.view || !opts.view->get() || !opts.view->owner()) {
+        fail(pos, fmt::format("descendant field '{}' requires a searched reader", name));
+      }
+      auto scope = opts.view->scoped(target.path);
+      node.source = opts.view->get();
+      node.ownerPath = program->copyString(ownerPath);
+    }
+    node.columnMultiValued = field->multiValued() || descendant;
     node.columnIndexed = field->indexed();
     if (!numeric && !geo) {
       node.type = ValueType::COLUMN_ONLY;
     } else {
       bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-      node.type = field->multiValued()
+      node.type = node.columnMultiValued
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->valueNature();
@@ -644,6 +655,8 @@ private:
       scale.intValue = valueDecimalScale(node.nature);
       auto scaleIndex = append(scale);
       node.kind = ValueNodeKind::FUNCTION;
+      node.source = nullptr;
+      node.ownerPath = {};
       node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
       node.function = ValueFunctionRegistry::decimalDecoder();
       node.opcode = ValueOpcode::NONE;
@@ -662,6 +675,11 @@ private:
       fail(value.sourcePos, fmt::format(
           "{} must be a scalar; reduce an array first, for example with min() or max()", what));
     }
+    return numericValue(node, what);
+  }
+
+  uint32_t numericValue(uint32_t node, std::string_view what) {
+    const ValueNode& value = program->nodes[node];
     if (value.type == ValueType::COLUMN_ONLY || value.nature == ValueNature::IP) {
       fail(value.sourcePos, fmt::format("{} must be numeric", what));
     }
@@ -680,7 +698,7 @@ private:
       if (argument == 0) {
         name = parseBindingName();
       } else if (argument == 1) {
-        value = numericScalar(grammar.parseExpression(), "the value of let()");
+        value = numericValue(grammar.parseExpression(), "the value of let()");
       } else {
         bindings.push_back({name, value});
         body = numericScalar(grammar.parseExpression(), "the body of let()");

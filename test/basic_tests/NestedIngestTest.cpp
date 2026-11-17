@@ -74,6 +74,41 @@ TEST_F(NestedIngestTest, shapesDepthsAndLocalStoredValuesUseOrdinaryViews) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("label_s", "Red")));
 }
 
+TEST_F(NestedIngestTest, nullArrayElementsAreEmptyRowsAtEveryDepthAndSurviveMerge) {
+  CollectionHelper helper;
+  ASSERT_TRUE(ingest(helper, {
+      R"({"id":"a","items_nested":[null,{"deep_nested":[null,{"label_s":"part"}]},{}]})",
+      R"({"id":"b","items_nested":null})"}).success);
+  ASSERT_TRUE(ingest(helper, {R"({"id":"dead","items_nested":[null]})"}).success);
+  ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
+  for (bool merge : {false,true}) {
+    if (merge) { CollectionHelper::UpdateBuilder input; input.commit(true,1); ASSERT_TRUE(helper.submit(input).success); }
+    auto req = localReq(helper.getSearchEngine());
+    auto& list = req->topDocs().allQuery().fields({"id","items_nested"});
+    qb::sort(list, "id", qb::ASC);
+    req->topDocs("owners").exprQuery("items_nested:*").countLimit().limit(0);
+    req->topDocs("rows").allQuery().countLimit().limit(0).rawOp().domain.emplace().to = "items_nested";
+    req->topDocs("parts").allQuery().countLimit().limit(0).rawOp().domain.emplace().to = "items_nested.deep_nested";
+    req->execute(1); ASSERT_OK(req);
+    EXPECT_EQ(1, req->getMatchCount("owners")); EXPECT_EQ(3, req->getMatchCount("rows")); EXPECT_EQ(2, req->getMatchCount("parts"));
+    auto values = std::get<api::ColVal>(req->docList()->columns.at("items_nested").kind).v;
+    ASSERT_EQ(2, values.size());
+    const auto& rows = std::get<api::ArrVal>(values[0].kind).v;
+    ASSERT_EQ(3, rows.size());
+    EXPECT_TRUE(std::get<api::Map>(rows[0].kind).fields.empty());
+    EXPECT_TRUE(std::get<api::Map>(rows[2].kind).fields.empty());
+    auto parts = std::get<api::ArrVal>(std::get<api::Map>(rows[1].kind).fields.at("deep_nested")->kind).v;
+    ASSERT_EQ(2, parts.size()); EXPECT_TRUE(std::get<api::Map>(parts[0].kind).fields.empty());
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(values[1].kind));
+    if (merge) {
+      auto snapshot = reader(helper);
+      ASSERT_EQ(1, snapshot->segments().size());
+      EXPECT_EQ(3, snapshot->view("items_nested")->maxDoc());
+      EXPECT_EQ(2, snapshot->view("items_nested.deep_nested")->maxDoc());
+    }
+  }
+}
+
 TEST_F(NestedIngestTest, emptyPathsAreOmittedAndMappingStopsAtTheRoot) {
   CollectionHelper helper;
   CollectionHelper::UpdateBuilder input;

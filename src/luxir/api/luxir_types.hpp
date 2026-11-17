@@ -85,7 +85,7 @@ struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
-struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
+struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
 struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
@@ -321,6 +321,7 @@ struct FieldDef {
   std::optional<bool> normalize_on_write;
   std::optional<bool> ignore_malformed;
   std::optional<bool> ignore_z_value;
+  std::optional<bool> reverse_map;
 };
 struct AuxStats {
   std::string_view kind;
@@ -415,6 +416,12 @@ struct StatsTotals {
   std::optional<uint64_t> bytes;
   uint64_t committed_bytes = 0;
 };
+struct RowSpaceStats {
+  std::string_view path;
+  uint64_t ends_bytes = 0;
+  uint64_t owners_bytes = 0;
+  int32_t max_doc = 0;
+};
 struct SegmentStats {
   std::string_view seg;
   std::string_view live_gen;
@@ -424,6 +431,7 @@ struct SegmentStats {
   uint64_t first_commit_time = 0;
   uint64_t bytes = 0;
   std::span<const AuxStats> overlays;
+  std::span<const RowSpaceStats> spaces;
   int32_t max_doc = 0;
   int32_t live_docs = 0;
   int32_t deleted_docs = 0;
@@ -909,6 +917,7 @@ struct Diversify {
   std::optional<int64_t> max_per_key;
 };
 struct TopDocs {                                                 // all indirect/span/opt-scalar
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
   int64_t offset = 0;
@@ -942,6 +951,7 @@ struct Fusion {                                                  // needs TopDoc
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
+  std::optional<std::string_view> from_match;
   std::optional<std::string_view> to;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
@@ -1138,6 +1148,8 @@ struct ToParentQuery {
   std::string_view path;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view score;
+  std::optional<int32_t> min_children;
+  std::optional<int32_t> max_children;
 };
 struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -1219,6 +1231,7 @@ struct ExprQuery {                                             // map value indi
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
 struct Query {                                                 // needs Match,AnyOfQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,GeoPolygon,Boost,Rescore
+  std::optional<std::string_view> name;
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
@@ -1267,7 +1280,7 @@ LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
-LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
+LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpaceStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
 LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
@@ -1318,7 +1331,7 @@ LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(OutcomeStats) LUXIR_ENTRY(CollectionActivityStats) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
-LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
+LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(RowSpaceStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)

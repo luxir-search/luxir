@@ -120,25 +120,40 @@ TEST_F(JoinCacheTest, scoredRankingReusesUnscoredOwnerMembershipForItsCount) {
   EXPECT_GT(SkipStats::wholeTopKCountHits, 0);
 }
 
-TEST_F(JoinCacheTest, uniformMaximumUsesResidentChildMembershipAndKeepsItsScore) {
-  for (int pass = 0; pass < 3; pass++) {
+TEST_F(JoinCacheTest, prunedUniformMaximumRoutesResidentChildMembershipByDensity) {
+  for (bool sparse : {false, true}) {
+    SCOPED_TRACE(sparse);
+    if (sparse) {
+      std::string json = R"({"id":"padding","items_nested":{"deep_nested":[)";
+      for (int i = 0; i < 2048; i++) {
+        if (i) json += ',';
+        json += R"({"text_w":"other"})";
+      }
+      json += "]}}";
+      CollectionHelper::UpdateBuilder input;
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+      input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
+    }
+    for (int pass = 0; pass < 3; pass++) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& op = req->topDocs().countLimit().limit(0);
+      op.rawQuery() = qb::phraseText(req->mr, "text_w", "deep common");
+      op.rawOp().domain.emplace().to = "items_nested.deep_nested";
+      req->execute(1); ASSERT_OK(req);
+      EXPECT_EQ(6, req->getMatchCount());
+    }
+    auto hits = cache->counters().hits;
     auto req = localReq(helper.getSearchEngine());
-    auto& op = req->topDocs().countLimit().limit(0);
-    op.rawQuery() = qb::phraseText(req->mr, "text_w", "deep common");
-    op.rawOp().domain.emplace().to = "items_nested.deep_nested";
+    req->topDocs().getScores().fields({"id"}).limit(3).rawQuery() = qb::boost(req->mr,
+        qb::toParent(req->mr, "items_nested.deep_nested", qb::constantScore(req->mr,
+            qb::phraseText(req->mr, "text_w", "deep common"), 1.0f)), 2.5f);
     req->execute(1); ASSERT_OK(req);
-    EXPECT_EQ(6, req->getMatchCount());
+    if (sparse) { EXPECT_EQ(hits, cache->counters().hits); }
+    else { EXPECT_GT(cache->counters().hits, hits); }
+    auto scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
+    ASSERT_EQ(3u, scores.size());
+    for (auto score : scores) EXPECT_EQ(2.5f, score);
   }
-  auto hits = cache->counters().hits;
-  auto req = localReq(helper.getSearchEngine());
-  req->topDocs().getScores().fields({"id"}).limit(3).rawQuery() = qb::boost(req->mr,
-      qb::toParent(req->mr, "items_nested.deep_nested", qb::constantScore(req->mr,
-          qb::phraseText(req->mr, "text_w", "deep common"), 1.0f)), 2.5f);
-  req->execute(1); ASSERT_OK(req);
-  EXPECT_GT(cache->counters().hits, hits);
-  auto scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
-  ASSERT_EQ(3u, scores.size());
-  for (auto score : scores) EXPECT_EQ(2.5f, score);
 }
 
 TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReopen) {
@@ -164,14 +179,16 @@ TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReope
   EXPECT_EQ(11, count());
 }
 
-TEST_F(JoinCacheTest, childMembershipUsesTheOrdinarySourceCacheIndependentlyOfTheJoin) {
+TEST_F(JoinCacheTest, joinDoesNotPopulateRawChildMembershipForAnotherJoin) {
   EXPECT_EQ(6, count(0, false, 2));
   EXPECT_EQ(6, count(0, false, 2));
   auto warm = cache->counters();
-  // The composed join is cold; only its phrase source has been admitted.
+  // The composed join is cold. A join only borrows a resident child set and
+  // does not populate raw child membership, so the first left no child hit.
   EXPECT_EQ(6, count(0, false, 3));
   EXPECT_EQ(warm.admissions, cache->counters().admissions);
-  EXPECT_GT(cache->counters().hits, warm.hits);
+  EXPECT_EQ(warm.builds, cache->counters().builds);
+  EXPECT_EQ(warm.hits, cache->counters().hits);
   cache->resize(0);
   EXPECT_EQ(6, count(0, false, 2));
   EXPECT_EQ(6, count(0, false, 3));
@@ -204,8 +221,9 @@ TEST_F(JoinCacheTest, ownerAdmissionDoesNotRequireAnAdmittedChildEntry) {
 TEST_F(JoinCacheTest, coreStableChildKeepsItsStricterScope) {
   EXPECT_EQ(12, count(0, false, 4));
   EXPECT_EQ(12, count(0, false, 4));
+  // Only owner membership is cached; the join does not populate its raw child.
   auto entries = cache->dump(10, nullptr);
-  ASSERT_EQ(2u, entries.size());
+  ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) { EXPECT_EQ(FilterKeyScope::CORE_STABLE, entry.scope); }
   SkipStatsScope stats;
   EXPECT_EQ(12, count(0, false, 4));

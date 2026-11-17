@@ -80,6 +80,24 @@ public:
       return true;
     }
 
+    // Values held by all rows in [first, end), including sparse columns.
+    // A boundary is the start rank of the next row with a value.
+    std::pair<int64_t, int64_t> range(int32_t first, int32_t end) {
+      if (first >= end) return {0, 0};
+      if (!shape->docs.hasBitset() && !shape->endValueRanks) {
+        return {std::min(first, shape->docs.numDocs()), std::min(end, shape->docs.numDocs())};
+      }
+      auto boundary = [&](int32_t row) -> int64_t {
+        if (seek(row)) return begin();
+        int32_t rank = !shape->docs.hasBitset() || found == PostingsReader::END
+            ? shape->docs.numDocs() : docsIter.rank();
+        if (!shape->endValueRanks) return rank;
+        return rank == 0 ? 0 : shape->endValueRanks->valueAt(rank - 1);
+      };
+      int64_t begin = boundary(first);
+      return {begin, boundary(end)};
+    }
+
     int32_t rank() const noexcept { return docRank; }
     int64_t begin() const noexcept { return first; }
     int64_t end() const noexcept { return last; }

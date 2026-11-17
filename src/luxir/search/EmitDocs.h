@@ -862,8 +862,8 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 struct ExtraColumn {
   std::string_view name;
   std::function<void(int64_t i, luxir::api::Val& out, std::pmr::memory_resource& mr)> value;
-  std::function<void(std::span<const segdoc>, std::span<const uint32_t>,
-                     std::span<api::Val>, std::pmr::memory_resource&)> batchValue = {};
+  std::function<void(SearchResponse&, std::span<const segdoc>, std::span<const uint32_t>,
+                     std::span<api::Val>, RequestMemResource&)> batchValue = {};
 };
 
 struct MappedReturnFields;
@@ -1208,15 +1208,16 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
         registerColumn();
         continue;
       case ReturnField::Kind::EXTRA: {
+        auto& scopedMemory = mappedMemory();
         auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
-        luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+        luxir::api::Val* values = build::allocArray(column.v, columnSize, scopedMemory);
         if (rf.source.extra->batchValue) {
           auto fn = rf.source.extra->batchValue;
-          addFieldLoader(pendingLoaders, runs, [fn, segDocs, values, columnSize, &mr](std::span<RowIndex> rows) {
-            fn(segDocs, rows, std::span<api::Val>(values, (size_t)columnSize), mr);
+          addFieldLoader(pendingLoaders, runs, [fn, segDocs, values, columnSize, &scopedMemory, &response](std::span<RowIndex> rows) {
+            fn(response, segDocs, rows, std::span<api::Val>(values, (size_t)columnSize), scopedMemory);
           });
         } else {
-          for (int i = 0; i < columnSize; i++) rf.source.extra->value(batchStart + i, values[i], mr);
+          for (int i = 0; i < columnSize; i++) rf.source.extra->value(batchStart + i, values[i], scopedMemory);
         }
         registerColumn();
         continue;
@@ -1343,6 +1344,9 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
     for (int i = 0; i < columnSize; i++) {
       scores[i] = getScore(batchStart + i);
     }
+    // Every hit has a score, so the sentinel is a value no hit scored.
+    std::vector<uint8_t> present((size_t)columnSize, 1);
+    floatColProto.missing_val = pickMissingVal<ColEmit<float>>({scores, (size_t)columnSize}, present);
   }
 
   loadFields(tg, loaders, runs);
@@ -1818,7 +1822,7 @@ void emitDocsResponse(SearchRequest& req, IndexReader& reader, uint64_t flags,
   std::vector<ExtraColumn> decoratedColumns(extraColumns.begin(), extraColumns.end());
   for (const auto& decorator : decorators) {
     decoratedColumns.push_back({decorator->columnName(), {},
-        [decorator](auto docs, auto rows, auto values, auto& mr) {
+        [decorator](SearchResponse&, auto docs, auto rows, auto values, auto& mr) {
           decorator->decorate(docs, rows, values, mr);
         }});
   }

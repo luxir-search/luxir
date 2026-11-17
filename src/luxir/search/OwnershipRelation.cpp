@@ -13,7 +13,10 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   OwnershipMapper::Cursor cursor;
   QueryPrep::DocSetScorer* domain;
   int32_t ownerCount;
+  RowReduction reduction;
   bool maximum;
+  bool scored;
+  bool bounded;
   bool probing;
   Query::MembershipProof* proof;
   int32_t childCount;
@@ -26,6 +29,7 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   float value = 0;
   ScoreBounds bounds;
   std::span<uint64_t> childBits;
+  std::span<uint64_t> ownerBits;
   std::span<int64_t> boundaries;
   std::span<uint64_t> candidates;
   std::span<int32_t> candidateOwners;
@@ -46,10 +50,23 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
     return current = end == ownerCount ? PostingsReader::END : end;
   }
 
+  bool countFamily(int32_t first, int32_t end, int64_t count = 0) {
+    if ((int64_t)end - first + count < reduction.min) return false;
+    int64_t stop = reduction.decidingCount();
+    while (count < stop && first < end) {
+      int32_t doc = child.advanceWindow(first, end);
+      if (doc >= end) break;
+      count++;
+      first = doc + 1;
+    }
+    return reduction.accepts(count);
+  }
+
   bool verifyOwner() {
     if (verified != current) {
       verified = current;
-      accepted = current < ownerCount && child.advanceWindow(family.first, family.end) < family.end;
+      accepted = current < ownerCount && (bounded ? countFamily(family.first, family.end)
+          : child.advanceWindow(family.first, family.end) < family.end);
       value = multiplier;
     }
     return accepted;
@@ -73,10 +90,18 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   }
 
   int32_t advanceChild(int32_t target) {
-    return maximum ? child.advance(target) : child.advanceWindow(target, PostingsReader::END);
+    return scored ? child.advance(target) : child.advanceWindow(target, PostingsReader::END);
   }
 
   void fillOwnerWindow(std::span<uint64_t> words, int32_t start, int32_t end) {
+    if (bounded) {
+      auto selected = ownerBits.first((size_t)(end - start + 63) / 64);
+      std::fill(selected.begin(), selected.end(), ~0ULL);
+      if ((end - start) & 63) selected.back() &= (1ULL << ((end - start) & 63)) - 1;
+      intersectCandidateBits(selected, start);
+      for (size_t word = 0; word < selected.size(); word++) words[word] |= selected[word];
+      return;
+    }
     auto run = boundaries.first((size_t)(end - start) + 1);
     mapper.readBoundaries(start, end, run);
     int32_t row = (int32_t)run.front();
@@ -131,19 +156,22 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
 
 public:
   Scorer(MemPool& pool, Query::Scorer& child, const OwnershipMapper& mapper,
-         DocSet* domain, int32_t ownerCount, Reduction reduction, float multiplier,
+         DocSet* domain, int32_t ownerCount, RowReduction reduction, float multiplier,
          const Query::ScorerShape& childShape, bool probing, Query::MembershipProof* proof, int32_t childCount)
       : child(child), mapper(mapper), cursor(mapper, pool),
         domain(domain ? pool.make<QueryPrep::DocSetScorer>(domain, ownerCount) : nullptr),
-        ownerCount(ownerCount), maximum(reduction == Reduction::MAXIMUM), probing(probing), proof(proof),
+        ownerCount(ownerCount), reduction(reduction), maximum(reduction.kind == RowReduction::MAXIMUM),
+        scored(reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::CONSTANT),
+        bounded(reduction.bounded()), probing(probing), proof(proof),
         childCount(childCount), multiplier(multiplier), childDoc(child.docId()),
-        childBits(reduction != Reduction::MAXIMUM && childShape.windowFillClause == Query::ClauseShape::DIRECT
+        childBits(!scored && childShape.windowFillClause == Query::ClauseShape::DIRECT
             ? pool.make_span<uint64_t>(DocsEnumMeta::L1_DOCS / 64) : std::span<uint64_t>{}),
-        boundaries(reduction != Reduction::MAXIMUM ? pool.make_span<int64_t>((size_t)std::min(ownerCount, DocsEnumMeta::L1_DOCS) + 1)
+        ownerBits(!scored && bounded ? pool.make_span<uint64_t>(DocsEnumMeta::L1_DOCS / 64) : std::span<uint64_t>{}),
+        boundaries(!scored ? pool.make_span<int64_t>((size_t)std::min(ownerCount, DocsEnumMeta::L1_DOCS) + 1)
             : std::span<int64_t>{}),
-        candidates(probing ? pool.make_span<uint64_t>(CANDIDATE_ROWS / 64) : std::span<uint64_t>{}),
-        candidateOwners(probing ? pool.make_span<int32_t>(DocsEnumMeta::L1_DOCS) : std::span<int32_t>{}) {
-    if (reduction == Reduction::CONSTANT) {
+        candidates(!scored && (probing || bounded) ? pool.make_span<uint64_t>(CANDIDATE_ROWS / 64) : std::span<uint64_t>{}),
+        candidateOwners(!scored && (probing || bounded) ? pool.make_span<int32_t>(DocsEnumMeta::L1_DOCS) : std::span<int32_t>{}) {
+    if (reduction.kind == RowReduction::CONSTANT) {
       auto score = child.constantContribution();
       if (!score) {
         // The weight proved uniformity, but a compound may not quote its
@@ -154,14 +182,41 @@ public:
       }
       this->multiplier = score.value_or(0.0f) * multiplier;
     }
-    if (!maximum) bounds = ScoreBounds::exact(this->multiplier);
+    if (!scored) bounds = ScoreBounds::exact(this->multiplier);
     else if (multiplier == 0.0f) bounds = ScoreBounds::exact(0.0f);
     else {
       // Capture whole-child bounds before iteration. The child may already
       // be beyond an owner's family when a parent asks for its score bound.
       auto childBounds = child.getScoreBounds(PostingsReader::END);
-      bounds = {childBounds.lo * multiplier,
-                std::min(childBounds.hi, child.getMaxScore(PostingsReader::END)) * multiplier};
+      if (maximum) {
+        bounds = {childBounds.lo * multiplier,
+                  std::min(childBounds.hi, child.getMaxScore(PostingsReader::END)) * multiplier};
+        return;
+      }
+      double lo = childBounds.lo;
+      double hi = std::min(childBounds.hi, child.getMaxScore(PostingsReader::END));
+      double magnitude = std::max(std::abs(lo), std::abs(hi));
+      if (reduction.kind == RowReduction::SUM) {
+        if (reduction.max == std::numeric_limits<int32_t>::max()) {
+          bounds = ScoreBounds::unknown();
+          return;
+        }
+        lo *= lo < 0 ? reduction.max : reduction.min;
+        hi *= hi > 0 ? reduction.max : reduction.min;
+      }
+      if (reduction.kind == RowReduction::SUM || reduction.kind == RowReduction::AVERAGE) {
+        int64_t count = reduction.kind == RowReduction::SUM ? reduction.max : childCount;
+        double error = (double)count * std::numeric_limits<double>::epsilon();
+        error = magnitude * error / (1 - error);
+        if (reduction.kind == RowReduction::SUM) error *= count;
+        lo -= error;
+        hi += error;
+      }
+      // Bounds round outward; reduction itself rounds only its final value.
+      auto lower = (float)(lo * multiplier);
+      auto upper = (float)(hi * multiplier);
+      bounds = {std::nextafter(lower, -std::numeric_limits<float>::infinity()),
+                std::nextafter(upper, std::numeric_limits<float>::infinity())};
     }
   }
 
@@ -169,7 +224,7 @@ public:
   float score() override { return value; }
 
   std::optional<float> constantContribution() const override {
-    return maximum ? std::nullopt : std::optional<float>(multiplier);
+    return scored ? std::nullopt : std::optional<float>(multiplier);
   }
   float getMaxScore(int32_t upTo) override { unused(upTo); return bounds.hi; }
   float getMaxScoreForSetup(int32_t upTo) override { unused(upTo); return bounds.hi; }
@@ -177,8 +232,8 @@ public:
   int32_t advanceShallowForSetup(int32_t target) override { unused(target); return PostingsReader::END; }
 
   void setMinCompetitiveScore(float floor) override {
-    if (!maximum && floor > multiplier) ownerCount = 0;
-    if (maximum && multiplier > 0.0f) {
+    if (!scored && floor > multiplier) ownerCount = 0;
+    if (maximum && !bounded && multiplier > 0.0f) {
       child.setMinCompetitiveScore(Query::unscaleScoreFloor(floor, multiplier));
     }
   }
@@ -230,11 +285,35 @@ public:
           continue;
         }
       }
-      value = maximum ? child.score() : 1.0f;
-      if (maximum) {
+      value = scored ? child.score() : 1.0f;
+      if (maximum && !bounded) {
         while ((doc = child.next()) < family.end) value = std::max(value, child.score());
+        value *= multiplier;
+      } else if (scored) {
+        int64_t count = 1;
+        double sum = value;
+        while ((doc = child.next()) < family.end) {
+          if (++count > reduction.max) break;
+          float score = child.score();
+          if (maximum) value = std::max(value, score);
+          else if (reduction.kind == RowReduction::MINIMUM) value = std::min(value, score);
+          else sum += score;
+        }
+        if (!reduction.accepts(count)) {
+          if (doc < family.end) doc = advanceChild(family.end);
+          continue;
+        }
+        if (reduction.kind == RowReduction::SUM || reduction.kind == RowReduction::AVERAGE) {
+          if (reduction.kind == RowReduction::AVERAGE) sum /= (double)count;
+          value = (float)(sum * (double)multiplier);
+        } else value *= multiplier;
+      } else {
+        if (bounded && !countFamily(doc + 1, family.end, 1)) {
+          doc = advanceChild(family.end);
+          continue;
+        }
+        value = multiplier;
       }
-      value *= multiplier;
       // A competitive next() can finish without moving the postings cursor.
       childDoc = doc;
       return current = owner;
@@ -244,7 +323,7 @@ public:
 
   int32_t advanceWindow(int32_t min, int32_t max) override {
     if (min >= max) return max;
-    if (maximum) return Query::Scorer::advanceWindow(min, max);
+    if (scored) return Query::Scorer::advanceWindow(min, max);
     if (probing) {
       while (min < max && approximateOwner(min, max) < max) {
         if (verifyOwner()) return current;
@@ -258,7 +337,8 @@ public:
     if (min >= max) return current = min;
     if (max == min + 1) {
       auto candidate = cursor.seek(min);
-      if (child.advanceWindow(candidate.first, candidate.end) < candidate.end) {
+      if (bounded ? countFamily(candidate.first, candidate.end)
+          : child.advanceWindow(candidate.first, candidate.end) < candidate.end) {
         value = multiplier;
         return current = min;
       }
@@ -269,8 +349,12 @@ public:
     while ((row = child.advanceWindow(row, end)) < end) {
       auto family = cursor.owner(row);
       if (!domain || domain->advanceWindow(family.owner, family.owner + 1) == family.owner) {
-        value = multiplier;
-        return current = family.owner;
+        if (!bounded || countFamily(row + 1, family.end, 1)) {
+          value = multiplier;
+          return current = family.owner;
+        }
+        row = family.end;
+        continue;
       }
       int32_t owner = domain->advanceWindow(family.owner + 1, max);
       if (owner >= max) return current = owner;
@@ -280,7 +364,7 @@ public:
   }
 
   void fillWindowBits(std::span<uint64_t> words, int32_t start, int32_t end) override {
-    if (maximum) return Query::Scorer::fillWindowBits(words, start, end);
+    if (scored) return Query::Scorer::fillWindowBits(words, start, end);
     skipCount(SkipStats::countBulkFillCalls);
     if (start == end || ownerCount == 0) return;
     assert(start >= 0 && start <= end && end <= ownerCount);
@@ -293,7 +377,7 @@ public:
   }
 
   void intersectCandidateBits(std::span<uint64_t> words, int32_t start) override {
-    if (maximum || candidates.empty()) return Query::Scorer::intersectCandidateBits(words, start);
+    if (scored || candidates.empty()) return Query::Scorer::intersectCandidateBits(words, start);
     // Boundary scratch is owner-window sized; child scratch is independent
     // of family size. Oversized families use the bounded single-owner probe.
     int32_t end = std::min(ownerCount, start + (int32_t)words.size() * 64);
@@ -317,7 +401,8 @@ public:
           int32_t owner = candidateOwners[i];
           auto candidate = cursor.seek(owner);
           if ((proof && proof->nextPossible(candidate.first) >= candidate.end)
-              || child.advanceWindow(candidate.first, candidate.end) >= candidate.end) {
+              || (bounded ? !countFamily(candidate.first, candidate.end)
+                  : child.advanceWindow(candidate.first, candidate.end) >= candidate.end)) {
             int32_t offset = owner - start;
             words[(size_t)offset >> 6] &= ~(1ULL << (offset & 63));
           }
@@ -338,20 +423,48 @@ public:
           int32_t base = firstRow(first);
           if (endRow(first) - base > CANDIDATE_ROWS) {
             int32_t limit = endRow(first);
-            if ((proof && proof->nextPossible(base) >= limit) || child.advanceWindow(base, limit) >= limit) reject(first);
+            if ((proof && proof->nextPossible(base) >= limit)
+                || (bounded ? !countFamily(base, limit) : child.advanceWindow(base, limit) >= limit)) reject(first);
             first++;
             continue;
           }
           size_t stop = first + 1;
-          while (stop < count && endRow(stop) - base <= CANDIDATE_ROWS) stop++;
-          int32_t limit = endRow(stop - 1);
+          int32_t limit;
+          if (bounded) {
+            // Complete small families together. Only the tail can be partial;
+            // finish it before advancing the child into a later family.
+            int64_t decide = reduction.decidingCount();
+            while (stop < count && endRow(stop - 1) - firstRow(stop - 1) <= decide
+                && endRow(stop) - base <= CANDIDATE_ROWS) stop++;
+            limit = (int32_t)std::min<int64_t>(endRow(stop - 1), (int64_t)firstRow(stop - 1) + decide);
+          } else {
+            while (stop < count && endRow(stop) - base <= CANDIDATE_ROWS) stop++;
+            limit = endRow(stop - 1);
+          }
           auto bits = candidates.first((size_t)(limit - base + 63) / 64);
           std::fill(bits.begin(), bits.end(), 0);
-          for (size_t i = first; i < stop; i++) setRange(bits, firstRow(i) - base, endRow(i) - base);
+          for (size_t i = first; i < stop; i++) setRange(bits, firstRow(i) - base, std::min(limit, endRow(i)) - base);
           if (proof) proof->intersect(bits, base);
           child.intersectCandidateBits(bits, base);
           for (size_t i = first; i < stop; i++) {
-            if (!any(bits, firstRow(i) - base, endRow(i) - base)) reject(i);
+            if (!bounded) {
+              if (!any(bits, firstRow(i) - base, endRow(i) - base)) reject(i);
+            } else {
+              int64_t matches = 0;
+              int32_t row = firstRow(i) - base;
+              int32_t last = std::min(limit, endRow(i)) - base;
+              while (row < last) {
+                int32_t next = std::min(last, (row | 63) + 1);
+                matches += std::popcount(bits[(size_t)row >> 6]
+                    & ((~0ULL << (row & 63)) & (~0ULL >> (63 - ((next - 1) & 63)))));
+                row = next;
+              }
+              if (limit < endRow(i) && matches < reduction.decidingCount()) {
+                if (!countFamily(limit, endRow(i), matches)) reject(i);
+              } else {
+                if (!reduction.accepts(matches)) reject(i);
+              }
+            }
           }
           first = stop;
         }
@@ -362,7 +475,7 @@ public:
   }
 
   [[gnu::cold]] void prepareMembership() override {
-    if (!maximum) child.prepareMembership();
+    if (!scored) child.prepareMembership();
   }
 };
 
@@ -396,7 +509,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
   DocSet* domain;
   int32_t ownerCount;
   int32_t childCount;
-  Reduction reduction;
+  RowReduction reduction;
   float multiplier;
 
   // hugin, 5M structured roots, 2026-11-16: mapping a filled owner costs
@@ -433,7 +546,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
   };
 
   Query::PlanContext childContext(Query::PlanContext context, Query::MembershipConsumption consumption) const {
-    if (reduction == Reduction::MAXIMUM) {
+    if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::CONSTANT) {
       context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
       return context;
     }
@@ -484,7 +597,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
 
   bool probe(const Query::PlanContext& context) const {
     using Consumption = Query::MembershipConsumption;
-    if (reduction == Reduction::MAXIMUM) return false;
+    if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::CONSTANT) return false;
     if (context.membershipConsumption == Consumption::CANDIDATES) return true;
     if (context.membershipConsumption == Consumption::EITHER) {
       auto shape = child.describeScorer(childContext(context, Consumption::EITHER));
@@ -516,6 +629,9 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
         : Query::MembershipConsumption::WINDOWS), {}, probing};
     auto& shape = selection.shape;
     shape.matchState = child.describeScorer(selection.childContext).matchState;
+    if (reduction.bounded() && shape.matchState == Query::MatchState::NONEMPTY) {
+      shape.matchState = Query::MatchState::UNKNOWN;
+    }
     shape.directKind = Query::DirectScorerKind::OTHER;
     shape.reportedTwoPhase = probing ? Query::ReportedTwoPhase::YES : Query::ReportedTwoPhase::NO;
     shape.windowFillClause = Query::ClauseShape::NONE;
@@ -530,7 +646,8 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
       shape.windowFillClause = Query::ClauseShape::DIRECT;
       return selection;
     }
-    if (reduction == Reduction::MAXIMUM || ownerCount == 0 || probing) return selection;
+    if ((reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::CONSTANT)
+        || ownerCount == 0 || probing) return selection;
     if (context.membershipConsumption == Query::MembershipConsumption::EITHER) {
       shape.windowFillClause = Query::ClauseShape::DIRECT;
       return selection;
@@ -541,7 +658,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
 
 public:
   Supplier(Query::ScorerSupplier& child, const OwnershipMapper& mapper,
-           DocSet* domain, int32_t ownerCount, int32_t childCount, Reduction reduction, float multiplier)
+           DocSet* domain, int32_t ownerCount, int32_t childCount, RowReduction reduction, float multiplier)
       : child(child), mapper(mapper), domain(domain), ownerCount(ownerCount), childCount(childCount),
         reduction(reduction), multiplier(multiplier) {}
 
@@ -579,7 +696,8 @@ OwnershipRelation::OwnershipRelation(IndexReader& many, IndexReader& one, Reques
 }
 
 Query::ScorerSupplier* OwnershipRelation::reduce(MemPool& pool, size_t leaf,
-    Query::ScorerSupplier& input, DocSet* domain, Reduction reduction, float multiplier) {
+    Query::ScorerSupplier& input, DocSet* domain, RowReduction reduction, float multiplier) {
+  assert(reduction.kind != RowReduction::NONE);
   return mappers[leaf] ? pool.make<Supplier>(input, *mappers[leaf], domain,
       one.segments()[leaf].maxDoc(), many.segments()[leaf].maxDoc(), reduction, multiplier) : nullptr;
 }
@@ -590,6 +708,33 @@ FilterKeyScope OwnershipRelation::appendFilterKey(FilterKeyBuilder& out, const F
   out.appendString(one.path());
   return FilterKeyScope::SEGMENT_STABLE;
 }
+
+namespace {
+
+// Separate functions: one loop's presence must not change how the other inlines.
+LUXIR_NOINLINE void addFamilies(const OwnershipMapper& mapper, DocSet& owners, DocSetBuilder& builder) {
+  owners.forEach([&](int32_t row) {
+    auto [first, end] = mapper.range(row);
+    builder.addRange(first, end);
+  });
+}
+
+// Consecutive owners have adjacent families, so a run of owners is one range.
+LUXIR_NOINLINE void addFamilyRuns(const OwnershipMapper& mapper, DocSet& owners, DocSetBuilder& builder) {
+  int32_t runFirst = 0, runEnd = 0;
+  auto addRun = [&] {
+    if (runFirst == runEnd) return;
+    auto [first, end] = mapper.range(runFirst, runEnd);
+    builder.addRange(first, end);
+  };
+  owners.forEach([&](int32_t row) {
+    if (row != runEnd) { addRun(); runFirst = row; }
+    runEnd = row + 1;
+  });
+  addRun();
+}
+
+} // namespace
 
 DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
   auto& source = one.segments()[leaf];
@@ -604,10 +749,11 @@ DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
   }
   DocSetBuilder builder(destination.maxDoc());
   if (mapper && domain.get()) {
-    domain.get()->forEach([&](int32_t row) {
-      auto [first, end] = mapper->range(row);
-      builder.addRange(first, end);
-    });
+    // hugin, random domains over 400K owners of 3M rows, 2026-11-17: tracking
+    // runs costs a filtered kNN 3% at half the owners and saves it 8% at
+    // three quarters and 27% at nine tenths.
+    if ((int64_t)domain.get()->card() * 3 >= (int64_t)source.maxDoc() * 2) addFamilyRuns(*mapper, *domain.get(), builder);
+    else addFamilies(*mapper, *domain.get(), builder);
   }
   return DomainVariantPlan::account(DomainHandle(builder.build()).scoped(destination), memory, "mapped domain");
 }

@@ -163,7 +163,9 @@ TEST(NestedMergeTest, allRepresentationsAndOwnershipMatchFreshSurvivors) {
     if (*path) {
       auto* shape = actual.ownership(path); auto* other = expected.ownership(path);
       ASSERT_EQ(other->parentCount(), shape->parentCount());
-      EXPECT_FALSE(shape->hasReverseMap());
+      EXPECT_TRUE(shape->hasReverseMap());
+      EXPECT_TRUE(other->hasReverseMap());
+      for (int32_t row = 0; row < shape->childCount(); row++) EXPECT_EQ(other->owner(row), shape->owner(row));
       for (int32_t p = 0; p < shape->parentCount(); p++) EXPECT_EQ(other->range(p), shape->range(p));
     }
     for (auto query : {"*:*", "text_w:\"alpha beta\"", "set_ss:a", "array_s:b", "n_i:[2 TO 40]",

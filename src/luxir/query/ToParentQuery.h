@@ -12,32 +12,36 @@ class ToParentQuery final : public Query {
   Query* child;
   PlanningContext& source;
   RowRelation& relation;
-  bool maximum;
+  RowReduction reduction;
 
   static std::optional<float> uniformChildScore(Query& child, float multiplier = 1.0f);
 
 public:
-  ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, bool maximum)
-      : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), maximum(maximum) {}
+  ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, RowReduction reduction)
+      : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), reduction(reduction) {}
 
   Query* getChild() const { return child; }
-  bool takesMaximum() const { return maximum; }
+  std::string_view sourcePath() const { return source.topReader.path(); }
+  const RowReduction& getReduction() const { return reduction; }
   bool recoverableAsPredicate() const noexcept override { return child->recoverableAsPredicate(); }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = (const ToParentQuery&)other;
-    return maximum == rhs.maximum && source.topReader.path() == rhs.source.topReader.path()
+    return reduction == rhs.reduction && source.topReader.path() == rhs.source.topReader.path()
         && child->equals(*rhs.child);
   }
   uint64_t hashImpl() const override {
     return mixHash(mixHash(Query::hashImpl(), child->hash()),
-        mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()), maximum));
+        mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()),
+            mixHash((int)reduction.kind, mixHash(reduction.min, reduction.max))));
   }
   void validateLogicalImpl(PlanningContext&, float multiplier) const override {
-    child->validateLogical(source, maximum ? multiplier : 1.0f);
+    child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());
+    out.appendUInt64(reduction.min);
+    out.appendUInt64(reduction.max);
     auto scope = relation.appendFilterKey(out, context);
     FilterKeyBuilder childKey;
     auto childScope = child->appendFilterKey(childKey, source.filterKeyContext);
@@ -52,7 +56,7 @@ public:
     Query::Weight* child;
     FilterCache::Use* childUse;
     RowRelation& relation;
-    RowRelation::Reduction reduction;
+    RowReduction reduction;
     float multiplier;
 
     Query::ScorerSupplier* supplier(MemPool& pool, IndexReader::Segment& segment,
@@ -61,10 +65,14 @@ public:
       auto& leaf = source.segments()[(size_t)segment.ord];
       auto childMode = child->consumesDomain() ? mode : Query::SupplierExecutionMode::RAW_MEMBERSHIP;
       auto* supplier = childUse
+          // Raw child population is not priced against this request's demand
+          // yet, so this join only borrows it. Reader-stable children still
+          // populate through prepareFilterSources; owner membership is cached
+          // independently.
           ? QueryPrep::filterSupplier(pool, input, source, leaf,
                 allowsPruning() ? QueryPrep::FilterSupplierMode::DENSITY_ROUTED
                     : QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE,
-                0, childMode)
+                0, childMode, FilterCache::Population::BORROW_ONLY)
           : input.segmentSource().scorerSupplier(pool, leaf, childMode);
       if (!supplier) return nullptr;
       return relation.reduce(pool, (size_t)segment.ord, *supplier,
@@ -76,31 +84,28 @@ public:
       Weight& weight;
       std::vector<DomainHandle> eligibility;
       QueryPrep::PreparedSource child;
-      std::vector<DocSet*> domains;
 
     public:
-      Prepared(Weight& weight, QueryPrep::PreparedSource child, std::span<DocSet* const> domains,
-               std::vector<DomainHandle> eligibility)
-          : weight(weight), eligibility(std::move(eligibility)), child(std::move(child)),
-            domains(domains.begin(), domains.end()) {}
+      Prepared(Weight& weight, QueryPrep::PreparedSource child, std::vector<DomainHandle> eligibility)
+          : weight(weight), eligibility(std::move(eligibility)), child(std::move(child)) {}
+      // The prepare domain reaches a consuming child through its selection and
+      // is not kept: it does not outlive preparation, and a canonical source
+      // must answer for every domain.
       Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
           Query::SupplierExecutionMode mode) override {
         return weight.supplier(pool, segment, child,
-            mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr
-                : domains.empty() ? segment.liveDocSet() : domains[(size_t)segment.ord], mode);
+            mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
       }
       Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(pool, segment, *this);
       }
       PreparedDomainDependence domainDependence() const noexcept override {
-        // Predicate sources were prepared without destination eligibility;
-        // raw output remains canonical even when the ordinary scorer is scoped.
+        // Predicate sources were prepared without destination eligibility.
         return weight.child->consumesDomain() ? child.domainDependence
             : PreparedDomainDependence::QUERY_CANONICAL;
       }
       size_t retainedBytes() const noexcept override {
         return sizeof(*this) + eligibility.capacity() * sizeof(DomainHandle)
-            + domains.capacity() * sizeof(DocSet*)
             + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -112,29 +117,34 @@ public:
     Weight(Query::Context& context, ToParentQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, query, flags), source(query.source.topReader),
           relation(query.relation),
-          reduction(query.maximum && (flags & NEED_SCORES) != 0 ? RowRelation::Reduction::MAXIMUM
-              : RowRelation::Reduction::NONE), multiplier(constantWhenScored(flags, multiplier)) {
+          reduction(query.reduction), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      auto constant = reduction == RowRelation::Reduction::MAXIMUM
+      if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
+        reduction.kind = RowReduction::FIXED;
+        this->multiplier = 0;
+      }
+      auto constant = reduction.kind != RowReduction::FIXED
+              && reduction.kind != RowReduction::SUM
           ? uniformChildScore(*query.child) : std::nullopt;
-      if (reduction == RowRelation::Reduction::MAXIMUM && constant) {
-        // Uniform max is membership plus the child's score, not score none.
-        // Keep the child's rounding before the join's multiplier.
+      if (constant) {
+        // Uniform reductions retain the child's rounding before the multiplier.
         this->multiplier = *constant * this->multiplier;
-        reduction = RowRelation::Reduction::NONE;
+        reduction.kind = RowReduction::FIXED;
       }
-      child = query.child->createWeight(*childContext, reduction == RowRelation::Reduction::MAXIMUM
-          ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
-      if (reduction == RowRelation::Reduction::MAXIMUM && child->isConstantScoring()) {
-        reduction = RowRelation::Reduction::CONSTANT;
-      }
+      int32_t childFlags = flags;
+      if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
+      else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
+      child = query.child->createWeight(*childContext, childFlags, 1.0f);
+      if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::SUM
+          && child->isConstantScoring()) reduction.kind = RowReduction::CONSTANT;
       // Every row of the path is not a set worth materializing or caching.
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
       traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
-      // Scored reduction keeps owner eligibility ahead of family scoring.
-      if (child->consumesDomain() || reduction == RowRelation::Reduction::MAXIMUM) traits |= NEEDS_PREPARE;
-      if (reduction != RowRelation::Reduction::MAXIMUM) traits |= IS_CONSTANT_SCORING;
+      if (child->consumesDomain()) traits |= NEEDS_PREPARE;
+      if (reduction.kind == RowReduction::FIXED || reduction.kind == RowReduction::CONSTANT) {
+        traits |= IS_CONSTANT_SCORING;
+      }
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
     }
@@ -159,7 +169,7 @@ public:
       std::array<Query::Weight*, 1> weights{child};
       std::array<FilterCache::Use*, 1> uses{childUse};
       auto inputs = QueryPrep::prepareFilterSources(weights, uses, childContext);
-      return std::make_unique<Prepared>(*this, std::move(inputs[0]), prepareContext.domainPerSeg, std::move(eligibility));
+      return std::make_unique<Prepared>(*this, std::move(inputs[0]), std::move(eligibility));
     }
     Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode mode) override {

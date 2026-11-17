@@ -33,6 +33,7 @@ class Query;
 class Schema;
 class ValueProgram;
 struct ParseContext;
+struct RowReduction;
 struct ValueResult;
 struct ResolvedFieldHandle;
 
@@ -83,7 +84,7 @@ class ProtobufQueryParser {
   Query* parseDisMax(const luxir::api::DisMaxQuery& query);
   Query* parsePlugin(const luxir::api::PluginQuery& query);
 
-  template <class Lower> Query* inPath(std::string_view path, bool maximum, Lower&& lower);
+  template <class Lower> Query* inPath(std::string_view path, RowReduction reduction, Lower&& lower);
   template <class Leaf, class Lower> Query* parseLeaf(const Leaf& leaf, Lower&& lower);
 
   static std::optional<float> constantOutput(const ValueProgram& program);

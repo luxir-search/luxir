@@ -407,6 +407,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `reverse_map` | `nested` only; defaults to `true`. Store each child row's owner in segments written from now on; see [Declaring nested paths](nested.md#declaring-nested-paths). |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
@@ -1104,6 +1105,10 @@ also work under paths: `lines_nested.color_s` needs no explicit declaration
 in the default schema. A nested path cannot declare scalar value settings,
 variants, indexing, columns or storage. Objects may contain nested paths
 recursively, up to 32 levels.
+
+A nested path's one setting is `reverse_map` (default `true`), described in
+[Declaring nested paths](nested.md#declaring-nested-paths). It can be changed
+on a live collection without reindexing.
 
 Dots separate path components. Each component starts with an ASCII letter
 and contains letters, digits or underscores. A physical name, including

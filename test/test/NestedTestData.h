@@ -4,10 +4,12 @@
 #pragma once
 
 #include <map>
+#include <glaze/glaze.hpp>
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
+#include "luxir/server/JsonResponse.h"
 
 namespace luxir::test::nested_test {
 
@@ -81,6 +83,31 @@ inline Counts local(LuxirNode& node, std::shared_ptr<IndexReader> reader = {}) {
   Counts counts;
   for (const auto* response : req->responses) capture(response->proto, counts);
   return counts;
+}
+
+inline constexpr std::string_view ROW_QUERY = R"JSON({"ops":{"q":{"top_docs":{
+  "query":{"name":"m","expr":"items:(color:red)"},"fields":["id"],"sort":[{"field":"id"}],
+  "row_ops":{"matched":{"domain":{"from_match":"m"},"top_docs":{"fields":["color","size"],"count_limit":-1}},
+    "deep":{"domain":{"to":"items.parts","filter":["material:steel"]},"top_docs":{"fields":["material"]}}}
+}}}})JSON";
+
+inline std::vector<std::string> captureRows(const api::SearchResponse& response) {
+  glz::generic_i64 json;
+  EXPECT_FALSE(glz::read_json(json, renderSearchResponseBody(response)));
+  std::vector<std::string> values;
+  for (const auto& row : json["ops"]["q"]["docs"].get_array()) {
+    values.push_back(row["id"].get_string() + ':'
+        + row["matched"]["docs"][0]["color"].get_string() + ':'
+        + row["deep"]["docs"][0]["material"].get_string());
+  }
+  return values;
+}
+
+inline std::vector<std::string> rowOperations(LuxirNode& node) {
+  auto req = localReq(node.getSearchEngine());
+  EXPECT_TRUE(api::read_json(req->rawRequest(), ROW_QUERY, req->mr));
+  req->execute(1); EXPECT_OK(req);
+  return captureRows(req->responses.back()->proto);
 }
 
 inline constexpr std::string_view RETRIEVAL_QUERY = R"({"ops":{

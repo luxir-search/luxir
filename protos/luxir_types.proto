@@ -170,6 +170,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Operations evaluated on each returned row, with that row as incoming domain.
+  map<string, SearchOp> row_ops = 26;
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
@@ -329,6 +331,8 @@ message SortSpec {
 }
 
 message Query {
+  // A request-unique reference to this clause; does not affect query identity.
+  optional string name = 28;
   // An unset kind selects all documents, same as `all`.
   oneof kind {
     Match match = 1;                // selects all documents with a value match in the specified field
@@ -361,8 +365,14 @@ message Query {
 message ToParentQuery {
   string path = 1;
   Query query = 2;
-  // none (constant score) or max. Unset selects max.
+  // How matching child scores reduce to the owner's score: max (default),
+  // min, sum, avg, or none (the join contributes zero).
   string score = 3;
+  // Fewest matching children an owner needs. Unset = 1; must be >= 1.
+  optional int32 min_children = 4;
+  // Most matching children an owner may have. Unset = unbounded; must be
+  // >= min_children.
+  optional int32 max_children = 5;
 }
 
 message ExistsQuery {
@@ -1040,6 +1050,8 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // In row_ops, select this named clause's matching descendant rows.
+  optional string from_match = 7;
   // Relative descendant path, .. steps to ancestors, or / for root documents.
   optional string to = 6;
   // If present, replaces the incoming domain with this query's matches
@@ -2175,6 +2187,14 @@ message SegmentStats {
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
+  repeated RowSpaceStats spaces = 15; // non-root spaces; bytes already included in the segment
+}
+
+message RowSpaceStats {
+  string path = 1;
+  int32 max_doc = 2; // physical child rows, including rows of deleted roots
+  uint64 ends_bytes = 3; // payload, alignment and block directory
+  uint64 owners_bytes = 4; // zero when the reverse map is absent
 }
 
 message AuxStats {
@@ -2590,6 +2610,10 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only. Store child-to-owner row lookups in segments written later.
+  // Unset inherits, else true. Changing it does not rewrite existing segments.
+  optional bool reverse_map = 30;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

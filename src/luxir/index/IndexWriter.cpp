@@ -3381,6 +3381,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
+  std::vector<std::shared_ptr<SegmentCore>> cores;
   auto copyAux = [](const AuxInfo& src) {
     AuxStats dst;
     dst.kind = src.kind;
@@ -3433,7 +3434,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
     committedIds = lastCommittedSegIds;
     if (!includeSegments) writerSegmentIds.reserve(segInfos.size());
-    if (includeSegments) out.segmentStats.reserve(segInfos.size());
+    if (includeSegments) { out.segmentStats.reserve(segInfos.size()); cores.reserve(segInfos.size()); }
     for (const auto& [segId, seg] : segInfos) {
       unused(segId);
       if (!includeSegments) writerSegmentIds.push_back(seg->segId);
@@ -3442,6 +3443,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       if (!includeSegments) continue;
 
       auto& dst = out.segmentStats.emplace_back();
+      cores.push_back(seg->sharedSegmentCore.load());
       dst.segId = seg->segId;
       dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
@@ -3457,6 +3459,13 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.merging = seg->merging;
     }
   }
+
+  for (size_t i = 0; i < cores.size(); i++) {
+    auto& segment = out.segmentStats[i];
+    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, true);
+    if (cores[i]) segment.readSpaces(*cores[i]);
+  }
+  cores.clear();
 
   boost::unordered_flat_set<uint64_t> committedSet(committedIds.begin(), committedIds.end());
   for (uint64_t segId : writerSegmentIds) {

@@ -34,7 +34,7 @@ namespace luxir {
 
 class SearchEngine;
 class SearchResponse;
-class RowRelation;
+class OwnershipRelation;
 
 // Cumulative count of emitter pauses caused by reply() flow control.
 // Process-wide; read by tests and (eventually) server stats.
@@ -64,7 +64,7 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
     std::shared_ptr<IndexReader> reader;
     std::shared_ptr<FilterCache::UseRegistry> uses;
     // Request-arena owned; the pair of paths fixes the direction of reduction.
-    std::map<std::pair<std::string, std::string>, RowRelation*> relations;
+    std::map<std::pair<std::string, std::string>, OwnershipRelation*> relations;
   };
   friend class SearchEngine;
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
@@ -167,7 +167,7 @@ public:
   // a request crosses a space boundary; registry identities never cross it.
   const std::shared_ptr<IndexReader>& pinView(std::string_view path);
   const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
-  RowRelation& ownershipRelation(IndexReader& many, IndexReader& one);
+  OwnershipRelation& ownershipRelation(IndexReader& many, IndexReader& one);
   Query::PlanningContext* createPlanningContext(IndexReader& view);
   size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }
 

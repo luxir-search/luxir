@@ -341,3 +341,19 @@ TEST(KnnPlannerTest, intervalTerminalReadsHaveSharedKFloor) {
   KnnPlanner::addIvf(totals, s, plan.prices[0], -1);
   EXPECT_EQ(0, totals.intervalVectors);
 }
+
+TEST(KnnPlannerTest, unitTargetsDoNotReplaceSourceWorkPopulations) {
+  auto source = segment(1000), owned = source;
+  owned.unitsWithValue = 10000; owned.eligibleUnits = 100;
+  KnnPlanner::Request request{.k = 10, .boundedTarget = 100};
+  KnnPlanner::Costs costs;
+  auto native = KnnPlanner::price(source, request, costs);
+  auto mapped = KnnPlanner::price(owned, request, costs);
+  EXPECT_EQ(native.exact, mapped.exact); EXPECT_EQ(native.linear, mapped.linear);
+  std::array segments{owned}; std::array prices{mapped};
+  auto totals = KnnPlanner::exactTotals(segments, prices, request);
+  EXPECT_EQ(100, totals.exactDocs);
+  KnnPlanner::addIvf(totals, owned, mapped, 1);
+  EXPECT_EQ(0, totals.exactDocs); EXPECT_EQ(100, totals.eligibleDocs);
+  EXPECT_EQ(100, totals.boundedDocs); EXPECT_EQ(1000, totals.eligibleVectors);
+}

@@ -182,6 +182,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
+- [`RowSpaceStats`](#message-luxir.rowspacestats)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
@@ -921,6 +922,7 @@ Overrides an operation's incoming document set, including beneath facet and grou
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.domain.from_match"></a>[`from_match`](#field-luxir.domain.from_match) | 7 | `string` | optional | In row\_ops, select this named clause's matching descendant rows. |
 | <a id="field-luxir.domain.to"></a>[`to`](#field-luxir.domain.to) | 6 | `string` | optional | Relative descendant path, .. steps to ancestors, or / for root documents. |
 | <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches within live documents and the enclosing structural bucket identities. If absent, inherits the incoming domain. |
 | <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the owning list's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore matching queries above this operation. |
@@ -1065,6 +1067,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.reverse_map"></a>[`reverse_map`](#field-luxir.fielddef.reverse_map) | 30 | `bool` | optional | NESTED only. Store child-to-owner row lookups in segments written later. Unset inherits, else true. Changing it does not rewrite existing segments. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1843,6 +1846,7 @@ An unset kind selects all documents, same as \`all\`.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.query.name"></a>[`name`](#field-luxir.query.name) | 28 | `string` | optional | A request-unique reference to this clause; does not affect query identity. |
 | <a id="field-luxir.query.match"></a>[`match`](#field-luxir.query.match) | 1 | [`Match`](#message-luxir.match) | oneof [`kind`](#oneof-luxir.query.kind) | selects all documents with a value match in the specified field |
 | <a id="field-luxir.query.boolean"></a>[`boolean`](#field-luxir.query.boolean) | 2 | [`BooleanQuery`](#message-luxir.booleanquery) | oneof [`kind`](#oneof-luxir.query.kind) |  |
 | <a id="field-luxir.query.all"></a>[`all`](#field-luxir.query.all) | 3 | `bool` | oneof [`kind`](#oneof-luxir.query.kind) | selects all documents |
@@ -2141,6 +2145,19 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
+<a id="message-luxir.rowspacestats"></a>
+
+### luxir.RowSpaceStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rowspacestats.path"></a>[`path`](#field-luxir.rowspacestats.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.rowspacestats.max_doc"></a>[`max_doc`](#field-luxir.rowspacestats.max_doc) | 2 | `int32` | singular | physical child rows, including rows of deleted roots |
+| <a id="field-luxir.rowspacestats.ends_bytes"></a>[`ends_bytes`](#field-luxir.rowspacestats.ends_bytes) | 3 | `uint64` | singular | payload, alignment and block directory |
+| <a id="field-luxir.rowspacestats.owners_bytes"></a>[`owners_bytes`](#field-luxir.rowspacestats.owners_bytes) | 4 | `uint64` | singular | zero when the reverse map is absent |
+
 <a id="message-luxir.rrffusion"></a>
 
 ### luxir.RrfFusion
@@ -2300,6 +2317,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.merge_level"></a>[`merge_level`](#field-luxir.segmentstats.merge_level) | 12 | `uint32` | singular |  |
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.segmentstats.spaces"></a>[`spaces`](#field-luxir.segmentstats.spaces) | 15 | [`RowSpaceStats`](#message-luxir.rowspacestats) | repeated | non-root spaces; bytes already included in the segment |
 
 <a id="message-luxir.servicestats"></a>
 
@@ -2557,7 +2575,9 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 |---|---|---|---|---|
 | <a id="field-luxir.toparentquery.path"></a>[`path`](#field-luxir.toparentquery.path) | 1 | `string` | singular |  |
 | <a id="field-luxir.toparentquery.query"></a>[`query`](#field-luxir.toparentquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
-| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | none (constant score) or max. Unset selects max. |
+| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | How matching child scores reduce to the owner's score: max (default), min, sum, avg, or none (the join contributes zero). |
+| <a id="field-luxir.toparentquery.min_children"></a>[`min_children`](#field-luxir.toparentquery.min_children) | 4 | `int32` | optional | Fewest matching children an owner needs. Unset = 1; must be &gt;= 1. |
+| <a id="field-luxir.toparentquery.max_children"></a>[`max_children`](#field-luxir.toparentquery.max_children) | 5 | `int32` | optional | Most matching children an owner may have. Unset = unbounded; must be &gt;= min\_children. |
 
 <a id="message-luxir.topdocs"></a>
 
@@ -2567,6 +2587,7 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.topdocs.row_ops"></a>[`row_ops`](#field-luxir.topdocs.row_ops) | 26 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Operations evaluated on each returned row, with that row as incoming domain. |
 | <a id="field-luxir.topdocs.decorate"></a>[`decorate`](#field-luxir.topdocs.decorate) | 25 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.topdocs.query"></a>[`query`](#field-luxir.topdocs.query) | 1 | [`Query`](#message-luxir.query) | singular | unset selects all documents (browse / filter-only search) |
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
