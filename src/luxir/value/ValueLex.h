@@ -94,6 +94,7 @@ struct NumericLiteral {
   bool floating = false;
   int64_t intValue = 0;
   double doubleValue = 0.0;
+  bool hex = false;
 };
 
 template <class Fail>
@@ -127,6 +128,7 @@ NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
       fail(pos, fmt::format("hex integer literal '{}' is out of range or invalid", literal.text));
     }
     literal.intValue = value;
+    literal.hex = true;
     return literal;
   }
 

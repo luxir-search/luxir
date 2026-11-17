@@ -73,21 +73,16 @@ class ValueExprParser {
         literal.type = node.type;
         literal.nature = node.nature;
         literal.sourcePos = node.sourcePos;
-        literal.text = node.text;
-        if (node.opcode == ValueOpcode::NEG) {
+        // A constant's text is the exact decimal spelling it was written with,
+        // which survives negation and nothing else.
+        if (!result.valid) literal.text = node.text;
+        else if (node.opcode == ValueOpcode::NEG) {
           const auto& input = program.nodes[node.children[0]];
-          auto text = input.text;
-          if (input.kind == ValueNodeKind::CONSTANT && !text.empty()
-              && (value::lex::digit(text.front()) || text.front() == '.'
-                  || text.front() == '-' || text.front() == '+')) {
-            std::string signedText;
-            if (text.front() == '-') signedText = text.substr(1);
-            else {
-              if (text.front() == '+') text.remove_prefix(1);
-              signedText = "-";
-              signedText += text;
-            }
-            literal.text = program.copyString(signedText);
+          auto text = input.kind == ValueNodeKind::CONSTANT ? input.text : std::string_view{};
+          if (text.starts_with('-')) literal.text = text.substr(1);
+          else if (!text.empty()) {
+            if (text.front() == '+') text.remove_prefix(1);
+            literal.text = program.copyString("-" + std::string(text));
           }
         }
         literal.intValue = result.intValue;
@@ -335,7 +330,7 @@ private:
     ValueNode node;
     node.kind = ValueNodeKind::CONSTANT;
     node.sourcePos = pos;
-    node.text = program->copyString(literal.text);
+    if (!literal.hex) node.text = program->copyString(literal.text);
     if (literal.floating) {
       node.type = ValueType::DOUBLE;
       node.doubleValue = literal.doubleValue;
@@ -541,31 +536,12 @@ private:
     if (!valueDecimal(resolved[field].nature) || resolved[field].type != ValueType::INT64) return;
     auto constant = constants.scalar(args[literal]);
     if (!constant || resolved[literal].nature != ValueNature::NUMBER) return;
-    const auto* source = &program->nodes[args[literal]];
-    bool negate = false;
-    while (source->kind == ValueNodeKind::FUNCTION && source->opcode == Op::NEG) {
-      negate = !negate;
-      source = &program->nodes[source->children[0]];
-    }
-    std::string signedLiteral;
+    // A written decimal literal compares by its exact spelling; any other
+    // constant compares by its value.
+    const ValueNode& source = program->nodes[args[literal]];
     api::Val literalValue;
-    auto numericText = source->text;
-    if (numericText.starts_with('-') || numericText.starts_with('+')) numericText.remove_prefix(1);
-    bool hex = numericText.starts_with("0x") || numericText.starts_with("0X");
-    if (source->kind == ValueNodeKind::CONSTANT && !source->text.empty() && !hex
-        && (value::lex::digit(source->text.front()) || source->text.front() == '.'
-            || source->text.front() == '-' || source->text.front() == '+')) {
-      auto text = source->text;
-      if (negate) {
-        if (text.front() == '-') text.remove_prefix(1);
-        else {
-          if (text.front() == '+') text.remove_prefix(1);
-          signedLiteral = "-" + std::string(text);
-          text = signedLiteral;
-        }
-      }
-      literalValue.kind = text;
-    } else if (constant->type == ValueType::INT64) literalValue.kind = constant->intValue;
+    if (source.kind == ValueNodeKind::CONSTANT && !source.text.empty()) literalValue.kind = source.text;
+    else if (constant->type == ValueType::INT64) literalValue.kind = constant->intValue;
     else literalValue.kind = constant->doubleValue;
     auto comparison = ValueFunctionRegistry::decimalComparison(function, valueDecimalScale(resolved[field].nature),
         literalValue, field == 1);

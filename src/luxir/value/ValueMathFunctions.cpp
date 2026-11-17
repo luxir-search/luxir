@@ -145,7 +145,7 @@ ResolvedValue binaryArrayDoubleResolve(std::span<const ResolvedValue> args) {
 
 template <auto Fn, bool MapsArrays = false>
 struct Math2 {
-  static ValueResult apply(const ValueNode& node, ValueResult a, ValueResult b, int32_t docid) {
+  static ValueResult apply(const ValueNode& node, const ValueResult& a, const ValueResult& b, int32_t docid) {
     if (!a.valid || !b.valid) return ValueResult::missing(ValueType::DOUBLE);
     double out = Fn(numberOf(a), numberOf(b));
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
