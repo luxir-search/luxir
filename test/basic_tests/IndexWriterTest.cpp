@@ -5,7 +5,9 @@
 #include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <numeric>
 #include <iostream>
 #include <limits>
 #include <filesystem>
@@ -4971,4 +4973,61 @@ TEST_F(IndexWriterTest, idTypeSurvivesMergeAndReopen) {
   CommitSnapshotRegistry snapshots(iw->dir);
   IndexWriter reopened(snapshots);
   check(*reopened.snapshots.readers.getReader(), 1);
+}
+
+namespace {
+std::vector<int32_t> segmentLiveDocs(IndexWriter& iw) {
+  std::vector<int32_t> live;
+  auto reader = iw.snapshots.readers.getReader();
+  for (auto& segment : reader->segments()) live.push_back(segment.numLive());
+  std::sort(live.begin(), live.end());
+  return live;
+}
+
+void indexSegmentsOfTwo(luxir::test::CollectionHelper& helper, int segments) {
+  for (int seg = 0; seg < segments; seg++) {
+    for (int i = 0; i < 2; i++) {
+      helper.index(luxir::test::flatdoc("id", std::to_string(seg) + "_" + std::to_string(i), "tag_s", "t"));
+    }
+    luxir::test::CollectionHelper::UpdateBuilder commit;
+    commit.commit(true);
+    ASSERT_TRUE(helper.submit(commit).success);
+  }
+}
+
+void forceMergeToOne(luxir::test::CollectionHelper& helper) {
+  luxir::test::CollectionHelper::UpdateBuilder update;
+  update.commit(true, 1);
+  ASSERT_TRUE(helper.submit(update).success);
+}
+}  // namespace
+
+// Background merges stop short of maxMergedSegmentDocs, and segments over half
+// of it leave the merge levels; a force merge overrides the cap.
+TEST_F(IndexWriterTest, naturalMergesRespectMaxMergedSegmentDocs) {
+  luxir::test::CollectionHelper helper("main");
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  iw->mergePolicy->maxMergedSegmentDocs = 6;
+  iw->mergePolicy->refresh();
+  indexSegmentsOfTwo(helper, 8);
+  auto live = segmentLiveDocs(*iw);
+  EXPECT_EQ(16, std::accumulate(live.begin(), live.end(), 0));
+  EXPECT_LE(live.back(), 4);  // 4 + anything passes 6; 4 > 6 / 2 stops merging
+  EXPECT_GE(live.size(), 4u);
+  forceMergeToOne(helper);
+  EXPECT_EQ(std::vector<int32_t>{16}, segmentLiveDocs(*iw));
+}
+
+// A background merge admits no source that pushes its most expensive field's
+// estimated working set past maxMergeWorkingSetBytes; a force merge still runs.
+TEST_F(IndexWriterTest, naturalMergesRespectMaxMergeWorkingSet) {
+  luxir::test::CollectionHelper helper("main");
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  iw->maxMergeWorkingSetBytes = 1;  // any second source passes it
+  indexSegmentsOfTwo(helper, 4);
+  EXPECT_EQ((std::vector<int32_t>{2, 2, 2, 2}), segmentLiveDocs(*iw));
+  forceMergeToOne(helper);
+  EXPECT_EQ(std::vector<int32_t>{8}, segmentLiveDocs(*iw));
 }

@@ -2737,12 +2737,25 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
       boost::unordered_flat_map<std::string, int64_t> pathRows;
+      // Admitted sources' field infos, to price each field's merge working
+      // set as candidates join. Only numeric members are read: fieldname
+      // points into a metadata pool that is gone by then.
+      boost::unordered_flat_map<std::string, std::vector<SegFieldInfo>> sourceInfos;
+      int64_t workingSetLimit = maxMergeWorkingSetBytes > 0 ? maxMergeWorkingSetBytes
+          : indexRamBudget != nullptr ? indexRamBudget->totalBytes() : 0;
+      int64_t workingSet = 0;
+      int64_t mergedDocsCap = clientOrigin ? 0 : mergePolicy->maxMergedSegmentDocs;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
                       seg->name());
+          continue;
+        }
+        if (mergedDocsCap > 0 && mergedDocs + seg->liveDocs > mergedDocsCap) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed max merged segment docs {}",
+                      seg->name(), mergedDocsCap);
           continue;
         }
         auto postingsReaderCore = getSegmentCore(*seg);
@@ -2784,10 +2797,47 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                       seg->name());
           continue;
         }
+        std::vector<std::pair<std::string, SegFieldInfo>> candidateInfos;
+        {
+          FieldReader fields(postingsReaderCore->rootReader());
+          while (fields.readNextField()) {
+            SegFieldInfo info{};
+            fields.readFieldInfo(info);
+            if (!SegmentMerger::isStoredField(info)) {
+              candidateInfos.emplace_back(std::string((std::string_view)info.fieldname), info);
+            }
+          }
+        }
+        SegmentMerger::FieldCostContext costContext{mergedDocs + seg->liveDocs, ordMapSpillMinBytes};
+        int64_t candidateWorkingSet = workingSet;
+        for (auto& [field, info] : candidateInfos) {
+          auto infos = sourceInfos[field];
+          infos.push_back(info);
+          candidateWorkingSet = std::max(candidateWorkingSet,
+                                         SegmentMerger::estimateFieldCost(infos, costContext));
+        }
+        if (!clientOrigin && workingSetLimit > 0 && !admitted.empty()
+            && candidateWorkingSet > workingSetLimit) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merge working set would reach {} bytes, over {}",
+                      seg->name(), candidateWorkingSet, workingSetLimit);
+          continue;
+        }
+        for (auto& [field, info] : candidateInfos) sourceInfos[field].push_back(info);
+        workingSet = candidateWorkingSet;
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
         for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
+      }
+      if (clientOrigin && admitted.size() > 1) {
+        if (mergePolicy->maxMergedSegmentDocs > 0 && mergedDocs > mergePolicy->maxMergedSegmentDocs) {
+          LOG_WARN("Force merge into {} segment(s) builds a segment of {} live docs, over max merged segment docs {}",
+                   msg.maxSegments, mergedDocs, mergePolicy->maxMergedSegmentDocs);
+        }
+        if (workingSetLimit > 0 && workingSet > workingSetLimit) {
+          LOG_WARN("Force merge into {} segment(s) has an estimated per-field working set of {} bytes, over {}",
+                   msg.maxSegments, workingSet, workingSetLimit);
+        }
       }
       segs.swap(admitted);
 

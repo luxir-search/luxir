@@ -747,6 +747,16 @@ the node unlimited. The resolved values are logged at startup.
   inverter holding at least its share of the half (and at least
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
+- `indexing.max-merged-segment-docs` (default 50,000,000; `0` is unlimited)
+  bounds the segments background merges build: a merge stops admitting sources
+  before its output would pass it, and a segment over half of it takes no
+  further part in background merges. A force merge (`max_segments`) overrides
+  it and logs a warning when it builds a larger segment.
+- `indexing.max-merge-working-set-mb` (default `0`, meaning `indexing.max-ram-mb`)
+  bounds the estimated working set of a background merge's most expensive
+  field (ord column uninversion, term ord maps, geo point rebuilds); sources
+  that would push it past the limit wait for a later merge. A force merge over
+  the limit still runs, with a warning.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it

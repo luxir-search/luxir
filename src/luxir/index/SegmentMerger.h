@@ -863,6 +863,7 @@ private:
     return total;
   }
 
+public:
   static bool isStoredField(const SegFieldInfo& info) {
     return FieldType::storage(info.type) == FieldType::Storage::BIN && (info.flags & FieldType::STORED) != 0;
   }
@@ -875,17 +876,22 @@ private:
     return FieldType::usesGeoPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
-  static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
+  static const SegFieldInfo& infoOf(const MergeFieldInfo& field) { return field.segFieldInfo; }
+  static const SegFieldInfo& infoOf(const SegFieldInfo& info) { return info; }
+
+  template <class Infos>
+  static void batchTypeAndFlags(const Infos& fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
     bool allIndexed = true;
-    for (const auto& field : fields) {
+    for (const auto& entry : fields) {
+      const SegFieldInfo& info = infoOf(entry);
       if (type == FieldType::Type::NONE) {
-        type = field.segFieldInfo.type;
+        type = info.type;
       }
-      allFlags |= field.segFieldInfo.flags;
-      if (field.segFieldInfo.numValues != 0
-          && !(field.segFieldInfo.flags & FieldType::INDEX_DOCS)) allIndexed = false;
+      allFlags |= info.flags;
+      if (info.numValues != 0
+          && !(info.flags & FieldType::INDEX_DOCS)) allIndexed = false;
     }
     // Numeric postings are an optional complete acceleration of the column.
     // A mode change can leave inputs without postings; their values must not
@@ -921,6 +927,21 @@ private:
           + StoredChunkCompressor::contextBytes(format, maxChunkBytes);
     }
 
+    return estimateFieldCost(fields, {space.maxDoc, ordMapSpillMinBytes});
+  }
+
+public:
+  // Merge-wide inputs to a field's cost, beside its sources' infos.
+  struct FieldCostContext {
+    int64_t mergedMaxDoc;
+    int64_t ordMapSpillMinBytes = MergeCostModel::ORD_MAP_SPILL_MIN_BYTES;
+  };
+
+  // RAM a non-stored field's merge holds at its peak, from its sources' infos
+  // (MergeFieldInfo or SegFieldInfo). Merge selection prices candidates with it
+  // before a merger exists.
+  template <class Infos>
+  static int64_t estimateFieldCost(const Infos& fields, const FieldCostContext& context) {
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
@@ -932,14 +953,15 @@ private:
     int64_t sourceTerms = 0;
     bool ordColumn = true;
     bool replay = false;
-    for (const auto& field : fields) {
-      sourceTerms += field.segFieldInfo.nTerms;
-      ordColumn = ordColumn && mergesOrdColumn(field.segFieldInfo);
-      replay = replay || replaysOrdColumn(field.segFieldInfo);
-      numValues += field.segFieldInfo.numValues;
-      docsWithField += field.segFieldInfo.docsWithField;
-      if (field.segFieldInfo.pointsMetaOff == 0) {
-        synthesizedPointValues += field.segFieldInfo.numValues;
+    for (const auto& entry : fields) {
+      const SegFieldInfo& info = infoOf(entry);
+      sourceTerms += info.nTerms;
+      ordColumn = ordColumn && mergesOrdColumn(info);
+      replay = replay || replaysOrdColumn(info);
+      numValues += info.numValues;
+      docsWithField += info.docsWithField;
+      if (info.pointsMetaOff == 0) {
+        synthesizedPointValues += info.numValues;
       }
     }
     int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
@@ -956,9 +978,9 @@ private:
       // only per-source term ord maps.
       if (replay) {
         int64_t mapBytes = 0;
-        for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
+        for (const auto& entry : fields) mapBytes += (infoOf(entry).nTerms + 1) * (int64_t)sizeof(uint32_t);
         // Spilled maps are mapped page cache; the heap keeps a write buffer each.
-        if (mapBytes >= ordMapSpillMinBytes) {
+        if (mapBytes >= context.ordMapSpillMinBytes) {
           mapBytes = (int64_t)fields.size() * (int64_t)ScratchFile::DEFAULT_BUFFER_BYTES;
         }
         // Mapped source runs stream directly; only maps and codec plans grow.
@@ -970,7 +992,7 @@ private:
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
-      return (int64_t)space.maxDoc * 4
+      return context.mergedMaxDoc * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes + termIndexBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
@@ -981,6 +1003,8 @@ private:
     // Int/str/vector columns and stored fields stream through fixed block buffers.
     return MergeCostModel::LIGHT_BYTES + pointsBytes + termIndexBytes;
   }
+
+private:
 
   // In postings and values processed. A merged term is a heap step over the
   // sources plus per-term encoding, worth many postings.

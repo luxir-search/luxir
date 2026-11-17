@@ -118,6 +118,8 @@ struct IndexConfig {
   // that shared cap - or from outgrowing pool addressability, which is what it
   // resolves to when the shared cap is unlimited.
   int64_t max_inverter_ram_mb = -1;              // RAM cap (MiB), -1 = auto
+  int64_t max_merged_segment_docs = 50'000'000;  // natural merges only, 0 = unlimited
+  int64_t max_merge_working_set_mb = 0;          // 0 = the indexing RAM budget
   // Shared indexing RAM cap (MiB) for merge admission and inverter flushing.
   // -1 = auto: half of the node-wide max_ram_mb, or 0 on a read-only node (it
   // never indexes, so it carves out no indexing share).  0 = unlimited.
