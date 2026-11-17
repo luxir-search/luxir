@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -62,15 +63,10 @@ struct BKDPointCost {
 
 // Inclusive encoded-space box. Reversed longitude bounds describe one
 // wrapped interval and are evaluated as two arms inside one traversal.
-struct BKDBoxRelation {
-  int32_t latMin;
-  int32_t latMax;
-  int32_t lonMin;
-  int32_t lonMax;
-
+struct BKDBoxRelation : geo::EncodedBox {
   BKDBoxRelation(int32_t latMin, int32_t latMax, int32_t lonMin,
                  int32_t lonMax)
-      : latMin(latMin), latMax(latMax), lonMin(lonMin), lonMax(lonMax) {
+      : geo::EncodedBox(geo::EncodedBox::fromEncoded(latMin, latMax, lonMin, lonMax)) {
     if (latMax < latMin) {
       throw std::invalid_argument("BKDBoxRelation: latitude bounds are reversed");
     }
@@ -91,8 +87,7 @@ struct BKDBoxRelation {
   }
 
   bool matches(int32_t lat, int32_t lon) const {
-    return latMin <= lat && lat <= latMax
-        && geo::longitudeInRange(lon, lonMin, lonMax);
+    return contains(lat, lon);
   }
 
   // The box test is the unit the other relations' tests are priced in.
@@ -738,7 +733,7 @@ private:
 public:
   BKDReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
     if (fieldInfo.pointsMetaOff == 0) invalid("points index is absent");
-    InputStream input = postingsReader.getInputStream(fieldInfo.pointsLoc.filenum());
+    InputStream input = postingsReader.core().getInputStream(fieldInfo.pointsLoc.filenum());
     init(input, fieldInfo.pointsLoc.offset(), fieldInfo.pointsMetaOff);
   }
 

@@ -119,15 +119,9 @@ class IntColHandler : public Inverter::IndexHandler {
   int32_t numVals = 0;
 
 public:
-  IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+  IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
       docsWithVal(inverter.pool) {
-  }
-
-  IntColHandler(Inverter& inverter, PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType,
-                IndexHandler& parent)
-    : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
-    unused(parent);
   }
 
   ~IntColHandler() override = default;
@@ -163,7 +157,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -174,7 +168,7 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numVals >= postingsWriter.getMaxDoc();
+    auto full = numVals >= postingsWriter.getMaxDoc(space);
 
     if (fieldType->indexed()) {
       auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
@@ -185,7 +179,7 @@ public:
     {
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter writer(*outputPtr,
-                          FieldType::sortsByIntColumn(fieldType->type()));
+                          FieldType::isNumericColumn(fieldType->type()));
       // When full, values are already in doc order and the column is written dense (no docs-with-field
       // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
       // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
@@ -253,8 +247,8 @@ class MultiIntColHandler : public Inverter::IndexHandler {
 
 public:
   MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
-                     const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+                     const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
       lengthStream(inverter.pool), docsWithVal(inverter.pool) {
   }
 
@@ -294,8 +288,7 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    // int64 -> any int-column type never throws, so the lazy transform is safe
-    // under the validate-before-mutate contract.
+    // indexMulti materializes every coerced value before appending any of them.
     indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
       return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
                                        inverter.coerceContext);
@@ -335,7 +328,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -346,7 +339,7 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numDocs >= postingsWriter.getMaxDoc();
+    auto full = numDocs >= postingsWriter.getMaxDoc(space);
 
     if (fieldType->indexed()) {
       auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
@@ -427,8 +420,8 @@ public:
 class GeoPointHandler final : public IntColHandler {
 public:
   GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
-                  const std::shared_ptr<FieldType>& fieldType)
-    : IntColHandler(inverter, fieldName, fieldType) {}
+                  const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IntColHandler(inverter, fieldName, fieldType, space) {}
 
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
@@ -444,8 +437,8 @@ public:
 class MultiGeoPointHandler final : public MultiIntColHandler {
 public:
   MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
-                       const std::shared_ptr<FieldType>& fieldType)
-    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+                       const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : MultiIntColHandler(inverter, fieldName, fieldType, space) {}
 
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {

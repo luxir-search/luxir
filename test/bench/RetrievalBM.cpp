@@ -10,6 +10,7 @@
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -106,6 +107,75 @@ static void BM_FieldLoad(benchmark::State& state, const std::vector<std::string>
 
   state.counters["fp"] = fp;
   state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+// Separate corpus: the standard root benchmark index stays reusable. Each
+// root has eight small children, or one root has a 4096-row family. The root
+// twins retain comparable payloads as multi-valued fields without objects.
+enum class NestedSelection { WHOLE, FIELD, DEEP, OWNER, FLAT };
+
+static void BM_NestedFieldLoad(benchmark::State& state, NestedSelection selection,
+                                luxir::api::DocFormat format) {
+  int children = (int)state.range(0);
+  bool large = children > 8;
+  int roots = large ? 1 : (luxir::unit_tests ? LuxirTest::scaleTestWork(100) : 1000);
+  CollectionHelper helper("retrieval_nested");
+  helper.clear();
+  SchemaBuilder schema;
+  auto& notes = schema.field("notes_w");
+  notes.type = api::FieldDef::FieldClass::TEXT;
+  notes.multi = api::FieldDef::MultiMode::ARRAY;
+  notes.stored = true;
+  schema.set(helper.collection());
+  CollectionHelper::UpdateBuilder input;
+  for (int root = 0; root < roots; root++) {
+    std::string items, colors, texts, materials;
+    for (int child = 0; child < children; child++) {
+      auto color = "color" + std::to_string(child);
+      auto material = "material" + std::to_string(child);
+      std::string text = "a stored item description " + std::to_string(child);
+      if (child) { items += ','; colors += ','; texts += ','; materials += ','; }
+      items += "{\"color_s\":\"" + color + "\",\"text_w\":\"" + text
+          + "\",\"parts_nested\":[{\"material_s\":\"" + material + "\"}]}";
+      colors += "\"" + color + "\"";
+      texts += "\"" + text + "\"";
+      materials += "\"" + material + "\"";
+    }
+    std::string json = "{\"id\":\"" + std::to_string(root) + "\",\"items_nested\":[" + items
+        + "],\"colors_ss\":[" + colors + "],\"notes_w\":[" + texts + "],\"materials_ss\":[" + materials + "]}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit();
+  ASSERT_TRUE(helper.submit(input).success);
+  std::vector<std::string> fields;
+  switch (selection) {
+    case NestedSelection::WHOLE: fields = {"items_nested"}; break;
+    case NestedSelection::FIELD: fields = {"items_nested.color_s"}; break;
+    case NestedSelection::DEEP: fields = {"items_nested.parts_nested.material_s"}; break;
+    case NestedSelection::OWNER: fields = {"color_s", "/id"}; break;
+    case NestedSelection::FLAT: fields = {"colors_ss", "notes_w", "materials_ss"}; break;
+  }
+  // One response batch holds at most 256 rows.
+  int limit = large ? (selection == NestedSelection::OWNER ? 256 : 1) : 100;
+  int64_t fp = -1;
+  for (auto _ : state) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& op = req->collection("retrieval_nested").topDocs("q").allQuery()
+        .fields(std::span<const std::string>(fields)).documentFormat(format).limit(limit).batchSize(limit);
+    if (selection == NestedSelection::OWNER) op.rawOp().domain.emplace().to = "items_nested";
+    req->execute(false);
+    ASSERT_OK(req);
+    const auto* docs = req->docList("q");
+    ASSERT_NE(nullptr, docs);
+    ASSERT_EQ(std::min(limit, selection == NestedSelection::OWNER ? roots * children : roots), docs->row_count);
+    auto value = fingerprintDocList(*docs);
+    benchmark::DoNotOptimize(docs);
+    if (fp != -1) { ASSERT_EQ(fp, value); }
+    fp = value;
+  }
+  state.counters["fp"] = fp;
+  state.counters["children"] = children;
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
@@ -228,6 +298,17 @@ LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, str_cols, FIELDS_STR, COLS);
 LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, str_rows, FIELDS_STR, ROWS);
 LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_cols, FIELDS_MIXED, COLS);
 LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_rows, FIELDS_MIXED, ROWS);
+
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, whole_rows, NestedSelection::WHOLE, ROWS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, whole_cols, NestedSelection::WHOLE, COLS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, field_rows, NestedSelection::FIELD, ROWS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, field_cols, NestedSelection::FIELD, COLS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, deep_rows, NestedSelection::DEEP, ROWS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, deep_cols, NestedSelection::DEEP, COLS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, owner_rows, NestedSelection::OWNER, ROWS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, owner_cols, NestedSelection::OWNER, COLS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, flat_rows, NestedSelection::FLAT, ROWS)->Arg(8)->Arg(4096);
+LUXIR_BENCHMARK_CAPTURE(BM_NestedFieldLoad, flat_cols, NestedSelection::FLAT, COLS)->Arg(8)->Arg(4096);
 
 LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_cols, FIELDS_MIXED7, COLS);
 LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_rows, FIELDS_MIXED7, ROWS);

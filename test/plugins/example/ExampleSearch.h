@@ -62,7 +62,7 @@ public:
   std::vector<std::string_view> fields;
   std::vector<std::string_view> rankNames{"_rank"};
 
-  SampleDocsOp(luxir::SearchRequest& req, std::string_view name) : SearchOp(req, name) {}
+  SampleDocsOp(luxir::SearchRequest& req, const std::shared_ptr<luxir::IndexReader>& view, std::string_view name) : SearchOp(req, view, name) {}
 
   class Calc : public Calculator {
   public:
@@ -78,8 +78,8 @@ public:
     Calc(SampleDocsOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
          const luxir::StructuralConstraint* structural)
       : Calculator(op, parent, slot, numSlots, structural),
-        found(op.req.reader->segments().size()),
-        pending((int32_t)op.req.reader->segments().size()) {
+        found(op.view->segments().size()),
+        pending((int32_t)op.view->segments().size()) {
       for (auto& [key, sub] : op.subOps) subCalcs.emplace_back(sub->createCalculator(this, -1));
     }
 
@@ -98,8 +98,9 @@ public:
         return;
       }
       if (segnum == 0) taskGroup = tg;
-      auto& reader = *op.req.reader;
+      auto& reader = *op.view;
       auto& segment = reader.segments()[(size_t)segnum];
+      domain.assertScope(segment);
       if (const auto* info = reader.field("id").at(segment)) {
         auto poolGuard = luxir::MemPool::threadLocalPoolGuard();
         luxir::TermsEnum terms(poolGuard.pool(), segment.postingsReader(), *info);
@@ -128,10 +129,10 @@ public:
         std::vector<luxir::segdoc> sorted = ranked;
         std::ranges::sort(sorted);
         auto doc = sorted.begin();
-        for (int32_t s = 0; s < (int32_t)op.req.reader->segments().size(); s++) {
-          luxir::DocSetBuilder builder(op.req.reader->segments()[(size_t)s].maxDoc());
+        for (int32_t s = 0; s < (int32_t)op.view->segments().size(); s++) {
+          luxir::DocSetBuilder builder(op.view->segments()[(size_t)s].maxDoc());
           for (; doc != sorted.end() && doc->segment() == s; ++doc) builder.add(doc->docId());
-          domains.emplace_back(builder.build());  // an empty set, never null (null = all docs)
+          domains.push_back(luxir::DomainHandle(builder.build()).scoped(op.view->segments()[(size_t)s]));  // an empty set, never null (null = all docs)
         }
         luxir::task_group_fanout(domains.empty() ? nullptr : tg, subCalcs.size(), [&](size_t i) {
           auto* subCalc = subCalcs[i].get();
@@ -146,7 +147,7 @@ public:
         }});
       }
       luxir::emitDocsResponse(
-          op.req, op.flags, [this](luxir::SearchResponse* r) -> luxir::api::DocList& {
+          op.req, *op.view, op.flags, [this](luxir::SearchResponse* r) -> luxir::api::DocList& {
             return *slotArm<luxir::api::DocList>(r);
           },
           (int64_t)ranked.size(), [this](int64_t i) { return ranked[(size_t)i]; },
@@ -164,7 +165,7 @@ public:
 
 inline luxir::SearchOp* makeSampleDocs(luxir::PluginOpContext& ctx) {
   ctx.node().pluginState<NodeState>("example")->ops++;
-  auto* op = luxir::arenaCreate<SampleDocsOp>(ctx.req.arena, ctx.req, ctx.name);
+  auto* op = luxir::arenaCreate<SampleDocsOp>(ctx.req.arena, ctx.req, ctx.view, ctx.name);
   op->ids = ctx.params.getStringList("ids");
   op->fields = ctx.params.getStringList("fields");
   if (ctx.params.has("rank_names")) op->rankNames = ctx.params.getStringList("rank_names");

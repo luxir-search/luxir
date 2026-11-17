@@ -593,6 +593,10 @@ TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty)
                std::invalid_argument);
   EXPECT_TRUE(GeoBoxQuery("geo", 90.0, 90.0, -180.0, 180.0).isEmpty());
   EXPECT_TRUE(GeoBoxQuery("geo", -90.0, 90.0, 180.0, 180.0).isEmpty());
+  GeoBoxQuery pole("geo", 90.0, 90.0, -180.0, 180.0);
+  GeoBoxQuery dateline("geo", -90.0, 90.0, 180.0, 180.0);
+  EXPECT_TRUE(pole.equals(dateline));
+  EXPECT_EQ(pole.hash(), dateline.hash());
 }
 
 TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {

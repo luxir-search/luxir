@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "SearchOp.h"  // build:: alias + luxir::api types (via SearchRequest.h)
 
 namespace luxir {
@@ -232,6 +232,11 @@ template <> struct FacetOutputTypes<double> {
   using ArrayColumn = api::ArrArrDouble;
 };
 
+template <> struct FacetOutputTypes<bool> {
+  using Column = api::ColVal;
+  using ArrayColumn = api::ColVal;
+};
+
 template <> struct FacetOutputTypes<std::string_view> {
   using Column = api::ColStr;
   using ArrayColumn = api::ArrArrStr;
@@ -240,7 +245,7 @@ template <> struct FacetOutputTypes<std::string_view> {
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING
 // FacetResult.  The bucket count is known up front (buckets.size()), so each
 // span is allocArray'd once into the response arena `mr` and index-filled.
-template <typename Output = NativeDateOutput>
+template <typename Output = NativeValueOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<int64_t, int64_t>>& buckets,
                         std::pmr::memory_resource& mr, Output output = {}) {
@@ -250,21 +255,23 @@ inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
   auto* ids = build::allocArray(bucketIds.v, n, mr);
   int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
   for (size_t i = 0; i < n; i++) {
-    ids[i] = output(buckets[i].first);
+    if constexpr (std::is_same_v<Column, api::ColVal>) ids[i].kind = output(buckets[i].first);
+    else ids[i] = output(buckets[i].first);
     counts[i] = buckets[i].second;
   }
 }
 
+template <typename Output = NativeValueOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<std::string, int64_t>>& buckets,
-                        std::pmr::memory_resource& mr) {
+                        std::pmr::memory_resource& mr, Output output = {}) {
   auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
   size_t n = buckets.size();
   std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
   int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
   for (size_t i = 0; i < n; i++) {
     // bucket strings live in the transient countVec; copy into the arena.
-    ids[i] = build::arenaStr(mr, buckets[i].first);
+    ids[i] = outputTerm(buckets[i].first, mr, output);
     counts[i] = buckets[i].second;
   }
 }
