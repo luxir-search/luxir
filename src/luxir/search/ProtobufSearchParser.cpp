@@ -2305,8 +2305,18 @@ public:
     if (qr->boundedCount && !qr->countLimitProven && !qr->estimateCount
         && !disableBoundedCountSplit && weight != nullptr && !weight->needsPrepare()
         && weight->allowsPruning() && !weight->isConstantScoring()) {
-      qr->boundedCountWeight = query->createWeight(
-          *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+      int64_t remaining = requirements.countLimit;
+      for (auto& segment : view()->segments()) {
+        // Metadata bounds may be loose, but a count that cannot pass the
+        // limit would only duplicate the held ranking pass.
+        auto bound = weight->countShortcut(segment, nullptr).maxMatches;
+        if (bound > remaining) {
+          qr->boundedCountWeight = query->createWeight(
+              *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+          break;
+        }
+        remaining -= bound;
+      }
     }
     qr->headSort = std::move(headSort);
     qr->resultQuery = resultQuery;

@@ -7,6 +7,7 @@
 
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/FilterCache.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
@@ -190,8 +191,49 @@ TEST_F(BoundedCountTest, conjunctionCountsApartFromRanking) {
       EXPECT_EQ(gte ? limit : 1297, bounded->getMatchCount()) << limit;
       EXPECT_EQ(ranked(*uncounted), ranked(*bounded)) << limit;
       if (parallel == 1 && limit == 10) { EXPECT_EQ(1, SkipStats::boundedCountSegments); }
-      if (parallel == 1 && limit == 10000) { EXPECT_EQ(4, SkipStats::boundedCountSegments); }
+      if (parallel == 1 && limit == 10000) { EXPECT_EQ(0, SkipStats::boundedCountSegments); }
     }
+  }
+}
+
+TEST_F(BoundedCountTest, aMetadataUpperBoundKeepsOneScorerPerSegment) {
+  SearchOverridesGuard split(disableBoundedCountSplit);
+  std::string query = "body_w:beta AND n_i:[0 TO 1999]";
+  SkipStatsScope stats;
+  for (int64_t limit : {667, 668, 10000}) {
+    disableBoundedCountSplit = false;
+    SkipStats::reset();
+    auto bounded = run(search(query, limit), 1);
+    EXPECT_EQ(0, SkipStats::boundedCountSegments);
+    EXPECT_EQ(4, SkipStats::numericPredicateSparseVerifyArms + SkipStats::numericPredicateScanArms
+        + SkipStats::numericPredicateZoneArms);
+    EXPECT_EQ(667, bounded->getMatchCount());
+    if (limit > 667) { EXPECT_FALSE(bounded->docList()->found_gte); }
+    disableBoundedCountSplit = true;
+    auto held = run(search(query, limit), 1);
+    EXPECT_EQ(ranked(*held), ranked(*bounded));
+    EXPECT_EQ(held->docList()->found, bounded->docList()->found);
+    EXPECT_EQ(held->docList()->found_gte, bounded->docList()->found_gte);
+  }
+}
+
+TEST_F(BoundedCountTest, phraseVerificationKeepsOneRankingPass) {
+  SearchOverridesGuard split(disableBoundedCountSplit);
+  SkipStatsScope stats;
+  for (auto query : {R"(body_w:\"alpha beta\")", R"(body_w:\"alpha beta\"~2)"}) {
+    disableBoundedCountSplit = false;
+    SkipStats::reset();
+    auto bounded = run(search(query, 10), 1);
+    EXPECT_EQ(0, SkipStats::boundedCountSegments);
+    int64_t verified = SkipStats::phraseVerifies;
+    EXPECT_GT(verified, 0);
+    disableBoundedCountSplit = true;
+    SkipStats::reset();
+    auto held = run(search(query, 10), 1);
+    EXPECT_EQ(verified, SkipStats::phraseVerifies);
+    EXPECT_EQ(ranked(*held), ranked(*bounded));
+    EXPECT_EQ(held->docList()->found, bounded->docList()->found);
+    EXPECT_EQ(held->docList()->found_gte, bounded->docList()->found_gte);
   }
 }
 
@@ -290,8 +332,28 @@ TEST_F(BoundedCountTest, stopsAtABulkWindowAndDoesNotRankAProvenEmptySegment) {
   EXPECT_EQ(1, SkipStats::boundedCountSegments);
   EXPECT_EQ(1, SkipStats::boundedCountStops);
   EXPECT_EQ(1, SkipStats::conjDenseCountWindows);
+  SearchOverridesGuard split(disableBoundedCountSplit);
+  for (int64_t limit : {10, 9999, 10000, 10001}) {
+    disableBoundedCountSplit = false;
+    SkipStats::reset();
+    auto counted = execute("tag_s:lead AND n_i:[0 TO 10]", limit);
+    EXPECT_EQ(1, SkipStats::boundedCountSegments);
+    EXPECT_EQ(limit < 10000, counted->docList()->found_gte) << limit;
+    EXPECT_EQ(std::min<int64_t>(10000, limit), counted->getMatchCount());
+    disableBoundedCountSplit = true;
+    auto held = execute("tag_s:lead AND n_i:[0 TO 10]", limit);
+    EXPECT_EQ(ranked(*held), ranked(*counted));
+    expectCount(*held, 10000, limit);
+    // A final held window may finish the exact count one hit past the limit,
+    // while the separate count reports the permitted lower bound.
+    if (limit != 9999) {
+      EXPECT_EQ(held->docList()->found, counted->docList()->found) << limit;
+      EXPECT_EQ(held->docList()->found_gte, counted->docList()->found_gte) << limit;
+    }
+  }
+  disableBoundedCountSplit = false;
   SkipStats::reset();
-  auto empty = execute("parity_s:odd AND n_i:[0 TO 10]", 10000);
+  auto empty = execute("parity_s:odd AND n_i:[0 TO 10]", 9999);
   EXPECT_EQ(0, empty->getMatchCount());
   EXPECT_FALSE(empty->docList()->found_gte);
   EXPECT_EQ(1, SkipStats::boundedCountSegments);

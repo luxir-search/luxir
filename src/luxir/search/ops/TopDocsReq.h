@@ -1118,35 +1118,15 @@ public:
     // count, or nullopt once the total passes the limit here or in another
     // segment.
     std::optional<int64_t> countBounded(
-        MemPool& pool, IndexReader::Segment& seg, DocSet* collectorFilter) {
+        IndexReader::Segment& seg, DocSet* collectorFilter, BulkScorer& bulk) {
       int32_t rangeDocs = TopDocsReq::boundedCountRangeDocsForTests;
-      if (boundedTotal.exceeded()) return std::nullopt;
-      auto* countSupplier = thisOp().boundedCountWeight->scorerSupplier(pool, seg);
-      if (countSupplier == nullptr) return 0;
       skipCount(SkipStats::boundedCountSegments);
-      Query::ScorerSupplier::BulkScorerContext bulkContext;
-      auto plan = countSupplier->planBulk(
-          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
-      BulkScorer* bulk = nullptr;
-      Query::Scorer* scorer = nullptr;
-      if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
-        bulk = countSupplier->buildBulk(pool, plan);
-      } else {
-        countSupplier->recordBulkPlanCommitment(
-            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext, plan);
-      }
-      if (bulk == nullptr) {
-        scorer = buildPullScorer(pool, *countSupplier);
-        if (scorer == nullptr) return 0;
-      }
       int64_t count = 0;
       int32_t maxDoc = seg.maxDoc();
       for (int32_t min = 0; min < maxDoc;) {
         int32_t max = (int32_t) std::min<int64_t>(maxDoc, (int64_t) min + rangeDocs);
         int64_t matches = 0;
-        int32_t next = max;
-        if (bulk != nullptr) next = bulk->countNextWindow(matches, nullptr, collectorFilter, min, max);
-        else matches = countMatchesInRange(scorer, collectorFilter, min, max);
+        int32_t next = bulk.countNextWindow(matches, nullptr, collectorFilter, min, max);
         if (next == PostingsReader::END) next = max;
         assert(next > min);
         count += matches;
@@ -1162,11 +1142,24 @@ public:
     // A bounded count apart from ranking: the count pass stops at the limit,
     // and ranking prunes from its first page. The total is exact unless it
     // passed the limit, which the emission reports as at least the limit.
-    void boundedCountThenCollectTopK(
+    bool boundedCountThenCollectTopK(
         MemPool& pool, int32_t segnum, IndexReader::Segment& seg,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
         auto& collector) {
-      std::optional<int64_t> count = countBounded(pool, seg, collectorFilter);
+      std::optional<int64_t> count;
+      if (!boundedTotal.exceeded()) {
+        auto* countSupplier = thisOp().boundedCountWeight->scorerSupplier(pool, seg);
+        if (countSupplier == nullptr) return true;
+        Query::ScorerSupplier::BulkScorerContext context;
+        auto plan = countSupplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, context);
+        // Candidate-by-candidate verification would be repeated by ranking.
+        // Keep the held pass unless counting has a bulk membership plan.
+        if (plan.available != Query::ScorerSupplier::BulkAnswer::YES) return false;
+        auto* bulk = countSupplier->buildBulk(pool, plan);
+        if (bulk == nullptr) return false;
+        count = countBounded(seg, collectorFilter, *bulk);
+      }
       int64_t before = collector.totalHits();
       if (collector.topCount > 0 && (!count || *count > 0)) {
         rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
@@ -1174,11 +1167,12 @@ public:
       }
       if (!count) {
         collector.countIncomplete = true;
-        return;
+        return true;
       }
       int64_t ranked = collector.totalHits() - before;
       assert(*count >= ranked);
       collector.hitCount += *count - ranked;
+      return true;
     }
 
     void rankTopK(
@@ -2641,14 +2635,15 @@ public:
                 }
                 return supplier->buildBulk(poolGuard.pool(), plan);
               };
-              if (composedExactCountTopK) {
-                // countThenCollectTopK supplied both the exact hit count and
-                // competitively pruned ranking.
-              } else if (!Collapsed && op.boundedCountWeight != nullptr
-                         && builderPtr == nullptr && !captureSharedRaw) {
-                boundedCountThenCollectTopK(
-                    poolGuard.pool(), segnum, seg, supplier, collectorFilter,
-                    *scoreCollector);
+              bool composedBoundedCountTopK = !Collapsed
+                  && op.boundedCountWeight != nullptr && builderPtr == nullptr
+                  && !captureSharedRaw && !composedExactCountTopK
+                  && boundedCountThenCollectTopK(
+                      poolGuard.pool(), segnum, seg, supplier, collectorFilter,
+                      *scoreCollector);
+              if (composedExactCountTopK || composedBoundedCountTopK) {
+                // The separate count supplied the hit count and competitively
+                // pruned ranking.
               } else if (useSparseConstantPull) {
                 auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {

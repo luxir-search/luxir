@@ -141,12 +141,14 @@ would otherwise stop at N. An explicit `0` or `-1` overrides it, and `-2`
 applies only to its own list.
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
-list with varying scores counts apart from ranking: an unscored pass counts
-matches until more than N are found, and ranking skips competitively from its
-first page. A list with uniform scores holds competitive-score skipping until N
-matches have been counted, or index statistics already prove at least N
-matches. If counting stops before the end, `found` is N and `found_gte: true`
-marks it as a lower bound. Otherwise the count is exact and `found_gte` is
+list with varying scores may count apart from ranking: when metadata permits
+more than N matches and counting has a bulk membership plan, an unscored pass
+counts until more than N are found, and ranking skips competitively from its
+first page. Otherwise one ranking pass holds competitive-score skipping until
+N matches have been counted. A list with uniform scores holds competitive-score
+skipping until N matches have been counted, or index statistics already prove
+at least N matches. If counting stops before the end, `found` is N and
+`found_gte: true` marks it as a lower bound. Otherwise the count is exact and `found_gte` is
 omitted. An exact total is a valid answer even when it equals or exceeds N.
 Metadata and already-resident membership can supply an exact count without a
 counting pass.
