@@ -2408,7 +2408,7 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 
 ### luxir.SplitCollectionRequest
 
-Divides a collection's committed documents among new collections of its tenant. The source commits first and is not changed; updates it accepts later are in no part. Each part receives whole segments, balanced by live documents, linked rather than copied, so a part has the source's schema and update versions. Either every part is created or none is.
+Divides a collection's committed documents among new collections of its tenant. The source commits first and is not changed; updates it accepts later are in no part. Segment files are linked rather than copied, so a part has the source's schema and update versions. Either every part is created or none is.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2418,6 +2418,7 @@ Divides a collection's committed documents among new collections of its tenant. 
 | <a id="field-luxir.splitcollectionrequest.to"></a>[`to`](#field-luxir.splitcollectionrequest.to) | 2 | `string` | repeated | part names, each free; or |
 | <a id="field-luxir.splitcollectionrequest.parts"></a>[`parts`](#field-luxir.splitcollectionrequest.parts) | 3 | `uint32` | singular | with no \`to\`: this many parts named &lt;from&gt;\_0, &lt;from&gt;\_1, ... |
 | <a id="field-luxir.splitcollectionrequest.tenant"></a>[`tenant`](#field-luxir.splitcollectionrequest.tenant) | 4 | `string` | singular |  |
+| <a id="field-luxir.splitcollectionrequest.key"></a>[`key`](#field-luxir.splitcollectionrequest.key) | 5 | `string` | singular | Empty: each part receives whole segments, balanced by live documents. Otherwise the id or a string field: a document goes to part xxh3\_64(value, seed 0) % parts, by its least value if it has several, and to the first part if it has none. Route later updates the same way. |
 
 <a id="message-luxir.splitcollectionresponse"></a>
 

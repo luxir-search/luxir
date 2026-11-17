@@ -285,8 +285,8 @@ created or none is.
 - The source commits first, and the parts hold exactly that commit. The source
   is not changed: delete it, or keep it, when the parts are in place. Updates
   it accepts after the split began are in no part, so stop writing to it first.
-- Each part receives whole segments, largest first, each to the part with the
-  fewest documents so far. The collection needs at least as many segments with
+- Without a `key`, each part receives whole segments, largest first, each to
+  the part with the fewest documents so far. The collection needs at least as many segments with
   documents as there are parts. Segment files are linked, not copied, on
   backends that support hard links, so a split takes about as long as a commit
   and needs no extra space until the parts merge.
@@ -297,6 +297,26 @@ created or none is.
   ID. Use a segment split for data that is no longer updated (logs, events,
   closed periods), or send each later update or delete to every part.
 - A follower downloads each part in full, since it is a new collection.
+
+With a `key`, each document goes to the part its key value selects, so later
+updates and deletes can be routed to the one part that holds the document:
+
+```sh
+curl -s localhost:9400/collections/_split -d '{"from":"users","parts":4,"key":"id"}'
+```
+
+- The part of a value is `xxh3_64(value) % parts`, with seed 0 over the value's
+  UTF-8 bytes as indexed. Numeric IDs use their canonical string form. Send each
+  later update to `<from>_<part>` (or the `to` name at that position).
+- The key is `id` or a string field. A document with several values goes with
+  its least one; a document without the key goes to the first part.
+- Every segment holding documents of several parts is linked into each of
+  them, with a live-documents file that hides the documents of the other parts.
+  The split itself writes only those files, but until a part rewrites its
+  segments it searches and stores the hidden rows too, and term statistics
+  still count them. Merges skip the largest segments, so reclaim that space
+  with a forced merge of each part once it is in place: an update request with
+  `"commit": {"max_segments": 1}` (see [Visibility and commits](indexing.md#visibility-and-commits)).
 
 ## Visibility policy
 

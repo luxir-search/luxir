@@ -230,9 +230,10 @@ void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
   if (following() || config.read_only) throw ReadOnlyError("cannot swap collections on a read-only node or follower");
   collections_->swap(a, b);
 }
-std::vector<Collections::SplitPart> LuxirNode::splitCollection(const CollectionId& from, std::span<const CollectionId> to) {
+std::vector<Collections::SplitPart> LuxirNode::splitCollection(const CollectionId& from, std::span<const CollectionId> to,
+                                                              std::string_view key) {
   if (following() || config.read_only) throw ReadOnlyError("cannot split collections on a read-only node or follower");
-  return collections_->split(from, to);
+  return collections_->split(from, to, key);
 }
 
 api::SplitCollectionResponse LuxirNode::splitCollection(const api::SplitCollectionRequest& request, std::pmr::memory_resource& mr) {
@@ -244,7 +245,7 @@ api::SplitCollectionResponse LuxirNode::splitCollection(const api::SplitCollecti
     if (request.parts > Collections::kMaxSplitParts) throw RequestError(std::format("a split needs 2 to {} parts", Collections::kMaxSplitParts));
     for (uint32_t i = 0; i < request.parts; i++) to.push_back(adminTarget(request.tenant, std::format("{}_{}", request.from, i)));
   }
-  auto parts = splitCollection(from, to);
+  auto parts = splitCollection(from, to, request.key);
   api::SplitCollectionResponse response{request.from, {}};
   auto* out = api::build::allocArray(response.parts, parts.size(), mr);
   for (size_t i = 0; i < parts.size(); i++) {

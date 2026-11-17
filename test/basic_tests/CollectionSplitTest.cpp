@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <format>
 #include <memory_resource>
+#include <xxhash.h>
 #include <chrono>
 #include <filesystem>
 #include "luxir/api/luxir_types.hpp"
@@ -159,10 +160,20 @@ TEST(CollectionSplitStorageTest, httpSplitLinksFilesAndSurvivesRestart) {
     if (entry.is_regular_file() && std::filesystem::hard_link_count(entry.path()) > 1) linked++;
   }
   EXPECT_GT(linked, 0u);
+  {
+    LuxirNode node(config);
+    EXPECT_EQ(2u, idsOf(node, "big_0").size());
+    EXPECT_EQ(2u, idsOf(node, "big_1").size());
+    EXPECT_EQ(4u, idsOf(node, "big").size());
+    // Parts hiding rows with their own live docs reopen as they were split.
+    std::vector<CollectionId> to{CollectionId::of("k0"), CollectionId::of("k1")};
+    node.splitCollection(CollectionId::of("big"), to, "id");
+  }
   LuxirNode node(config);
-  EXPECT_EQ(2u, idsOf(node, "big_0").size());
-  EXPECT_EQ(2u, idsOf(node, "big_1").size());
-  EXPECT_EQ(4u, idsOf(node, "big").size());
+  auto k0 = idsOf(node, "k0"), k1 = idsOf(node, "k1");
+  EXPECT_EQ(4u, k0.size() + k1.size());
+  for (const auto& id : k0) EXPECT_EQ(0u, XXH3_64bits(id.data(), id.size()) % 2) << id;
+  for (const auto& id : k1) EXPECT_EQ(1u, XXH3_64bits(id.data(), id.size()) % 2) << id;
 }
 
 TEST_F(CollectionSplitTest, catalogActivatesPartsTogether) {
@@ -176,4 +187,54 @@ TEST_F(CollectionSplitTest, catalogActivatesPartsTogether) {
   storage.activate(names);
   EXPECT_EQ("active", storage.owned(a).state);
   EXPECT_EQ("active", storage.owned(b).state);
+}
+
+namespace {
+size_t partOf(std::string_view value, size_t parts) { return XXH3_64bits(value.data(), value.size()) % parts; }
+}
+
+TEST_F(CollectionSplitTest, keyRoutesEachDocumentByItsHash) {
+  ASSERT_TRUE(big.deleteById("d03", UpdateMessage::COMMIT).success);
+  std::erase(all, "d03");
+  std::vector<CollectionId> to{CollectionId::of("p0"), CollectionId::of("p1"), CollectionId::of("p2")};
+  auto parts = node.splitCollection(CollectionId::of("big"), to, "id");
+  ASSERT_EQ(3u, parts.size());
+  std::vector<std::string> both;
+  for (size_t i = 0; i < 3; i++) {
+    auto ids = idsOf(node, to[i].name);
+    EXPECT_EQ(parts[i].docs, ids.size());
+    for (const auto& id : ids) EXPECT_EQ(i, partOf(id, 3)) << id;
+    both.insert(both.end(), ids.begin(), ids.end());
+  }
+  std::ranges::sort(both);
+  EXPECT_EQ(all, both);
+
+  // The masked copies stay deleted, and an update replaces its document.
+  auto id = idsOf(node, "p1").front();
+  CollectionHelper part(node, "p1");
+  ASSERT_TRUE(part.index(flatdoc("id", id, "n_i", 100), UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(parts[1].docs, idsOf(node, "p1").size());
+  ASSERT_TRUE(part.index(flatdoc("id", "zz"), UpdateMessage::COMMIT, true, 1).success);  // a forced merge drops the masked rows
+  EXPECT_EQ(parts[1].docs + 1, idsOf(node, "p1").size());
+  auto reader = part.collection().getReaderManager().getReader();
+  EXPECT_EQ(reader->liveDocs(), reader->maxDoc());
+}
+
+TEST_F(CollectionSplitTest, keyFieldValuesAndMissingValues) {
+  ASSERT_TRUE(big.indexAll({flatdoc("id", "t1", "tag_s", "red"), flatdoc("id", "t2", "tag_s", "blue")},
+                           UpdateMessage::COMMIT, true).success);
+  std::vector<CollectionId> to{CollectionId::of("p0"), CollectionId::of("p1")};
+  node.splitCollection(CollectionId::of("big"), to, "tag_s");
+  auto first = idsOf(node, "p0"), second = idsOf(node, "p1");
+  // Documents without the key go to the first part.
+  for (const auto& id : all) EXPECT_TRUE(std::ranges::binary_search(first, id)) << id;
+  EXPECT_EQ(partOf("red", 2) == 0, std::ranges::binary_search(first, std::string("t1")));
+  EXPECT_EQ(partOf("blue", 2) == 1, std::ranges::binary_search(second, std::string("t2")));
+  EXPECT_EQ(all.size() + 2, first.size() + second.size());
+
+  EXPECT_THROW(node.splitCollection(CollectionId::of("big"), std::vector{CollectionId::of("q0"), CollectionId::of("q1")}, "n_i"),
+               RequestError);
+  EXPECT_THROW(node.splitCollection(CollectionId::of("big"), std::vector{CollectionId::of("q0"), CollectionId::of("q1")}, "absent_x"),
+               RequestError);
+  EXPECT_FALSE(node.collections().catalog().find("q0"));
 }

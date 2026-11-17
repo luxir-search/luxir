@@ -5,7 +5,12 @@
 #include <format>
 #include <thread>
 #include "Promotion.h"
+#include <xxhash.h>
 #include "luxir/api/index_files.h"
+#include "luxir/index/LiveDocsWriter.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
@@ -598,8 +603,20 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
 }
 
 namespace {
-// The segments each part of a split keeps, by segment id.
-using SplitPlan = std::vector<std::set<uint64_t>>;
+// What each part of a split keeps: whole segments, and segments shared by
+// several parts, of which it keeps the documents it owns.
+struct SplitPlan {
+  static constexpr uint16_t NONE = UINT16_MAX;
+  struct Shared {
+    std::vector<uint16_t> owner;  // per document: its part, NONE when deleted
+    std::vector<int32_t> live;    // per part: documents owned
+  };
+  std::vector<std::set<uint64_t>> whole;
+  std::map<uint64_t, Shared> shared;
+  std::vector<uint64_t> docs;
+  std::vector<uint32_t> segments;
+  explicit SplitPlan(size_t parts) : whole(parts), docs(parts), segments(parts) {}
+};
 
 // Whole segments, largest first, each to the part with the fewest documents.
 SplitPlan planBySegments(const api::IndexInfo& info, size_t parts) {
@@ -613,32 +630,118 @@ SplitPlan planBySegments(const api::IndexInfo& info, size_t parts) {
     return a->live_docs != b->live_docs ? a->live_docs > b->live_docs : a->seg_id < b->seg_id;
   });
   SplitPlan plan(parts);
-  std::vector<uint64_t> docs(parts);
   for (const auto* seg : segments) {
-    auto part = (size_t)(std::ranges::min_element(docs) - docs.begin());
-    plan[part].insert(seg->seg_id);
-    docs[part] += (uint64_t)seg->live_docs;
+    auto part = (size_t)(std::ranges::min_element(plan.docs) - plan.docs.begin());
+    plan.whole[part].insert(seg->seg_id);
+    plan.docs[part] += (uint64_t)seg->live_docs;
+    plan.segments[part]++;
   }
   return plan;
 }
 
-// Keeps the planned segments. The composition changed, so index-scope aux
-// indexes, which cover the whole source, are dropped.
-SnapshotEdit keepSegments(const std::set<uint64_t>& keep) {
-  return [&keep](api::IndexInfo& info, Directory&, uint64_t, std::pmr::memory_resource& mr) {
+// Each document goes to the part xxh3-64 (seed 0) of its key value selects,
+// modulo the number of parts, so a client can route later updates the same way.
+// Terms ascend, so a document with several values goes with its least one;
+// a document without the key goes to the first part.
+SplitPlan planByKey(IndexReader& reader, std::string_view key, size_t parts, const std::function<void()>& progress) {
+  SplitPlan plan(parts);
+  for (auto& seg : reader.segments()) {
+    progress();
+    if (seg.numLive() == 0) continue;
+    int32_t maxDoc = seg.maxDoc();
+    std::vector<uint16_t> owner((size_t)maxDoc, SplitPlan::NONE);
+    auto& postings = seg.postingsReader();
+    if (const auto* info = postings.fieldInfo(key); info && info->nTerms > 0) {
+      // A segment written before the field's current definition.
+      if (info->type != FieldType::ID && info->type != FieldType::STRING) {
+        throw RequestError("split key '" + std::string(key) + "' is not a string field in every segment");
+      }
+      auto guard = MemPool::threadLocalPoolGuard();
+      TermsEnum terms(guard.pool(), postings, *info);
+      while (terms.nextTerm()) {
+        auto term = (std::string_view)terms.term();
+        auto part = (uint16_t)(XXH3_64bits(term.data(), term.size()) % parts);
+        DocsOnlyEnum docs(terms);
+        for (int32_t doc = docs.next(); doc != DocsEnumMeta::END; doc = docs.next()) {
+          if (owner[(size_t)doc] == SplitPlan::NONE) owner[(size_t)doc] = part;
+        }
+      }
+    }
+    const auto* live = seg.liveDocs();
+    std::vector<int32_t> counts(parts);
+    for (int32_t doc = 0; doc < maxDoc; doc++) {
+      auto& part = owner[(size_t)doc];
+      if (live && !live->bitset().get(doc)) part = SplitPlan::NONE;
+      else counts[part == SplitPlan::NONE ? (part = 0) : part]++;
+    }
+    size_t holders = 0, holder = 0;
+    for (size_t part = 0; part < parts; part++) {
+      if (counts[part] == 0) continue;
+      plan.docs[part] += (uint64_t)counts[part];
+      plan.segments[part]++;
+      holders++;
+      holder = part;
+    }
+    if (holders == 1) plan.whole[holder].insert(seg.segInfo.seg_id);
+    else plan.shared.emplace(seg.segInfo.seg_id, SplitPlan::Shared{std::move(owner), std::move(counts)});
+  }
+  return plan;
+}
+
+// Keeps a part's segments, writing a live docs generation of the new lifetime
+// for each shared one. The composition changed, so index-scope aux indexes,
+// which cover the whole source, are dropped.
+SnapshotEdit keepSegments(const SplitPlan& plan, size_t part) {
+  return [&plan, part](api::IndexInfo& info, Directory& dir, uint64_t writerEpoch, std::pmr::memory_resource& mr) {
     std::span<const api::SegmentInfo> kept;
-    auto* out = api::build::allocArray(kept, keep.size(), mr);
+    auto* out = api::build::allocArray(kept, plan.segments[part], mr);
     size_t n = 0;
-    for (const auto& seg : info.segments) if (keep.contains(seg.seg_id)) out[n++] = seg;
-    assert(n == keep.size());
+    for (const auto& seg : info.segments) {
+      if (plan.whole[part].contains(seg.seg_id)) { out[n++] = seg; continue; }
+      auto shared = plan.shared.find(seg.seg_id);
+      if (shared == plan.shared.end() || shared->second.live[part] == 0) continue;
+      auto& copy = out[n++] = seg;
+      int32_t live = shared->second.live[part];
+      screaming::RAMFixedBitSet bits(seg.max_doc);
+      for (int32_t doc = 0; doc < seg.max_doc; doc++) if (shared->second.owner[(size_t)doc] == part) bits.set(doc);
+      std::vector<FileDescriptor> written;
+      LiveDocsWriter::writeLiveDocs(dir, seg.seg_id, seg.creator_epoch, seg.live_gen + 1, writerEpoch, bits,
+                                    seg.max_doc, live, &written);
+      auto previous = seg.live_gen == 0 ? std::string{}
+          : Postings::getLiveDocsFileName(Postings::segmentKey(seg.seg_id, seg.creator_epoch), seg.live_gen, seg.live_epoch);
+      std::span<const api::FileDescriptor> files;
+      auto* file = api::build::allocArray(files, seg.files.size() + 1, mr);
+      size_t f = 0;
+      for (const auto& existing : seg.files) if (existing.name != previous) file[f++] = existing;
+      file[f++] = {api::build::arenaStr(mr, written[0].name), written[0].size, written[0].xxh3};
+      copy.files = files.first(f);
+      copy.live_gen = seg.live_gen + 1;
+      copy.live_epoch = writerEpoch;
+      copy.live_docs = live;
+    }
+    assert(n == plan.segments[part]);
     info.segments = kept;
     info.aux_indexes = {};
     info.core_gen++;
   };
 }
+
+// A routing key must be a root-level id or indexed string field: a key under
+// a nested path holds the values of child rows, not of the document.
+void requireSplitKey(const Schema* schema, std::string_view key) {
+  auto* type = schema ? schema->getFieldTypePtr(key) : nullptr;
+  bool nested = false;
+  for (auto dot = key.find('.'); schema && dot != std::string_view::npos; dot = key.find('.', dot + 1)) {
+    nested = nested || schema->isNestedPath(key.substr(0, dot));
+  }
+  if (!type || nested || (type->type() != FieldType::ID && type->type() != FieldType::STRING) || !type->indexed()) {
+    throw RequestError("split key '" + std::string(key) + "' must be the id or an indexed string field of the document");
+  }
+}
 }
 
-std::vector<Collections::SplitPart> Collections::split(const CollectionId& from, std::span<const CollectionId> to) {
+std::vector<Collections::SplitPart> Collections::split(const CollectionId& from, std::span<const CollectionId> to,
+                                                       std::string_view key) {
   validate(from);
   if (to.size() < 2 || to.size() > kMaxSplitParts) {
     throw RequestError(std::format("a split needs 2 to {} target collections", kMaxSplitParts));
@@ -669,7 +772,9 @@ std::vector<Collections::SplitPart> Collections::split(const CollectionId& from,
   };
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(snapshot->bytes, arena);
-  auto plan = planBySegments(info, to.size());
+  if (!key.empty()) requireSplitKey(snapshot->schema.get(), key);
+  auto plan = key.empty() ? planBySegments(info, to.size())
+                          : planByKey(*std::make_shared<IndexReader>(shard->snapshots->dir, *snapshot), key, to.size(), refreshPin);
   Manifest manifest;
   manifest.bytes = snapshot->bytes;
   manifest.generation = manifest.highestGeneration = snapshot->id.index_gen;
@@ -698,7 +803,7 @@ std::vector<Collections::SplitPart> Collections::split(const CollectionId& from,
   try {
     for (size_t i = 0; i < to.size(); i++) {
       refreshPin();
-      reserved.emplace_back(to[i].name, copySnapshotAs(storage, to[i].name, snapshot->id.incarnation, manifest, keepSegments(plan[i])));
+      reserved.emplace_back(to[i].name, copySnapshotAs(storage, to[i].name, snapshot->id.incarnation, manifest, keepSegments(plan, i)));
     }
     refreshPin();
   } catch (...) {
@@ -735,12 +840,8 @@ std::vector<Collections::SplitPart> Collections::split(const CollectionId& from,
       std::this_thread::yield();
     }
     registered(to[i], created[i]);
-    SplitPart part{to[i], created[i]};
-    for (const auto& seg : info.segments) {
-      if (plan[i].contains(seg.seg_id)) { part.docs += (uint64_t)seg.live_docs; part.segments++; }
-    }
-    LOG_INFO("Created collection {} from {} segments of {}", to[i].label(), part.segments, from.label());
-    parts.push_back(std::move(part));
+    LOG_INFO("Created collection {} from {} segments of {}", to[i].label(), plan.segments[i], from.label());
+    parts.push_back({to[i], created[i], plan.docs[i], plan.segments[i]});
   }
   return parts;
 }

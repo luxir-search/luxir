@@ -218,12 +218,15 @@ public:
   };
   static constexpr size_t kMaxSplitParts = 256;
   // Divides the committed documents of `from` among new collections `to`
-  // (at least two, all free names of its tenant). Each part receives whole
-  // segments, balanced by live documents, whose files are linked rather than
-  // copied, under the source's schema and update versions. The source commits
-  // first and is otherwise unchanged; updates it accepts after that commit are
-  // not in any part. Creates every part or, on failure, none.
-  std::vector<SplitPart> split(const CollectionId& from, std::span<const CollectionId> to);
+  // (at least two, all free names of its tenant), whose files are linked
+  // rather than copied, under the source's schema and update versions. Without
+  // a `key` each part receives whole segments, balanced by live documents.
+  // With one, the part of a document is xxh3-64 of its value of `key` (the id
+  // or a string field) modulo the number of parts; a segment shared by several
+  // parts carries a live docs generation per part. The source commits first
+  // and is otherwise unchanged; updates it accepts after that commit are not in
+  // any part. Creates every part or, on failure, none.
+  std::vector<SplitPart> split(const CollectionId& from, std::span<const CollectionId> to, std::string_view key = {});
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }
   // Empty incarnation ids leave unavailable names. Running installers retain

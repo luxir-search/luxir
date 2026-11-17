@@ -107,7 +107,8 @@ public:
   void deleteCollection(const CollectionId& id);
   void renameCollection(const CollectionId& from, const CollectionId& to);
   void swapCollections(const CollectionId& a, const CollectionId& b);
-  std::vector<Collections::SplitPart> splitCollection(const CollectionId& from, std::span<const CollectionId> to);
+  std::vector<Collections::SplitPart> splitCollection(const CollectionId& from, std::span<const CollectionId> to,
+                                                      std::string_view key = {});
   // The SplitCollection request: `to`, or `parts` names <from>_<i>. The
   // response's strings live in `mr`.
   api::SplitCollectionResponse splitCollection(const api::SplitCollectionRequest& request, std::pmr::memory_resource& mr);
