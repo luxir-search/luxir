@@ -2961,6 +2961,42 @@ TEST(FilterCacheTest, buildRaceLoserOwnsWithoutPublishingOrReprobing) {
   EXPECT_GT(cache.bytesUsed(), 0u);
 }
 
+TEST(FilterCacheTest, exactDomainBorrowsWithoutStartingPopulation) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(writerSnapshots);
+  addTermDoc(writer, "selected");
+  addTermDoc(writer, "other");
+  writer.commit();
+  auto reader = writer.snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery query("text_w", "selected");
+  auto* use = context.getFilterUse(query);
+  std::array sources{QueryPrep::ExactDomainSource{
+      .weight = query.createWeight(context, 0), .cacheUse = use}};
+  auto domain = docs(2, {0, 1});
+  auto before = reader->filterCache()->counters();
+  auto miss = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
+  EXPECT_FALSE(miss.available);
+  auto after = reader->filterCache()->counters();
+  EXPECT_EQ(before.misses + 1, after.misses);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.thrashBuildSkips, after.thrashBuildSkips);
+
+  auto build = use->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+  use->publishRaw(0, build, docs(2, {0}), 1);
+  auto hit = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
+  ASSERT_TRUE(hit.available);
+  ASSERT_NE(nullptr, hit.docs.get());
+  EXPECT_EQ(1, hit.docs.get()->card());
+  EXPECT_TRUE(hit.docs.get()->get(0));
+}
+
 TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
