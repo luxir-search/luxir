@@ -157,3 +157,21 @@ TEST(RangeFetchTest, countdownResumesOnTheArenaAfterTheLastFetch) {
   EXPECT_TRUE(failsWith<FileIOException>(error));
   EXPECT_TRUE(onArena);
 }
+
+TEST(RangeFetchTest, aReadSetKeepsItsFirstBytes) {
+  auto a = std::make_shared<RAMInputFile>(std::make_unique_for_overwrite<char[]>(100), 100);
+  auto b = std::make_shared<RAMInputFile>(std::make_unique_for_overwrite<char[]>(100), 100);
+  ReadSet reads{{a, {{0, 10}, {50, 20}}}, {b, {{0, 30}}}, {a, {{90, 10}}}};
+  EXPECT_EQ(70u, reads.bytes());
+  EXPECT_EQ(0u, reads.truncate(70));
+  EXPECT_EQ(3u, reads.size());
+  // The limit falls in the second range: it is cut, and what follows is dropped.
+  EXPECT_EQ(45u, reads.truncate(25));
+  ASSERT_EQ(1u, reads.size());
+  ASSERT_EQ(2u, reads[0].ranges.size());
+  EXPECT_EQ(50u, reads[0].ranges[1].offset);
+  EXPECT_EQ(15u, reads[0].ranges[1].length);
+  EXPECT_EQ(25u, reads.bytes());
+  EXPECT_EQ(25u, reads.truncate(0));
+  EXPECT_TRUE(reads.empty());
+}

@@ -5,7 +5,9 @@
 
 #include <oneapi/tbb/task_arena.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -25,7 +27,52 @@ struct FileReads {
   std::shared_ptr<InputFile> file;
   std::vector<ByteRange> ranges;
 };
-using ReadSet = std::vector<FileReads>;
+
+/// The reads one fetch round declares, in the order they matter.
+struct ReadSet : std::vector<FileReads> {
+  using std::vector<FileReads>::vector;
+
+  // Set by a part that could declare only a prerequisite of its reads (a
+  // segment's hotcache, an overlay's footer): the rest follows from those
+  // bytes, so the caller declares once more after this round arrived.
+  bool again = false;
+  // Set on that second declare: the prerequisites are resident now (or read
+  // on demand), so a part reads them and declares the rest.
+  bool prerequisitesFetched = false;
+
+  /// The bytes of every declared range.
+  uint64_t bytes() const {
+    uint64_t total = 0;
+    for (const auto& read : *this) {
+      for (const auto& range : read.ranges) total += range.length;
+    }
+    return total;
+  }
+
+  /// Keeps the first `max` bytes in declared order: the range that crosses
+  /// the limit is cut short, later ranges and files with none left are
+  /// dropped. Returns the bytes dropped.
+  uint64_t truncate(uint64_t max) {
+    uint64_t left = max, dropped = 0;
+    size_t files = 0;
+    for (size_t f = 0; f < size(); f++) {
+      auto& ranges = (*this)[f].ranges;
+      size_t kept = 0;
+      for (const auto& range : ranges) {
+        uint64_t take = std::min(range.length, left);
+        dropped += range.length - take;
+        left -= take;
+        if (take > 0) ranges[kept++] = {range.offset, take};
+      }
+      ranges.erase(ranges.begin() + (int64_t)kept, ranges.end());
+      if (kept == 0) continue;
+      if (files != f) (*this)[files] = std::move((*this)[f]);
+      files++;
+    }
+    erase(begin() + (int64_t)files, end());
+    return dropped;
+  }
+};
 
 /// Joins the fetches of one request and resumes the request when the last one
 /// finishes, so that no thread waits in between.
