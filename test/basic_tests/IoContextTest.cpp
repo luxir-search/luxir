@@ -319,6 +319,24 @@ TEST(IoContextTest, boundWorkRestoresTheContextOfTheThreadThatRunsIt) {
   EXPECT_FALSE(shared.stop.stop_possible());
 }
 
+// Fetch waits end a margin before the transport deadline, so their error
+// reaches a client that still waits: 5% of the budget, at most 500 ms.
+TEST(IoContextTest, fetchWaitsEndAMarginBeforeTheDeadline) {
+  using namespace std::chrono_literals;
+  auto now = IoContext::Clock::now();
+  IoContext io;
+  EXPECT_EQ(IoContext::Clock::time_point::max(), io.fetchDeadline());
+  io.setDeadline(now + 2s, now);
+  EXPECT_EQ(now + 2s - 100ms, io.fetchDeadline());
+  io.setDeadline(now + 30s, now);
+  EXPECT_EQ(now + 30s - 500ms, io.fetchDeadline());
+  EXPECT_EQ(now + 30s, io.deadline);
+  io.setDeadline(now - 1s, now);  // already passed: no margin to keep
+  EXPECT_EQ(now - 1s, io.fetchDeadline());
+  io.setDeadline(now + 30s, now);
+  EXPECT_EQ(IoContext::Clock::time_point::max(), io.shared().fetchDeadline());
+}
+
 // A search over a collection on lazily read storage reports the requests and
 // bytes its reads fetched, exactly as the storage counted them.
 TEST(IoContextTest, searchProfileCountsStorageIo) {

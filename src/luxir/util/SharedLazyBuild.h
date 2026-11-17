@@ -108,7 +108,7 @@ public:
     }
     std::unique_lock lock(finishedMutex);
     auto done = [this] { return finished; };
-    if (!(io->hasDeadline() ? finishedChanged.wait_until(lock, io->stop, io->deadline, done)
+    if (!(io->hasDeadline() ? finishedChanged.wait_until(lock, io->stop, io->fetchDeadline(), done)
                             : finishedChanged.wait(lock, io->stop, done))) {
       if (io->stopRequested()) throw RequestCancelledError();
       throw ApiError(ErrorKind::UNAVAILABLE, "fetch_timeout",

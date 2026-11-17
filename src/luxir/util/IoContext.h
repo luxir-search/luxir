@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -91,11 +92,12 @@ struct IoContext {
   std::string_view requestId;
   // When the client stops waiting; Clock::time_point::max() when it set no
   // deadline. A hint for hedging and for giving up on a slow request early:
-  // core never fails a read on it. Fetches ahead of a search pass it as
-  // their ReadDeadline, and a wait on work shared with other requests (a
-  // SharedLazyBuild) ends at it. A layer may read it here as its own fetch
-  // deadline.
+  // core never fails a read on it. Set it with setDeadline(); waits on
+  // fetches end at fetchDeadline(), a margin before it.
   Clock::time_point deadline = Clock::time_point::max();
+  // How long before `deadline` waits on fetches end (fetchDeadline()); set
+  // with it by setDeadline().
+  Clock::duration fetchMargin = Clock::duration::zero();
   // Requested when the client cancelled the request or the server is
   // stopping; empty when nothing can cancel it. Core checks it between the
   // stages of a search; a layer may stop waiting for a fetch on it.
@@ -118,6 +120,28 @@ struct IoContext {
 
   bool hasDeadline() const { return deadline != Clock::time_point::max(); }
   bool stopRequested() const { return stop.stop_requested(); }
+
+  /// The most a fetch wait keeps back from the transport deadline, and its
+  /// share of the budget a request starts with.
+  static constexpr Clock::duration kMaxFetchMargin = std::chrono::milliseconds(500);
+  static constexpr int kFetchMarginPercent = 5;
+
+  /// Sets the client's deadline at request start (`now`), and the margin
+  /// fetch waits keep before it: min(kMaxFetchMargin, 5% of the budget).
+  void setDeadline(Clock::time_point clientDeadline, Clock::time_point now = Clock::now()) {
+    deadline = clientDeadline;
+    auto budget = clientDeadline > now ? clientDeadline - now : Clock::duration::zero();
+    fetchMargin = std::min(kMaxFetchMargin, budget * kFetchMarginPercent / 100);
+  }
+
+  /// When waits on fetches for this request end (a fetch ahead, a wait on a
+  /// shared build, a storage layer's own fetch, a reader reopen): a margin
+  /// before the transport deadline, so a fetch_timeout error still reaches a
+  /// client that is waiting for it, instead of losing the race to the
+  /// client's own deadline. max() without a deadline.
+  Clock::time_point fetchDeadline() const {
+    return hasDeadline() ? deadline - fetchMargin : Clock::time_point::max();
+  }
   /// Time left before the deadline (negative once passed); max() without one.
   Clock::duration remaining(Clock::time_point now = Clock::now()) const {
     return hasDeadline() ? deadline - now : Clock::duration::max();
@@ -144,6 +168,7 @@ struct IoContext {
   IoContext shared() const {
     IoContext io = *this;
     io.deadline = Clock::time_point::max();
+    io.fetchMargin = Clock::duration::zero();
     io.stop = {};
     io.fillCache = true;
     return io;

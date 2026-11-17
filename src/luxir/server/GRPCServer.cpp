@@ -772,10 +772,11 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
-  // The client's deadline is the storage layer's hint for hedging (IoContext).
+  // The client's deadline is the storage layer's hint for hedging (IoContext),
+  // and fetch waits end a margin before it (IoContext::fetchDeadline).
   if (auto left = call.genericCtx.deadline() - std::chrono::system_clock::now();
       left < std::chrono::hours(24 * 365)) {
-    req.io.deadline = startTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(left);
+    req.io.setDeadline(startTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(left), startTime);
   }
   // A client cancel (or a server stop) ends the request's waits: a min_commit
   // wait, a fetch ahead, a wait on a shared build (IoContext::stop).
