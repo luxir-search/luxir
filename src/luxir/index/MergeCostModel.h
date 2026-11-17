@@ -99,8 +99,12 @@ struct MergeCostModel {
   static constexpr int64_t POINTS_RUN_BYTES = 1024;
   static constexpr int64_t POINTS_DECODE_BYTES = POINTS_PER_LEAF * (8 + 4 + 4);
   static constexpr int64_t SYNTHESIZED_POINT_BYTES = 16;
-  // vector growth can retain nearly 2x the 16-byte triple payload.
-  static constexpr int64_t GEO_POINT_BYTES = 32;
+  // One BKDWriter::Point per merged value; the merge reserves the vector
+  // up front and BKDWriter partitions it in place.
+  static constexpr int64_t GEO_POINT_BYTES = 12;
+  // A TextWriter keeps one block offset and one separator key (trie or
+  // vector) per term block until its field ends.
+  static constexpr int64_t TERM_INDEX_BYTES_PER_BLOCK = 64;
   // Three 8-byte directory arrays can each retain nearly 2x vector capacity.
   static constexpr int64_t POINTS_DIRECTORY_BYTES_PER_LEAF = 48;
 
@@ -126,6 +130,12 @@ struct MergeCostModel {
         + sourceRuns * (POINTS_RUN_BYTES + POINTS_DECODE_BYTES)
         + leaves * POINTS_DIRECTORY_BYTES_PER_LEAF
         + synthesizedValues * SYNTHESIZED_POINT_BYTES;
+  }
+
+  // Upper bound from the source term counts (the merged dictionary is at
+  // most their sum).
+  static int64_t termIndexBytes(int64_t sourceTerms, int64_t termsPerBlock) {
+    return (sourceTerms / termsPerBlock + 1) * TERM_INDEX_BYTES_PER_BLOCK;
   }
 
   static int64_t geoPointsBytes(int64_t totalValues) {
