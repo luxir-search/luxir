@@ -126,36 +126,15 @@ and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
 its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
 terminal rescoring retain the canonical query.
 
-Codes with one bit per dimension and a quantized query skip FAISS's distance
-computer for `RaBitQScorer`. Each scan task allocates its query buffers once;
-for each list it re-quantizes the residual and packs the query's bit planes
-without allocating, then scores 256-row blocks without a virtual call. Scoring
-uses AVX2 nibble lookups or NEON `vcnt` over whole chunks, with hardware popcount
-on 64-bit words for the rest and on other targets, all chosen at compile time
-from `LUXIR_CPU_TARGET`. Its estimates equal FAISS's to the bit: the quantized
-query and popcounts are the same integers, the query norms come from the same
-FAISS functions, and the floats combine in the same order. The one subtlety is
-FMA. FAISS compiles this code without FMA on x86-64 and GCC contracts it on
-AArch64, so the file builds with `-ffp-contract=off` and fuses explicitly on
-AArch64 only. Tests compare factors, planes and estimates against FAISS on real
-overlays, for 7 dimension counts, every query-bit setting, and both metrics.
-FAISS's computer remains for extended codes and for query bits 0. Filtered blocks
-first select rows without branching, then prefetch ahead through the selection,
-which took 5 to 30% off forced filtered IVF at 1-30% selectivity.
-
-| Forced IVF, 1 segment, serial, RaBitQ-1, i7-14700KF | FAISS computer | scorer |
-|---|---|---|
-| Cohere 1M 768-d cosine, default effort | 1817 us | 1148 us |
-| Cohere 1M, full scan, nlist 1000 | 26.7 ms | 12.8 ms |
-| Cohere 1M, full scan, nlist 4000 | 58.1 ms | 14.5 ms |
-| arxiv 1M 1536-d cosine, default effort | 4765 us | 2617 us |
-| Deep 1M 96-d L2, default effort | 738 us | 339 us |
-
-These runs returned identical ids and score bits. A list now costs about 0.6 us
-at 768 dims rather than 10.5 us, and a code about 12.2 ns rather than 16.2 ns, so
-list count no longer dominates the scan. A larger nlist still costs more at equal
-coverage (1500 vs 1148 us at default effort for nlist 4000 vs 1000), now mostly
-in the coarse search, which ranks every centroid.
+Codes with one bit per dimension and a quantized query use `RaBitQScorer`.
+It owns its arithmetic: residuals are quantized by rounding half up and
+clamping, and estimates agree with FAISS within query-quantization error;
+last-bit float differences across builds and architectures are accepted.
+Tests check exact quantized values, bit planes and integer counts against a
+scalar reference, and factors and estimates against FAISS within a derived
+one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
+packing, and the per-code virtual call. FAISS's computer remains for extended
+codes and query bits 0.
 
 RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
 clamps its 1-bit L2 estimates at zero; the port patch

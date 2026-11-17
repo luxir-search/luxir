@@ -1,10 +1,5 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
-//
-// Built with -ffp-contract=off: FAISS compiles its distance computer without
-// FMA on x86-64 whatever the target of its dependents, while GCC contracts it
-// on AArch64. Fused operations here are therefore explicit (fusedAdd below), so
-// the estimate keeps the rounding of FAISS's at every optimization level.
 #include "RaBitQScorer.h"
 
 #include "luxir/util/luxir_util.h"
@@ -36,15 +31,6 @@ constexpr size_t CHUNK_BYTES = 0;  // Hardware popcount over 64-bit words.
 #endif
 
 constexpr size_t PREFETCH_ROWS = 6;
-
-// a * b + c, fused where FAISS's own build fuses it.
-inline LUXIR_INLINE float fusedAdd(float a, float b, float c) {
-#if defined(__aarch64__)
-  return __builtin_fmaf(a, b, c);
-#else
-  return a * b + c;
-#endif
-}
 
 inline LUXIR_INLINE uint64_t load64(const uint8_t* p) {
   uint64_t v;
@@ -106,10 +92,9 @@ void minMax(const float* values, size_t n, float& low, float& high) {
   high = maxValue;
 }
 
-// std::clamp(std::round(x), 0, maxCode) for x >= 0 or NaN. NaN (a list whose
-// residual is constant has delta 0, so 0 * inf) gives 0, as FAISS's float to
-// uint8_t cast does in practice; c1 and delta are then 0 and hide the value. x
-// minus its truncation is exact, so the half test has no rounding of its own.
+// Scorer definition: round (residual - low) / delta half up and clamp to the
+// query-code range. Constant residuals map to zero (0 * inf becomes NaN, then
+// the first comparison selects zero). The half test has no rounding of its own.
 // Written to auto-vectorize: its compile-time target picks the width.
 LUXIR_NOINLINE uint32_t quantize(const float* LUXIR_RESTRICT residual, size_t n, float low, float scale,
                                             float maxCode, uint8_t* LUXIR_RESTRICT out) {
@@ -291,19 +276,46 @@ void RaBitQScorer::setList(const float* centroid) {
   packPlanes();
   factors.c1 = 2 * delta * invSqrtDims;
   factors.c2 = 2 * low * invSqrtDims;
-  factors.c34 = invSqrtDims * fusedAdd(delta, (float)sum, (float)dims * low);
+  factors.c34 = invSqrtDims * (delta * (float)sum + (float)dims * low);
+}
+
+template <int QB, class Ops>
+inline LUXIR_INLINE RaBitQScorer::Counts RaBitQScorer::countCode(const uint8_t* code, const Ops& ops) const {
+  // Only the last word can overlap the factor bytes. Planes are zero there.
+  const uint64_t lastMask = codeBytes % 8 == 0 ? ~(uint64_t)0 : ((uint64_t)1 << (codeBytes % 8 * 8)) - 1;
+  uint64_t dot = 0, sum = 0;
+  if constexpr (CHUNK_BYTES != 0) {
+    if (chunks != 0) ops.template score<QB>(code, planes, chunks, dot, sum);
+  }
+  const uint8_t* plane = planes + chunks * CHUNK_BYTES * QB;
+  for (size_t w = 0; w < tailWords; w++, plane += QB * sizeof(uint64_t)) {
+    uint64_t row = load64(code + chunks * CHUNK_BYTES + w * sizeof(uint64_t));
+    for (int p = 0; p < QB; p++)
+      dot += (uint64_t)std::popcount(row & load64(plane + (size_t)p * sizeof(uint64_t))) << p;
+    sum += (uint64_t)std::popcount(w + 1 == tailWords ? row & lastMask : row);
+  }
+  return {dot, sum};
+}
+
+RaBitQScorer::Counts RaBitQScorer::counts(const uint8_t* code) const {
+  const ChunkOps ops;
+  switch (queryBits) {
+    case 1: return countCode<1>(code, ops);
+    case 2: return countCode<2>(code, ops);
+    case 3: return countCode<3>(code, ops);
+    case 4: return countCode<4>(code, ops);
+    case 5: return countCode<5>(code, ops);
+    case 6: return countCode<6>(code, ops);
+    case 7: return countCode<7>(code, ops);
+    default: return countCode<8>(code, ops);
+  }
 }
 
 template <int QB, bool IP, bool Selected>
 LUXIR_NOINLINE void RaBitQScorer::scoreBlock(const uint8_t* codes, size_t codeSize, const uint16_t* rows,
                                              size_t count, float* LUXIR_RESTRICT out) const {
   const ChunkOps ops;
-  const size_t chunkCount = chunks, words = tailWords, binary = codeBytes;
-  const size_t wordsAt = chunkCount * CHUNK_BYTES;
-  const uint8_t* wordPlanes = planes + wordsAt * QB;
-  // Only the last word can run past the sign bits, into the 8 factor bytes that
-  // follow them in every row, so it stays inside the row; plane words are 0 there.
-  const uint64_t lastMask = binary % 8 == 0 ? ~(uint64_t)0 : ((uint64_t)1 << (binary % 8 * 8)) - 1;
+  const size_t binary = codeBytes;
   const float c1 = factors.c1, c2 = factors.c2, c34 = factors.c34;
   const float queryToCentroid = factors.queryToCentroidSqr, queryNorm = factors.queryNormSqr;
   for (size_t i = 0; i < count; i++) {
@@ -316,23 +328,13 @@ LUXIR_NOINLINE void RaBitQScorer::scoreBlock(const uint8_t* codes, size_t codeSi
         __builtin_prefetch(next + codeSize - 1);
       }
     }
-    uint64_t dot = 0, sum = 0;
-    if constexpr (CHUNK_BYTES != 0) {
-      if (chunkCount != 0) ops.template score<QB>(code, planes, chunkCount, dot, sum);
-    }
-    const uint8_t* plane = wordPlanes;
-    for (size_t w = 0; w < words; w++, plane += QB * sizeof(uint64_t)) {
-      uint64_t row = load64(code + wordsAt + w * sizeof(uint64_t));
-      for (int p = 0; p < QB; p++)
-        dot += (uint64_t)std::popcount(row & load64(plane + (size_t)p * sizeof(uint64_t))) << p;
-      sum += (uint64_t)std::popcount(w + 1 == words ? row & lastMask : row);
-    }
+    auto [dot, sum] = countCode<QB>(code, ops);
     float orMinusC, dpMultiplier;
     std::memcpy(&orMinusC, code + binary, sizeof(float));
     std::memcpy(&dpMultiplier, code + binary + sizeof(float), sizeof(float));
-    // In FAISS's order; the leading 0 + c1 * dot changes no value, c1 being >= 0.
-    float finalDot = fusedAdd(c2, (float)(int64_t)sum, c1 * (float)(int64_t)dot) - c34;
-    float preDist = fusedAdd(-(2 * dpMultiplier), finalDot, orMinusC + queryToCentroid);
+    // Through int64: unsigned 64-bit to float is slow without AVX-512.
+    float finalDot = c1 * (float)(int64_t)dot + c2 * (float)(int64_t)sum - c34;
+    float preDist = orMinusC + queryToCentroid - 2 * dpMultiplier * finalDot;
     out[i] = IP ? -0.5f * (preDist - queryNorm) : preDist;
   }
 }

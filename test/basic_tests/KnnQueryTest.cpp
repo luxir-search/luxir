@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
@@ -4802,28 +4803,55 @@ TEST_F(KnnQueryTest, rabitqSelectorKindsMatchExact) {
   }
 }
 
-static void expectSameRaBitQEstimate(float expected, float actual) {
-#if defined(__aarch64__) && !defined(NDEBUG)
-  // Only an optimized FAISS build contracts as RaBitQScorer does on AArch64.
-  EXPECT_NEAR(expected, actual, 1e-3f + std::abs(expected) * 1e-5f);
-#else
-  EXPECT_TRUE(expected == actual || std::bit_cast<uint32_t>(expected) == std::bit_cast<uint32_t>(actual))
-      << std::hexfloat << expected << " vs " << actual;
-#endif
+// Independent scalar definition: float residuals and quantization, then double
+// factors and estimates. Scale float error by the terms before cancellation.
+struct RaBitQReference {
+  std::vector<uint8_t> values;
+  double delta, c1, c2, c34, c34Scale, distance = 0, norm = 0;
+
+  RaBitQReference(const std::vector<float>& query, const std::vector<float>& centroid, int32_t qb) {
+    std::vector<float> residual(query.size());
+    for (size_t i = 0; i < query.size(); i++) {
+      residual[i] = query[i] - centroid[i];
+      distance += (double)residual[i] * residual[i];
+      norm += (double)query[i] * query[i];
+    }
+    auto [low, high] = std::minmax_element(residual.begin(), residual.end());
+    int maxCode = (1 << qb) - 1;
+    float step = (*high - *low) / (float)maxCode;
+    float scale = step > 0 ? 1.0f / step : 0;
+    uint64_t sum = 0;
+    for (float r : residual) {
+      float x = (r - *low) * scale;
+      auto value = (uint8_t)std::clamp(std::floor((double)x + 0.5), 0.0, (double)maxCode);
+      values.push_back(value);
+      sum += value;
+    }
+    delta = step;
+    double invSqrt = 1 / std::sqrt((double)query.size());
+    c1 = 2 * delta * invSqrt;
+    c2 = 2 * *low * invSqrt;
+    c34 = invSqrt * (delta * sum + query.size() * (double)*low);
+    c34Scale = invSqrt * (std::abs(delta * sum) + std::abs(query.size() * (double)*low));
+  }
+};
+
+static void expectRaBitQFloat(double expected, float actual, double scale) {
+  EXPECT_NEAR(expected, actual, 2e-6 * std::max(1.0, scale));
 }
 
-// Setup factors, bit planes and estimates for every list, against FAISS. A given
-// centroid replaces the overlay's to reach constant and zero residuals.
+// Check each list against our definition exactly, and FAISS within the error
+// induced by its SIMD-dependent rounding. Override centroids for degenerate cases.
 static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<float>& query, int32_t qb,
-                               const std::vector<float>* fixedCentroid = nullptr) {
+                               const std::vector<float>* fixedCentroid = nullptr, bool checkFaiss = true) {
   size_t d = (size_t)index.d;
   std::vector<float> centroid(d), rotated;
   std::vector<uint8_t> quantized;
   auto metric = index.rabitq.metric_type;
-  RaBitQScorer scorer(index.d, qb, metric == faiss::METRIC_INNER_PRODUCT, query.data());
-  std::vector<float> distances;
-  std::vector<uint16_t> rows;
+  bool ip = metric == faiss::METRIC_INNER_PRODUCT;
+  RaBitQScorer scorer(index.d, qb, ip, query.data());
   for (size_t list = 0; list < index.nlist; list++) {
+    SCOPED_TRACE(list);
     size_t count = std::min(index.invlists->list_size(list), RaBitQScorer::BLOCK_ROWS);
     if (fixedCentroid) centroid = *fixedCentroid;
     else index.quantizer->reconstruct((faiss::idx_t)list, centroid.data());
@@ -4832,29 +4860,77 @@ static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<f
     computer->set_query(query.data());
     auto* dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
     scorer.setList(centroid.data());
-    auto expected = faiss::rabitq_utils::compute_query_factors(
+    RaBitQReference ref(query, centroid, qb);
+    auto faissFactors = faiss::rabitq_utils::compute_query_factors(
         query.data(), d, centroid.data(), (uint8_t)qb, false, metric, rotated, quantized);
     const auto& actual = scorer.listFactors();
-    expectSameRaBitQEstimate(expected.c1, actual.c1);
-    expectSameRaBitQEstimate(expected.c2, actual.c2);
-    expectSameRaBitQEstimate(expected.c34, actual.c34);
-    expectSameRaBitQEstimate(expected.qr_to_c_L2sqr, actual.queryToCentroidSqr);
-    expectSameRaBitQEstimate(dc->g_error, scorer.queryToCentroid());
-    if (metric == faiss::METRIC_INNER_PRODUCT) expectSameRaBitQEstimate(expected.qr_norm_L2sqr, actual.queryNormSqr);
-    for (size_t i = 0; i < d; i++) for (int32_t p = 0; p < qb; p++)
-      ASSERT_EQ((quantized[i] >> p) & 1, (scorer.planeByte(p, i / 8) >> (i % 8)) & 1) << i << '/' << p;
+    size_t changed = 0;
+    for (size_t i = 0; i < d; i++) {
+      ASSERT_EQ(ref.values[i], scorer.quantizedValue(i)) << i;
+      if (checkFaiss) {
+        ASSERT_LE(std::abs((int)quantized[i] - ref.values[i]), 1) << i;
+      }
+      changed += quantized[i] != ref.values[i];
+    }
+    if (checkFaiss) {
+      EXPECT_LE(changed, (d + 99) / 100); // At most 1%, rounded up for small d.
+    }
+    for (size_t i = 0; i < ((d + 7) / 8) * 8; i++) for (int32_t p = 0; p < qb; p++)
+      ASSERT_EQ(i < d ? (ref.values[i] >> p) & 1 : 0,
+          (scorer.planeByte(p, i / 8) >> (i % 8)) & 1) << i << '/' << p;
+    expectRaBitQFloat(ref.c1, actual.c1, std::abs(ref.c1));
+    expectRaBitQFloat(ref.c2, actual.c2, std::abs(ref.c2));
+    expectRaBitQFloat(ref.c34, actual.c34, ref.c34Scale);
+    expectRaBitQFloat(ref.distance, actual.queryToCentroidSqr, ref.distance);
+    expectRaBitQFloat(std::sqrt(ref.distance), scorer.queryToCentroid(), std::sqrt(ref.distance));
+    if (ip) expectRaBitQFloat(ref.norm, actual.queryNormSqr, ref.norm);
+    double quantizationError = ref.delta * changed / std::sqrt((double)d);
+    if (checkFaiss) {
+      expectRaBitQFloat(faissFactors.c1, actual.c1, std::abs(ref.c1));
+      expectRaBitQFloat(faissFactors.c2, actual.c2, std::abs(ref.c2));
+      // Each changed query value adds at most delta/sqrt(d) to c34, and
+      // 2*abs(multiplier)*delta/sqrt(d) to L2 (half that to IP).
+      EXPECT_NEAR(faissFactors.c34, actual.c34, quantizationError + 2e-6 * std::max(1.0, ref.c34Scale));
+      expectRaBitQFloat(faissFactors.qr_to_c_L2sqr, actual.queryToCentroidSqr, ref.distance);
+      expectRaBitQFloat(dc->g_error, scorer.queryToCentroid(), std::sqrt(ref.distance));
+      if (ip) expectRaBitQFloat(faissFactors.qr_norm_L2sqr, actual.queryNormSqr, ref.norm);
+    }
 
     faiss::InvertedLists::ScopedCodes codes(index.invlists, list);
-    distances.resize(count);
+    auto check = [&](size_t row, float estimate) {
+      const uint8_t* code = codes.get() + row * index.code_size;
+      uint64_t dot = 0, popcount = 0;
+      for (size_t i = 0; i < d; i++) if ((code[i / 8] >> (i % 8)) & 1) {
+        dot += ref.values[i];
+        popcount++;
+      }
+      auto counts = scorer.counts(code);
+      ASSERT_EQ(dot, counts.dot);
+      ASSERT_EQ(popcount, counts.popcount);
+      float base, multiplier;
+      std::memcpy(&base, code + (d + 7) / 8, sizeof(float));
+      std::memcpy(&multiplier, code + (d + 7) / 8 + sizeof(float), sizeof(float));
+      double finalDot = ref.c1 * dot + ref.c2 * popcount - ref.c34;
+      double preDist = base + ref.distance - 2 * multiplier * finalDot;
+      double expected = ip ? -0.5 * (preDist - ref.norm) : preDist;
+      double scale = std::abs(base) + ref.distance + 2 * std::abs(multiplier)
+          * (std::abs(ref.c1 * dot) + std::abs(ref.c2 * popcount) + ref.c34Scale) + (ip ? ref.norm : 0);
+      if (ip) scale *= 0.5;
+      if (checkFaiss) {
+        EXPECT_NEAR(dc->distance_to_code_1bit(code), estimate,
+            (ip ? 1 : 2) * std::abs(multiplier) * quantizationError + 4e-6 * std::max(1.0, scale));
+      }
+      expectRaBitQFloat(expected, estimate, scale);
+    };
+    std::vector<float> distances(count);
     scorer.score(codes.get(), index.code_size, count, distances.data());
-    rows.clear();
+    std::vector<uint16_t> rows;
     for (size_t i = 0; i < count; i++) {
-      expectSameRaBitQEstimate(dc->distance_to_code_1bit(codes.get() + i * index.code_size), distances[i]);
+      check(i, distances[i]);
       if (i % 3 == 1) rows.push_back((uint16_t)i);
     }
     scorer.score(codes.get(), index.code_size, rows.data(), rows.size(), distances.data());
-    for (size_t k = 0; k < rows.size(); k++)
-      expectSameRaBitQEstimate(dc->distance_to_code_1bit(codes.get() + rows[k] * index.code_size), distances[k]);
+    for (size_t k = 0; k < rows.size(); k++) check(rows[k], distances[k]);
   }
 }
 
@@ -4886,18 +4962,33 @@ TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
       ASSERT_NE(nullptr, index);
       ASSERT_EQ(1u, index->rabitq.nb_bits);
       auto query = rabitqTestVector(rng, dims, 0.5f);
-      auto constant = query;
-      for (auto& x : constant) x -= 1.5f;
+      std::vector<float> constant((size_t)dims, 1.5f), nearConstant = query;
+      for (auto& x : nearConstant) x -= 1.5f;
       std::vector<float> zero((size_t)dims, 0.0f);
       for (int32_t qb = 1; qb <= 8; qb++) {
         SCOPED_TRACE(qb);
         compareRaBitQLists(*index, query, qb);
-        compareRaBitQLists(*index, query, qb, &constant);
+        compareRaBitQLists(*index, constant, qb, &zero);
+        auto halfStep = zero;
+        halfStep[0] = 0.5f; halfStep[1] = (float)((1 << qb) - 1); // delta = 1.
+        compareRaBitQLists(*index, halfStep, qb, &zero);
+        // Almost constant residuals amplify FAISS's SIMD cancellation beyond a
+        // one-step difference. Keep this coverage against our scalar definition.
+        compareRaBitQLists(*index, query, qb, &nearConstant, false);
         compareRaBitQLists(*index, query, qb, &query);
         compareRaBitQLists(*index, zero, qb, &zero);
       }
     }
   }
+  std::vector<float> ones(8, 1), zeros(8, 0);
+  RaBitQScorer scorer(8, 4, false, ones.data());
+  scorer.setList(zeros.data());
+  std::array<uint8_t, 9> code{0xff};
+  float base = 1, multiplier = std::sqrt(8.0f), estimate;
+  std::memcpy(code.data() + 1, &base, sizeof(float));
+  std::memcpy(code.data() + 5, &multiplier, sizeof(float));
+  scorer.score(code.data(), code.size(), 1, &estimate);
+  EXPECT_NEAR(-7, estimate, 1e-5); // Negative L2 estimates must retain their order.
 }
 
 // One request through both kernels, on every selector and result path.
@@ -4937,15 +5028,31 @@ TEST_F(KnnQueryTest, rabitqScorerScanMatchesFaissComputer) {
           for (float score : resultScores(*req)) scores[kernel].push_back(std::bit_cast<uint32_t>(score));
         }
         EXPECT_FALSE(ids[0].empty());
-        EXPECT_EQ(ids[1], ids[0]);
-        EXPECT_EQ(scores[1], scores[0]);
+        ASSERT_EQ(ids[1].size(), ids[0].size());
+        // Approximate cuts can swap near-tie ids. Terminal scores for the same
+        // id must still be bit equal, wherever it occurs in the other ranking.
+        // The 1e-5 relative near-tie allowance is specific to this fixture.
+        for (size_t i = 0; i < ids[0].size(); i++) {
+          auto found = std::find(ids[1].begin(), ids[1].end(), ids[0][i]);
+          if (found != ids[1].end()) {
+            EXPECT_EQ(scores[0][i], scores[1][(size_t)(found - ids[1].begin())]);
+          }
+          float a = std::bit_cast<float>(scores[0][i]), b = std::bit_cast<float>(scores[1][i]);
+          EXPECT_NEAR(a, b, 1e-5f * std::max(std::abs(a), std::abs(b)));
+        }
         EXPECT_GT(stats[0].work.oneBitScores, 0);
         EXPECT_GT(stats[0].work.listSetups, 0);
         for (auto field : {&VectorSearchWork::oneBitScores, &VectorSearchWork::physicalEntries, &VectorSearchWork::selectorPasses,
                            &VectorSearchWork::resolveIdentity, &VectorSearchWork::selectorBitmap, &VectorSearchWork::selectorNone,
-                           &VectorSearchWork::bitProbes, &VectorSearchWork::seedReads, &VectorSearchWork::remainingReads,
-                           &VectorSearchWork::listSetups})
+                           &VectorSearchWork::bitProbes, &VectorSearchWork::listSetups})
           EXPECT_EQ(stats[1].work.*field, stats[0].work.*field);
+        // Scan/selector work is fixed by coverage; interval seed/remaining
+        // reads depend on approximate cuts and may change by a few candidates.
+        for (const auto& stat : stats) {
+          int64_t reads = stat.work.seedReads + stat.work.remainingReads;
+          EXPECT_GE(reads, (int64_t)ids[0].size());
+          EXPECT_LE(reads, stat.work.selectorPasses);
+        }
       }
     }
   }
