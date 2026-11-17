@@ -154,9 +154,9 @@ Filter results of nested clauses are cached like other filters.
 
 Queries can reach into children implicitly, and returned fields can reach
 children and owners (see [Returning nested values](#returning-nested-values)).
-Everything else that reads fields (facets, sorts, collapse keys, value
-expressions) reads the fields of its own view. To run an operation over
-children, move its domain:
+Facets, collapse keys, and direct field sorts read the fields of their own
+view. Value expressions can reduce descendant values (see below). To run an
+operation over child rows themselves, move its domain:
 
 ```json
 {"query":"body_w:camera", "filter":["items:(color:red AND size:L)"],
@@ -192,6 +192,34 @@ belong to:
   "documents":{"domain":{"to":"/"},"top_docs":{"count_limit":-1,"limit":0}}
 }}}
 ```
+
+## Reducers over child values
+
+A descendant field in a value expression is an array of its values from all
+children owned by the current row. For example, sort questions by their newest
+answer:
+
+```json
+{"limit":10,"fields":["id"],"count_limit":10000,
+ "query":{"match":{"field":"tag","val":"java"}},
+ "sort":[{"expr":"max(answers.date)","dir":"desc"}]}
+```
+
+Names are relative to the current view: `parts.price` in the items view, or
+`items.parts.price` at the root. Values follow descendant row order, and a
+multi-valued child field contributes all its values. The array includes all
+owned descendants, regardless of which children matched a query.
+
+Use the usual `min`, `max`, `avg`, `sum`, and `count` reducers. A scalar
+position requires a reducer; a bare descendant field cannot be a sort key.
+No children, or no values among them, means missing, except `count`, which
+returns zero. Empty values sort last in either direction. DATE and DECIMAL
+values retain their usual expression semantics.
+
+The same expressions work in rescoring and metrics. For example,
+`sum(max(items.price))` sums each root's maximum item price over the operation's
+domain. Upward names in value expressions are not supported. Facet and
+collapse field keys still require `domain.to` to operate in the child's view.
 
 ## Names are relative to the view
 

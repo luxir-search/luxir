@@ -354,8 +354,12 @@ TEST_F(NestedQueryTest, ancestorConsumersRequireADomainAndLocalConsumersWork) {
       ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"ops":{"q":{"top_docs":{"collapse":{"field":["items.color"]}}}}})", req->mr));
     }
     req->execute(1); EXPECT_FALSE(req->ok()) << kind;
-    EXPECT_NE(std::string::npos, req->errorMsg().find("nested path 'items'")) << req->errorMsg();
-    EXPECT_NE(std::string::npos, req->errorMsg().find("Domain 'to'")) << req->errorMsg();
+    if (kind == 1 || kind == 6) {
+      EXPECT_NE(std::string::npos, req->errorMsg().find("nested path 'items'")) << req->errorMsg();
+      EXPECT_NE(std::string::npos, req->errorMsg().find("Domain 'to'")) << req->errorMsg();
+    } else {
+      EXPECT_NE(std::string::npos, req->errorMsg().find(kind == 3 ? "scalar numeric" : "reduce")) << req->errorMsg();
+    }
   }
   auto req = localReq(helper.getSearchEngine());
   auto& rows = req->topDocs().exprQuery("color:red").countLimit().fields({"color", "price"});

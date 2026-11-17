@@ -558,6 +558,7 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
     throw std::runtime_error("RescoreQuery requires a non-empty expression");
   }
   ValueExprOptions options;
+  options.view = &context.view;
   options.schema = &schema;
   options.fieldResolver = &context.fields;
   options.vars = rescoreQuery.vars;

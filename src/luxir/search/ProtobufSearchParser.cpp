@@ -576,6 +576,7 @@ public:
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
         options.fieldResolver = &parseView.fields;
+        options.view = &parseView;
         options.shareProducers = !disableAggregateSharingForTests;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
@@ -1170,6 +1171,7 @@ public:
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
       options.fieldResolver = &parseView.fields;
       options.opName = "sort";
+      options.view = &parseView;
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
       const ValueNode& root = program->root();
       bool scoreRoot = root.kind == ValueNodeKind::SCORE;
@@ -1182,6 +1184,11 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
+      if (root.source && (valueArray(root.type) || root.type == ValueType::COLUMN_ONLY)) {
+        throw std::runtime_error(fmt::format(
+            "sort expression '{}' reads descendant field '{}'; choose an explicit reducer such as {}",
+            sortSpec.expr, root.text, ValueFunctionRegistry::arrayReducerNames()));
+      }
       if (root.kind == ValueNodeKind::COLUMN) {
         auto* fieldTypePtr = req.schema->physical(root.text);
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));

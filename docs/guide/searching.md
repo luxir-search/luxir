@@ -843,9 +843,18 @@ to its following value. The function spellings remain available:
   reducer. The two-argument
   `min` and `max` compare scalars, which is useful for clamping.
 
-Field names use the value binding. Numeric, date, string, and ID fields keep
-the direct column-sort path. Use `col("name")` when a field name is reserved
-or is not an identifier. To sort analyzed text, use a string variant.
+Field names use the value binding. Numeric, date, string, and ID fields of
+the current view keep the direct column-sort path. Use `col("name")` when a
+field name is reserved or is not an identifier. To sort analyzed text, use a
+string variant.
+
+A dotted name below the current view, such as `answers.date`, reads an array
+of values from all its owned descendant rows. Multi-valued child fields are
+flattened into that array. Use a reducer in scalar positions, for example
+`max(answers.date)` as a sort key or `sum(max(items.price))` as a bucket metric.
+No descendant values means missing (`count` returns zero). Names stay relative
+to the view, and upward names are not accepted in expressions. See
+[Reducers over child values](nested.md#reducers-over-child-values).
 
 Multi-valued field sorting and per-document reducers follow the field's
 [multi-valued mode](schema.md#multi-valued-modes).

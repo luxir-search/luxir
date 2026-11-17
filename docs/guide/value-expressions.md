@@ -67,9 +67,10 @@ Every operator has a function spelling: `mod`, `bit_and`, `bit_or`, `bit_xor`,
 
 ## Field paths and variables
 
-A field path starts with a bare column name or `col("name")`. A dot denotes a
-child of that field and must be adjacent to both path names (no whitespace).
-DATE and GEO_POINT columns define these components:
+A field path starts with a bare column name or `col("name")`. A dot descends
+through a nested path; after a leaf field it selects a type component. It
+must be adjacent to both names (no whitespace). DATE and GEO_POINT columns
+define these components:
 
 | Field type | Components | Equivalent function |
 |---|---|---|
@@ -88,6 +89,24 @@ let-bound date.
 
 Request variables use `$name` in both per-document and bucket expressions.
 `score` and `_score` denote the query score.
+
+## Descendant arrays
+
+A field below the current view reads an array of values from all its owned
+rows: `max(answers.date)` sorts roots by their newest answer, and
+`max(items.parts.price)` reduces across both levels. Names are relative to the
+view. Multi-valued child fields contribute all their values; no values means
+missing, except `count`, which returns zero. Scalar positions require a
+reducer, as for local multi-valued columns.
+
+A dot continues a nested path until it reaches a field, then selects that
+field's type component. Components map elementwise:
+`max(answers.date.year)` is `max(year(answers.date))`.
+`let(v, answers.date, max(v))` binds the array; its body must still be scalar.
+Repeated expressions and let-bound values use the ordinary shared nodes and
+per-row caches. Arrays stay lazy; sharing retains their range, not a
+materialized copy. Upward names are not supported in expressions. See
+[Reducers over child values](nested.md#reducers-over-child-values).
 
 ## Math
 
@@ -204,9 +223,9 @@ Where each geo operation lives:
 let(name, value, body)
 ```
 
-`name` stands for `value` inside `body`, and the result is `body`. Both
-`value` and `body` must be scalars (not arrays). Integers stay integers; dates
-and geo points keep their nature. A geo point must be consumed by a geo
+`name` stands for `value` inside `body`, and the result is `body`. The value
+may be a scalar or an array; the body must be scalar. Integers stay integers;
+dates and geo points keep their nature. A geo point must be consumed by a geo
 function rather than returned as the expression's numeric result. Decimal and
 boolean values become numbers. A name shadows a column of the same name,
 cannot shadow another binding or a reserved name, and is not visible outside
