@@ -13,6 +13,8 @@
 #include "luxir/query/ImpactsIndex.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/OwnershipRelation.h"
+#include "luxir/server/JsonResponse.h"
+#include <glaze/glaze.hpp>
 
 namespace luxir::test {
 namespace {
@@ -420,6 +422,20 @@ TEST_F(NestedQueryTest, implicitKnnGetsOwnerEligibilityBeforeSelection) {
     req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
     EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", std::string(owner.empty() ? std::string_view("b") : owner))));
   }
+}
+
+TEST_F(NestedQueryTest, aScoredJoinAnswersFacetsThatExcludeAListFilter) {
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"JSON({"ops":{"q":{"top_docs":{
+    "query":"items.text:quick","fields":["id"],"count_limit":-1,
+    "filter":[{"query":"id:a","except_ops":["ids"]}],
+    "ops":{"ids":{"field_facet":{"field":"id"}}}}}}})JSON", req->mr));
+  req->execute(1); ASSERT_OK(req);
+  glz::generic_i64 result;
+  ASSERT_FALSE(glz::read_json(result, renderSearchResponseBody(req->responses.back()->proto)));
+  EXPECT_EQ(1, result["ops"]["q"]["found"].get<int64_t>());
+  // The facet leaves the id filter out, so it counts every root the join matches.
+  EXPECT_EQ(4u, result["ops"]["q"]["ops"]["ids"]["buckets"].get_array().size());
 }
 
 TEST_F(NestedQueryTest, rootOnlyParsingPinsNoOtherViewOrRelation) {

@@ -76,31 +76,28 @@ public:
       Weight& weight;
       std::vector<DomainHandle> eligibility;
       QueryPrep::PreparedSource child;
-      std::vector<DocSet*> domains;
 
     public:
-      Prepared(Weight& weight, QueryPrep::PreparedSource child, std::span<DocSet* const> domains,
-               std::vector<DomainHandle> eligibility)
-          : weight(weight), eligibility(std::move(eligibility)), child(std::move(child)),
-            domains(domains.begin(), domains.end()) {}
+      Prepared(Weight& weight, QueryPrep::PreparedSource child, std::vector<DomainHandle> eligibility)
+          : weight(weight), eligibility(std::move(eligibility)), child(std::move(child)) {}
+      // The prepare domain reaches a consuming child through its selection and
+      // is not kept: it does not outlive preparation, and a canonical source
+      // must answer for every domain.
       Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
           Query::SupplierExecutionMode mode) override {
         return weight.supplier(pool, segment, child,
-            mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr
-                : domains.empty() ? segment.liveDocSet() : domains[(size_t)segment.ord], mode);
+            mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
       }
       Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(pool, segment, *this);
       }
       PreparedDomainDependence domainDependence() const noexcept override {
-        // Predicate sources were prepared without destination eligibility;
-        // raw output remains canonical even when the ordinary scorer is scoped.
+        // Predicate sources were prepared without destination eligibility.
         return weight.child->consumesDomain() ? child.domainDependence
             : PreparedDomainDependence::QUERY_CANONICAL;
       }
       size_t retainedBytes() const noexcept override {
         return sizeof(*this) + eligibility.capacity() * sizeof(DomainHandle)
-            + domains.capacity() * sizeof(DocSet*)
             + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -132,8 +129,7 @@ public:
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
       traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
-      // Scored reduction keeps owner eligibility ahead of family scoring.
-      if (child->consumesDomain() || reduction == RowRelation::Reduction::MAXIMUM) traits |= NEEDS_PREPARE;
+      if (child->consumesDomain()) traits |= NEEDS_PREPARE;
       if (reduction != RowRelation::Reduction::MAXIMUM) traits |= IS_CONSTANT_SCORING;
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
@@ -159,7 +155,7 @@ public:
       std::array<Query::Weight*, 1> weights{child};
       std::array<FilterCache::Use*, 1> uses{childUse};
       auto inputs = QueryPrep::prepareFilterSources(weights, uses, childContext);
-      return std::make_unique<Prepared>(*this, std::move(inputs[0]), prepareContext.domainPerSeg, std::move(eligibility));
+      return std::make_unique<Prepared>(*this, std::move(inputs[0]), std::move(eligibility));
     }
     Query::ScorerSupplier* scorerSupplierImpl(MemPool& pool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode mode) override {
