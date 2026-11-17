@@ -11,7 +11,7 @@ namespace luxir {
 // Unlike BuildInfo these are runtime choices: one binary reports different
 // values on different CPUs, or when FAISS_SIMD_LEVEL forces a level.
 struct KernelInfo {
-  std::string faissSimd;  // NONE, AVX2, AVX512, AVX512_SPR, ARM_NEON or ARM_SVE
+  std::string faissSimd;  // NONE, AVX2, AVX512, AVX512_VPOPCNT, AVX512_SPR, ARM_NEON or ARM_SVE
   std::string blasCore;   // OpenBLAS core name, or "Accelerate" on macOS
 };
 

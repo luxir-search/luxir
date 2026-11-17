@@ -21,13 +21,24 @@ namespace faiss::rabitq {
 template <> uint64_t bitwise_and_dot_product<SIMDLevel::ARM_NEON>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t bitwise_xor_dot_product<SIMDLevel::ARM_NEON>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t popcount<SIMDLevel::ARM_NEON>(const uint8_t*, size_t);
+template <> BitwiseAndDotProductResult bitwise_and_dot_product_with_popcount<SIMDLevel::ARM_NEON>(
+    const uint8_t*, const uint8_t*, size_t, size_t);
 #elif defined(__x86_64__)
 template <> uint64_t bitwise_and_dot_product<SIMDLevel::AVX2>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t bitwise_xor_dot_product<SIMDLevel::AVX2>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t popcount<SIMDLevel::AVX2>(const uint8_t*, size_t);
+template <> BitwiseAndDotProductResult bitwise_and_dot_product_with_popcount<SIMDLevel::AVX2>(
+    const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t bitwise_and_dot_product<SIMDLevel::AVX512>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t bitwise_xor_dot_product<SIMDLevel::AVX512>(const uint8_t*, const uint8_t*, size_t, size_t);
 template <> uint64_t popcount<SIMDLevel::AVX512>(const uint8_t*, size_t);
+template <> BitwiseAndDotProductResult bitwise_and_dot_product_with_popcount<SIMDLevel::AVX512>(
+    const uint8_t*, const uint8_t*, size_t, size_t);
+template <> uint64_t bitwise_and_dot_product<SIMDLevel::AVX512_VPOPCNT>(const uint8_t*, const uint8_t*, size_t, size_t);
+template <> uint64_t bitwise_xor_dot_product<SIMDLevel::AVX512_VPOPCNT>(const uint8_t*, const uint8_t*, size_t, size_t);
+template <> uint64_t popcount<SIMDLevel::AVX512_VPOPCNT>(const uint8_t*, size_t);
+template <> BitwiseAndDotProductResult bitwise_and_dot_product_with_popcount<SIMDLevel::AVX512_VPOPCNT>(
+    const uint8_t*, const uint8_t*, size_t, size_t);
 #endif
 }  // namespace faiss::rabitq
 
@@ -40,12 +51,13 @@ struct Kernels {
   uint64_t (*andDot)(const uint8_t*, const uint8_t*, size_t, size_t);
   uint64_t (*xorDot)(const uint8_t*, const uint8_t*, size_t, size_t);
   uint64_t (*popcount)(const uint8_t*, size_t);
+  faiss::rabitq::BitwiseAndDotProductResult (*andDotWithPopcount)(const uint8_t*, const uint8_t*, size_t, size_t);
 };
 
 template <SIMDLevel SL>
 Kernels kernels() {
   return {SL, &faiss::rabitq::bitwise_and_dot_product<SL>, &faiss::rabitq::bitwise_xor_dot_product<SL>,
-          &faiss::rabitq::popcount<SL>};
+          &faiss::rabitq::popcount<SL>, &faiss::rabitq::bitwise_and_dot_product_with_popcount<SL>};
 }
 
 std::vector<Kernels> simdKernels() {
@@ -55,6 +67,7 @@ std::vector<Kernels> simdKernels() {
 #elif defined(__x86_64__)
   out.push_back(kernels<SIMDLevel::AVX2>());
   out.push_back(kernels<SIMDLevel::AVX512>());
+  out.push_back(kernels<SIMDLevel::AVX512_VPOPCNT>());
 #endif
   std::erase_if(out, [](const Kernels& k) { return !faiss::SIMDConfig::is_simd_level_available(k.level); });
   return out;
@@ -66,7 +79,9 @@ TEST(RaBitQKernelTest, simdPopcountsMatchScalar) {
   auto levels = simdKernels();
   if (levels.empty()) GTEST_SKIP() << "no SIMD RaBitQ kernel for this CPU";
   std::mt19937_64 rng(17);
-  std::vector<size_t> bytes = {0, 1, 7, 8, 9, 12, 15, 16, 17, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96, 128, 192, 513};
+  std::vector<size_t> bytes;
+  for (size_t size = 0; size <= 33; size++) bytes.push_back(size);
+  bytes.insert(bytes.end(), {48, 63, 64, 65, 96, 128, 192, 513});
   for (int i = 0; i < 40; i++) bytes.push_back(1 + rng() % 600);
   // Around one and two 2048-chunk NEON lane-reduction blocks.
   bytes.insert(bytes.end(), {32767, 32768, 32769, 65536, 65537});
@@ -93,6 +108,9 @@ TEST(RaBitQKernelTest, simdPopcountsMatchScalar) {
           ASSERT_EQ(k.andDot(q, d, size, qb), andDot);
           ASSERT_EQ(k.xorDot(q, d, size, qb), xorDot);
           ASSERT_EQ(k.popcount(d, size), bits);
+          auto both = k.andDotWithPopcount(q, d, size, qb);
+          ASSERT_EQ(both.dot_product, andDot);
+          ASSERT_EQ(both.popcount, bits);
         }
       }
     }

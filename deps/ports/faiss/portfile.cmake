@@ -2,13 +2,12 @@ vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO facebookresearch/faiss
     REF "v${VERSION}"
-    SHA512 c1cbf92a96dfee0a27dc0cb8d719a451efec6ea44a73bd4a8b764593624bc0e074da5aa6bca19fbc904899416aab2a82aa5659d06bb07174624cb4449252ac07
+    SHA512 f653dafbf1750b8c1719f12c6fa63d3fe84093ba0c663c6fa787ab6e381dab5ce8606830c821df9ad8d5300dfea73d7cfb890437a9e006539c417bffa4f8e799
     HEAD_REF main
     PATCHES
-        msvc-template.diff
-        undef-small.diff
-        dispatch-features.diff
-        rabitq-neon.diff  # NEON 1-bit RaBitQ popcounts; ARM_NEON forwards to scalar code upstream
+        dispatch-features.diff  # AVX2/AVX-512 levels also need FMA, F16C and POPCNT
+        rabitq-negative-l2.diff  # keep negative 1-bit L2 estimates; see vector-search.md
+        rabitq-neon.diff  # 1-bit kernels measured faster than upstream on Neoverse N1
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
@@ -46,11 +45,6 @@ vcpkg_cmake_configure(
 )
 
 vcpkg_cmake_install()
-# RaBitQUtils.h includes rabitq_simd.h, which needs this public header.
-# FAISS leaves it out of its install list through 1.15.1 (fixed upstream by
-# facebookresearch/faiss#5744); drop this once the port includes that fix.
-file(INSTALL "${SOURCE_PATH}/faiss/utils/popcount.h"
-     DESTINATION "${CURRENT_PACKAGES_DIR}/include/faiss/utils")
 vcpkg_copy_pdbs()
 vcpkg_cmake_config_fixup()
 

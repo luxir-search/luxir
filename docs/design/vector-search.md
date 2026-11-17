@@ -126,7 +126,10 @@ and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
 its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
 terminal rescoring retain the canonical query.
 
-RaBitQ's estimated squared L2 distance can be negative. Internal ordering
+RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
+clamps its 1-bit L2 estimates at zero; the port patch
+`deps/ports/faiss/rabitq-negative-l2.diff` removes that clamp so negative
+estimates keep their order. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
 at 1. The common bounded handler inverts this map outward when setting its
@@ -361,12 +364,13 @@ older formats fail on open and must be rebuilt.
 code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
 zero), sigma1, and upward-rounded `f_error = sigma1 * 1.9` for multi-bit codes.
 FAISS still writes the sign bits, `or_minus_c_l2sqr`, and extra-bit codes and
-factors. This avoids FAISS 1.14.3's small-norm guards: below a squared residual
-of `FLT_EPSILON`, its multiplier scores the residual as if it had unit length,
-and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor becomes zero. Such
-codes arise near centroids (duplicates, singleton lists, normalized-centroid
-rounding) and throughout small-magnitude L2 data. A false-high 1-bit interval
-can raise the witness floor and prune true neighbors at any probe count.
+factors. This avoids FAISS's small-norm guards (still present in 1.16.0): below
+a squared residual of `FLT_EPSILON`, its multiplier scores the residual as if it
+had unit length, and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor
+becomes zero. Such codes arise near centroids (duplicates, singleton lists,
+normalized-centroid rounding) and throughout small-magnitude L2 data. A
+false-high 1-bit interval can raise the witness floor and prune true neighbors
+at any probe count.
 The corrected factors preserve residual length and direction across scales,
 but the intervals remain empirical: for IP, float cancellation in FAISS's
 1-bit estimator leaves errors around 1e-7 even at zero amplitude, so they are

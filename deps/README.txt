@@ -60,6 +60,9 @@ Libraries
   checks the CPU features required by each dispatched kernel. Apple silicon
   has no SVE to dispatch to, so macOS uses the NEON-only generic level and
   omits the Metal GPU backend.
+  The port carries three patches: CPU feature checks, negative RaBitQ L2
+  estimates, and 1-bit RaBitQ NEON kernels measured faster than FAISS 1.16.0's
+  kernels on Neoverse N1.
 - OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler
   or runtime is needed. BLAS is single-threaded with locking for concurrent
   callers; CPU-specific kernels are selected at runtime. ASan disables the
