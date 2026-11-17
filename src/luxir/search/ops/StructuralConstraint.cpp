@@ -101,8 +101,7 @@ std::vector<DomainHandle> SearchOp::Calculator::structuralDomains() const {
   std::vector<DomainHandle> domains;
   auto path = structuralConstraint();
   for (auto& segment : op.req.reader->segments()) {
-    DomainHandle live =
-        DomainHandle::pinned(segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr, op.req.reader);
+    DomainHandle live = DomainHandle::pinned(segment.liveDocSet(), op.req.reader);
     domains.push_back(path ? path->prefix(segment.ord, std::move(live)) : std::move(live));
   }
   return domains;
@@ -129,8 +128,7 @@ DomainHandle StructuralConstraint::Producer::prefix(int32_t segnum, size_t bucke
   }
   if (ready[(size_t)segnum] != 1) {
     auto& seg = req.reader->segments()[(size_t)segnum];
-    DomainHandle base =
-        DomainHandle::pinned(seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, req.reader);
+    DomainHandle base = DomainHandle::pinned(seg.liveDocSet(), req.reader);
     if (ancestor) base = ancestor->prefix(segnum, std::move(base));
     values.resize(bucketCount);
     if (base.get() && base.get()->card() == 0) {

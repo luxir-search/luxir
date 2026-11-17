@@ -158,7 +158,7 @@ public:
       auto guard = MemPool::threadLocalPoolGuard();
       TextWriter textWriter(postingsWriter);
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
-      fieldInfo.type = fieldType->persistedType();
+      fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->segmentFlags();
       fieldInfo.typeFlags = fieldType->segmentTypeFlags();
       OrdCollector ords(guard.pool(), inverter.getMaxDoc());

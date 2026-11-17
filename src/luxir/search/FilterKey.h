@@ -53,7 +53,6 @@ enum class FilterKeyTag : uint8_t {
 struct FilterKeyContext {
   uint64_t schemaGen = 0;
   uint64_t coreGen = 0;
-  int32_t fuzzyMaxExpansions = 10000;
   std::string_view timeZone;
 };
 

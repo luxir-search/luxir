@@ -111,7 +111,7 @@ again, then rerun the script. No changes to upstream ports or triplets are neede
 The same presets and setup script work with Homebrew GCC. On macOS:
 
 - Dependencies use the `arm64-osx-luxir-m1*` triplets: a fixed `apple-m1`
-  and macOS 14 baseline instead of the host CPU, so one install serves local
+  and macOS 15 baseline instead of the host CPU, so one install serves local
   builds and binaries for other Macs. Later Apple cores add only BF16 and int8
   matrix-multiply instructions, and no dependency header tests for them, so
   Luxir built for a newer chip sees the same inline dependency code. No CPU
@@ -130,6 +130,18 @@ The same presets and setup script work with Homebrew GCC. On macOS:
   caps them.
 - FAISS is built without its Metal GPU backend, which needs Xcode's `metal`
   compiler.
+
+For a distributable binary, use `macos-release`. It inherits `base-native`
+and `base-release`, fixes the CPU at apple-m1, links GCC runtimes statically,
+and uses `/opt/vcpkg/installed-native-release`. Prepare that install with
+`LUXIR_DEPS_VARIANTS=native-release deps/make_deps.sh`; it builds only Release,
+without ASan. `gcc-release` remains the host-CPU developer build with shared
+runtimes. Both Luxir and the dependency triplets read the deployment target
+from `deps/triplets/common/macos-version.cmake` before compiler detection.
+
+Publish binaries on macOS 15. A local developer build on a newer system still
+works, but its Homebrew static runtime objects can require that newer system,
+regardless of the deployment target requested from the linker.
 
 When migrating an existing build from the old classic-mode dependencies, reset
 the CMake caches so cached package paths cannot retain system TBB or the old
@@ -288,6 +300,24 @@ On macOS, run the tests without `ASAN_OPTIONS` (see
 [macOS](#macos-apple-silicon)).
 
 The binaries for every preset are under `build/<preset>/bin/`.
+
+## Embedded build information
+
+The binary embeds the CMake project version, full Git HEAD commit hash, and CPU
+target. `luxir --version`, the startup banner, `GET /`, `_stats`, and the
+`luxir_build_info` metric expose the same values. Incremental builds track Git
+HEAD and its ref, including linked worktrees, packed refs, and reftable, so
+committing or switching branches refreshes the embedded hash. Uncommitted edits
+are not represented by the hash.
+
+For a source archive without `.git`, pass `-DLUXIR_SOURCE_COMMIT=<full-hash>` when
+configuring. Without it, or when Git cannot read the checkout's repository, CMake
+warns and the binary reports `unknown`; release packaging rejects such a binary.
+This override is cached; leave it empty for automatic Git detection in a checkout.
+
+Run `tools/test-build-info` to check metadata refresh behavior with real Git
+repositories and a small CMake/Ninja build, without building the engine. It uses
+CMake's default C++ compiler; set `CXX` to choose another.
 
 ## Measure on your workload
 

@@ -17,20 +17,29 @@ counts answer different questions from HTTP p50/p99 and total index size here.
 
 The [Dependency image workflow](../../.github/workflows/deps-image.yml) builds
 `.devcontainer/Dockerfile` through `dev`. It publishes
-`ghcr.io/<repository-owner>/luxir-dev:<key>` and skips a tag that already exists.
-The key is a SHA-256 of all four Dockerfile stages and their declared
+`ghcr.io/<repository-owner>/luxir-dev:<key>-<arch>` and skips a tag that already exists.
+A cold build exceeds a hosted job's six-hour limit, so three chained jobs
+publish the toolchain (`<key>-<arch>-toolchain`), the normal dependencies
+(`<key>-<arch>-normal`), and the `dev` image with the ASan dependencies.
+The key is a SHA-256 of all seven Dockerfile stages and their declared
 COPY inputs. Compiler, base image, vcpkg pins, ports, triplets, build checks,
 ASan dependencies, and final development setup therefore participate; engine
 source and build concurrency do not. Unknown COPY/ADD contracts fail so the helper must be reviewed when
 the Dockerfile layout changes. Ignore rules are validated by Docker at build
 time, rather than included in dependency identity.
 
+Each architecture publishes independently on its native hosted runner.
+`compare-refs` selects `amd64` or `arm64` from the local host architecture.
+
 The image includes normal and ASan dependencies and the development environment.
 Use it directly with the wrapper:
 
 ```bash
 key=$(python3 tools/benchmarks/deps-key.py .)
-export LUXIR_DEV_IMAGE="ghcr.io/<repository-owner>/luxir-dev:$key"
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) exit 2 ;;
+esac
+export LUXIR_DEV_IMAGE="ghcr.io/<repository-owner>/luxir-dev:$key-$arch"
 docker pull "$LUXIR_DEV_IMAGE"
 ./tools/dev-container cmake --preset container-release
 ./tools/dev-container cmake --build --preset container-release --target luxir
@@ -146,6 +155,16 @@ pooled latency distribution. All three servers stay alive during these passes.
 Requests are serial, with two server workers by default; this is not concurrent
 throughput or a codec kernel timing.
 
+Ingest is serial by default: every server receives
+`--indexing.max-inflight-batches=1`. A single HTTP stream otherwise pipelines
+internal batches, which can change physical document order and the strided ANN
+training sample. Serial ingest makes identical arms build identical indexes in
+the same environment. Use `vector-compare.py --max-inflight-batches=0` to omit
+the server flag and use its default, or choose a positive batch limit. The
+selected limit and each measured pass's ordered query-result ID hash are
+recorded in `results.json`. This does not promise identical bytes across CPUs
+or numerical libraries.
+
 Ingest time, merge plus ANN build time, and index size are single
 measurements, prepared in base, candidate-feature, candidate-default order, and
 have their own table. Index size includes all collection files, not just
@@ -164,10 +183,12 @@ does not establish a statistically significant speedup. In three hosted runs
 of the same two refs, absolute base p50 moved by up to 37% between runs, the
 feature arm's single-shot ingest change ranged from -4% to +40%, and base
 recall@10 at nprobe 16 ranged from 0.897 to 0.906. Compare only within a run,
-and treat latency differences under about 10% and recall differences under
-about one point as noise. The full development
+and treat latency differences under about 10% as noise. Those earlier runs
+used parallel ingest; serial ingest removes the observed document-order source
+of recall variation. Other environments and numerical implementations still
+need their own repeatability checks. The full development
 image, two source builds, and dataset need substantial disk space;
 hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent
-all search workloads. Native ARM, cold-cache performance, and ASan results are
+all search workloads. Cold-cache performance and ASan results are
 outside this workflow.

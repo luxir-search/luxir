@@ -31,6 +31,8 @@
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
+#include <faiss/impl/RaBitQuantizer.h>
+#include <faiss/utils/distances.h>
 
 #include <cstring>
 #include <atomic>
@@ -39,6 +41,8 @@
 #include <latch>
 #include <memory>
 #include <memory_resource>
+#include <random>
+#include <set>
 #include <span>
 #include <thread>
 #include <vector>
@@ -1247,6 +1251,214 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
   EXPECT_EQ(afterApprox, afterExact);
 }
 
+namespace {
+
+class AsyncAuxCommit final : public UpdateMessage {
+  std::latch& finished;
+
+public:
+  explicit AsyncAuxCommit(std::latch& finished, std::string selector = "vec.embedding_v") : finished(finished) {
+    commit = COMMIT;
+    buildAuxIndexes.push_back(std::move(selector));
+  }
+  void handle(IndexWriter& iw) override { unused(iw); }
+  void done(IndexWriter& iw) override { unused(iw); finished.count_down(); }
+};
+
+// Swaps the merge while the commit build is held, then releases the commit.
+void mergeFinishesDuringAuxBuild(CollectionHelper& h, IndexWriter& iw, bool failCommit,
+                                std::string selector = "vec.embedding_v") {
+  std::latch mergeStarted(1), releaseMerge(1), building(1), mergeDone(1), releaseCommit(1), finished(1);
+  std::atomic_bool fail{false};
+  luxir::Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    mergeStarted.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+  auto reached = [&](void*, void*, void*) -> void* {
+    mergeDone.count_down();
+    return nullptr;
+  };
+  luxir::Signal::listen("mergeSwap", reached);
+  luxir::Signal::listen("vectorBuildField", [&](void*, void* site, void*) -> void* {
+    if ((VectorIndexBuilder::BuildSite)(intptr_t)site == VectorIndexBuilder::BuildSite::COMMIT) {
+      if (!building.try_wait()) building.count_down();
+      releaseCommit.wait();
+      if (fail.load()) throw std::runtime_error("injected commit build failure");
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([&] {
+    if (!releaseMerge.try_wait()) releaseMerge.count_down();
+    if (!releaseCommit.try_wait()) releaseCommit.count_down();
+    iw.updateGraph->wait_for_all();
+    for (auto name : {"mergeStart", "mergeSwap", "vectorBuildField"}) luxir::Signal::unlisten(name);
+  });
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  mergeStarted.wait();
+  AsyncAuxCommit aux(finished, std::move(selector));
+  ASSERT_TRUE(iw.submitUpdate(&aux));
+  building.wait();
+  releaseMerge.count_down();
+  mergeDone.wait();
+  EXPECT_FALSE(finished.try_wait()) << "the commit finished before the merge swapped";
+  fail.store(failCommit);
+  releaseCommit.count_down();
+  finished.wait();
+  iw.updateGraph->wait_for_all();
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+}
+
+} // namespace
+
+TEST_F(VectorIndexBuilderTest, mergeFinishingDuringAuxCommitPublishesWithOverlay) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/false);
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+}
+
+TEST_F(VectorIndexBuilderTest, failedAuxCommitKeepsConcurrentMergeOverlay) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  ExpectLog quiet("injected commit build failure");
+  mergeFinishesDuringAuxBuild(h, *iw, /*failCommit=*/true);
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+  auto firstOutput = info->segments.front().seg_id;
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "next" + std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)i, 2.0f, 1.0f, 0.0f}));
+  }
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  EXPECT_TRUE(h.submit(merge).success);
+  info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_NE(info->segments.front().seg_id, firstOutput);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+}
+
+TEST_F(VectorIndexBuilderTest, failedAuxCommitMergeOverlaySeedsActiveNameOnRestart) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  auto path = std::filesystem::temp_directory_path() / "luxir-vector-overlay-failed-commit-restart";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  {
+    LuxirNode node(config);
+    CollectionHelper h(node, "main");
+    enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+    auto iw = h.getIndexWriter();
+    iw->mergePolicy->setMergeFactor(2);
+    ExpectLog quiet("injected commit build failure");
+    mergeFinishesDuringAuxBuild(h, *iw, true);
+  }
+  LuxirNode reopened(config);
+  CollectionHelper h(reopened, "main");
+  EXPECT_TRUE(h.getIndexWriter()->testActiveVectorOverlayName("vec.embedding_v"));
+  EXPECT_EQ(vectorOverlays(readIndexInfo(h.getIndexWriter()->dir)).size(), 1u);
+}
+
+TEST_F(VectorIndexBuilderTest, mergeMatchesWildcardDuringAuxCommit) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  mergeFinishesDuringAuxBuild(h, *iw, false, "*");
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(onlyVectorOverlay(info).name, "vec.embedding_v");
+}
+
+namespace {
+
+// Hold the merge between preparation and swap while a commit activates or
+// reselects its name. Only a previously unattempted name needs another pass.
+void mergeRechecksVectorRequirements(bool reselectActive) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+  std::latch atDiff(1), releaseMerge(1), finished(1);
+  std::atomic_int passes{0};
+  luxir::Signal::listen("mergeVectorOverlayPrepare", [&](void*, void*, void*) -> void* {
+    passes++;
+    return nullptr;
+  });
+  auto unlistenPrepare = scope_guard([&] { luxir::Signal::unlisten("mergeVectorOverlayPrepare"); });
+  std::atomic_flag once;
+  auto unlisten = scope_guard([&] {
+    if (!releaseMerge.try_wait()) releaseMerge.count_down();
+    iw->updateGraph->wait_for_all();
+    luxir::Signal::unlisten("mergeLiveDocsDiff");
+  });
+  luxir::Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
+    if (once.test_and_set()) return nullptr;
+    atDiff.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit(seg == 0 && reselectActive ? std::vector<std::string>{"vec.embedding_v"}
+                                      : std::vector<std::string>{});
+  }
+  atDiff.wait();
+  AsyncAuxCommit aux(finished);
+  ASSERT_TRUE(iw->submitUpdate(&aux));
+  finished.wait();
+  releaseMerge.count_down();
+  iw->updateGraph->wait_for_all();
+  luxir::Signal::unlisten("mergeLiveDocsDiff");
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u);
+  EXPECT_EQ(passes.load(), reselectActive ? 1 : 2);
+}
+
+} // namespace
+
+TEST_F(VectorIndexBuilderTest, mergeSwappingAfterActivationRechecksActiveNames) {
+  mergeRechecksVectorRequirements(false);
+}
+
+TEST_F(VectorIndexBuilderTest, reselectingActiveNameDoesNotRepeatMergePreparation) {
+  mergeRechecksVectorRequirements(true);
+}
+
 // Cosine metric normalizes on column write by default.  The FAISS builder can
 // add the already-normalized column bytes directly as inner-product vectors.
 TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
@@ -1388,6 +1600,171 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     EXPECT_EQ(approx, (std::vector<std::string>{"doc79"}));
     EXPECT_EQ(approx, runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1, true));
   }
+}
+
+namespace {
+std::vector<float> randomUnit(std::mt19937& rng, int32_t dims) {
+  std::normal_distribution<float> normal;
+  std::vector<float> v((size_t)dims);
+  for (auto& x : v) x = normal(rng);
+  faiss::fvec_renorm_L2((size_t)dims, 1, v.data());
+  return v;
+}
+}
+
+// FAISS scores a residual below sqrt(FLT_EPSILON) as if it had unit length.
+TEST_F(VectorIndexBuilderTest, nearCentroidRaBitQEstimatesTrackTrueDistance) {
+  constexpr int32_t dims = 128;
+  std::mt19937 rng(7);
+  auto centroid = randomUnit(rng, dims), query = randomUnit(rng, dims), direction = randomUnit(rng, dims);
+  float toCentroid = std::sqrt(faiss::fvec_L2sqr(query.data(), centroid.data(), dims));
+  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
+    for (int32_t bits : {1, 4}) {
+      for (double scale = 1e-7; scale < 1e-2; scale *= 2) {
+        SCOPED_TRACE(fmt::format("metric={} bits={} scale={}", (int)metric, bits, scale));
+        std::vector<float> x = centroid;
+        for (int32_t i = 0; i < dims; i++) x[(size_t)i] += (float)scale * direction[(size_t)i];
+        faiss::RaBitQuantizer quantizer((size_t)dims, metric, (size_t)bits);
+        std::vector<uint8_t> code(quantizer.code_size);
+        quantizer.compute_codes_core(x.data(), code.data(), 1, centroid.data());
+        float amplitude = VectorIndexBuilder::finishRaBitQCode(x.data(), centroid.data(), code.data(), dims, bits, metric);
+        double norm2 = 0, absSum = 0;
+        for (int32_t i = 0; i < dims; i++) {
+          double r = (double)x[i] - centroid[i];
+          norm2 += r * r;
+          absSum += std::abs(r);
+        }
+        double factor = metric == faiss::METRIC_L2 ? 2 : 1;
+        double sigma1 = factor * std::sqrt(std::max(0.0, norm2 * (norm2 * dims / (absSum * absSum) - 1)) / (dims - 1));
+        if (bits == 1) EXPECT_NEAR(amplitude, sigma1, sigma1 * 1e-5);
+        else {
+          // Recover each residual coordinate through FAISS's full-bit dot
+          // kernel. Remove its additive term to avoid centroid cancellation.
+          using namespace faiss::rabitq_utils;
+          const uint8_t* extra = code.data() + (dims + 7) / 8 + sizeof(SignBitFactorsWithError);
+          ExtraBitsFactors full;
+          std::memcpy(&full, code.data() + code.size() - sizeof(full), sizeof(full));
+          full.f_add_ex = 0;
+          if (metric == faiss::METRIC_L2) full.f_rescale_ex *= -0.5f;
+          std::array<float, dims> basis{};
+          double error2 = 0;
+          for (int32_t i = 0; i < dims; i++) {
+            basis[i] = 1;
+            double reconstructed = compute_full_multibit_distance(code.data(), extra, full,
+                basis.data(), 0, dims, bits - 1, faiss::METRIC_INNER_PRODUCT);
+            basis[i] = 0;
+            double error = reconstructed - ((double)x[i] - centroid[i]);
+            error2 += error * error;
+          }
+          double expectedAmplitude = factor * std::sqrt(error2 / (dims - 1));
+          EXPECT_NEAR(amplitude, expectedAmplitude, expectedAmplitude * 1e-5);
+          float fError;
+          std::memcpy(&fError, code.data() + (dims + 7) / 8 + RABITQ_F_ERROR_OFFSET, sizeof(fError));
+          EXPECT_NEAR(fError, sigma1 * 1.9, sigma1 * 2e-5);
+        }
+        std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
+            quantizer.get_distance_computer(4, centroid.data()));
+        computer->set_query(query.data());
+        auto* rabitq = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
+        ASSERT_NE(rabitq, nullptr);
+        float truth = metric == faiss::METRIC_L2 ? faiss::fvec_L2sqr(query.data(), x.data(), dims)
+                                                 : faiss::fvec_inner_product(query.data(), x.data(), dims);
+        // Hard bound for any sane sign code: cos(angle) >= 1/2 here.
+        double bound = (metric == faiss::METRIC_L2 ? 2 : 1) * 2 * toCentroid * scale + 1e-5;
+        EXPECT_NEAR(rabitq->distance_to_code_1bit(code.data()), truth, bound);
+        if (bits > 1) {
+          EXPECT_NEAR(rabitq->distance_to_code_full(code.data()), truth, bound);
+        }
+        // The broad distance bound also admits a zero multiplier. Align q-c
+        // with the actual residual and isolate the directional contribution
+        // from the same code's centroid-only estimate. Allow query quantization
+        // error and float cancellation, but require the residual response.
+        auto centroidOnly = code;
+        float zero = 0;
+        std::memcpy(centroidOnly.data() + (dims + 7) / 8
+            + offsetof(faiss::rabitq_utils::SignBitFactors, dp_multiplier), &zero, sizeof(zero));
+        std::vector<float> aligned(dims);
+        for (int32_t i = 0; i < dims; i++) aligned[i] = centroid[i] + (float)(((double)x[i] - centroid[i]) / std::sqrt(norm2));
+        computer->set_query(aligned.data());
+        double response = rabitq->distance_to_code_1bit(code.data()) - rabitq->distance_to_code_1bit(centroidOnly.data());
+        double expected = (metric == faiss::METRIC_L2 ? -2 : 1) * std::sqrt(norm2);
+        EXPECT_NEAR(response, expected, std::abs(expected) * 0.1 + 1e-6);
+      }
+    }
+  }
+}
+
+// A list holding only copies of one vector has a centroid within rounding of
+// it, and small-magnitude data has small residuals in every list. Neither may
+// outrank true neighbors at full scan.
+TEST_F(VectorIndexBuilderTest, nearCentroidCodesKeepFullScanRecall) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  constexpr int32_t dims = 64, rows = 300, k = 9;
+  struct Case { api::VectorMetric metric; float scale; int32_t copies, nlist; };
+  for (auto [metric, scale, copies, nlist] : {Case{api::VectorMetric::COSINE, 1, 3, 256},
+                                              Case{api::VectorMetric::L2, 1e-5f, 1, 16}}) {
+    SCOPED_TRACE(fmt::format("metric={} scale={}", (int)metric, scale));
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = metric;
+    f.dims = dims;
+    f.ann = rabitqAnn(nlist, 1);
+    b.set(h.collection());
+    std::mt19937 rng(11);
+    auto next = [&] {
+      auto v = randomUnit(rng, dims);
+      for (auto& x : v) x *= scale;
+      return v;
+    };
+    for (int32_t i = 0; i < rows; i++) {
+      auto v = next();
+      for (int32_t c = 0; c < copies; c++) {
+        h.index(flatdoc("id", std::to_string(i) + "_" + std::to_string(c), "v_v", v));
+      }
+    }
+    h.commit({"*"});
+    // Copies tie, so compare the distinct rows reached rather than ids.
+    auto rowsOf = [](const std::vector<std::string>& ids) {
+      std::set<std::string> out;
+      for (const auto& id : ids) out.insert(id.substr(0, id.find('_')));
+      return out;
+    };
+    int32_t hits = 0, total = 0;
+    for (int32_t q = 0; q < 20; q++) {
+      auto query = next();
+      int32_t fullProbe = defaultIvfNList((int64_t)rows * copies);
+      auto approx = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, fullProbe, 0));
+      auto exact = rowsOf(runKnnIds(h.getSearchEngine(), "v_v", query, k, fullProbe, 0, true));
+      total += (int32_t)exact.size();
+      for (const auto& row : exact) hits += approx.count(row) ? 1 : 0;
+    }
+    EXPECT_GE((double)hits / total, 0.9);
+  }
+}
+
+TEST_F(VectorIndexBuilderTest, trainingSampleScalesWithCentroids) {
+  IvfTestGuard guard;
+  SearchOverridesGuard<size_t> maxBytes{VectorIndexBuilder::ivfTrainingSampleMaxBytes};
+  auto trained = [](api::VectorAnnDef ann) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), ann, 4);
+    std::mt19937 rng(3);
+    for (int32_t i = 0; i < 1000; i++) h.index(flatdoc("id", std::to_string(i), "embedding_v", randomUnit(rng, 4)));
+    h.commit({"*"});
+    return VectorIndexBuilder::ivfLastTrainingVectorsForTests.load();
+  };
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 400);       // lists * 100
+  EXPECT_EQ(trained(rabitqAnn(32, 1)), 1000);     // capped by the segment
+  EXPECT_EQ(trained(pqAnn(2, 2, 3)), 800);        // 2^bits codebook entries bind
+  EXPECT_EQ(trained(pqAnn(8, 2, 2)), 800);        // lists bind
+  VectorIndexBuilder::ivfTrainingSampleMaxBytes = 100 * 4 * sizeof(float);
+  EXPECT_EQ(trained(rabitqAnn(4, 1)), 100);       // memory ceiling
+  EXPECT_EQ(trained(rabitqAnn(200, 1)), 200);     // floor (one per list) beats the ceiling
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {

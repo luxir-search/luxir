@@ -4,6 +4,7 @@
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
+#include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
@@ -23,6 +24,7 @@ struct Registries {
   SearchOpRegistry& searchOps;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
+  HitDecoratorRegistry& hitDecorators;
 
   static Registries global();
   // Freezes every registry.

@@ -10,6 +10,7 @@
 #include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ValueOutput.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -51,6 +52,35 @@ auto runFlags(CollectionHelper& helper, std::string_view json, bool binary = fal
 }
 
 class RequestFlagsTest : public LuxirTest {};
+
+TEST_F(RequestFlagsTest, outputPolicySelection) {
+  std::pmr::monotonic_buffer_resource mr;
+  const ValueNature natures[] = {ValueNature::NUMBER, ValueNature::GEO_POINT,
+      ValueNature::DATE_MS, ValueNature::DATE_NS};
+  const bool native[][4] = {{true, true, true, true}, {true, true, true, true},
+      {true, false, true, false}, {true, false, false, true}};
+  for (size_t i = 0; i < std::size(natures); i++) for (uint64_t mode = 0; mode < 4; mode++) {
+    SCOPED_TRACE(fmt::format("{} mode {}", valueNatureName(natures[i]), mode));
+    int sources = 0;
+    withNatureOutput(natures[i], mode, mr, [&] {
+      sources++;
+      return "value";
+    }, [&](auto output) {
+      EXPECT_EQ(native[i][mode], (std::is_same_v<decltype(output), NativeValueOutput>));
+      api::Val value;
+      value.kind = (int64_t)-7;
+      renderValue(value, output);
+      if constexpr (std::is_same_v<decltype(output), IsoValueOutput>) {
+        EXPECT_EQ(formatDateIso8601(-7, valueDateUnit(natures[i])), std::get<std::string_view>(value.kind));
+      } else {
+        int64_t expected = i == 2 && mode == 3 ? -7000000 : i == 3 && mode == 2 ? -1 : -7;
+        EXPECT_EQ(expected, std::get<int64_t>(value.kind));
+      }
+    });
+    EXPECT_EQ(native[i][mode], nativeValueOutput(natures[i], mode));
+    EXPECT_EQ(native[i][mode] ? 0 : 1, sources);
+  }
+}
 
 TEST_F(RequestFlagsTest, numericLiteralUnitsInEveryDialectAndWireFormat) {
   CollectionHelper helper;
@@ -158,7 +188,7 @@ TEST_F(RequestFlagsTest, explicitAndDataFacetGridsConvertGapAndOriginAtTheEdge) 
 TEST_F(RequestFlagsTest, binaryValidationRejectsUnknownPartialAndOpOnlyOverrides) {
   CollectionHelper helper;
   for (bool opLevel : {false, true}) for (auto [flags, set] : {
-      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {8, 0}, {0, 8},
+      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {32, 0}, {0, 32},
       {uint64_t{1} << 63, 0}, {4, 0}, {0, 4}}) {
     if (!opLevel && ((flags | set) & RequestFlags::INT64_STR)) continue;
     auto req = localReq(helper.getSearchEngine());

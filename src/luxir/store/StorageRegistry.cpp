@@ -111,6 +111,11 @@ void registerBuiltinStorage(StorageRegistry& registry) {
   registry.addBackend("fs", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
     return std::make_unique<FSDirFactory>(ctx.config.store.data_dir, ctx.config.read_only);
   });
+  registry.addBackend("shared_fs", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
+    if (!ctx.config.replication.source.empty()) throw std::invalid_argument("shared_fs cannot run as a follower");
+    return std::make_unique<FSDirFactory>(ctx.config.store.data_dir, ctx.config.read_only,
+                                        FSDirFactory::Mode::SHARED, ctx.config.node.id);
+  });
 }
 
 StorageRegistry& StorageRegistry::global() {

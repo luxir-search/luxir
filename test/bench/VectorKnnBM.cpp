@@ -1222,13 +1222,14 @@ void BM_VectorAnnDataset(benchmark::State& state) {
 
   std::vector<std::vector<float>> queries;
   for (int32_t q = 0; q < ds->nQueries; q++) queries.push_back(ds->query(q));
+  KnnQuery::Stats stats;
+  std::optional<SearchOverridesGuard<KnnQuery::Stats*>> statsGuard;
+  statsGuard.emplace(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
   double recallSum = 0;
   // Ids and score bits across all queries: equal digests mean equal results.
   uint64_t resultsDigest = 0;
-  KnnQuery::Stats stats;
   {
-    SearchOverridesGuard savedStats(KnnQuery::statsForTests);
-    KnnQuery::statsForTests = &stats;
     for (int32_t q = 0; q < ds->nQueries; q++) {
       auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)q], k,
                                   nprobe, cand, false, false, true);
@@ -1251,6 +1252,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
       recallSum += (double)hits / (double)truth[(size_t)q].size();
     }
   }
+  statsGuard.reset();
 
   int32_t queryOrd = 0;
   std::vector<double> latencies;
@@ -1284,6 +1286,8 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["terminal_reads"] = stats.terminalReads.load() / queryCount;
   state.counters["results_digest"] = (double)(resultsDigest & (((uint64_t)1 << 48) - 1));
   state.counters["recall"] = recallSum / (double)ds->nQueries;
+  state.counters["unsupported_floors"] = (double)stats.unsupportedFloors.load();
+  state.counters["unsupported_floor_shortfall"] = (double)stats.unsupportedFloorShortfall.load();
   state.counters["buildSecs"] = buildSecs;
   state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
   state.counters["overlaySegs"] = (double)overlaySegments;

@@ -13,6 +13,7 @@
 #include "luxir/luxir_main.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
@@ -79,7 +80,9 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
   CLI::App app{"Luxir search engine"};
-  app.set_version_flag("--version", "Luxir " + std::string(buildVersion()) + " (" + std::string(buildCpuTarget()) + ")");
+  const auto& build = buildInfo();
+  app.set_version_flag("--version", fmt::format("Luxir {} ({}) commit {}",
+      build.version, build.cpuTarget, build.sourceCommit));
   LuxirConfig config;
   config.addOptions(app);
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
@@ -202,7 +205,8 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
 
 std::string luxir_banner() {
   std::stringstream ss;
-  ss << "Luxir " << buildVersion() << " (" << buildCpuTarget() << ")";
+  const auto& build = buildInfo();
+  ss << "Luxir " << build.version << " (" << build.cpuTarget << ") commit " << build.sourceCommit;
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else
@@ -237,6 +241,8 @@ std::string luxir_banner() {
   ss << std::endl;
   ss << "\tallocator=" << allocatorName();
   ss << " hw_threads=" << std::thread::hardware_concurrency();
+  ss << " faiss_simd=" << kernelInfo().faissSimd;
+  ss << " blas_core=" << kernelInfo().blasCore;
   ss << " cwd=" << fs::current_path();
   ss << " tmp=" << fs::temp_directory_path();
 

@@ -15,7 +15,7 @@
 #include <fmt/format.h>
 
 #include "luxir/search/SearchOverrides.h"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/ops/FacetExecution.h"
@@ -31,8 +31,12 @@ namespace luxir {
 // Expression aggregate over an incoming domain, with ordinary bucket-domain,
 // inline string-facet, and selected-column replay execution bindings.
 class ExprStatsOp : public SearchOp {
+  friend class MetricGroupData;
   static constexpr std::string_view FACET_STATE_BREAKER =
       "facet aggregate state";
+  // Cap on an optional exact ordinal set per state: an L2-sized working set
+  // (2M ords); larger dictionaries use the sketch.
+  static constexpr size_t MAX_ORD_SET_BYTES = 256 * 1024;
 
   AggregateProgram& aggregate;
   std::span<const AggregateFieldInfos> fields;
@@ -57,12 +61,11 @@ class ExprStatsOp : public SearchOp {
     }
     auto infos = fields[aggregate.leaves.front().producer].values[producer.input->rootNode];
     for (auto& segment : req.reader->segments()) {
-      auto& postings = segment.postingsReader();
-      if (postings.maxDoc() == 0) continue;
+      if (segment.maxDoc() == 0) continue;
       auto* field = infos.at((size_t)segment.ord);
       if (!field) return nullptr;
       const auto& info = *field;
-      if (info.docsWithField != postings.maxDoc()) return nullptr;
+      if (info.docsWithField != segment.maxDoc()) return nullptr;
     }
     return producer.resolved.denseFacetState;
   }
@@ -80,39 +83,47 @@ class ExprStatsOp : public SearchOp {
 
   template <typename Output>
   static void writeOutputValue(api::Val& target, const BucketScalar& value, const Output& output) {
-    if constexpr (std::is_same_v<Output, NativeDateOutput>) {
-      writeAggregateValue(target, value);
+    if constexpr (std::is_same_v<Output, NativeValueOutput>) {
+      writeAggregateValue(target, integerAggregateOutput(value));
     } else if (!value.valid) {
-      if constexpr (std::is_same_v<Output, IsoDateOutput>) {
+      if constexpr (std::is_same_v<Output, IsoValueOutput>) {
         if (value.failure == AggregateFailure::NON_FINITE_SUM
             || value.failure == AggregateFailure::NON_FINITE_AVERAGE
             || value.failure == AggregateFailure::NON_FINITE_EXPRESSION) {
-          throw RequestError("date_iso output for " + output.source + " is non-finite");
+          throw RequestError("date_iso output for " + output.context.source + " is non-finite");
         }
       }
       target.kind = google::protobuf::NullValue::NULL_VALUE;
     } else if (value.type == BucketValueType::DOUBLE) {
       target.kind = output(value.doubleValue);
     } else {
-      target.kind = output((int64_t)value.intValue);
+      if constexpr (std::is_invocable_v<Output, __int128>) target.kind = output(value.intValue);
+      else target.kind = output((int64_t)value.intValue);
     }
   }
 
-  void warnFailure(const BucketScalar& result) const {
+  void warnFailure(BucketScalar result, uint64_t outputFlags) const {
+    if (nativeOutput(outputFlags)) result = integerAggregateOutput(result);
     if (result.failure == AggregateFailure::NONE) return;
     req.warnOnce("aggregate_eval_failed", fmt::format(
         "aggregate op '{}' emitted null: {}", name,
         aggregateFailureReason(result.failure)));
   }
 
+  void warnFailure(const BucketScalar& result) const { warnFailure(result, flags); }
+
 public:
   ExprStatsOp(SearchRequest& req, std::string_view name,
               AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
       : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
 
+  bool nativeOutput(uint64_t outputFlags) const {
+    return nativeValueOutput(aggregate.root().nature, outputFlags);
+  }
+
   template <typename Emit>
   void withOutput(uint64_t outputFlags, std::pmr::memory_resource& mr, Emit emit) const {
-    withDateOutput(aggregate.root().nature, outputFlags, mr, [this] {
+    withNatureOutput<int64_t>(aggregate.root().nature, outputFlags, mr, [this] {
       std::string sources;
       for (const auto& producer : aggregate.producers) {
         auto description = producer.input->describeDateSources(producer.input->rootNode);
@@ -196,23 +207,32 @@ public:
       const ValueNode& root = binding.producer->input->root();
       BoundValueNode& bound = binding.values->nodes[
           binding.producer->input->rootNode];
-      if (!bound.column) return;
+      bool ordinals = root.type == ValueType::COLUMN_ONLY;
+      if (ordinals ? bound.stringColumn == nullptr || bound.stringColumn->ords == nullptr
+                   : !bound.column) return;
+      int64_t numOrds = ordinals ? thisOp().fields[binding.producerIndex].ords->numOrds() : 0;
+      size_t maxSetBytes = disableCardinalityOrdSetsForTests ? 0 : MAX_ORD_SET_BYTES;
       std::array<int64_t, BATCH_SIZE> values;
       size_t count = 0;
       auto flush = [&] {
-        accumulator.addRawBatch(
-            binding.producerIndex,
-            std::span<const int64_t>(values.data(), count), root.columnType);
+        auto batch = std::span<const int64_t>(values.data(), count);
+        if (ordinals) accumulator.addOrdBatch(
+            binding.producerIndex, batch, numOrds, maxSetBytes);
+        else accumulator.addRawBatch(binding.producerIndex, batch, root.columnType);
         count = 0;
       };
       int64_t missing = 0;
-      forEachIntColValue(
-          domain, *bound.column, maxDoc, missing,
-          [&](int32_t docid, int64_t value) LUXIR_INLINE {
-            unused(docid);
-            values[count++] = value;
-            if (count == values.size()) flush();
-          });
+      auto consume = [&](int32_t docid, int64_t value) LUXIR_INLINE {
+        unused(docid);
+        values[count++] = value;
+        if (count == values.size()) flush();
+      };
+      if (ordinals) {
+        forEachOrdValue(domain, *bound.stringColumn->ords, binding.ordMapping,
+                        maxDoc, missing, consume);
+      } else {
+        forEachIntColValue(domain, *bound.column, maxDoc, missing, consume);
+      }
       if (count != 0) flush();
     }
 
@@ -304,9 +324,11 @@ public:
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
               thisOp().aggregate, pool, segment, thisOp().fields);
 
-          int32_t maxDoc = segment.postingsReader().maxDoc();
+          int32_t maxDoc = segment.maxDoc();
           for (BoundAggregateInput& binding : bindings) {
-            if (binding.columnScan) {
+            if (binding.columnScan
+                && !(disableOrdinalAggregateBatchesForTests
+                     && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
             } else {
@@ -325,8 +347,10 @@ public:
 
   class InlineCalc final : public InlineCalculator {
     std::vector<BoundAggregateInput> bindings;
-    std::vector<uint64_t> finalizedValues;
-    std::vector<uint64_t> finalizedValid;
+    RequestMemResource finalizedResource;
+    std::pmr::vector<__int128> finalizedValues;
+    std::pmr::vector<double> finalizedDoubles;
+    std::pmr::vector<uint64_t> finalizedValid;
     AggregateEvalScratch scratch;
     AggregateFailure segmentFailure = AggregateFailure::NONE;
     size_t trackedFinalizedBytes = 0;
@@ -395,18 +419,18 @@ public:
       bool bValid = valid(b);
       if (!aValid || !bValid) return (int)aValid - (int)bValid;
       if (resultType == BucketValueType::DOUBLE) {
-        double aValue = std::bit_cast<double>(finalizedValues[a]);
-        double bValue = std::bit_cast<double>(finalizedValues[b]);
+        double aValue = finalizedDoubles[a];
+        double bValue = finalizedDoubles[b];
         return aValue < bValue ? -1 : (aValue > bValue ? 1 : 0);
       }
-      int64_t aValue = std::bit_cast<int64_t>(finalizedValues[a]);
-      int64_t bValue = std::bit_cast<int64_t>(finalizedValues[b]);
+      __int128 aValue = finalizedValues[a];
+      __int128 bValue = finalizedValues[b];
       return aValue < bValue ? -1 : (aValue > bValue ? 1 : 0);
     }
 
     size_t finalizedCapacityBytes() const {
-      return (finalizedValues.capacity() + finalizedValid.capacity())
-          * sizeof(uint64_t);
+      return finalizedValues.capacity() * sizeof(__int128)
+          + finalizedDoubles.capacity() * sizeof(double) + finalizedValid.capacity() * sizeof(uint64_t);
     }
 
     void trackFinalizedCapacity() {
@@ -435,6 +459,8 @@ public:
     InlineCalc(SearchOp& op, Calculator* parent, int64_t slot,
                int64_t numSlots)
         : InlineCalculator(op, parent, slot, numSlots),
+          finalizedResource(op.req.memoryTracker, "finalized values", "group aggregate state"),
+          finalizedValues(&finalizedResource), finalizedDoubles(&finalizedResource), finalizedValid(&finalizedResource),
           denseFacetState(static_cast<ExprStatsOp&>(op).denseFacetState),
           resultType(static_cast<ExprStatsOp&>(op).aggregate.root().type),
           entryBytes(op.inlineEntryBytes()),
@@ -558,23 +584,24 @@ public:
 
     void beginFinalize(size_t entries) override {
       finalizedValues.clear();
-      finalizedValues.reserve(entries);
+      finalizedDoubles.clear();
+      if (resultType == BucketValueType::DOUBLE) finalizedDoubles.reserve(entries);
+      else finalizedValues.reserve(entries);
       finalizedValid.assign((entries + 63) / 64, 0);
       trackFinalizedCapacity();
     }
 
     void finalize(void* entry, int64_t count) override {
       BucketScalar result = finishState(entry, count);
-      size_t slot = finalizedValues.size();
+      size_t slot = resultType == BucketValueType::DOUBLE ? finalizedDoubles.size() : finalizedValues.size();
       if (result.valid) {
         finalizedValid[slot / 64] |= uint64_t{1} << (slot % 64);
       }
-      finalizedValues.push_back(result.type == BucketValueType::DOUBLE
-          ? std::bit_cast<uint64_t>(result.doubleValue)
-          : (uint64_t)(int64_t)result.intValue);
+      if (resultType == BucketValueType::DOUBLE) finalizedDoubles.push_back(result.doubleValue);
+      else finalizedValues.push_back(result.intValue);
     }
 
-    api::Val finalizedValue(size_t slot) const;
+    BucketScalar finalizedValue(size_t slot);
 
     int compare(size_t a, size_t b) override {
       return compareResults(a, b);
@@ -690,13 +717,12 @@ public:
       static constexpr size_t BATCH_SIZE = 256;
       auto poolGuard = MemPool::threadLocalPoolGuard();
       auto& segment = child.req.reader->segments()[(size_t)segnum];
-      auto& postings = segment.postingsReader();
-      int32_t maxDoc = postings.maxDoc();
+      int32_t maxDoc = segment.maxDoc();
 
-      auto* info = source.segInfos.at((size_t)segnum);
+      auto* info = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
       if (!info) return;
       const auto& parentInfo = *info;
-      OrdColReader parentColumn(postings, parentInfo);
+      OrdColReader parentColumn(segment.postingsReader(), parentInfo);
       auto mapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
 

@@ -132,6 +132,19 @@ void AggregateStateView::addRawBatch(
       producerState(producer), values, columnType, producer.arguments);
 }
 
+void AggregateStateView::addOrdBatch(
+    uint32_t producerIndex, std::span<const int64_t> ords,
+    int64_t numOrds, size_t maxSetBytes) {
+  if (failed() || ords.empty()) return;
+  const AggregateProducer& producer = program->producers[producerIndex];
+  if (auto add = producer.resolved.state.accumulateOrdBatch) {
+    add(producerState(producer), ords, numOrds, maxSetBytes, producer.arguments);
+  } else {
+    producer.resolved.state.accumulateRawBatch(
+        producerState(producer), ords, FieldType::INT, producer.arguments);
+  }
+}
+
 void AggregateStateView::fail(AggregateFailure reason) {
   if (!failed()) setFailure(reason);
 }
@@ -181,13 +194,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
     return BucketScalar::failed(root.type, root.nature, stateFailure);
   }
   auto validateOutput = [](BucketScalar result) {
-    if (result.valid && result.type == BucketValueType::INT128
-        && (result.intValue < std::numeric_limits<int64_t>::min()
-            || result.intValue > std::numeric_limits<int64_t>::max())) {
-      return BucketScalar::failed(result.type, result.nature,
-                                  AggregateFailure::INT64_OUTPUT_OVERFLOW);
-    }
-    return result;
+    return valueDecimal(result.nature) ? result : integerAggregateOutput(result);
   };
   if (root.kind == AggregateNodeKind::AGGREGATE) {
     const AggregateLeaf& leaf = program->leaves[root.aggregate];
@@ -241,6 +248,13 @@ void AggregateAccumulator::addRawBatch(
     FieldType::Type columnType) {
   AggregateStateView(*program, states.data()).addRawBatch(
       producerIndex, values, columnType);
+}
+
+void AggregateAccumulator::addOrdBatch(
+    uint32_t producerIndex, std::span<const int64_t> ords,
+    int64_t numOrds, size_t maxSetBytes) {
+  AggregateStateView(*program, states.data()).addOrdBatch(
+      producerIndex, ords, numOrds, maxSetBytes);
 }
 
 void AggregateAccumulator::fail(AggregateFailure reason) {
@@ -315,30 +329,23 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
   for (uint32_t index = 0; index < program.producers.size(); index++) {
     const AggregateProducer& producer = program.producers[index];
     const ValueNode& root = producer.input->root();
-    if (root.type == ValueType::COLUMN_ONLY) {
-      BoundAggregateInput binding;
-      binding.producer = &producer;
-      binding.producerIndex = index;
-      binding.producerStateOffset = (uint32_t)sizeof(AggregateFailure) + producer.stateOffset;
-      binding.columnType = root.columnType;
-      binding.arguments = producer.arguments;
-      auto* info = fields[index].values[producer.input->rootNode].at(segment);
-      if (info != nullptr && fields[index].ords != nullptr) {
-        binding.ordColumn = pool.make<OrdColReader>(segment.postingsReader(), *info);
-        binding.ordIterator = pool.make<OrdColReader::Iterator>(*binding.ordColumn);
-        binding.ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
-      }
-      bindings.push_back(binding);
-      continue;
-    }
     BoundValueProgram* values = producer.input->bind(pool, segment, fields[index].values);
-    bool columnScan = root.kind == ValueNodeKind::COLUMN;
-    bool bareColumn = columnScan && !valueArray(root.type);
     BoundValueNode& rootBinding = values->nodes[producer.input->rootNode];
+    // A string column root yields its global ords (cardinality). Raw point
+    // reads remain numeric-only.
+    bool strings = root.type == ValueType::COLUMN_ONLY;
+    OrdMap::SegToGlobal ordMapping;
+    if (strings && rootBinding.stringColumn != nullptr && fields[index].ords != nullptr) {
+      assert(root.columnIndexed);
+      rootBinding.stringColumn->attachOrds(pool, segment.postingsReader());
+      ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
+    }
+    bool columnScan = root.kind == ValueNodeKind::COLUMN && (!strings || root.columnIndexed);
+    bool bareColumn = columnScan && !strings && !valueArray(root.type);
     bindings.push_back({
         .values = values,
         .producer = &producer,
-        .ordMapping = {},
+        .ordMapping = ordMapping,
         .columnIterator = bareColumn && rootBinding.bulkIterator
             ? &*rootBinding.bulkIterator : nullptr,
         .accumulateRawPoint = producer.resolved.state.accumulateRawPoint,

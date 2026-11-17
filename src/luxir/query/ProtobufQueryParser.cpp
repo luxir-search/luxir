@@ -176,21 +176,24 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
 
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix,
-                                   prefixQuery.case_insensitive);
+                                   prefixQuery.max_expansions, prefixQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern,
                                      wildcardQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery) {
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings,
+      &context.fields, context.reader, context.minLiteralPrefix);
   return builder.createRegexQuery(regexQuery.field, regexQuery.pattern,
                                   regexQuery.case_insensitive);
 }
@@ -516,7 +519,7 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   options.opName = context.opName;
   options.nestingBudget = &context.nestingBudget;
   ValueProgram* program =
-      ValueExprParser(options, context.arena).parse(rescoreQuery.expr);
+      ValueExprParser(options, context.arena).parse(rescoreQuery.expr, NaturePolicy::NUMBER);
   ValueType rootType = program->root().type;
   if (valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
     throw std::runtime_error(

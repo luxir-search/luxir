@@ -51,6 +51,8 @@ struct FilterCacheConfig {
   // while remaining independently configurable.
   size_t wholeAdmissionHistorySize = 0;
   uint32_t admissionThreshold = 2;
+  // Eviction policy: scale density by recent key demand. False selects plain GDS.
+  bool recentDemandEviction = true;
   size_t maxMetadataEntries = 8192;
   size_t maxMetadataBytes = 0;
   // A metadata sweep started by exceeding maxMetadataBytes trims to this
@@ -111,6 +113,9 @@ public:
     uint64_t admissions = 0;
     uint64_t buildAttempts = 0;
     uint64_t builds = 0;
+    uint64_t buildNanos = 0;
+    uint64_t servedBuildNanos = 0;
+    uint64_t deadBuildNanos = 0;
     uint64_t byproductInserts = 0;
     uint64_t publishRejects = 0;
     uint64_t evictions = 0;
@@ -127,14 +132,18 @@ public:
     size_t metadataBytes = 0;
   };
 
-  // GDSF priority is the inflation clock plus a frozen density. The clock
-  // only moves forward, so a hit changes the priority only after a sweep has
-  // advanced it; skip the store otherwise to keep hot values' cache lines
-  // shared across cores. Concurrent relaxed touches may still overwrite one
-  // another; that race is a benign approximation in GDSF.
-  static void touchPriority(std::atomic<double>& priority, double next) {
-    if (priority.load(std::memory_order_relaxed) != next) {
-      priority.store(next, std::memory_order_relaxed);
+  // Values keep pure GDS state: frozen build-nanoseconds / effective bytes
+  // and the clock at publish / last shared hit. Sweep ranks by touchClock +
+  // density * bit_width(max(count, 1)), using the max of both admission lanes'
+  // window counts for the key. Counts include misses and survive value turnover
+  // (segment flush/merge and reader refresh). The window is admissionHistorySize
+  // lane uses, not requests or time: requests with many filters shorten it.
+  // A key outside both windows ranks as plain GDS. Metadata eviction uses GDS.
+  // Hits only store when the clock moved; concurrent relaxed touches remain a
+  // benign approximation. cacheHits is solely the zero-hit backoff signal.
+  static void updateTouchClock(std::atomic<double>& clock, double next) {
+    if (clock.load(std::memory_order_relaxed) != next) {
+      clock.store(next, std::memory_order_relaxed);
     }
   }
 
@@ -154,20 +163,20 @@ public:
     // DocSet payload charge only - key bytes are deliberately excluded
     // (entry-lifetime metadataBytes budget, not value lifetime).
     uint32_t charge;
-    uint32_t buildCostMicros;
+    uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
     // Set once capacity eviction has detached this value from its slot.
     mutable std::atomic<bool> capacityDetached{false};
     double density = 0;
-    mutable std::atomic<double> priority;
+    mutable std::atomic<double> touchClock;
     #ifndef NDEBUG
     SegmentIdentity identityForTest;
     #endif
 
   public:
     SegmentValue(std::unique_ptr<DocSet> docs,
-                 SegmentIdentity identityForTest, uint32_t buildCostMicros,
+                 SegmentIdentity identityForTest, uint64_t buildCostNanos,
                  bool claimedBuild);
 
     DocSet* docSet() const { return docs.get(); }
@@ -178,10 +187,10 @@ public:
     }
     size_t ramBytesUsed() const { return charge; }
     void touch(double evictionClock) const {
-      touchPriority(priority, evictionClock + density);
+      updateTouchClock(touchClock, evictionClock);
     }
-    double evictionPriority() const {
-      return priority.load(std::memory_order_relaxed);
+    double evictionPriority(uint32_t weight = 1) const {
+      return touchClock.load(std::memory_order_relaxed) + density * weight;
     }
   };
 
@@ -201,26 +210,26 @@ public:
     uint64_t readerVersion_;
     std::vector<SegmentDocs> segments;
     size_t charge;
-    uint32_t buildCostMicros;
+    uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
     double density = 0;
-    mutable std::atomic<double> priority;
+    mutable std::atomic<double> touchClock;
 
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
                 std::vector<std::unique_ptr<DocSet>> docs,
-                uint32_t buildCostMicros, bool claimedBuild);
+                uint64_t buildCostNanos, bool claimedBuild);
 
   public:
     uint64_t readerVersion() const { return readerVersion_; }
     size_t ramBytesUsed() const { return charge; }
     DocSet* docSet(size_t segmentOrd, const SegmentIdentity& identity) const;
     void touch(double evictionClock) const {
-      touchPriority(priority, evictionClock + density);
+      updateTouchClock(touchClock, evictionClock);
     }
-    double evictionPriority() const {
-      return priority.load(std::memory_order_relaxed);
+    double evictionPriority(uint32_t weight = 1) const {
+      return touchClock.load(std::memory_order_relaxed) + density * weight;
     }
   };
 
@@ -401,16 +410,16 @@ public:
     // effectiveDocSet / effectiveDomain seam.
     std::shared_ptr<const SegmentValue> publishRaw(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const SegmentValue> publishRawByproduct(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const SegmentValue> offerRaw(
         size_t segmentOrd, std::unique_ptr<DocSet> raw,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
     std::shared_ptr<const ReaderValue> publishReaderStable(
         ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
-        uint32_t buildCostMicros);
+        uint64_t buildCostNanos);
 
     DocSet* adoptOwnedRaw(size_t segmentOrd, Probe& probe,
                           std::unique_ptr<DocSet> raw);
@@ -592,6 +601,11 @@ private:
     // Bumped on every segment probe by every search thread.
     StripedCounter hits;
     StripedCounter misses;
+    // Build time served is an upper bound on savings: uncached evaluation may
+    // avoid materializing a DocSet. Keep nanoseconds until API conversion.
+    StripedCounter servedBuildNanos;
+    std::atomic<uint64_t> buildNanos{0};
+    std::atomic<uint64_t> deadBuildNanos{0};
     std::atomic<uint64_t> admissions{0};
     std::atomic<uint64_t> buildAttempts{0};
     std::atomic<uint64_t> builds{0};
@@ -609,8 +623,8 @@ private:
     std::atomic<uint64_t> readerStableRetires{0};
   };
 
-  // Fingerprints are admission hints only. A collision can admit early, but
-  // never causes a false hit because the data map compares full key bytes.
+  // Fingerprints are admission and eviction hints. Collisions can admit early
+  // or change a rank, but hits always compare full key bytes.
   class AdmissionRing {
     std::vector<uint64_t> history;
     std::unordered_map<uint64_t, uint32_t> frequencies;
@@ -623,6 +637,14 @@ private:
     AdmissionRing(size_t size, uint32_t threshold);
     bool record(uint64_t fingerprint);
     void reset();
+    std::vector<uint64_t> snapshotSortedHistory();
+  };
+
+  struct RecentUses {
+    std::vector<uint64_t> clause;
+    std::vector<uint64_t> whole;
+
+    uint32_t count(uint64_t fingerprint) const;
   };
 
   // Immutable policy and explicit-or-zero overrides. config.maxBytes is only
@@ -637,7 +659,7 @@ private:
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
   std::atomic<uint64_t> epoch{1};
-  // Only the elected sweeper advances the GDSF inflation clock.
+  // Only the elected sweeper advances the GDS inflation clock.
   std::atomic<double> evictionClock{0};
   std::atomic<uint64_t> publishedCoreGen{0};
   std::atomic<uint64_t> publishedReaderVersion{0};
@@ -687,6 +709,7 @@ private:
       const std::shared_ptr<const ReaderValue>& value);
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
+  RecentUses snapshotRecentUses();
   void recordCapacityEviction(
       const std::shared_ptr<SegmentSlot>& slot,
       const std::shared_ptr<const SegmentValue>& value);
@@ -695,11 +718,11 @@ private:
       const std::shared_ptr<const ReaderValue>& value);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-      bool byproduct, uint32_t buildCostMicros);
+      bool byproduct, uint64_t buildCostNanos);
   std::shared_ptr<const ReaderValue> publishReaderValue(
       Use& use, ReaderProbe& probe,
       std::vector<std::unique_ptr<DocSet>> liveExact,
-      uint32_t buildCostMicros);
+      uint64_t buildCostNanos);
   size_t budgetBytes() const { return budget.load(std::memory_order_relaxed); }
   size_t lowWatermarkBytes(size_t bytes) const;
   size_t maxEntryBytes(size_t bytes) const;
@@ -757,6 +780,8 @@ public:
     uint32_t segmentsResident = 0;
     uint64_t hits = 0;
     uint64_t lastUsed = 0;
+    uint64_t buildNanos = 0;
+    uint32_t recentUses = 0;
   };
   std::vector<EntryDump> dump(size_t limit, size_t* totalResident);
 

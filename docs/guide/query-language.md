@@ -395,7 +395,8 @@ beside it. The expression must produce a value for every matched document;
 `def(popularity_i, 0)` or an `exists()` clause in the child query makes it
 total. `$name` variables inside the expression bind from the surrounding
 expression's `vars`. The value-expression language is the one sorting uses;
-see [Searching](searching.md#sorting).
+see [Searching](searching.md#sorting) and
+[Value expressions](value-expressions.md).
 
 ## Functions
 
@@ -410,6 +411,7 @@ phrase(dune messiah, field=title_t)
 phrase(dune messiah, field=title_t, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_t)
+prefix(m, field=title_t, max_expansions=50)
 wildcard(du*, field=title_t)
 regex(dune|kings, field=title_t)
 exists(year_i)

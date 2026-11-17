@@ -379,8 +379,8 @@ TEST_F(GrowingDistinctTupleTest, workerTupleIdsRemappedBothOrders) {
       flatdoc("id", "1", "key_s", "b", "key_i", INT64_MAX)}, UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   CollapsePlan key(*reader, api::Collapse_::MissingPolicy::GROUP, false);
-  key.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"), reader->field("key_s")});
-  key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, {}, reader->field("key_i")});
+  key.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"), reader->field("key_s")});
+  key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, FieldType::Storage::INT64, {}, reader->field("key_i")});
   FacetGroupPlan plan(key);
   ASSERT_TRUE(plan.internTuples);
   CollapseKey first, second;

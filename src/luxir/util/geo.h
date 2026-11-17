@@ -127,6 +127,55 @@ inline bool longitudeInRange(int32_t longitude, int32_t minLongitude,
       : longitude >= minLongitude || longitude <= maxLongitude;
 }
 
+// Inclusive encoded box. Empty quantized boxes use a reversed latitude
+// interval, so the point predicate stays the same for empty and nonempty boxes.
+struct EncodedBox {
+  int32_t latMin;
+  int32_t latMax;
+  int32_t lonMin;
+  int32_t lonMax;
+
+private:
+  EncodedBox(int64_t latitudes, int64_t longitudes)
+      : latMin(unpackLatitude(latitudes)), latMax(unpackLongitude(latitudes)),
+        lonMin(unpackLatitude(longitudes)), lonMax(unpackLongitude(longitudes)) {}
+
+public:
+  EncodedBox(double minLat, double maxLat, double minLon, double maxLon) {
+    checkLatitude(minLat);
+    checkLatitude(maxLat);
+    checkLongitude(minLon);
+    checkLongitude(maxLon);
+    if (minLat > maxLat) throw std::invalid_argument("minimum latitude exceeds maximum latitude");
+    bool noPoints = minLat == 90.0 || (minLon == 180.0 && maxLon == 180.0);
+    if (minLon == 180.0 && maxLon < minLon) minLon = -180.0;
+    bool wraps = minLon > maxLon;
+    latMin = encodeLatitudeCeil(minLat);
+    latMax = encodeLatitude(maxLat);
+    lonMin = encodeLongitudeCeil(minLon);
+    lonMax = encodeLongitude(maxLon);
+    if (noPoints || latMax < latMin || (!wraps && lonMax < lonMin)) {
+      latMin = 1;
+      latMax = 0;
+    }
+  }
+
+  static EncodedBox fromEncoded(int32_t latMin, int32_t latMax, int32_t lonMin, int32_t lonMax) {
+    return EncodedBox(pack(latMin, latMax), pack(lonMin, lonMax));
+  }
+  static EncodedBox fromPacked(int64_t latitudes, int64_t longitudes) {
+    return EncodedBox(latitudes, longitudes);
+  }
+  int64_t packedLatitudes() const { return pack(latMin, latMax); }
+  int64_t packedLongitudes() const { return pack(lonMin, lonMax); }
+  bool empty() const { return latMin > latMax; }
+  bool contains(int32_t lat, int32_t lon) const {
+    return latMin <= lat && lat <= latMax && longitudeInRange(lon, lonMin, lonMax);
+  }
+  bool contains(int64_t point) const { return contains(unpackLatitude(point), unpackLongitude(point)); }
+  bool operator==(const EncodedBox&) const = default;
+};
+
 inline double haversinSortKey(double lat1, double lon1,
                               double lat2, double lon2) {
   double x1 = lat1 * (std::numbers::pi / 180.0);

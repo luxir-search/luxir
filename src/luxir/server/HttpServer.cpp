@@ -6,6 +6,8 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "Prometheus.h"
 
 #include <cassert>
@@ -651,7 +653,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
     PLUGIN
   };
@@ -1471,7 +1473,9 @@ private:
 
   static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
-    if (target == "/health") {
+    if (target == "/") {
+      m.route = Route::BUILD_INFO; m.allow = "GET"; m.prettyDefault = true;
+    } else if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
     } else if (target == "/metrics") {
       m.route = Route::METRICS; m.allow = "GET";
@@ -1586,6 +1590,17 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::BUILD_INFO: {
+        const auto& build = buildInfo();
+        OverlayJsonBuilder json;
+        json.string("version", build.version);
+        json.string("source_commit", build.sourceCommit);
+        json.string("cpu_target", build.cpuTarget);
+        json.string("faiss_simd", kernelInfo().faissSimd);
+        json.string("blas_core", kernelInfo().blasCore);
+        respondJson(http::status::ok, json.finish());
+        break;
+      }
       case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
@@ -4286,7 +4301,7 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel == -1) {
+  if (parallelLane()) {
     // The parallel lane runs on this shard inside the arena (see
     // SearchEngine::dispatch), and so does resumed production: its per-batch
     // task groups must spawn into the node arena, not this thread's implicit
@@ -4373,6 +4388,7 @@ void HttpServer::armReplicationExpiry() {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
         }
         node.getReplication().expire();
+        node.collections().expireRetirements();
         Signal::emit("replicationExpiryTick");
       } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
       net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -56,12 +57,12 @@ void clearIfSet(std::atomic<uint32_t>& value) {
 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
                                         SegmentIdentity identityForTest,
-                                        uint32_t buildCostMicros,
+                                        uint64_t buildCostNanos,
                                         bool claimedBuild)
   : docs(std::move(docs)),
     charge((uint32_t) this->docs->ramBytesUsed()),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
-    priority(0)
+    buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
+    touchClock(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
     #endif
@@ -73,10 +74,10 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
 FilterCache::ReaderValue::ReaderValue(
     uint64_t readerVersion, std::span<const SegmentIdentity> identities,
     std::vector<std::unique_ptr<DocSet>> docs,
-    uint32_t buildCostMicros, bool claimedBuild)
+    uint64_t buildCostNanos, bool claimedBuild)
   : readerVersion_(readerVersion), charge(0),
-    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
-    priority(0) {
+    buildCostNanos(buildCostNanos), claimedBuild(claimedBuild),
+    touchClock(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
         "reader-stable DocSets must align with reader segments");
@@ -305,6 +306,7 @@ void FilterCache::acceptSharedHit(
     clearIfSet(slot->deadBuildStreak);
     clearIfSet(slot->buildBypassesRemaining);
   }
+  counter.servedBuildNanos.add(value->buildCostNanos);
   value->touch(evictionClock.load(std::memory_order_relaxed));
   touchEpoch(use.entry->lastUsed, use.epoch);
   use.pinValue(segmentOrd, std::move(value));
@@ -325,6 +327,7 @@ void FilterCache::acceptReaderSharedHit(
     clearIfSet(entry->readerDeadBuildStreak);
     clearIfSet(entry->readerBuildBypassesRemaining);
   }
+  counter.servedBuildNanos.add(value->buildCostNanos);
   value->touch(evictionClock.load(std::memory_order_relaxed));
   touchEpoch(entry->lastUsed, use.epoch);
   use.pinReaderValue(value);
@@ -465,7 +468,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
     IndexReader& reader, std::span<DocSet* const> domainPerSeg) {
   if (cache == nullptr || !cache->enabled()
       || scope_ != FilterKeyScope::READER_STABLE
-      || reader.commitTime() != readerVersion
+      || reader.coreCommitTime() != readerVersion
       || reader.segments().size() != readerSegments.size()) {
     return {};
   }
@@ -485,8 +488,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   }
   for (size_t i = 0; i < reader.segments().size(); i++) {
     auto& segment = reader.segments()[i];
-    DocSet* canonical = segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset();
+    DocSet* canonical = segment.liveDocSet();
     DocSet* actual = emptyMeansCanonical ? nullptr : domainPerSeg[i];
     if (actual != canonical) return {};
   }
@@ -593,9 +595,9 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRaw(size_t segmentOrd, Probe& probe,
                              std::unique_ptr<DocSet> raw,
-                             uint32_t buildCostMicros) {
+                             uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, &probe, std::move(raw), false,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 DocSet* FilterCache::Use::adoptOwnedRaw(
@@ -638,24 +640,24 @@ DocSet* FilterCache::Use::adoptOwnedRaw(
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRawByproduct(size_t segmentOrd, Probe& probe,
                                       std::unique_ptr<DocSet> raw,
-                                      uint32_t buildCostMicros) {
+                                      uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, &probe, std::move(raw), true,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::offerRaw(size_t segmentOrd, std::unique_ptr<DocSet> raw,
-                           uint32_t buildCostMicros) {
+                           uint64_t buildCostNanos) {
   return cache->publish(*this, segmentOrd, nullptr, std::move(raw), true,
-                        buildCostMicros);
+                        buildCostNanos);
 }
 
 std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::Use::publishReaderStable(
     ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
-    uint32_t buildCostMicros) {
+    uint64_t buildCostNanos) {
   auto value = cache->publishReaderValue(
-      *this, probe, std::move(liveExact), buildCostMicros);
+      *this, probe, std::move(liveExact), buildCostNanos);
   return value;
 }
 
@@ -743,7 +745,7 @@ DocSet* FilterCache::Use::effectiveDocSet(
       value = readerPin;
     }
     if (value == nullptr || value->readerVersion() != readerVersion
-        || reader.commitTime() != readerVersion) {
+        || reader.coreCommitTime() != readerVersion) {
       return nullptr;
     }
     return value->docSet(segmentOrd, readerSegments[segmentOrd]);
@@ -753,12 +755,12 @@ DocSet* FilterCache::Use::effectiveDocSet(
   DocSet* raw = requestSlot.raw;
   if (raw == nullptr) return nullptr;
 
-  if (segment.liveDocs() == nullptr) return raw;
+  if (!segment.hasDeletes()) return raw;
   if (requestSlot.liveEffective != nullptr) {
     return requestSlot.liveEffective.get();
   }
   std::array<DocSet*, 2> sets{
-      raw, &segment.liveDocs()->docset()};
+      raw, segment.liveDocSet()};
   auto docs = DocSet::intersect(sets);
   docs->card();
   requestSlot.chargeRouted(docs->ramBytesUsed());
@@ -772,8 +774,7 @@ DomainHandle FilterCache::Use::effectiveDomain(
   // AND domain. The canonical live set is the request-stable value itself.
   if (domain != nullptr && segmentOrd < reader.segments().size()) {
     auto& segment = reader.segments()[segmentOrd];
-    DocSet* canonical = segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset();
+    DocSet* canonical = segment.liveDocSet();
     if (domain == canonical) domain = nullptr;
   }
   if (domain == nullptr) {
@@ -819,7 +820,7 @@ FilterCache::UseRegistry::UseRegistry(
 }
 
 FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader)
-  : UseRegistry(cache, reader.coreGen(), reader.commitTime(),
+  : UseRegistry(cache, reader.coreGen(), reader.coreCommitTime(),
                 readerIdentities(reader)) {
 }
 
@@ -835,7 +836,7 @@ FilterCache::UseRegistry::UseRegistry(
   : UseRegistry(&cache, readerCoreGen, readerVersion, segments) {}
 
 FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
-  : UseRegistry(&cache, reader.coreGen(), reader.commitTime(),
+  : UseRegistry(&cache, reader.coreGen(), reader.coreCommitTime(),
                 readerIdentities(reader)) {
 }
 
@@ -948,6 +949,35 @@ void FilterCache::AdmissionRing::reset() {
   filled = 0;
 }
 
+std::vector<uint64_t> FilterCache::AdmissionRing::snapshotSortedHistory() {
+  // The history capacity is fixed. Allocate before locking so record() waits
+  // only for a contiguous copy, never for allocation or sorting.
+  std::vector<uint64_t> snapshot(history.size());
+  size_t size;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    size = filled;
+    std::copy_n(history.begin(), size, snapshot.begin());
+  }
+  snapshot.resize(size);
+  std::sort(snapshot.begin(), snapshot.end());
+  return snapshot;
+}
+
+uint32_t FilterCache::RecentUses::count(uint64_t fingerprint) const {
+  auto countIn = [fingerprint](const std::vector<uint64_t>& history) {
+    auto [first, last] = std::equal_range(
+        history.begin(), history.end(), fingerprint);
+    return (uint32_t)(last - first);
+  };
+  return std::max(countIn(clause), countIn(whole));
+}
+
+FilterCache::RecentUses FilterCache::snapshotRecentUses() {
+  return {clauseAdmission.snapshotSortedHistory(),
+          wholeAdmission.snapshotSortedHistory()};
+}
+
 FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
   return lane == AdmissionLane::CLAUSE
       ? clauseAdmission : wholeAdmission;
@@ -1053,6 +1083,7 @@ void FilterCache::recordCapacityEviction(
   slot->buildBypassesRemaining.store(bypasses,
                                      std::memory_order_relaxed);
   counter.capacityDeadBuilds.fetch_add(1, std::memory_order_relaxed);
+  counter.deadBuildNanos.fetch_add(value->buildCostNanos, std::memory_order_relaxed);
 }
 
 void FilterCache::recordReaderCapacityEviction(
@@ -1070,6 +1101,7 @@ void FilterCache::recordReaderCapacityEviction(
   entry->readerBuildBypassesRemaining.store(
       bypasses, std::memory_order_relaxed);
   counter.readerDeadBuilds.fetch_add(1, std::memory_order_relaxed);
+  counter.deadBuildNanos.fetch_add(value->buildCostNanos, std::memory_order_relaxed);
 }
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
@@ -1421,7 +1453,7 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
 
 std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-    bool byproduct, uint32_t buildCostMicros) {
+    bool byproduct, uint64_t buildCostNanos) {
   if (use.scope_ == FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
@@ -1431,8 +1463,13 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
   SegmentIdentity identity = segmentOrd < use.readerSegments.size()
       ? use.readerSegments[segmentOrd] : SegmentIdentity{};
   bool claimed = probe != nullptr && probe->ownsClaim;
+  // Count claimed work even if publication rejects it. offerRaw and other
+  // byproducts were materialized for the query, not at the cache's request.
+  if (claimed && !byproduct) {
+    counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
+  }
   auto local = std::make_shared<SegmentValue>(
-      std::move(raw), identity, buildCostMicros,
+      std::move(raw), identity, buildCostNanos,
       claimed && !byproduct);
 
   bool attempted = enabled() && use.entry != nullptr
@@ -1472,9 +1509,9 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
             *use.entry, local->ramBytesUsed(), valueCount);
         // Density is written once before release-publication; touches only
         // combine this frozen value with the current inflation clock.
-        local->density = (double) local->buildCostMicros / effectiveBytes;
-        local->priority.store(
-            evictionClock.load(std::memory_order_relaxed) + local->density,
+        local->density = (double) local->buildCostNanos / effectiveBytes;
+        local->touchClock.store(
+            evictionClock.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         // Charge before visibility. Eviction detaches with a value CAS and
         // subtracts this exact immutable charge once; readers can pin the
@@ -1507,15 +1544,18 @@ std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::publishReaderValue(
     Use& use, ReaderProbe& probe,
     std::vector<std::unique_ptr<DocSet>> liveExact,
-    uint32_t buildCostMicros) {
+    uint64_t buildCostNanos) {
   if (use.scope_ != FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
         "whole-reader publication requires READER_STABLE scope");
   }
+  if (probe.ownsClaim) {
+    counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
+  }
   auto mutableLocal = std::shared_ptr<ReaderValue>(new ReaderValue(
       use.readerVersion, use.readerSegments, std::move(liveExact),
-      buildCostMicros, probe.ownsClaim));
+      buildCostNanos, probe.ownsClaim));
   std::shared_ptr<const ReaderValue> local = mutableLocal;
   auto localEntry = probe.entry;
   bool inserted = false;
@@ -1549,10 +1589,9 @@ FilterCache::publishReaderValue(
         double effectiveBytes = effectiveValueBytes(
             *localEntry, local->ramBytesUsed(), valueCount);
         mutableLocal->density =
-            (double) mutableLocal->buildCostMicros / effectiveBytes;
-        mutableLocal->priority.store(
-            evictionClock.load(std::memory_order_relaxed)
-                + mutableLocal->density,
+            (double) mutableLocal->buildCostNanos / effectiveBytes;
+        mutableLocal->touchClock.store(
+            evictionClock.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         // Charge before visibility. The exchange is the one detach event for
         // any prior whole-reader value; its immutable charge is then retired
@@ -1695,7 +1734,7 @@ bool FilterCache::onReaderPublished(
 
 bool FilterCache::onReaderPublished(IndexReader& reader) {
   auto identities = readerIdentities(reader);
-  return onReaderPublished(reader.coreGen(), reader.commitTime(), identities);
+  return onReaderPublished(reader.coreGen(), reader.coreCommitTime(), identities);
 }
 
 void FilterCache::maybeSweep() {
@@ -1733,24 +1772,30 @@ void FilterCache::sweep() {
       SweepGuard guard{sweeping};
       while (residentBytes.load(std::memory_order_relaxed)
              > lowWatermarkBytes(budgetBytes())) {
-        std::vector<std::shared_ptr<FilterEntry>> entrySnapshot;
+        // Copy each lane under its mutex, then release both before walking
+        // entries. Every value of a key gets the same weight this iteration.
+        auto counts = config.recentDemandEviction
+            ? snapshotRecentUses() : RecentUses{};
+        std::vector<std::pair<std::shared_ptr<FilterEntry>, uint32_t>> entrySnapshot;
         entrySnapshot.reserve(entries.size());
         entries.cvisit_all([&](const auto& item) {
-          entrySnapshot.push_back(item.second);
+          uint32_t count = counts.count(item.first.hash());
+          entrySnapshot.emplace_back(item.second,
+              std::bit_width(std::max<uint32_t>(count, 1)));
         });
         std::vector<Candidate> candidates;
-        for (const auto& entry : entrySnapshot) {
+        for (const auto& [entry, weight] : entrySnapshot) {
           auto readerValue = entry->readerValue.load(std::memory_order_acquire);
           if (readerValue != nullptr) {
             candidates.push_back({nullptr, entry, nullptr, readerValue,
-                                  readerValue->evictionPriority()});
+                                  readerValue->evictionPriority(weight)});
           }
           auto slots = entry->slots.load(std::memory_order_acquire);
           for (const auto& slot : *slots) {
             auto value = slot->value.load(std::memory_order_acquire);
             if (value != nullptr) {
               candidates.push_back({slot, nullptr, value, nullptr,
-                                    value->evictionPriority()});
+                                    value->evictionPriority(weight)});
             }
           }
         }
@@ -1775,8 +1820,7 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.readerValue->ramBytesUsed(),
                   std::memory_order_relaxed);
-              advanceEvictionClock(
-                  candidate.readerValue->evictionPriority());
+              advanceEvictionClock(candidate.priority);
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
@@ -1791,8 +1835,7 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.segmentValue->ramBytesUsed(),
                   std::memory_order_relaxed);
-              advanceEvictionClock(
-                  candidate.segmentValue->evictionPriority());
+              advanceEvictionClock(candidate.priority);
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
@@ -1954,6 +1997,9 @@ void FilterCache::resetAdmission() {
 void FilterCache::resetCounters() {
   counter.hits.reset();
   counter.misses.reset();
+  counter.buildNanos.store(0, std::memory_order_relaxed);
+  counter.servedBuildNanos.reset();
+  counter.deadBuildNanos.store(0, std::memory_order_relaxed);
   counter.admissions.store(0, std::memory_order_relaxed);
   counter.buildAttempts.store(0, std::memory_order_relaxed);
   counter.builds.store(0, std::memory_order_relaxed);
@@ -1981,6 +2027,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
                                                       size_t* totalResident) {
   std::vector<EntryDump> rows;
   size_t resident = 0;
+  auto counts = snapshotRecentUses();
   entries.cvisit_all([&](const auto& item) {
     const FilterKey& key = item.first;
     const std::shared_ptr<FilterEntry>& entry = item.second;
@@ -1989,6 +2036,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
     if (readerValue != nullptr) {
       row.readerValue = true;
       row.bytes += readerValue->ramBytesUsed();
+      row.buildNanos += readerValue->buildCostNanos;
       row.hits += readerValue->cacheHits.load(std::memory_order_relaxed);
     }
     auto slots = entry->slots.load(std::memory_order_acquire);
@@ -1997,11 +2045,13 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       if (value == nullptr) continue;
       row.segmentsResident++;
       row.bytes += value->ramBytesUsed();
+      row.buildNanos += value->buildCostNanos;
       row.hits += value->cacheHits.load(std::memory_order_relaxed);
     }
     if (row.bytes == 0) return;
     resident++;
     row.keyHash = key.hash();
+    row.recentUses = counts.count(row.keyHash);
     row.keyBytes = key.bytes().size();
     row.scope = entry->scope;
     row.lastUsed = entry->lastUsed.load(std::memory_order_relaxed);
@@ -2044,6 +2094,9 @@ FilterCache::CounterValues FilterCache::counters() const {
       .admissions = counter.admissions.load(std::memory_order_relaxed),
       .buildAttempts = counter.buildAttempts.load(std::memory_order_relaxed),
       .builds = counter.builds.load(std::memory_order_relaxed),
+      .buildNanos = counter.buildNanos.load(std::memory_order_relaxed),
+      .servedBuildNanos = counter.servedBuildNanos.load(),
+      .deadBuildNanos = counter.deadBuildNanos.load(std::memory_order_relaxed),
       .byproductInserts = counter.byproductInserts.load(std::memory_order_relaxed),
       .publishRejects = counter.publishRejects.load(std::memory_order_relaxed),
       .evictions = counter.evictions.load(std::memory_order_relaxed),

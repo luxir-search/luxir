@@ -222,6 +222,7 @@ struct SkipStats {
   static inline int64_t conjPlanUnknownIslandNumericGeo = 0;
   static inline int64_t conjPlanUnknownIslandOther = 0;
   static inline int64_t multitermExpansions = 0;
+  static inline int64_t multitermUnionBuilds = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -336,6 +337,9 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
   static inline int64_t numericPredicateClassifiedBlocks = 0;
@@ -556,6 +560,7 @@ struct SkipStats {
     conjPlanUnknownIslandNumericGeo = 0;
     conjPlanUnknownIslandOther = 0;
     multitermExpansions = 0;
+    multitermUnionBuilds = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;
@@ -638,6 +643,8 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
     numericPredicateClassifiedBlocks = 0;

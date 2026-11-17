@@ -10,11 +10,14 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <google/protobuf/arena.h>
 
+#include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/IntColReader.h"
+#include "luxir/reader/OrdColReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/MemPool.h"
@@ -26,6 +29,7 @@ namespace luxir {
 
 enum class ValueNodeKind : uint8_t {
   CONSTANT,
+  MISSING,
   VARIABLE,
   COLUMN,
   SCORE,
@@ -46,9 +50,14 @@ struct ValueNode {
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
   bool columnIndexed = false;
+  enum Flag : uint8_t { SHARED = 1, READS_SCORE = 2 };
+  uint8_t flags = 0;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
+  // A second integer parameter for functions that keep one (a box's longitudes,
+  // a date's unit); prepare() sets it.
+  int64_t intValue2 = 0;
   double doubleValue = 0.0;
 };
 
@@ -96,6 +105,37 @@ public:
     }
   }
 
+  // Nodes are appended after their dependencies. Walk reachable nodes once,
+  // in child order, with caller-selected edges and a postorder visitor.
+  template <class Children, class Visit>
+  void walkNodes(uint32_t root, Children&& children, Visit&& visit) const {
+    std::vector<bool> visited(nodes.size());
+    auto walk = [&](auto&& self, uint32_t index) -> void {
+      if (visited[index]) return;
+      visited[index] = true;
+      uint32_t mask = children(index);
+      const ValueNode& node = nodes[index];
+      for (uint8_t i = 0; i < node.childCount; i++) {
+        if (mask & (1u << i)) self(self, node.children[i]);
+      }
+      visit(index);
+    };
+    walk(walk, root);
+  }
+
+  template <class Visit>
+  void walkNodes(uint32_t root, Visit&& visit) const {
+    walkNodes(root, [&](uint32_t index) {
+      return (1u << nodes[index].childCount) - 1;
+    }, std::forward<Visit>(visit));
+  }
+
+  // Reduce the program to the nodes the root needs, one per distinct value
+  // and numbered in postorder from the root. A repeated subexpression becomes
+  // one shared node, exactly like a let value, and structurallyEqual() is a
+  // comparison of node vectors. Every program must pass through here.
+  void retainRoot();
+
   const ValueNode& root() const { return nodes[rootNode]; }
   ValueBounds constantBounds(uint32_t index) const;
   bool structurallyEqual(const ValueProgram& other) const;
@@ -104,10 +144,47 @@ public:
                           ValueFieldInfos fields) const;
 };
 
+// A STRING or ID column node. count() reads only its shape; a consumer that
+// needs the stored ords (cardinality) attaches them.
+struct BoundStringColumn {
+  const SegFieldInfo& fieldInfo;
+  ColumnShape shape;
+  ColumnShape::Cursor cursor;
+  OrdColReader* ords = nullptr;
+  OrdColReader::BulkOrds* ordValues = nullptr;
+
+  BoundStringColumn(PostingsReader& postings, const SegFieldInfo& fieldInfo)
+      : fieldInfo(fieldInfo), shape(postings, fieldInfo), cursor(shape) {}
+
+  // Only indexed STRING and ID columns store ords.
+  void attachOrds(MemPool& pool, PostingsReader& postings) {
+    ords = pool.make<OrdColReader>(postings, fieldInfo);
+    ordValues = pool.make<OrdColReader::BulkOrds>(*ords);
+  }
+
+  // The stored ord (segment ord + 1) at value rank `rank` of `docid`, after
+  // cursor.seek(docid) found it.
+  int32_t storedOrd(int32_t docid, int64_t rank) {
+    assert(ords != nullptr && rank >= cursor.begin() && rank < cursor.end());
+    int64_t index = !ords->multiValued() && ords->docIdIndexed() ? docid : rank;
+    return ordValues->valueAt(index);
+  }
+};
+
+struct ValueMemo {
+  ValueResult result;
+  int32_t docid = -1;
+  uint32_t scoreBits = 0;
+};
+
 struct BoundValueNode {
+  // Allocated only for nodes with repeated consumers (including scalar
+  // operands revisited by lazy array elements).
+  ValueMemo* memo = nullptr;
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
+  BoundStringColumn* stringColumn = nullptr;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;
@@ -122,12 +199,15 @@ class BoundValueProgram {
 
 public:
   const ValueProgram& program;
-  IndexReader::Segment& segment;
-  PostingsReader& postings;
+  IndexReader::Segment* segment;
   std::span<BoundValueNode> nodes;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment, ValueFieldInfos fields);
+
+  // Used by parse-time constant analysis. Independence is established before
+  // evaluation; document-dependent nodes are never evaluated through this ctor.
+  explicit BoundValueProgram(const ValueProgram& program) : program(program), segment(nullptr) {}
 
   ValueResult evalPoint(int32_t docid, float score);
   // Aggregate/facet scans call this with monotonically increasing document
@@ -150,6 +230,7 @@ public:
   int64_t arraySize(uint32_t node, int32_t docid, float score);
 
 private:
+  ValueResult evalShared(uint32_t index, const ValueNode& node, int32_t docid, float score);
   ValueResult evalColumnSequential(uint32_t node, int32_t docid,
                                    float score);
   bool readColumnSequential(uint32_t node, int32_t docid, int64_t& raw);

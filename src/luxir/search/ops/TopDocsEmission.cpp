@@ -230,16 +230,16 @@ void emitPage(const CollapsedPageSettings& settings,
           keyAt((size_t)rank.slot), mr, pool);
       size_t slot = (size_t)(i - offset);
       if (counts) counts[i - begin] = page->counts[slot];
-      if constexpr (metricOrder) {
-        if (ranks) collector.emitRank(ranks[i - begin], rank.slot, mr);
-      } else if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
-        emitCollapseRank(ranks[i - begin], settings.sort,
-            *qr.req.reader, rank.doc, rank.score, mr);
+      if constexpr (!metricOrder) {
+        if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
+          emitCollapseRank(ranks[i - begin], settings.sort,
+              *qr.req.reader, rank.doc, rank.score, mr);
+        }
       }
     }
     settings.collapse.renderKeys(table.keys, qr.flags, mr);
     if (ranks) {
-      if constexpr (metricOrder) collector.renderRanks(table.ranks, qr.flags, mr);
+      if constexpr (metricOrder) collector.renderRanks(table.ranks, scoreDocs.subspan((size_t)begin, (size_t)(end - begin)), qr.flags, mr);
       else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
     }
   };
@@ -254,7 +254,7 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.emitCount, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.documentFormat, emission, std::move(metadata), false, false, {}, qr.decorators);
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
@@ -321,14 +321,23 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, false, false, {}, qr.decorators);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
       // Opening the threshold alone does not invalidate an exhaustive count.
       int64_t found = collector.totalHits();
       bool foundGte = qr.boundedCount && collector.countIncomplete;
-      if (foundGte) found = qr.requirements.countLimit;
+      bool foundEstimated = false;
+      if (foundGte && qr.estimateCount) {
+        // Ranking pruned somewhere, so the segments' shares are the answer. All
+        // of them can still be exact, from metadata or a full count.
+        found = std::max(collector.estimatedHits, qr.requirements.countLimit);
+        foundEstimated = collector.countEstimated;
+        foundGte = !foundEstimated && collector.countFloored;
+      } else if (foundGte) {
+        found = qr.requirements.countLimit;
+      }
       emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
@@ -340,7 +349,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte);
+        emission, {}, foundGte, foundEstimated, {}, qr.decorators);
     }
   }
 

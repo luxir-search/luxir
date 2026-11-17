@@ -539,27 +539,45 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   EXPECT_EQ(60u, req2->getDocs().size());
 }
 
-TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncatesSilently) {
+TEST_F(FuzzyQueryTest, explicitMaxExpansionsHasNoUpperBound) {
   CollectionHelper helper{"main"};
-  constexpr int32_t kMatches = FuzzyQuery::FUZZY_CLAUSE_BUDGET + 1;
+  constexpr int32_t kMatches = 5000;
+  constexpr std::pair<int32_t, int32_t> kPositions[] = {
+      {1, 2}, {1, 3}, {1, 4}, {1, 5}, {2, 3}, {2, 4}, {2, 5}, {3, 4}};
   for (int32_t i = 0; i < kMatches; i++) {
-    std::string term = "aaaaa";
-    int32_t pos = 1 + i / 25;
-    term[(size_t)pos] = (char)('b' + (i % 25));
+    std::string term = "aaaaaa";
+    auto [first, second] = kPositions[i / 625];
+    term[(size_t)first] = (char)('b' + (i % 625) / 25);
+    term[(size_t)second] = (char)('b' + (i % 625) % 25);
     helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", term),
                  i == kMatches - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
-  // Explicit max_expansions above the budget: the budget clamps without a
-  // request warning. The truncation is execution policy, not response data.
+  auto matches = [&](int32_t maxExpansions, bool scored) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& op = req->collection("main").topDocs("q")
+        .fuzzyQuery("body_w", "aaaaaa", 2, 0, maxExpansions)
+        .limit(10).countLimit();
+    if (scored) op.getScores();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_TRUE(req->respWarnings().empty());
+    return req->getMatchCount();
+  };
+  for (bool scored : {false, true}) {
+    EXPECT_EQ(65, matches(65, scored));
+    EXPECT_EQ(4500, matches(4500, scored));
+    EXPECT_EQ(kMatches, matches(kMatches + 1, scored));
+  }
+
+  // Pruned top-k over the same clause count.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
-      .fuzzyQuery("body_w", "aaaaa", 1, 0, 100)
-      .fields({"id"}).limit(100).getScores();
+      .fuzzyQuery("body_w", "aaaaaa", 2, 0, 4500)
+      .fields({"id"}).limit(10).getScores();
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ((size_t)FuzzyQuery::FUZZY_CLAUSE_BUDGET, req->getDocs().size());
-  EXPECT_TRUE(req->respWarnings().empty());
+  EXPECT_EQ(10u, req->getDocs().size());
 }
 
 TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {

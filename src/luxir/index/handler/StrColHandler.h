@@ -28,10 +28,8 @@ namespace luxir::handler {
 ///   - endValueRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
-  StringValue stringValue;
+  StringValue<false> stringValue;
   std::vector<std::string_view> docValues;
-  std::vector<std::string> normalizedValues; // retained slots; views built after materialization
-  size_t normalizedBytes = 0;
   size_t scratchBytes = 0;
 
 protected:
@@ -80,48 +78,15 @@ public:
   ~StrColHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<std::string_view>(val.kind)) {
-      indexSingle(inverter, std::get<std::string_view>(val.kind));
-    }
-    else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
-      // TODO: only OK if this is a binary type, otherwise we could accept non-unicode and then attempt
-      // to return that as a string later and cause gRPC or someone else up the line to choke.
-      const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
-      indexSingle(inverter, std::string_view((const char*)b.data(), b.size()));
-    }
-    else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
-      const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
-      indexMulti(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
-    }
-    else if (std::holds_alternative<luxir::api::ArrBin>(val.kind)) {
-      const auto& arr = std::get<luxir::api::ArrBin>(val.kind).v;
-      docValues.clear();
-      auto account = scope_guard([&] { accountScratch(inverter); });
-      docValues.reserve(arr.size());
-      for (const auto& bin : arr) {
-        docValues.emplace_back((const char*)bin.data(), bin.size());
-      }
-      indexMulti(inverter, docValues);
-    }
-    else if (coerce::isNull(val)) {
+    if (auto s = std::get_if<std::string_view>(&val.kind)) {
+      index(inverter, *s);
       return;
     }
-    else if (coerce::isArray(val)) {
-      // Coerce and normalize once, before any column stream changes.
+    if (coerce::isNull(val)) return;
+    if (coerce::isArray(val)) {
       auto account = scope_guard([&] { accountScratch(inverter); });
-      char buf[coerce::TEXT_BUF_SIZE];
-      size_t count = 0;
-      coerce::forEachElement(val, [&](const IndexVal& elem) {
-        materialize(count++, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
-      });
-      materializedViews(count);
-      appendDocValues(inverter);
-    }
-    else {
-      // numeric scalars: store the canonical rendering
-      char buf[coerce::TEXT_BUF_SIZE];
-      indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
-    }
+      appendPrepared(inverter, stringValue.prepareMany(val, std::string_view(fieldName)));
+    } else indexSingle(inverter, val);
   }
 
   void index(Inverter& inverter, std::string_view val) override {
@@ -129,84 +94,38 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
-    indexMulti(inverter, vals);
-  }
-
-  void indexSingle(Inverter& inverter, std::string_view term) {
-    if (!stringValue.hasNormalizer()) {
-      appendSingle(inverter, term);
-      return;
-    }
     auto account = scope_guard([&] { accountScratch(inverter); });
-    appendSingle(inverter, stringValue.normalize(term));
-  }
-
-  void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
-    if (vals.empty()) return;
-    if (!fieldType->multiValued()) {
-      if (vals.size() > 1) {
-        throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
-                                        std::string_view(fieldName)));
-      }
-      indexSingle(inverter, vals[0]);
-      return;
-    }
-    // Validate every value before starting a column row. A later failure must
-    // not leave the row's value count or end offsets incomplete.
-    if (!stringValue.hasNormalizer() && !fieldType->multiSet()) {
-      appendMulti(inverter, vals);
-      return;
-    }
-    auto account = scope_guard([&] { accountScratch(inverter); });
-    if (stringValue.hasNormalizer()) {
-      normalizedValues.reserve(vals.size());
-      for (size_t i = 0; i < vals.size(); i++) materialize(i, vals[i]);
-      materializedViews(vals.size());
-    } else if (vals.data() != docValues.data()) {
-      docValues.assign(vals.begin(), vals.end());
-    }
-    appendDocValues(inverter);
+    appendPrepared(inverter, stringValue.prepareMany(vals, std::string_view(fieldName)));
   }
 
 private:
-  static size_t heapBytes(const std::string& value) {
-    return value.capacity() > std::string{}.capacity() ? value.capacity() + 1 : 0;
-  }
-
-  void materialize(size_t index, std::string_view value) {
-    if (index == normalizedValues.size()) normalizedValues.emplace_back();
-    auto& target = normalizedValues[index];
-    size_t before = heapBytes(target);
-    auto account = scope_guard([&] { normalizedBytes = normalizedBytes - before + heapBytes(target); });
-    target.assign(value);
-    stringValue.normalizeInPlace(target);
-  }
-
-  void materializedViews(size_t count) {
-    docValues.clear();
-    docValues.reserve(count);
-    for (size_t i = 0; i < count; i++) docValues.emplace_back(normalizedValues[i]);
-  }
-
-  void appendDocValues(Inverter& inverter) {
-    if (docValues.empty()) return;
-    if (!fieldType->multiValued()) {
-      if (docValues.size() > 1) throw DocumentError(fmt::format(
-          "Field '{}' is single-valued but received multiple values", std::string_view(fieldName)));
-      appendSingle(inverter, docValues[0]);
+  template <typename T>
+  void indexSingle(Inverter& inverter, const T& val) {
+    if (!stringValue.hasNormalizer()) {
+      appendSingle(inverter, stringValue.prepare(val, std::string_view(fieldName)));
       return;
     }
-    if (fieldType->multiSet()) {
+    auto account = scope_guard([&] { accountScratch(inverter); });
+    appendSingle(inverter, stringValue.prepare(val, std::string_view(fieldName)));
+  }
+
+  void appendPrepared(Inverter& inverter, std::span<const std::string_view> vals) {
+    if (vals.empty()) return;
+    if (!fieldType->multiValued()) {
+      if (vals.size() > 1) throw DocumentError(fmt::format(
+          "Field '{}' is single-valued but received multiple values", std::string_view(fieldName)));
+      appendSingle(inverter, vals[0]);
+    } else if (fieldType->multiSet()) {
+      docValues.assign(vals.begin(), vals.end());
       std::ranges::sort(docValues);
       docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
-    }
-    appendMulti(inverter, docValues);
+      appendMulti(inverter, docValues);
+    } else appendMulti(inverter, vals);
   }
 
   void accountScratch(Inverter& inverter) {
     scratchBytes = docValues.capacity() * sizeof(std::string_view)
-        + normalizedValues.capacity() * sizeof(std::string)
-        + normalizedBytes + stringValue.retainedBytes();
+        + stringValue.retainedBytes();
     accountExtraRam(inverter, valuesFile.size() + scratchBytes);
   }
 

@@ -21,6 +21,14 @@
 
 namespace luxir::coerce {
 
+enum class DecimalRounding : uint8_t { NEAREST_AWAY, FLOOR, CEIL, EXACT };
+enum class DecimalError : uint8_t { INVALID, INEXACT, BELOW_RANGE, ABOVE_RANGE };
+
+std::optional<int64_t> parseScaledDecimal(std::string_view text, int32_t scale,
+    DecimalRounding rounding, DecimalError& error);
+std::optional<int64_t> parseScaledDecimal(const api::Val& value, int32_t scale,
+    DecimalRounding rounding, DecimalError& error);
+
 // Single implementation of the Val -> field-native conversion rules.
 // Index-time handlers and query-time building share these so both sides
 // coerce identically: a doc ingested via one rule must be findable by
@@ -94,7 +102,7 @@ inline api::Val scalarVal(auto value) {
 
 // Typed scalar entry points let homogeneous array consumers select the Val arm
 // once, outside their element loop. They intentionally mirror the Val coercion
-// contract below; scalarVal is only called on a failing typed-coercion path.
+// contract below; scalarVal also feeds the field-specific query hooks.
 template<typename T>
 inline std::optional<int64_t> tryToInt64Scalar(T value) {
   using V = std::remove_cvref_t<T>;
@@ -102,7 +110,8 @@ inline std::optional<int64_t> tryToInt64Scalar(T value) {
     return value;
   } else if constexpr (std::is_same_v<V, std::string_view>) {
     if (auto parsed = parseInt64(value)) return parsed;
-    if (auto parsed = parseDouble(value)) return tryToInt64Scalar(*parsed);
+    DecimalError error;
+    return parseScaledDecimal(value, 0, DecimalRounding::EXACT, error);
   } else if constexpr (std::is_same_v<V, double> || std::is_same_v<V, float>) {
     double widened = (double)value;
     if (widened >= INT64_LO && widened < INT64_HI && std::trunc(widened) == widened) {
@@ -123,6 +132,7 @@ inline std::optional<int64_t> tryToInt64(const api::Val& val) {
 template<typename T>
 inline int64_t toInt64Scalar(T value, std::string_view fieldName) {
   if (auto parsed = tryToInt64Scalar(value)) return *parsed;
+  // TODO: DECIMAL rounds instead; the INT ingest policy is still undecided.
   using V = std::remove_cvref_t<T>;
   if constexpr (std::is_same_v<V, std::string_view>) {
     if (parseDouble(value)) {

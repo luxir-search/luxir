@@ -2083,6 +2083,25 @@ public:
     fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
   }
 
+  // Writes the docs-with-field set of a field from its docs in increasing
+  // order: the bitset when some of the segment's docs lack the field, else
+  // just the dense count. For indexed fields without a column.
+  template <class ForEachDoc>
+  static void write(MemPool& pool, PostingsWriter& postingsWriter,
+                    PostingsWriter::IndexFieldInfo& fieldInfo, int32_t numDocs,
+                    ForEachDoc&& forEachDoc) {
+    if (numDocs == postingsWriter.getMaxDoc()) {
+      fieldInfo.docsWithField = numDocs;
+      fieldInfo.docsWithFieldEndLoc = {0, 0};
+      return;
+    }
+    auto guard = pool.rewindScopeGuard();
+    DocsWithValWriter writer(pool, postingsWriter, fieldInfo);
+    forEachDoc([&](int32_t doc) { writer.startDoc(doc); });
+    assert(writer.numAdded() == numDocs);
+    writer.finish();
+  }
+
   // Signal that the column has all docs present. No docs should be added in this case, but the count
   // in fieldInfo should be filled in.
   void finishDense(int32_t numDocs) {

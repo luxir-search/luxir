@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -36,6 +38,12 @@ public:
     return field == rhs.field && lower == rhs.lower
         && upper == rhs.upper && includeLower == rhs.includeLower
         && includeUpper == rhs.includeUpper;
+  }
+
+  std::string describe() const override {
+    return std::format("range query {}{}, {}{} on field '{}'",
+                       includeLower ? '[' : '(', lower.value_or("*"),
+                       upper.value_or("*"), includeUpper ? ']' : ')', field);
   }
 
   uint64_t hashImpl() const override {

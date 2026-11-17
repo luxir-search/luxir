@@ -25,6 +25,7 @@ class PointsReader {
   const char* leafMins = nullptr;
   const char* leafMaxes = nullptr;
   const char* leafPointers = nullptr;
+  const char* leafEncodings = nullptr;
   uint64_t pointsFileOffset = 0;
   uint64_t metaOffset = 0;
   uint64_t pointsCount = 0;
@@ -75,7 +76,8 @@ class PointsReader {
     directoryFileOffset = (directoryFileOffset + 7) & ~(uint64_t)7;
     uint64_t directoryOff = directoryFileOffset - pointsFileOffset;
     uint64_t directoryBytes = (uint64_t)leavesCount * sizeof(int64_t) * 2
-                            + ((uint64_t)leavesCount + 1) * sizeof(uint64_t);
+                            + ((uint64_t)leavesCount + 1) * sizeof(uint64_t)
+                            + (uint64_t)leavesCount * sizeof(uint32_t);
     if (directoryOff > (uint64_t)(fileEnd - points)
         || directoryBytes > (uint64_t)(fileEnd - points) - directoryOff) {
       invalid("truncated leaf directory");
@@ -84,6 +86,7 @@ class PointsReader {
     leafMins = points + directoryOff;
     leafMaxes = leafMins + (uint64_t)leavesCount * sizeof(int64_t);
     leafPointers = leafMaxes + (uint64_t)leavesCount * sizeof(int64_t);
+    leafEncodings = leafPointers + ((uint64_t)leavesCount + 1) * sizeof(uint64_t);
 
     if (leafFP(0) != 0) invalid("first leaf pointer must be zero");
     if (leafFP(leavesCount) != metaOffset) invalid("final leaf pointer does not equal pointsMetaOff");
@@ -112,6 +115,106 @@ public:
     uint64_t begin;
     uint64_t end;
   };
+
+  struct EmissionWork {
+    uint64_t leaves = 0;
+    uint64_t decodedBits = 0;
+    uint64_t scattered = 0;
+    uint64_t bitsetWords = 0;
+    uint64_t runWords = 0;
+    uint64_t selects = 0;
+
+    EmissionWork& operator+=(const EmissionWork& other) {
+      leaves += other.leaves;
+      decodedBits += other.decodedBits;
+      scattered += other.scattered;
+      bitsetWords += other.bitsetWords;
+      runWords += other.runWords;
+      selects += other.selects;
+      return *this;
+    }
+  };
+
+  uint32_t leafEncoding(uint32_t leaf) const {
+    if (leaf >= leavesCount) throw std::out_of_range("PointsReader: leaf encoding index");
+    return load<uint32_t>(leafEncodings + (uint64_t)leaf * sizeof(uint32_t));
+  }
+
+  // Match emitOrdinalRange's leaf invocations, without touching leaf payloads.
+  EmissionWork emissionWork(uint64_t begin, uint64_t end) const {
+    if (begin > end || end > pointsCount) {
+      throw std::out_of_range("PointsReader: emission ordinal range");
+    }
+    EmissionWork work;
+    if (begin == end) return work;
+    uint32_t firstLeaf = (uint32_t)(begin / leafSizeMax);
+    uint32_t lastLeaf = (uint32_t)((end - 1) / leafSizeMax);
+    auto boundary = [&](uint32_t leaf, uint64_t first, uint64_t last) {
+      uint64_t count = leafOrdinalEnd(leaf) - leafOrdinalStart(leaf);
+      uint32_t encoding = leafEncoding(leaf);
+      uint32_t detail = encoding >> 2;
+      work.leaves++;
+      switch (encoding & 3) {
+        case PointsWriter::DOC_CONTIG:
+          work.runWords += (detail + last - 1) / 64 - (detail + first) / 64 + 1;
+          break;
+        case PointsWriter::DOC_FOR:
+          work.decodedBits += count * detail; // Partial ranges decode the whole leaf.
+          work.scattered += last - first;
+          break;
+        case PointsWriter::DOC_BITSET:
+          work.bitsetWords += detail;
+          if (first != 0 || last != count) {
+            // Rank selections plus the emission pass: conservative bounds,
+            // since exact boundary word positions require reading the bitmap.
+            work.bitsetWords += first == 0 ? 1 : detail;
+            work.selects++;
+            if (last != count) {
+              work.bitsetWords += detail;
+              work.selects++;
+            }
+          }
+          break;
+        default: invalid("reserved summary docid codec");
+      }
+    };
+    uint64_t firstStart = (uint64_t)firstLeaf * leafSizeMax;
+    if (firstLeaf == lastLeaf) {
+      boundary(firstLeaf, begin - firstStart, end - firstStart);
+      return work;
+    }
+    boundary(firstLeaf, begin - firstStart, leafSizeMax);
+    boundary(lastLeaf, 0, end - (uint64_t)lastLeaf * leafSizeMax);
+
+    // Interior leaves are full. Stream the packed summaries without ordinal
+    // arithmetic or checked directory lookups; multiply FOR totals once.
+    uint64_t forLeaves = 0, docBits = 0, bitsetWords = 0, runWords = 0;
+    const char* stop = leafEncodings + (uint64_t)lastLeaf * sizeof(uint32_t);
+    for (const char* p = leafEncodings + ((uint64_t)firstLeaf + 1) * sizeof(uint32_t);
+         p < stop; p += sizeof(uint32_t)) {
+      uint32_t encoding = load<uint32_t>(p);
+      uint32_t detail = encoding >> 2;
+      switch (encoding & 3) {
+        case PointsWriter::DOC_CONTIG:
+          runWords += (detail + leafSizeMax + 63) >> 6;
+          break;
+        case PointsWriter::DOC_FOR:
+          forLeaves++;
+          docBits += detail;
+          break;
+        case PointsWriter::DOC_BITSET:
+          bitsetWords += detail;
+          break;
+        default: invalid("reserved summary docid codec");
+      }
+    }
+    work.leaves += lastLeaf - firstLeaf - 1;
+    work.decodedBits += docBits * leafSizeMax;
+    work.scattered += forLeaves * leafSizeMax;
+    work.bitsetWords += bitsetWords;
+    work.runWords += runWords;
+    return work;
+  }
 
   struct Point {
     int64_t value;
@@ -569,6 +672,11 @@ public:
       if (i > 0 && leafMin(i) < leafMax(i - 1)) invalid("leaf value ranges are out of order");
 
       auto info = leafInfo(i);
+      uint32_t detail = info.docCodec == PointsWriter::DOC_CONTIG ? info.docBase & 63
+          : info.docCodec == PointsWriter::DOC_FOR ? info.docBits : info.docBytes / 8;
+      if (leafEncoding(i) != (detail << 2 | info.docCodec)) {
+        invalid("leaf encoding summary does not match header");
+      }
       if (info.count == 0 || info.count > leafSizeMax) invalid("invalid leaf point count");
       if (i + 1 < leavesCount && info.count != leafSizeMax) {
         invalid("non-final leaf is not full");
