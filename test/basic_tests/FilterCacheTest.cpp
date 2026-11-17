@@ -2250,8 +2250,10 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
     req->execute(1); EXPECT_OK(req); EXPECT_EQ(8, req->getMatchCount());
   };
   for (int i = 0; i < 3; i++) { count(false); count(true); }
+  // to_parent only borrows its child set; the child-domain view builds it, so
+  // one entry serves both views.
   auto entries = shared->dump(10, nullptr);
-  ASSERT_EQ(2u, entries.size());
+  ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) EXPECT_EQ(2u, entry.segmentsResident);
   auto warm = shared->counters();
   EXPECT_GT(warm.hits, 0u);
@@ -2265,7 +2267,7 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
     EXPECT_NE(segment.segInfo.seg_id, merged->segments()[0].segInfo.seg_id);
   }
   EXPECT_TRUE(shared->dump(10, nullptr).empty());
-  EXPECT_EQ(warm.purges + 4, shared->counters().purges);
+  EXPECT_EQ(warm.purges + 2, shared->counters().purges);
   EXPECT_EQ(0u, shared->bytesUsed());
   // Admission history belongs to the key; the first new sighting builds a
   // fresh slot under the merged segment identity, then both views hit it.
@@ -2276,7 +2278,7 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
     EXPECT_EQ(1u, entry.segmentsResident);
     EXPECT_TRUE(std::ranges::any_of(entries, [&](const auto& prior) { return prior.keyHash == entry.keyHash; }));
   }
-  EXPECT_EQ(warm.builds + 2, shared->counters().builds);
+  EXPECT_EQ(warm.builds + 1, shared->counters().builds);
   auto hits = shared->counters().hits;
   count(false); count(true);
   EXPECT_GT(shared->counters().hits, hits);

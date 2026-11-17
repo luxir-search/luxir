@@ -65,10 +65,10 @@ public:
       auto& leaf = source.segments()[(size_t)segment.ord];
       auto childMode = child->consumesDomain() ? mode : Query::SupplierExecutionMode::RAW_MEMBERSHIP;
       auto* supplier = childUse
+          // The relation verifies child rows lazily for the owners it visits, so
+          // a miss must not build a set over every row of the path.
           ? QueryPrep::filterSupplier(pool, input, source, leaf,
-                allowsPruning() ? QueryPrep::FilterSupplierMode::DENSITY_ROUTED
-                    : QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE,
-                0, childMode)
+                QueryPrep::FilterSupplierMode::RESIDENT_ONLY, 0, childMode)
           : input.segmentSource().scorerSupplier(pool, leaf, childMode);
       if (!supplier) return nullptr;
       return relation.reduce(pool, (size_t)segment.ord, *supplier,
