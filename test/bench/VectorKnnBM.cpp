@@ -880,7 +880,9 @@ void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
 // (LUXIR_VECTOR_DIMS, default 768); the last LUXIR_VECTOR_QUERIES rows
 // (default 200) are held-out queries and up to LUXIR_VECTOR_N (default: the
 // rest) leading rows are indexed into LUXIR_VECTOR_SEGMENTS (default 4)
-// segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).  Per
+// segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).
+// LUXIR_FORCE_FAISS_RABITQ, when set, uses FAISS's RaBitQ distance computer
+// instead of RaBitQScorer, to compare both kernels with one binary. Per
 // codec it reports the aux build time (train + encode + write over every
 // segment), overlay bytes per vector, recall@10 against the exact path, and
 // serial single-query latency.  Instances are grouped by codec so the built
@@ -1042,7 +1044,9 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     builtCodec = codec;
   }
-  SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion);
+  SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion,
+                             KnnQuery::forceFaissRaBitQ);
+  KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
   KnnQuery::tuning.routing = (KnnQuery::Routing)state.range(4);
   KnnQuery::tuning.selector = (KnnPlanner::Selector)state.range(5);
   KnnQuery::tuning.completion = (KnnQuery::Completion)state.range(6);
@@ -1165,6 +1169,8 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
 
 void BM_VectorAnnDataset(benchmark::State& state) {
   ForceIvfGuard forceIvf;
+  SearchOverridesGuard savedKernel(KnnQuery::forceFaissRaBitQ);
+  KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
   int32_t codec = (int32_t)state.range(0);
