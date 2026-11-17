@@ -7,7 +7,7 @@
 #include <optional>
 
 #include "DocsReader.h"
-#include "IntColReader.h"
+#include "MonoReader.h"
 #include "PostingsReader.h"
 
 namespace luxir {

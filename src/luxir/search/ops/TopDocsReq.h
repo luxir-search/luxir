@@ -83,6 +83,20 @@ public:
   static inline bool
       disableExactCountTopKSparseFilterSinglePassForTests = false;
 
+  // A requested estimate. Where ranking pruned a segment, the segment counts the
+  // leading 1/64, then 1/8, of kEstimateSlices evenly spaced doc ranges until
+  // the sample holds kEstimateMinMatches matches (about 6% relative error for
+  // doc order independent of the query), and scales by the sampled fraction.
+  // That visits at most 1/8 of the segment, the estimator's whole budget: a
+  // full count runs only when the matches provably fit the same budget, and a
+  // sample too thin to scale reports the lower bound the segment can prove.
+  static constexpr int32_t kEstimateSlices = 16;
+  static constexpr int64_t kEstimateMinMatches = 256;
+  static constexpr int32_t kEstimateSampleShifts[] = {6, 3};
+  static constexpr int32_t kEstimateBudgetShift = 3;
+  // Below this, a full count costs too little to be worth sampling.
+  static constexpr int64_t kEstimateMinBudgetDocs = 8192;
+
   // Filtered MUST conjunctions can abandon competitive-score pruning when the
   // filter caps the candidate set tightly enough. The depth-specific knees
   // bracketed on the 5M Wikipedia corpus are:
@@ -108,6 +122,10 @@ public:
   // complete constant-scoring top-k requests, and disables the limit-only
   // bounded drain for parity tests.
   static inline bool disableConstantWindowCaptureForTests = false;
+  // A bounded count pass counts ranges of this many docids (several count
+  // windows), checking the shared total after each: a stop overshoots the
+  // limit by at most one range.
+  static inline int32_t boundedCountRangeDocsForTests = 1 << 16;
 
   enum class ConstantScoreDisposition : uint8_t {
     NOT_CONSTANT_TOP_K,
@@ -265,7 +283,7 @@ public:
         || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
       return false;
     }
-    return FieldType::sortsByIntColumn(const_cast<FieldType&>(
+    return FieldType::isNumericColumn(const_cast<FieldType&>(
         sortPlan.clauses[0].getSortField().getFieldType()).type());
   }
 
@@ -481,9 +499,7 @@ public:
       if (supplier != nullptr) {
         int64_t estimatedCard = supplier->cost();
         if (segment.hasDeletes()) {
-          estimatedCard = std::min(
-              estimatedCard,
-              (int64_t)segment.liveDocs()->docset().card());
+          estimatedCard = std::min(estimatedCard, (int64_t)segment.numLive());
         }
         cards[s] = estimatedCard;
         auto context = supplier->makePlanContext(
@@ -581,6 +597,7 @@ public:
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::PlanningContext& planning;
   Query::Context* weightContext;
+  Query* resultQuery = nullptr;
   Query* query;
   Query::Weight* weight;
   Query::Weight* variantMembershipWeight;
@@ -598,7 +615,14 @@ public:
   CollectionRequirements requirements;
   // The requested quantity stays in requirements; exact routes need no hold.
   bool boundedCount = false;
+  // Unscored membership for a bounded count counted apart from ranking (see
+  // boundedCountThenCollectTopK); null keeps the held-threshold collection.
+  Query::Weight* boundedCountWeight = nullptr;
   bool countLimitProven = false;
+  // The request permits an estimate of this bounded count. The estimator
+  // samples through the ranking weight, scored with pruning allowed, so lazy
+  // plans stay lazy: an unscored weight would materialize a multi-term union.
+  bool estimateCount = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
@@ -613,10 +637,35 @@ public:
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
 
+  bool ownsMatchDomain() const override { return true; }
+
+  // Counting and ranking are priced apart, each at the matches it may visit.
+  // A count that metadata answers costs nothing, and score-ordered
+  // constant-score ranking stops at the first K. Sub-ops need every match. A
+  // prepared query's work is not a document count; it adds none.
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    if (weight == nullptr || weight->needsPrepare()) return total;
+    bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
+    for (auto& segment : view->segments()) {
+      auto shortcut = weight->countShortcut(segment, nullptr);
+      auto matches = (size_t) shortcut.maxMatches;
+      size_t counting = !requirements.needsCount()
+              || shortcut.how == Query::CountHow::METADATA
+          ? 0 : matches;
+      size_t ranking = !requirements.needRankedDocs ? 0
+          : firstK ? std::min(matches, (size_t) std::max<int64_t>(topCount, 0))
+          : matches;
+      size_t work = subOps.empty() ? std::max(counting, ranking) : matches;
+      total = saturatingAdd(total, work);
+    }
+    return total;
+  }
+
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, boundedCountWeight}) {
       if (source) source->releaseSegmentState(segment);
     }
     for (auto* source : filterWeights) source->releaseSegmentState(segment);
@@ -629,7 +678,7 @@ public:
 
   bool facetBucketSharesSegmentState() const override {
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, boundedCountWeight}) {
       if (source && source->hasReleasableSegmentState()) return true;
     }
     return std::ranges::any_of(filterWeights, [](const auto* source) {
@@ -686,7 +735,7 @@ public:
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         auto* collector = new MergeableCollector(
-            op.topCount, op.sortPlan, op.req.reader.get(),
+            op.topCount, op.sortPlan, op.view.get(),
             op.requestNeedsScores, op.collapse);
         if (collector->useFieldSort) {
           if (op.collapse != nullptr) collector->groupFieldCollector->primaryValues = op.sortValues;
@@ -699,12 +748,13 @@ public:
       };
       if (op.boundedCount) {
         scoreAccumulator.holdUntilHits(op.requirements.countLimit, op.countLimitProven);
+        boundedTotal.setLimit(op.requirements.countLimit);
       }
 
       if (op.subOps.size() > 0) {
         if (op.domainVariants.empty()
             || !op.domainVariants.needsInheritProduction()) {
-          output.resize(op.req.reader->segments().size());
+          output.resize(op.view->segments().size());
         }
         subCalcs.reserve(op.subOps.size());
         if (!op.domainVariants.empty()) {
@@ -721,7 +771,7 @@ public:
       }
       if (op.enrichGroups()) {
         memberReplay = std::make_unique<MemberReplay>(op.req.memoryTracker,
-            op.req.reader->segments().size());
+            op.view->segments().size());
       }
       requiresWholeIndexPrepare =
           op.weight != nullptr && op.weight->needsPrepare();
@@ -745,6 +795,10 @@ public:
 
     AtomicMerger<MergeableCollector> collectorMerger;
     MaxScoreAccumulator scoreAccumulator;
+    // Split bounded counts: the shared total, and a threshold open from the
+    // first page for their ranking passes.
+    BoundedHitTotal boundedTotal;
+    MaxScoreAccumulator rankingAccumulator;
 
 
     // Calc pins finalized eligibility and its replayable prepared SegmentSource
@@ -793,9 +847,8 @@ public:
     std::unique_ptr<StructuralResetState> structuralReset;
 
     DomainHandle resetBaseHandle(int32_t segment) {
-      auto& seg = thisOp().req.reader->segments()[(size_t)segment];
-      DomainHandle live = DomainHandle::pinned(
-          seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr, thisOp().req.reader);
+      auto& seg = thisOp().view->segments()[(size_t)segment];
+      DomainHandle live = DomainHandle::pinned(seg.liveDocSet(), thisOp().view).scoped(seg);
       if (!requiresWholeIndexPrepare) return structural->prefix(segment, std::move(live));
       auto& base = structuralReset->domains[(size_t)segment];
       if (!base) base = structural->prefix(segment, std::move(live));
@@ -809,8 +862,8 @@ public:
     DocSet* resetBase(int32_t segment) {
       if constexpr (Structural) return resetBaseHandle(segment).get();
       else {
-        auto& seg = op.req.reader->segments()[(size_t)segment];
-        return seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
+        auto& seg = op.view->segments()[(size_t)segment];
+        return seg.liveDocSet();
       }
     }
 
@@ -948,6 +1001,103 @@ public:
       return true;
     }
 
+    // Adds this segment's share of an estimated count, given the matches
+    // ranking saw before it pruned. Exact counts are never replaced by a guess,
+    // and a guess stays within the bounds index statistics prove.
+    void estimateSegmentCount(MemPool& pool, IndexReader::Segment& seg,
+                              DocSet* collectorFilter, auto& collector,
+                              int64_t seen) {
+      auto& weight = *thisOp().weight;
+      auto bounds = weight.countShortcut(seg, nullptr);
+      if (collectorFilter == nullptr && bounds.how == Query::CountHow::METADATA) {
+        collector.estimatedHits += bounds.maxMatches;
+        return;
+      }
+      // Clamp to the bounds; minMatches ignores a collector filter.
+      int64_t floor = collectorFilter == nullptr
+          ? std::max(seen, bounds.minMatches) : seen;
+      int64_t ceiling = bounds.maxMatches;
+      if (floor >= ceiling) {
+        collector.estimatedHits += floor;
+        return;
+      }
+      int32_t maxDoc = seg.maxDoc();
+
+      auto countRanges = [&](auto rangeOf) -> std::optional<int64_t> {
+        auto* supplier = weight.scorerSupplier(pool, seg);
+        if (supplier == nullptr) return std::nullopt;
+        Query::ScorerSupplier::BulkScorerContext bulkContext;
+        auto plan = supplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+        BulkScorer* bulk = nullptr;
+        Query::Scorer* scorer = nullptr;
+        if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+          bulk = supplier->buildBulk(pool, plan);
+        } else {
+          supplier->recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext, plan);
+        }
+        if (bulk == nullptr) {
+          scorer = buildPullScorer(pool, *supplier);
+          if (scorer == nullptr) return std::nullopt;
+        }
+        int64_t matches = 0;
+        for (int32_t slice = 0; slice < TopDocsReq::kEstimateSlices; slice++) {
+          auto [begin, end] = rangeOf(slice);
+          matches += bulk != nullptr
+              ? countMatchesInRange(bulk, collectorFilter, begin, end)
+              : countMatchesInRange(scorer, collectorFilter, begin, end);
+        }
+        return matches;
+      };
+
+      int64_t budget = std::max(
+          (int64_t) maxDoc >> TopDocsReq::kEstimateBudgetShift,
+          TopDocsReq::kEstimateMinBudgetDocs);
+      if (ceiling <= budget) {
+        auto matches = countRanges([&](int32_t slice) {
+          return std::pair(
+              (int32_t) ((int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices),
+              (int32_t) ((int64_t) maxDoc * (slice + 1) / TopDocsReq::kEstimateSlices));
+        });
+        collector.estimatedHits += std::max(matches.value_or(0), seen);
+        return;
+      }
+
+      // Each round counts only what the last one did not, so the walks add up
+      // to the final round's coverage.
+      auto sampleEnd = [&](int32_t slice, int32_t shift) {
+        int64_t begin = (int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices;
+        int64_t end = (int64_t) maxDoc * (slice + 1) / TopDocsReq::kEstimateSlices;
+        return (int32_t) (begin + std::max<int64_t>(1, (end - begin) >> shift));
+      };
+      int64_t matches = 0;
+      int64_t sampled = 0;
+      int32_t lastShift = -1;
+      for (int32_t shift : TopDocsReq::kEstimateSampleShifts) {
+        auto counted = countRanges([&](int32_t slice) {
+          int32_t begin = lastShift < 0
+              ? (int32_t) ((int64_t) maxDoc * slice / TopDocsReq::kEstimateSlices)
+              : sampleEnd(slice, lastShift);
+          int32_t end = sampleEnd(slice, shift);
+          sampled += end - begin;
+          return std::pair(begin, end);
+        });
+        if (!counted) break;
+        matches += *counted;
+        lastShift = shift;
+        if (matches >= TopDocsReq::kEstimateMinMatches) {
+          int64_t scaled = std::llround(
+              (double) matches * (double) maxDoc / (double) sampled);
+          collector.estimatedHits += std::clamp(scaled, floor, ceiling);
+          collector.countEstimated = true;
+          return;
+        }
+      }
+      collector.estimatedHits += floor;
+      collector.countFloored = true;
+    }
+
     void collectKnownCountTopK(
         MemPool& pool, int32_t segnum, int64_t count,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
@@ -955,6 +1105,81 @@ public:
         int32_t maxDoc, bool allowPruning,
         BulkScorer* exactScorer = nullptr) {
       int64_t before = collector.totalHits();
+      rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
+               maxDoc, allowPruning, allowPruning ? &scoreAccumulator : nullptr,
+               exactScorer);
+      int64_t ranked = collector.totalHits() - before;
+      assert(count >= ranked);
+      collector.hitCount += count - ranked;
+    }
+
+    // This segment's matches added to the request's bounded total with the
+    // unscored weight, a docid range at a time. Returns the segment's exact
+    // count, or nullopt once the total passes the limit here or in another
+    // segment.
+    std::optional<int64_t> countBounded(
+        IndexReader::Segment& seg, DocSet* collectorFilter, BulkScorer& bulk) {
+      int32_t rangeDocs = TopDocsReq::boundedCountRangeDocsForTests;
+      skipCount(SkipStats::boundedCountSegments);
+      int64_t count = 0;
+      int32_t maxDoc = seg.maxDoc();
+      for (int32_t min = 0; min < maxDoc;) {
+        int32_t max = (int32_t) std::min<int64_t>(maxDoc, (int64_t) min + rangeDocs);
+        int64_t matches = 0;
+        int32_t next = bulk.countNextWindow(matches, nullptr, collectorFilter, min, max);
+        if (next == PostingsReader::END) next = max;
+        assert(next > min);
+        count += matches;
+        if (boundedTotal.add(matches)) {
+          if (next < maxDoc) skipCount(SkipStats::boundedCountStops);
+          return std::nullopt;
+        }
+        min = next;
+      }
+      return count;
+    }
+
+    // A bounded count apart from ranking: the count pass stops at the limit,
+    // and ranking prunes from its first page. The total is exact unless it
+    // passed the limit, which the emission reports as at least the limit.
+    bool boundedCountThenCollectTopK(
+        MemPool& pool, int32_t segnum, IndexReader::Segment& seg,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        auto& collector) {
+      std::optional<int64_t> count;
+      if (!boundedTotal.exceeded()) {
+        auto* countSupplier = thisOp().boundedCountWeight->scorerSupplier(pool, seg);
+        if (countSupplier == nullptr) return true;
+        Query::ScorerSupplier::BulkScorerContext context;
+        auto plan = countSupplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, context);
+        // Candidate-by-candidate verification would be repeated by ranking.
+        // Keep the held pass unless counting has a bulk membership plan.
+        if (plan.available != Query::ScorerSupplier::BulkAnswer::YES) return false;
+        auto* bulk = countSupplier->buildBulk(pool, plan);
+        if (bulk == nullptr) return false;
+        count = countBounded(seg, collectorFilter, *bulk);
+      }
+      int64_t before = collector.totalHits();
+      if (collector.topCount > 0 && (!count || *count > 0)) {
+        rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
+                 seg.maxDoc(), true, &rankingAccumulator);
+      }
+      if (!count) {
+        collector.countIncomplete = true;
+        return true;
+      }
+      int64_t ranked = collector.totalHits() - before;
+      assert(*count >= ranked);
+      collector.hitCount += *count - ranked;
+      return true;
+    }
+
+    void rankTopK(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc, bool allowPruning,
+        MaxScoreAccumulator* accumulator, BulkScorer* exactScorer = nullptr) {
       if (rankingSupplier != nullptr) {
         Query::ScorerSupplier::BulkScorerContext bulkContext;
         auto plan = rankingSupplier->planBulk(
@@ -971,21 +1196,16 @@ public:
         if (rankingBulk != nullptr) {
           collectTopKWindowed(
               segnum, rankingBulk, collectorFilter, collector,
-              allowPruning ? &scoreAccumulator : nullptr,
-              maxDoc, allowPruning, exactScorer);
+              accumulator, maxDoc, allowPruning, exactScorer);
         } else {
           auto* rankingScorer = buildPullScorer(pool, *rankingSupplier);
           if (rankingScorer != nullptr) {
             collectTopK(
                 segnum, rankingScorer, collectorFilter, nullptr,
-                collector, allowPruning,
-                allowPruning ? &scoreAccumulator : nullptr);
+                collector, allowPruning, accumulator);
           }
         }
       }
-      int64_t ranked = collector.totalHits() - before;
-      assert(count >= ranked);
-      collector.hitCount += count - ranked;
     }
 
     void countThenCollectTopK(
@@ -999,6 +1219,37 @@ public:
       collectKnownCountTopK(
           pool, segnum, count, rankingSupplier, collectorFilter,
           collector, maxDoc, allowPruning, exactScorer);
+    }
+
+    // A single scorer ranks canonically by itself: count with the unscored
+    // weight (windowed when it can, else pulled), then rank with pruning.
+    void countThenRankWithoutRescoring(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto countPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      BulkScorer* countBulk = nullptr;
+      if (countPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+        countBulk = countSupplier.buildBulk(pool, countPlan);
+      } else {
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+      }
+      int64_t count = 0;
+      if (countBulk != nullptr) {
+        count = countMatchesWindowed(
+            countBulk, collectorFilter, nullptr, maxDoc);
+      } else if (auto* scorer = buildPullScorer(pool, countSupplier)) {
+        count = countMatchesInRange(scorer, collectorFilter, 0, maxDoc);
+      }
+      auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+          pool, thisOp().planning.topReader.segments()[segnum]);
+      collectKnownCountTopK(
+          pool, segnum, count, rankingSupplier, collectorFilter,
+          collector, maxDoc, true);
     }
 
     bool composeVariableScoreExactCountTopK(
@@ -1015,6 +1266,15 @@ public:
               != Query::ScorerSupplier::BulkAnswer::YES
           || scoringPlan.supportsExactCandidateScoring
               != Query::ScorerSupplier::BulkAnswer::YES;
+      if (scoringDeclined && scoringPlan.rankingScoresExact
+              == Query::ScorerSupplier::BulkAnswer::YES) {
+        scoringSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+            bulkContext, scoringPlan);
+        countThenRankWithoutRescoring(
+            pool, segnum, countSupplier, collectorFilter, collector, maxDoc);
+        return true;
+      }
       if (scoringDeclined) {
         auto countPlan = countSupplier.planBulk(
             Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
@@ -1114,23 +1374,23 @@ public:
         DomainHandle docs;
         if constexpr (Structural) {
           auto& sources = structural->producer->filterSources(op.filterWeights, op.filterUses,
-              *op.req.reader, op.planning, seg.ord, op.req.memoryTracker);
+              *op.view, op.planning, seg.ord, op.req.memoryTracker);
           assert(owner && owner->get() == baseDomain);
           docs = sources.resolve(source, *owner,
               prepared ? &(*prepared)[source] : nullptr);
         } else {
           docs = prepared != nullptr
               ? QueryPrep::materializeEffectiveFilter(
-                    (*prepared)[source], *op.req.reader, seg, baseDomain)
+                    (*prepared)[source], *op.view, seg, baseDomain)
               : QueryPrep::materializeEffectiveFilter(
-                    *op.filterWeights[source], op.filterUses[source], *op.req.reader, seg, baseDomain);
+                    *op.filterWeights[source], op.filterUses[source], *op.view, seg, baseDomain);
         }
         if constexpr (!Structural) if (reservation != nullptr && docs.get() != nullptr
             && docs.isDeliverable()) {
           reservation->grow(docs.get()->ramBytesUsed());
         }
         if (docs.get() == nullptr && filter.composesUnion()) {
-          return {};
+          return DomainHandle().scoped(seg);
         }
         sourcePtrs.push_back(docs.get());
         sources.push_back(std::move(docs));
@@ -1142,7 +1402,7 @@ public:
 
       assert(sourcePtrs.size() > 1);
       skipCount(SkipStats::selectionUnionCompositions);
-      DomainHandle result(DocSet::union_(sourcePtrs));
+      DomainHandle result = DomainHandle(DocSet::union_(sourcePtrs)).scoped(seg);
       if constexpr (Structural) {
         return DomainVariantPlan::account(std::move(result), op.req.memoryTracker, "selection union");
       } else {
@@ -1157,8 +1417,8 @@ public:
     DomainHandle buildEffectiveDomain(
         int32_t segnum, DocSet* baseDomain) {
       auto& op = thisOp();
-      if (op.filterWeights.empty()) return {};
-      auto& seg = op.req.reader->segments()[segnum];
+      if (op.filterWeights.empty()) return DomainHandle().scoped(op.view->segments()[segnum]);
+      auto& seg = op.view->segments()[segnum];
 
       std::vector<DomainHandle> filters;
       std::vector<DocSet*> filterPtrs;
@@ -1175,12 +1435,12 @@ public:
         }
       }
       assert(source == op.filterWeights.size());
-      if (filterPtrs.empty()) return {};
+      if (filterPtrs.empty()) return DomainHandle().scoped(seg);
       if (filterPtrs.size() == 1) {
         auto result = std::move(filters[0]);
         return std::move(result).pinnedWith(op.planning.filterUses);
       }
-      return DomainHandle(DocSet::intersect(filterPtrs));
+      return DomainHandle(DocSet::intersect(filterPtrs)).scoped(seg);
     }
 
     void configureDiversify();
@@ -1189,7 +1449,7 @@ public:
     void completeEmpty(oneapi::tbb::task_group* tg) {
       std::span<const DomainHandle> noDomains;
       for (auto& subCalc : subCalcs) {
-        subCalc->calcAll(tg, noDomains);
+        subCalc->acceptAll(tg, noDomains);
       }
       doneCollecting<MetricGroups>();
     }
@@ -1212,7 +1472,7 @@ public:
     void dispatch(
         oneapi::tbb::task_group* tg,
         std::span<const DomainHandle> domains) {
-      assert(domains.size() == thisOp().req.reader->segments().size());
+      assert(domains.size() == thisOp().view->segments().size());
       // Keep the same task-stack ordering as Calculator::calcAll, except
       // that a field sort visits segments in its visit order
       // (fieldSortVisitOrder). Sequentially, one collector then carries its
@@ -1227,13 +1487,14 @@ public:
           && op.sortPlan.useFieldSort && op.topCount > 0
           && !disableFieldSortPruning) {
         order = fieldSortVisitOrder(
-            fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
+            fieldSortSegmentKeys(*op.view, op.sortPlan, op.sortValues),
             op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
       }
       task_group_fanout(tg, domains.size(), [&](size_t i) {
         int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
+          domain.assertScope(thisOp().view->segments()[(size_t)segnum]);
           doCollect<Structural, MetricGroups, Admission>(tg, segnum, domain);
         };
       });
@@ -1245,7 +1506,7 @@ public:
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation,
         const DomainHandle* owner = nullptr) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       std::vector<DomainHandle> filters;
       filters.reserve(op.filters.size());
       size_t source = 0;
@@ -1268,7 +1529,7 @@ public:
         int32_t segnum,
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       DomainHandle base;
       DocSet* live;
       if constexpr (Structural) {
@@ -1295,7 +1556,7 @@ public:
         const std::shared_ptr<DomainVariantPlan::Reservation>& reservation,
         const DomainHandle* owner = nullptr) {
       auto& op = thisOp();
-      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      auto& seg = op.view->segments()[(size_t) segnum];
       DocSet* live = resetBase<Structural>(segnum);
       if (!preparedDomainExtraSets.empty()
           && op.domainVariants.sourceIsResetExtra(source)
@@ -1312,7 +1573,7 @@ public:
       }
       if constexpr (Structural) {
         auto& sources = structural->producer->segmentSources(
-            op.domainVariants, *op.req.reader, op.planning, segnum, op.req.memoryTracker);
+            op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
         assert(owner && owner->get() == base);
         return sources.resolve(source, *owner,
             preparedDomainSources.empty() ? nullptr : &preparedDomainSources[source]);
@@ -1321,9 +1582,9 @@ public:
           ? QueryPrep::materializeEffectiveFilter(
                 *op.domainVariants.sourceWeight(source),
                 op.domainVariants.sourceUse(source),
-                *op.req.reader, seg, base)
+                *op.view, seg, base)
           : QueryPrep::materializeEffectiveFilter(
-                preparedDomainSources[source], *op.req.reader, seg, base);
+                preparedDomainSources[source], *op.view, seg, base);
       if (result.get() != nullptr && result.isDeliverable()) {
         reservation->grow(result.get()->ramBytesUsed());
       }
@@ -1378,7 +1639,7 @@ public:
         std::vector<DomainHandle> domains;
         if (op.domainVariants.segmentLocal(structural->hasSelection())) {
           auto& sources = structural->producer->segmentSources(
-              op.domainVariants, *op.req.reader, op.planning, segnum, op.req.memoryTracker);
+              op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
           domains = op.domainVariants.produceSegment(sources, {}, base,
               op.req.memoryTracker, bases, DomainVariantPlan::Frame::RESET);
         } else {
@@ -1591,7 +1852,7 @@ public:
           } else if (reusableRaw != nullptr) {
             DomainHandle rawMatches = op.domainVariants.constrainRaw<Structural>(
                 DomainHandle::pinned(
-                    reusableRaw, op.planning.filterUses),
+                    reusableRaw, op.planning.filterUses).scoped(seg),
                 baseDomain,
               Structural ? &op.req.memoryTracker : nullptr);
             result.inheritBases = op.domainVariants.produceSharedBases<Structural>(
@@ -1654,7 +1915,7 @@ public:
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get();
+      DocSet* domain = domainHandle.get(op.view->segments()[segnum]);
 
       // A constant-scoring match-all is the identity on its domain: every doc
       // in the domain matches, all with the same score.  So the domain IS the
@@ -1671,7 +1932,7 @@ public:
       std::unique_ptr<std::conditional_t<MetricGroups, MetricGroupData, MergeableCollector>> data;
       std::optional<RoutedProduction> routedProduction;
       DocSet* routedBaseDomain = nullptr;
-      int64_t numSegs = (int64_t)op.req.reader->segments().size();
+      int64_t numSegs = (int64_t)op.view->segments().size();
 
       {
         auto& seg = op.planning.topReader.segments()[segnum];
@@ -1694,7 +1955,7 @@ public:
               std::vector<DomainHandle> parts{domainHandle};
               for (size_t i = 0; i < op.filterWeights.size(); i++) {
                 parts.push_back(QueryPrep::materializeEffectiveFilter(
-                    *op.filterWeights[i], op.filterUses[i], *op.req.reader, seg, nullptr));
+                    *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
               }
               domainHandle = memberReplay->compose(std::move(parts),
                   op.domainVariants.estimatedSetBytes(seg.maxDoc()));
@@ -1714,7 +1975,7 @@ public:
           if (!requiresWholeIndexPrepare && op.domainVariants.empty() && !memberReplay) {
             for (size_t i = 0; i < op.filterWeights.size(); i++) {
               parts.push_back(QueryPrep::materializeEffectiveFilter(
-                  *op.filterWeights[i], op.filterUses[i], *op.req.reader, seg, nullptr));
+                  *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
             }
           }
           auto eligibility = DomainVariantPlan::compose(std::move(parts));
@@ -1732,6 +1993,20 @@ public:
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
+          // A segment ranking never pruned has its exact count already. Track
+          // pruning per segment, restoring the collector's own flag afterward.
+          int64_t hitsBeforeSegment = 0;
+          bool prunedBeforeSegment = false;
+          DocSet* estimateFilter = nullptr;
+          bool estimatorReady = false;
+          if constexpr (!Collapsed) {
+            if (op.estimateCount) {
+              hitsBeforeSegment = scoreCollector->totalHits();
+              prunedBeforeSegment = scoreCollector->countIncomplete;
+              scoreCollector->countIncomplete = false;
+            }
+          }
+
           // Field-sorted ranking is the one thing a match-all still has to
           // iterate for: it orders by column values the domain says nothing
           // about.  A count-only field sort (limit 0) reads nothing back, so it
@@ -1744,7 +2019,7 @@ public:
           if (!requiresWholeIndexPrepare && op.requirements.needExactDomain
               && !op.exactDomainPlan.empty()) {
             auto result = op.exactDomainPlan.produce(
-                poolGuard.pool(), *op.req.reader, seg, domain);
+                poolGuard.pool(), *op.view, seg, domain);
             exactDomain = result.available;
             if (exactDomain) {
               if (result.docs.get() == domain) {
@@ -1777,7 +2052,7 @@ public:
               && !(matchEverything && (rankFromDocOrder || data->topCount() == 0))
               && !op.wholeMembershipPlan.empty()) {
             wholeMembershipResult = op.wholeMembershipPlan.resolve(
-                *op.req.reader, seg, domain, preparedWeight.get(),
+                *op.view, seg, domain, preparedWeight.get(),
                 [&](Query::Weight& resolver) {
                   return &resolver == op.weight ? obtainMainSupplier()
                       : resolver.scorerSupplier(poolGuard.pool(), seg);
@@ -1806,7 +2081,7 @@ public:
               if (!output.empty()) {
                 output[(size_t)segnum] =
                     DomainHandle::pinned(
-                        borrowedDomain, op.planning.filterUses);
+                        borrowedDomain, op.planning.filterUses).scoped(seg);
               }
             }
           }
@@ -1837,18 +2112,23 @@ public:
               if (wholeMembershipResult.count > 0) {
                 Query::Scorer* scorer = nullptr;
                 DocSet* collectorFilter = domain;
-                if (wholeMembershipResult.docs.get() != nullptr) {
-                  scorer = QueryPrep::createDocSetScorer(
-                      poolGuard.pool(), wholeMembershipResult.docs.get(), seg,
-                      op.scoreProfile.value);
-                  collectorFilter = nullptr;
-                } else {
+                auto constant = op.scoreProfile.kind == Query::ScoreProfile::Kind::VARIABLE
+                    ? std::optional<float>{} : std::optional<float>{op.scoreProfile.value};
+                if (!constant || wholeMembershipResult.docs.get() == nullptr) {
                   auto* rankingSupplier = obtainMainSupplier();
                   if (rankingSupplier != nullptr) {
                     scorer = buildBoundedConstantScorer(
                         poolGuard.pool(), *rankingSupplier, collectorFilter,
                         scoreCollector->topCount);
+                    if (scorer != nullptr && !constant) constant = scorer->constantContribution();
                   }
+                }
+                // Execution can prove uniformity without a query-tree score
+                // quote. A resident membership set still needs that score.
+                if (wholeMembershipResult.docs.get() != nullptr && constant) {
+                  scorer = QueryPrep::createDocSetScorer(
+                      poolGuard.pool(), wholeMembershipResult.docs.get(), seg, *constant);
+                  collectorFilter = nullptr;
                 }
                 if (scorer != nullptr) {
                   ranked = collectFirstKConstant(
@@ -1929,7 +2209,7 @@ public:
               for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
                 filters.push_back(QueryPrep::materializeEffectiveFilter(
                     *thisOp().filterWeights[i], thisOp().filterUses[i],
-                    *op.req.reader, seg, nullptr));
+                    *op.view, seg, nullptr));
                 filterPtrs.push_back(filters.back().get());
               }
               if (domain) {
@@ -1950,6 +2230,9 @@ public:
               sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
                 ? nullptr
                 : filter;
+            estimateFilter = collectorFilter;
+            estimatorReady = op.estimateCount && op.weight != nullptr
+                && !op.weight->needsPrepare() && !requiresWholeIndexPrepare;
             if constexpr (Collapsed) {
               if (!data->useFieldSort) {
                 int64_t sourceCost = supplier->cost();
@@ -2352,9 +2635,15 @@ public:
                 }
                 return supplier->buildBulk(poolGuard.pool(), plan);
               };
-              if (composedExactCountTopK) {
-                // countThenCollectTopK supplied both the exact hit count and
-                // competitively pruned ranking.
+              bool composedBoundedCountTopK = !Collapsed
+                  && op.boundedCountWeight != nullptr && builderPtr == nullptr
+                  && !captureSharedRaw && !composedExactCountTopK
+                  && boundedCountThenCollectTopK(
+                      poolGuard.pool(), segnum, seg, supplier, collectorFilter,
+                      *scoreCollector);
+              if (composedExactCountTopK || composedBoundedCountTopK) {
+                // The separate count supplied the hit count and competitively
+                // pruned ranking.
               } else if (useSparseConstantPull) {
                 auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {
@@ -2447,9 +2736,25 @@ public:
               }
             }
           }
+          if constexpr (!Collapsed) {
+            if (op.estimateCount) {
+              int64_t seen = scoreCollector->totalHits() - hitsBeforeSegment;
+              bool pruned = scoreCollector->countIncomplete;
+              scoreCollector->countIncomplete = pruned || prunedBeforeSegment;
+              if (!pruned) {
+                scoreCollector->estimatedHits += seen;
+              } else if (estimatorReady) {
+                estimateSegmentCount(
+                    poolGuard.pool(), seg, estimateFilter, *scoreCollector, seen);
+              } else {
+                scoreCollector->estimatedHits += seen;
+                scoreCollector->countFloored = true;
+              }
+            }
+          }
         }
         if (builder.has_value()) {
-          DomainHandle built(builder->build());
+          DomainHandle built = DomainHandle(builder->build()).scoped(op.view->segments()[segnum]);
           if constexpr (Structural) built = DomainVariantPlan::account(
               std::move(built), op.req.memoryTracker, "captured bucket matches");
           if (captureSharedRaw) {
@@ -2493,7 +2798,7 @@ public:
         auto domain = childDomain(child);
         return [subCalc, tg, segnum, domain = std::move(domain)]() {
           Signal::emit("searchTopDocsChildStart", subCalc);
-          subCalc->calc(tg, segnum, domain);
+          subCalc->accept(tg, segnum, domain);
         };
       });
       auto count = [&] {
@@ -2525,7 +2830,7 @@ public:
   // ProtobufSearchParser resolves everything that can fail and passes the
   // execution sources in. A fully resident validated membership plan may omit
   // the main Weight entirely.
-  TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
+  TopDocsReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::PlanningContext& planning, Query::Context* weightContext,
     Query* query, Query::Weight* weight,
     Query::Weight* variantMembershipWeight,
@@ -2543,7 +2848,7 @@ public:
     Query* domainQuery, Query::Weight* domainQueryWeight,
     std::span<Query::Weight*> domainFilterWeights,
     std::span<FilterCache::Use*> residentExactDomainUses)
-    : SearchOp(req, name), topDocsProto(topDocsProto), planning(planning),
+    : SearchOp(req, view, name), topDocsProto(topDocsProto), planning(planning),
       weightContext(weightContext), query(query),
       weight(weight), variantMembershipWeight(variantMembershipWeight),
       countWeight(countWeight), rankingWeight(rankingWeight),
@@ -2633,11 +2938,11 @@ public:
       if constexpr (Structural) {
         assert(this->structural && op.domainVariants.hasResetVariants());
         structuralReset = std::make_unique<StructuralResetState>(
-            op.req.memoryTracker, op.req.reader->segments().size());
+            op.req.memoryTracker, op.view->segments().size());
         requiresWholeIndexPrepare |= op.bucketVariantsNeedCompleteInput(this->structural->hasSelection());
       }
       if (requiresWholeIndexPrepare) {
-        auto numSegs = op.req.reader->segments().size();
+        auto numSegs = op.view->segments().size();
         inputDomains.resize(numSegs);
         inputDomainViews.resize(numSegs);
         effectiveDomains.resize(numSegs);
@@ -2658,18 +2963,19 @@ public:
         return;
       }
 
+      domain.assertScope(op.view->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =
           gatheredDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
-      if (count != (int32_t)thisOp().req.reader->segments().size()) return;
+      if (count != (int32_t)thisOp().view->segments().size()) return;
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) override {
       if constexpr (Structural) assert(tg == nullptr);
-      assert(domains.size() == thisOp().req.reader->segments().size());
+      assert(domains.size() == thisOp().view->segments().size());
       if (domains.empty()) {
         completeEmpty<MetricGroups>(tg);
         return;
@@ -2681,6 +2987,7 @@ public:
       std::copy(domains.begin(), domains.end(), inputDomains.begin());
       for (size_t i = 0; i < inputDomains.size(); i++) {
         assert(inputDomains[i].isDeliverable());
+        inputDomains[i].assertScope(op.view->segments()[i]);
         inputDomainViews[i] = inputDomains[i].get();
       }
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
@@ -2708,7 +3015,7 @@ public:
         ? std::numeric_limits<size_t>::max() : (size_t)topCount * perDoc;
     size_t bytes = saturatingAdd(sizeof(CalcBase), heap);
     bytes = saturatingAdd(
-        bytes, req.reader->segments().size() * 4 * sizeof(DomainHandle));
+        bytes, view->segments().size() * 4 * sizeof(DomainHandle));
     for (const auto& [name, child] : subOps) {
       unused(name);
       bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());

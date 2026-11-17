@@ -13,6 +13,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/api/RequestFlags.h"
 #include "SearchOp.h"
 #include "TopDocsReq.h"
 #include "luxir/query/Query.h"
@@ -81,12 +82,12 @@ public:
 
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
-  FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
+  FusionOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const ReqFusion& fusionProto,
            std::vector<TopDocsReq*>&& sources,
            std::vector<double>&& sourceWeights, int64_t topCount,
            std::span<ParsedFilter> filters,
            std::span<Query::Weight*> filterWeights, Method method, int32_t rrfK)
-    : SearchOp(req, name), fusionProto(fusionProto),
+    : SearchOp(req, view, name), fusionProto(fusionProto),
       sources(std::move(sources)), sourceWeights(std::move(sourceWeights)),
       topCount(topCount), filters(filters),
       filterWeights(filterWeights), method(method), rrfK(rrfK) {
@@ -102,7 +103,19 @@ public:
     }
   }
 
-  bool needsCount() const { return fusionProto.count_limit.value_or(0) != 0; }
+  bool ownsMatchDomain() const override { return true; }
+
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
+    return total;
+  }
+
+  bool needsCount() const {
+    return fusionProto.count_limit.has_value()
+        ? *fusionProto.count_limit != 0
+        : (flags & RequestFlags::ESTIMATE_COUNT) != 0;
+  }
 
   // Min-max normalize one source's merged ranked scores in place:
   // (score - min) / (max - min), so the source's best document gets 1 and its
@@ -209,7 +222,7 @@ public:
         const StructuralConstraint* structural = nullptr)
       : SearchOp::Calculator(op, parent, slot, numSlots, structural) {
       auto numSources = op.sources.size();
-      auto numSegs = op.req.reader->segments().size();
+      auto numSegs = op.view->segments().size();
       sourceCalcs.reserve(numSources);
       deliveredCollectors.assign(numSources, nullptr);
       for (auto* src : op.sources) {
@@ -249,6 +262,7 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {
       assert(domain.isDeliverable());
+      if (segnum >= 0) domain.assertScope(op.view->segments()[(size_t)segnum]);
       // Every segment shares the request task group; only the segment-0 (or
       // empty-index) dispatch writes it so there is a single writer.  That
       // dispatch precedes source completion, whose acq_rel counters order the
@@ -270,13 +284,13 @@ public:
 
     DomainHandle buildSharedFilter(int32_t segnum, DocSet* domain) {
       auto& op = thisOp();
-      if (op.filterWeights.empty()) return {};
+      if (op.filterWeights.empty()) return DomainHandle().scoped(op.view->segments()[segnum]);
 
       std::vector<DomainHandle> filterDocSets;
       std::vector<DocSet*> filterPtrs;
       filterDocSets.reserve(op.filterWeights.size());
       filterPtrs.reserve(op.filterWeights.size());
-      auto& seg = op.req.reader->segments()[segnum];
+      auto& seg = op.view->segments()[segnum];
       auto release = scope_guard([&]() noexcept {
         if (op.segmentStateRetained(seg)) return;
         for (const auto& source : preparedFilterSources) source.releaseSegmentState(seg);
@@ -285,22 +299,22 @@ public:
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
         if (i < preparedFilterSources.size()) {
           filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(
-              preparedFilterSources[i], *op.req.reader, seg, domain));
+              preparedFilterSources[i], *op.view, seg, domain));
         } else {
           filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(
               *op.filterWeights[i], op.filterUses[i],
-              *op.req.reader, seg, domain));
+              *op.view, seg, domain));
         }
         filterPtrs.push_back(filterDocSets.back().get());
       }
-      if (filterPtrs.empty()) return {};
+      if (filterPtrs.empty()) return DomainHandle().scoped(seg);
       if (filterPtrs.size() == 1) {
         auto result = std::move(filterDocSets[0]);
         assert(!op.sources.empty());
         return std::move(result).pinnedWith(
             op.sources.front()->planning.filterUses);
       }
-      return DomainHandle(DocSet::intersect(filterPtrs));
+      return DomainHandle(DocSet::intersect(filterPtrs)).scoped(seg);
     }
 
     void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -314,16 +328,16 @@ public:
       baseDomains[(size_t)segnum] = std::move(domain);
       baseDomainViews[(size_t)segnum] = baseDomains[(size_t)segnum].get();
       auto count = preparedDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
-      if (count != (int32_t)op.req.reader->segments().size()) return;
+      if (count != (int32_t)op.view->segments().size()) return;
 
       Query::Weight::PrepareContext baseCtx{
-        *op.req.reader,
+        *op.view,
         std::span<DocSet* const>(baseDomainViews.data(), baseDomainViews.size()),
         tg != nullptr, &op.req};
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 
-      for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
+      for (int32_t i = 0; i < (int32_t)op.view->segments().size(); i++) {
         segFilters[(size_t)i] = buildSharedFilter(i, baseDomainViews[(size_t)i]);
       }
 
@@ -365,7 +379,7 @@ public:
           [&](size_t i) {
         auto* sourceCalc = sourceCalcs[i].get();
         return [sourceCalc, tg, segnum, sharedFilter]() {
-          sourceCalc->calc(tg, segnum, sharedFilter);
+          sourceCalc->accept(tg, segnum, sharedFilter);
         };
       });
     }
@@ -483,7 +497,7 @@ public:
         candidates.reserve(fusedList.size());
         for (auto& [doc, score] : fusedList) candidates.push_back(doc);
         std::sort(candidates.begin(), candidates.end());
-        const auto& segments = op.req.reader->segments();
+        const auto& segments = op.view->segments();
         fusedDomains.reserve(segments.size());
         auto doc = candidates.begin();
         for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
@@ -493,13 +507,13 @@ public:
             ++doc;
           }
           // An empty segment needs an empty set: a null domain means all docs.
-          fusedDomains.emplace_back(builder.build());
+          fusedDomains.push_back(DomainHandle(builder.build()).scoped(op.view->segments()[segnum]));
         }
       }
 
       task_group_fanout(fusedDomains.empty() ? nullptr : taskGroup, subCalcs.size(), [&](size_t i) {
         auto* subCalc = subCalcs[i].get();
-        return [this, subCalc]() { subCalc->calcAll(taskGroup, fusedDomains); };
+        return [this, subCalc]() { subCalc->acceptAll(taskGroup, fusedDomains); };
       });
 
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
@@ -510,7 +524,7 @@ public:
       DocEmission emission = underBucketSlot()
           ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
-      emitDocsResponse(op.req, op.flags, getDocList,
+      emitDocsResponse(op.req, *op.view, op.flags, getDocList,
         numCollected,
         [this](int64_t i) { return fusedList[i].first; },
         [this](int64_t i) { return fusedList[i].second; },
@@ -521,7 +535,7 @@ public:
         op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission);
+        emission, {}, false, false, {}, op.decorators);
     }
   };
 
@@ -547,7 +561,7 @@ public:
   size_t facetBucketResidentBytes() const override {
     size_t bytes = saturatingAdd(
         sizeof(Calc),
-        req.reader->segments().size() * 2 * sizeof(DomainHandle));
+        view->segments().size() * 2 * sizeof(DomainHandle));
     for (auto* source : sources) {
       bytes = saturatingAdd(bytes, source->facetBucketResidentBytes());
       bytes = saturatingAdd(

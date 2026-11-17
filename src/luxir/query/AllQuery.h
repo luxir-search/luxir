@@ -179,7 +179,7 @@ public:
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (bulkContext.requireConstantCount) {
-        if (segment.hasDeletes()) {
+        if (segment.mayHaveDeletes()) {
           return {
             BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO,
@@ -238,7 +238,7 @@ public:
     CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
       if (domain && domain->cachedCard() >= 0
-          && (!segment.hasDeletes() || domain == &segment.liveDocs()->docset())) {
+          && (!segment.mayHaveDeletes() || domain == segment.liveDocSet())) {
         return {domain->cachedCard(), CountHow::METADATA};
       }
       return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);
@@ -248,6 +248,8 @@ public:
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
                                  float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
 };
 

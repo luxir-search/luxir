@@ -87,6 +87,14 @@ struct AggregateConstant {
   double doubleValue = 0.0;
 };
 
+inline BucketScalar integerAggregateOutput(BucketScalar value) {
+  if (value.valid && value.type == BucketValueType::INT128
+      && (value.intValue < INT64_MIN || value.intValue > INT64_MAX)) {
+    return BucketScalar::failed(value.type, value.nature, AggregateFailure::INT64_OUTPUT_OVERFLOW);
+  }
+  return value;
+}
+
 struct AggregateStateOps {
   using Init = void (*)(void* state,
                         std::span<const AggregateConstant> arguments,
@@ -104,6 +112,10 @@ struct AggregateStateOps {
       void* state, std::span<const int64_t> raw,
       FieldType::Type columnType,
       std::span<const AggregateConstant> arguments);
+  // Ordinals identify values only within this input's pinned reader dictionary.
+  using AccumulateOrdBatch = void (*)(
+      void* state, std::span<const int64_t> ords, int64_t numOrds,
+      size_t maxSetBytes, std::span<const AggregateConstant> arguments);
   using Merge = void (*)(void* target, const void* source,
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
@@ -128,6 +140,7 @@ struct AggregateStateOps {
   bool inlineCapable = true;
   bool replayCapable = true;
   bool orderSensitive = false;
+  AccumulateOrdBatch accumulateOrdBatch = nullptr;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -266,6 +279,8 @@ public:
   void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
   void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
+  void addOrdBatch(uint32_t producer, std::span<const int64_t> ords,
+                   int64_t numOrds, size_t maxSetBytes);
   void fail(AggregateFailure reason);
   bool failed() const { return failure() != AggregateFailure::NONE; }
   void merge(const AggregateStateView& source);
@@ -291,6 +306,8 @@ public:
   void addBatch(uint32_t producer, std::span<const ScalarValueResult> values);
   void addRawBatch(uint32_t producer, std::span<const int64_t> values,
                    FieldType::Type columnType);
+  void addOrdBatch(uint32_t producer, std::span<const int64_t> ords,
+                   int64_t numOrds, size_t maxSetBytes);
   void fail(AggregateFailure reason);
   bool failed() const;
   BucketScalar finish(AggregateEvalScratch& scratch) const;

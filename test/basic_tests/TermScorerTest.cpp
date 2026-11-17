@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include <luxir/query/AllQuery.h>
 #include <algorithm>
@@ -2378,7 +2379,7 @@ TEST_F(TermScorerTest, singleSeg) {
     fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
     fieldStats.sumDocFreq = tenum.sumDocFreq();
     fieldStats.docsWithField = tenum.docsWithField();
-    fieldStats.maxDoc = f.currentSegment()->postingsReader().maxDoc();
+    fieldStats.maxDoc = f.currentSegment()->maxDoc();
 
     Similarity::TermStats termStats;
     termStats.docFreq = denum.numDocs();
@@ -4811,7 +4812,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   PostingsWriter postingsWriter(dir, 0, 1, N + 16);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = FieldType::INDEX_DOCS_FREQS;
     writer.startField(&finfo);
@@ -4826,7 +4827,8 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -6913,7 +6915,7 @@ TEST_F(TermScorerTest, countBulkFillWithDeletesMatchesPull) {
   Query::Context qContext(testIndex.pool, *testIndex.reader);
   auto& segment = qContext.topReader.segments()[0];
   ASSERT_NE(segment.liveDocs(), nullptr);
-  DocSet* liveDocs = &segment.liveDocs()->docset();
+  DocSet* liveDocs = segment.liveDocSet();
   std::array<std::string_view, 3> terms = {"bf_a", "bf_b", "bf_c"};
 
   BulkDomainDriveGuard guard(true);
@@ -6963,7 +6965,7 @@ TEST_F(TermScorerTest, bulkCountDomainDisjunctionMatchesPullAcrossFiltersAndDele
   };
 
   check(nullptr, true);
-  check(&segment.liveDocs()->docset(), true);
+  check(segment.liveDocSet(), true);
   check(bitsetFilter.get(), true);
   check(arrayFilter.get(), true);
 }
@@ -7038,7 +7040,7 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
   Query::Context qContext(testIndex.pool, *testIndex.reader);
   auto& segment = qContext.topReader.segments()[0];
   ASSERT_NE(segment.liveDocs(), nullptr);
-  DocSet* liveDocs = &segment.liveDocs()->docset();
+  DocSet* liveDocs = segment.liveDocSet();
   TermQuery filterA("body_w", "filter_a");
   TermQuery filterB("body_w", "filter_b");
   std::array<Query*, 2> filters = {&filterA, &filterB};

@@ -7,6 +7,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Prometheus.h"
 #include "luxir/server/Stats.h"
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <future>
@@ -31,6 +32,18 @@ std::string httpLabels(std::string_view operation, std::string_view outcome) {
   return "{transport=\"http\",operation=\"" + std::string(operation) + "\",outcome=\"" + std::string(outcome) + "\"}";
 }
 constexpr const char* scrape = "/_stats?collections=true&format=prometheus";
+// A request is counted once its response is written, which can be after the client has read it.
+// Scrapes until the counter `name` reaches `value`.
+auto scrapeAfter(int port, const std::string& name, double value) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (true) {
+    auto response = httpRequest(port, http::verb::get, scrape);
+    auto pos = response.body().find("\n" + name + " ");
+    bool counted = pos != std::string::npos && std::stod(response.body().substr(pos + name.size() + 2)) >= value;
+    if (counted || std::chrono::steady_clock::now() > deadline) return response;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
 api::StatsRequest statsRequest(bool collections, bool files = false, std::string_view collection = {},
                                bool system = false) {
   api::StatsRequest request;
@@ -152,7 +165,10 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
   const_cast<api::CollectionStats&>(response.collections[0]).error.reset();
   // Rendered in seconds, from microseconds and milliseconds.
   static const std::map<std::string, double> perSecond = {{"collections.shards.index.commit_time", 1e6},
-                                                          {"scrub.last_pass_end", 1e3}};
+      {"collections.shards.index.query_cache.build_us", 1e6},
+      {"collections.shards.index.query_cache.served_build_us", 1e6},
+      {"collections.shards.index.query_cache.dead_build_us", 1e6},
+      {"scrub.last_pass_end", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;
   ASSERT_TRUE(api::write_json(response, json));
@@ -189,7 +205,7 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   ASSERT_EQ(400, httpRequest(port, http::verb::post, "/collections/metrics/_search", "{").result_int());
   ASSERT_EQ(404, httpRequest(port, http::verb::get, "/does-not-exist").result_int());
   ASSERT_EQ(405, httpRequest(port, http::verb::post, "/health").result_int());
-  auto response = httpRequest(port, http::verb::get, scrape);
+  auto response = scrapeAfter(port, "luxir_requests_total" + httpLabels("health", "error"), 1);
   ASSERT_EQ(200, response.result_int());
   EXPECT_EQ(prometheusContentType, response[http::field::content_type]);
   auto& text = response.body();
@@ -215,9 +231,9 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   // Directory bytes need files=true; the cheap walk lists no directories.
   EXPECT_EQ(std::string::npos, text.find("luxir_index_directory_bytes"));
   // Stats requests are their own operation, so they never blur service traffic.
-  auto again = httpRequest(port, http::verb::get, scrape).body();
-  EXPECT_EQ(sample(text, "luxir_requests_total" + httpLabels("stats", "ok")) + 1,
-            sample(again, "luxir_requests_total" + httpLabels("stats", "ok")));
+  auto stats = "luxir_requests_total" + httpLabels("stats", "ok");
+  auto again = scrapeAfter(port, stats, sample(text, stats) + 1).body();
+  EXPECT_GT(sample(again, stats), sample(text, stats));
   EXPECT_EQ(sample(text, "luxir_requests_total" + httpLabels("search", "ok")),
             sample(again, "luxir_requests_total" + httpLabels("search", "ok")));
   // /metrics is the same rendering with collections and system on by default.

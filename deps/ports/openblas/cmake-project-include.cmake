@@ -23,6 +23,16 @@ set(need_target 0)
 # an absent sgemm_kernel_sve_v2x4.S; none of these supported kernels require it.
 if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64" AND DYNAMIC_ARCH)
     set(DYNAMIC_LIST "NEOVERSEN1;NEOVERSEV1;NEOVERSEN2;ARMV8SVE" CACHE STRING "ARM runtime kernels")
+# The x86-64 baseline is v2, so kernels for older CPUs (CORE2, BARCELONA) can
+# never be selected. The Bulldozer family uses the SANDYBRIDGE kernels.
+# OpenBLAS always adds PRESCOTT as the fallback. A list overrides NO_AVX512,
+# so honor it here.
+elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64" AND DYNAMIC_ARCH)
+    set(x86_kernels NEHALEM SANDYBRIDGE HASWELL ZEN)
+    if(NOT NO_AVX512)
+        list(APPEND x86_kernels SKYLAKEX COOPERLAKE SAPPHIRERAPIDS)
+    endif()
+    set(DYNAMIC_LIST "${x86_kernels}" CACHE STRING "x86-64 runtime kernels")
 endif()
 
 if(NOT "${TARGET}" STREQUAL "")

@@ -50,6 +50,7 @@ if(NOT APPLE)
   add_executable(blas_lapack_test blas_lapack_test.cpp)
   target_link_libraries(blas_lapack_test PRIVATE OpenBLAS::OpenBLAS Threads::Threads)
   if(NOT CMAKE_CROSSCOMPILING)
+    luxir_runs_during_build(blas_lapack_test)
     add_custom_command(TARGET blas_lapack_test POST_BUILD COMMAND blas_lapack_test
                        COMMENT "Checking the OpenBLAS overlay")
   endif()

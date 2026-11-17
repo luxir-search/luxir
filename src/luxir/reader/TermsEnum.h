@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/codec/StreamVByte.h"
 #include "PostingsReader.h"
 #include "Postings.h"
@@ -24,7 +25,7 @@ class TermsEnum {
 
   InputStream termsIS;
   MemPool& pool;
-  PostingsReader& postingsReader;
+  SegmentCore& segmentCore;
 
   const SegFieldInfo& fieldInfo;
 
@@ -151,20 +152,20 @@ public:
   };
 
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
-    unused(this->pool, this->postingsReader);
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), segmentCore(postingsReader.core()), fieldInfo(fieldInfo) {
+    unused(this->pool, this->segmentCore);
     currTerm = PackedTerm(pool.alloc(TERM_BUFFER_BYTES), 0);
     if (fieldInfo.nTerms == 0) return;
-    termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
+    termsIS = segmentCore.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     // The writers pad the terms stream so this table starts 8-aligned (see
     // PostingsWriter::finalizeField), which is what lets us read it in place.
     assert((termsIS.offset() & 7) == 0);
     termBlockOffsets = reinterpret_cast<const uint64_t*>(termsIS.ptr());
-    trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
+    trieIS = segmentCore.getInputStreamSeek(fieldInfo.trieLoc);
     trieBase = trieIS.ptr();
 
     if (!fieldInfo.rangeTableLoc.isNull()) {
-      InputStream tableIS = postingsReader.getInputStreamSeek(fieldInfo.rangeTableLoc);
+      InputStream tableIS = segmentCore.getInputStreamSeek(fieldInfo.rangeTableLoc);
       assert((tableIS.offset() & 7) == 0);
       const auto* header = reinterpret_cast<const TermRangeTableHeader*>(tableIS.ptr());
       rangeCount = (int32_t) header->nRanges;
@@ -266,7 +267,7 @@ public:
 
       std::vector<uint64_t> docsOffsets((size_t) samples);
       std::vector<uint64_t> posOffsets((size_t) samples);
-      InputStream input = postingsReader.getInputStream(sourceRow.termsBase.filenum());
+      InputStream input = segmentCore.getInputStream(sourceRow.termsBase.filenum());
       size_t outputBase = blocks.size();
       for (int32_t i = 0; i < samples; i++) {
         int32_t blockOrd = firstBlock + i * stride;
@@ -478,11 +479,11 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
-      state.docIS = postingsReader.getInputStream(rowDocsFile);
+      state.docIS = segmentCore.getInputStream(rowDocsFile);
       state.docIS.seek(state.docsStart);
       if (state.hasPositions) {
         state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = postingsReader.getInputStream(rowPosFile);
+        state.posIS = segmentCore.getInputStream(rowPosFile);
         state.posIS.seek(state.posStart);
       }
     }
@@ -777,7 +778,7 @@ protected:
 
   PackedTerm firstTermForBlock(int32_t blockOrd) const {
     const TermRangeRow* selected = rowForBlock(blockOrd);
-    InputStream input = postingsReader.getInputStream(selected->termsBase.filenum());
+    InputStream input = segmentCore.getInputStream(selected->termsBase.filenum());
     return input.readPackedTerm(blockLocation(selected, blockOrd));
   }
 

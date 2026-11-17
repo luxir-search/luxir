@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
+#include "luxir/reader/OwnershipShape.h"
+#include <map>
+#include <set>
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
@@ -24,6 +28,7 @@
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -41,6 +46,7 @@
 // #define MERGER_DEBUG LOG_DEBUG
 
 #include "luxir/util/Signal.h"
+#include "luxir/reader/DocsReader.h"
 
 namespace luxir {
 
@@ -75,6 +81,18 @@ class SegmentMerger {
     }
 
 
+  };
+
+  struct Space {
+    SpaceOrdinal ordinal;
+    std::vector<PostingsReader*> preaders;
+    std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
+    std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
+    std::vector<Segment> segs;
+    int32_t maxDoc = 0;
+
+    explicit Space(SpaceOrdinal ordinal, std::span<LiveDocs*> liveDocs = {})
+        : ordinal(ordinal), liveDocs(liveDocs) {}
   };
 
   struct MergeFieldInfo {
@@ -315,6 +333,7 @@ class SegmentMerger {
       int32_t streams = 0;
       std::string name;
       std::vector<MergeFieldInfo> fields;
+      Space* space = nullptr;
       bool bootstrapStoredDictionary = false;
       std::function<void(MergeAdmissionDriver&, Batch&, BatchAdmission&)> body;
     };
@@ -558,8 +577,10 @@ class SegmentMerger {
     }
   };
 
-  std::span<PostingsReader *> preaders;
-  std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
+  std::span<const std::shared_ptr<SegmentCore>> cores;
+  IndexRamBudget::Guard rowMapsRam;
+  Space root;
+  std::vector<std::unique_ptr<Space>> children;
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
   // Current schema, for per-resource stored-fields formats.
@@ -571,31 +592,41 @@ class SegmentMerger {
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
 
-  std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
-  std::vector<Segment> segs;
 public:
 
+  size_t rowMapBytes() const {
+    size_t bytes = 0;
+    auto count = [&](const Space& space) {
+      for (const auto& seg : space.segs) bytes += seg.remap.capacity() * sizeof(int32_t);
+    };
+    count(root);
+    for (const auto& child : children) count(*child);
+    return bytes;
+  }
+
   int32_t mapDocId(size_t sourceOrd, int32_t localDocId) const {
-    auto [docId, deleted] = segs[sourceOrd].remapDocId(localDocId);
+    auto [docId, deleted] = root.segs[sourceOrd].remapDocId(localDocId);
     return deleted ? -1 : docId;
   }
 
 
 
-  SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
+  SegmentMerger(std::span<const std::shared_ptr<SegmentCore>> cores, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges, const Schema& schema,
                 StoredDictionaryRegistry& storedDictionaries)
-  : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
+  : cores(cores), root(SpaceOrdinal::ROOT, liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     schema(schema), storedDictionaries(storedDictionaries),
-    estimatedOutputBytes(estimateOutputBytes(preaders)),
+    estimatedOutputBytes(estimateOutputBytes(cores)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
     termPartitionMaxRanges(termPartitionMaxRanges)
   {
-    assert(preaders.size() == liveDocs.size());
+    assert(cores.size() == liveDocs.size());
+    root.preaders.reserve(cores.size());
+    for (const auto& core : cores) root.preaders.push_back(&core->rootReader());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
     assert(termPartitionMaxRanges == MergeCostModel::DERIVED_TERM_RANGES
            || (termPartitionMaxRanges >= 2
@@ -609,53 +640,168 @@ public:
 
   void merge() {
     auto guard = MemPool::threadLocalPoolGuard();
+    prepareSpace(root);
+    // Set maxDoc to total number of live documents
+    postingsWriter.setMaxDoc(root.maxDoc);
 
-    segs.reserve(preaders.size());
-    fieldReaders.reserve(preaders.size());  // This is important since we take pointers to these! Pool allocate later...
+    MERGER_DEBUG("SegmentMerger: total live docs to merge: {}, estimated bytes: {}, stream budget: {}",
+                 root.maxDoc, estimatedOutputBytes, streamBudget);
+    writeRootVersions();
+    prepareChildren();
+    assert(rowMapsRam.size() == (int64_t)rowMapBytes());
+    Signal::emit("mergeRowMaps", this);
+    std::vector<MergeAdmissionDriver::Batch> batches;
+    planFields(root, batches);
+    for (auto& child : children) planFields(*child, batches);
+    std::sort(batches.begin(), batches.end(), MergeAdmissionDriver::longestFirst);
+
+    MergeAdmissionDriver driver(*this, ramBudget, streamBudget, std::move(batches));
+    driver.run();
+
+    // Caller is responsible for calling postingsWriter.finish()
+    // so it can collect the filenames written.
+  }
+
+private:
+  void reserveRowMap(std::vector<int32_t>& map, int32_t count) {
+    assert(map.empty() && map.capacity() == 0);
+    // One reservation grows before each allocation. Parent maps determine
+    // child sizes, and both stay charged until the merger releases its maps.
+    int64_t bytes = (int64_t)count * sizeof(int32_t);
+    if (rowMapsRam) rowMapsRam.forceResize(rowMapsRam.size() + bytes);
+    else rowMapsRam = ramBudget.forceAcquire(bytes);
+    map.reserve(count);
+    if (map.capacity() != (size_t)count) {
+      rowMapsRam.forceResize(rowMapsRam.size() + (int64_t)(map.capacity() - count) * sizeof(int32_t));
+    }
+  }
+
+  void prepareSpace(Space& space) {
+    space.segs.reserve(space.preaders.size());
+    space.fieldReaders.reserve(space.preaders.size());  // This is important since we take pointers to these! Pool allocate later...
 
     int64_t totalLive = 0;  // used to set each segment base, will be equal to total live docs after the loop
-    for (size_t i = 0; i < preaders.size(); i++) {
-      auto preader = preaders[i];
-      auto segLiveDocs = liveDocs[i];
+    for (size_t i = 0; i < space.preaders.size(); i++) {
+      auto preader = space.preaders[i];
+      auto segLiveDocs = space.liveDocs[i];
       
       MERGER_DEBUG("SegmentMerger: segment {}, maxDoc={}, liveDocs={}",
                i, preader->maxDoc(), segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc());
       
-      fieldReaders.emplace_back(*preader);
-      FieldReader& fieldReader = fieldReaders.back();
+      space.fieldReaders.emplace_back(*preader);
+      FieldReader& fieldReader = space.fieldReaders.back();
 
       int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
-      segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)i);
+      space.segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)i);
       totalLive += numLive;
     }
-    // Set maxDoc to total number of live documents
-    postingsWriter.setMaxDoc(totalLive);
-
-    MERGER_DEBUG("SegmentMerger: total live docs to merge: {}, estimated bytes: {}, stream budget: {}",
-                 totalLive, estimatedOutputBytes, streamBudget);
-
+    space.maxDoc = (int32_t)totalLive;
     // Now build the docId maps based on liveDocs, then release the liveDocs.
-    PostingsWriter::VersionRunsWriter versions(postingsWriter);
-    for (size_t i = 0; i < segs.size(); i++) {
-      auto& seg = segs[i];
-      buildDocIdMapping(seg, liveDocs[i], seg.remap, versions);
+    for (size_t i = 0; i < space.segs.size(); i++) {
+      auto& seg = space.segs[i];
+      auto* live = space.liveDocs[i];
+      if (live && live->numLive() != seg.postingsReader->maxDoc()) {
+        reserveRowMap(seg.remap, seg.postingsReader->maxDoc());
+        buildDocIdMapping(seg.postingsReader->maxDoc(), live, seg.remap);
+      }
       // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
     }
+  }
 
-    versions.finish();
+  void prepareChildren() {
+    std::set<std::string> paths;
+    for (const auto& core : cores) {
+      for (size_t i = 1; i < core->spaces().size(); i++) paths.insert(core->spaces()[i].path);
+    }
+    std::map<std::string, Space*, std::less<>> spaces;
+    for (const auto& path : paths) {
+      auto parentPath = spaceParentPath(path);
+      auto found = spaces.find(parentPath);
+      Space* parent = parentPath.empty() ? &root : found == spaces.end() ? nullptr : found->second;
+      if (!parent) continue;
+      auto space = std::make_unique<Space>(SpaceOrdinal::ROOT);
+      space->preaders.reserve(cores.size());
+      space->segs.reserve(cores.size());
+      space->fieldReaders.reserve(cores.size());
+      int64_t total = 0;
+      for (size_t i = 0; i < cores.size(); i++) {
+        auto* reader = cores[i]->spaceReader(path);
+        const auto& owner = parent->segs[i];
+        int32_t count = 0;
+        if (reader && owner.numLive) {
+          if (owner.numLive == owner.postingsReader->maxDoc()) count = reader->maxDoc();
+          else {
+            OwnershipShape::Cursor cursor(*cores[i]->ownership(path));
+            for (int32_t p = 0; p < owner.postingsReader->maxDoc(); p++) {
+              if (owner.remapDocId(p).second) continue;
+              auto family = cursor.seek(p);
+              count += family.end - family.first;
+            }
+          }
+        }
+        space->preaders.push_back(reader);
+        FieldReader* fields = nullptr;
+        if (count) {
+          space->fieldReaders.emplace_back(*reader);
+          fields = &space->fieldReaders.back();
+        }
+        space->segs.emplace_back(count ? reader : nullptr, fields, count, (int32_t)total, (int)i);
+        total += count;
+      }
+      if (!total) continue;
+      if (!MergeCostModel::docsFit(0, total)) throw std::runtime_error("merged row space exceeds row limit: " + path);
+      space->maxDoc = (int32_t)total;
+      space->ordinal = postingsWriter.addSpace(path);
+      auto output = postingsWriter.getOutputStream();
+      MonoWriter ends(postingsWriter.pool, *output);
+      int32_t end = 0, owners = 0;
+      for (size_t i = 0; i < cores.size(); i++) {
+        const auto& owner = parent->segs[i];
+        auto& child = space->segs[i];
+        auto* reader = space->preaders[i];
+        if (child.numLive && child.numLive != reader->maxDoc()) {
+          reserveRowMap(child.remap, reader->maxDoc());
+          child.remap.assign(reader->maxDoc(), -1);
+        }
+        int32_t local = 0;
+        std::optional<OwnershipShape::Cursor> cursor;
+        if (reader) cursor.emplace(*cores[i]->ownership(path));
+        if (!owner.numLive) continue;
+        for (int32_t p = 0; p < owner.postingsReader->maxDoc(); p++) {
+          if (owner.remapDocId(p).second) continue;
+          auto family = cursor ? cursor->seek(p) : OwnershipShape::Family{p, 0, 0};
+          if (!child.remap.empty()) {
+            for (int32_t row = family.first; row < family.end; row++) child.remap[row] = local++;
+          } else local += family.end - family.first;
+          end += family.end - family.first;
+          ends.addInt64(end);
+          owners++;
+        }
+        assert(local == child.numLive);
+      }
+      unused(owners);
+      assert(owners == parent->maxDoc && end == space->maxDoc);
+      ends.finish();
+      postingsWriter.finishSpace(space->ordinal, space->maxDoc, {ends.blockLoc, ends.metaOff, {}, 0});
+      output.reset();
+      spaces.emplace(path, space.get());
+      children.push_back(std::move(space));
+    }
+  }
 
+  void planFields(Space& space, std::vector<MergeAdmissionDriver::Batch>& batches) {
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
     std::vector<Segment*> segPtrs;
-    segPtrs.reserve(segs.size());
-    for (auto& seg : segs) {
-      if (seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
+    segPtrs.reserve(space.segs.size());
+    for (auto& seg : space.segs) {
+      if (seg.fieldReader && seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
     }
     IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segPtrs);
 
-    std::vector<MergeAdmissionDriver::Batch> batches;
     while (fieldPQ.size() > 0) {
       MergeAdmissionDriver::Batch batch;
-      batch.fields.reserve(segs.size());
+      batch.space = &space;
+      batch.fields.reserve(space.segs.size());
       auto currField = fieldPQ.top().fieldReader->name();
       batch.name = std::string((std::string_view)currField);
 
@@ -681,7 +827,7 @@ public:
       // If merging would break any of the segment max constraints (i.e. number of unique terms in a field)
       // we could bail early.
 
-      batch.cost = estimateCost(batch.fields);
+      batch.cost = estimateCost(space, batch.fields);
       batch.work = estimateWork(batch.fields);
       if (isStoredField(batch.fields[0].segFieldInfo)) {
         auto format = storedFormat(batch.name);
@@ -694,25 +840,16 @@ public:
       batch.streams = estimateStreams(batch.fields);
       batch.body = [this](MergeAdmissionDriver& driver, MergeAdmissionDriver::Batch& current,
                           MergeAdmissionDriver::BatchAdmission& admission) {
-        mergeField(current, driver, admission);
+        mergeField(*current.space, current, driver, admission);
       };
       batches.push_back(std::move(batch));
     }
-
-    std::sort(batches.begin(), batches.end(), MergeAdmissionDriver::longestFirst);
-
-    MergeAdmissionDriver driver(*this, ramBudget, streamBudget, std::move(batches));
-    driver.run();
-
-    // Caller is responsible for calling postingsWriter.finish()
-    // so it can collect the filenames written.
   }
 
-private:
-  static uint64_t estimateOutputBytes(std::span<PostingsReader*> readers) {
+  static uint64_t estimateOutputBytes(std::span<const std::shared_ptr<SegmentCore>> cores) {
     uint64_t total = 0;
-    for (const auto* reader : readers) {
-      uint64_t bytes = reader->sizeInBytes();
+    for (const auto& core : cores) {
+      uint64_t bytes = core->sizeInBytes();
       total = bytes > std::numeric_limits<uint64_t>::max() - total
           ? std::numeric_limits<uint64_t>::max() : total + bytes;
     }
@@ -720,29 +857,44 @@ private:
   }
 
   static bool isStoredField(const SegFieldInfo& info) {
-    return info.type == FieldType::BIN && (info.flags & FieldType::STORED) != 0;
+    return FieldType::storage(info.type) == FieldType::Storage::BIN && (info.flags & FieldType::STORED) != 0;
   }
 
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
-    return type != FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+    return FieldType::isNumericColumn(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static bool hasGeoPoints(FieldType::Type type, int32_t flags) {
-    return type == FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+    return FieldType::usesGeoPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
+    bool allIndexed = true;
     for (const auto& field : fields) {
       if (type == FieldType::Type::NONE) {
         type = field.segFieldInfo.type;
       }
       allFlags |= field.segFieldInfo.flags;
+      if (field.segFieldInfo.numValues != 0
+          && !(field.segFieldInfo.flags & FieldType::INDEX_DOCS)) allIndexed = false;
+    }
+    // Numeric postings are an optional complete acceleration of the column.
+    // A mode change can leave inputs without postings; their values must not
+    // disappear behind a partial dictionary. Keep the merged column instead.
+    // TODO: take the merged index structures from the current schema instead
+    // of the inputs' flags. Today postings drop on mixed inputs (none -> match
+    // never takes effect for merged data) while points are synthesized from
+    // the column (range -> none never takes effect). Building postings from
+    // the column as synthesizePointRun does for points would let index mode
+    // changes converge in both directions.
+    if (FieldType::storage(type) == FieldType::Storage::INT64 && !allIndexed) {
+      allFlags &= ~FieldType::INDEX_DOCS_FREQS_POSITIONS;
     }
   }
 
-  int64_t estimateCost(std::span<const MergeFieldInfo> fields) const {
+  int64_t estimateCost(const Space& space, std::span<const MergeFieldInfo> fields) const {
     assert(!fields.empty());
     if (isStoredField(fields[0].segFieldInfo)) {
       StoredChunkFormat format = storedFormat(std::string_view(fields[0].segFieldInfo.fieldname));
@@ -765,11 +917,16 @@ private:
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
+    auto storage = FieldType::storage(type);
 
     int64_t numValues = 0;
     int64_t docsWithField = 0;
     int64_t synthesizedPointValues = 0;
+    bool ordColumn = true;
+    bool replay = false;
     for (const auto& field : fields) {
+      ordColumn = ordColumn && mergesOrdColumn(field.segFieldInfo);
+      replay = replay || replaysOrdColumn(field.segFieldInfo);
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
       if (field.segFieldInfo.pointsMetaOff == 0) {
@@ -782,12 +939,11 @@ private:
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues) : 0;
 
-    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
-      // Ord columns hold the term-order -> doc-order transposition in RAM until the
-      // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
-      // up front, plus a pool delta stream per multi-valued doc.  This is the
-      // heavy class the budget exists for.
-      if (allFlags & FieldType::MULTI_ARRAY) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
+        && ordColumn) {
+      // Multi-valued columns are replayed from the source columns and hold
+      // only per-source term ord maps.
+      if (replay) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
         // Mapped source runs stream directly; only maps and codec plans grow.
@@ -796,15 +952,13 @@ private:
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
             + MergeCostModel::LIGHT_BYTES + pointsBytes;
       }
-      // A doc's first value takes its ords[maxDoc] slot.  A multi-valued doc
-      // spills into a pool delta stream: about 40 bytes for its header and
-      // first slice, then a few bytes per further value.
-      int64_t spilledValues = std::max<int64_t>(0, numValues - docsWithField);
-      int64_t multiValuedDocs = std::min(spilledValues, docsWithField);
-      return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
+      // Single-valued columns hold the term-order -> doc-order transposition
+      // in RAM until the postings pass finishes: OrdCollector's
+      // ords[mergedMaxDoc] (int32).
+      return (int64_t)space.maxDoc * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
-    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
       return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
@@ -836,14 +990,15 @@ private:
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
+    auto storage = FieldType::storage(type);
 
-    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0) {
       return MergeCostModel::ORD_COL_STREAMS;
     }
-    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+    if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       return MergeCostModel::TEXT_STREAMS;
     }
-    if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+    if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
         && (allFlags & FieldType::INDEX_DOCS) == 0) {
       return MergeCostModel::STR_COL_STREAMS;
     }
@@ -857,42 +1012,44 @@ private:
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
   // Returns a vector where vector[oldDocId] = newDocId, or -1 if deleted.
   // This is still 0 based, so add the base in both cases.
-  void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target,
-                         PostingsWriter::VersionRunsWriter& versions) {
-    if (liveDocs == nullptr) {
-      VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
-      VersionRun run;
-      while (runs.next(run)) versions.add((uint32_t)seg.base + run.firstDocId, run.version);
-      return;
-    }
-    int32_t maxDoc = seg.postingsReader->maxDoc();
+  static void buildDocIdMapping(int32_t maxDoc, const LiveDocs* liveDocs, std::vector<int32_t>& target) {
+    if (liveDocs == nullptr) return;
     assert(liveDocs->size() == maxDoc); // make sure this is the right liveDocs for the segment.
     target.resize(maxDoc);
     int32_t newDocId = 0;
     const FixedBitSet& bitset = liveDocs->bitset();
-    
-    VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
-    VersionRun current, next;
-    bool haveNext = runs.next(current) && runs.next(next);
-    bool emitted = false;
     for (int32_t oldDocId = 0; oldDocId < maxDoc; oldDocId++) {
-      if (haveNext && next.firstDocId == (uint32_t)oldDocId) {
-        current = next;
-        haveNext = runs.next(next);
-        emitted = false;
-      }
       if (bitset.get(oldDocId)) {
-        if (!emitted) {
-          versions.add((uint32_t)(seg.base + newDocId), current.version);
-          emitted = true;
-        }
         target[oldDocId] = newDocId++;
       } else {
         target[oldDocId] = -1; // Document is deleted
       }
     }
+    assert(newDocId == liveDocs->numLive()); // Make sure we got the right number of live documents
+  }
 
-    assert(newDocId == seg.numLive); // Make sure we got the right number of live documents
+  void writeRootVersions() {
+    PostingsWriter::VersionRunsWriter versions(postingsWriter);
+    for (size_t i = 0; i < root.segs.size(); i++) {
+      const auto& seg = root.segs[i];
+      VersionRuns::Iterator runs(seg.postingsReader->core().versionRuns());
+      VersionRun current, next;
+      if (seg.remap.empty()) {
+        while (runs.next(current)) versions.add((uint32_t)seg.base + current.firstDocId, current.version);
+        continue;
+      }
+      if (!runs.next(current)) continue;
+      for (;;) {
+        bool haveNext = runs.next(next);
+        int32_t end = haveNext ? (int32_t)next.firstDocId : seg.postingsReader->maxDoc();
+        int32_t first = (int32_t)current.firstDocId;
+        if (seg.remap[first] == -1) first = root.liveDocs[i]->bitset().nextSetBit(first + 1, end);
+        if (first < end) versions.add((uint32_t)(seg.base + seg.remap[first]), current.version);
+        if (!haveNext) break;
+        current = next;
+      }
+    }
+    versions.finish();
   }
 
   void addDocsFreq(TextWriter& textWriter, DocsFreqEnum& docsEnum, const Segment& seg) {
@@ -1285,7 +1442,7 @@ private:
   // A replayable, doc-ordered source for the writer's count/plan/encode passes.
   // Only one source column/cursor is live at a time. Sequence payloads stay on
   // disk rather than being copied into another merge-time collector.
-  class MergedArrayOrds {
+  class MergedSourceOrds {
     std::span<MergeFieldInfo*> fields;
     const std::vector<std::vector<uint32_t>>& maps;
     int32_t maxDoc;
@@ -1328,7 +1485,7 @@ private:
     }
 
   public:
-    MergedArrayOrds(std::span<MergeFieldInfo*> fields,
+    MergedSourceOrds(std::span<MergeFieldInfo*> fields,
                     const std::vector<std::vector<uint32_t>>& maps, int32_t maxDoc)
         : fields(fields), maps(maps), maxDoc(maxDoc) {
       for (auto* field : fields) {
@@ -1362,9 +1519,52 @@ private:
     }
   };
 
-  // ARRAY columns cannot be reconstructed from DOCS-only postings. Keep their
-  // term map/replay workspace and walks out of the SET merge instantiation.
-  void LUXIR_NOINLINE mergeArrayOrdColumn(
+  // Writes the merged docs-with-field set of an indexed field without a
+  // column from each source's set, in merged doc order.
+  void mergeDocsWithField(std::span<MergeFieldInfo*> compactFields,
+                          PostingsWriter::IndexFieldInfo& output, MemPool& pool) {
+    auto forEachDoc = [&](auto&& accept) {
+      for (auto* field : compactFields) {
+        const Segment& seg = *field->seg;
+        DocsReader docs(*seg.postingsReader, field->segFieldInfo);
+        auto emit = [&](int32_t doc) {
+          auto [mapped, deleted] = seg.remapDocId(doc);
+          if (!deleted) accept(mapped);
+        };
+        if (!docs.hasBitset()) {
+          for (int32_t doc = 0; doc < docs.numDocs(); doc++) emit(doc);
+          continue;
+        }
+        screaming::BitSet::Iterator it(docs.bitset());
+        for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) emit(doc);
+      }
+    };
+    int32_t numDocs = 0;
+    forEachDoc([&](int32_t) { numDocs++; });
+    output.numValues = output.sumDocFreq;
+    DocsWithValWriter::write(pool, postingsWriter, output, numDocs, forEachDoc);
+  }
+
+  // An indexed TERMS field keeps an ord column only when every source has one
+  // and declares it (COLUMN_STORED): column: false drops it, and a schema
+  // change never needs a column rebuilt for sources written without one.
+  static bool mergesOrdColumn(const SegFieldInfo& info) {
+    return info.hasOrdColumn() && (info.flags & FieldType::COLUMN_STORED) != 0;
+  }
+
+  // A source with a multi-valued ord column (ARRAY, or SET holding a
+  // multi-valued doc) sends the merge to mergeOrdColumnByReplay.
+  static bool replaysOrdColumn(const SegFieldInfo& info) {
+    return (info.flags & FieldType::MULTI_ARRAY) != 0 || info.numValues > info.docsWithField;
+  }
+
+  // Rebuilds a multi-valued ord column doc-major from the source ord columns
+  // through per-source term ord maps, holding one map entry per source term
+  // rather than every doc's ords. ARRAY sequences cannot be reconstructed from
+  // DOCS-only postings at all; SET columns could be uninverted from them, but
+  // the sources already hold the doc-major order, so replaying them is faster
+  // and its workspace does not grow with the values.
+  void LUXIR_NOINLINE mergeOrdColumnByReplay(
       std::span<MergeFieldInfo*> fields, PostingsWriter::IndexFieldInfo& output,
       MemPool& pool) {
     std::vector<std::vector<uint32_t>> ordMaps;
@@ -1375,8 +1575,8 @@ private:
         std::nullopt, std::nullopt, pool, &ordMaps);
     textWriter.endField();
 
-    MergedArrayOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
-    BasicOrdColWriter<MergedArrayOrds> writer(pool, postingsWriter, output, ords);
+    MergedSourceOrds ords(fields, ordMaps, postingsWriter.getMaxDoc(output.space));
+    BasicOrdColWriter<MergedSourceOrds> writer(pool, postingsWriter, output, ords);
     writer.finish();
   }
 
@@ -1396,6 +1596,7 @@ private:
     };
 
     SegmentMerger& merger;
+    Space& space;
     MergeAdmissionDriver& driver;
     IndexRamBudget::Guard ramGuard;
     MergeAdmissionDriver::HeldStreams heldStreams;
@@ -1413,12 +1614,12 @@ private:
     int32_t flags;
 
   public:
-    PartitionCoordinator(SegmentMerger& merger, MergeAdmissionDriver& driver,
+    PartitionCoordinator(SegmentMerger& merger, Space& space, MergeAdmissionDriver& driver,
                          std::vector<MergeFieldInfo>&& fields,
                          std::vector<TermRangePlan>&& plans, int32_t flags)
-      : merger(merger), driver(driver), fields(std::move(fields)), plans(std::move(plans)),
+      : merger(merger), space(space), driver(driver), fields(std::move(fields)), plans(std::move(plans)),
         normDocsWithField(pool), flags(flags) {
-      std::vector<MergeFieldInfo*> bySegment(merger.segs.size());
+      std::vector<MergeFieldInfo*> bySegment(space.segs.size());
       for (auto& field : this->fields) bySegment[(size_t) field.seg->ord] = &field;
       compactFields.reserve(this->fields.size());
       for (auto* field : bySegment) {
@@ -1432,7 +1633,7 @@ private:
       merger.buildMergedNorms(compactFields, normBytes, normDocsWithField,
                               numNormDocsWithField, pool);
 
-      outputFieldInfo = &merger.postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
+      outputFieldInfo = &merger.postingsWriter.addField(space.ordinal, compactFields[0]->segFieldInfo.fieldname);
       outputFieldInfo->type = FieldType::TEXT;
       outputFieldInfo->flags = flags;
       preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
@@ -1490,6 +1691,7 @@ private:
       output.docsBase = docsOut.slocation();
       output.posBase = posOut.slocation();
       PostingsWriter::IndexFieldInfo rangeFieldInfo{};
+      rangeFieldInfo.space = space.ordinal;
       rangeFieldInfo.type = FieldType::TEXT;
       rangeFieldInfo.flags = flags;
 
@@ -1649,11 +1851,11 @@ private:
     }
   };
 
-  void mergeField(MergeAdmissionDriver::Batch& batch,
+  void mergeField(Space& space, MergeAdmissionDriver::Batch& batch,
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
     auto& mergeFieldInfos = batch.fields;
-    int32_t nDocs = postingsWriter.getMaxDoc();
+    int32_t nDocs = space.maxDoc;
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
@@ -1662,16 +1864,16 @@ private:
     // dedicated merger.  Recognize them by the combination of type=BIN and
     // flags=STORED set by StoredFieldsWriter::finish().
     const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
-    if (firstInfo.type == FieldType::BIN
+    if (FieldType::storage(firstInfo.type) == FieldType::Storage::BIN
         && (firstInfo.flags & FieldType::STORED) != 0) {
-      mergeStoredFields(mergeFieldInfos, batch.bootstrapStoredDictionary);
+      mergeStoredFields(space, mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
     }
 
     // sort mergeFieldInfos so we can add docids low to high.
     // This is a simple O(n+m) sort where n=number of segments and m is number of segments with this specific field.
     // Simply slot the field into it's place and then compact.
-    std::vector<MergeFieldInfo*> sortedFields(segs.size());
+    std::vector<MergeFieldInfo*> sortedFields(space.segs.size());
     for (auto& field : mergeFieldInfos) {
       sortedFields[field.seg->ord] = &field;
     }
@@ -1686,15 +1888,19 @@ private:
     }
 
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
-    int32_t allFlags = 0;
-    FieldType::Type type = firstInfo.type;
-    for (auto* field : compactFields) {
-      allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
-    }
-    bool isText = type == FieldType::Type::TEXT;
+    int32_t allFlags;
+    FieldType::Type type;
+    batchTypeAndFlags(mergeFieldInfos, type, allFlags);
+    allFlags &= ~FieldType::SEGMENT_MARKERS;
+    auto storage = FieldType::storage(type);
+    bool isText = storage == FieldType::Storage::TEXT;
+    bool isIndexedTerms = storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS);
+    bool isOrdCol = isIndexedTerms
+        && std::ranges::all_of(compactFields, [](auto* f) { return mergesOrdColumn(f->segFieldInfo); });
+    if (isIndexedTerms && !isOrdCol) allFlags &= ~FieldType::COLUMN_STORED;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
-      int64_t serialCost = estimateCost(mergeFieldInfos);
+      int64_t serialCost = estimateCost(space, mergeFieldInfos);
       int64_t coordinatorCost = partitionCoordinatorCost(compactFields);
       // Partitioning is an on-disk plan decision, so it must not depend on
       // transient pool occupancy after this batch has started.  Planning holds
@@ -1708,7 +1914,7 @@ private:
       if (rangePlan.has_value()) {
         if (!admission.repriceRam(coordinatorCost)) std::unreachable();
         auto coordinator = std::make_shared<PartitionCoordinator>(
-            *this, admissionDriver, std::move(mergeFieldInfos),
+            *this, space, admissionDriver, std::move(mergeFieldInfos),
             std::move(*rangePlan), allFlags);
         coordinator->start(coordinator, admission, batch.work);
         return;
@@ -1723,7 +1929,7 @@ private:
     }
 
     // get/reserve a new fieldInfo from the postingsReader
-    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
+    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(space.ordinal, compactFields[0]->segFieldInfo.fieldname);
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
     outputFieldInfo.typeFlags = FieldType::typeParameters(type, firstInfo.typeFlags);
@@ -1733,10 +1939,9 @@ private:
                                            normDocsWithField, numNormDocsWithField);
     }
 
-    // if this is an indexed string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (type == FieldType::Type::STRING) && (allFlags & FieldType::INDEX_DOCS);
-    if (isOrdCol && (allFlags & FieldType::MULTI_ARRAY)) {
-      mergeArrayOrdColumn(compactFields, outputFieldInfo, pool);
+    if (isOrdCol && std::ranges::any_of(compactFields, [](auto* f) {
+          return replaysOrdColumn(f->segFieldInfo); })) {
+      mergeOrdColumnByReplay(compactFields, outputFieldInfo, pool);
       return;
     }
     std::optional<OrdCollector> ordCollector;
@@ -1770,19 +1975,21 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
+    } else if (isIndexedTerms) {
+      mergeDocsWithField(compactFields, outputFieldInfo, pool);
     } else if (isText) {
       NormsWriter::writeValues(pool, postingsWriter, outputFieldInfo, preparedNorms,
                                normDocsWithField);
-    } else if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+    } else if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use
       // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
-      mergeStrCol(sortedFields, postingsWriter, outputFieldInfo);
+      mergeStrCol(space, sortedFields, postingsWriter, outputFieldInfo);
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
-      mergeIntCol(sortedFields, postingsWriter, outputFieldInfo,
+      mergeIntCol(space, sortedFields, postingsWriter, outputFieldInfo,
                    rebuildGeo ? &geoPoints : nullptr);
       if (rebuildGeo) {
         if (!geoPoints.empty()) {
@@ -1807,7 +2014,7 @@ private:
     return type ? type->format_ : StoredChunkFormat{};
   }
 
-  std::vector<char> sampleStoredFields(std::span<const PostingsReader::Field* const> fields,
+  std::vector<char> sampleStoredFields(const Space& space, std::span<const PostingsReader::Field* const> fields,
                                        size_t budget) {
     uint64_t chunks = 0;
     for (auto* field : fields) if (field) chunks += (uint64_t)field->numValues;
@@ -1824,7 +2031,7 @@ private:
     for (uint64_t visited = 0; visited < limit && samples.size() < budget; visited++) {
       if (position < chunks) {
         uint64_t chunk = position;
-        for (auto& seg : segs) {
+        for (auto& seg : space.segs) {
           auto* field = fields[seg.ord];
           if (!field) continue;
           if (chunk >= (uint64_t)field->numValues) {
@@ -1852,14 +2059,14 @@ private:
   }
 
   std::shared_ptr<const StoredCompressionDictionary> storedDictionary(
-      std::string_view resource, const StoredChunkFormat& format,
+      const Space& space, std::string_view resource, const StoredChunkFormat& format,
       std::span<const PostingsReader::Field* const> fields, bool bootstrap) {
     auto dictionary = storedDictionaries.lookup(resource, format);
     if (!bootstrap || dictionary) return dictionary;
     auto token = storedDictionaries.token(resource, format);
     if (!token) return {};
     size_t budget = StoredChunkCompressor::dictionarySampleBudget(format);
-    auto samples = sampleStoredFields(fields, budget);
+    auto samples = sampleStoredFields(space, fields, budget);
     // Group encoded bytes into bounded training blocks. Document boundaries
     // need no side array, even when millions of tiny docs fill the budget.
     std::vector<size_t> sizes;
@@ -1902,7 +2109,7 @@ private:
   // chunk a merge leaves costs about 100 chunks of later recompression when its
   // segment crosses 1%; this is an amortization rule, not an output invariant.
   // Multi-valued fields keep their grouping through single addValues calls.
-  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos, bool bootstrap) {
+  void mergeStoredFields(Space& space, std::vector<MergeFieldInfo>& mergeFieldInfos, bool bootstrap) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
 
@@ -1910,14 +2117,14 @@ private:
     // segments whose source had no stored-fields resource.  Readers are opened
     // one source segment at a time below so decompressed chunk scratch does not
     // accumulate across sources.
-    std::vector<const PostingsReader::Field*> fieldInfos(segs.size());
+    std::vector<const PostingsReader::Field*> fieldInfos(space.segs.size());
     for (auto& mfi : mergeFieldInfos) {
       fieldInfos[mfi.seg->ord] = mfi.seg->postingsReader->fieldInfo(resourceName);
     }
 
     auto format = storedFormat(resourceName);
-    StoredFieldsWriter writer(postingsWriter, resourceName, format,
-                              storedDictionary(resourceName, format, fieldInfos, bootstrap));
+    StoredFieldsWriter writer(postingsWriter, space.ordinal, resourceName, format,
+                              storedDictionary(space, resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
     auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
@@ -1926,7 +2133,7 @@ private:
     };
     int bestSource = -1;
     int64_t bestBytes = 0;
-    for (auto& seg : segs) {
+    for (auto& seg : space.segs) {
       const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
@@ -1937,11 +2144,11 @@ private:
       }
     }
     if (bestSource >= 0) {
-      StoredFieldsReader reader(*segs[bestSource].postingsReader, *fieldInfos[bestSource]);
+      StoredFieldsReader reader(*space.segs[bestSource].postingsReader, *fieldInfos[bestSource]);
       writer.adoptFieldTable(reader.fieldNames());  // writer's table is still empty
     }
 
-    for (auto& seg : segs) {
+    for (auto& seg : space.segs) {
       const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
@@ -1986,21 +2193,21 @@ private:
       }
     }
 
-    writer.finish(postingsWriter.getMaxDoc());
+    writer.finish(space.maxDoc);
   }
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
   // variable-size), and the per-doc endValueRankReader (if the field is multi-valued).
-  void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
+  void mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
-    assert(sortedFields.size() == segs.size());
+    assert(sortedFields.size() == space.segs.size());
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    assert(outputFieldInfo.type == FieldType::Type::STRING
-           || outputFieldInfo.type == FieldType::Type::VECTOR);
+    assert(FieldType::storage(outputFieldInfo.type) == FieldType::Storage::TERMS
+           || FieldType::storage(outputFieldInfo.type) == FieldType::Storage::VECTOR);
     assert(!(outputFieldInfo.flags & FieldType::INDEX_DOCS));
 
     bool multiValued = (outputFieldInfo.flags & FieldType::MULTI_VALUED) != 0;
@@ -2079,7 +2286,7 @@ private:
     // we can simply iterate through each segment sequentially.
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
-      auto& seg = segs[segnum];
+      auto& seg = space.segs[segnum];
 
       if (field == nullptr) {
         // Field didn't exist for this segment.  If segment has live docs, the merged
@@ -2176,8 +2383,8 @@ private:
 
     if (docsWriter) {
       assert(docsWriter->numAdded() == docsWithField);
-      if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
-        docsWriter->finishDense(postingsWriter.getMaxDoc());
+      if (docsWriter->numAdded() == space.maxDoc) {
+        docsWriter->finishDense(space.maxDoc);
       } else {
         docsWriter->finish();
       }
@@ -2253,11 +2460,11 @@ private:
   // value rank == doc id for single-valued readers) whenever every surviving
   // doc has a value: all sources dense and present, or a sparse source whose
   // docs without a value were all deleted.
-  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields,
+  void mergeIntCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
                    PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
                    std::vector<BKDWriter::Point>* geoPoints) {
-    assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
+    assert(sortedFields.size() == space.segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
@@ -2265,7 +2472,7 @@ private:
     auto outputPtr = postingsWriter.getOutputStream();
     auto intColWriter = pool.make_unique_align<IntColWriter>(
         8, *outputPtr,
-        FieldType::sortsByIntColumn(outputFieldInfo.type)
+        FieldType::isNumericColumn(outputFieldInfo.type)
             && !(outputFieldInfo.flags & FieldType::MULTI_VALUED));
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
@@ -2283,10 +2490,11 @@ private:
 
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
-      auto& seg = segs[segnum];
+      auto& seg = space.segs[segnum];
       auto base = seg.base;
 
       if (field == nullptr) {
+        if (seg.numLive == 0) continue;
         // If the field didn't exist for this segment, then output can't be dense.
         // If no docsWriter exists yet (because all full) we need to create one and fill it in up until base.
         if (docsWriter == nullptr) {
@@ -2327,7 +2535,7 @@ private:
       int32_t maxDocIn = seg.postingsReader->maxDoc();
 
       // we don't need to check liveDocs since we have the doc mapping.
-      // auto* liveBits = liveDocs[seg.ord] ? &liveDocs[seg.ord]->bitset() : nullptr;
+      // auto* liveBits = space.liveDocs[seg.ord] ? &space.liveDocs[seg.ord]->bitset() : nullptr;
 
       int64_t lastEndValueRankIn = 0;
       int32_t docRankIn = -1;  // rank of the doc we are on, faster than figuring out from docsIter.
@@ -2409,17 +2617,17 @@ private:
     intColWriter->finish(outputFieldInfo);
     if (docsWriter) {
       assert(docsWriter->numAdded() == docsWithField);
-      if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
+      if (docsWriter->numAdded() == space.maxDoc) {
         // all docs were added.  We may have written stuff into the index,
         // but we can forget it (it will be dropped on the next merge).
         // TODO: we could look into rewinding any part of the OutputStream that was unflushed as well.
-        docsWriter->finishDense(postingsWriter.getMaxDoc());
+        docsWriter->finishDense(space.maxDoc);
       } else {
         // some docs were not added, so we need to finish it.
         docsWriter->finish();
       }
     } else {
-      outputFieldInfo.docsWithField = postingsWriter.getMaxDoc();
+      outputFieldInfo.docsWithField = space.maxDoc;
       outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
     if (endValueRankWriter) {

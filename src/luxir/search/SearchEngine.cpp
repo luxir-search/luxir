@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <limits>
+#include <optional>
+
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
@@ -65,9 +68,21 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
+  // With the operator's opt-in, max_parallel 0 fans a heavy request out across
+  // segments once parsing shows enough work; light requests stay serial and
+  // pay no handoff.
+  std::optional<oneapi::tbb::task_group> autoTg;
   try {
     root = prepare(req);
     root->init();
+    size_t autoMinWork = searchConfig().auto_parallel_min_work;
+    // SkipStats counters are single-threaded; instrumented runs stay serial.
+    if (autoMinWork > 0 && req.maxParallel == 0 && req.tg == nullptr
+        && !SkipStats::enabled && req.reader->segments().size() > 1
+        && root->workEstimate() >= autoMinWork) {
+      req.tg = &autoTg.emplace();
+      req.autoParallel = true;
+    }
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and
@@ -75,9 +90,17 @@ void SearchEngine::submitBody(SearchRequest& req) {
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
     fallback = ErrorKind::INTERNAL;
-    rootCalc->start(req.tg);
+    if (autoTg.has_value()) {
+      // The receiving thread may be outside the arena; tasks must spawn in it.
+      node.executeIsolated([&] {
+        rootCalc->start(req.tg);
+        req.tg->wait();
+      });
+    } else {
+      rootCalc->start(req.tg);
+    }
 
-    if (req.tg) {
+    if (req.tg && !autoTg.has_value()) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
       req.tg->wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
@@ -87,7 +110,13 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
       req.tg->cancel();
-      try { req.tg->wait(); } catch (...) {}
+      if (autoTg.has_value()) {
+        node.executeIsolated([&] {
+          try { req.tg->wait(); } catch (...) {}
+        });
+      } else {
+        try { req.tg->wait(); } catch (...) {}
+      }
     }
     ErrorInfo info = classifyException(e, fallback);
     if (info.kind == ErrorKind::INTERNAL) {
@@ -119,6 +148,8 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  // autoTg dies with this frame; later emitter resumptions must not see it.
+  if (autoTg.has_value()) req.tg = nullptr;
   execution.finish();
   req.bodyDone();
 }
@@ -206,27 +237,29 @@ void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
 }
 
 void SearchEngine::getResources(SearchRequest& req) {
-  // look up the correct index reader and the associated schema
-  auto& request = req.proto;
-  auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
-  req.collectionMetrics = collection->sharedMetrics();
+  if (!req.reader) {
+    // look up the correct index reader and the associated schema
+    auto& request = req.proto;
+    auto& node = req.engine.node;
+    auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
+    req.collectionMetrics = collection->sharedMetrics();
 
-  // get the index reader
-  // The API freshness tolerance is milliseconds; the reader clock domain is
-  // microseconds (commit times).  Saturate: an absurd tolerance means "any".
-  constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
-  uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
-      ? maxUs : request.freshness_ms * 1000;
-  req.reader = collection->getReaderManager().getReader(freshnessUs);
-  if (!request.min_commit.empty()) {
-    auto floor = CommitId::parse(request.min_commit);
-    if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
-      req.reader = collection->getReaderManager().getReader(0);
-    if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
-        "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
-    if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
-        "stale_replica", "reader is older than min_commit");
+    // get the index reader
+    // The API freshness tolerance is milliseconds; the reader clock domain is
+    // microseconds (commit times).  Saturate: an absurd tolerance means "any".
+    constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
+    uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
+        ? maxUs : request.freshness_ms * 1000;
+    req.reader = collection->getReaderManager().getReader(freshnessUs);
+    if (!request.min_commit.empty()) {
+      auto floor = CommitId::parse(request.min_commit);
+      if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
+        req.reader = collection->getReaderManager().getReader(0);
+      if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
+          "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
+      if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
+          "stale_replica", "reader is older than min_commit");
+    }
   }
   req.schema = req.reader->schema();
   auto* filterCache = req.reader->filterCache();

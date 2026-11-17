@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -367,6 +368,14 @@ inline __int128 convertDateUnits(int64_t value, DateUnit from, DateUnit to) {
   __int128 nanos = (__int128)value * dateUnitNanos(from);
   int64_t divisor = dateUnitNanos(to);
   return nanos / divisor - (nanos % divisor < 0);
+}
+
+// Fractional date ticks round toward earlier time. Check before narrowing,
+// including NaN and the double representation of INT64_MAX (which is 2^63).
+inline std::optional<int64_t> floorDateTick(double value) {
+  double tick = std::floor(value);
+  if (!(tick >= -0x1p63 && tick < 0x1p63)) return std::nullopt;
+  return (int64_t)tick;
 }
 
 inline int64_t dateEpochMillis(int64_t value, DateUnit unit) {

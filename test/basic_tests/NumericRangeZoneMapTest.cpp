@@ -878,3 +878,184 @@ TEST_F(ZoneFillWindowTest, sparseFillsSelectOnlyAtOutsideJumps) {
 }
 
 } // namespace
+
+namespace {
+
+// Crossing masks against a scalar oracle: 64-value group and window edges,
+// the column's partial last frame, raw and exact-set blocks, residuals at
+// the unsigned extremes, sparse holes, and multivalued documents spanning
+// frames and blocks with an early, late or no match, residual or raw.
+// N sets the dense columns' last frame: a whole group then 13 values, 40
+// values, or exactly one group.
+class CrossingMaskTest : public LuxirTest,
+                         public ::testing::WithParamInterface<int32_t> {
+protected:
+  static constexpr std::array<std::string_view, 6> FIELDS = {
+      "res_i", "raw_i", "ramp_i", "sparse_i", "multi_is", "rawmulti_is"};
+  const int32_t N = GetParam();
+  // Ranks 63, 64 and 127 alone; n = 63, 64 and 63 + 1; unaligned mins and
+  // maxes mid-run; sparse maxes in holes (doc % 100 >= 60); block edges; the
+  // tail and the last frame; then overlapping and backward windows on the
+  // same scorer. Clipped to N.
+  std::vector<std::pair<int32_t, int32_t>> windows;
+
+  CollectionHelper helper;
+  std::shared_ptr<IndexReader> reader;
+  std::array<std::vector<std::vector<int64_t>>, FIELDS.size()> values;
+
+  void SetUp() override {
+    for (auto [min, max] : std::initializer_list<std::pair<int32_t, int32_t>>{
+             {0, N}, {63, 64}, {64, 65}, {127, 128}, {1, 64}, {64, 128},
+             {65, 129}, {37, 4133}, {130, 175}, {170, 263}, {8191, 8257},
+             {N - 13, N}, {N / 128 * 128, N}, {4000, 4200}, {4100, 4300},
+             {500, 700}, {N - 100, N}}) {
+      if (min < N) windows.push_back({min, std::min(max, N)});
+    }
+    constexpr std::array<int32_t, 9> LENGTHS = {0, 1, 2, 5, 63, 64, 65, 130, 3};
+    SplitMix64 rng(0xc0551);
+    std::vector<Doc> docs;
+    for (auto& field : values) field.resize((size_t)N);
+    for (int32_t doc = 0; doc < N; doc++) {
+      // Every block holds 0, so its residuals are the values, clustered at
+      // both unsigned ends and around the high bit.
+      uint32_t near = (uint32_t)rng.rint(64);
+      std::array<uint32_t, 4> picks = {
+          (uint32_t)rng(), near, 0x7fffffe0u + near, 0xffffffffu - near};
+      int64_t residual = doc % IntColReader::BLOCK_SIZE == 0
+          ? 0 : (int64_t)picks[(size_t)rng.rint(4)];
+      values[0][(size_t)doc] = {residual};
+      values[1][(size_t)doc] = {(int64_t)rng()};
+      values[2][(size_t)doc] = {1'000'000 + (int64_t)doc * 7 + rng.rint(50)};
+      if (doc % 100 < 60) values[3][(size_t)doc] = {residual};
+      // Sorted, a match in [0, 1000) comes first and one in [200'000,
+      // 201'000) last.
+      auto& multi = values[4][(size_t)doc];
+      int32_t length = LENGTHS[(size_t)(doc % 9)];
+      for (int32_t i = 0; i < length; i++) multi.push_back(1000 + rng.rint(100'000));
+      if (length > 0 && doc % 3 == 0) multi[0] = rng.rint(1000);
+      if (length > 0 && doc % 3 == 1) multi[0] = 200'000 + rng.rint(1000);
+      // The same pattern over raw 64-bit values, matches at both int64 ends.
+      auto& raw = values[5][(size_t)doc];
+      for (int32_t i = 0; i < length; i++) {
+        raw.push_back((int64_t)(rng() >> 1) - (1LL << 62));
+      }
+      if (length > 0 && doc % 3 == 0) raw[0] = INT64_MIN + rng.rint(1000);
+      if (length > 0 && doc % 3 == 1) raw[0] = INT64_MAX - rng.rint(1000);
+
+      docs.push_back(flatdoc("id", std::to_string(doc)));
+      for (size_t f = 0; f < FIELDS.size(); f++) {
+        const auto& v = values[f][(size_t)doc];
+        if (FIELDS[f].ends_with("_is")) docs.back().push_back({std::string(FIELDS[f]), v});
+        else if (!v.empty()) docs.back().push_back({std::string(FIELDS[f]), v[0]});
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+  }
+
+  // Count, pull and fills of query against accepts, a per-value oracle.
+  void check(size_t f, NumericPredicateQuery& query, auto&& accepts) {
+    SCOPED_TRACE(::testing::Message() << FIELDS[f] << " [" << query.getLo()
+                                      << ", " << query.getHi() << "]");
+    std::vector<int32_t> expected;
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (std::ranges::any_of(values[f][(size_t)doc], accepts)) expected.push_back(doc);
+    }
+    auto& segment = reader->segments()[0];
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = static_cast<NumericPredicateQuery::Weight*>(
+        query.createWeight(context, 0));
+    EXPECT_EQ((int64_t)expected.size(), countForTests(weight, segment));
+    for (bool eager : {true, false}) {
+      EXPECT_EQ(expected, collect(weight->createZoneMapScorerForTests(pool, segment, eager)));
+      auto* scorer = weight->createZoneMapScorerForTests(pool, segment, eager);
+      ASSERT_NE(nullptr, scorer);
+      for (auto [min, max] : windows) {
+        // Into cleared words, then into words with prior bits to keep.
+        for (uint64_t prior : {0ULL, 0x9249249249249249ULL}) {
+          size_t count = (size_t)(max - min + 63) / 64;
+          std::vector<uint64_t> want(count, prior), got(count, prior);
+          for (int32_t doc : expected) {
+            if (doc >= min && doc < max) {
+              want[(size_t)(doc - min) / 64] |= 1ULL << ((doc - min) % 64);
+            }
+          }
+          scorer->fillWindowBits(got, min, max);
+          EXPECT_EQ(want, got) << "eager=" << eager << " [" << min << ", " << max
+                               << ") prior=" << prior;
+        }
+      }
+    }
+  }
+
+  void checkRange(size_t f, int64_t lo, int64_t hi) {
+    NumericPredicateQuery query(FIELDS[f], lo, hi);
+    check(f, query, [=](int64_t v) { return lo <= v && v <= hi; });
+  }
+
+  void checkSet(size_t f, std::vector<int64_t> members) {
+    std::ranges::sort(members);
+    members.erase(std::unique(members.begin(), members.end()), members.end());
+    std::vector<PointsReader::ValueRange> intervals;
+    for (int64_t m : members) intervals.push_back({m, m});
+    NumericPredicateQuery query(FIELDS[f], std::span<const int64_t>(members),
+                                std::span<const PointsReader::ValueRange>(intervals));
+    check(f, query, [&](int64_t v) { return std::ranges::binary_search(members, v); });
+  }
+};
+
+TEST_P(CrossingMaskTest, masksMatchScalarOracle) {
+  auto& segment = reader->segments()[0];
+  auto everyBlock = [&](std::string_view name, auto&& expect) {
+    IntColReader column(segment.postingsReader(),
+                        *segment.postingsReader().fieldInfo(name));
+    for (int64_t block = 0; block < column.numBlocks(); block++) {
+      EXPECT_TRUE(expect(column.blockInfo(block))) << name << " block " << block;
+    }
+  };
+  everyBlock("res_i", [](const auto& info) { return info.residualComparable(); });
+  everyBlock("raw_i", [](const auto& info) { return !info.residualComparable(); });
+  everyBlock("ramp_i", [](const auto& info) { return info.linearFit(); });
+  everyBlock("rawmulti_is", [](const auto& info) { return !info.residualComparable(); });
+
+  constexpr int64_t HIGH = 0x80000000LL;
+  constexpr int64_t TOP = 0xffffffffLL;
+  for (size_t f : {0, 3}) {
+    for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 5>{{
+             {HIGH - 16, HIGH + 15}, {0, 31}, {TOP - 31, TOP},
+             {HIGH / 2, HIGH + HIGH / 2 - 1}, {1, TOP - 1}}}) {
+      checkRange(f, lo, hi);
+    }
+  }
+  checkRange(1, -(1LL << 62), 1LL << 62);
+  checkRange(1, 0, std::numeric_limits<int64_t>::max());
+  // Linear-fit rank bounds end runs mid-word, around blocks too.
+  const auto& ramp = values[2];
+  checkRange(2, ramp[1000][0], ramp[3000][0]);
+  checkRange(2, ramp[4090][0], ramp[(size_t)std::min(4200, N - 1)][0]);
+  checkRange(2, ramp[33][0], ramp[(size_t)std::min(8200, N - 1)][0]);
+  for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 3>{{
+           {0, 999}, {200'000, 200'999}, {500, 150'000}}}) {
+    checkRange(4, lo, hi);
+  }
+  checkSet(0, {values[0][5][0], values[0][64][0], values[0][4097][0],
+               values[0][(size_t)N - 1][0], HIGH});
+  checkSet(4, {values[4][3][0], values[4][4][0], values[4][4][4], 0});
+  // Raw: early, late, middle (one value in 16), no value, and everything.
+  constexpr int64_t MIN = INT64_MIN, MAX = INT64_MAX;
+  for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 5>{{
+           {MIN, MIN + 999}, {MAX - 999, MAX}, {-(1LL << 58), 1LL << 58},
+           {MIN + 1000, MIN + (1LL << 40)}, {MIN, MAX}}}) {
+    checkRange(5, lo, hi);
+  }
+  checkSet(5, {values[5][3][0], values[5][4][0], values[5][5][7], 0});
+}
+
+INSTANTIATE_TEST_SUITE_P(Tails, CrossingMaskTest,
+                         ::testing::Values((int32_t)(2 * IntColReader::BLOCK_SIZE + 77),
+                                           (int32_t)IntColReader::BLOCK_SIZE + 40,
+                                           (int32_t)IntColReader::BLOCK_SIZE + 64));
+
+} // namespace

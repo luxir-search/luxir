@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
 #include "PostingsReader.h"
 #include "SegFieldInfo.h"
 #include "luxir/schema/FieldType.h"
@@ -26,7 +27,7 @@ class FieldReader {
 public:
   explicit FieldReader(PostingsReader& postingsReader) {
     // Field metadata ends where the offsets table begins; reads are checked against that bound.
-    auto file = postingsReader.getInputStream(0);
+    auto file = postingsReader.core().getInputStream(0);
     fieldIS = InputStream(file.ptr(0), file.ptr(postingsReader.fieldOffsetsLoc));
     nFields = postingsReader.nFields;
     fieldOffsets = postingsReader.fieldOffsets;

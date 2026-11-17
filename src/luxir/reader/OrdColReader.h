@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -141,7 +142,7 @@ public:
     assert(format == SegFieldInfo::ORD_DIRECT || format == SegFieldInfo::ORD_PREDICTED);
     assert(indexing == SegFieldInfo::ORD_DOCID || indexing == SegFieldInfo::ORD_RANK);
     assert(!multi || indexing == SegFieldInfo::ORD_RANK);
-    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
+    columnIS = postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc);
     blocks = columnIS.ptr();
     if (format == SegFieldInfo::ORD_PREDICTED) {
       blockMeta = blocks + fieldInfo.columnMetaOff;
