@@ -86,11 +86,11 @@ struct KnnPlanner {
   struct Segment {
     int64_t vectors = 0, liveVectors = 0, docsWithValue = 0;
     int64_t eligibleDocs = 0, eligibleVectors = 0, domainSize = 0, maxDoc = 0;
-    int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0;
+    int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0, rabitqQueryBits = 4;
     Codec codec = Codec::FLAT;
     bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
-    bool vectorsEstimated = false, pqPerListTable = false;
+    bool vectorsEstimated = false, pqPerListTable = false, forceFaissRaBitQ = false;
   };
   struct Request {
     int64_t k = 0, boundedTarget = 0;
@@ -140,8 +140,12 @@ struct KnnPlanner {
     return std::clamp(std::max(fraction, request.minScanFraction), 0.0, 1.0);
   }
   static double arraySteps(int64_t card) { return (double)std::bit_width((uint64_t)std::max((int64_t)1, card)); }
-  // The planner assumes the default query bits, which select RaBitQScorer.
-  static bool usesScorer(const Segment& s) { return s.codec == Codec::RABITQ && s.rabitqBits <= 1; }
+  static bool usesScorer(int32_t codeBits, int32_t queryBits, bool forceFaiss) {
+    return codeBits <= 1 && queryBits > 0 && !forceFaiss;
+  }
+  static bool usesScorer(const Segment& s) {
+    return s.codec == Codec::RABITQ && usesScorer(s.rabitqBits, s.rabitqQueryBits, s.forceFaissRaBitQ);
+  }
   static bool canIvf(const Segment& s) {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
   }
@@ -217,15 +221,14 @@ struct KnnPlanner {
       p.linear[PQ_SUBCODE] = (double)s.eligibleVectors * s.pqM;
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
     } else {
-      if (s.rabitqBits > 1) {
-        p.linear[ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
+      p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
+      if (s.rabitqBits > 1)
         p.linear[EXTRA_BIT_DIM] = p.linear[ONE_BIT_DIM] * (s.rabitqBits - 1) * costs.extraBitSurvival(s.dims);
-      } else p.linear[SCORER_DIM] = (double)s.eligibleVectors * s.dims;
     }
     if (s.codec == Codec::PQ) {
       p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
       p.linear[PQ_TABLE_DIM] = s.pqPerListTable ? (double)s.nlist * (1 << s.pqBits) * s.dims : 0;
-    } else p.linear[s.rabitqBits > 1 ? RABITQ_LIST_DIM : SCORER_LIST_DIM] = (double)s.nlist * s.dims;
+    } else p.linear[usesScorer(s) ? SCORER_LIST_DIM : RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
     p.a = costs.price(p.linear);
     p.b = costs.price(p.fixed);

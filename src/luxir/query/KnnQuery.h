@@ -1021,6 +1021,8 @@ public:
               input.codec = vaux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ;
               input.nlist = vaux->getNList(); input.pqM = vaux->getPqM(); input.pqBits = vaux->getPqBits();
               input.rabitqBits = vaux->getRaBitQBits();
+              input.rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
+              input.forceFaissRaBitQ = forceFaissRaBitQ;
               input.pqPerListTable = input.codec == KnnPlanner::Codec::PQ && input.l2
                   && !VectorAuxReader::usePrecomputedTable(faiss::METRIC_L2, true,
                       input.nlist, input.pqM, 1 << input.pqBits, segCount, dims);
@@ -2100,7 +2102,7 @@ public:
           centroid.resize((size_t)ivf.d);
           // FAISS's distance computer remains for extended codes and for the
           // unquantized query (query bits 0).
-          if (!multiBit && preparedQuery.queryBits > 0 && !forceFaissRaBitQ)
+          if (KnnPlanner::usesScorer((int32_t)rabitq->rabitq.nb_bits, preparedQuery.queryBits, forceFaissRaBitQ))
             oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
                                  rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
         } else {

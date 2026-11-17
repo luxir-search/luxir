@@ -305,6 +305,30 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
     }
 }
 
+TEST(KnnPlannerTest, rabitqKernelPricing) {
+  auto s = segment(10);
+  s.codec = KnnPlanner::Codec::RABITQ;
+  s.vectors = 100; s.nlist = 3;
+  VectorSearchWork work;
+  work.oneBitScores = 10; work.listSetups = 3;
+  work.physicalEntries = 100; work.selectorPasses = 10; work.selectorBitmap = 100;
+  for (int bits : {1, 2}) for (int qb = 0; qb <= 8; qb++) for (bool force : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << bits << '/' << qb << '/' << force);
+    s.rabitqBits = bits; s.rabitqQueryBits = qb; s.forceFaissRaBitQ = force;
+    bool scorer = bits == 1 && qb > 0 && !force;
+    EXPECT_EQ(scorer, KnnPlanner::usesScorer(s));
+    auto price = KnnPlanner::price(s, {}, {});
+    auto actual = KnnPlanner::actualWork(s, work);
+    for (const auto& features : {price.linear, actual}) {
+      EXPECT_EQ(scorer ? 1280 : 0, features[KnnPlanner::SCORER_DIM]);
+      EXPECT_EQ(scorer ? 0 : 1280, features[KnnPlanner::ONE_BIT_DIM]);
+      EXPECT_EQ(scorer ? 384 : 0, features[KnnPlanner::SCORER_LIST_DIM]);
+      EXPECT_EQ(scorer ? 0 : 384, features[KnnPlanner::RABITQ_LIST_DIM]);
+      EXPECT_DOUBLE_EQ(scorer ? 0 : 9, features[KnnPlanner::ENTRY_MISPREDICT]);
+    }
+  }
+}
+
 TEST(KnnPlannerTest, pqPerListTablePricing) {
   auto s = segment();
   KnnPlanner::Costs costs;
