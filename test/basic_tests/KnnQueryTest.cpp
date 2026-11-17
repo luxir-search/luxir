@@ -3,10 +3,15 @@
 
 #include <gtest/gtest.h>
 
+#include <faiss/IndexIVFRaBitQ.h>
+#include <faiss/impl/DistanceComputer.h>
+#include <faiss/impl/RaBitQuantizer.h>
+
 #include <array>
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
@@ -21,6 +26,8 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryShape.h"
+#include "luxir/query/RaBitQScorer.h"
+#include "luxir/reader/VectorAuxReader.h"
 #include "luxir/query/VectorEngine.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
@@ -4676,12 +4683,14 @@ TEST_F(KnnQueryTest, foldedDomainMatchesResolve) {
           KnnPlanner::Segment input{.vectors = vr.numVectors(), .liveVectors = vr.numVectors(), .docsWithValue = vr.docsWithValue(),
               .eligibleDocs = eligible.eligibleDocs, .eligibleVectors = eligible.eligibleVectors,
               .domainSize = domain->card(), .maxDoc = seg.maxDoc(), .dims = vr.dims(), .nlist = aux->getNList(), .pqM = aux->getPqM(),
+              .rabitqBits = aux->isRaBitQ() ? aux->getRaBitQBits() : 0,
               .codec = aux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ,
               .l2 = true, .domain = true, .arrayDomain = domain->type == DocSet::ARRAY, .unfiltered = false,
               .sparse = sparse, .multi = multi};
           auto predicted = KnnPlanner::price(input, {}, {});
           EXPECT_EQ(predicted.fixed[KnnPlanner::COARSE_DIM], stats.costWork[KnnPlanner::COARSE_DIM]);
-          auto setup = aux->isRaBitQ() ? KnnPlanner::RABITQ_LIST_DIM : KnnPlanner::PQ_LIST_SETUP;
+          auto setup = !aux->isRaBitQ() ? KnnPlanner::PQ_LIST_SETUP
+              : aux->getRaBitQBits() > 1 ? KnnPlanner::RABITQ_LIST_DIM : KnnPlanner::SCORER_LIST_DIM;
           EXPECT_EQ(predicted.linear[setup] * stats.work.ivfRounds, stats.costWork[setup]);
           if (selector == KnnPlanner::Selector::FOLD && !KnnPlanner::borrowDomain(input)) {
             auto fold = KnnPlanner::foldWork(input);
@@ -4788,6 +4797,267 @@ TEST_F(KnnQueryTest, rabitqSelectorKindsMatchExact) {
           EXPECT_EQ(mode == 1 ? 514 : 0, stats.work.resolveMono);
           EXPECT_EQ(mode == 2 || (mode == 0 && deletes) ? 514 : 0, stats.work.selectorBitmap);
           EXPECT_EQ(mode == 0 && !deletes ? 514 : 0, stats.work.selectorNone);
+        }
+      }
+    }
+  }
+}
+
+// Independent scalar definition: float residuals and quantization, then double
+// factors and estimates. Scale float error by the terms before cancellation.
+struct RaBitQReference {
+  std::vector<uint8_t> values;
+  double delta, c1, c2, c34, c34Scale, distance = 0, norm = 0;
+
+  RaBitQReference(const std::vector<float>& query, const std::vector<float>& centroid, int32_t qb) {
+    std::vector<float> residual(query.size());
+    for (size_t i = 0; i < query.size(); i++) {
+      residual[i] = query[i] - centroid[i];
+      distance += (double)residual[i] * residual[i];
+      norm += (double)query[i] * query[i];
+    }
+    auto [low, high] = std::minmax_element(residual.begin(), residual.end());
+    int maxCode = (1 << qb) - 1;
+    float step = (*high - *low) / (float)maxCode;
+    float scale = step > 0 ? 1.0f / step : 0;
+    uint64_t sum = 0;
+    for (float r : residual) {
+      float x = (r - *low) * scale;
+      auto value = (uint8_t)std::clamp(std::floor((double)x + 0.5), 0.0, (double)maxCode);
+      values.push_back(value);
+      sum += value;
+    }
+    delta = step;
+    double invSqrt = 1 / std::sqrt((double)query.size());
+    c1 = 2 * delta * invSqrt;
+    c2 = 2 * *low * invSqrt;
+    c34 = invSqrt * (delta * sum + query.size() * (double)*low);
+    c34Scale = invSqrt * (std::abs(delta * sum) + std::abs(query.size() * (double)*low));
+  }
+};
+
+static void expectRaBitQFloat(double expected, float actual, double scale) {
+  EXPECT_NEAR(expected, actual, 2e-6 * std::max(1.0, scale));
+}
+
+// Check each list against our definition exactly, and FAISS within the error
+// induced by its SIMD-dependent rounding. Override centroids for degenerate cases.
+static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<float>& query, int32_t qb,
+                               const std::vector<float>* fixedCentroid = nullptr, bool checkFaiss = true) {
+  size_t d = (size_t)index.d;
+  std::vector<float> centroid(d), rotated;
+  std::vector<uint8_t> quantized;
+  auto metric = index.rabitq.metric_type;
+  bool ip = metric == faiss::METRIC_INNER_PRODUCT;
+  RaBitQScorer scorer(index.d, qb, ip, query.data());
+  for (size_t list = 0; list < index.nlist; list++) {
+    SCOPED_TRACE(list);
+    size_t count = std::min(index.invlists->list_size(list), RaBitQScorer::BLOCK_ROWS);
+    if (fixedCentroid) centroid = *fixedCentroid;
+    else index.quantizer->reconstruct((faiss::idx_t)list, centroid.data());
+    std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
+        index.rabitq.get_distance_computer((uint8_t)qb, centroid.data()));
+    computer->set_query(query.data());
+    auto* dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
+    scorer.setList(centroid.data());
+    RaBitQReference ref(query, centroid, qb);
+    auto faissFactors = faiss::rabitq_utils::compute_query_factors(
+        query.data(), d, centroid.data(), (uint8_t)qb, false, metric, rotated, quantized);
+    const auto& actual = scorer.listFactors();
+    size_t changed = 0;
+    for (size_t i = 0; i < d; i++) {
+      ASSERT_EQ(ref.values[i], scorer.quantizedValue(i)) << i;
+      if (checkFaiss) {
+        ASSERT_LE(std::abs((int)quantized[i] - ref.values[i]), 1) << i;
+      }
+      changed += quantized[i] != ref.values[i];
+    }
+    if (checkFaiss) {
+      EXPECT_LE(changed, (d + 99) / 100); // At most 1%, rounded up for small d.
+    }
+    for (size_t i = 0; i < ((d + 7) / 8) * 8; i++) for (int32_t p = 0; p < qb; p++)
+      ASSERT_EQ(i < d ? (ref.values[i] >> p) & 1 : 0,
+          (scorer.planeByte(p, i / 8) >> (i % 8)) & 1) << i << '/' << p;
+    expectRaBitQFloat(ref.c1, actual.c1, std::abs(ref.c1));
+    expectRaBitQFloat(ref.c2, actual.c2, std::abs(ref.c2));
+    expectRaBitQFloat(ref.c34, actual.c34, ref.c34Scale);
+    expectRaBitQFloat(ref.distance, actual.queryToCentroidSqr, ref.distance);
+    expectRaBitQFloat(std::sqrt(ref.distance), scorer.queryToCentroid(), std::sqrt(ref.distance));
+    if (ip) expectRaBitQFloat(ref.norm, actual.queryNormSqr, ref.norm);
+    double quantizationError = ref.delta * changed / std::sqrt((double)d);
+    if (checkFaiss) {
+      expectRaBitQFloat(faissFactors.c1, actual.c1, std::abs(ref.c1));
+      expectRaBitQFloat(faissFactors.c2, actual.c2, std::abs(ref.c2));
+      // Each changed query value adds at most delta/sqrt(d) to c34, and
+      // 2*abs(multiplier)*delta/sqrt(d) to L2 (half that to IP).
+      EXPECT_NEAR(faissFactors.c34, actual.c34, quantizationError + 2e-6 * std::max(1.0, ref.c34Scale));
+      expectRaBitQFloat(faissFactors.qr_to_c_L2sqr, actual.queryToCentroidSqr, ref.distance);
+      expectRaBitQFloat(dc->g_error, scorer.queryToCentroid(), std::sqrt(ref.distance));
+      if (ip) expectRaBitQFloat(faissFactors.qr_norm_L2sqr, actual.queryNormSqr, ref.norm);
+    }
+
+    faiss::InvertedLists::ScopedCodes codes(index.invlists, list);
+    std::vector<uint8_t> onesFactors(index.code_size, 0xff);
+    auto check = [&](size_t row, float estimate) {
+      const uint8_t* code = codes.get() + row * index.code_size;
+      uint64_t dot = 0, popcount = 0;
+      for (size_t i = 0; i < d; i++) if ((code[i / 8] >> (i % 8)) & 1) {
+        dot += ref.values[i];
+        popcount++;
+      }
+      auto counts = scorer.counts(code);
+      ASSERT_EQ(dot, counts.dot);
+      ASSERT_EQ(popcount, counts.popcount);
+      std::memcpy(onesFactors.data(), code, (d + 7) / 8);
+      auto maskedCounts = scorer.counts(onesFactors.data());
+      ASSERT_EQ(dot, maskedCounts.dot);
+      ASSERT_EQ(popcount, maskedCounts.popcount);
+      float base, multiplier;
+      std::memcpy(&base, code + (d + 7) / 8, sizeof(float));
+      std::memcpy(&multiplier, code + (d + 7) / 8 + sizeof(float), sizeof(float));
+      double finalDot = ref.c1 * dot + ref.c2 * popcount - ref.c34;
+      double preDist = base + ref.distance - 2 * multiplier * finalDot;
+      double expected = ip ? -0.5 * (preDist - ref.norm) : preDist;
+      double scale = std::abs(base) + ref.distance + 2 * std::abs(multiplier)
+          * (std::abs(ref.c1 * dot) + std::abs(ref.c2 * popcount) + ref.c34Scale) + (ip ? ref.norm : 0);
+      if (ip) scale *= 0.5;
+      if (checkFaiss) {
+        EXPECT_NEAR(dc->distance_to_code_1bit(code), estimate,
+            (ip ? 1 : 2) * std::abs(multiplier) * quantizationError + 4e-6 * std::max(1.0, scale));
+      }
+      expectRaBitQFloat(expected, estimate, scale);
+    };
+    std::vector<float> distances(count);
+    scorer.score(codes.get(), index.code_size, count, distances.data());
+    std::vector<uint16_t> rows;
+    for (size_t i = 0; i < count; i++) {
+      check(i, distances[i]);
+      if (i % 3 == 1) rows.push_back((uint16_t)i);
+    }
+    scorer.score(codes.get(), index.code_size, rows.data(), rows.size(), distances.data());
+    for (size_t k = 0; k < rows.size(); k++) check(rows[k], distances[k]);
+  }
+}
+
+static std::vector<float> rabitqTestVector(std::mt19937& rng, int32_t dims, float bias) {
+  std::normal_distribution<float> normal;
+  std::vector<float> v((size_t)dims);
+  for (auto& x : v) x = normal(rng) + bias;
+  return v;
+}
+
+TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+    for (int32_t dims : {1, 7, 8, 63, 96, 100, 129, 384, 500, 511, 512, 513, 520, 768, 1024, 1030, 1536}) {
+      SCOPED_TRACE(::testing::Message() << (int)metric << '/' << dims);
+      CollectionHelper h("main");
+      h.clear();
+      installVecSchema(h.collection(), metric, rabitqAnn(4), dims);
+      std::mt19937 rng((uint32_t)dims);
+      for (int i = 0; i < 80; i++)
+        h.index(flatdoc("id", std::to_string(i), "emb_v", rabitqTestVector(rng, dims, (float)(i % 4))));
+      h.commit({"*"});
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(1u, reader->segments().size());
+      auto* aux = (VectorAuxReader*)reader->segments()[0].getAuxReader("vec.emb_v").get();
+      ASSERT_NE(nullptr, aux);
+      auto* index = dynamic_cast<faiss::IndexIVFRaBitQ*>(aux->getFaissIndex());
+      ASSERT_NE(nullptr, index);
+      ASSERT_EQ(1u, index->rabitq.nb_bits);
+      auto query = rabitqTestVector(rng, dims, 0.5f);
+      std::vector<float> constant((size_t)dims, 1.5f), nearConstant = query;
+      for (auto& x : nearConstant) x -= 1.5f;
+      std::vector<float> zero((size_t)dims, 0.0f);
+      for (int32_t qb = 1; qb <= 8; qb++) {
+        SCOPED_TRACE(qb);
+        compareRaBitQLists(*index, query, qb);
+        compareRaBitQLists(*index, constant, qb, &zero);
+        auto halfStep = zero;
+        halfStep[0] = 0.5f;
+        if (dims > 1) halfStep[1] = (float)((1 << qb) - 1); // delta = 1.
+        compareRaBitQLists(*index, halfStep, qb, &zero);
+        // Almost constant residuals amplify FAISS's SIMD cancellation beyond a
+        // one-step difference. Keep this coverage against our scalar definition.
+        compareRaBitQLists(*index, query, qb, &nearConstant, false);
+        compareRaBitQLists(*index, query, qb, &query);
+        compareRaBitQLists(*index, zero, qb, &zero);
+      }
+    }
+  }
+  std::vector<float> ones(8, 1), zeros(8, 0);
+  RaBitQScorer scorer(8, 4, false, ones.data());
+  scorer.setList(zeros.data());
+  std::array<uint8_t, 9> code{0xff};
+  float base = 1, multiplier = std::sqrt(8.0f), estimate;
+  std::memcpy(code.data() + 1, &base, sizeof(float));
+  std::memcpy(code.data() + 5, &multiplier, sizeof(float));
+  scorer.score(code.data(), code.size(), 1, &estimate);
+  EXPECT_NEAR(-7, estimate, 1e-5); // Negative L2 estimates must retain their order.
+}
+
+// One request through both kernels, on every selector and result path.
+TEST_F(KnnQueryTest, rabitqScorerScanMatchesFaissComputer) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::forceFaissRaBitQ, KnnQuery::tuning.selector);
+  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP}) for (int32_t dims : {100, 384}) {
+    CollectionHelper h("main");
+    h.clear();
+    installVecSchema(h.collection(), metric, rabitqAnn(4), dims);
+    std::mt19937 rng((uint32_t)dims);
+    for (int i = 0; i < 1200; i++)
+      h.index(flatdoc("id", std::to_string(i), "keep_s", i % 3 == 0 ? "yes" : "no",
+                      "emb_v", rabitqTestVector(rng, dims, (float)(i % 4))));
+    h.commit({"*"});
+    auto query = rabitqTestVector(rng, dims, 1.0f);
+    for (bool deletes : {false, true}) {
+      if (deletes) h.deleteByIds({"0", "6", "900"}, UpdateMessage::COMMIT);
+      // No selector or rank liveness, resolve, folded bitmap; interval and bounded.
+      for (int mode : {0, 1, 2}) for (int refine : {0, 40}) {
+        SCOPED_TRACE(::testing::Message() << (int)metric << '/' << dims << '/' << deletes << '/' << mode << '/' << refine);
+        KnnQuery::tuning.selector = mode == 2 ? KnnPlanner::Selector::FOLD : KnnPlanner::Selector::RESOLVE;
+        std::vector<std::string> ids[2];
+        std::vector<uint32_t> scores[2];
+        KnnQuery::Stats stats[2];
+        for (int kernel : {0, 1}) {
+          KnnQuery::forceFaissRaBitQ = kernel == 1;
+          KnnQuery::statsForTests = &stats[kernel];
+          auto req = localReq(h.getSearchEngine());
+          auto& cur = req->collection("main").topDocs("q");
+          configKnn(cur, "emb_v", query, 10, 16, refine);
+          if (mode) addMatchFilter(cur, "keep_s", "yes");
+          req->execute(false);
+          ASSERT_OK(req);
+          ids[kernel] = resultIds(*req);
+          for (float score : resultScores(*req)) scores[kernel].push_back(std::bit_cast<uint32_t>(score));
+        }
+        EXPECT_FALSE(ids[0].empty());
+        ASSERT_EQ(ids[1].size(), ids[0].size());
+        // Approximate cuts can swap near-tie ids. Terminal scores for the same
+        // id must still be bit equal, wherever it occurs in the other ranking.
+        // The 1e-5 relative near-tie allowance is specific to this fixture.
+        for (size_t i = 0; i < ids[0].size(); i++) {
+          auto found = std::find(ids[1].begin(), ids[1].end(), ids[0][i]);
+          if (found != ids[1].end()) {
+            EXPECT_EQ(scores[0][i], scores[1][(size_t)(found - ids[1].begin())]);
+          }
+          float a = std::bit_cast<float>(scores[0][i]), b = std::bit_cast<float>(scores[1][i]);
+          EXPECT_NEAR(a, b, 1e-5f * std::max(std::abs(a), std::abs(b)));
+        }
+        EXPECT_GT(stats[0].work.oneBitScores, 0);
+        EXPECT_GT(stats[0].work.listSetups, 0);
+        for (auto field : {&VectorSearchWork::oneBitScores, &VectorSearchWork::physicalEntries, &VectorSearchWork::selectorPasses,
+                           &VectorSearchWork::resolveIdentity, &VectorSearchWork::selectorBitmap, &VectorSearchWork::selectorNone,
+                           &VectorSearchWork::bitProbes, &VectorSearchWork::listSetups})
+          EXPECT_EQ(stats[1].work.*field, stats[0].work.*field);
+        // Scan/selector work is fixed by coverage; interval seed/remaining
+        // reads depend on approximate cuts and may change by a few candidates.
+        for (const auto& stat : stats) {
+          int64_t reads = stat.work.seedReads + stat.work.remainingReads;
+          EXPECT_GE(reads, (int64_t)ids[0].size());
+          EXPECT_LE(reads, stat.work.selectorPasses);
         }
       }
     }
