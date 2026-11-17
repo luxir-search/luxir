@@ -382,7 +382,12 @@ luxir::Query* ProtobufQueryParser::parseBoolean(const luxir::api::BooleanQuery& 
   }
   auto required = parseQueryList(booleanQuery.required);
   auto optional = parseQueryList(booleanQuery.optional);
-  auto prohibited = parseQueryList(booleanQuery.prohibited);
+  auto previousProhibited = context.prohibited;
+  auto prohibited = [&] {
+    context.prohibited = true;
+    auto restore = scope_guard([&]() noexcept { context.prohibited = previousProhibited; });
+    return parseQueryList(booleanQuery.prohibited);
+  }();
   auto filter = parseQueryList(booleanQuery.filter);
   return pool.make<luxir::BooleanQuery>(required, optional, prohibited, filter, minMatch);
 }
@@ -710,7 +715,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // which parser (wire, JSON, expr, simple_query) produced the tree.
   NestingScope nesting(context);
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
-  return std::visit(luxir::overloaded{
+  auto* result = std::visit(luxir::overloaded{
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseLeaf(m, [&](const auto& target) { return parseMatch(m, target); }); },
     [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseLeaf(a, [&](const auto& target) { return parseAnyOf(a, target); }); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parseLeaf(p, [&](const auto& target) { return parsePhrase(p, target); }); },
@@ -744,6 +749,15 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
+  if (pquery.name) {
+    if (pquery.name->empty()) throw RequestError("clause name must not be empty");
+    if (!context.names) context.names = &context.localNames.emplace();
+    if (!context.names->emplace(*pquery.name, NamedClause{
+        result, context.list, std::string(context.fields.path()), context.prohibited}).second) {
+      throw RequestError("duplicate clause name '" + std::string(*pquery.name) + "'");
+    }
+  }
+  return result;
 }
 
 } // luxir

@@ -26,6 +26,11 @@ struct SkipStats {
   // Calls to TermsEnum::seek(), including unsuccessful seeks.
   static inline int64_t termDictionarySeeks = 0;
 
+  // Returned rows a row operation ran for, and scorers it planned for them
+  // (one per operation and segment run of a batch, not one per row).
+  static inline int64_t rowOperationRows = 0;
+  static inline int64_t rowOperationLeafPlans = 0;
+
   // Docs-block body decodes (full 128-doc blocks + the StreamVByte tail). This is
   // the real decode work; blocks_decoded(pruned) / blocks_decoded(exhaustive) is
   // the "% of blocks decoded vs total" headline.
@@ -406,6 +411,7 @@ struct SkipStats {
   static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreCompactionKeptByLevel{};
 
   static void reset() {
+    rowOperationRows = rowOperationLeafPlans = 0;
     docBlocksDecoded = 0;
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;

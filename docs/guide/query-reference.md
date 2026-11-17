@@ -42,6 +42,16 @@ sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
 one representation directly. See [default bindings for variants](schema.md#default-bindings-for-variants)
 and the [worked example](searching.md#field-bindings).
 
+## Clause names
+
+Any structured query object accepts an optional sibling `name`, unique within
+its request: `{"name":"recent","range":{"field":"answers.date","lte":"2012-04-08"}}`.
+A name references the subtree; it does not wrap it or change scores, equality,
+planning or cache keys. Expression strings have no name syntax, but the
+structured `expr` arm may be named. Row operations use `domain.from_match`
+to select a named clause's matching descendant rows. See
+[Per-row operations](searching.md#per-row-operations) for eligibility and errors.
+
 ## Match all and exists
 
 ```json

@@ -904,6 +904,7 @@ struct Diversify {
   std::optional<int64_t> max_per_key;
 };
 struct TopDocs {                                                 // all indirect/span/opt-scalar
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
   int64_t offset = 0;
@@ -937,6 +938,7 @@ struct Fusion {                                                  // needs TopDoc
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
+  std::optional<std::string_view> from_match;
   std::optional<std::string_view> to;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
@@ -1212,6 +1214,7 @@ struct ExprQuery {                                             // map value indi
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
 struct Query {                                                 // needs Match,AnyOfQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,GeoPolygon,Boost,Rescore
+  std::optional<std::string_view> name;
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,

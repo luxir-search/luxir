@@ -339,6 +339,11 @@ public:
     heap.reserve(std::min(maxSize, initialReserve));
   }
 
+  void clear() {
+    heap.clear();
+    if constexpr (Indexed) positions.values.clear();
+  }
+
   // Reference to the top element.
   T& top() {
     return heap.front();

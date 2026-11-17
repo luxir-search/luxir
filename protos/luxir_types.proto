@@ -170,6 +170,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Operations evaluated on each returned row, with that row as incoming domain.
+  map<string, SearchOp> row_ops = 26;
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
@@ -329,6 +331,8 @@ message SortSpec {
 }
 
 message Query {
+  // A request-unique reference to this clause; does not affect query identity.
+  optional string name = 28;
   // An unset kind selects all documents, same as `all`.
   oneof kind {
     Match match = 1;                // selects all documents with a value match in the specified field
@@ -1028,6 +1032,8 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // In row_ops, select this named clause's matching descendant rows.
+  optional string from_match = 7;
   // Relative descendant path, .. steps to ancestors, or / for root documents.
   optional string to = 6;
   // If present, replaces the incoming domain with this query's matches

@@ -282,6 +282,38 @@ Return the item color and the document id with each matching part:
 - `_version_` on any row is its owning root's version. Scores of owners and
   children are not returned.
 
+## Matched children per hit
+
+Name the descendant clause and reference it from a row operation. This
+returns only the matching answers for each returned root, rather than every
+answer as a returned-field selector would.
+
+```json
+{
+  "limit": 10, "fields": ["id"], "count_limit": 10000,
+  "query": {"boolean": {"required": [
+    {"match": {"field": "tag", "val": "java"}},
+    {"name": "recent", "range": {
+      "field": "answers.date", "lte": "2012-04-08T21:15:33.873Z"}}
+  ]}},
+  "row_ops": {"inner": {
+    "domain": {"from_match": "recent"},
+    "top_docs": {"limit": 3, "fields": ["date", "user"]}
+  }}
+}
+```
+
+A name may mark an explicit `to_parent`, a nested-path expression group, or
+an implicit descendant leaf. Each row operation sees that root's own family.
+Without a query of its own, the operation uses the named clause's child-side
+query for matching and scoring. An explicit query instead scores within the
+named clause's matching rows. A `domain.filter` narrows either form further.
+To retrieve children independently of a matching clause, use `domain.to`;
+with no query those children are unscored and in row order.
+
+See [Per-row operations](searching.md#per-row-operations) for controls,
+restrictions, formats and result-name rules.
+
 ## Chunks and vectors
 
 Text chunks are a natural use: `chunks_nested:(text_wl:"quick fox")` requires
@@ -316,7 +348,5 @@ of each child matter together.
 - Score modes other than `max` and `none`, and bounds on the number of
   matching children.
 - kNN counted in distinct documents.
-- Sorting or computing over child values from the owning document.
-- Returning the matching children beside each hit.
 - Updating or addressing a single child.
 - `domain.to` paths that go up and then down.

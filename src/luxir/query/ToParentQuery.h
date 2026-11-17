@@ -21,6 +21,7 @@ public:
       : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), maximum(maximum) {}
 
   Query* getChild() const { return child; }
+  std::string_view sourcePath() const { return source.topReader.path(); }
   bool takesMaximum() const { return maximum; }
   bool recoverableAsPredicate() const noexcept override { return child->recoverableAsPredicate(); }
 

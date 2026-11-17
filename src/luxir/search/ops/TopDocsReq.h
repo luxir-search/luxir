@@ -59,6 +59,9 @@ protected:
 
 public:
   class CalcBase;
+  std::vector<TopDocsReq*> rowOps;
+  std::span<ReturnField> rowFields;
+  std::vector<ExtraColumn> rowColumns();
 
   // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between
   // glass (0.758%, 1.008 compose/exhaustive) and philadelphia (0.861%, 0.977).
@@ -587,6 +590,7 @@ public:
 
   void init() override {
     SearchOp::init();
+    for (auto* row : rowOps) row->init();
     for (auto& [name, child] : groupOps) child->init();
     if (collapse && !topDocsProto.collapse->sort.empty()) resolveMetricGroupOrder(*this);
   }

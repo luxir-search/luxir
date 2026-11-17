@@ -2394,6 +2394,7 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   auto originalProjection = nested_test::retrieval(*source);
   EXPECT_EQ(originalProjection, nested_test::retrieval(*follower));
   auto replica = follower->getCollection("main");
@@ -2410,6 +2411,7 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   ASSERT_EQ(1u, merged->segments().size());
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
   EXPECT_EQ(originalProjection, nested_test::retrieval(*source, leaderOld));
   EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
@@ -2441,6 +2443,7 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
       {"deep",1},{"deep_group",1},{"rows",2},{"rows.up",2},{"parts",1},
       {"parts.up",1},{"parts.root",1},{"parts.two",1}};
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().first);
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().second);
   auto deletedProjection = nested_test::retrieval(*source);
@@ -2473,6 +2476,7 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   replica.reset(); before.reset(); after.reset();
   stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(deletedProjection, nested_test::retrieval(*source));
   EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
   for (auto* node : {source.get(), follower.get()}) {

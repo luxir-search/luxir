@@ -1364,3 +1364,51 @@ preparation without collecting results. See
 Documents can contain lists of structured children, queried with forms such as
 `items:(color:red AND size:L)` and reached by operations through `domain.to`.
 See [Nested documents](nested.md).
+
+## Per-row operations
+
+`top_docs.row_ops` maps output names to ordinary operations. Each runs over
+one returned row, after ranking, offset and limit, and its result sits beside
+that row's fields. HTTP root shorthand accepts `row_ops` too. In `columns` or
+`adaptive` format these results are row-aligned value columns.
+
+```json
+{
+  "query": "status_s:active", "fields": ["id"], "limit": 10,
+  "row_ops": {
+    "children": {
+      "domain": {"to": "items", "filter": ["color:red"]},
+      "top_docs": {"fields": ["color", "size"], "limit": 3, "count_limit": -1}
+    },
+    "self": {"top_docs": {"fields": ["id"]}}
+  }
+}
+```
+
+A row operation without a domain sees the row itself. `domain.to` uses the
+same relative paths, `..` and `/` as other operations. Without a query it
+returns rows in row order, unscored. With a query it matches and scores within
+its domain; `filter`, sort, fields, limit, offset and count controls apply
+normally. Output names must not collide with returned fields (including
+fields expanded by `*`), decorators or reserved keys such as `_score_`.
+
+A structured query may carry a request-unique `name`. In a row operation,
+`domain.from_match` references a named descendant clause of the list's query
+or filters. It selects that clause's matching rows in the clause's own view.
+Names do not change query equality, scores, plans or filter-cache identity.
+See [Matched children per hit](nested.md#matched-children-per-hit).
+
+With `from_match` and no query, the named clause supplies the score and
+ranking. With an explicit `top_docs.query`, the named clause only restricts
+the domain; the explicit query supplies the score and ranking. In both cases
+`domain.filter` may narrow the eligible rows further. `from_match` cannot be
+combined with `to`. Unknown names, non-descendant clauses, prohibited clauses
+and clauses containing kNN are rejected.
+
+A row operation is a `top_docs`, which includes count-only lists (`limit` 0
+with a count). Not supported yet: per-row facets and metrics, row operations
+inside a row operation, decorators, domain resets (`domain.query`), row
+queries that need a prepare pass (kNN), and `row_ops` on fusion sources or on
+collapsed or diversified lists. Group operations on collapsed lists are
+unaffected. Row results count against the request's memory limit; their size
+grows with page size times the inner limit.

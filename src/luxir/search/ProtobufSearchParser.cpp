@@ -27,6 +27,9 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/ToParentQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/FittedTerms.h"
 #include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
@@ -118,6 +121,7 @@ struct SearchParserImpl {
   ParseView parseView;
   OpParseContext options;
   TopDocsReq* firstQuery = nullptr;
+  NamedClauses namedClauses;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
@@ -134,6 +138,7 @@ struct SearchParserImpl {
     ROOT_OP,
     NESTED_OP,
     FUSION_SOURCE,
+    ROW_OP,
   };
 
   enum class OpsPlacement : uint8_t {
@@ -233,6 +238,7 @@ public:
         coerceContext(*req.timeZone), name, &req.warnings, &parseView, &req.engine.getNode()};
     parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
     parseContext.collapse = enclosingCollapse;
+    parseContext.names = &namedClauses;
     return parseContext;
   }
 
@@ -453,6 +459,9 @@ public:
       inheritedFacetMeasure = previousMeasure;
       owningList = previousList;
     });
+    if (searchOp.domain && searchOp.domain->from_match) {
+      throw RequestError("domain.from_match '" + std::string(*searchOp.domain->from_match) + "' is only supported in row_ops");
+    }
     InputDomainPlan* input = nullptr;
     std::optional<ParseView::Scope> viewScope;
     if (searchOp.domain && movesView(*searchOp.domain)) {
@@ -503,6 +512,7 @@ public:
         auto topDocsPlacement = depth == 1 && !searchOp.domain
             ? TopDocsPlacement::ROOT_OP : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
+        parseRowOps(*qr, topDocs, depth);
         if (topDocs.collapse) {
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
           // Keep the nearest collapse for explicit group units, while a
@@ -1718,12 +1728,102 @@ public:
     return filters;
   }
 
+  Query* descendantClause(Query* query, std::string& path) {
+    if (query->getKind() == QueryKind::TO_PARENT) {
+      auto& join = *(ToParentQuery*)query;
+      path = join.sourcePath();
+      return join.getChild();
+    }
+    if (query->getKind() == QueryKind::BOOST) {
+      auto& boost = *(BoostQuery*)query;
+      auto* child = descendantClause(boost.getChild(), path);
+      return req.requestPool.make<BoostQuery>(child, boost.getBoost());
+    }
+    if (query->getKind() == QueryKind::CONSTANT_SCORE) {
+      auto& constant = *(ConstantScoreQuery*)query;
+      auto* child = descendantClause(constant.getChild(), path);
+      return req.requestPool.make<ConstantScoreQuery>(child, constant.getScoreProfile());
+    }
+    return query;
+  }
+
+  void parseRowOps(TopDocsReq& owner, const api::TopDocs& list, int depth) {
+    if (list.row_ops.empty()) return;
+    if (list.collapse || list.diversify) throw RequestError("row_ops on collapsed or diversified lists are not supported yet");
+    if (depth >= maxOpDepth) throw RequestError("row_ops exceeds the operation nesting limit");
+    auto returned = resolveReturnFields(req, *view(), list.fields);
+    for (auto& [name, wire] : lastWins(list.row_ops)) {
+      validateName(name, "row operation");
+      if (name.starts_with('_')) throw RequestError("reserved row operation name '" + std::string(name) + "'");
+      for (const auto& field : returned) if (field.outputKey == name) {
+        throw RequestError("row operation '" + std::string(name) + "' conflicts with a returned field");
+      }
+      for (const auto& decorator : owner.decorators) if (decorator->columnName() == name) {
+        throw RequestError("row operation '" + std::string(name) + "' conflicts with a decorator");
+      }
+      const auto& spec = **wire;
+      auto* top = std::get_if<api::TopDocs>(&spec.kind);
+      if (!top) throw RequestError("row operation '" + std::string(name) + "': this operation kind is not supported yet");
+      if (!top->row_ops.empty() || !top->ops.empty() || top->collapse || top->diversify || !top->decorate.empty()) {
+        throw RequestError("row operation '" + std::string(name) + "': nested operations, collapse, diversify and decorators are not supported yet");
+      }
+      auto inherited = options;
+      options = options.child(spec, name);
+      auto restore = scope_guard([&]() noexcept { options = inherited; });
+      std::string path(view()->path());
+      Query* selectedRows = nullptr;
+      if (spec.domain) {
+        const auto& domain = *spec.domain;
+        if (domain.query) throw RequestError("row operation '" + std::string(name) + "': domain.query is not supported yet");
+        if (domain.apply_parent_filters) throw RequestError("row operation '" + std::string(name) + "': apply_parent_filters requires domain.query");
+        if (domain.from_match) {
+          auto clauseName = *domain.from_match;
+          auto found = namedClauses.find(clauseName);
+          auto fail = [&](std::string_view why) {
+            throw RequestError("domain.from_match '" + std::string(clauseName) + "': " + std::string(why));
+          };
+          if (domain.to) fail("cannot be combined with domain.to");
+          if (found == namedClauses.end()) fail("unknown clause name");
+          const auto& clause = found->second;
+          if (clause.list != &list) fail("the clause is not part of this list's query or filters");
+          if (clause.prohibited) fail("a prohibited clause has no matched rows");
+          path = clause.path;
+          selectedRows = descendantClause(clause.query, path);
+          auto base = view()->path();
+          if (path.empty() || path == base || (!base.empty() && !path.starts_with(std::string(base) + '.'))) {
+            fail("the clause does not select descendant rows");
+          }
+          if (logicalConsumesDomain(*selectedRows)) fail("kNN and other domain-consuming clauses cannot be replayed per row");
+        } else if (domain.to) path = domainPath(*domain.to);
+      }
+      auto scope = parseView.scoped(path);
+      auto* copy = arenaCreate<api::TopDocs>(req.arena, *top);
+      if (spec.domain && !spec.domain->filter.empty()) {
+        auto filters = req.requestPool.make_span<api::Filter>(top->filter.size() + spec.domain->filter.size());
+        std::copy(top->filter.begin(), top->filter.end(), filters.begin());
+        for (size_t i = 0; i < spec.domain->filter.size(); i++) {
+          auto* query = arenaCreate<api::Query>(req.arena, spec.domain->filter[i]);
+          filters[top->filter.size() + i].query = query;
+        }
+        copy->filter = filters;
+      }
+      auto* row = parseTopDocs(name, *copy, TopDocsPlacement::ROW_OP, selectedRows);
+      if (row->weight->needsPrepare() || !row->filterWeights.empty()) {
+        throw RequestError("row operation '" + std::string(name) + "': prepared queries and routed filters are not supported yet");
+      }
+      row->rowFields = resolveReturnFields(req, *row->view, top->fields);
+      resolveReturnFieldMetadata(*row->view, row->rowFields);
+      row->parent = &owner;
+      owner.rowOps.push_back(row);
+    }
+  }
+
   // Build a TopDocsReq from a TopDocs proto. Placement is semantic: ordinary
   // TopDocs can serve a canonical-root whole-reader fact, while a Fusion
   // source delivers candidates into a parent-owned domain.
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
-                           TopDocsPlacement placement) {
+                           TopDocsPlacement placement, Query* selectedRows = nullptr) {
     int64_t countLimit = topDocsReq.count_limit.value_or(0);
     if (countLimit < -2) {
       throw std::runtime_error(
@@ -1765,14 +1865,15 @@ public:
       inheritedFacetMeasure = collapse;
     }
     auto parseContext = createParseContext(name);
+    parseContext.list = &topDocsReq;
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
     // eliminates the match-all when filters fold in beside it.
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
-      : req.requestPool.make<AllQuery>();
-    Query* resultQuery = topDocsReq.query ? query : nullptr;
+      : selectedRows ? selectedRows : req.requestPool.make<AllQuery>();
+    Query* resultQuery = topDocsReq.query || selectedRows ? query : nullptr;
     // A minimum score turns the query's score into part of its membership,
     // so the cut-off wraps the query before filters fold in beside it: every
     // ranking, count, and ops-domain route below then sees the same matches.
@@ -1802,6 +1903,7 @@ public:
     }
 
     if (placement == TopDocsPlacement::FUSION_SOURCE) {
+      if (!topDocsReq.row_ops.empty()) throw RequestError("row_ops on fusion sources are not supported yet");
       if (!topDocsReq.ops.empty()) {
         throw std::runtime_error(
             "fusion source '" + std::string(name)
@@ -1818,6 +1920,13 @@ public:
     }
     auto explicitFilters = parseFilters(
         parser, topDocsReq.filter, &topDocsReq.ops, "top_docs.filter");
+    if (selectedRows && topDocsReq.query) {
+      auto all = req.requestPool.make_span<ParsedFilter>(explicitFilters.size() + 1);
+      std::copy(explicitFilters.begin(), explicitFilters.end(), all.begin());
+      all.back() = {selectedRows, {}};
+      explicitFilters = all;
+    }
+    parseContext.list = nullptr;
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
@@ -1915,7 +2024,7 @@ public:
     // iterators. Ranked requests need scores only when their normalized sort
     // plan consumes score (default ranking, SCORE, or a score-dependent EXPR).
     int32_t requestFlags = 0;
-    if (limit > 0
+    if (limit > 0 && (placement != TopDocsPlacement::ROW_OP || topDocsReq.query || selectedRows)
         && (topDocsReq.get_scores || parsedSorts.rankNeedsScores
             || (headSort && headSort->rankNeedsScores))) {
       requestFlags |= Query::NEED_SCORES;
@@ -1945,7 +2054,8 @@ public:
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     bool exactCountTopK = exactCountTopKShape && !boundedCount;
-    bool pureCountShape = collapse == nullptr && diversify == nullptr
+    bool pureCountShape = placement != TopDocsPlacement::ROW_OP
+        && collapse == nullptr && diversify == nullptr
         && !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && requirements.needsCount()
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
