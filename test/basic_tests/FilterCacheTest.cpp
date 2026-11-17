@@ -1010,6 +1010,177 @@ TEST(FilterCacheTest, concurrentResizeAndRoutedPublish) {
   cache.validateForTest();
 }
 
+TEST(FilterCacheTest, segmentLookIsInertOnMissingAndRetiredValues) {
+  FilterCache cache(testConfig());
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("unseen-segment");
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  auto before = cache.counters();
+  for (int i = 0; i < 4; i++) EXPECT_FALSE(use->look(0));
+  EXPECT_EQ(before, cache.counters());
+  EXPECT_FALSE(use->wasAdmitted());
+  EXPECT_EQ(0u, cache.entryCountForTest());
+
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache evicting(config);
+  std::array largeSegments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(evicting.onReaderPublished(1, largeSegments));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(evicting, largeSegments, key, 1, 1));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(evicting, largeSegments, FilterKey("winner"), 2, 100'000));
+  FilterCache::UseRegistry retired(evicting, 1, largeSegments);
+  auto* ghost = retired.get(key);
+  before = evicting.counters();
+  for (int i = 0; i < 4; i++) EXPECT_FALSE(ghost->look(0));
+  EXPECT_EQ(before, evicting.counters());
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, ghost->probe(0).kind());
+  }
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, ghost->probe(0).kind());
+}
+
+TEST(FilterCacheTest, segmentCandidatePinsAcrossDetachAndDeduplicatesAcceptance) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("looked-value");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, servePolicyValue(cache, segments, key, 7, 1));
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  auto before = cache.counters();
+  auto dump = cache.dump(1, nullptr);
+  auto candidate = use->look(0);
+  ASSERT_TRUE(candidate);
+  EXPECT_EQ(1, candidate->card());
+  EXPECT_EQ(before, cache.counters());
+  auto looked = cache.dump(1, nullptr);
+  ASSERT_EQ(1u, looked.size());
+  EXPECT_EQ(dump[0].lastUsed, looked[0].lastUsed);
+  EXPECT_EQ(dump[0].recentUses, looked[0].recentUses);
+  DocSet* docs = candidate->docSet();
+  std::thread evict([&] {
+    servePolicyValue(cache, segments, FilterKey("replacement"), 11, 100'000);
+  });
+  evict.join();
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+  EXPECT_TRUE(docs->get(7));
+  before = cache.counters();
+  auto hit = use->accept(std::move(*candidate));
+  EXPECT_EQ(docs, hit.docSet());
+  EXPECT_EQ(before.hits + 1, cache.counters().hits);
+  EXPECT_EQ(before.servedBuildNanos + 1, cache.counters().servedBuildNanos);
+  before = cache.counters();
+  auto second = use->look(0);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(docs, use->probe(0).docSet());
+  EXPECT_EQ(docs, use->accept(std::move(*second)).docSet());
+  EXPECT_EQ(before, cache.counters());
+  FilterCache::UseRegistry next(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, next.get(key)->probe(0).kind());
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, residentFilterModesKeepTheirDensityBands) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots);
+  for (int i = 0; i < 1024; i++) {
+    std::string text = "other";
+    if (i < 1) text += " sparse";
+    if (i < 2) text += " middle";
+    if (i < 4) text += " dense";
+    addTermDoc(writer, text);
+  }
+  writer.commit();
+  auto reader = writer.snapshots.readers.getReader();
+  auto* cache = reader->filterCache();
+  auto& segment = reader->segments()[0];
+  for (auto term : {"sparse", "middle", "dense"}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    TermQuery query("text_w", term);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(query);
+    auto probe = use->probe(0);
+    use->publishRaw(0, probe, QueryPrep::materializeRawFilter(*weight, nullptr, segment), 10);
+  }
+  for (auto mode : {QueryPrep::FilterSupplierMode::DENSITY_ROUTED,
+                    QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE,
+                    QueryPrep::FilterSupplierMode::SPARSE_BATCH}) {
+    for (auto term : {"sparse", "middle", "dense"}) {
+      SCOPED_TRACE(term);
+      SCOPED_TRACE((int)mode);
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      TermQuery query("text_w", term);
+      auto* weight = query.createWeight(context, 0);
+      auto* use = context.getFilterUse(query);
+      auto before = cache->counters();
+      auto dump = cache->dump(3, nullptr);
+      bool admitted = use->wasAdmitted();
+      auto* supplier = QueryPrep::filterSupplier(pool, *weight, use, *reader, segment, mode, 1024);
+      bool cached = mode == QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE
+          || std::string_view(term) == "dense"
+          || (mode == QueryPrep::FilterSupplierMode::SPARSE_BATCH && std::string_view(term) == "sparse");
+      EXPECT_EQ(cached, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr);
+      EXPECT_EQ(admitted, use->wasAdmitted());
+      if (!cached) {
+        EXPECT_EQ(before, cache->counters());
+        auto after = cache->dump(3, nullptr);
+        ASSERT_EQ(dump.size(), after.size());
+        for (size_t i = 0; i < dump.size(); i++) {
+          EXPECT_EQ(dump[i].lastUsed, after[i].lastUsed);
+          EXPECT_EQ(dump[i].recentUses, after[i].recentUses);
+        }
+      }
+    }
+  }
+}
+
+TEST(FilterCacheTest, prohibitedResidentDensityRejectionDoesNotAccept) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots);
+  for (int i = 0; i < 1024; i++) addTermDoc(writer, i == 0 ? "sparse" : "other");
+  writer.commit();
+  auto reader = writer.snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery query("text_w", "sparse");
+  QueryPrep::PreparedSource source;
+  source.weight = query.createWeight(context, 0);
+  source.cacheUse = context.getFilterUse(query);
+  auto probe = source.cacheUse->probe(0);
+  source.cacheUse->publishRaw(0, probe, QueryPrep::materializeRawFilter(*source.weight, nullptr, segment), 10);
+  auto* cache = reader->filterCache();
+  auto before = cache->counters();
+  auto* supplier = QueryPrep::prohibitedSupplier(pool, source, *reader, segment, true,
+      QueryPrep::ProhibitedCacheRoute::DENSITY);
+  ASSERT_NE(nullptr, supplier);
+  EXPECT_EQ(before, cache->counters());
+  auto planContext = supplier->makePlanContext(Query::Demand{});
+  EXPECT_EQ(Query::DirectScorerKind::TERM, supplier->describeScorer(planContext).directKind);
+}
+
 TEST(FilterCacheTest, existingLookupIsInertUntilCompleteAcceptance) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;

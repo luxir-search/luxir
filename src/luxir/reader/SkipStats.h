@@ -40,6 +40,8 @@ struct SkipStats {
   static inline int64_t collapseDocsVisited = 0;
   // Point reads of persisted child-to-owner columns, excluding family reuse.
   static inline int64_t ownershipReverseReads = 0;
+  // Child suppliers requested by ownership reductions.
+  static inline int64_t joinChildSuppliers = 0;
   // Candidate-family boundary work, accumulated once per owner window.
   static inline int64_t joinBoundaryPointFamilies = 0;
   static inline int64_t joinBoundaryRuns = 0;
@@ -421,6 +423,7 @@ struct SkipStats {
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;
     ownershipReverseReads = 0;
+    joinChildSuppliers = 0;
     joinBoundaryPointFamilies = 0;
     joinBoundaryRuns = 0;
     joinCandidatesVisited = 0;

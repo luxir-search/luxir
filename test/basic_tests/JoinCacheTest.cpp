@@ -56,6 +56,47 @@ protected:
   }
 };
 
+TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
+  CollectionHelper::UpdateBuilder input;
+  for (int i = 0; i < 256; i++) {
+    auto json = "{\"id\":\"r" + std::to_string(i) + "\",\"tag_w\":\"common\","
+        "\"rows_nested\":{\"value_i\":" + std::to_string(i % 4) + "}}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(true, 1);
+  ASSERT_TRUE(helper.submit(input).success);
+  for (bool folded : {false, true}) for (bool exact : {false, true}) {
+    SCOPED_TRACE(folded);
+    SCOPED_TRACE(exact);
+    cache->clear();
+    cache->resetAdmission();
+    auto run = [&](bool warm) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& mr = req->mr;
+      auto join = qb::toParent(mr, "rows_nested",
+          qb::range(mr, "value_i", qb::valI64(mr, 1), nullptr, qb::valI64(mr, 2), nullptr), "max");
+      auto& op = req->topDocs().getScores().limit(warm ? 0 : 10).countLimit(exact ? -1 : 20);
+      if (warm) op.rawQuery() = join;
+      else if (folded) { op.rawQuery() = qb::match(mr, "tag_w", "common"); op.filter(join); }
+      else op.rawQuery() = qb::boolean(mr, {qb::match(mr, "tag_w", "common")}, {}, {}, {join});
+      req->execute(1);
+      EXPECT_OK(req);
+      EXPECT_GE(req->getMatchCount(), 20);
+      if (!warm) { EXPECT_EQ(10u, req->getDocs().size()); }
+    };
+    run(true);
+    run(true);
+    auto before = cache->counters();
+    SkipStatsScope stats;
+    run(false);
+    auto after = cache->counters();
+    EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+    EXPECT_EQ(1u, after.hits - before.hits);
+    EXPECT_EQ(exact ? 1u : 0u, after.misses - before.misses);
+    EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  }
+}
+
 TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership) {
   EXPECT_EQ(12, count(1));
   EXPECT_EQ(0u, cache->counters().admissions);

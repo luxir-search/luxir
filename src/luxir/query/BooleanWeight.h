@@ -13240,8 +13240,14 @@ public:
       return -1;
     }
     int64_t cost = segment.maxDoc();
-    for (auto* weight : filterWeights) {
-      auto* supplier = weight->scorerSupplier(targetPool, segment);
+    for (size_t i = 0; i < filterWeights.size(); i++) {
+      auto candidate = filterUses[i] != nullptr
+          ? filterUses[i]->look((size_t) segment.ord) : std::nullopt;
+      if (candidate) {
+        cost = std::min<int64_t>(cost, candidate->card());
+        continue;
+      }
+      auto* supplier = filterWeights[i]->scorerSupplier(targetPool, segment);
       if (supplier == nullptr) {
         return 0;
       }

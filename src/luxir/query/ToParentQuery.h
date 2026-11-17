@@ -64,6 +64,7 @@ public:
       if (mode != Query::SupplierExecutionMode::RAW_MEMBERSHIP && domain && domain->card() == 0) return nullptr;
       auto& leaf = source.segments()[(size_t)segment.ord];
       auto childMode = child->consumesDomain() ? mode : Query::SupplierExecutionMode::RAW_MEMBERSHIP;
+      skipCount(SkipStats::joinChildSuppliers);
       auto* supplier = childUse
           // Raw child population is not priced against this request's demand
           // yet, so this join only borrows it. Reader-stable children still

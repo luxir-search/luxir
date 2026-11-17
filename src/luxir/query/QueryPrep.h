@@ -853,8 +853,17 @@ inline Query::ScorerSupplier* prohibitedSupplier(
     return wrap(ordinary(), ProhibitedCacheOutcome::DISABLED);
   }
 
+  // Live membership is no larger than raw, so a resident set whose raw
+  // cardinality is below the density gate is left unaccepted.
+  auto candidate = use->look((size_t) segment.ord);
+  if (candidate && route != ProhibitedCacheRoute::VERIFICATION
+      && !prohibitedDensityRoutesToCache(candidate->card(), segment.maxDoc())) {
+    return wrap(ordinary(), ProhibitedCacheOutcome::ROUTING_BYPASS);
+  }
+
   {
-    auto probe = use->probe((size_t) segment.ord);
+    auto probe = candidate ? use->accept(std::move(*candidate))
+        : use->probe((size_t) segment.ord);
     if (probe.kind() == FilterCache::Probe::Kind::HIT) {
       DocSet* docs = executionMode
               == Query::SupplierExecutionMode::RAW_MEMBERSHIP
@@ -1187,6 +1196,22 @@ inline bool shouldOwnFilterValue(FilterSupplierMode mode, int64_t cost,
   std::unreachable();
 }
 
+inline bool filterDensityRoutesToCache(FilterSupplierMode mode, int64_t cost,
+                                        int32_t maxDoc,
+                                        int32_t sparseBatchDensityInverse) {
+  switch (mode) {
+    case FilterSupplierMode::DENSITY_ROUTED:
+      return cost >= maxDoc / kMaskFilterDensityInverse;
+    case FilterSupplierMode::EXHAUSTIVE_CLAUSE:
+      return true;
+    case FilterSupplierMode::SPARSE_BATCH:
+      return sparseBatchDensityInverse > 0
+          && (cost <= maxDoc / sparseBatchDensityInverse
+              || cost >= maxDoc / kMaskFilterDensityInverse);
+  }
+  std::unreachable();
+}
+
 inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, const PreparedSource& source,
     IndexReader& reader, IndexReader::Segment& segment,
@@ -1213,6 +1238,17 @@ inline Query::ScorerSupplier* filterSupplier(
         targetPool, segment, executionMode);
   }
 
+  if (use != nullptr) {
+    auto candidate = use->look((size_t) segment.ord);
+    if (candidate && filterDensityRoutesToCache(
+            mode, candidate->card(), segment.maxDoc(), sparseBatchDensityInverse)) {
+      auto hit = use->accept(std::move(*candidate));
+      DocSet* docs = executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+          ? hit.docSet() : use->effectiveDocSet((size_t) segment.ord, reader);
+      return targetPool.make<DocSetSupplier>(docs, segment);
+    }
+  }
+
   // Gate before cache traffic. DENSITY_ROUTED leaves sparse filters on pruned
   // pull/WAND (a cached mask measures 7-16% slower on the 5M sweep).
   // SPARSE_BATCH extends that policy in both directions: its measured sparse
@@ -1226,13 +1262,8 @@ inline Query::ScorerSupplier* filterSupplier(
       targetPool, segment, executionMode);
   if (uncached == nullptr) return nullptr;
   int64_t cost = uncached->cost();
-  if (use == nullptr
-      || (mode == FilterSupplierMode::DENSITY_ROUTED
-          && cost < segment.maxDoc() / kMaskFilterDensityInverse)
-      || (mode == FilterSupplierMode::SPARSE_BATCH
-          && (sparseBatchDensityInverse <= 0
-              || (cost > segment.maxDoc() / sparseBatchDensityInverse
-                  && cost < segment.maxDoc() / kMaskFilterDensityInverse)))) {
+  if (use == nullptr || !filterDensityRoutesToCache(
+          mode, cost, segment.maxDoc(), sparseBatchDensityInverse)) {
     return uncached;
   }
 

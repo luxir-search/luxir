@@ -357,6 +357,68 @@ void FilterCache::Use::pinReaderValue(
   readerPinRequestOwned = requestOwned;
 }
 
+std::shared_ptr<const FilterCache::SegmentValue> FilterCache::lookSegmentValue(
+    const std::shared_ptr<SegmentSlot>& slot, const SegmentIdentity& identity) {
+  if (slot == nullptr || !slot->active.load(std::memory_order_acquire)
+      || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc
+      || slot->space != identity.space) {
+    return nullptr;
+  }
+  return slot->value.load(std::memory_order_acquire);
+}
+
+std::optional<FilterCache::SegmentCandidate> FilterCache::Use::look(size_t segmentOrd) {
+  if (scope_ == FilterKeyScope::READER_STABLE || segmentOrd >= requestSlotCount) {
+    return std::nullopt;
+  }
+  auto& requestSlot = requestSlots[segmentOrd];
+  {
+    std::lock_guard<std::mutex> lock(requestSlot.mutex);
+    if (requestSlot.raw != nullptr) {
+      return SegmentCandidate(this, segmentOrd, nullptr, requestSlot.raw);
+    }
+  }
+  if (cache == nullptr || !cache->enabled() || segmentOrd >= slotsByOrd.size()) {
+    return std::nullopt;
+  }
+  auto value = lookSegmentValue(slotsByOrd[segmentOrd], readerSegments[segmentOrd]);
+  if (value == nullptr) return std::nullopt;
+  return SegmentCandidate(this, segmentOrd, std::move(value));
+}
+
+FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate) {
+  if (candidate.use != this || candidate.segmentOrd >= requestSlotCount) {
+    throw std::logic_error("segment candidate belongs to a different filter use");
+  }
+  size_t segmentOrd = candidate.segmentOrd;
+  auto& requestSlot = requestSlots[segmentOrd];
+  {
+    std::unique_lock<std::mutex> lock(requestSlot.mutex);
+    requestSlot.condition.wait(lock, [&] {
+      return !requestSlot.resolving || requestSlot.raw != nullptr;
+    });
+    if (requestSlot.raw != nullptr) {
+      DocSet* raw = requestSlot.raw;
+      bool owned = requestSlot.rawOwned;
+      candidate.use = nullptr;
+      lock.unlock();
+      if (owned) skipCount(SkipStats::ownedFilterServes);
+      return Probe(Probe::Kind::HIT, nullptr, nullptr, false, raw);
+    }
+    if (candidate.value == nullptr) {
+      throw std::logic_error("segment candidate has no pinned membership");
+    }
+    requestSlot.resolving = true;
+  }
+  Probe claim(Probe::Kind::BYPASS, nullptr, nullptr, false, nullptr,
+              this, segmentOrd, true);
+  DocSet* raw = candidate.value->docSet();
+  cache->acceptSharedHit(*this, segmentOrd, slotsByOrd[segmentOrd], std::move(candidate.value));
+  candidate.use = nullptr;
+  claim.releaseClaims();
+  return Probe(Probe::Kind::HIT, nullptr, nullptr, false, raw);
+}
+
 FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Population population) {
   if (scope_ == FilterKeyScope::READER_STABLE
       || segmentOrd >= readerSegments.size()
@@ -1338,13 +1400,10 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
           return std::tie(slot->segId, slot->space, slot->maxDoc)
               < std::tie(target.segId, target.space, target.maxDoc);
         });
-    if (found == current->end() || (*found)->segId != identity.segId
-        || (*found)->maxDoc != identity.maxDoc || (*found)->space != identity.space
-        || !(*found)->active.load(std::memory_order_acquire)
-        || !isActive(*active, identity)) {
+    if (found == current->end() || !isActive(*active, identity)) {
       return nullptr;
     }
-    auto value = (*found)->value.load(std::memory_order_acquire);
+    auto value = lookSegmentValue(*found, identity);
     if (value == nullptr) return nullptr;
     aligned[i] = *found;
     candidates[i] = std::move(value);

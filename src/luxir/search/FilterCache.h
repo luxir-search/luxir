@@ -95,6 +95,7 @@ public:
   class Use;
   class UseRegistry;
   class ExistingCandidate;
+  class SegmentCandidate;
 
   enum class AdmissionLane : uint8_t {
     CLAUSE,
@@ -137,6 +138,8 @@ public:
     uint64_t readerStableRetires = 0;
     size_t residentBytes = 0;
     size_t metadataBytes = 0;
+
+    friend bool operator==(const CounterValues&, const CounterValues&) = default;
   };
 
   // Values keep pure GDS state: frozen build-nanoseconds / effective bytes
@@ -324,6 +327,35 @@ public:
     }
   };
 
+  // A segment lookup has no cache effects until its Use accepts it. It holds
+  // either a pin on the shared value or the value this request already
+  // resolved, which lives as long as the Use.
+  class SegmentCandidate {
+    Use* use;
+    size_t segmentOrd;
+    std::shared_ptr<const SegmentValue> value;
+    DocSet* requestValue;
+
+    SegmentCandidate(Use* use, size_t segmentOrd,
+                     std::shared_ptr<const SegmentValue> value,
+                     DocSet* requestValue = nullptr)
+      : use(use), segmentOrd(segmentOrd),
+        value(std::move(value)), requestValue(requestValue) {}
+
+    friend class Use;
+
+  public:
+    SegmentCandidate(const SegmentCandidate&) = delete;
+    SegmentCandidate& operator=(const SegmentCandidate&) = delete;
+    SegmentCandidate(SegmentCandidate&&) noexcept = default;
+    SegmentCandidate& operator=(SegmentCandidate&&) noexcept = default;
+
+    DocSet* docSet() const {
+      return value != nullptr ? value->docSet() : requestValue;
+    }
+    int32_t card() const { return docSet()->card(); }
+  };
+
   class Use {
     struct RequestSlot {
       std::mutex mutex;
@@ -408,6 +440,11 @@ public:
 
   public:
     ~Use();
+
+    // Look only pins existing membership. Acceptance has the same hit and
+    // request-local deduplication effects as probe(), including late hits.
+    std::optional<SegmentCandidate> look(size_t segmentOrd);
+    Probe accept(SegmentCandidate&& candidate);
 
     // BORROW_ONLY counts a miss but takes no build claim, counts no build
     // attempt and spends no backoff. Both policies take the request slot's
@@ -697,6 +734,9 @@ private:
   bool isActive(const ActiveSnapshot& snapshot,
                 const SegmentIdentity& identity) const;
   std::shared_ptr<FilterEntry> findEntry(const FilterKey& key);
+  static std::shared_ptr<const SegmentValue> lookSegmentValue(
+      const std::shared_ptr<SegmentSlot>& slot,
+      const SegmentIdentity& identity);
   std::shared_ptr<FilterEntry> findOrCreateEntry(const FilterKey& key,
                                                  FilterKeyScope scope);
   bool eraseEntry(const FilterKey& key,
