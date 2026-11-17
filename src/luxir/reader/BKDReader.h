@@ -48,7 +48,7 @@ inline BKDLongitudeRelation compareBKDLongitudeInterval(
 
 // One box matches() in the planner's point emissions (Query::Demand):
 // GeoBM's box test takes 0.43-0.54 ns per point (release, 2026-11-03), and a
-// forced BKD box emits a point in 0.69 ns (GeoQuery.h, CROSSING_POINTS).
+// forced BKD box emits a point in 0.69 ns (GeoPointSource.h, CROSSING_POINTS).
 inline constexpr double BOX_TEST_POINTS = 0.7;
 
 // What one point test costs beyond a box test, in point emissions: exact for

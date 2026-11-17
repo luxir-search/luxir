@@ -10,47 +10,45 @@
 #include <limits>
 #include <optional>
 #include <span>
-#include <stdexcept>
-#include <string>
 
 #include <boost/sort/spreadsort/integer_sort.hpp>
 
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/query/Query.h"
-#include "luxir/reader/BKDReader.h"
 #include "luxir/reader/IntColReader.h"
-#include "luxir/util/geo.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
-template <class Relation, class ColIter>
-class GeoQueryScorer final : public Query::ConstantScorer {
+template <class PointSource, class Relation, class ColIter>
+class BKDQueryScorer final : public Query::ConstantScorer {
   IntColReader& reader;
   ColIter iter;
   Relation relation;
-  bool multi;
+  bool singlePoint;
   int32_t docid = -1;
 
-  bool pointMatches(int64_t packed) const {
-    return relation.matches(geo::unpackLatitude(packed),
-                            geo::unpackLongitude(packed));
+  bool pointMatches(int64_t rank) {
+    auto [v0, v1] = PointSource::pointAt(iter.values(), rank);
+    return relation.matches(v0, v1);
   }
 
   bool valueMatches() {
     if (docid == PostingsReader::END) return false;
-    if (!multi) return pointMatches(iter.value());
-    auto [start, end] = reader.getStartEndValueRank(iter.rank());
+    // With one point per populated document, point rank is document rank.
+    if (singlePoint) return pointMatches(iter.rank());
+    auto [start, end] = PointSource::pointRanks(reader, iter.rank());
     for (int64_t rank = start; rank < end; rank++) {
-      if (pointMatches(iter.values().valueAt(rank))) return true;
+      if (pointMatches(rank)) return true;
     }
     return false;
   }
 
 public:
-  GeoQueryScorer(IntColReader& reader, const Relation& relation,
+  BKDQueryScorer(IntColReader& reader, const Relation& relation,
                  float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
-        relation(relation), multi(reader.multiValued()) {}
+        relation(relation), singlePoint(PointSource::onePointPerDoc(reader)) {}
 
   int32_t approximationNext() override {
     docid = iter.next();
@@ -62,16 +60,8 @@ public:
   }
   int32_t approximationDocId() override { return docid; }
   bool matches() override { return valueMatches(); }
-  // A box test is two value compares; other relations scale it by their
-  // average test (BKDPointCost).
-  static constexpr double BOX_MATCH_COST = 2.0;
-
   float matchCost() override {
-    float point = (float)(BOX_MATCH_COST
-        * (1.0 + relation.pointCost().average / BOX_TEST_POINTS));
-    if (!multi) return point;
-    int64_t docs = reader.docsWithValue();
-    return docs > 0 ? point * (float)reader.numValues() / (float)docs : point;
+    return PointSource::matchCost(reader, relation.pointCost());
   }
 
   int32_t next() override {
@@ -92,7 +82,12 @@ public:
 };
 
 template <class QueryType, class Relation>
-class GeoQueryWeight final : public Query::Weight {
+class BKDQueryWeight final : public Query::Weight {
+  using PointSource = typename QueryType::PointSource;
+  using PointTraits = typename PointSource::PointTraits;
+  using Reader = typename PointSource::Reader;
+  using Unsigned = typename PointTraits::Unsigned;
+
   QueryType& query;
   IndexReader::FieldSegments segInfos;
   float constantScore;
@@ -102,18 +97,8 @@ class GeoQueryWeight final : public Query::Weight {
     return info != nullptr && info->columnLoc.offset() > 0;
   }
 
-  [[noreturn]] static void wrongFieldType() {
-    throw std::runtime_error(std::string(QueryType::QUERY_NAME)
-                             + " requires a GEO_POINT field");
-  }
-
-  [[noreturn]] static void countMismatch() {
-    throw std::runtime_error(std::string(QueryType::QUERY_NAME)
-                             + ": points/column value count mismatch");
-  }
-
 public:
-  GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags,
+  BKDQueryWeight(Query::Context& context, QueryType& query, int32_t flags,
                  float constantScore)
       : Query::Weight(context, query, flags), query(query),
         constantScore(constantScore) {
@@ -125,10 +110,10 @@ public:
   // the walk belongs to execution after the supplier has been selected.
   Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
     const SegFieldInfo* info = nullptr;
-    if (query.isEmpty() || !segmentInfo(segment, info) || info->numValues == 0) {
+    if (query.isEmpty() || !segmentInfo(segment, info) || PointSource::pointCount(*info) == 0) {
       return {0, Query::CountHow::METADATA};
     }
-    auto how = info->pointsMetaOff != 0 && info->monoLoc.offset() == 0
+    auto how = info->pointsMetaOff != 0 && PointSource::onePointPerDoc(*info)
         ? Query::CountHow::INDEX_WALK : Query::CountHow::ITERATE;
     auto shortcut = Query::countBound(segment, domain, info->docsWithField, how);
     if (shortcut.how == Query::CountHow::INDEX_WALK) shortcut.resolver = this;
@@ -142,35 +127,27 @@ public:
       SCAN,
     };
 
-    GeoQueryWeight& weight;
+    BKDQueryWeight& weight;
     MemPool& planPool;
     IndexReader::Segment& segment;
     IntColReader& reader;
-    BKDReader* bkd;
+    Reader* bkd;
     Relation relation;
     int64_t estimatedCost;
     uint64_t materializeUpperBound;
     // Points of the crossing leaves, which the traversal tests one by one.
     uint64_t crossingPoints;
 
-    // Testing one point of a crossing leaf against a box, in point
-    // emissions. Measured by forcing the BKD for lone boxes under a
-    // 35-candidate lead (5M docs, one segment, 2026-10-28): 0.69 ns per
-    // emitted point, 1.3 ns per crossing point (nine boxes, emitted
-    // 0.8k-2.5M, crossing 1.5k-88k). Other relations add their exact test's
-    // extra (BKDPointCost).
-    static constexpr double CROSSING_POINTS = 2;
-
-    BKDReader::Scratch scratch(MemPool& pool) const {
+    typename Reader::Scratch scratch(MemPool& pool) const {
       size_t size = bkd->maxPointsPerLeaf();
       return {pool.make_span<uint32_t>(size),
-              pool.make_span<uint32_t>(size),
-              pool.make_span<uint32_t>(size)};
+              pool.make_span<Unsigned>(size),
+              pool.make_span<Unsigned>(size)};
     }
 
     PointsMaterialize::Materialized materialize(MemPool& pool) const {
       assert(bkd != nullptr);
-      BKDReader::Scratch leafScratch = scratch(pool);
+      typename Reader::Scratch leafScratch = scratch(pool);
       if (PointsMaterialize::useBitset((uint64_t)estimatedCost,
                                        segment.maxDoc())) {
         auto words = pool.make_span<uint64_t>(
@@ -207,7 +184,7 @@ public:
       auto used = docs.first(size);
       // BKD output is sorted only within leaves.
       boost::sort::spreadsort::integer_sort(used.begin(), used.end());
-      if (reader.multiValued()) {
+      if (!PointSource::onePointPerDoc(reader)) {
         size = (size_t)(std::unique(used.begin(), used.end()) - used.begin());
       }
       return {docs.first(size), nullptr};
@@ -219,14 +196,12 @@ public:
     // emits each matching point.
     double bkdPrice() const {
       return PointsMaterialize::price((uint64_t)estimatedCost, segment.maxDoc())
-          + (CROSSING_POINTS + relation.pointCost().exact) * (double)crossingPoints;
+          + (PointSource::CROSSING_POINTS + relation.pointCost().exact) * (double)crossingPoints;
     }
 
-    // Verifying one candidate: a column check, VERIFY_POINTS as fitted on
-    // boxes, plus the relation's average test extra, since candidates fall
-    // anywhere in its box.
+    // The source prices a column check and the relation's average test.
     double verifyPoints() const {
-      return PointsMaterialize::VERIFY_POINTS + relation.pointCost().average;
+      return PointSource::verifyPoints(relation.pointCost());
     }
 
     // Verify or produce the BKD. A consumer that fills windows over an
@@ -236,9 +211,8 @@ public:
     // those candidates plus the work producing would spare it, against
     // producing. Under an exposure a verifying box, which cannot fill
     // windows, also turns the consumer away from its window plan. The verify
-    // price is flat against the values per document a multivalued verifier
-    // tests (matchCost). Elsewhere the box verifies for a lead sparser than
-    // its matches.
+    // price comes from the source, independently of matchCost(). Elsewhere
+    // it verifies for a lead sparser than its matches.
     ScorerArm selectScorerArm(const Query::PlanContext& context) const {
       const Query::Demand& demand = context.demand;
       bool exposure = fillsExposedWindows(context);
@@ -282,19 +256,19 @@ public:
         MemPool& targetPool, ScorerArm arm) const {
       switch (arm) {
         case ScorerArm::SPARSE_VERIFY:
-          skipCount(SkipStats::geoSparseVerifyArms);
+          skipCount(PointSource::sparseVerifyArms);
           return targetPool.make<
-              GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
+              BKDQueryScorer<PointSource, Relation, IntColReader::SparseIterator>>(
                   reader, relation, weight.constantScore);
         case ScorerArm::BKD:
-          skipCount(SkipStats::geoBKDArms);
+          skipCount(PointSource::bkdArms);
           return PointsMaterialize::scorerFor(
               targetPool, materialize(targetPool), segment.maxDoc(),
               weight.constantScore);
         case ScorerArm::SCAN:
-          skipCount(SkipStats::geoScanArms);
+          skipCount(PointSource::scanArms);
           return targetPool.make<
-              GeoQueryScorer<Relation, IntColReader::Iterator>>(
+              BKDQueryScorer<PointSource, Relation, IntColReader::Iterator>>(
                   reader, relation, weight.constantScore);
       }
       std::unreachable();
@@ -317,10 +291,10 @@ public:
     };
 
   public:
-    Supplier(GeoQueryWeight& weight, MemPool& planPool,
+    Supplier(BKDQueryWeight& weight, MemPool& planPool,
              IndexReader::Segment& segment,
-             IntColReader& reader, BKDReader* bkd,
-             BKDReader::EstimateResult estimate)
+             IntColReader& reader, Reader* bkd,
+             typename Reader::EstimateResult estimate)
         : weight(weight), planPool(planPool), segment(segment),
           reader(reader), bkd(bkd),
           relation(weight.query.makeRelation()),
@@ -332,9 +306,9 @@ public:
     int64_t cost() override { return estimatedCost; }
 
     // The sparse verifier quotes its check when the relation's price is
-    // measured; multivalued fields do not quote.
+    // measured and the source guarantees one point per populated document.
     std::optional<double> checkPrice() const {
-      if (reader.multiValued() || !relation.pointCost().quoted) return std::nullopt;
+      if (!PointSource::onePointPerDoc(reader) || !relation.pointCost().quoted) return std::nullopt;
       return verifyPoints();
     }
 
@@ -375,11 +349,11 @@ public:
             BulkAnswer::NO,
           };
         }
-        assert(bkd != nullptr && !reader.multiValued() && !segment.hasDeletes());
+        assert(bkd != nullptr && PointSource::onePointPerDoc(reader) && !segment.hasDeletes());
         size_t size = bkd->maxPointsPerLeaf();
-        BKDReader::Scratch countScratch{
-          {}, planPool.make_span<uint32_t>(size),
-          planPool.make_span<uint32_t>(size),
+        typename Reader::Scratch countScratch{
+          {}, planPool.make_span<Unsigned>(size),
+          planPool.make_span<Unsigned>(size),
         };
         int64_t exact =
             (int64_t)bkd->countIntersect(relation, countScratch).exactCount;
@@ -404,7 +378,7 @@ public:
       assert(!plan.hasConstantCount());
       assert(bkd != nullptr);
       if (bkd == nullptr) return nullptr;
-      skipCount(SkipStats::geoBKDArms);
+      skipCount(PointSource::bkdArms);
       return PointsMaterialize::bulkFor(
           targetPool, materialize(targetPool), segment.maxDoc(),
           weight.constantScore);
@@ -418,15 +392,15 @@ public:
     if (query.isEmpty()) return nullptr;
     const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
-    if (info->type != FieldType::GEO_POINT) wrongFieldType();
-    auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *info);
-    if (reader->numValues() == 0) return nullptr;
-    BKDReader* bkd = nullptr;
-    BKDReader::EstimateResult estimate{
-        (uint64_t)reader->docsWithValue(), (uint64_t)reader->numValues()};
+    auto* reader = PointSource::openColumn(
+        targetPool, segment.postingsReader(), *info, QueryType::QUERY_NAME);
+    if (PointSource::pointCount(*reader) == 0) return nullptr;
+    Reader* bkd = nullptr;
+    typename Reader::EstimateResult estimate{
+        (uint64_t)reader->docsWithValue(), PointSource::pointCount(*reader)};
     if (info->pointsMetaOff != 0) {
-      bkd = targetPool.make<BKDReader>(segment.postingsReader(), *info);
-      if (bkd->pointCount() != (uint64_t)reader->numValues()) countMismatch();
+      bkd = targetPool.make<Reader>(segment.postingsReader(), *info);
+      PointSource::validatePointCount(*bkd, *reader, QueryType::QUERY_NAME);
       Relation relation = query.makeRelation();
       estimate = bkd->estimateIntersect(relation);
       if (estimate.upperBound == 0) return nullptr;
@@ -451,12 +425,11 @@ public:
     if (query.isEmpty()) return nullptr;
     const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
-    if (info->type != FieldType::GEO_POINT) wrongFieldType();
-    auto* reader = targetPool.make<IntColReader>(segment.postingsReader(),
-                                                 *info);
-    if (reader->numValues() == 0) return nullptr;
+    auto* reader = PointSource::openColumn(
+        targetPool, segment.postingsReader(), *info, QueryType::QUERY_NAME);
+    if (PointSource::pointCount(*reader) == 0) return nullptr;
     Relation relation = query.makeRelation();
-    return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
+    return targetPool.make<BKDQueryScorer<PointSource, Relation, IntColReader::Iterator>>(
         *reader, relation, constantScore);
   }
 
