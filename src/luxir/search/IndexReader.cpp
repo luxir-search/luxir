@@ -411,6 +411,33 @@ std::shared_ptr<AuxReader> SegmentOverlay::get() {
   });
 }
 
+void SegmentOverlay::declareOpen(HeldFiles& held, ReadSet& reads) {
+  if (info.kind != VectorAuxReader::KIND || info.files.size() != 1) {
+    SegmentPart::declareOpen(held, reads);
+    return;
+  }
+  const auto& name = info.files.front().name;
+  auto file = held.mapping(name);
+  if (!file) return;
+  uint64_t size = (uint64_t)file->size();
+  if (!openRanges) {
+    if (!reads.prerequisitesFetched) {
+      held.declare(name, {VectorAuxListsFooter::rangeIn(size)}, reads);
+      reads.again = true;
+      return;
+    }
+    openRanges.emplace();
+    try {
+      auto footer = VectorAuxListsFooter::fromFile(*file, info.name);
+      openRanges->push_back(VectorAuxListsFooter::rangeIn(size));
+      openRanges->push_back(footer.openRange());
+    } catch (const std::exception& e) {
+      LOG_DEBUG("Overlay '{}' declares no open reads: {}", info.name, e.what());  // the open reports it
+    }
+  }
+  held.declare(name, *openRanges, reads);
+}
+
 bool Segment::isMaterialized() const noexcept {
   if (!sharedBase->peekRaw() || (sharedLive && !sharedLive->peekRaw())) return false;
   for (const auto& overlay : sharedOverlays) {

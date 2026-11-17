@@ -225,6 +225,16 @@ public:
 
 // A segment overlay of a known kind (a vector index, the test overlay).
 class SegmentOverlay : public SegmentPart<AuxReader> {
+  // A vector overlay's open ranges, once a declare read its footer; empty
+  // before that. Under filesMutex.
+  std::optional<std::vector<ByteRange>> openRanges;
+
+protected:
+  // A vector overlay (large: its inverted lists) declares its footer, fetched
+  // in a round of its own first, then the header and list sizes the footer
+  // locates. Other overlays are small and declare their files whole.
+  void declareOpen(HeldFiles& held, ReadSet& reads) override;
+
 public:
   const AuxInfo info;
   const SegmentOverlayPolicy policy;

@@ -182,6 +182,17 @@ struct VectorAuxListsFooter {
     return decode(base + fileBytes - sizeof(VectorAuxListsFooter), fileBytes, auxName);
   }
 
+  /// Where the footer of a fileBytes-long file lies (all of a smaller file).
+  static ByteRange rangeIn(uint64_t fileBytes) noexcept {
+    uint64_t footer = std::min<uint64_t>(fileBytes, sizeof(VectorAuxListsFooter));
+    return {fileBytes - footer, footer};
+  }
+
+  /// What opening the file and its first search read besides the footer: the
+  /// FAISS header and the per-list sizes after it, one range. The lists are
+  /// read by range as scans use them.
+  ByteRange openRange() const noexcept { return {0, (uint64_t)idsOffset()}; }
+
   /// The same, reading only the footer's bytes of the file.
   static VectorAuxListsFooter fromFile(InputFile& file, std::string_view auxName) {
     size_t fileBytes = file.size();
