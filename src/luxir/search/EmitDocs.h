@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include "luxir/query/FieldResolver.h"
+#include "luxir/reader/SegmentCore.h"
+#include "luxir/search/AncestorRows.h"
+#include "luxir/search/HitDecorator.h"
+
 // Field loading + streaming response emission for an already-ranked list of
 // (segdoc, score) pairs.  Used by TopDocsReq (after collector sort) and by
 // FusionOp (after RRF merge); both share the same segment-grouped column
@@ -41,7 +46,7 @@
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
-#include "luxir/search/DateOutput.h"
+#include "luxir/search/ValueOutput.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
@@ -232,17 +237,19 @@ inline uint8_t* allocStringColumn(luxir::api::Column& fieldCol, size_t columnSiz
 // segment and writes values into starget (single) or mtarget (multi).
 // No-op if the field isn't in the segment.  Extracted so the stored-fields
 // path can fall back here when a segment predates the STORED flag.
-inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, FieldType& fieldType,
+template <typename Output>
+inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info, FieldType& fieldType,
                                  std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
-                                 uint8_t* present, std::pmr::memory_resource& mr)
+                                 uint8_t* present, std::pmr::memory_resource& mr, const Output& output)
 {
   auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
+  info = SegFieldInfo::column(info);
   if (!info) return;
-  auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+  auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
   const auto& segFieldInfo = *info;
 
@@ -254,14 +261,14 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
       auto valHandler = [&](size_t idx, int32_t doc, int32_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
-        starget[idxSpan[idx]] = build::arenaStr(mr, (std::string_view) tenum.term());
+        starget[idxSpan[idx]] = outputTerm((std::string_view)tenum.term(), mr, output);
         if (present) present[idxSpan[idx]] = 1;
       };
       OrdColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        starget[idxSpan[idx]] = build::arenaStr(mr, val);
+        starget[idxSpan[idx]] = outputTerm(val, mr, output);
         if (present) present[idxSpan[idx]] = 1;
       };
       StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
@@ -274,7 +281,7 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
         if (valIdx == 0) build::allocArray(target.v, numVals, mr);
         tenum.seekOrd((int32_t) val - 1);
-        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, (std::string_view) tenum.term());
+        const_cast<std::string_view*>(target.v.data())[valIdx] = outputTerm((std::string_view)tenum.term(), mr, output);
       };
       OrdColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
@@ -282,30 +289,41 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
         assert(segDocs[idxSpan[idx]].docId() == doc);
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
         if (valIdx == 0) build::allocArray(target.v, numVals, mr);
-        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, val);
+        const_cast<std::string_view*>(target.v.data())[valIdx] = outputTerm(val, mr, output);
       };
       StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
   }
 }
 
-// loadStrCol when the output spans are already allocated (by the caller's
-// earlier allocStringColumn).  Dispatches one per-segment task per run.
-inline void loadStrColWithTargets(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
-                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
-                                  uint8_t* present,
-                                  std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
-                                  std::pmr::memory_resource& mr)
-{
-  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr](std::span<RowIndex> idxSpan) {
-    loadStrColForSegment(req, infos.at(segDocs[idxSpan[0]].segment()), fieldType, idxSpan, segDocs, starget, mtarget, present, mr);
+inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info, FieldType& fieldType,
+    std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
+    std::span<std::string_view> starget, std::span<api::ArrStr> mtarget,
+    uint8_t* present, std::pmr::memory_resource& mr, uint64_t flags) {
+  withNatureOutput<std::string_view>(fieldType.valueNature(), flags, mr, [&] { return fieldType.name(); }, [&](auto output) {
+    loadStrColForSegment(req, reader, info, fieldType, idxSpan, segDocs, starget, mtarget, present, mr, output);
   });
 }
 
-inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
+// loadStrCol when the output spans are already allocated (by the caller's
+// earlier allocStringColumn).  Dispatches one per-segment task per run.
+inline void loadStrColWithTargets(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos, FieldType& fieldType,
+                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
+                                  uint8_t* present,
+                                  std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
+                                  std::pmr::memory_resource& mr, uint64_t flags)
+{
+  withNatureOutput<std::string_view>(fieldType.valueNature(), flags, mr, [&] { return fieldType.name(); }, [&](auto output) {
+    addFieldLoader(loaders, runs, [&req, &reader, infos, &fieldType, segDocs, starget, mtarget, present, &mr, output](std::span<RowIndex> idxSpan) {
+      loadStrColForSegment(req, reader, infos.at(segDocs[idxSpan[0]].segment()), fieldType, idxSpan, segDocs, starget, mtarget, present, mr, output);
+    });
+  });
+}
+
+inline void loadStrCol(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
-                       FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr)
+                       FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr, uint64_t flags)
 {
   auto columnSize = segDocs.size();
   if (columnSize == 0) return;
@@ -313,7 +331,7 @@ inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   std::span<luxir::api::ArrStr> mtarget;
   uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                        starget, mtarget, pendingCols, mr);
-  loadStrColWithTargets(req, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr);
+  loadStrColWithTargets(req, reader, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr, flags);
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -322,7 +340,9 @@ inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
 // floating point value.  encodeVal/decodeEnc map client-facing values to
 // the order-preserving int64 space pickMissingVal searches in (identity
 // for ints, sortable bits for floats/doubles).
-struct IntColEmit {
+template <typename T> struct ColEmit;
+
+template <> struct ColEmit<int64_t> {
   using value_type = int64_t;
   using arr_type = luxir::api::ArrInt;
   static constexpr bool foldZeros = false;
@@ -335,7 +355,7 @@ struct IntColEmit {
   static int64_t encHi() { return std::numeric_limits<int64_t>::max(); }
 };
 
-struct FloatColEmit {
+template <> struct ColEmit<float> {
   using value_type = float;
   using arr_type = luxir::api::ArrFloat;
   static constexpr bool foldZeros = true;
@@ -348,7 +368,7 @@ struct FloatColEmit {
   static int64_t encHi() { return (int64_t)floatToSortableInt32(std::numeric_limits<float>::infinity()); }
 };
 
-struct DoubleColEmit {
+template <> struct ColEmit<double> {
   using value_type = double;
   using arr_type = luxir::api::ArrDouble;
   static constexpr bool foldZeros = true;
@@ -361,9 +381,14 @@ struct DoubleColEmit {
   static int64_t encHi() { return doubleToSortableInt64(std::numeric_limits<double>::infinity()); }
 };
 
-struct DateStrColEmit {
+template <> struct ColEmit<std::string_view> {
   using value_type = std::string_view;
   using arr_type = luxir::api::ArrStr;
+};
+
+template <> struct ColEmit<bool> {
+  using value_type = api::Val;
+  using arr_type = api::ArrVal;
 };
 
 template <typename Emit>
@@ -373,7 +398,7 @@ struct ColumnDecode {
 
 // The caller finishes the batch and waits before releasing loader resources.
 template <typename Emit, typename Decode = ColumnDecode<Emit>>
-inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
+inline void loadNumCol(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
                        FieldLoaders* loaders, PendingCols& pendingCols, std::pmr::memory_resource& mr, Decode decode = {})
@@ -387,7 +412,13 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     return;
   }
 
-  if constexpr (std::is_same_v<typename Emit::value_type, std::string_view>) {
+  if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+    auto& col = fieldCol.kind.emplace<api::ColVal>();
+    starget = {build::allocArray(col.v, columnSize, mr), columnSize};
+    if (fieldType.multiValued()) {
+      for (auto& value : starget) value.kind.template emplace<api::ArrVal>();
+    }
+  } else if constexpr (std::is_same_v<typename Emit::value_type, std::string_view>) {
     present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                 starget, mtarget, pendingCols, mr);
   } else if (!fieldType.multiValued()) {
@@ -410,32 +441,42 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
     auto& numCol = Emit::multiCol(fieldCol);
     mtarget = std::span<typename Emit::arr_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
   }
-  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, starget, mtarget, present, &mr, decode](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, &reader, infos, &fieldType, segDocs, starget, mtarget, present, &mr, decode](std::span<RowIndex> idxSpan) {
     auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
     auto* info = infos.at(segNum);
     if (!info) return;
-    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     const auto& segFieldInfo = *info;
 
     if (!fieldType.multiValued()) {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        starget[idxSpan[idx]] = decode(val);
-        present[idxSpan[idx]] = 1;
+        if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+          starget[idxSpan[idx]].kind = decode(val);
+        } else {
+          starget[idxSpan[idx]] = decode(val);
+          present[idxSpan[idx]] = 1;
+        }
       };
       IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        typename Emit::arr_type& target = mtarget[idxSpan[idx]];
+        typename Emit::arr_type& target = [&]() -> typename Emit::arr_type& {
+          if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
+            return std::get<api::ArrVal>(starget[idxSpan[idx]].kind);
+          } else return mtarget[idxSpan[idx]];
+        }();
         if (valIdx == 0) {
           build::allocArray(target.v, numVals, mr);
         }
-        const_cast<typename Emit::value_type*>(target.v.data())[valIdx] = decode(val);
+        auto& value = const_cast<typename Emit::value_type*>(target.v.data())[valIdx];
+        if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) value.kind = decode(val);
+        else value = decode(val);
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
@@ -447,7 +488,7 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
 // [lon, lat] and a multi-valued one [[lon, lat], ...], by the field's
 // cardinality rather than the document's point count. A missing document
 // leaves the kind unset.
-inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
+inline void loadGeoCol(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos, FieldType& fieldType,
                        std::span<const segdoc> segDocs, SegmentRuns runs,
                        luxir::api::Column& fieldCol,
                        FieldLoaders* loaders, std::pmr::memory_resource& mr)
@@ -457,13 +498,13 @@ inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   auto& geoCol = fieldCol.kind.emplace<luxir::api::ColVal>();
   std::span<luxir::api::Val> target(build::allocArray(geoCol.v, columnSize, mr), columnSize);
   bool multi = fieldType.multiValued();
-  addFieldLoader(loaders, runs, [&req, infos, segDocs, target, multi, &mr](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, &reader, infos, segDocs, target, multi, &mr](std::span<RowIndex> idxSpan) {
     auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
     auto* info = infos.at(segNum);
     if (!info) return;
-    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     luxir::api::Val* points = nullptr;
     auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
@@ -484,7 +525,7 @@ inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   });
 }
 
-inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
+inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<const segdoc> segDocs, SegmentRuns runs,
                             luxir::api::Column& fieldCol, FieldLoaders* loaders,
                             PendingCols& pendingCols, std::pmr::memory_resource& mr) {
   auto& col = fieldCol.kind.emplace<luxir::api::ColInt>();
@@ -492,12 +533,20 @@ inline void loadVersionRuns(SearchRequest& req, std::span<const segdoc> segDocs,
   auto& pending = pendingCols.emplace_back();
   pending.present.assign(segDocs.size(), 1);
   pending.finish = [&col](std::span<const uint8_t> present) {
-    col.missing_val = pickMissingVal<IntColEmit>(col.v, present);
+    col.missing_val = pickMissingVal<ColEmit<int64_t>>(col.v, present);
   };
-  addFieldLoader(loaders, runs, [&req, segDocs, target](std::span<RowIndex> indices) {
+  addFieldLoader(loaders, runs, [&req, &reader, segDocs, target](std::span<RowIndex> indices) {
     auto segment = segDocs[indices[0]].segment();
-    VersionRuns::Cursor cursor(req.reader->segments()[segment].postingsReader().versionRuns());
-    for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
+    auto& core = reader.segments()[segment].segmentCore();
+    VersionRuns::Cursor cursor(core.versionRuns());
+    if (reader.path().empty()) {
+      for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
+    } else {
+      OwnershipMapper mapper(core, "", reader.path());
+      MemPool pool;
+      OwnershipMapper::Cursor owners(mapper, pool);
+      for (auto index : indices) target[index] = (int64_t)cursor.birth(owners.owner(segDocs[index].docId()).owner);
+    }
   });
 }
 
@@ -512,7 +561,7 @@ inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::
   std::memcpy(fs, bytes.data(), bytes.size());
 }
 
-inline void loadVectorColForSegmentSingle(SearchRequest& req, const SegFieldInfo* info,
+inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info,
                                           std::span<RowIndex> idxSpan,
                                           std::span<const segdoc> segDocs,
                                           std::span<luxir::api::Vector> target, std::pmr::memory_resource& mr)
@@ -522,7 +571,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, const SegFieldInfo
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
   if (!info) return;
-  auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+  auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
   const auto& segFieldInfo = *info;
 
@@ -534,7 +583,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, const SegFieldInfo
   StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
 
-inline void loadVectorColForSegmentMulti(SearchRequest& req, const SegFieldInfo* info,
+inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info,
                                          std::span<RowIndex> idxSpan,
                                          std::span<const segdoc> segDocs,
                                          std::span<luxir::api::ArrVector> target, std::pmr::memory_resource& mr)
@@ -544,7 +593,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, const SegFieldInfo*
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
   if (!info) return;
-  auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+  auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
   const auto& segFieldInfo = *info;
 
@@ -567,7 +616,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, const SegFieldInfo*
 // leave the slot's kind oneof unset.
 // Multi-valued output:  Column.multi_vec - one ArrVector per doc; missing
 // docs (or docs that indexed an empty list) leave an empty ArrVector.
-inline void loadVectorCol(SearchRequest& req, IndexReader::FieldSegments infos, FieldType& fieldType,
+inline void loadVectorCol(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos, FieldType& fieldType,
                           std::span<const segdoc> segDocs, SegmentRuns runs,
                           luxir::api::Column& fieldCol,
                           FieldLoaders* loaders, std::pmr::memory_resource& mr)
@@ -579,15 +628,15 @@ inline void loadVectorCol(SearchRequest& req, IndexReader::FieldSegments infos, 
     auto& vecCol = fieldCol.kind.emplace<luxir::api::ColVector>();
     std::span<luxir::api::Vector> target(build::allocArray(vecCol.v, columnSize, mr), columnSize);
 
-    addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
-      loadVectorColForSegmentSingle(req, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
+    addFieldLoader(loaders, runs, [&req, &reader, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+      loadVectorColForSegmentSingle(req, reader, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
     });
   } else {
     auto& arrVecCol = fieldCol.kind.emplace<luxir::api::MultiVector>();
     std::span<luxir::api::ArrVector> target(build::allocArray(arrVecCol.v, columnSize, mr), columnSize);
 
-    addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
-      loadVectorColForSegmentMulti(req, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
+    addFieldLoader(loaders, runs, [&req, &reader, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+      loadVectorColForSegmentMulti(req, reader, infos.at(segDocs[idxSpan[0]].segment()), idxSpan, segDocs, target, mr);
     });
   }
 }
@@ -619,15 +668,15 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
 // left empty if the field also lacks a column.  This handles both
 // pre-STORED segments (no SFR at all) and partial-stored segments (SFR
 // present but missing a specific field added later).
-inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments infos,
+inline void loadStoredFields(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos,
                              std::vector<StoredReq> reqsOwned,
                              std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
-                             std::pmr::memory_resource& mr)
+                             std::pmr::memory_resource& mr, uint64_t flags)
 {
-  addFieldLoader(loaders, runs, [&req, infos, reqs = std::move(reqsOwned), segDocs, &mr](std::span<RowIndex> idxSpan) {
+  addFieldLoader(loaders, runs, [&req, &reader, infos, reqs = std::move(reqsOwned), segDocs, &mr, flags](std::span<RowIndex> idxSpan) {
     auto segNum = segDocs[idxSpan[0]].segment();
     auto* info = infos.at(segNum);
-    auto sfr = info ? std::make_unique<StoredFieldsReader>(req.reader->segments()[segNum].postingsReader(), *info)
+    auto sfr = info ? std::make_unique<StoredFieldsReader>(reader.segments()[segNum].postingsReader(), *info)
                     : nullptr;
 
     // Partition reqs: sfrReqs serve from SFR, colReqs fall back to
@@ -652,8 +701,8 @@ inline void loadStoredFields(SearchRequest& req, IndexReader::FieldSegments info
     }
 
     for (auto* r : colReqs) {
-      loadStrColForSegment(req, r->infos.at(segNum), *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
-                           r->present, mr);
+      loadStrColForSegment(req, reader, r->infos.at(segNum), *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
+                           r->present, mr, flags);
     }
 
     if (sfrReqs.empty()) return;
@@ -767,29 +816,58 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 struct ExtraColumn {
   std::string_view name;
   std::function<void(int64_t i, luxir::api::Val& out, std::pmr::memory_resource& mr)> value;
+  std::function<void(std::span<const segdoc>, std::span<const uint32_t>,
+                     std::span<api::Val>, std::pmr::memory_resource&)> batchValue = {};
 };
 
+struct MappedReturnFields;
+
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED };
 
   std::string_view outputKey;
   std::string_view physicalName;
   FieldType* fieldType;
   Kind kind;
   bool discovered;
-  IndexReader::FieldSegments infos;
-  IndexReader::FieldSegments storedInfos;
-  const ExtraColumn* extra = nullptr;  // Kind::EXTRA only
+  IndexReader::FieldSegments infos{};
+  IndexReader::FieldSegments storedInfos{};
+  union Source {
+    const ExtraColumn* extra;    // Kind::EXTRA only
+    MappedReturnFields* mapped;  // Kind::MAPPED only
+    constexpr Source() : extra(nullptr) {}
+  };
+  Source source{};
+  AncestorRows* rows = nullptr;
 };
 
+struct MappedReturnFields {
+  IndexReader& target;
+  std::vector<ReturnField> fields;
+
+  explicit MappedReturnFields(IndexReader& target) : target(target) {}
+};
+
+void loadMappedFields(SearchResponse& response, const ReturnField& field,
+                      std::span<const segdoc> docs, std::span<RowIndex> rows,
+                      api::DocList& output, uint64_t flags, RequestMemResource& mr);
+bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_view selector,
+                          std::vector<ReturnField>& picked);
+
+
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
-  boost::unordered_flat_map<std::string_view, IndexReader::FieldSegments, PackedTermHash, PackedTermEqual> resources;
+  boost::unordered_flat_map<std::pair<IndexReader*, std::string_view>, IndexReader::FieldSegments> resources;
   for (auto& rf : fields) {
-    if (rf.kind != ReturnField::Kind::PHYSICAL) continue;
-    if (rf.fieldType->type() != FieldType::TEXT) rf.infos = reader.field(rf.physicalName);
+    if (rf.kind != ReturnField::Kind::PHYSICAL) {
+      if (rf.kind == ReturnField::Kind::MAPPED) resolveReturnFieldMetadata(rf.source.mapped->target, rf.source.mapped->fields);
+      continue;
+    }
+    auto& source = rf.rows ? rf.rows->reader : reader;
+    if (rf.fieldType->type() != FieldType::TEXT) rf.infos = source.field(rf.physicalName);
     if (rf.fieldType->isStored()) {
-      auto [it, inserted] = resources.try_emplace(rf.fieldType->storedResource_);
-      if (inserted) it->second = reader.field(it->first);
+      auto [it, inserted] = resources.try_emplace(
+          std::pair<IndexReader*, std::string_view>{&source, rf.fieldType->storedResource_});
+      if (inserted) it->second = source.field(it->first.second);
       rf.storedInfos = it->second;
     }
   }
@@ -926,6 +1004,362 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
   moved = SearchResponse::ColumnsType(std::span<const Pair>(out, numMoved));
 }
 
+struct DocBatchScratch {
+  // Placement scratch reused across batches. Column pointers refer to this
+  // batch's ReturnFields and presence slots; the other vectors serve scatter.
+  std::vector<const ReturnField*> columnFields;
+  std::vector<const uint8_t*> columnPresent;
+  std::vector<uint8_t> columnFate;
+  std::vector<uint32_t> rowCaps;
+};
+
+struct DocBatchOptions {
+  uint64_t flags;
+  bool parallel;
+  api::DocFormat placement;
+  size_t colCap;
+  int64_t start;
+  bool scores;
+  RequestMemResource* retained = nullptr;
+};
+
+// Load and place one view's document batch. Mapped selections use the same
+// column and stored-resource loaders as ordinary ranked hits.
+template <typename GetScore>
+void loadDocuments(SearchResponse& response, IndexReader& reader,
+                   std::span<const segdoc> segDocs, std::span<ReturnField> fields,
+                   api::DocList& docListProto, std::pmr::memory_resource& memory,
+                   DocBatchOptions options, GetScore&& getScore, DocBatchScratch& scratch) {
+  auto& [columnFields, columnPresent, columnFate, rowCaps] = scratch;
+  auto flags = options.flags;
+  auto parallel = options.parallel;
+  auto placement = options.placement;
+  auto colCap = options.colCap;
+  auto batchStart = options.start;
+  auto* retained = options.retained;
+  auto mappedMemory = [&]() -> RequestMemResource& {
+    if (!retained) retained = arenaCreate<RequestMemResource>(response.arena, response.req.memoryTracker,
+        "row-space retrieval", "returned fields", &memory, RequestMemResource::Lifetime::RESOURCE);
+    return *retained;
+  };
+  auto& mr = memory;
+  auto& req = response.req;
+  int columnSize = (int)segDocs.size();
+  // An isolated context: cancellation of the request group, or of whatever
+  // context a resumed emitter runs in, must not skip loaders and leave a
+  // batch's columns unfilled. Only a loader's own exception ends the wait.
+  std::optional<oneapi::tbb::task_group_context> loadColumnsContext;
+  std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
+  oneapi::tbb::task_group* tg = nullptr;
+  if (parallel) {
+    auto& context = loadColumnsContext.emplace(oneapi::tbb::task_group_context::isolated);
+    tg = &loadColumnsTaskGroup.emplace(context);
+  }
+
+  bool returnScores = options.scores;
+
+  // indirect sort the documents so we can access them in order of both segment and docid
+  std::vector<RowIndex> sortedIdx(segDocs.size());
+  std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
+  std::ranges::sort(sortedIdx, [&segDocs](auto a, auto b) {
+    return segDocs[a] < segDocs[b];
+  });
+
+  // calculate segment run lengths so they can be reused when retrieving each column.
+  auto bySeg = sortedIdx
+               | std::views::chunk_by([&segDocs](auto a, auto b) {
+    return segDocs[a].segment() == segDocs[b].segment();
+  })
+               | std::views::transform([](const auto& run) { return (RowIndex)run.size(); });
+
+  std::vector<std::span<RowIndex>> runs;
+  RowIndex start = 0;
+  for (RowIndex length : bySeg) {
+    runs.push_back(std::span<RowIndex>(sortedIdx).subspan(start, length));
+    start += length;
+  }
+
+  // Columns placeBatchColumns takes out of the response for the post-wait
+  // scatter into docListProto.docs.  The loaders themselves are
+  // placement-blind.
+  SearchResponse::ColumnsType rowColumns;
+
+  // Single-valued columns register here so the post-wait finish pass can
+  // pick each column's exact missing_val and fill the missing slots.
+  PendingCols pendingCols;
+
+  // Stored-field retrieval is grouped by resource so that multiple stored
+  // fields sharing one resource decompress each chunk only once.
+  struct StoredGroup {
+    IndexReader* reader;
+    std::span<const segdoc> docs;
+    IndexReader::FieldSegments infos;
+    std::vector<StoredReq> reqs;
+  };
+  boost::unordered_flat_map<std::pair<IndexReader*, std::string_view>, StoredGroup> storedByResource;
+  // Groups served from their columns instead, and the rows of the group
+  // being re-read from the chunk after the column loads (see below).
+  std::vector<StoredGroup> columnGroups;
+  std::vector<RowIndex> fittedIdx;
+  std::vector<std::span<RowIndex>> fittedRuns;
+  FieldLoaders loaders;
+  auto* pendingLoaders = tg ? &loaders : nullptr;
+
+  std::optional<RequestMemResource> rowMemory;
+  std::map<const AncestorRows*, std::pmr::vector<segdoc>> ancestorDocs;
+  auto mappedDocs = [&](const AncestorRows& mapping) -> std::span<const segdoc> {
+    auto found = ancestorDocs.find(&mapping);
+    if (found == ancestorDocs.end()) {
+      if (!rowMemory) rowMemory.emplace(req.memoryTracker, "ancestor returned rows", "returned fields");
+      auto& docs = ancestorDocs.try_emplace(&mapping, &*rowMemory).first->second;
+      docs.resize(segDocs.size());
+      for (auto run : runs) mapping.map(segDocs, run, docs);
+      return docs;
+    }
+    return found->second;
+  };
+
+  // Cancel and drain before unwinding destroys loader captures. This guard
+  // follows the batch storage and loaders so it is destroyed first.
+  // Disarmed after each wait below.
+  struct TgJoinGuard {
+    oneapi::tbb::task_group* tg;
+    ~TgJoinGuard() {
+      if (tg) {
+        tg->cancel();
+        try { tg->wait(); } catch (...) {}
+      }
+    }
+  } tgJoin{tg};
+
+  // Response column i comes from columnFields[i]: fields add the first
+  // columns, _score_ the last.
+  assert(docListProto.columns.empty());
+  columnFields.clear();
+  columnPresent.clear();
+  for (const ReturnField& rf : fields) {
+    auto& sourceReader = rf.rows ? rf.rows->reader : reader;
+    auto sourceDocs = rf.rows ? mappedDocs(*rf.rows) : segDocs;
+    size_t columnsBefore = docListProto.columns.size();
+    size_t pendingBefore = pendingCols.size();
+    auto outputColumn = [&]() -> luxir::api::Column& {
+      return build::columnSlot(docListProto.columns, colCap, rf.outputKey, mr);
+    };
+    auto registerColumn = [&] {
+      if (docListProto.columns.size() > columnsBefore) {
+        // A field registers at most one PendingCol, for its own column.
+        columnFields.push_back(&rf);
+        columnPresent.push_back(pendingCols.size() > pendingBefore ? pendingCols.back().present.data() : nullptr);
+      }
+    };
+
+    switch (rf.kind) {
+      case ReturnField::Kind::SCORE:
+        returnScores = true;
+        continue;
+      case ReturnField::Kind::VERSION:
+        loadVersionRuns(req, sourceReader, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+        registerColumn();
+        continue;
+      case ReturnField::Kind::EXTRA: {
+        auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+        luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+        if (rf.source.extra->batchValue) {
+          auto fn = rf.source.extra->batchValue;
+          addFieldLoader(pendingLoaders, runs, [fn, segDocs, values, columnSize, &mr](std::span<RowIndex> rows) {
+            fn(segDocs, rows, std::span<api::Val>(values, (size_t)columnSize), mr);
+          });
+        } else {
+          for (int i = 0; i < columnSize; i++) rf.source.extra->value(batchStart + i, values[i], mr);
+        }
+        registerColumn();
+        continue;
+      }
+      case ReturnField::Kind::MAPPED: {
+        auto& scopedMemory = mappedMemory();
+        auto& column = outputColumn().kind.template emplace<api::ColVal>();
+        build::allocArray(column.v, columnSize, scopedMemory);
+        addFieldLoader(pendingLoaders, runs, [&response, &rf, segDocs, &docListProto, flags, &scopedMemory](auto rows) {
+          loadMappedFields(response, rf, segDocs, rows, docListProto, flags, scopedMemory);
+        });
+        registerColumn();
+        continue;
+      }
+      case ReturnField::Kind::PHYSICAL:
+        break;
+    }
+    std::string_view field = rf.physicalName;
+    FieldType& fieldType = *rf.fieldType;
+
+    // Group stored fields by resource. The group can use columns only
+    // when every column preserves the source value; otherwise decompress
+    // each chunk once for all outputs.
+    auto recordStoredReq = [&](std::string_view resourceName) {
+      std::span<std::string_view> starget;
+      std::span<luxir::api::ArrStr> mtarget;
+      auto& fieldCol = outputColumn();
+      uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
+                                           starget, mtarget, pendingCols, mr);
+      auto& group = storedByResource[{&sourceReader, resourceName}];
+      group.reader = &sourceReader;
+      group.docs = sourceDocs;
+      group.infos = rf.storedInfos;
+      group.reqs.push_back({field, &fieldType, rf.infos, fieldType.multiValued(), starget, mtarget, present});
+    };
+
+    switch (FieldType::storage(fieldType.type())) {
+      case FieldType::Storage::INT64: {
+        if (fieldType.type() == FieldType::FLOAT) {
+          loadNumCol<ColEmit<float>>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+        } else if (fieldType.type() == FieldType::DOUBLE) {
+          loadNumCol<ColEmit<double>>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+        } else if (fieldType.type() == FieldType::GEO_POINT) {
+          loadGeoCol(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, mr);
+        } else {
+          withNatureOutput<int64_t>(fieldType.valueNature(), flags, mr, [field] { return field; }, [&](auto output) {
+            using Emit = ColEmit<decltype(output(int64_t{}))>;
+            if constexpr (std::is_same_v<decltype(output), NativeValueOutput>) {
+              loadNumCol<Emit>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(),
+                               pendingLoaders, pendingCols, mr);
+            } else {
+              loadNumCol<Emit>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(),
+                               pendingLoaders, pendingCols, mr, output);
+            }
+          });
+        }
+        break;
+      }
+      case FieldType::Storage::TERMS: {
+        if (fieldType.isStored()) {
+          recordStoredReq(fieldType.storedResource_);
+        } else if (fieldType.hasColumn() && columnSize != 0) {
+          loadStrCol(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr, flags);
+        }
+        break;
+      }
+      case FieldType::Storage::TEXT: {
+        if (fieldType.isStored()) {
+          recordStoredReq(fieldType.storedResource_);
+        }
+        break;
+      }
+      case FieldType::Storage::VECTOR: {
+        if (columnSize != 0) {
+          loadVectorCol(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, mr);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    registerColumn();
+  }
+
+  for (auto& [resourceName, group] : storedByResource) {
+    auto& reqs = group.reqs;
+    auto& sourceReader = *group.reader;
+    auto sourceDocs = group.docs;
+    // A single-valued STRING or ID column holds the source value except
+    // where a normalizer rewrote it (every row) or the term was fitted to
+    // the term space (rows recognizable by length, re-read from the chunk
+    // after the loads). Multi-valued columns can differ from stored source,
+    // and TEXT has no column, so such members send the group to the chunk.
+    bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
+      if (r.multi || !r.fieldType->hasColumn()) return false;
+      switch (r.fieldType->type()) {
+        case FieldType::ID: return true;
+        case FieldType::STRING: return !static_cast<StrFieldType*>(r.fieldType)->normalizer;
+        default: return false;
+      }
+    });
+    if (useColumns) {
+      for (const auto& r : reqs) {
+        loadStrColWithTargets(req, sourceReader, r.infos, *r.fieldType, r.starget, r.mtarget, r.present,
+                              sourceDocs, runs, pendingLoaders, mr, flags);
+      }
+      columnGroups.push_back(std::move(group));
+    } else {
+      loadStoredFields(req, sourceReader, group.infos, std::move(reqs),
+                       sourceDocs, runs, pendingLoaders, mr, flags);
+    }
+  }
+
+  bool scoreRows = returnScores && placement == luxir::api::DocFormat::ROWS;
+  if (returnScores && !scoreRows) {
+    auto& scoresProto = build::columnSlot(docListProto.columns, colCap, "_score_", mr);
+    auto& floatColProto = scoresProto.kind.template emplace<luxir::api::ColFloat>();
+    float* scores = build::allocArray(floatColProto.v, columnSize, mr);
+    for (int i = 0; i < columnSize; i++) {
+      scores[i] = getScore(batchStart + i);
+    }
+  }
+
+  loadFields(tg, loaders, runs);
+  if (tg != nullptr) {
+    Signal::emit("emitDocsColumnsWait", &req, tg);
+    tg->wait();
+  }
+  tgJoin.tg = nullptr;  // joined normally
+
+  // A column value of PackedTerm::MIN_FITTED_LEN bytes or more may be a
+  // term fitted to the term space rather than the source (or a genuine
+  // value of that length); re-read those rows from the stored chunk.  The
+  // subset keeps sortedIdx's segment order, so loadStoredFields serves it
+  // as a small batch with its own segment runs.
+  for (auto& group : columnGroups) {
+    auto& reqs = group.reqs;
+    auto& sourceReader = *group.reader;
+    auto sourceDocs = group.docs;
+    loaders.clear();
+    fittedIdx.clear();
+    fittedRuns.clear();
+    for (RowIndex idx : sortedIdx) {
+      bool fitted = std::ranges::any_of(reqs, [idx](const StoredReq& r) {
+        return r.present[idx] && PackedTerm::mayBeFitted(r.starget[idx]);
+      });
+      if (fitted) fittedIdx.push_back(idx);
+    }
+    start = 0;
+    while (start < fittedIdx.size()) {
+      RowIndex end = start + 1;
+      while (end < fittedIdx.size()
+             && segDocs[fittedIdx[end]].segment() == segDocs[fittedIdx[start]].segment()) end++;
+      fittedRuns.push_back(std::span<RowIndex>(fittedIdx).subspan(start, end - start));
+      start = end;
+    }
+    if (fittedIdx.empty()) continue;
+    tgJoin.tg = tg;
+    loadStoredFields(req, sourceReader, group.infos, std::move(reqs), sourceDocs, fittedRuns, pendingLoaders, mr, flags);
+    loadFields(tg, loaders, fittedRuns);
+    if (tg != nullptr) {
+      Signal::emit("emitDocsStoredWait", &req, tg);
+      tg->wait();
+    }
+    tgJoin.tg = nullptr;
+  }
+
+  // All slots are loaded; pick each single-valued column's exact
+  // missing_val and fill its missing slots.  (ROWS mode relies on the
+  // exact sentinels for its presence checks.)
+  finishPendingCols(pendingCols);
+  placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
+                    (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
+
+  // Scores bypass the row columns: every doc has one, and a direct
+  // write avoids the all-present column's sentinel ambiguity (a real
+  // 0.0 score would collide with ColFloat's default missing_val).
+  if (!rowCaps.empty() && columnSize > 0) {
+    auto* rows = scatterColumnsToRows(rowColumns, docListProto, (size_t)columnSize, rowCaps, mr);
+    if (scoreRows) {
+      for (int i = 0; i < columnSize; i++) {
+        build::mapSlot<luxir::api::Val>(rows[i].fields, rowCaps[i], "_score_", mr)->kind =
+            getScore(batchStart + i);
+      }
+    }
+  }
+
+}
+
 // Streams a final ranked list of (segdoc, score) pairs back to the client as
 // one or more SearchResponses.  Both TopDocsReq and FusionOp use this (via
 // emitDocsResponse below) after their own ranking is complete.  The caller's
@@ -963,6 +1397,7 @@ template <typename GetDocList, typename GetDoc, typename GetScore>
 class DocEmitterImpl final : public DocEmitter {
 public:
   SearchRequest& req;
+  IndexReader& reader;
   uint64_t flags;
   GetDocList getDocList;
   GetDoc getDoc;
@@ -987,22 +1422,15 @@ public:
   size_t colCap;  // response columns map capacity (fields + _score_)
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
   bool fieldMetadataResolved = false;
-  // Per-batch placement scratch, reused across batches: columnFields maps
-  // response columns to their ReturnField, columnPresent to their PendingCol
-  // slot tracker (or null); columnFate and rowCaps belong to
-  // placeBatchColumns.
-  std::vector<const ReturnField*> columnFields;
-  std::vector<const uint8_t*> columnPresent;
-  std::vector<uint8_t> columnFate;
-  std::vector<uint32_t> rowCaps;
+  DocBatchScratch scratch;
 
-  DocEmitterImpl(SearchRequest& req, uint64_t flags, GetDocList getDocList, GetDoc getDoc,
+  DocEmitterImpl(SearchRequest& req, IndexReader& reader, uint64_t flags, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
                  bool getScores, luxir::api::DocFormat placement, bool parallel, size_t colCap,
                  DocBatchMetadata metadata)
-      : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
+      : req(req), reader(reader), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
         foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
@@ -1092,289 +1520,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     int columnSize = (int)segDocs.size();
     docListProto.row_count = columnSize;
     if (columnSize > 0 && !fieldMetadataResolved) {
-      resolveReturnFieldMetadata(*req.reader, fields);
+      resolveReturnFieldMetadata(reader, fields);
       fieldMetadataResolved = true;
     }
     if (metadata) metadata(docListProto, batchStart, batchEnd, mr);
 
-    // An isolated context: cancellation of the request group, or of whatever
-    // context a resumed emitter runs in, must not skip loaders and leave a
-    // batch's columns unfilled. Only a loader's own exception ends the wait.
-    std::optional<oneapi::tbb::task_group_context> loadColumnsContext;
-    std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
-    oneapi::tbb::task_group* tg = nullptr;
-    if (parallel) {
-      auto& context = loadColumnsContext.emplace(oneapi::tbb::task_group_context::isolated);
-      tg = &loadColumnsTaskGroup.emplace(context);
-    }
-
-    bool returnScores = getScores;
-
-    // indirect sort the documents so we can access them in order of both segment and docid
-    std::vector<RowIndex> sortedIdx(segDocs.size());
-    std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
-    std::ranges::sort(sortedIdx, [&segDocs](auto a, auto b) {
-      return segDocs[a] < segDocs[b];
-    });
-
-    // calculate segment run lengths so they can be reused when retrieving each column.
-    auto bySeg = sortedIdx
-                 | std::views::chunk_by([&segDocs](auto a, auto b) {
-      return segDocs[a].segment() == segDocs[b].segment();
-    })
-                 | std::views::transform([](const auto& run) { return (RowIndex)run.size(); });
-
-    std::vector<std::span<RowIndex>> runs;
-    RowIndex start = 0;
-    for (RowIndex length : bySeg) {
-      runs.push_back(std::span<RowIndex>(sortedIdx).subspan(start, length));
-      start += length;
-    }
-
-    // Columns placeBatchColumns takes out of the response for the post-wait
-    // scatter into docListProto.docs.  The loaders themselves are
-    // placement-blind.
-    SearchResponse::ColumnsType rowColumns;
-
-    // Single-valued columns register here so the post-wait finish pass can
-    // pick each column's exact missing_val and fill the missing slots.
-    PendingCols pendingCols;
-
-    // Stored-field retrieval is grouped by resource so that multiple stored
-    // fields sharing one resource decompress each chunk only once.
-    struct StoredGroup {
-      IndexReader::FieldSegments infos;
-      std::vector<StoredReq> reqs;
-    };
-    boost::unordered_flat_map<std::string_view, StoredGroup,
-                              PackedTermHash, PackedTermEqual> storedByResource;
-    // Groups served from their columns instead, and the rows of the group
-    // being re-read from the chunk after the column loads (see below).
-    std::vector<StoredGroup> columnGroups;
-    std::vector<RowIndex> fittedIdx;
-    std::vector<std::span<RowIndex>> fittedRuns;
-    FieldLoaders loaders;
-    auto* pendingLoaders = tg ? &loaders : nullptr;
-
-    // Cancel and drain before unwinding destroys loader captures. This guard
-    // follows the batch storage and loaders so it is destroyed first.
-    // Disarmed after each wait below.
-    struct TgJoinGuard {
-      oneapi::tbb::task_group* tg;
-      ~TgJoinGuard() {
-        if (tg) {
-          tg->cancel();
-          try { tg->wait(); } catch (...) {}
-        }
-      }
-    } tgJoin{tg};
-
-    // Response column i comes from columnFields[i]: fields add the first
-    // columns, _score_ the last.
-    assert(docListProto.columns.empty());
-    columnFields.clear();
-    columnPresent.clear();
-    for (const ReturnField& rf : fields) {
-      size_t columnsBefore = docListProto.columns.size();
-      size_t pendingBefore = pendingCols.size();
-      auto outputColumn = [&]() -> luxir::api::Column& {
-        return build::columnSlot(docListProto.columns, colCap, rf.outputKey, mr);
-      };
-      auto registerColumn = [&] {
-        if (docListProto.columns.size() > columnsBefore) {
-          // A field registers at most one PendingCol, for its own column.
-          columnFields.push_back(&rf);
-          columnPresent.push_back(pendingCols.size() > pendingBefore ? pendingCols.back().present.data() : nullptr);
-        }
-      };
-
-      switch (rf.kind) {
-        case ReturnField::Kind::SCORE:
-          returnScores = true;
-          continue;
-        case ReturnField::Kind::VERSION:
-          loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          registerColumn();
-          continue;
-        case ReturnField::Kind::EXTRA: {
-          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
-          luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
-          for (int i = 0; i < columnSize; i++) rf.extra->value(batchStart + i, values[i], mr);
-          registerColumn();
-          continue;
-        }
-        case ReturnField::Kind::PHYSICAL:
-          break;
-      }
-      std::string_view field = rf.physicalName;
-      FieldType& fieldType = *rf.fieldType;
-
-      // Group stored fields by resource. The group can use columns only
-      // when every column preserves the source value; otherwise decompress
-      // each chunk once for all outputs.
-      auto recordStoredReq = [&](std::string_view resourceName) {
-        std::span<std::string_view> starget;
-        std::span<luxir::api::ArrStr> mtarget;
-        auto& fieldCol = outputColumn();
-        uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
-                                             starget, mtarget, pendingCols, mr);
-        auto& group = storedByResource[resourceName];
-        group.infos = rf.storedInfos;
-        group.reqs.push_back({field, &fieldType, rf.infos, fieldType.multiValued(), starget, mtarget, present});
-      };
-
-      switch (fieldType.type()) {
-        case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          break;
-        }
-        case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          break;
-        }
-        case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          break;
-        }
-        case FieldType::Type::DATE: {
-          auto nature = dateValueNature(DateFieldType::unitOf(fieldType));
-          withDateOutput(nature, flags, mr, [field] { return field; }, [&](auto output) {
-            using Emit = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
-                                            DateStrColEmit, IntColEmit>;
-            loadNumCol<Emit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(),
-                             pendingLoaders, pendingCols, mr, output);
-          });
-          break;
-        }
-        case FieldType::Type::GEO_POINT: {
-          loadGeoCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
-          break;
-        }
-        case FieldType::Type::ID:
-        case FieldType::Type::STRING: {
-          if (fieldType.isStored()) {
-            recordStoredReq(fieldType.storedResource_);
-          } else if (fieldType.hasColumn() && columnSize != 0) {
-            loadStrCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
-          }
-          break;
-        }
-        case FieldType::Type::TEXT: {
-          if (fieldType.isStored()) {
-            recordStoredReq(fieldType.storedResource_);
-          }
-          break;
-        }
-        case FieldType::Type::VECTOR: {
-          if (columnSize != 0) {
-            loadVectorCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
-          }
-          break;
-        }
-        default:
-          break;
-      }
-      registerColumn();
-    }
-
-    for (auto& [resourceName, group] : storedByResource) {
-      auto& reqs = group.reqs;
-      // A single-valued STRING or ID column holds the source value except
-      // where a normalizer rewrote it (every row) or the term was fitted to
-      // the term space (rows recognizable by length, re-read from the chunk
-      // after the loads). Multi-valued columns can differ from stored source,
-      // and TEXT has no column, so such members send the group to the chunk.
-      bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
-        if (r.multi || !r.fieldType->hasColumn()) return false;
-        switch (r.fieldType->type()) {
-          case FieldType::ID: return true;
-          case FieldType::STRING: return !static_cast<StrFieldType*>(r.fieldType)->normalizer;
-          default: return false;
-        }
-      });
-      if (useColumns) {
-        for (const auto& r : reqs) {
-          loadStrColWithTargets(req, r.infos, *r.fieldType, r.starget, r.mtarget, r.present,
-                                segDocs, runs, pendingLoaders, mr);
-        }
-        columnGroups.push_back(std::move(group));
-      } else {
-        loadStoredFields(req, group.infos, std::move(reqs),
-                         segDocs, runs, pendingLoaders, mr);
-      }
-    }
-
-    bool scoreRows = returnScores && placement == luxir::api::DocFormat::ROWS;
-    if (returnScores && !scoreRows) {
-      auto& scoresProto = build::columnSlot(docListProto.columns, colCap, "_score_", mr);
-      auto& floatColProto = scoresProto.kind.template emplace<luxir::api::ColFloat>();
-      float* scores = build::allocArray(floatColProto.v, columnSize, mr);
-      for (int i = 0; i < columnSize; i++) {
-        scores[i] = getScore(batchStart + i);
-      }
-    }
-
-    loadFields(tg, loaders, runs);
-    if (tg != nullptr) {
-      Signal::emit("emitDocsColumnsWait", &req, tg);
-      tg->wait();
-    }
-    tgJoin.tg = nullptr;  // joined normally
-
-    // A column value of PackedTerm::MIN_FITTED_LEN bytes or more may be a
-    // term fitted to the term space rather than the source (or a genuine
-    // value of that length); re-read those rows from the stored chunk.  The
-    // subset keeps sortedIdx's segment order, so loadStoredFields serves it
-    // as a small batch with its own segment runs.
-    for (auto& group : columnGroups) {
-      auto& reqs = group.reqs;
-      loaders.clear();
-      fittedIdx.clear();
-      fittedRuns.clear();
-      for (RowIndex idx : sortedIdx) {
-        bool fitted = std::ranges::any_of(reqs, [idx](const StoredReq& r) {
-          return r.present[idx] && PackedTerm::mayBeFitted(r.starget[idx]);
-        });
-        if (fitted) fittedIdx.push_back(idx);
-      }
-      start = 0;
-      while (start < fittedIdx.size()) {
-        RowIndex end = start + 1;
-        while (end < fittedIdx.size()
-               && segDocs[fittedIdx[end]].segment() == segDocs[fittedIdx[start]].segment()) end++;
-        fittedRuns.push_back(std::span<RowIndex>(fittedIdx).subspan(start, end - start));
-        start = end;
-      }
-      if (fittedIdx.empty()) continue;
-      tgJoin.tg = tg;
-      loadStoredFields(req, group.infos, std::move(reqs), segDocs, fittedRuns, pendingLoaders, mr);
-      loadFields(tg, loaders, fittedRuns);
-      if (tg != nullptr) {
-        Signal::emit("emitDocsStoredWait", &req, tg);
-        tg->wait();
-      }
-      tgJoin.tg = nullptr;
-    }
-
-    // All slots are loaded; pick each single-valued column's exact
-    // missing_val and fill its missing slots.  (ROWS mode relies on the
-    // exact sentinels for its presence checks.)
-    finishPendingCols(pendingCols);
-    placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
-                      (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
-
-    // Scores bypass the row columns: every doc has one, and a direct
-    // write avoids the all-present column's sentinel ambiguity (a real
-    // 0.0 score would collide with ColFloat's default missing_val).
-    if (!rowCaps.empty() && columnSize > 0) {
-      auto* rows = scatterColumnsToRows(rowColumns, docListProto, (size_t)columnSize, rowCaps, mr);
-      if (scoreRows) {
-        for (int i = 0; i < columnSize; i++) {
-          build::mapSlot<luxir::api::Val>(rows[i].fields, rowCaps[i], "_score_", mr)->kind =
-              getScore(batchStart + i);
-        }
-      }
-    }
+    loadDocuments(response, reader, segDocs, fields, docListProto, mr,
+                  {flags, parallel, placement, colCap, batchStart, getScores}, getScore, scratch);
 
     batchStart = batchEnd;
     if (!lastResponse) {
@@ -1424,9 +1576,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 // Arena allocation is thread-safe; the request MemPool is not).  The names
 // are reader-catalog or request-proto views; generated read names are copied
 // into the request arena. The reader and schema are pinned for the request.
-inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
-                                                  std::span<const std::string_view> fields,
-                                                  std::span<const ExtraColumn> extraColumns = {}) {
+inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
+                               std::span<const std::string_view> fields,
+                               std::vector<ReturnField>& picked,
+                               std::span<const ExtraColumn> extraColumns = {}) {
   boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> extraNames;
   for (const auto& extra : extraColumns) {
     if (!extraNames.insert(extra.name).second) {
@@ -1442,42 +1595,79 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   }
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
-  std::vector<ReturnField> picked;
+  FieldResolver resolver(*req.schema, req.resolvedFields, reader.path());
+  auto relative = [&](std::string_view name) {
+    return reader.path().empty() ? name : name.substr(reader.path().size() + 1);
+  };
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
-    if (extraNames.contains(field.name)) {
+    auto output = relative(field.name);
+    if (extraNames.contains(output)) {
       throw RequestError("Extra column '" + std::string(field.name)
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
                            " or select the extra by name");
     }
-    picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
+    picked.push_back({output, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
+  };
+  auto pushMapped = [&](std::string_view f) {
+    if (!appendMappedSelector(req, reader, f, picked)) return false;
+    for (const auto& field : picked) {
+      if (extraNames.contains(field.outputKey)) {
+        throw RequestError("Extra column '" + std::string(field.outputKey) + "' conflicts with a returned field");
+      }
+    }
+    return true;
   };
   auto pushExplicit = [&](std::string_view f) {
     if (extraNames.contains(f)) return;  // extras are appended after the physical fields
     for (auto& rf : picked) {
-      if (rf.outputKey == f) return;  // explicit lists are small; linear scan
+      if (rf.outputKey == f) {
+        if (rf.kind == ReturnField::Kind::MAPPED) {
+          rf.discovered = false;
+          pushMapped(f);
+        }
+        return;  // explicit lists are small; linear scan
+      }
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
-    auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
-    if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
-      auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
-      std::string message = "Field '" + std::string(f) + "' has no retrievable value";
-      bool storedSource = primary->isStored() && (primary->type() == FieldType::TEXT ||
-          primary->type() == FieldType::STRING || primary->type() == FieldType::ID);
-      if (storedSource || primary->hasColumn()) {
-        message += "; retrieve logical root '" + source.logicalName + "' instead";
-      } else if (primary->type() == FieldType::TEXT) {
-        message += "; logical root '" + source.logicalName + "' must enable stored for source text";
+    if (f.starts_with('/') || f.starts_with("..")) { pushMapped(f); return; }
+    try {
+      auto source = resolver.resolve(f, OpClass::RETRIEVE);
+      if (source.fieldType->type() == FieldType::NESTED
+          || (source.path != resolver.path() && source.physicalName != "_version_")) {
+        pushMapped(f);
+        return;
       }
-      throw RequestError(message, "invalid_field");
+      if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
+        auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
+        std::string message = "Field '" + std::string(f) + "' has no retrievable value";
+        bool storedSource = primary->isStored() && (primary->type() == FieldType::TEXT ||
+            primary->type() == FieldType::STRING || primary->type() == FieldType::ID);
+        if (storedSource || primary->hasColumn()) {
+          message += "; retrieve logical root '" + source.logicalName + "' instead";
+        } else if (primary->type() == FieldType::TEXT) {
+          message += "; logical root '" + source.logicalName + "' must enable stored for source text";
+        }
+        throw RequestError(message, "invalid_field");
+      }
+      auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+      picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
+    } catch (const RequestError&) {
+      // A real leaf error is reported in its destination view, just as when
+      // the same selector is made directly in that view.
+      auto dot = f.find('.');
+      if (dot != std::string_view::npos) {
+        auto first = f.substr(0, dot);
+        auto qualified = reader.path().empty() ? std::string(first) : Schema::qualify(reader.path(), first);
+        if (req.schema->isNestedPath(qualified) && pushMapped(f)) return;
+      }
+      throw;
     }
-    auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
-    picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
   };
   if (fields.empty()) {
-    auto catalog = req.reader->retrievableFields();
+    auto catalog = reader.retrievableFields();
     picked.reserve(catalog.size());
     for (const auto& field : catalog) {
       if (!field.derived) pushDiscovered(field);
@@ -1488,7 +1678,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     picked.reserve(fields.size());
     for (std::string_view f : fields) pushExplicit(f);
   } else {
-    auto catalog = req.reader->retrievableFields();
+    auto catalog = reader.retrievableFields();
     boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> taken;
     for (std::string_view f : fields) {
       if (!isPattern(f)) taken.insert(f);
@@ -1498,9 +1688,17 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
         pushExplicit(f);
         continue;
       }
-      forEachFieldPattern(catalog, f, [](const auto& field) { return field.name; },
+      if (f.starts_with('/') || f.starts_with("..")) { pushMapped(f); continue; }
+      auto dot = f.find('.');
+      if (dot != std::string_view::npos) {
+        auto first = f.substr(0, dot);
+        auto qualified = reader.path().empty() ? std::string(first) : Schema::qualify(reader.path(), first);
+        if (req.schema->isNestedPath(qualified)) { pushMapped(f); continue; }
+      }
+      resolver.requireLocalPattern(f);
+      forEachFieldPattern(catalog, f, [&](const auto& field) { return relative(field.name); },
           [](const auto& field) { return field.derived; }, [&](const auto& field) {
-            if (taken.insert(field.name).second) pushDiscovered(field);
+            if (taken.insert(relative(field.name)).second) pushDiscovered(field);
           });
     }
   }
@@ -1511,10 +1709,17 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
         req.arena, extraColumns.begin(), extraColumns.end());
     for (const auto& extra : *extras) {
       ReturnField rf{extra.name, {}, nullptr, ReturnField::Kind::EXTRA, false};
-      rf.extra = &extra;
+      rf.source.extra = &extra;
       picked.push_back(rf);
     }
   }
+}
+
+inline std::span<ReturnField> resolveReturnFields(SearchRequest& req, IndexReader& reader,
+                                                std::span<const std::string_view> fields,
+                                                std::span<const ExtraColumn> extraColumns = {}) {
+  std::vector<ReturnField> picked;
+  appendReturnFields(req, reader, fields, picked, extraColumns);
   if (picked.empty()) return {};
   auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * picked.size(),
                                                       alignof(ReturnField));
@@ -1526,7 +1731,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
 // emitter and produces batches until done or paused.  See DocEmitter above for
 // the resumable-emission contract.
 template <typename GetDocList, typename GetDoc, typename GetScore>
-void emitDocsResponse(SearchRequest& req, uint64_t flags,
+void emitDocsResponse(SearchRequest& req, IndexReader& reader, uint64_t flags,
                       GetDocList&& getDocList,
                       int64_t numCollected,
                       GetDoc&& getDoc,
@@ -1542,7 +1747,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       DocBatchMetadata metadata = {},
                       bool foundGte = false,
                       bool foundEstimated = false,
-                      std::span<const ExtraColumn> extraColumns = {})
+                      std::span<const ExtraColumn> extraColumns = {},
+                      std::span<const std::shared_ptr<HitDecorator>> decorators = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1563,7 +1769,14 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   // every field in docs, COLUMNS leaves out all-missing discovered columns,
   // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
   // get_scores) is a column except under ROWS.
-  std::span<ReturnField> rfields = resolveReturnFields(req, fields, extraColumns);
+  std::vector<ExtraColumn> decoratedColumns(extraColumns.begin(), extraColumns.end());
+  for (const auto& decorator : decorators) {
+    decoratedColumns.push_back({decorator->columnName(), {},
+        [decorator](auto docs, auto rows, auto values, auto& mr) {
+          decorator->decorate(docs, rows, values, mr);
+        }});
+  }
+  std::span<ReturnField> rfields = resolveReturnFields(req, reader, fields, decoratedColumns);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
@@ -1584,7 +1797,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
 
   using Impl = DocEmitterImpl<std::decay_t<GetDocList>, std::decay_t<GetDoc>,
                               std::decay_t<GetScore>>;
-  auto* emitter = luxir::arenaCreate<Impl>(req.arena, req, flags,
+  auto* emitter = luxir::arenaCreate<Impl>(req.arena, req, reader, flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,

@@ -15,7 +15,7 @@ class PostingsReader;
 struct SegFieldInfo;
 
 // Immutable after Field publication. Views and the DDict borrow the segment
-// mapping; PostingsReader destroys its Fields before releasing the files.
+// mapping; SegmentCore destroys its space readers before releasing the files.
 struct StoredFieldsMetadata {
   StoredChunkFormat format;  // level and training capacity are not recorded
   int64_t maxChunkBytes = 0;

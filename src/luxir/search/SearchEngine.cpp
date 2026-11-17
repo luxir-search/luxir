@@ -242,27 +242,29 @@ void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
 }
 
 void SearchEngine::getResources(SearchRequest& req) {
-  // look up the correct index reader and the associated schema
-  auto& request = req.proto;
-  auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
-  req.collectionMetrics = collection->sharedMetrics();
+  if (!req.reader) {
+    // look up the correct index reader and the associated schema
+    auto& request = req.proto;
+    auto& node = req.engine.node;
+    auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
+    req.collectionMetrics = collection->sharedMetrics();
 
-  // get the index reader
-  // The API freshness tolerance is milliseconds; the reader clock domain is
-  // microseconds (commit times).  Saturate: an absurd tolerance means "any".
-  constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
-  uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
-      ? maxUs : request.freshness_ms * 1000;
-  req.reader = collection->getReaderManager().getReader(freshnessUs);
-  if (!request.min_commit.empty()) {
-    auto floor = CommitId::parse(request.min_commit);
-    if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
-      req.reader = collection->getReaderManager().getReader(0);
-    if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
-        "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
-    if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
-        "stale_replica", "reader is older than min_commit");
+    // get the index reader
+    // The API freshness tolerance is milliseconds; the reader clock domain is
+    // microseconds (commit times).  Saturate: an absurd tolerance means "any".
+    constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
+    uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
+        ? maxUs : request.freshness_ms * 1000;
+    req.reader = collection->getReaderManager().getReader(freshnessUs);
+    if (!request.min_commit.empty()) {
+      auto floor = CommitId::parse(request.min_commit);
+      if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
+        req.reader = collection->getReaderManager().getReader(0);
+      if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
+          "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
+      if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
+          "stale_replica", "reader is older than min_commit");
+    }
   }
   req.schema = req.reader->schema();
   auto* filterCache = req.reader->filterCache();

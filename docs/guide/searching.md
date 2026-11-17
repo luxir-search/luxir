@@ -114,6 +114,10 @@ which costs far more than finding the top documents for common terms.
 `count_limit: -2` asks for a count that may be estimated, and costs little at
 any scale. `found` is still exact when that is cheap: from index statistics,
 when ranking visited every match, or when the matches are few enough to count.
+For unfiltered prefix, wildcard, regex, term range and terms-in-set queries,
+each segment without deletions also supplies an exact count when its indexed
+`string` or `id` field has at most one distinct term per document. The count
+reuses the accepted terms' document frequencies computed during ranking.
 Otherwise each segment that ranking pruned counts a sample spread across its
 documents and scales it up, within the bounds index statistics prove, and
 `found_estimated: true` marks the result, which can be above or below the exact
@@ -137,12 +141,17 @@ would otherwise stop at N. An explicit `0` or `-1` overrides it, and `-2`
 applies only to its own list.
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
-list holds competitive-score skipping until N matches have been counted, or
-index statistics already prove at least N matches. If collection then skips
-remaining work, `found` is N and `found_gte: true` marks it as a lower bound.
-Otherwise the count is exact and `found_gte` is omitted. An exact total is a
-valid answer even when it equals or exceeds N. Metadata and already-resident
-membership can supply an exact count without a counting pass.
+list with varying scores may count apart from ranking: when metadata permits
+more than N matches and counting has a bulk membership plan, an unscored pass
+counts until more than N are found, and ranking skips competitively from its
+first page. Otherwise one ranking pass holds competitive-score skipping until
+N matches have been counted. A list with uniform scores holds competitive-score
+skipping until N matches have been counted, or index statistics already prove
+at least N matches. If counting stops before the end, `found` is N and
+`found_gte: true` marks it as a lower bound. Otherwise the count is exact and `found_gte` is
+omitted. An exact total is a valid answer even when it equals or exceeds N.
+Metadata and already-resident membership can supply an exact count without a
+counting pass.
 
 ```http
 POST /collections/books/_search
@@ -453,8 +462,8 @@ members. A request using only `collapse` performs no enrichment pass. Each
 streaming batch includes complete group metadata and operation results for its rows.
 
 A key field uses value binding and must be single-valued. Supported types
-are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
-a column. Use an object to group by a tuple of fields:
+are STRING or ID with an index and column, INT (signed 64-bit), DECIMAL, IP,
+BOOLEAN, and DATE with a column. Use an object to group by a tuple of fields:
 
 ```json
 "collapse": {"field": ["shop_s", "product_i"], "missing": "group"}
@@ -868,6 +877,13 @@ A rescore expression must produce a finite value for every matched document.
 Handle missing values with `def()` or exclude them with an `exists()` child
 query.
 
+More operators and functions are in [Value expressions](value-expressions.md):
+the bitwise operators and `%`, trigonometry and rounding, calendar parts of dates
+(`year(d)`, `day_of_week(d)`), coordinates and distances between places,
+hashing for consistent sampling, `let` variables, `$name` request variables,
+`_score` as an alias of `score`, and typed field components such as `loc.lat`
+and `ts.year`.
+
 ### Decay functions
 
 `gauss_decay`, `exp_decay`, and `linear_decay` follow Elasticsearch's
@@ -972,8 +988,11 @@ by the field's cardinality; see [Geo search](geo-search.md#return-points).
 
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
-column when requested. A field type with no typed column arm, such as a geo
-point, is a `col_val` column.
+column when requested. A field type with no typed column arm, such as a boolean
+or geo point, is a `col_val` column. BOOLEAN collapse components carry a boolean
+value in the `b` arm of `GroupComponent`. DECIMAL components use the `d`
+arm for doubles, or the `i` arm under `decimal_scaled`. IP components carry
+canonical address text in the `s` arm.
 
 ## Full request form
 
@@ -1149,8 +1168,9 @@ Responses with `more: true` omit it, as does the `format=docs` document stream,
 which has no envelope to carry it; a pre-output JSON error still carries it.
 
 Profiling is opt-in and request-wide, and operations adopt instrumentation
-independently; string field facets are the currently instrumented operation.
-Their profile contains one entry per executed segment:
+independently; string field facets and `knn` queries are the currently
+instrumented operations. A facet's profile contains one entry per executed
+segment:
 
 ```json
 {
@@ -1187,6 +1207,42 @@ as prose for humans: its wording, ordering, and entry count change with the
 engine, so do not build tooling on it. Serial execution (the default, or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
+
+A `knn(<field>)` op has one piece per segment with eligible docs and live
+vectors. `strategy` is the initial routing, `ivf` or `exact`; an `ivf` piece
+may later complete exactly. `details` reports the planner's reason, predicted
+and actual coverage, rounds, terminal (full-precision) reads, and IVF budgets
+and list counts:
+
+```json
+{
+  "kind": "knn",
+  "segment": 0,
+  "strategy": "ivf",
+  "details": [
+    "reason=lowest modeled configuration; eligible_vectors=20000; exact_cost=...; ivf_scan_cost_at_predicted_coverage=...; ivf_linear=...; ivf_fixed=...",
+    "predicted_coverage=0.238; predicted_total=...; predicted_ivf_rounds=1; predicted_terminal_dims=...; predicted_terminal_reads=...; rounds=1; coverage=0.241; entries=4830; selector_passes=1; terminal_reads=212",
+    "reference_nlist=141; initial_nprobe=33.6",
+    "segment_nlist=141; lists_probed=34"
+  ]
+}
+```
+
+For IVF pieces, `coverage` is the fraction of the segment's live vectors in
+the probed lists. It remains IVF list coverage when a piece completes exactly;
+the exact scan does not raise it to 1.
+
+`reference_nlist` and `initial_nprobe` appear once, on the first piece that
+executed IVF, including one that later completes exactly. `initial_nprobe`
+is the round-one budget in units of the reference index (`reference_nlist`),
+before whole-list allocation, widening, and completion. `ivf.min_scan_fraction`
+can raise a pinned `ivf.nprobe`; budgets are also capped at `reference_nlist`.
+
+Every piece that executed IVF reports `segment_nlist` and `lists_probed`, the
+number of distinct lists scanned in that segment. Rescans do not increase
+`lists_probed`. These are per-segment counts, in different units from
+`initial_nprobe`, so they are not directly comparable to it. Pieces that never
+ran IVF carry none of these fields.
 
 On lazily read storage (an object-store backend, see
 [storage tiers](../design/storage-tiers.md)) the profile also counts the
@@ -1294,7 +1350,7 @@ preparation without collecting results. See
   [Multi-match](query-reference.md#multi-match) for field types and phrase options.
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Per-group `collapse.ops` uses the page's matching member domains.
-  Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
+  Distinct facet counts support STRING/ID and INT/DECIMAL/BOOLEAN/IP/DATE field facets, numeric/date
   ranges, and query facets. TEXT distinct facets and metric facet sorts with
   distinct counts are unsupported.
 - Document-unit kNN selects `k` documents before collapse, so repeated keys
@@ -1308,5 +1364,12 @@ preparation without collecting results. See
 - The `(segment, docid)` tiebreak is reader-local and can change after segment
   merges, so it is not a durable pagination token.
 - `max_parallel` supports `-1`, `0`, and `1`; higher values are reserved.
-- Only string field facets emit profile entries; other operations run
-  unprofiled under `profile: true`.
+- Only string field facets and `knn` queries emit profile entries; other
+  operations run unprofiled under `profile: true`.
+
+
+## Queries over nested rows
+
+Documents can contain lists of structured children, queried with forms such as
+`items:(color:red AND size:L)` and reached by operations through `domain.to`.
+See [Nested documents](nested.md).

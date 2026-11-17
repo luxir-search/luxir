@@ -6,60 +6,31 @@
 #include <atomic>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
 #include "SegFieldInfo.h"
+#include "Space.h"
 #include "StoredFieldsMetadata.h"
-#include "VersionRuns.h"
-#include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
 
 namespace luxir {
 
-class PostingsReader;
+class SegmentCore;
 class FieldReader;
 class TermsEnum;
 class DocsEnum;
 
 
-// Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
-// PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
-// This does not contain deleted docs, so one instance serves every index snapshot that holds the segment
-// (IndexReader::openSnapshot shares it from the writer or the previous snapshot, and the writer from
-// the published snapshot), and with it the views derived from the segment's bytes that it caches.
+// Concrete reader of one dense row space within a segment core. Its immutable
+// field catalog and lazy decoded headers live with the core; iterators are local
+// to callers. Liveness belongs to the snapshot's leaf.
 class PostingsReader {
-  // Indexed by physical filenum and intentionally sparse. Segment finalize
-  // folds buffered streams without renaming survivors, which keeps already
-  // spilled filesystem/object-store keys stable.
-  std::vector<std::shared_ptr<InputFile>> files;
-
-  // The whole-file stream of each physical file. A file's stream is created on
-  // first use: on a lazy file (an object store) that is the moment its bytes
-  // are fetched, so files no query touches are never materialized. Files that
-  // are already resident (memory, mmap) are published at open and cost one
-  // acquire load per use.
-  struct StreamSlot {
-    std::atomic<bool> ready{false};
-    std::mutex mutex;  // serializes the one materialization of this file only
-    InputStream stream;
-  };
-  std::unique_ptr<StreamSlot[]> streams;
-  InputStream materializeStream(uint32_t fnum);
-
-  // The part of file 0 that describes the fields: every field's metadata, the
-  // offsets table, the count and the segment info. Opening a segment reads
-  // exactly this tail of file 0 (plus the header of every file and the request
-  // versions), so a lazy file fetches only those ranges. Offsets within
-  // `catalog` count from catalogStart.
-  InputStream catalog;
-  int64_t catalogStart = 0;
-  int64_t segInfoOffset;  // after this is segInfo, before this is the field index
-  int32_t maxdoc;
-  VersionRuns versions;
+  SegmentCore& segmentCore;
+  int32_t maxdoc = 0;
+  const SpaceOrdinal ordinal;
 
   // Ordinals follow the sorted field index. Only the directory is allocated
   // at open; slot pages and immutable headers are published on first use.
@@ -107,22 +78,14 @@ public:
   // stay quiet on a legal overshoot of the soft cap.
   static constexpr int32_t HARD_MAX_DOC = END - (1 << 20);
 
-  // Static factory method to create PostingsReader with optional handling of missing files.
-  // Returns nullptr if missingFileOK=true and any required files are missing.
-  // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
-  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK = false, bool expectSynced = false);
-
-  explicit PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~PostingsReader();
   PostingsReader(const PostingsReader&) = delete;
   PostingsReader& operator=(const PostingsReader&) = delete;
 
 private:
-  // Private default constructor for factory method
-  PostingsReader() = default;
-
-  // Initialize from files, returns false if missing files and missingFileOK=true
-  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced);
+  friend class SegmentCore;
+  PostingsReader(SegmentCore& core, SpaceOrdinal ordinal) : segmentCore(core), ordinal(ordinal) {}
+  void initialize(int32_t maxDoc, int64_t fieldOffsetsLoc, const uint32_t* fieldOffsets, int32_t count);
 
 public:
 
@@ -130,8 +93,9 @@ public:
     return maxdoc;
   }
 
+  SpaceOrdinal spaceOrdinal() const noexcept { return ordinal; }
   int32_t numFields() const noexcept { return nFields; }
-  const VersionRuns& versionRuns() const { return versions; }
+  SegmentCore& core() const noexcept { return segmentCore; }
 
   // Immutable headers, decoded on first use and shared by all snapshots.
   // Missing names and ordinals outside the field index return nullptr.
@@ -146,41 +110,6 @@ public:
     size_t bytes = 0;
   };
   FieldCacheStats fieldCacheStats() const noexcept;
-
-  // Total bytes in the physical base-segment files this reader can merge.
-  uint64_t sizeInBytes() const noexcept {
-    uint64_t total = 0;
-    for (const auto& file : files) {
-      if (file == nullptr) continue;
-      uint64_t bytes = (uint64_t) file->size();
-      total = bytes > std::numeric_limits<uint64_t>::max() - total
-          ? std::numeric_limits<uint64_t>::max() : total + bytes;
-    }
-    return total;
-  }
-
-  InputFile* getFile(uint32_t fnum) {
-    assert(fnum < files.size());
-    assert(files[fnum] != nullptr);
-    return files[fnum].get();
-  }
-
-  // Bulk readers use this: it hands out the whole file, so on a lazy file the
-  // first call materializes it. Open-time reads go through getFile()->rangeStream().
-  InputStream getInputStream(uint32_t fnum) {
-    assert(fnum < files.size());
-    assert(files[fnum] != nullptr);
-    StreamSlot& slot = streams[fnum];
-    if (!slot.ready.load(std::memory_order_acquire)) [[unlikely]] return materializeStream(fnum);
-    return slot.stream;
-  }
-
-  // return an InputStream positioned on the current location specified
-  InputStream getInputStreamSeek(seg_location sloc) {
-    InputStream is = getInputStream(sloc.filenum());
-    is.seek(sloc.offset());
-    return is;
-  }
 
   friend class FieldReader;
 };

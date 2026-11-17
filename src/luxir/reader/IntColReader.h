@@ -3,83 +3,18 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <cstddef>
 
 #include "DocsReader.h"
+#include "MonoReader.h"
 #include "PostingsReader.h"
 #include "luxir/codec/NumColumn.h"
 #include "luxir/codec/LinearPack.h"
 #include "luxir/store/InputStream.h"
 
 namespace luxir {
-
-// Monotonic semantic facade over the shared numeric-column physical layer.
-class MonoReader {
-public:
-  static constexpr uint32_t BLOCK_SIZE = MonoColumn::BLOCK_SIZE;
-  static constexpr int64_t ENDINDEX = MonoColumn::ENDINDEX;
-  using BlockInfo = NumBlockInfo;
-
-private:
-  MonoColumn values;
-
-public:
-  MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
-             int64_t nValues) {
-    InputStream columnIS = postingsReader.getInputStreamSeek(loc);
-    const char* blocks = columnIS.ptr();
-    values = MonoColumn(blocks, blocks + metaOff, nValues);
-  }
-
-  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff,
-             int64_t nValues) {
-    const char* blocks = columnIS.ptr(loc);
-    values = MonoColumn(blocks, blocks + metaOff, nValues);
-  }
-
-  [[nodiscard]] int64_t numValues() const {
-    return values.numValues();
-  }
-
-  [[nodiscard]] int64_t valueAt(int64_t index) const {
-    return values.valueAt(index);
-  }
-
-  // Retrieve values[index-1], values[index]. If index is 0, the first value is
-  // defined as zero.
-  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
-    return values.valuesAt(index);
-  }
-
-  class BulkValues {
-    MonoColumn::Bulk values;
-
-  public:
-    explicit BulkValues(const MonoReader& column) : values(column.values) {}
-
-    int64_t index() const {
-      return values.index();
-    }
-
-    int64_t value() const {
-      return values.value();
-    }
-
-    int64_t next() {
-      return values.next();
-    }
-
-    int64_t advance(int64_t target) {
-      return values.advance(target);
-    }
-
-    int64_t valueAt(int64_t index) {
-      return values.valueAt(index);
-    }
-  };
-};
-
 
 // Some logical columns have multiple underlying columns implementing them:
 // A sparse multi-valued integer column:
@@ -140,7 +75,7 @@ public:
     nvals = fieldInfo.numValues;
     arrayMode = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
     docsWithField = fieldInfo.docsWithField;
-    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
+    columnIS = postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc);
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);

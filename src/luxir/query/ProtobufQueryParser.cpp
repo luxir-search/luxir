@@ -21,6 +21,8 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ToParentQuery.h"
+#include "luxir/search/SearchRequest.h"
 #include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
@@ -58,8 +60,7 @@ std::string_view ProtobufQueryParser::getString(const luxir::api::Val& val) {
   return {};
 }
 
-luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuery) {
-  std::string_view field = matchQuery.field;
+luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuery, const ResolvedFieldHandle& target) {
 
   if (matchQuery.min_match < 0) {
     throw std::runtime_error("Match 'min_match' must not be negative");
@@ -75,15 +76,15 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
     // Val goes through the coercion contract: a numeric val against a
     // text/string field matches its canonical rendering (it used to
     // silently match nothing).
-    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match,
+    return builder.createMatchQuery(target, *matchQuery.val, op, matchQuery.min_match,
                                     1.0f, matchQuery.case_insensitive);
   }
-  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match,
+  return builder.createMatchQuery(target, std::string_view{}, op, matchQuery.min_match,
                                   1.0f, matchQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseAnyOf(
-    const luxir::api::AnyOfQuery& anyOfQuery) {
+    const luxir::api::AnyOfQuery& anyOfQuery, const ResolvedFieldHandle& target) {
   if (!anyOfQuery.values.has_value()) {
     throw std::runtime_error("AnyOfQuery requires values");
   }
@@ -91,7 +92,7 @@ luxir::Query* ProtobufQueryParser::parseAnyOf(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
   try {
     CanonicalValueSet values = builder.canonicalizeFieldValues(
-        anyOfQuery.field,
+        target,
         ValueSequence(*anyOfQuery.values, "AnyOfQuery values"));
     return builder.createAnyOfQuery(values);
   } catch (const std::runtime_error& e) {
@@ -121,8 +122,7 @@ std::span<std::string_view> ProtobufQueryParser::binToSpan(
   return out;
 }
 
-luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& phraseQuery) {
-  std::string_view field = phraseQuery.field;
+luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& phraseQuery, const ResolvedFieldHandle& target) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
 
@@ -150,20 +150,20 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
         "Phrase query 'positions' cannot be combined with 'text' (text has no word boundaries to position)");
     }
     std::string_view text = phraseQuery.text;
-    return builder.createPhraseQuery(field, std::span<const std::string_view>(&text, 1), {},
+    return builder.createPhraseQuery(target, std::span<const std::string_view>(&text, 1), {},
                                      phraseQuery.slop);
   }
   if (hasWords) {
     // positions (when given) are one per word; the builder shifts them to
     // absorb words that analyze to multiple tokens.
-    return builder.createPhraseQuery(field, phraseQuery.words, positions, phraseQuery.slop);
+    return builder.createPhraseQuery(target, phraseQuery.words, positions, phraseQuery.slop);
   }
   if (hasTerms) {
-    return builder.createPhraseFromTerms(field, toSpan(phraseQuery.terms), positions,
+    return builder.createPhraseFromTerms(target, toSpan(phraseQuery.terms), positions,
                                          phraseQuery.slop);
   }
   if (hasTermsBin) {
-    return builder.createPhraseFromTerms(field, binToSpan(phraseQuery.terms_bin), positions,
+    return builder.createPhraseFromTerms(target, binToSpan(phraseQuery.terms_bin), positions,
                                          phraseQuery.slop);
   }
 
@@ -174,47 +174,46 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
   return builder.matchNoDocs();
 }
 
-luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
+luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery, const ResolvedFieldHandle& target) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings,
-      &context.fields, context.reader, context.minLiteralPrefix);
-  return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix,
+      &context.fields, context.view.get(), context.minLiteralPrefix);
+  return builder.createPrefixQuery(target, prefixQuery.prefix,
                                    prefixQuery.max_expansions, prefixQuery.case_insensitive);
 }
 
-luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {
+luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery, const ResolvedFieldHandle& target) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings,
-      &context.fields, context.reader, context.minLiteralPrefix);
-  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern,
+      &context.fields, context.view.get(), context.minLiteralPrefix);
+  return builder.createWildcardQuery(target, wildcardQuery.pattern,
                                      wildcardQuery.case_insensitive);
 }
 
-luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery) {
+luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery, const ResolvedFieldHandle& target) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings,
-      &context.fields, context.reader, context.minLiteralPrefix);
-  return builder.createRegexQuery(regexQuery.field, regexQuery.pattern,
+      &context.fields, context.view.get(), context.minLiteralPrefix);
+  return builder.createRegexQuery(target, regexQuery.pattern,
                                   regexQuery.case_insensitive);
 }
 
-luxir::Query* ProtobufQueryParser::parseExists(const luxir::api::ExistsQuery& existsQuery) {
+luxir::Query* ProtobufQueryParser::parseExists(const luxir::api::ExistsQuery& existsQuery, const ResolvedFieldHandle& target) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createExistsQuery(existsQuery.field);
+  return builder.createExistsQuery(target);
 }
 
-luxir::Query* ProtobufQueryParser::parseRange(const luxir::api::RangeQuery& rangeQuery) {
+luxir::Query* ProtobufQueryParser::parseRange(const luxir::api::RangeQuery& rangeQuery, const ResolvedFieldHandle& target) {
   auto ptr = [](const ::hpp_proto::optional_indirect_view<luxir::api::Val>& v)
       -> const luxir::api::Val* { return v.has_value() ? &*v : nullptr; };
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createRangeQuery(rangeQuery.field, ptr(rangeQuery.gte), ptr(rangeQuery.gt),
+  return builder.createRangeQuery(target, ptr(rangeQuery.gte), ptr(rangeQuery.gt),
                                   ptr(rangeQuery.lte), ptr(rangeQuery.lt));
 }
 
-luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery) {
-  const auto& target = context.fields.resolve(geoBoxQuery.field, OpClass::PRIMARY, context.opName);
+luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery, const ResolvedFieldHandle& target) {
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoBox query on non-geo field: {}", geoBoxQuery.field));
   }
@@ -224,8 +223,7 @@ luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& ge
 }
 
 luxir::Query* ProtobufQueryParser::parseGeoDistance(
-    const luxir::api::GeoDistanceQuery& geoDistanceQuery) {
-  const auto& target = context.fields.resolve(geoDistanceQuery.field, OpClass::PRIMARY, context.opName);
+    const luxir::api::GeoDistanceQuery& geoDistanceQuery, const ResolvedFieldHandle& target) {
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoDistance query on non-geo field: {}", geoDistanceQuery.field));
   }
@@ -235,8 +233,7 @@ luxir::Query* ProtobufQueryParser::parseGeoDistance(
 }
 
 luxir::Query* ProtobufQueryParser::parseGeoPolygon(
-    const luxir::api::GeoPolygonQuery& geoPolygonQuery) {
-  const auto& target = context.fields.resolve(geoPolygonQuery.field, OpClass::PRIMARY, context.opName);
+    const luxir::api::GeoPolygonQuery& geoPolygonQuery, const ResolvedFieldHandle& target) {
   if (target.fieldType->type() != FieldType::GEO_POINT) {
     throw std::runtime_error(std::format("GeoPolygon query on non-geo field: {}", geoPolygonQuery.field));
   }
@@ -256,7 +253,7 @@ luxir::Query* ProtobufQueryParser::parseGeoPolygon(
       pool, api::build::arenaStr(pool, target.physicalName), polygons);
 }
 
-luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery) {
+luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery, const ResolvedFieldHandle& target) {
   if (fuzzyQuery.max_expansions < 0) {
     throw std::runtime_error(
       std::format("Fuzzy query max_expansions must not be negative (got {})",
@@ -268,12 +265,11 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
       ? std::optional<int>(*fuzzyQuery.max_edits) : std::nullopt;
   std::optional<int> prefixLength = fuzzyQuery.prefix_length.has_value()
       ? std::optional<int>(*fuzzyQuery.prefix_length) : std::nullopt;
-  return builder.createFuzzyQuery(fuzzyQuery.field, fuzzyQuery.term,
+  return builder.createFuzzyQuery(target, fuzzyQuery.term,
                                   maxEdits, prefixLength, fuzzyQuery.max_expansions);
 }
 
-luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
-  const auto& target = context.fields.resolve(knnQuery.field, OpClass::PRIMARY, context.opName);
+luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery, const ResolvedFieldHandle& target) {
   auto field = api::build::arenaStr(pool, target.physicalName);
   FieldType& fieldType = *target.fieldType;
   if (fieldType.type() != FieldType::Type::VECTOR) {
@@ -337,7 +333,8 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     throw std::runtime_error("knn.unit must be docs or groups");
   }
   if (groups && context.collapse == nullptr) {
-    throw std::runtime_error("knn.unit groups requires an enclosing collapse");
+    throw std::runtime_error("knn.unit groups requires an enclosing collapse"
+        + (target.path.empty() ? std::string() : " in nested path '" + target.path + "'"));
   }
   std::optional<float> similarity = knnQuery.similarity;
   if (similarity.has_value()) {
@@ -449,13 +446,61 @@ luxir::Query* ProtobufQueryParser::parseExpr(
   }
   ExprOptions options;
   options.schema = &schema;
-  options.fieldResolver = &context.fields;
+  options.view = &context.view;
   options.vars = exprQuery.vars;
   options.exactSources = &context.exactSources;
   options.nestingBudget = &context.nestingBudget;
   const luxir::api::Query* root = luxir::parseExpr(exprQuery.q, options, pool);
   const_cast<luxir::api::Query&>(node).kind = root->kind;
   return parse(*root);
+}
+
+template <class Lower>
+Query* ProtobufQueryParser::inPath(std::string_view path, bool maximum, Lower&& lower) {
+  auto* req = context.view.owner();
+  if (!req || !context.view.get()) throw RequestError("to_parent requires a searched reader");
+  auto& destination = context.view.reader();
+  auto scope = context.view.scoped(path);
+  auto& source = context.view.reader();
+  auto& relation = req->ownershipRelation(*source, *destination);
+  auto* planning = req->createPlanningContext(*source);
+  auto* collapse = context.collapse;
+  auto restore = scope_guard([&]() noexcept { context.collapse = collapse; });
+  context.collapse = nullptr;
+  auto* child = lower();
+  return child ? pool.make<ToParentQuery>(child, *planning, relation, maximum) : nullptr;
+}
+
+template <class Leaf, class Lower>
+Query* ProtobufQueryParser::parseLeaf(const Leaf& leaf, Lower&& lower) {
+  constexpr auto op = [] {
+    if constexpr (std::is_same_v<Leaf, api::RangeQuery> || std::is_same_v<Leaf, api::AnyOfQuery>) return OpClass::VALUE;
+    else if constexpr (std::is_same_v<Leaf, api::ExistsQuery>) return OpClass::EXISTS;
+    else if constexpr (std::is_same_v<Leaf, api::KnnQuery>
+        || std::is_same_v<Leaf, api::GeoBoxQuery> || std::is_same_v<Leaf, api::GeoDistanceQuery>
+        || std::is_same_v<Leaf, api::GeoPolygonQuery>) return OpClass::PRIMARY;
+    else return OpClass::SEARCH;
+  }();
+  const auto& target = context.fields.resolve(leaf.field, op, context.opName);
+  if constexpr (std::is_same_v<Leaf, api::ExistsQuery>) {
+    if (target.fieldType->type() == FieldType::NESTED) {
+      return inPath(target.physicalName, true, [&] { return pool.make<AllQuery>(); });
+    }
+  }
+  if (target.path == context.fields.path()) return lower(target);
+  return inPath(target.path, true, [&] { return lower(target); });
+}
+
+luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery& query) {
+  if (!query.query || std::holds_alternative<std::monostate>(query.query->kind)) {
+    throw RequestError("to_parent requires a child query");
+  }
+  if (query.path.empty()) throw RequestError("to_parent requires a descendant path");
+  if (!query.score.empty() && query.score != "none" && query.score != "max") {
+    throw RequestError("to_parent score must be none or max");
+  }
+  const auto& path = context.fields.resolvePath(query.path);
+  return inPath(path.physicalName, query.score != "none", [&] { return parse(*query.query); });
 }
 
 luxir::Query* ProtobufQueryParser::parseConstantScore(
@@ -519,7 +564,7 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   options.opName = context.opName;
   options.nestingBudget = &context.nestingBudget;
   ValueProgram* program =
-      ValueExprParser(options, context.arena).parse(rescoreQuery.expr);
+      ValueExprParser(options, context.arena).parse(rescoreQuery.expr, NaturePolicy::NUMBER);
   ValueType rootType = program->root().type;
   if (valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
     throw std::runtime_error(
@@ -598,14 +643,34 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
     fields.push_back({field.field, weight});
   }
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields, context.reader);
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields, context.view.get());
+  auto resolved = builder.resolveWeightedFields(fields, context.view);
   auto op = builderOperator(query.operator_);
   switch (query.mode) {
-    case Mode::COMBINED:
-      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tie);
-    case Mode::PER_FIELD:
-      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie,
-          query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt);
+    case Mode::COMBINED: {
+      auto lower = [&] { return builder.createMultiMatchCombined(resolved, query.text, op, query.min_match, tie); };
+      if (resolved.empty()) return lower();
+      const auto& path = resolved.front().target->path;
+      for (const auto& field : resolved) {
+        if (field.target->path != path) {
+          throw RequestError("multi_match combined mixes nested paths '" + path + "' and '"
+              + field.target->path + "'; use per_field or explicit to_parent queries");
+        }
+      }
+      return path == context.fields.path() ? lower() : inPath(path, true, lower);
+    }
+    case Mode::PER_FIELD: {
+      auto clauses = pool.make_span<Query*>(resolved.size());
+      size_t count = 0;
+      for (const auto& field : resolved) {
+        auto lower = [&] { return builder.createMultiMatchField(field, query.text, op, query.min_match,
+            query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt); };
+        const auto& path = field.target->path;
+        auto* clause = path == context.fields.path() ? lower() : inPath(path, true, lower);
+        if (clause) clauses[count++] = clause;
+      }
+      return count ? DisMaxQuery::make(pool, clauses.first(count), tie) : builder.matchNoDocs();
+    }
   }
   throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
 }
@@ -645,28 +710,29 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   NestingScope nesting(context);
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
   return std::visit(luxir::overloaded{
-    [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
-    [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseAnyOf(a); },
-    [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
-    [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parsePrefix(p); },
-    [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseWildcard(w); },
-    [&](const luxir::api::RegexQuery& r) -> luxir::Query* { return parseRegex(r); },
-    [&](const luxir::api::ExistsQuery& e) -> luxir::Query* { return parseExists(e); },
-    [&](const luxir::api::RangeQuery& r) -> luxir::Query* { return parseRange(r); },
-    [&](const luxir::api::GeoBoxQuery& g) -> luxir::Query* { return parseGeoBox(g); },
+    [&](const luxir::api::Match& m) -> luxir::Query* { return parseLeaf(m, [&](const auto& target) { return parseMatch(m, target); }); },
+    [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseLeaf(a, [&](const auto& target) { return parseAnyOf(a, target); }); },
+    [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parseLeaf(p, [&](const auto& target) { return parsePhrase(p, target); }); },
+    [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parseLeaf(p, [&](const auto& target) { return parsePrefix(p, target); }); },
+    [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseLeaf(w, [&](const auto& target) { return parseWildcard(w, target); }); },
+    [&](const luxir::api::RegexQuery& r) -> luxir::Query* { return parseLeaf(r, [&](const auto& target) { return parseRegex(r, target); }); },
+    [&](const luxir::api::ExistsQuery& e) -> luxir::Query* { return parseLeaf(e, [&](const auto& target) { return parseExists(e, target); }); },
+    [&](const luxir::api::RangeQuery& r) -> luxir::Query* { return parseLeaf(r, [&](const auto& target) { return parseRange(r, target); }); },
+    [&](const luxir::api::GeoBoxQuery& g) -> luxir::Query* { return parseLeaf(g, [&](const auto& target) { return parseGeoBox(g, target); }); },
     [&](const luxir::api::GeoDistanceQuery& g) -> luxir::Query* {
-      return parseGeoDistance(g);
+      return parseLeaf(g, [&](const auto& target) { return parseGeoDistance(g, target); });
     },
     [&](const luxir::api::GeoPolygonQuery& g) -> luxir::Query* {
-      return parseGeoPolygon(g);
+      return parseLeaf(g, [&](const auto& target) { return parseGeoPolygon(g, target); });
     },
-    [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseFuzzy(f); },
+    [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseLeaf(f, [&](const auto& target) { return parseFuzzy(f, target); }); },
     [&](const luxir::api::SimpleQuery& s) -> luxir::Query* { return parseSimpleQuery(s, pquery); },
     [&](const luxir::api::ExprQuery& e) -> luxir::Query* { return parseExpr(e, pquery); },
     [&](bool) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },  // the `all` arm
-    [&](const luxir::api::KnnQuery& k) -> luxir::Query* { return parseKnn(k); },
+    [&](const luxir::api::KnnQuery& k) -> luxir::Query* { return parseLeaf(k, [&](const auto& target) { return parseKnn(k, target); }); },
     [&](const luxir::api::BooleanQuery& b) -> luxir::Query* { return parseBoolean(b); },
     [&](const luxir::api::ConstantScoreQuery& c) -> luxir::Query* { return parseConstantScore(c); },
+    [&](const luxir::api::ToParentQuery& q) -> luxir::Query* { return parseToParent(q); },
     [&](const luxir::api::BoostQuery& b) -> luxir::Query* { return parseBoost(b); },
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);

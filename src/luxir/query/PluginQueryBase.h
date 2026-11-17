@@ -28,6 +28,7 @@ protected:
       FilterKeyBuilder& out, const FilterKeyContext& ctx) const = 0;
 
 public:
+  virtual bool logicalConsumesDomain() const { return false; }
   std::string_view registeredName() const { return typeName; }
   FilterKeyScope appendFilterKey(
       FilterKeyBuilder& out, const FilterKeyContext& ctx) const final;

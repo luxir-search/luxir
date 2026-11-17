@@ -18,6 +18,7 @@ enum RequestFlagBit {
   DATE_MODE_HIGH_BIT = 1;
   INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
   ESTIMATE_COUNT_BIT = 3; // lists with an unset or positive count_limit may estimate found
+  DECIMAL_SCALED_BIT = 4; // decimal literals and results use raw scaled integers
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -169,6 +170,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
 
@@ -234,6 +237,8 @@ message TopDocs {
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
+  // Plugin result decorators, executed only for emitted rows.
+  map<string, Val> decorate = 27;
   // Named source queries. At least one source is required.
   map<string, TopDocs> sources = 1;
 
@@ -349,7 +354,15 @@ message Query {
     GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
+    ToParentQuery to_parent = 27;   // reduces child matches onto their owners
   }
+}
+
+message ToParentQuery {
+  string path = 1;
+  Query query = 2;
+  // none (constant score) or max. Unset selects max.
+  string score = 3;
 }
 
 message ExistsQuery {
@@ -1015,6 +1028,8 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // Relative descendant path, .. steps to ancestors, or / for root documents.
+  optional string to = 6;
   // If present, replaces the incoming domain with this query's matches
   // within live documents and the enclosing structural bucket identities.
   // If absent, inherits the incoming domain.
@@ -1125,12 +1140,14 @@ message SearchResponse {
 
 // Typed collapse identity. Component types follow the resolved schema fields.
 message GroupComponent {
-  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; } // INT carries signed int64 values.
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; BOOLEAN = 4; DECIMAL = 5; IP = 6; } // INT carries signed int64 values.
   Type type = 1;
   oneof value {
     google.protobuf.NullValue null = 2;
     string s = 3;
     sint64 i = 4;
+    bool b = 5;
+    double d = 6;
   }
 }
 message GroupKey {
@@ -1689,6 +1706,13 @@ message ServiceStats {
   string cpu_target = 20;
   // The full Git commit the binary was built from, or "unknown".
   string source_commit = 23;
+  // The SIMD level FAISS selected for this CPU at startup: NONE, AVX2,
+  // AVX512, AVX512_VPOPCNT, AVX512_SPR, ARM_NEON or ARM_SVE.
+  // FAISS_SIMD_LEVEL overrides it.
+  string faiss_simd = 24;
+  // The BLAS kernels selected for this CPU at startup: the OpenBLAS core name,
+  // or "Accelerate" on macOS.
+  string blas_core = 25;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.
@@ -1956,6 +1980,8 @@ message FieldMetadataStats {
   uint64 entry_bytes = 7;
   uint64 names = 8;
   uint64 name_bytes = 9;
+  uint64 live_views = 10;
+  uint64 live_view_bytes = 11;
 }
 
 // Node memory: Luxir's own budgets and usage, and the process allocator's
@@ -2193,6 +2219,15 @@ message QueryCacheStats {
   uint64 thrash_build_skips = 19;
   uint64 reader_dead_builds = 20;
   uint64 reader_thrash_build_skips = 21;
+  // Build time of claimed cache builds, including rejected publications,
+  // in microseconds. Excludes byproducts.
+  uint64 build_us = 22;
+  // Build time of values served as shared hits, in microseconds.
+  // An upper bound on time saved, not measured savings.
+  uint64 served_build_us = 23;
+  // Build time of zero-hit capacity evictions that install bypass debt,
+  // in microseconds.
+  uint64 dead_build_us = 24;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2278,6 +2313,10 @@ message CacheEntryDump {
   uint32 segments_resident = 7;
   uint64 hits = 8;
   uint64 last_used_epoch = 9;
+  // Summed build time of this entry's resident values, in microseconds.
+  uint64 build_us = 10;
+  // Current key uses in the admission window, taking the max of the two lanes.
+  uint32 recent_uses = 11;
 }
 
 message ShardCacheControl {
@@ -2429,11 +2468,15 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 units since the Unix epoch (see unit)
     GEO_POINT = 9; // latitude/longitude point
+    BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
+    IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
+    DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
+    NESTED = 14;   // structural path of nested object rows
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
   // Index acceleration. Numeric Match/Range and geographic predicates can
-  // scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH;
+  // scan a column with NONE. Term queries on STRING/TEXT/ID/IP require MATCH;
   // STRING columns alone do not provide term-query support.
   enum IndexMode {
     NONE = 0;    // no index
@@ -2527,6 +2570,9 @@ message FieldDef {
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
 
+  // DECIMAL only, and required there: digits after the decimal point, 0 to 18.
+  // Excess fractional digits round half away from zero.
+  optional int32 scale = 25;
   // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
   // text is converted to this precision, truncating toward earlier time.
   // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.

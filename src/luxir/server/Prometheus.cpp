@@ -53,9 +53,10 @@ public:
 };
 
 void service(Renderer& r, const api::ServiceStats& s) {
-  r.gauge("luxir_build_info", "Luxir build version, CPU target and source commit.", 1,
+  r.gauge("luxir_build_info", "Luxir build version, CPU target, source commit, and the vector kernels selected at startup.", 1,
           PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target) + "," +
-          PrometheusText::label("source_commit", s.source_commit));
+          PrometheusText::label("source_commit", s.source_commit) + "," +
+          PrometheusText::label("faiss_simd", s.faiss_simd) + "," + PrometheusText::label("blas_core", s.blas_core));
   r.gauge("luxir_node_read_only", "Node is configured read only.", s.read_only);
   for (auto [transportName, transport] : {std::pair{"http", &s.http}, {"grpc", &s.grpc}}) {
     auto t = PrometheusText::label("transport", transportName);
@@ -108,7 +109,8 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_schema_cache_bytes", "Estimated parsed schema payload held by snapshots and readers.", (double)m.schema_cache_bytes);
   const auto& f = m.field_metadata;
   for (auto [part, count, bytes] : {std::tuple{"directory", f.directories, f.directory_bytes}, {"page", f.pages, f.page_bytes},
-                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes}}) {
+                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes},
+                                    {"live_view", f.live_views, f.live_view_bytes}}) {
     auto labels = PrometheusText::label("part", part);
     r.gauge("luxir_field_metadata_objects", "Cached field metadata objects.", (double)count, labels);
     r.gauge("luxir_field_metadata_bytes", "Cached field metadata payload bytes, excluding allocator overhead.", (double)bytes, labels);
@@ -151,6 +153,9 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
       {"reader_stable_hits", c.reader_stable_hits}, {"reader_stable_refreshes", c.reader_stable_refreshes},
       {"reader_stable_retires", c.reader_stable_retires}})
     r.counter(std::string("luxir_filter_cache_") + name + "_total", "Filter-cache events; reset by cache-control reset_counters.", (double)value, labels);
+  r.counter("luxir_filter_cache_build_seconds_total", "Build time of claimed cache builds, including rejected publications; excludes byproducts. Reset by cache-control reset_counters.", (double)c.build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_served_build_seconds_total", "Build time of values served as shared hits; an upper bound on time saved. Reset by cache-control reset_counters.", (double)c.served_build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_dead_build_seconds_total", "Build time of zero-hit capacity evictions that install bypass debt. Reset by cache-control reset_counters.", (double)c.dead_build_us / 1e6, labels);
 }
 
 void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, const std::string& labels) {

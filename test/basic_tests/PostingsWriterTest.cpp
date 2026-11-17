@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include <set>
 #include "luxir/index/PostingsWriter.h"
@@ -32,7 +33,8 @@ protected:
   uint32_t termsPerFieldMax = 100;
 
 
-  std::unique_ptr<PostingsReader> reader;
+  std::unique_ptr<SegmentCore> core;
+  PostingsReader* reader = nullptr;
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsPosEnum> docsEnum;
@@ -61,7 +63,8 @@ protected:
     luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
-    reader = std::make_unique<PostingsReader>(dir, 0, 1);
+    core = std::make_unique<SegmentCore>(dir, 0, 1);
+    reader = &core->rootReader();
     fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state
@@ -199,7 +202,7 @@ protected:
       tenum = std::make_unique<TermsEnum>(pool, *reader, fieldInfo);
     } else {
       writer = std::make_unique<TextWriter>(*postingsWriter);
-      writer->startField(fname);
+      writer->startField(SpaceOrdinal::ROOT, fname);
     }
     int realNumTerms = 0;
     for (uint32_t i = 0; i < numTerms; i++) {
@@ -263,7 +266,7 @@ TEST_F(PostingsTest, basic) {
   {
     TextWriter writer(postingsWriter);
 
-    writer.startField("field1");
+    writer.startField(SpaceOrdinal::ROOT, "field1");
     writer.startTerm(term1);  // single doc, single position... this should be pulsed
     writer.startDoc(44);
     writer.addPositionDelta(1);
@@ -295,7 +298,7 @@ TEST_F(PostingsTest, basic) {
   {
     TextWriter writer(postingsWriter);
 
-    writer.startField("field2");
+    writer.startField(SpaceOrdinal::ROOT, "field2");
     writer.startTerm(terma);
     writer.startDoc(0);
     writer.addPositionDelta(3);
@@ -309,7 +312,8 @@ TEST_F(PostingsTest, basic) {
   postingsWriter.finish();
 
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   while (fieldReader.readNextField()) {
@@ -377,7 +381,7 @@ TEST_F(PostingsTest, levelLadder) {
     PostingsWriter postingsWriter(dir, 0, 1, Postings::DOCS_BLOCK_SIZE + 20);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = flags;
       writer.startField(&finfo);
@@ -406,7 +410,8 @@ TEST_F(PostingsTest, levelLadder) {
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
-    PostingsReader reader(dir, 0, 1);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -566,7 +571,7 @@ TEST_F(PostingsTest, blockPositions) {
     std::string t1 = "term1";
     TermRef term1(pool, t1.data(), t1.size());
 
-    writer.startField("field1");
+    writer.startField(SpaceOrdinal::ROOT, "field1");
     writer.startTerm(term1);
     writer.startDoc(42);
 
@@ -587,7 +592,8 @@ TEST_F(PostingsTest, blockPositions) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -649,7 +655,7 @@ TEST_F(PostingsTest, blockTerms) {
   tstr.resize(12);
   {
     TextWriter writer(postingsWriter);
-    writer.startField("field1");
+    writer.startField(SpaceOrdinal::ROOT, "field1");
 
 
     for (int i = 0; i < nTerms; i++) {
@@ -666,7 +672,8 @@ TEST_F(PostingsTest, blockTerms) {
   }
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
 
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -717,7 +724,7 @@ TEST_F(PostingsTest, seekForward) {
   // Generate sorted term names: term00000000, term00000001, ...
   {
     TextWriter writer(postingsWriter);
-    writer.startField("field1");
+    writer.startField(SpaceOrdinal::ROOT, "field1");
     for (int i = 0; i < nTerms; i++) {
       sprintf(tstr.data() + 4, "%08d", i);
       TermRef term(pool, tstr.data(), tstr.size());
@@ -732,7 +739,8 @@ TEST_F(PostingsTest, seekForward) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -903,7 +911,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
   PostingsWriter postingsWriter(dir, 0, 1, nTerms);
   {
     TextWriter writer(postingsWriter);
-    writer.startField("id");
+    writer.startField(SpaceOrdinal::ROOT, "id");
     for (int i = 0; i < nTerms; i++) {
       TermRef term(pool, ids[i].data(), ids[i].size());
       writer.startTerm(term);
@@ -917,7 +925,8 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -998,7 +1007,7 @@ TEST_F(PostingsTest, seekForwardRandom) {
     PostingsWriter postingsWriter(dir, 0, 1, nTerms);
     {
       TextWriter writer(postingsWriter);
-      writer.startField("id");
+      writer.startField(SpaceOrdinal::ROOT, "id");
       for (int i = 0; i < nTerms; i++) {
         TermRef term(pool, ids[i].data(), ids[i].size());
         writer.startTerm(term);
@@ -1012,7 +1021,8 @@ TEST_F(PostingsTest, seekForwardRandom) {
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
-    PostingsReader reader(dir, 0, 1);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -1162,7 +1172,7 @@ TEST_F(PostingsTest, intCol) {
 
     PostingsWriter writer(dir, 0, 1, 3);
 
-    auto &finfo = writer.addField(fname1);
+    auto &finfo = writer.addField(SpaceOrdinal::ROOT, fname1);
     {
       auto outputPtr = writer.getOutputStream();
       IntColWriter colWriter(*outputPtr);
@@ -1188,7 +1198,8 @@ TEST_F(PostingsTest, intCol) {
   dir.listFiles(files);
   ASSERT_EQ(files.size(), 1);
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), fname1);

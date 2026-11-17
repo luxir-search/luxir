@@ -383,10 +383,15 @@ public:
 
   // mutex held; callable from any thread.  Schedules maybeSendFinish() on this
   // call's cq thread via an immediately-expiring alarm.
-  void kickFinish() {
+  void kickFinish() noexcept {
     if (finishSent || finishKick) return;
-    finishKick.emplace();
-    finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+    try {
+      finishKick.emplace();
+      finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+    } catch (...) {
+      finishKick.reset();
+      LOG_ERROR("gRPC finish notification failed");
+    }
   }
 
   /// Enqueue an owned response (one outstanding write at a time).
@@ -396,7 +401,7 @@ public:
   /// NOTE: with finishCount>0 this may eventually delete "this" on another thread,
   /// so make it the last use of "this" in the caller.
   int64_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
-    const std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock lock(mutex);
     responsesExpected -= finishCount;
     if (finishCount > 0) requestCompleted();
     if (errored) {
@@ -406,13 +411,28 @@ public:
       kickFinish();
       return -1;
     }
-    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
-    queuedBytes += (int64_t)buf.Length();
+    const int64_t length = (int64_t)buf.Length();
+    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, length);
     if (writeOutstanding) {
-      pending.emplace_back(std::move(buf));
+      try {
+        pending.emplace_back(std::move(buf));
+      } catch (...) {
+        finishStatus = grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, {});
+        metricError(ErrorKind::RESOURCE_EXHAUSTED);
+        errored = true;
+        readsDone = true;
+        auto waiters = std::move(drainWaiters);
+        auto& arena = server.getLuxirNode().getTaskArena();
+        // The outstanding WRITE evaluates Finish on the CQ thread. After
+        // unlock it can delete this call, so use only locals to wake waiters.
+        lock.unlock();
+        for (auto& w : waiters) enqueueResume(arena, std::move(w));
+        return -1;
+      }
     } else {
       doWrite(std::move(buf));
     }
+    queuedBytes += length;
     return queuedBytes;
   }
 
@@ -466,7 +486,7 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
       responsesExpected -= finishCount;
       readsDone = true;
-      finishStatus = status;
+      finishStatus = std::move(status);
       kickFinish();
       waiters = std::move(drainWaiters);
     }
@@ -509,10 +529,14 @@ public:
   // catch), and a lost resume strands its request forever - so an enqueue
   // allocation failure falls back to running the resume inline.
   void enqueueResume(std::function<void()> resume) {
+    enqueueResume(server.getLuxirNode().getTaskArena(), std::move(resume));
+  }
+
+  static void enqueueResume(oneapi::tbb::task_arena& arena, std::function<void()> resume) {
     try {
       // Isolated like the search itself (SearchEngine::enqueueSubmit): a
       // parallel emitter's batch waits help only with its own tasks.
-      server.getLuxirNode().getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+      arena.enqueue([resume] {  // copies; resume stays valid if this throws
         oneapi::tbb::this_task_arena::isolate(resume);
       });
     } catch (...) {
@@ -536,7 +560,7 @@ public:
     if (requestMetric.active()) {
       int kind = metricErrorKind.load(std::memory_order_relaxed);
       // A failed write means the client went away, as on HTTP.
-      auto outcome = genericCtx.IsCancelled() || errored ? MetricOutcome::CANCELLED
+      auto outcome = genericCtx.IsCancelled() || (errored && finishStatus.ok()) ? MetricOutcome::CANCELLED
           : kind >= 0 || !finishStatus.ok() ? MetricOutcome::ERROR : MetricOutcome::OK;
       if (outcome == MetricOutcome::ERROR) {
         server.getLuxirNode().metrics->requestError(MetricTransport::GRPC,
@@ -679,10 +703,24 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       grpc::ByteBuffer buf;
       try {
         buf = serializeToByteBuffer(response.proto);
-      } catch (const std::exception& e) {
-        // The response cannot be delivered: the call ends with the failure
-        // instead of a silently empty message.
-        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
+      } catch (...) {
+        // Build the status before changing response accounting. If detailed
+        // reporting also fails, retain a nonallocating code-only fallback.
+        grpc::Status status(grpc::StatusCode::RESOURCE_EXHAUSTED, {});
+        try {
+          auto info = currentExceptionInfo(ErrorKind::INTERNAL);
+          status = grpcStatus(info);
+          parent->metricError(info.kind);
+        } catch (...) {
+          parent->metricError(ErrorKind::RESOURCE_EXHAUSTED);
+          LOG_ERROR("gRPC response serialization and error reporting failed");
+        }
+        try {
+          parent->finishWithError(std::move(status), response.last ? 1 : 0);
+        } catch (...) {
+          // Accounting may already have changed; do not decrement it again.
+          LOG_ERROR("gRPC response error completion failed");
+        }
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
@@ -692,7 +730,13 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       // Snapshot highWater first: once the final response is handed to
       // respondRaw, the call can Finish and delete parent at any moment.
       const int64_t highWater = parent->highWater;
-      int64_t buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      int64_t buffered = -1;
+      try {
+        buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      } catch (...) {
+        // Accounting may already have changed; release the response once.
+        LOG_ERROR("gRPC response delivery failed");
+      }
       auto status = ReplyStatus::OK;
       if (buffered < 0) status = ReplyStatus::CANCEL;
       else if (buffered > highWater) status = ReplyStatus::PAUSE;

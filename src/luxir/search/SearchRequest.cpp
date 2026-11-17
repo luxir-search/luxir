@@ -6,10 +6,53 @@
 #include <cassert>
 
 #include "SearchEngine.h"
+#include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
 
 namespace luxir {
+
+const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path) {
+  if (path == reader->path()) return reader;
+  const std::lock_guard lock(mutex);
+  if (!scopedStates) scopedStates = std::make_unique<std::map<std::string, ScopedState, std::less<>>>();
+  auto found = scopedStates->find(path);
+  if (found != scopedStates->end()) return found->second.reader;
+  reader->schema()->requirePath(path);
+  auto scoped = reader->view(path);
+  auto uses = std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped);
+  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}}).first->second.reader;
+}
+
+const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader& scoped) {
+  if (&scoped == reader.get()) return filterUses;
+  pinView(scoped.path());
+  const std::lock_guard lock(mutex);
+  return scopedStates->find(scoped.path())->second.uses;
+}
+
+RowRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
+  if (many.path() == one.path()) throw RequestError("domain transform requires different spaces");
+  if (pinView(many.path()).get() != &many || pinView(one.path()).get() != &one) {
+    throw RequestError("relation views must belong to this request");
+  }
+  const std::lock_guard lock(mutex);
+  auto& state = scopedStates->find(&many == reader.get() ? one.path() : many.path())->second;
+  auto key = std::pair{std::string(many.path()), std::string(one.path())};
+  auto found = state.relations.find(key);
+  if (found != state.relations.end()) return *found->second;
+  auto* relation = arenaCreate<OwnershipRelation>(arena, many, one, memoryTracker);
+  state.relations.emplace(std::move(key), relation);
+  return *relation;
+}
+
+Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
+  Query::PlanningContext::Limits limits;
+  limits.multiTermBudget = &multiTermBudget;
+  return arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
+      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
+      uses(view), &memoryTracker, proto.profile ? this : nullptr);
+}
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
                              google::protobuf::Arena& arena,

@@ -23,6 +23,12 @@ std::string ReaderManager::resolvedSchema() {
   result["fields"] = Json::object_t{};
   for (const auto& [name, signature] : fields) {
     auto& logical = result["fields"][signature.logicalName];
+    auto* structural = schema->physical(name);
+    if (structural->type() == FieldType::NESTED) {
+      logical["type"] = "nested";
+      logical["introduced_generation"] = schema->introduction(name);
+      continue;
+    }
     for (auto [name, op] : {std::pair{"search", OpClass::SEARCH}, {"value", OpClass::VALUE}}) {
       try {
         logical["bindings"][name] = schema->resolveFor(signature.logicalName, op).physicalName;

@@ -111,7 +111,7 @@ again, then rerun the script. No changes to upstream ports or triplets are neede
 The same presets and setup script work with Homebrew GCC. On macOS:
 
 - Dependencies use the `arm64-osx-luxir-m1*` triplets: a fixed `apple-m1`
-  and macOS 14 baseline instead of the host CPU, so one install serves local
+  and macOS 15 baseline instead of the host CPU, so one install serves local
   builds and binaries for other Macs. Later Apple cores add only BF16 and int8
   matrix-multiply instructions, and no dependency header tests for them, so
   Luxir built for a newer chip sees the same inline dependency code. No CPU
@@ -130,6 +130,18 @@ The same presets and setup script work with Homebrew GCC. On macOS:
   caps them.
 - FAISS is built without its Metal GPU backend, which needs Xcode's `metal`
   compiler.
+
+For a distributable binary, use `macos-release`. It inherits `base-native`
+and `base-release`, fixes the CPU at apple-m1, links GCC runtimes statically,
+and uses `/opt/vcpkg/installed-native-release`. Prepare that install with
+`LUXIR_DEPS_VARIANTS=native-release deps/make_deps.sh`; it builds only Release,
+without ASan. `gcc-release` remains the host-CPU developer build with shared
+runtimes. Both Luxir and the dependency triplets read the deployment target
+from `deps/triplets/common/macos-version.cmake` before compiler detection.
+
+Publish binaries on macOS 15. A local developer build on a newer system still
+works, but its Homebrew static runtime objects can require that newer system,
+regardless of the deployment target requested from the linker.
 
 When migrating an existing build from the old classic-mode dependencies, reset
 the CMake caches so cached package paths cannot retain system TBB or the old

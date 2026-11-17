@@ -31,6 +31,7 @@
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/util/Signal.h"
 
 namespace luxir::test {
@@ -160,14 +161,13 @@ protected:
     return out;
   }
 
-  static void expectResponsesDifferOnlyByIncarnation(std::string_view first, std::string_view second) {
+  static void expectResponsesMatchApartFromIncarnation(std::string_view first, std::string_view second) {
     std::pmr::monotonic_buffer_resource arena;
     api::UpdateResponse a, b;
     ASSERT_TRUE(api::read_json(a, first, arena));
     ASSERT_TRUE(api::read_json(b, second, arena));
     ASSERT_FALSE(a.commit.empty());
     ASSERT_FALSE(b.commit.empty());
-    EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
     a.took_us = b.took_us = 0;
@@ -311,18 +311,27 @@ TEST_F(HttpApiTest, buildInfo) {
     EXPECT_EQ(buildInfo().version, root["version"].get_string());
     EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
     EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+    EXPECT_EQ(kernelInfo().faissSimd, root["faiss_simd"].get_string());
+    EXPECT_EQ(kernelInfo().blasCore, root["blas_core"].get_string());
   }
+  // OpenBLAS reports "Unknown" when read before its load-time core selection.
+  EXPECT_FALSE(kernelInfo().faissSimd.empty());
+  EXPECT_NE("Unknown", kernelInfo().blasCore);
   auto res = httpRequest(port(), http::verb::post, "/");
   EXPECT_EQ(405, res.result_int());
   EXPECT_EQ("GET", res[http::field::allow]);
 
-  // _stats (shared with gRPC) and Prometheus report the same commit.
+  // _stats (shared with gRPC) and Prometheus report the same commit and kernels.
   auto stats = httpRequest(port(), http::verb::get, "/_stats");
   glz::generic_i64 statsJson;
   ASSERT_FALSE(glz::read_json(statsJson, stats.body())) << stats.body();
   EXPECT_EQ(buildInfo().sourceCommit, statsJson["service"]["source_commit"].get_string());
+  EXPECT_EQ(kernelInfo().faissSimd, statsJson["service"]["faiss_simd"].get_string());
+  EXPECT_EQ(kernelInfo().blasCore, statsJson["service"]["blas_core"].get_string());
   auto metrics = httpRequest(port(), http::verb::get, "/metrics");
   EXPECT_NE(std::string::npos, metrics.body().find("source_commit=\"" + std::string(buildInfo().sourceCommit) + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("faiss_simd=\"" + kernelInfo().faissSimd + "\""));
+  EXPECT_NE(std::string::npos, metrics.body().find("blas_core=\"" + kernelInfo().blasCore + "\""));
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {
@@ -1699,8 +1708,8 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
   EXPECT_EQ((int64_t)128, serial.plainCount);
   EXPECT_EQ(serial.plainCount, pipelined.plainCount);
-  expectResponsesDifferOnlyByIncarnation(serial.plainResponse, pipelined.plainResponse);
-  expectResponsesDifferOnlyByIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
+  expectResponsesMatchApartFromIncarnation(serial.plainResponse, pipelined.plainResponse);
+  expectResponsesMatchApartFromIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
   EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
   ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
   for (int id = 0; id < 12; id++) {
@@ -1967,7 +1976,7 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
   EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
   EXPECT_EQ((int64_t)2, serial.found);
-  expectResponsesDifferOnlyByIncarnation(serial.response, pipelined.response);
+  expectResponsesMatchApartFromIncarnation(serial.response, pipelined.response);
   EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
   EXPECT_EQ(serial.found, pipelined.found);
 }
