@@ -58,6 +58,7 @@ inline bool logicalConsumesDomain(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
     case QueryKind::COMBINED_FIELDS:

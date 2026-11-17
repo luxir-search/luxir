@@ -106,6 +106,19 @@ public:
 
 using Ids = std::vector<std::string>;
 
+TEST_F(RangeFieldTest, booleanClauses) {
+  indexAllDocs();
+  for (std::string_view field : {"bkd", "col"}) {
+    for (std::string_view role : {"required", "filter"}) {
+      SCOPED_TRACE(std::string(field) + " " + std::string(role));
+      std::string query = std::string(R"({"boolean":{")") + std::string(role)
+          + R"(":[{"range":{"field":")" + std::string(field)
+          + R"(","gte":18,"lte":22}}],"prohibited":[{"match":{"field":"id","val":"b"}}]}})";
+      EXPECT_EQ((Ids{"a", "f"}), ids(query));
+    }
+  }
+}
+
 TEST_F(RangeFieldTest, relations) {
   indexAllDocs();
   SkipStatsScope stats;
