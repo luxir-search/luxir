@@ -159,7 +159,21 @@ void SegmentCore::initializeSpace(PostingsReader& reader, const SpaceDescriptor&
   reader.initialize(space.maxDoc, offsetsLoc, offsets, (int32_t)space.fieldCount);
 }
 
+std::vector<ByteRange> SegmentCore::openReads(uint32_t fileNum, uint64_t fileSize) {
+  static_assert(OPEN_HEADER_BYTES >= Postings::LUXIR_HEADER.size());
+  // validateSegmentFileHeader reads every file's header.
+  uint64_t header = std::min(fileSize, OPEN_HEADER_BYTES);
+  if (fileNum != 0 || fileSize <= header) return {{0, header}};
+  // File 0 also ends with what initializeFromFiles reads back from its end:
+  // the segment info and its size, each space's field count and offsets, the
+  // catalog.
+  uint64_t tail = std::max(header, fileSize - std::min(fileSize, OPEN_TAIL_BYTES));
+  if (tail == header) return {{0, fileSize}};
+  return {{0, header}, {tail, fileSize - tail}};
+}
+
 // Initialize from files, returns false if missing files and missingFileOK=true
+// (openReads lists what this reads before it reads anything)
 bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced) {
   std::string segStr = Postings::segmentKey(segId, creatorEpoch);
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);

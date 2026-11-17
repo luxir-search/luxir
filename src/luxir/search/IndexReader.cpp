@@ -346,6 +346,38 @@ std::optional<std::pair<SpaceOrdinal, int32_t>> SegmentBase::space(std::string_v
   return std::pair{(SpaceOrdinal)(found - spaces.begin() + 1), found->second};
 }
 
+void SegmentBase::declareOpen(HeldFiles& held, ReadSet& reads) {
+  auto hotName = Hotcache::fileName(segId, creatorEpoch);
+  if (!hotcacheRead) {
+    if (auto hot = held.mapping(hotName)) {
+      // The hotcache lists what the open reads, but its bytes must arrive
+      // before it says anything: fetch it in a round of its own (it is
+      // small), and read it on the declare after that round.
+      if (!reads.prerequisitesFetched) {
+        held.declareWhole(hotName, reads);
+        reads.again = true;
+        return;
+      }
+      try {
+        auto bytes = hot->rangeStream(0, (uint64_t)hot->size());
+        hotcache = Hotcache::decode(std::string_view(bytes.ptr(), (size_t)bytes.size()));
+      } catch (const std::exception& e) {
+        LOG_WARN("Hotcache of segment {} unusable; declaring the open's fixed regions: {}", segId, e.what());
+      }
+    }
+    hotcacheRead = true;
+  }
+  for (auto name : held.names()) {
+    auto data = Hotcache::parseDataFile(name);
+    if (!data) continue;  // the hotcache itself, source documents: not read by the open
+    if (hotcache) {
+      held.declare(name, hotcache->rangesOf(data->fileNum), reads);
+    } else if (auto file = held.mapping(name)) {
+      held.declare(name, SegmentCore::openReads(data->fileNum, (uint64_t)file->size()), reads);
+    }
+  }
+}
+
 std::shared_ptr<LiveDocs> SegmentLive::get() {
   if (auto value = cell.peek()) return value;  // the warm path builds no message
   return getOrOpen("live docs of segment " + std::to_string(segId), [this](HeldFiles& held) {

@@ -12,6 +12,7 @@
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/index/PostingsWriter.h"
+#include "luxir/search/IndexReader.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -250,4 +251,39 @@ TEST_F(HotcacheSegmentTest, openingASegmentReadsNothingOutsideTheHotcache) {
       EXPECT_TRUE(inside) << name << " [" << range.offset << ", +" << range.length << ")";
     }
   }
+}
+
+// Ahead of a materialize, a segment with a hotcache declares the hotcache
+// alone first, then exactly its ranges: never a whole data file.
+TEST_F(HotcacheSegmentTest, aHeldSegmentDeclaresItsHotcacheRanges) {
+  auto cache = writeHotcache();
+  auto held = std::make_unique<HeldFiles>();
+  for (const auto& name : dataFiles) ASSERT_TRUE(held->hold(*dir, name));
+  ASSERT_TRUE(held->hold(*dir, Hotcache::fileName(segStr)));
+  SegmentBase base(segId, epoch, 1500, {}, std::move(held), Metrics::detached(), nullptr);
+
+  ReadSet first;
+  base.declareReads(first);
+  EXPECT_TRUE(first.again);
+  ASSERT_EQ(1u, first.size());
+  EXPECT_EQ((uint64_t)first[0].file->size(), first.bytes());  // the hotcache, whole
+
+  ReadSet second;
+  second.prerequisitesFetched = true;
+  base.declareReads(second);
+  EXPECT_FALSE(second.again);
+  EXPECT_EQ(dataFiles.size(), second.size());
+  uint64_t hotBytes = 0;
+  for (const auto& e : cache.entries) hotBytes += e.range.length;
+  EXPECT_EQ(hotBytes, second.bytes());
+
+  // Read once: a later round declares the ranges at once.
+  ReadSet later;
+  base.declareReads(later);
+  EXPECT_FALSE(later.again);
+  EXPECT_EQ(hotBytes, later.bytes());
+  ASSERT_NE(nullptr, base.get());
+  ReadSet opened;
+  base.declareReads(opened);
+  EXPECT_TRUE(opened.empty());
 }

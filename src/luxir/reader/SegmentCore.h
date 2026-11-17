@@ -9,6 +9,7 @@
 #include <mutex>
 #include <span>
 #include "luxir/store/Directory.h"
+#include "luxir/store/RangeFetch.h"
 
 namespace luxir {
 class OwnershipShape;
@@ -64,6 +65,17 @@ public:
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
   SegmentCore& operator=(const SegmentCore&) = delete;
+
+  // The regions of physical file `fileNum` that opening the segment reads and
+  // that are known before reading anything: every file's header, and file
+  // 0's tail (segment info, every space's field counts and offsets, and the
+  // field catalogs when they fit in OPEN_TAIL_BYTES). A fetch ahead of the
+  // open declares these for a segment without a hotcache; the open reads
+  // anything else (a larger catalog, the version runs) on demand. Kept beside
+  // initializeFromFiles, which it must follow.
+  static constexpr uint64_t OPEN_HEADER_BYTES = 4096;
+  static constexpr uint64_t OPEN_TAIL_BYTES = 64 * 1024;
+  static std::vector<ByteRange> openReads(uint32_t fileNum, uint64_t fileSize);
 
   std::span<const SpaceDescriptor> spaces() const noexcept { return spaceDescriptors; }
   std::optional<SpaceOrdinal> spaceOrdinal(std::string_view path) const noexcept;
