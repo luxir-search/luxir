@@ -11,7 +11,6 @@
 #include <memory>
 #include <memory_resource>
 #include <mutex>
-#include <oneapi/tbb/task_group.h>
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
@@ -32,6 +31,7 @@
 
 namespace luxir {
 
+class FanoutScope;
 class SearchEngine;
 class SearchResponse;
 class OwnershipRelation;
@@ -120,13 +120,9 @@ private:
   // request pool and tracker, and before releasing their reader pins.
   std::unique_ptr<std::map<std::string, ScopedState, std::less<>>> scopedStates;
 public:
-  oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
+  FanoutScope* tg = nullptr; // optional top-level fan-out scope for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
-  // The engine chose the parallel lane for a max_parallel 0 request, so
-  // transports resume paused production inside the arena, as for -1.
-  bool autoParallel = false;
-  bool parallelLane() const noexcept { return maxParallel == -1 || autoParallel; }
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);
@@ -218,8 +214,8 @@ public:
   /// transport must invoke `resume` exactly once when the connection drains
   /// below its low-water mark (or immediately on error - the producer's next
   /// reply() then observes CANCEL).  Which thread fires it is the transport's
-  /// placement choice (the connection's io shard for default-lane HTTP
-  /// requests, a task-arena worker otherwise); producers must not assume one.
+  /// placement choice (HTTP uses its connection shard except for value 1;
+  /// gRPC uses an arena worker); producers must not assume one.
   /// The default is for transports without flow control: resume immediately.
   virtual void resumeWhenDrained(std::function<void()> resume) { resume(); }
 

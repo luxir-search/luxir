@@ -614,7 +614,7 @@ TEST_F(RangeFilterTest, LonePreparedFilterUnderTopKStaysFlat) {
   MemPool pool;
   Query::Context context(pool, *reader);
   auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
-  Query::Weight::PrepareContext prepareContext{*reader, std::span<DocSet* const>{}, false, nullptr};
+  Query::Weight::PrepareContext prepareContext{*reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto preparedWeight = weight->prepare(prepareContext);
   auto* supplier = preparedWeight->scorerSupplier(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, supplier);
@@ -662,7 +662,7 @@ ScheduleRun scheduleRun(IndexReader& source, Query& query, Schedule schedule,
   auto* weight = query.createWeight(context, flags);
   std::unique_ptr<Query::Weight::PreparedWeight> prepared;
   if (prepare) {
-    Query::Weight::PrepareContext prepareContext{source, std::span<DocSet* const>{}, false, nullptr};
+    Query::Weight::PrepareContext prepareContext{source, std::span<DocSet* const>{}, nullptr, nullptr};
     prepared = weight->prepare(prepareContext);
   }
   for (auto& segment : source.segments()) {

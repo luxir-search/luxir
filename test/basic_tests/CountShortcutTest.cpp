@@ -536,7 +536,7 @@ TEST_P(CountShortcutTest, preparedSourcesKeepCountArms) {
   auto* program = ValueExprParser(options, arena).parse("add(score,1)");
   RescoreQuery rescore(&force, program);
   std::vector<DocSet*> domains(reader->segments().size());
-  Query::Weight::PrepareContext prepare{*reader, domains, false, nullptr};
+  Query::Weight::PrepareContext prepare{*reader, domains, nullptr, nullptr};
   for (Query* query : std::array<Query*, 3>{&force, &constant, &rescore}) {
     auto* weight = query->createWeight(context, 0);
     auto prepared = weight->prepare(prepare);

@@ -18,7 +18,7 @@ class SearchEngine {
   LuxirNode& node;
 
   void submitBody(SearchRequest& req);
-  // Runs submit() on an arena worker; -1's waits stay within the request.
+  // Runs submit() on an arena worker, isolating its waits.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
   RootOp* prepare(SearchRequest& req);
 
@@ -46,18 +46,13 @@ public:
   enum class Receiver { MAY_EXECUTE, OFFLOAD };
 
   // Transport entry point: route the request by max_parallel, then submit().
-  // With Receiver::MAY_EXECUTE, 0 (the default) executes serially inline on
-  // the calling thread (no cross-thread hop at all - the caller eats the
-  // query's latency); -1 also starts on the calling thread, entering the
-  // shared TBB task arena so arena workers parallelize it; 1 enqueues on the
-  // arena and runs serially there, off the calling thread.  With
-  // Receiver::OFFLOAD every request is enqueued on the arena: 0 and 1 run
-  // serially on a worker, -1 starts on a worker and fans out from there.
+  // With MAY_EXECUTE, 0 starts inline and adaptively uses idle cores, -1
+  // publishes every sibling, -2 stays serial inline, and 1 enqueues serial
+  // work on the arena. OFFLOAD enqueues every value on the arena.
   void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver);
 
   // Synchronous execution on the calling thread (dispatch() routes here).
-  // maxParallel: 0 / 1 = single-threaded, -1 = unlimited intra-request
-  // parallelism (task_group), >1 reserved (rejected as a request error).
+  // 0 = adaptive, -1 = every sibling, 1 / -2 = serial.
   void submit(SearchRequest& req, int32_t maxParallel = 0);
   // bool converts to int silently and would flip meaning (false -> 0);
   // force old call sites to say what they mean.

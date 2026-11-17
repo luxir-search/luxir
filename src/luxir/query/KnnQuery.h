@@ -1464,7 +1464,7 @@ public:
       int64_t eligibleExamined = 0;
       VectorSearchRound round = VectorSearchRound::BREADTH;
       auto baseEngine = std::make_unique<CompositeVectorEngine<Groups, Owned>>(std::move(slots), ivfLiveTotal, kDocs,
-            metric, ctx.parallel, query.groups, v2dSpan, intervals, workBySeg);
+            metric, ctx.fanout, query.groups, v2dSpan, intervals, workBySeg);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
@@ -1791,7 +1791,7 @@ public:
       }
       rescoreAndCollapseCandidates<Groups, Owned>(candidateHits, intervals, reader, segInfos, v2dSpan,
           segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
-          selectedLimit, docHits, ctx.parallel, workBySeg, query.groups);
+          selectedLimit, docHits, ctx.fanout, workBySeg, query.groups);
       // If terminal T exceeds the witness floor, k distinct exact seeds
       // already support it. Per-unit skips also have a better exact member.
       // Thus valid intervals must leave k exact units at or above the floor.
@@ -2747,7 +2747,7 @@ public:
       int64_t ivfLiveTotal;
       int64_t kDocs;
       int32_t metric;
-      bool parallel;
+      FanoutScope* fanout;
 
       struct CoarseRun {
         std::vector<faiss::idx_t> listIds;
@@ -2926,11 +2926,11 @@ public:
     public:
       CompositeVectorEngine(std::vector<EngineSlot<Groups, Owned>>&& slots,
                             int64_t ivfLiveTotal, int64_t kDocs, int32_t metric,
-                            bool parallel, const CollapsePlan* groupPlan,
+                            FanoutScope* fanout, const CollapsePlan* groupPlan,
                             std::span<const Binding<Owned>> groupV2d, KnnIntervalCollector<Groups>& intervals,
                             std::span<VectorSearchWork> workBySeg) noexcept
         : intervals(intervals), groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
-          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), parallel(parallel) {}
+          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), fanout(fanout) {}
 
       double coveredFraction() const { return std::min(1.0, allocation.cost); }
       std::vector<size_t> listsProbedBySegment() const {
@@ -3046,11 +3046,11 @@ public:
           // A new cut is a fresh epoch, including DEPTH rounds that exclude
           // the banked hits. Carrying their previous floor would starve it.
           BoundedScanCut<Groups, Owned> cut(request.candidates, groupPlan, groupV2d, request.perKey);
-          bool spawnTasks = parallel && units.size() > 1;
+          bool spawnTasks = fanout && fanout->publishesEvery() && units.size() > 1;
           if (spawnTasks) parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           std::vector<VectorSearchWork> work(units.size());
-          TaskGroupRunner runner;
-          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(), [&](size_t i) {
+          FanoutScope runner = fanout ? fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+          task_group_fanout(spawnTasks ? &runner : nullptr, units.size(), [&](size_t i) {
             return [&, i]() { work[i] = scanUnit(units[i], request, cut); };
           });
           runner.join();
@@ -3314,7 +3314,7 @@ private:
                                            const float* queryPtr, int32_t dims, int32_t metric,
                                            bool normalizeColumnOnCosineRescore,
                                            int64_t kDocs, std::vector<DocHit>& docHits,
-                                           bool parallel, std::span<VectorSearchWork> workBySeg,
+                                           FanoutScope* fanout, std::span<VectorSearchWork> workBySeg,
                                            const CollapsePlan* groupPlan = nullptr) {
     auto rankOrder = [](const VectorEngineHit& a, const VectorEngineHit& b) {
       return a.segOrd != b.segOrd ? a.segOrd < b.segOrd : a.valueRank < b.valueRank;
@@ -3430,12 +3430,12 @@ private:
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
       for (size_t i = 0; i < buckets.size(); i++) {
-        if (parallel && ((int64_t)(buckets[i].second - buckets[i].first) >= rescoreTaskGrainCandidates
+        if (fanout && fanout->publishesEvery() && ((int64_t)(buckets[i].second - buckets[i].first) >= rescoreTaskGrainCandidates
                          || i + 1 == buckets.size())) tasks.push_back(i);
         else local.push_back(i);
       }
-      TaskGroupRunner runner;
-      task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(),
+      FanoutScope runner = fanout ? fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+      task_group_fanout(tasks.size() > 1 ? &runner : nullptr, tasks.size(),
                        [&](size_t i) { return readBucket(tasks[i]); });
       for (size_t i : local) readBucket(i)();
       runner.join();

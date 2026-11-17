@@ -73,7 +73,7 @@ public:
     std::vector<luxir::segdoc> ranked;
     std::vector<int64_t> ranks;
     std::vector<luxir::DomainHandle> domains;
-    oneapi::tbb::task_group* taskGroup = nullptr;
+    luxir::FanoutScope* taskGroup = nullptr;
 
     Calc(SampleDocsOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
          const luxir::StructuralConstraint* structural)
@@ -92,7 +92,7 @@ public:
       return luxir::api::build::opsSlot(docList.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, luxir::DomainHandle domain) override {
+    void calc(luxir::FanoutScope* tg, int32_t segnum, luxir::DomainHandle domain) override {
       if (segnum < 0) {
         finish(tg);
         return;
@@ -115,7 +115,7 @@ public:
       if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) finish(taskGroup);
     }
 
-    void finish(oneapi::tbb::task_group* tg) {
+    void finish(luxir::FanoutScope* tg) {
       std::vector<std::pair<size_t, luxir::segdoc>> hits;
       for (size_t s = 0; s < found.size(); s++) {
         for (auto [i, doc] : found[s]) hits.emplace_back(i, luxir::segdoc((int32_t)s, doc));

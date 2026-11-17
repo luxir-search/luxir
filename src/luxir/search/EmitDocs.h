@@ -71,7 +71,7 @@ void addFieldLoader(FieldLoaders* loaders, SegmentRuns runs, F body) {
   else for (auto run : runs) body(run);
 }
 
-inline void loadFields(oneapi::tbb::task_group* tg, FieldLoaders& loaders, SegmentRuns runs) {
+inline void loadFields(FanoutScope* tg, FieldLoaders& loaders, SegmentRuns runs) {
   task_group_fanout(tg, loaders.size() * runs.size(), [&](size_t i) {
     size_t loader = i / runs.size();
     auto run = runs[i % runs.size()];
@@ -1013,9 +1013,21 @@ struct DocBatchScratch {
   std::vector<uint32_t> rowCaps;
 };
 
+// A scope's configuration. Emitters snapshot it because the request scope
+// ends before a paused emitter resumes.
+struct DocLoadFanout {
+  oneapi::tbb::task_arena* arena = nullptr;
+  std::optional<FanoutPolicy> policy;
+
+  DocLoadFanout() = default;
+  explicit DocLoadFanout(FanoutScope* scope)
+      : arena(scope ? scope->getArena() : nullptr),
+        policy(scope ? std::optional(scope->getPolicy()) : std::nullopt) {}
+};
+
 struct DocBatchOptions {
   uint64_t flags;
-  bool parallel;
+  DocLoadFanout fanout;
   api::DocFormat placement;
   size_t colCap;
   int64_t start;
@@ -1032,7 +1044,7 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
                    DocBatchOptions options, GetScore&& getScore, DocBatchScratch& scratch) {
   auto& [columnFields, columnPresent, columnFate, rowCaps] = scratch;
   auto flags = options.flags;
-  auto parallel = options.parallel;
+  auto fanout = options.fanout;
   auto placement = options.placement;
   auto colCap = options.colCap;
   auto batchStart = options.start;
@@ -1045,17 +1057,6 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   auto& mr = memory;
   auto& req = response.req;
   int columnSize = (int)segDocs.size();
-  // An isolated context: cancellation of the request group, or of whatever
-  // context a resumed emitter runs in, must not skip loaders and leave a
-  // batch's columns unfilled. Only a loader's own exception ends the wait.
-  std::optional<oneapi::tbb::task_group_context> loadColumnsContext;
-  std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
-  oneapi::tbb::task_group* tg = nullptr;
-  if (parallel) {
-    auto& context = loadColumnsContext.emplace(oneapi::tbb::task_group_context::isolated);
-    tg = &loadColumnsTaskGroup.emplace(context);
-  }
-
   bool returnScores = options.scores;
 
   // indirect sort the documents so we can access them in order of both segment and docid
@@ -1103,7 +1104,7 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   std::vector<RowIndex> fittedIdx;
   std::vector<std::span<RowIndex>> fittedRuns;
   FieldLoaders loaders;
-  auto* pendingLoaders = tg ? &loaders : nullptr;
+  auto* pendingLoaders = fanout.policy ? &loaders : nullptr;
 
   std::optional<RequestMemResource> rowMemory;
   std::map<const AncestorRows*, std::pmr::vector<segdoc>> ancestorDocs;
@@ -1119,18 +1120,11 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
     return found->second;
   };
 
-  // Cancel and drain before unwinding destroys loader captures. This guard
-  // follows the batch storage and loaders so it is destroyed first.
-  // Disarmed after each wait below.
-  struct TgJoinGuard {
-    oneapi::tbb::task_group* tg;
-    ~TgJoinGuard() {
-      if (tg) {
-        tg->cancel();
-        try { tg->wait(); } catch (...) {}
-      }
-    }
-  } tgJoin{tg};
+  // Destroy the scope before loader captures. Its own cancellation domain
+  // keeps request/sibling cancellation from leaving batch columns unfilled.
+  std::optional<FanoutScope> loadScope;
+  FanoutScope* tg = nullptr;
+  if (fanout.policy) tg = &loadScope.emplace(fanout.arena, *fanout.policy, true);
 
   // Response column i comes from columnFields[i]: fields add the first
   // columns, _score_ the last.
@@ -1301,9 +1295,8 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   loadFields(tg, loaders, runs);
   if (tg != nullptr) {
     Signal::emit("emitDocsColumnsWait", &req, tg);
-    tg->wait();
+    tg->join();
   }
-  tgJoin.tg = nullptr;  // joined normally
 
   // A column value of PackedTerm::MIN_FITTED_LEN bytes or more may be a
   // term fitted to the term space rather than the source (or a genuine
@@ -1332,14 +1325,12 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
       start = end;
     }
     if (fittedIdx.empty()) continue;
-    tgJoin.tg = tg;
     loadStoredFields(req, sourceReader, group.infos, std::move(reqs), sourceDocs, fittedRuns, pendingLoaders, mr, flags);
     loadFields(tg, loaders, fittedRuns);
     if (tg != nullptr) {
       Signal::emit("emitDocsStoredWait", &req, tg);
-      tg->wait();
+      tg->join();
     }
-    tgJoin.tg = nullptr;
   }
 
   // All slots are loaded; pick each single-valued column's exact
@@ -1420,9 +1411,8 @@ public:
   // column; placeBatchColumns settles each batch's placement.  The synthetic
   // _score_ is written per row under ROWS and is a column otherwise.
   luxir::api::DocFormat placement;
-  // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
-  // dangle by the time a resumed emitter runs.
-  bool parallel;
+  // Snapshot the configuration, since the request scope ends before resume.
+  DocLoadFanout fanout;
   size_t colCap;  // response columns map capacity (fields + _score_)
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
   bool fieldMetadataResolved = false;
@@ -1432,14 +1422,14 @@ public:
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
-                 bool getScores, luxir::api::DocFormat placement, bool parallel, size_t colCap,
+                 bool getScores, luxir::api::DocFormat placement, FanoutScope* fanout, size_t colCap,
                  DocBatchMetadata metadata)
       : req(req), reader(reader), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
         foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
         placement(placement),
-        parallel(parallel), colCap(colCap),
+        fanout(fanout), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
@@ -1530,7 +1520,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     if (metadata) metadata(docListProto, batchStart, batchEnd, mr);
 
     loadDocuments(response, reader, segDocs, fields, docListProto, mr,
-                  {flags, parallel, placement, colCap, batchStart, getScores}, getScore, scratch);
+                  {flags, fanout, placement, colCap, batchStart, getScores}, getScore, scratch);
 
     batchStart = batchEnd;
     if (!lastResponse) {
@@ -1800,7 +1790,7 @@ void emitDocsResponse(SearchRequest& req, IndexReader& reader, uint64_t flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      req.tg, colCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();
 }

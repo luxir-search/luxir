@@ -1747,7 +1747,7 @@ TEST_F(KnnBooleanDomainTest, extractedLeafSharesRequestMaterialization) {
     Query::Context context(pool, reader);
     auto* weight = query.createWeight(context, Query::NEED_SCORES);
     SkipStats::reset();
-    Query::Weight::PrepareContext prepare(reader, {}, false, nullptr);
+    Query::Weight::PrepareContext prepare(reader, {}, nullptr, nullptr);
     auto prepared = weight->prepare(prepare);
     std::vector<int> docs;
     for (auto& segment : reader.segments()) {
@@ -2691,7 +2691,7 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
 
 // Parallel mode must reach a kNN nested inside a boolean clause:
 // BooleanQuery::prepare rebuilds the child PrepareContext, and dropping
-// ctx.parallel there would leave hybrid boolean+kNN queries silently
+// ctx.fanout there would leave hybrid boolean+kNN queries silently
 // single-threaded (results are identical either way, so the spawn counter is
 // the only observable).
 TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
@@ -4207,7 +4207,7 @@ TEST_F(KnnQueryTest, filteredFlatWalkMatchesCosineOracle) {
           KnnQuery query(field, type, q, 7, 0, 0, 0, exact);
           auto* weight = query.createWeight(context, Query::NEED_SCORES);
           std::array<DocSet*, 1> domains{domain};
-          Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+          Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
           auto prepared = weight->prepare(prepare);
           auto* scorer = prepared->createScorer(pool, seg);
           std::map<int32_t, float> actual;
@@ -4337,7 +4337,7 @@ TEST_F(KnnQueryTest, emptyVectorDomainSkipsOverlayLoad) {
       auto* weight = query.createWeight(context, Query::NEED_SCORES);
       std::vector<DocSet*> domains(reader->segments().size(), nullptr);
       domains[0] = bits ? (DocSet*)&bitmap : &array;
-      Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+      Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
       int64_t builds = KnnQuery::rankLiveBitmapBuildsForTests.load();
       auto prepared = weight->prepare(prepare);
       EXPECT_EQ(builds, KnnQuery::rankLiveBitmapBuildsForTests.load());
@@ -4388,7 +4388,8 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
                          0, segments * 16, 0, !approximate);
           auto* weight = query.createWeight(context, Query::NEED_SCORES);
           std::vector<DocSet*> domains(segments, nullptr);
-          Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
+          FanoutScope fanout(nullptr, FanoutPolicy::EVERY);
+          Query::Weight::PrepareContext prepare(*reader, domains, parallel ? &fanout : nullptr, nullptr);
           std::unique_ptr<Query::Weight::PreparedWeight> prepared;
           int64_t spawns;
           {
@@ -4437,7 +4438,8 @@ TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
       KnnQuery query("embedding_v", fieldType, queryVec, 10, 4, 160, 1, false);
       auto* weight = query.createWeight(context, Query::NEED_SCORES);
       std::array<DocSet*, 1> domains{nullptr};
-      Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
+      FanoutScope fanout(nullptr, FanoutPolicy::EVERY);
+      Query::Weight::PrepareContext prepare(*reader, domains, parallel ? &fanout : nullptr, nullptr);
       std::unique_ptr<Query::Weight::PreparedWeight> prepared;
       int64_t spawns;
       {
@@ -4669,7 +4671,7 @@ TEST_F(KnnQueryTest, foldedDomainMatchesResolve) {
           KnnQuery query(field, type, q, 7, 0, ann.codec == api::VectorAnnDef::Codec::PQ ? 8 : 0, 1);
           auto* weight = query.createWeight(context, Query::NEED_SCORES);
           std::array<DocSet*, 1> domains{domain};
-          Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+          Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
           auto prepared = weight->prepare(prepare);
           std::map<int32_t, float> actual;
           auto* scorer = prepared->createScorer(pool, seg);
@@ -5444,7 +5446,7 @@ TEST_F(KnnQueryTest, exactWorkPredictionMatchesExecution) {
         KnnQuery query(field, type, q, 3, 0, 0, 0, true);
         auto* weight = query.createWeight(context, Query::NEED_SCORES);
         std::array<DocSet*, 1> domains{domain};
-        Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+        Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
         auto prepared = weight->prepare(prepare);
         EXPECT_EQ(1, stats.plannedExact);
         for (size_t unit = 0; unit < KnnPlanner::NUM_UNITS; unit++) {
@@ -5494,7 +5496,7 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   EXPECT_GT(0.25 * (domain.card() * vr.numVectors() / vr.docsWithValue()), domain.card());
   KnnQuery query("emb_vs", type, q, 3, 0, 8, 0.25f);
   std::array<DocSet*, 1> domains{&domain};
-  Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+  Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
   int64_t walks = KnnQuery::domainWalksForTests.load();
   for (int run = 1; run <= 2; run++) {
     rounds.clear();
@@ -5620,7 +5622,7 @@ TEST_F(KnnQueryTest, rankEligibilityUsesRequestMemory) {
     std::vector<float> q{0, 0, 0, 0};
     KnnQuery query("emb_v", type, q, 3, 0, 8, 1);
     std::array<DocSet*, 1> domains{borrowed ? (DocSet*)&bitmap : &array};
-    Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+    Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
     try {
       query.createWeight(*context, Query::NEED_SCORES)->prepare(prepare);
       FAIL() << "expected request memory breaker";

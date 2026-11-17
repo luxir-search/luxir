@@ -390,7 +390,7 @@ void BM_VectorKnnFlatDomain(benchmark::State& state) {
     KnnQuery query(field, type, vector, 10);
     auto* weight = query.createWeight(context, Query::NEED_SCORES);
     std::array<DocSet*, 1> domains{domain};
-    Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+    Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
     auto prepared = weight->prepare(prepare);
     auto* scorer = prepared->createScorer(pool, seg);
     uint64_t fp = 0;

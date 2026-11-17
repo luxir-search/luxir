@@ -198,7 +198,7 @@ TEST_F(NestedQueryTest, maximumBoundsCoverEveryScoreAfterTheChildMoves) {
     tree->validateLogical(*planning);
     auto* context = Query::Context::create(&req->arena, *planning);
     auto* weight = tree->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
-    Query::Weight::PrepareContext preparation{*req->reader, {}, false, nullptr, Query::SupplierExecutionMode::ORDINARY};
+    Query::Weight::PrepareContext preparation{*req->reader, {}, nullptr, nullptr, Query::SupplierExecutionMode::ORDINARY};
     auto prepared = weight->prepare(preparation);
     MemPool pool;
     auto* source = prepared->scorerSupplier(pool, req->reader->segments()[0]);

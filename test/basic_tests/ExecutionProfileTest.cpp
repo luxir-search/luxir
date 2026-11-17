@@ -449,7 +449,7 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
   CollectionHelper helper("profile_reject");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
-  for (int32_t maxParallel : {2, -2}) {
+  for (int32_t maxParallel : {2, -3}) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("profile_reject").facet("cats", "cat_s").limit(-1);
     req->execute(maxParallel);
@@ -459,7 +459,7 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
   }
 }
 
-TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
+TEST_F(ExecutionProfileTest, maxParallelMinusTwoRunsInlineOnCallingThread) {
   CollectionHelper helper("profile_inline");
   std::vector<Doc> docs;
   for (int i = 0; i < 32; i++) {
@@ -469,8 +469,8 @@ TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("profile_inline").profile().facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), 0, SearchEngine::Receiver::MAY_EXECUTE);
-  // 0 (the default) = the calling thread: the whole request completed inside
+  helper.getSearchEngine().dispatch(*req.get(), -2, SearchEngine::Receiver::MAY_EXECUTE);
+  // Serial inline: the whole request completed inside
   // dispatch(), so the response is readable with no wait/synchronization.
   ASSERT_OK(req);
   const auto& pieces = profileOp(*req).pieces;
@@ -525,7 +525,7 @@ TEST_F(ExecutionProfileTest, offloadRunsEveryLaneOffCallingThread) {
     docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
     if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
   }
-  for (int32_t maxParallel : {0, 1, -1}) {
+  for (int32_t maxParallel : {-2, -1, 0, 1}) {
     auto* arena = createArena();
     auto req = LocalReqHandle(
         luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
@@ -540,7 +540,7 @@ TEST_F(ExecutionProfileTest, offloadRunsEveryLaneOffCallingThread) {
   }
 }
 
-TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) {
+TEST_F(ExecutionProfileTest, maxParallelMinusOneRepliesOnCallingThread) {
   CollectionHelper helper("profile_parallel");
   std::vector<Doc> docs;
   for (int i = 0; i < 32; i++) {
@@ -554,12 +554,10 @@ TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) 
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_parallel").facet("cats", "cat_s").limit(-1);
   helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
-  // Completed inside dispatch(), on this thread, inside the (wider than
-  // default) node arena rather than this thread's implicit arena.
+  // Completed inside dispatch(), on this thread. The node arena is entered
+  // only to publish and to join shares, so the reply runs outside it.
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(0)));
   EXPECT_EQ(std::this_thread::get_id(), repliedOn.get());
-  EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(),
-            static_cast<DispatchReq*>(req.get())->replyArenaConcurrency);
   ASSERT_OK(req);
 }
 
@@ -735,7 +733,7 @@ TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
     }
     ASSERT_EQ((size_t)segments,
               helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
-    for (int profile : {0, -1}) {
+    for (int profile : {-2, -1}) {
       for (bool loadFields : {false, true}) {
         for (int64_t offset : {0, 1000}) {
           SCOPED_TRACE(::testing::Message() << segments << " segments, profile=" << profile
@@ -753,7 +751,7 @@ TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
             spawns = counter.count();
           }
           ASSERT_OK(req);
-          int64_t expected = profile == 0 ? 0 : segments - 1;
+          int64_t expected = profile == -2 ? 0 : segments - 1;
           if (profile == -1 && loadFields && offset == 0) expected += segments - 1;
           EXPECT_EQ(expected, spawns);
           ASSERT_NE(nullptr, req->docList());

@@ -163,7 +163,7 @@ public:
           views.push_back(eligibility.back().get());
         }
       }
-      Query::Weight::PrepareContext childContext{source, views, prepareContext.parallel, prepareContext.warnings,
+      Query::Weight::PrepareContext childContext{source, views, prepareContext.fanout, prepareContext.warnings,
           child->consumesDomain() ? Query::SupplierExecutionMode::ORDINARY
               : Query::SupplierExecutionMode::RAW_MEMBERSHIP};
       std::array<Query::Weight*, 1> weights{child};

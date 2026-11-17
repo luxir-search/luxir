@@ -28,7 +28,7 @@ Scores scores(IndexReader& reader, Query& query) {
   MemPool pool;
   Query::Context context(pool, reader);
   auto* weight = query.createWeight(context, Query::NEED_SCORES);
-  Query::Weight::PrepareContext prepareContext{reader, {}, false, nullptr};
+  Query::Weight::PrepareContext prepareContext{reader, {}, nullptr, nullptr};
   auto prepared = weight->needsPrepare() ? weight->prepare(prepareContext) : nullptr;
   Scores result;
   for (auto& segment : reader.segments()) {
