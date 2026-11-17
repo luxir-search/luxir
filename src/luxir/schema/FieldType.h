@@ -100,7 +100,7 @@ public:
     PATTERN = 1u << 3, FUZZY = 1u << 4, FREE_TEXT = 1u << 5,
     TERM_FILTER = 1u << 6, RANGE = 1u << 7, SORT = 1u << 8,
     FIELD_FACET = 1u << 9, RANGE_FACET = 1u << 10,
-    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12
+    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12, RANGE_RELATION = 1u << 13
   };
 
   // Type support only; callers validate indexing and column configuration.
@@ -516,7 +516,8 @@ public:
 // An interval of INT, DOUBLE or DATE endpoints. Each endpoint is stored with
 // its element type's column encoding (raw int64, sortable double bits, epoch
 // millis), so encoded order is value order and both [min, max] and query
-// bounds compare as plain int64. An open end stores the int64 extreme.
+// bounds compare as plain int64. Open double ends store encoded infinities;
+// open long and date ends store the int64 extremes.
 //
 // The segment column is laid out like a multi-valued int column with two
 // values per document (min, max), so merges, deletes and the column scans
@@ -526,13 +527,6 @@ class RangeFieldType : public FieldType {
 public:
   static constexpr uint32_t ELEMENT_FLAGS_SHIFT = 2;
   static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_FLAGS_SHIFT) - 1;
-
-  // Encoded inclusive bounds; lo > hi never escapes encodeBounds.
-  struct Bounds {
-    int64_t lo;
-    int64_t hi;
-    bool unroundedNow = false; // a DATE bound came from unrounded NOW math
-  };
 
   // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
   const std::shared_ptr<FieldType> element;
@@ -549,7 +543,7 @@ public:
   }
 
   FieldType::Type elementType() const { return element->type(); }
-  uint32_t capabilities() const override { return MATCH | RANGE; }
+  uint32_t capabilities() const override { return MATCH | RANGE | RANGE_RELATION; }
   // Low bits encode the element kind (long, double, date); upper bits carry
   // the element's persisted parameters.
   uint32_t segmentTypeFlags() const override {
@@ -564,16 +558,14 @@ public:
   // The schema type name: long_range, double_range or date_range.
   std::string_view typeName() const;
 
-  // Folds {gte|gt, lte|lt} (any may be null for an open side) into inclusive
-  // encoded bounds; an exclusive bound steps one encoded unit. DATE endpoints
-  // round by the granule a literal names, like a DATE range query: gte/gt use
-  // the window start/end and lte/lt the window end/start. Returns nullopt for
-  // an empty interval. Throws on both gte and gt (or lte and lt) and on
-  // uncoercible values.
-  std::optional<Bounds> encodeBounds(const api::Val* gte, const api::Val* gt,
-                                     const api::Val* lte, const api::Val* lt,
-                                     std::string_view fieldName,
-                                     const CoerceContext& context = {}) const;
+  IntWindow domainBounds() const;
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+  IntWindow coerceIngestBound(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context) const;
+
 };
 
 // Unique id field

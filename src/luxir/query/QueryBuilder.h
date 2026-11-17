@@ -35,6 +35,7 @@
 #include "luxir/query/FieldResolver.h"
 #include "luxir/query/ParseView.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
@@ -221,6 +222,14 @@ private:
         : pool.make<NumericPredicateQuery>(field, window.lo, window.hi,
             window.unroundedNow ? FilterKeyScope::REQUEST_STABLE
                                 : FilterKeyScope::SEGMENT_STABLE);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+  }
+
+  Query* createRangeFieldPredicate(std::string_view field, const FieldType::IntWindow& window,
+      RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS, float boost = 1.0f) {
+    Query* query = window.empty() ? matchNoDocs()
+        : pool.make<RangeFieldQuery>(field, relation, window.lo, window.hi,
+            window.unroundedNow ? FilterKeyScope::REQUEST_STABLE : FilterKeyScope::SEGMENT_STABLE);
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
@@ -947,7 +956,9 @@ public:
     if (fieldType.type() == FieldType::INTERVAL) {
       // Exact match on a range field: the intervals containing the value.
       if (coerce::isNull(val)) return matchNoDocs();
-      return createRangeQuery(target, &val, nullptr, &val, nullptr);
+      requireNumericColumn(target);
+      return createRangeFieldPredicate(field, coerceIntWindow(target, val, FieldType::LiteralUse::MATCH),
+          RangeFieldQuery::Relation::INTERSECTS, boost);
     }
     if (FieldType::isNumericColumn(fieldType.type())) {
       if (coerce::isNull(val)) return matchNoDocs();
@@ -980,7 +991,7 @@ private:
   Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
                              Operator op, int minMatch, float weight) {
     FieldType& type = *target.fieldType;
-    if (FieldType::isNumericColumn(type.type())) {
+    if (FieldType::isNumericColumn(type.type()) || type.supports(FieldType::RANGE_RELATION)) {
       type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
       requireNumericColumn(target);
       api::Val value;
@@ -989,6 +1000,10 @@ private:
                                              target.physicalName, coerceContext);
       if (!window) return nullptr;
       warnSkippedGranule(target, value, *window);
+      if (type.supports(FieldType::RANGE_RELATION)) {
+        return createRangeFieldPredicate(poolCopy(target.physicalName), *window,
+            RangeFieldQuery::Relation::INTERSECTS, weight);
+      }
       return createNumericPredicate(poolCopy(target.physicalName), *window, weight);
     }
     type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
@@ -1197,31 +1212,17 @@ public:
                           RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    if (fieldType.type() == FieldType::INTERVAL) {
-      auto bounds = ((RangeFieldType&)fieldType).encodeBounds(gte, gt, lte, lt, field, coerceContext);
-      if (!bounds) return matchNoDocs();
-      return pool.make<RangeFieldQuery>(field, relation, bounds->lo, bounds->hi,
-          bounds->unroundedNow ? FilterKeyScope::REQUEST_STABLE
-                               : FilterKeyScope::SEGMENT_STABLE);
-    }
-    if (relation != RangeFieldQuery::Relation::INTERSECTS) {
+    if (relation != RangeFieldQuery::Relation::INTERSECTS && !fieldType.supports(FieldType::RANGE_RELATION)) {
       throw std::runtime_error(std::format(
           "Range query relation applies only to range fields; '{}' is not one", field));
     }
     fieldType.requireCapability(FieldType::RANGE, "Range query", field);
-    bool numeric = FieldType::isNumericColumn(fieldType.type());
+    bool interval = fieldType.supports(FieldType::RANGE_RELATION);
+    bool numeric = FieldType::isNumericColumn(fieldType.type()) || interval;
     if (numeric) requireNumericColumn(target);
-
-    bool hasGte = gte && !coerce::isNull(*gte);
-    bool hasGt  = gt  && !coerce::isNull(*gt);
-    bool hasLte = lte && !coerce::isNull(*lte);
-    bool hasLt  = lt  && !coerce::isNull(*lt);
-    if (hasGte && hasGt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both gte and gt", field));
-    }
-    if (hasLte && hasLt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both lte and lt", field));
-    }
+    auto bounds = rangeBoundLiterals(gte, gt, lte, lt, field);
+    bool hasGte = bounds[0] != nullptr, hasGt = bounds[1] != nullptr;
+    bool hasLte = bounds[2] != nullptr, hasLt = bounds[3] != nullptr;
 
     if (!numeric) {
       auto termBound = [&](const api::Val& v) -> std::string_view {
@@ -1236,19 +1237,10 @@ public:
       return pool.make<TermRangeQuery>(field, lower, hasGte, upper, hasLte);
     }
 
-    // Coerce both bounds before testing emptiness: a malformed upper bound
-    // must still fail when the lower bound already admits no values.
-    FieldType::IntWindow window;
-    auto intersect = [&](const FieldType::IntWindow& bound) {
-      window.lo = std::max(window.lo, bound.lo);
-      window.hi = std::min(window.hi, bound.hi);
-      window.unroundedNow |= bound.unroundedNow;
-    };
-    if (hasGte) intersect(coerceIntWindow(target, *gte, FieldType::LiteralUse::GTE));
-    if (hasGt)  intersect(coerceIntWindow(target, *gt, FieldType::LiteralUse::GT));
-    if (hasLte) intersect(coerceIntWindow(target, *lte, FieldType::LiteralUse::LTE));
-    if (hasLt)  intersect(coerceIntWindow(target, *lt, FieldType::LiteralUse::LT));
-    return createNumericPredicate(field, window);
+    auto domain = interval ? ((RangeFieldType&)fieldType).domainBounds() : FieldType::IntWindow{};
+    auto window = foldRangeBounds(bounds, domain,
+        [&](const api::Val& value, FieldType::LiteralUse use) { return coerceIntWindow(target, value, use); });
+    return interval ? createRangeFieldPredicate(field, window, relation) : createNumericPredicate(field, window);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

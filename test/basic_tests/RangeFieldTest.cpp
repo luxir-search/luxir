@@ -6,12 +6,16 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "luxir/api/build.h"
 #include "luxir/query/RangeFieldQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/schema/RangeBounds.h"
+#include "luxir/server/JsonRequest.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -91,6 +95,13 @@ public:
     for (const Doc& doc : req->getDocs()) out.push_back(std::get<std::string>(*find(doc, "id")));
     std::sort(out.begin(), out.end());
     return out;
+  }
+
+  auto request(std::string_view json) {
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->execute();
+    return req;
   }
 
   // The same range query over both fields; the results must agree.
@@ -321,4 +332,312 @@ TEST_F(RangeFieldTest, elementTypeFlagsAndSignatures) {
   field.type = FieldClass::DATE_RANGE;
   field.unit = api::FieldDef::DateUnit::NS;
   EXPECT_ANY_THROW(schema.set(helper.collection()));
+}
+
+TEST_F(RangeFieldTest, sharedBoundFolding) {
+  auto schema = helper.collection().getSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto zero = coerce::scalarVal((int64_t)0);
+  auto max = coerce::scalarVal(INT64_MAX);
+  auto bad = coerce::scalarVal(std::string_view("bad"));
+  for (auto field : {"bkd", "number_i"}) {
+    SCOPED_TRACE(field);
+    // Empty lower bounds must not hide a malformed upper bound.
+    try {
+      builder.createRangeQuery(field, nullptr, &max, &bad, nullptr);
+      FAIL() << "accepted a malformed upper bound";
+    } catch (const RequestError& e) {
+      EXPECT_EQ("invalid_value", e.code);
+      EXPECT_NE(std::string::npos, std::string(e.what()).find(field));
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("bound 'lte'"));
+    }
+    for (bool lower : {true, false}) {
+      try {
+        builder.createRangeQuery(field, lower ? &zero : nullptr, lower ? &max : nullptr,
+                                 lower ? nullptr : &zero, lower ? nullptr : &max);
+        FAIL() << "accepted conflicting bounds";
+      } catch (const RequestError& e) {
+        EXPECT_EQ("invalid_value", e.code);
+        EXPECT_EQ(fmt::format("Range on '{}' sets both {}", field,
+                             lower ? "gte and gt" : "lte and lt"), e.what());
+      }
+    }
+  }
+  try {
+    builder.createRangeQuery("location_p", &zero, nullptr, nullptr, nullptr);
+    FAIL() << "accepted a range query on geo_point";
+  } catch (const RequestError& e) {
+    EXPECT_EQ("invalid_request", e.code);
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("not supported"));
+  }
+  ResolvedFieldHandle branch{};
+  branch.logicalName = "logical";
+  branch.physicalName = "logical__range";
+  branch.fieldType = schema->getFieldTypePtr("bkd");
+  try {
+    builder.createRangeQuery(branch, &bad, nullptr, nullptr, nullptr);
+    FAIL() << "accepted a malformed branch bound";
+  } catch (const RequestError& e) {
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("'logical__range'"));
+    EXPECT_EQ(std::string::npos, std::string(e.what()).find("'logical'"));
+  }
+}
+
+TEST_F(RangeFieldTest, strictIngestAndPermissiveQueries) {
+  auto rejected = indexJson({
+    R"({"id":"fraction","bkd":{"gte":1.5}})",
+    R"({"id":"overflow","bkd":{"lte":"9223372036854775808"}})",
+    R"({"id":"underflow","bkd":{"gt":"-9223372036854775809"}})",
+    R"({"id":"date","when":{"lt":9223372036854775807}})",
+    R"({"id":"empty","bkd":{"gt":9223372036854775807}})",
+    R"({"id":"inverted","bkd":{"gte":3,"lte":2}})",
+  });
+  EXPECT_EQ(6, rejected.total_errors);
+  ASSERT_GE(rejected.errors.size(), 4u);
+  EXPECT_NE(std::string::npos, rejected.errors[0].error_message.find("bkd"));
+  EXPECT_NE(std::string::npos, rejected.errors[0].error_message.find("gte"));
+  EXPECT_NE(std::string::npos, rejected.errors[3].error_message.find("lt"));
+  ASSERT_TRUE(indexJson({R"({"id":"ok","bkd":{"gte":2,"lte":4},"col":{"gte":2,"lte":4}})"}).success);
+  EXPECT_EQ((Ids{"ok"}), both(R"("gte":1.5,"lte":4.9)"));
+  EXPECT_EQ((Ids{"ok"}), both(R"("gte":"-9223372036854775809","lte":"9223372036854775808")"));
+  EXPECT_TRUE(both(R"("gt":9223372036854775807)").empty());
+  EXPECT_TRUE(ids(R"({"match":{"field":"bkd","val":2.5}})").empty());
+  EXPECT_TRUE(ids(R"({"multi_match":{"text":"2.5","fields":["bkd"]}})").empty());
+}
+
+TEST_F(RangeFieldTest, doubleDomainAndSignedZero) {
+  SchemaBuilder indexed;
+  auto& price = indexed.field("price");
+  price.type = FieldClass::DOUBLE_RANGE;
+  price.index = IndexMode::RANGE;
+  indexed.set(helper.collection());
+  ASSERT_TRUE(indexJson({
+    R"({"id":"open","price":{}})",
+    R"({"id":"infinity","price":{"gte":"-Infinity","lte":"Infinity"}})",
+    R"({"id":"negative","price":{"gte":-0.0,"lte":-0.0}})",
+    R"({"id":"positive","price":{"gte":0.0,"lte":0.0}})",
+  }).success);
+  for (auto relation : {"intersects", "contains", "within"}) {
+    auto open = ids(fmt::format(R"({{"range":{{"field":"price","relation":"{}"}}}})", relation));
+    auto explicitEnds = ids(fmt::format(R"({{"range":{{"field":"price","gte":"-Infinity","lte":"Infinity","relation":"{}"}}}})", relation));
+    EXPECT_EQ(open, explicitEnds);
+    EXPECT_NE(open.end(), std::ranges::find(open, std::string("open")));
+    EXPECT_NE(open.end(), std::ranges::find(open, std::string("infinity")));
+  }
+  EXPECT_EQ((Ids{"infinity", "negative", "open"}), ids(R"({"range":{"field":"price","gte":-0.0,"lte":-0.0}})"));
+  EXPECT_EQ((Ids{"infinity", "open", "positive"}), ids(R"({"range":{"field":"price","gte":0.0,"lte":0.0}})"));
+  EXPECT_EQ((Ids{"infinity", "open", "positive"}), ids(R"({"range":{"field":"price","gt":-0.0,"lte":0.0}})"));
+  EXPECT_EQ((Ids{"infinity", "negative", "open"}), ids(R"({"range":{"field":"price","gte":-0.0,"lt":0.0}})"));
+  for (auto bounds : {R"("gt":"Infinity")", R"("lt":"-Infinity")"}) {
+    EXPECT_TRUE(ids(fmt::format(R"({{"range":{{"field":"price",{}}}}})", bounds)).empty());
+    EXPECT_EQ(1, indexJson({fmt::format(R"({{"id":"bad","price":{{{}}}}})", bounds)}).total_errors);
+  }
+  for (auto bound : {"gte", "gt", "lte", "lt"}) {
+    auto json = fmt::format(R"({{"id":"nan","price":{{"{}":"NaN"}}}})", bound);
+    EXPECT_EQ(1, indexJson({json}).total_errors);
+    auto query = request(fmt::format(R"({{"query":{{"range":{{"field":"price","{}":"NaN"}}}}}})", bound));
+    EXPECT_FALSE(query->ok());
+  }
+  RangeFieldType type("price", FieldType::DOUBLE);
+  auto nan = coerce::scalarVal(std::numeric_limits<double>::quiet_NaN());
+  EXPECT_THROW(type.coerceIntWindow(nan, FieldType::LiteralUse::GTE, "price"), RequestError);
+  EXPECT_THROW(type.coerceIngestBound(nan, FieldType::LiteralUse::LTE, "price", {}), RequestError);
+}
+
+TEST_F(RangeFieldTest, dateGranulesTimeZonesAndNow) {
+  ASSERT_TRUE(indexJson({
+    R"({"id":"june","when":{"gte":"2024-06","lte":"2024-06"}})",
+    R"({"id":"apia","when":{"gte":"2011-12-30T10:00:00Z","lte":"2011-12-31T09:59:59.999Z"}})",
+    R"({"id":"now","when":{"gte":"now","lte":"now"}})",
+  }).success);
+  EXPECT_EQ((Ids{"june"}), ids(R"({"range":{"field":"when","gte":"2024-06-01T00:00:00Z","lte":"2024-06-30T23:59:59.999Z","relation":"within"}})"));
+  auto skipped = localReq(helper.getSearchEngine());
+  auto& cursor = skipped->collection("main").timeZone("Pacific/Apia").topDocs("q");
+  ASSERT_TRUE(api::read_json(cursor.rawQuery(), R"({"range":{"field":"when","gte":"2011-12-30","lte":"2011-12-30"}})", cursor.mr()));
+  cursor.withStats();
+  skipped->execute();
+  ASSERT_TRUE(skipped->ok()) << skipped->errorMsg();
+  EXPECT_EQ(1, skipped->getMatchCount());
+  EXPECT_TRUE(skipped->hasWarning("date_granule_skipped"));
+
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  QueryBuilder builder(pool, *schema, CoerceContext{JAN_1, TimeZone::utc()});
+  for (auto text : {"now", "now/DAY"}) {
+    auto now = coerce::scalarVal(std::string_view(text));
+    auto* query = dynamic_cast<RangeFieldQuery*>(builder.createRangeQuery("when", &now, nullptr, &now, nullptr));
+    ASSERT_NE(nullptr, query);
+    FilterKeyBuilder key;
+    EXPECT_EQ(std::string_view(text) == "now" ? FilterKeyScope::REQUEST_STABLE : FilterKeyScope::SEGMENT_STABLE,
+              query->appendFilterKey(key, FilterKeyContext{}));
+  }
+  RangeFieldType date("when", FieldType::DATE);
+  auto beyond = coerce::scalarVal(datetime_detail::kMaxEpochMs + 1);
+  EXPECT_THROW(date.coerceIngestBound(beyond, FieldType::LiteralUse::LT, "when", {}), RequestError);
+  auto minimum = coerce::scalarVal(datetime_detail::kMinEpochMs - 1);
+  EXPECT_THROW(date.coerceIngestBound(minimum, FieldType::LiteralUse::GT, "when", {}), RequestError);
+  auto last = coerce::scalarVal(datetime_detail::kMaxEpochMs);
+  auto first = coerce::scalarVal(datetime_detail::kMinEpochMs);
+  EXPECT_TRUE(date.coerceIngestBound(last, FieldType::LiteralUse::GT, "when", {}).empty());
+  EXPECT_TRUE(date.coerceIngestBound(first, FieldType::LiteralUse::LT, "when", {}).empty());
+}
+
+TEST_F(RangeFieldTest, dateOutputModesAndReingest) {
+  ASSERT_TRUE(indexJson({
+    R"({"id":"canonical","when":{"gte":"2024-01-01T00:00:00Z","lt":"2024-02-01"},"bkd":{"gte":2,"lte":4},"price":{"gte":-0.0,"lte":1.5}})",
+    R"({"id":"open","when":{"gte":"2024-01-01"},"bkd":{},"price":{"gte":"-Infinity","lte":"Infinity"}})",
+  }).success);
+  for (auto format : {"rows", "columns"}) for (auto mode : {"date_native", "date_iso", "date_ms", "date_ns"}) {
+    SCOPED_TRACE(fmt::format("{} {}", format, mode));
+    auto json = fmt::format(R"({{"flags":["{}"],"query":"*:*","fields":["id","when","bkd","price"],"sort":"id asc","document_format":"{}","limit":-1}})", mode, format);
+    auto req = request(json);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto* list = req->docList();
+    ASSERT_NE(nullptr, list);
+    auto bound = [&](size_t row, std::string_view field, std::string_view key) -> const api::Val* {
+      const api::Val* value;
+      if (std::string_view(format) == "rows") value = &**list->docs[row].fields.find(field);
+      else value = &std::get<api::ColVal>(list->columns.at(field).kind).v[row];
+      auto* found = std::get<api::Map>(value->kind).fields.find(key);
+      return found ? &**found : nullptr;
+    };
+    ASSERT_NE(nullptr, bound(0, "when", "gte"));
+    if (std::string_view(mode) == "date_iso") {
+      EXPECT_EQ("2024-01-01T00:00:00.000Z", std::get<std::string_view>(bound(0, "when", "gte")->kind));
+    } else {
+      int64_t scale = std::string_view(mode) == "date_ns" ? 1000000 : 1;
+      EXPECT_EQ(JAN_1 * scale, bound(0, "when", "gte")->asInt());
+      EXPECT_EQ((FEB_1 - 1) * scale, bound(0, "when", "lte")->asInt());
+    }
+    EXPECT_EQ(nullptr, bound(1, "when", "lte"));
+    EXPECT_EQ(nullptr, bound(1, "price", "gte"));
+    EXPECT_EQ(nullptr, bound(1, "price", "lte"));
+    EXPECT_EQ(nullptr, bound(1, "bkd", "gte"));
+    // Native and ISO endpoint values can be sent back without an input-unit override.
+    if (std::string_view(format) == "rows" && std::string_view(mode) != "date_ns") {
+      CollectionHelper::UpdateBuilder copies;
+      for (const auto& row : list->docs) copies.addRaw([&row](api::Map& doc, auto&) { doc = row; });
+      copies.commit();
+      ASSERT_TRUE(helper.submit(copies).success);
+      auto returned = request(json);
+      ASSERT_TRUE(returned->ok()) << returned->errorMsg();
+      std::string before, after;
+      ASSERT_TRUE(api::write_json(*list, before));
+      ASSERT_TRUE(api::write_json(*returned->docList(), after));
+      EXPECT_EQ(before, after);
+      EXPECT_EQ((Ids{"canonical"}), ids(R"({"range":{"field":"when","gte":"2024-01","lte":"2024-01","relation":"within"}})"));
+      EXPECT_EQ((Ids{"canonical"}), ids(R"({"range":{"field":"bkd","gte":2,"lte":4,"relation":"within"}})"));
+    }
+  }
+}
+
+TEST_F(RangeFieldTest, matchBoostMultiMatchAndParsers) {
+  indexAllDocs();
+  for (auto field : {"bkd", "col"}) {
+    for (auto query : {
+      fmt::format(R"({{"match":{{"field":"{}","val":17}}}})", field),
+      fmt::format(R"({{"expr":"{}:17"}})", field),
+      fmt::format(R"({{"simple_query":{{"q":"{}:17","fields":["id"]}}}})", field),
+      fmt::format(R"({{"simple_query":{{"q":"{}:\"17\"","fields":["id"]}}}})", field)}) {
+      EXPECT_EQ((Ids{"a", "b"}), ids(query));
+    }
+  }
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto* boosted = dynamic_cast<BoostQuery*>(builder.createMatchQuery("bkd", coerce::scalarVal((int64_t)17),
+      QueryBuilder::Operator::OR, 0, 3.0f));
+  ASSERT_NE(nullptr, boosted);
+  EXPECT_FLOAT_EQ(3, boosted->getBoost());
+  EXPECT_EQ(QueryKind::RANGE_FIELD, boosted->getChild()->getKind());
+  for (auto mode : {"combined", "per_field"}) {
+    EXPECT_TRUE(ids(fmt::format(R"({{"multi_match":{{"text":"17","fields":["*"],"mode":"{}"}}}})", mode)).empty());
+    for (auto fields : {R"([{"field":"bkd","weight":3}])", R"([{"field":"col","weight":3}])",
+                        R"([{"field":"*"},{"field":"bkd","weight":3}])"}) {
+      auto req = request(fmt::format(R"({{"query":{{"multi_match":{{"text":"17","fields":{},"mode":"{}"}}}},"get_scores":true,"fields":["id"],"limit":-1}})", fields, mode));
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ(2u, req->getDocs().size());
+      for (float score : std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v) EXPECT_FLOAT_EQ(3, score);
+    }
+    EXPECT_EQ((Ids{"a"}), ids(fmt::format(R"({{"multi_match":{{"text":"a","fields":["bkd","id"],"mode":"{}"}}}})", mode)));
+  }
+  auto invalid = request(R"({"query":{"match":{"field":"bkd","val":"bad"}}})");
+  EXPECT_FALSE(invalid->ok());
+}
+
+TEST_F(RangeFieldTest, boundDiagnostics) {
+  auto rejected = indexJson({R"({"id":"fraction","bkd":{"gte":1.5}})"});
+  ASSERT_EQ(1u, rejected.errors.size());
+  EXPECT_EQ("Field 'bkd' branch 'self': field 'bkd': cannot coerce 1.5 to an integer "
+            "(value is not integral) (bound 'gte')", rejected.errors[0].error_message);
+  auto schema = helper.collection().getSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto bad = coerce::scalarVal(std::string_view("bad"));
+  for (auto field : {"number_i", "bkd"}) {
+    auto* element = field == std::string_view("bkd")
+        ? ((RangeFieldType*)schema->getFieldTypePtr(field))->element.get() : schema->getFieldTypePtr(field);
+    std::string before = fmt::format("field '{}': cannot coerce 'bad' to an integer range bound", field);
+    try {
+      element->coerceIntWindow(bad, FieldType::LiteralUse::LTE, field);
+      FAIL() << "accepted an invalid element bound";
+    } catch (const RequestError& e) {
+      EXPECT_EQ(before, e.what());
+    }
+    try {
+      builder.createRangeQuery(field, nullptr, nullptr, &bad, nullptr);
+      FAIL() << "accepted an invalid query bound";
+    } catch (const RequestError& e) {
+      EXPECT_EQ(before + " (bound 'lte')", e.what());
+      EXPECT_EQ("invalid_value", e.code);
+    }
+  }
+}
+
+TEST_F(RangeFieldTest, tryCoercionMatchesElements) {
+  using Use = FieldType::LiteralUse;
+  RangeFieldType range("range", FieldType::DOUBLE);
+  DoubleFieldType scalar("scalar");
+  auto domain = range.domainBounds();
+  const api::Val literals[] = {
+    coerce::scalarVal((int64_t)17), coerce::scalarVal(1.5), coerce::scalarVal(-0.0),
+    coerce::scalarVal(0.0f), coerce::scalarVal(std::numeric_limits<double>::infinity()),
+    coerce::scalarVal(-std::numeric_limits<double>::infinity()),
+    coerce::scalarVal(std::numeric_limits<double>::quiet_NaN()),
+    coerce::scalarVal(std::string_view("Infinity")), coerce::scalarVal(std::string_view("-Infinity")),
+    coerce::scalarVal(std::string_view("NaN")), coerce::scalarVal(std::string_view("17")),
+    coerce::scalarVal(std::string_view("1.5")), coerce::scalarVal(std::string_view("-0")),
+    coerce::scalarVal(std::string_view("1e3")), coerce::scalarVal(std::string_view("bad")),
+    coerce::scalarVal(true), api::Val{}, api::Val{.kind = api::Map{}}
+  };
+  for (const auto& value : literals) {
+    SCOPED_TRACE(coerce::describe(value));
+    auto encoded = scalar.tryCoerceColInt64(value, "scalar");
+    bool accepted = encoded && domain.lo <= *encoded && *encoded <= domain.hi;
+    for (auto use : {Use::GTE, Use::GT, Use::LTE, Use::LT}) {
+      auto window = range.tryCoerceIntWindow(value, use, "range");
+      ASSERT_EQ(accepted, window.has_value());
+      if (!accepted) {
+        EXPECT_THROW(range.coerceIntWindow(value, use, "range"), RequestError);
+        continue;
+      }
+      auto expected = scalar.coerceIntWindow(value, use, "scalar");
+      expected.lo = std::max(expected.lo, domain.lo);
+      expected.hi = std::min(expected.hi, domain.hi);
+      EXPECT_EQ(expected.empty(), window->empty());
+      if (!expected.empty()) {
+        EXPECT_EQ(expected.lo, window->lo);
+        EXPECT_EQ(expected.hi, window->hi);
+      }
+    }
+  }
+  for (auto type : {FieldType::INT, FieldType::DATE}) {
+    RangeFieldType other("other", type);
+    auto bad = coerce::scalarVal(std::string_view("bad"));
+    for (auto use : {Use::MATCH, Use::GTE, Use::GT, Use::LTE, Use::LT}) {
+      EXPECT_FALSE(other.tryCoerceIntWindow(bad, use, "other"));
+      EXPECT_THROW(other.coerceIntWindow(bad, use, "other"), RequestError);
+    }
+  }
 }

@@ -213,6 +213,7 @@ Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHand
             resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
             resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
             resolved.fieldType->type() == FieldType::NESTED ? LogicalField::Shape::NESTED :
+            resolved.fieldType->type() == FieldType::INTERVAL ? LogicalField::Shape::RANGE :
             LogicalField::Shape::SCALAR),
       multi(resolved.owner ? resolved.owner->multi : resolved.fieldType->multiValued()), writer(writer) {}
 

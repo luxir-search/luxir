@@ -6,6 +6,7 @@
 // FieldType.h stays independent of the api types.
 
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 
 #include "luxir/schema/FieldType.h"
 #include <array>
@@ -142,21 +143,22 @@ __int128 DateFieldType::coerceGridValue(const api::Val& val, std::string_view fi
 
 namespace {
 
-FieldType::IntWindow literalWindow(FieldType::IntWindow window, FieldType::LiteralUse use) {
+FieldType::IntWindow literalWindow(FieldType::IntWindow window, FieldType::LiteralUse use,
+    FieldType::IntWindow domain = {}) {
   using Use = FieldType::LiteralUse;
   switch (use) {
     case Use::MATCH: case Use::MEMBER: return window;
-    case Use::GTE: window.hi = INT64_MAX; break;
+    case Use::GTE: window.hi = domain.hi; break;
     case Use::GT:
-      if (window.hi == INT64_MAX) return {1, 0, window.granuleSkipped, window.unroundedNow};
+      if (window.hi == domain.hi) return {1, 0, window.granuleSkipped, window.unroundedNow};
       window.lo = window.hi + 1;
-      window.hi = INT64_MAX;
+      window.hi = domain.hi;
       break;
-    case Use::LTE: window.lo = INT64_MIN; break;
+    case Use::LTE: window.lo = domain.lo; break;
     case Use::LT:
-      if (window.lo == INT64_MIN) return {1, 0, window.granuleSkipped, window.unroundedNow};
+      if (window.lo == domain.lo) return {1, 0, window.granuleSkipped, window.unroundedNow};
       window.hi = window.lo - 1;
-      window.lo = INT64_MIN;
+      window.lo = domain.lo;
       break;
   }
   return window;
@@ -428,7 +430,15 @@ int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fiel
 
 namespace {
 
-std::optional<FieldType::IntWindow> tryDateWindow(
+struct WideDateWindow {
+  __int128 lo, hi;
+  bool granuleSkipped = false, unroundedNow = false;
+  FieldType::IntWindow encoded() const {
+    return {clampDateUnits(lo), clampDateUnits(hi), granuleSkipped, unroundedNow};
+  }
+};
+
+std::optional<WideDateWindow> tryDateWindow(
     const api::Val& val, DateUnit unit, const CoerceContext& context) {
   auto inputUnit = context.dateInputUnit.value_or(unit);
   std::optional<int64_t> integer;
@@ -439,15 +449,15 @@ std::optional<FieldType::IntWindow> tryDateWindow(
     // A coarser numeric input names its entire input tick. Native numbers
     // are exact: no exclusive i+1 endpoint is constructed.
     int64_t width = dateUnitNanos(inputUnit) / dateUnitNanos(unit);
-    return FieldType::IntWindow{clampDateUnits(lo), clampDateUnits(lo + std::max(width, (int64_t)1) - 1)};
+    return WideDateWindow{lo, lo + std::max(width, (int64_t)1) - 1};
   }
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());
     if (auto parsed = parseDateRange(*s, now, context.timeZone, inputUnit)) {
       int64_t tick = dateUnitNanos(unit);
-      return FieldType::IntWindow{
-          clampDateUnits(datetime_detail::toUnits128(parsed->lo, parsed->loNanos, tick, false)),
-          clampDateUnits(datetime_detail::toUnits128(parsed->hiExclusive, parsed->hiNanos, tick, true) - 1),
+      return WideDateWindow{
+          datetime_detail::toUnits128(parsed->lo, parsed->loNanos, tick, false),
+          datetime_detail::toUnits128(parsed->hiExclusive, parsed->hiNanos, tick, true) - 1,
           parsed->granuleSkipped, parsed->unroundedNow};
     }
   }
@@ -473,7 +483,7 @@ std::optional<FieldType::IntWindow> DateFieldType::tryCoerceIntWindow(
     if (parsed.outsideRange) return IntWindow{1, 0};
     return std::nullopt;
   }
-  if (auto window = tryDateWindow(val, unit, context)) return literalWindow(*window, use);
+  if (auto window = tryDateWindow(val, unit, context)) return literalWindow(window->encoded(), use);
   return std::nullopt;
 }
 
@@ -512,44 +522,81 @@ std::string_view RangeFieldType::typeName() const {
   }
 }
 
-std::optional<RangeFieldType::Bounds> RangeFieldType::encodeBounds(
-    const api::Val* gte, const api::Val* gt, const api::Val* lte, const api::Val* lt,
-    std::string_view fieldName, const CoerceContext& context) const {
-  bool hasGte = gte && !coerce::isNull(*gte);
-  bool hasGt = gt && !coerce::isNull(*gt);
-  bool hasLte = lte && !coerce::isNull(*lte);
-  bool hasLt = lt && !coerce::isNull(*lt);
-  if (hasGte && hasGt) {
-    throw RequestError(fmt::format("range on '{}' sets both gte and gt", fieldName), "invalid_value");
-  }
-  if (hasLte && hasLt) {
-    throw RequestError(fmt::format("range on '{}' sets both lte and lt", fieldName), "invalid_value");
-  }
+FieldType::IntWindow RangeFieldType::domainBounds() const {
+  if (elementType() != DOUBLE) return {};
+  return {doubleToSortableInt64(-std::numeric_limits<double>::infinity()),
+          doubleToSortableInt64(std::numeric_limits<double>::infinity())};
+}
 
-  // Coerce every supplied bound before deciding emptiness, so a malformed
-  // bound is always an error. Each bound's half-line window already steps an
-  // exclusive bound by one encoded unit and rounds a DATE literal by its granule.
-  Bounds bounds{std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
-  bool empty = false;
-  auto lower = [&](const api::Val& value, LiteralUse use) {
-    auto window = element->coerceIntWindow(value, use, fieldName, context);
-    bounds.unroundedNow |= window.unroundedNow;
-    if (window.empty()) empty = true;
-    bounds.lo = window.lo;
-  };
-  auto upper = [&](const api::Val& value, LiteralUse use) {
-    auto window = element->coerceIntWindow(value, use, fieldName, context);
-    bounds.unroundedNow |= window.unroundedNow;
-    if (window.empty()) empty = true;
-    bounds.hi = window.hi;
-  };
-  if (hasGte) lower(*gte, LiteralUse::GTE);
-  if (hasGt) lower(*gt, LiteralUse::GT);
-  if (hasLte) upper(*lte, LiteralUse::LTE);
-  if (hasLt) upper(*lt, LiteralUse::LT);
-  if (empty) return std::nullopt;
-  if (bounds.lo > bounds.hi) return std::nullopt;
-  return bounds;
+FieldType::IntWindow RangeFieldType::coerceIntWindow(const api::Val& val, LiteralUse use,
+    std::string_view fieldName, const CoerceContext& context) const {
+  if (auto window = tryCoerceIntWindow(val, use, fieldName, context)) return *window;
+  if (elementType() == DOUBLE) {
+    // Reuse the element's error for an invalid literal. A successfully encoded
+    // value rejected by the try form is a NaN endpoint.
+    element->coerceColInt64(val, fieldName, context);
+    coerce::throwCoerce(fieldName, val, "a non-NaN range endpoint");
+  }
+  return element->coerceIntWindow(val, use == LiteralUse::MATCH ? LiteralUse::GTE : use,
+                                  fieldName, context);
+}
+
+std::optional<FieldType::IntWindow> RangeFieldType::tryCoerceIntWindow(const api::Val& val,
+    LiteralUse use, std::string_view fieldName, const CoerceContext& context) const {
+  if (use == LiteralUse::MATCH) {
+    auto lower = tryCoerceIntWindow(val, LiteralUse::GTE, fieldName, context);
+    auto upper = tryCoerceIntWindow(val, LiteralUse::LTE, fieldName, context);
+    if (!lower || !upper) return std::nullopt;
+    return foldRangeBounds(rangeBoundLiterals(&val, nullptr, &val, nullptr, fieldName), domainBounds(),
+        [&](const api::Val&, LiteralUse boundUse) { return boundUse == LiteralUse::GTE ? *lower : *upper; });
+  }
+  IntWindow bound;
+  auto domain = domainBounds();
+  if (elementType() == DOUBLE) {
+    auto encoded = element->tryCoerceColInt64(val, fieldName, context);
+    if (!encoded || *encoded < domain.lo || *encoded > domain.hi) return std::nullopt;
+    bound = literalWindow({*encoded, *encoded}, use, domain);
+  } else {
+    auto window = element->tryCoerceIntWindow(val, use, fieldName, context);
+    if (!window) return std::nullopt;
+    bound = *window;
+  }
+  bound.lo = std::max(bound.lo, domain.lo);
+  bound.hi = std::min(bound.hi, domain.hi);
+  return bound;
+}
+
+FieldType::IntWindow RangeFieldType::coerceIngestBound(const api::Val& val, LiteralUse use,
+    std::string_view fieldName, const CoerceContext& context) const {
+  if (elementType() == DOUBLE) return coerceIntWindow(val, use, fieldName, context);
+  IntWindow value;
+  if (elementType() == DATE) {
+    const auto& date = (const DateFieldType&)*element;
+    auto utc = context;
+    utc.timeZone = TimeZone::utc();
+    auto window = tryDateWindow(val, date.unit, utc);
+    if (!window) throwDateCoerce(val, fieldName, date.unit);
+    // Validate the expanded endpoint before stepping an exclusive bound.
+    __int128 endpoint = use == LiteralUse::GT || use == LiteralUse::LTE ? window->hi : window->lo;
+    bool outside = date.unit == DateUnit::MILLIS
+        ? endpoint < datetime_detail::kMinEpochMs || endpoint > datetime_detail::kMaxEpochMs
+        : endpoint <= INT64_MIN || endpoint >= INT64_MAX;
+    if (outside) throwDateCoerce(val, fieldName, date.unit, true);
+    int64_t min = date.unit == DateUnit::MILLIS ? datetime_detail::kMinEpochMs : INT64_MIN + 1;
+    int64_t max = date.unit == DateUnit::MILLIS ? datetime_detail::kMaxEpochMs : INT64_MAX - 1;
+    if ((use == LiteralUse::GT && endpoint == max) || (use == LiteralUse::LT && endpoint == min)) {
+      return {1, 0};
+    }
+    value = window->encoded();
+  } else {
+    int64_t encoded = element->coerceColInt64(val, fieldName, context);
+    value = {encoded, encoded};
+  }
+  value = literalWindow(value, use);
+  auto domain = domainBounds();
+  value.lo = std::max(value.lo, domain.lo);
+  value.hi = std::min(value.hi, domain.hi);
+  return value;
 }
 
 } // namespace luxir

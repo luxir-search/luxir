@@ -111,12 +111,12 @@ namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3, BOOLEAN = 4, DECIMAL = 5, IP = 6 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
-// Enums an expr callable takes as an argument also describe the values it
-// accepts (ExprFunctions.h); keep each list beside its enum.
 namespace RangeQuery_ {
 enum class Relation { INTERSECTS = 0, CONTAINS = 1, WITHIN = 2 };
 BOOST_DESCRIBE_ENUM(Relation, INTERSECTS, CONTAINS, WITHIN)
 }
+// Enums an expr callable takes as an argument also describe the values it
+// accepts (ExprFunctions.h); keep each list beside its enum.
 namespace Match_ {
 enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 };
 BOOST_DESCRIBE_ENUM(Operator, AND, OR)

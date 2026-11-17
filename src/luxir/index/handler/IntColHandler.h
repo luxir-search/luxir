@@ -11,6 +11,7 @@
 #include "luxir/index/IntColWriter.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/NumericUtils.h"
 
@@ -535,10 +536,13 @@ public:
       else invalid(fmt::format("unknown key '{}' (expected gte, gt, lte or lt)", key));
     }
     auto& rangeType = (const RangeFieldType&)*fieldType;
-    auto bounds = rangeType.encodeBounds(gte, gt, lte, lt, std::string_view(fieldName),
-                                         inverter.coerceContext);
-    if (!bounds) invalid("the lower bound is above the upper bound");
-    std::array<int64_t, 2> pair{bounds->lo, bounds->hi};
+    auto name = std::string_view(fieldName);
+    auto bounds = foldRangeBounds(rangeBoundLiterals(gte, gt, lte, lt, name),
+        rangeType.domainBounds(), [&](const api::Val& value, FieldType::LiteralUse use) {
+          return rangeType.coerceIngestBound(value, use, name, inverter.coerceContext);
+        });
+    if (bounds.empty()) invalid("the lower bound is above the upper bound");
+    std::array<int64_t, 2> pair{bounds.lo, bounds.hi};
     indexMulti(inverter, pair);
   }
 };
