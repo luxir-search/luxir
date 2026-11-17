@@ -1342,7 +1342,8 @@ inline ExactDomainResult tryExactDomain(
         allAvailable = false;
         continue;
       }
-      auto probe = source.cacheUse->probe((size_t) segment.ord);
+      auto probe = source.cacheUse->probe(
+          (size_t) segment.ord, FilterCache::Population::BORROW_ONLY);
       if (probe.kind() != FilterCache::Probe::Kind::HIT) {
         allAvailable = false;
         continue;
