@@ -50,23 +50,32 @@ public:
 };
 
 // Actual allocation accounting, including container growth overlap.
+// RESOURCE lifetime retains charges until destruction: an arena upstream
+// cannot reclaim individual allocations when its containers deallocate them.
 class RequestMemResource : public std::pmr::memory_resource {
+public:
+  enum class Lifetime { ALLOCATION, RESOURCE };
+
+private:
   RequestMemTracker& tracker;
   std::string detail;
   std::string breaker;
   std::atomic<size_t> allocatedBytes{0};
+  std::pmr::memory_resource* upstream;
+  Lifetime lifetime;
 
   void* do_allocate(size_t bytes, size_t alignment) override {
     tracker.charge(bytes, breaker, detail);
     try {
-      void* result = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+      void* result = upstream->allocate(bytes, alignment);
       allocatedBytes.fetch_add(bytes, std::memory_order_relaxed);
       return result;
     }
     catch (...) { tracker.release(bytes); throw; }
   }
   void do_deallocate(void* p, size_t bytes, size_t alignment) override {
-    std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+    if (lifetime == Lifetime::RESOURCE) return;
+    upstream->deallocate(p, bytes, alignment);
     allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
     tracker.release(bytes);
   }
@@ -76,8 +85,11 @@ class RequestMemResource : public std::pmr::memory_resource {
 public:
   size_t bytes() const { return allocatedBytes.load(std::memory_order_relaxed); }
   RequestMemResource(RequestMemTracker& tracker, std::string_view detail,
-                     std::string_view breaker = "facet distinct state")
-      : tracker(tracker), detail(detail), breaker(breaker) {}
+                     std::string_view breaker = "facet distinct state",
+                     std::pmr::memory_resource* upstream = std::pmr::new_delete_resource(),
+                     Lifetime lifetime = Lifetime::ALLOCATION)
+      : tracker(tracker), detail(detail), breaker(breaker), upstream(upstream), lifetime(lifetime) {}
+  ~RequestMemResource() override { tracker.release(bytes()); }
 };
 
 } // namespace luxir

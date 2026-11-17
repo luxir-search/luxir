@@ -407,8 +407,8 @@ private:
 
 
 // The compiled analysis plan for one effective AnalyzerDef (Lucene's Analyzer):
-// immutable and thread-safe, shared by every field that resolves to the same
-// definition (Schema::fromProto compiles each effective definition once).
+// immutable and thread-safe. Schema::fromProto shares it per authored definition;
+// equal inline definitions compile separately.
 // compile() runs the component registry, so an Analyzer only exists for a
 // fully validated definition and owns everything it needs (the authored
 // views may be freed right after); createChain() instantiates a fresh
@@ -450,6 +450,11 @@ public:
   // Same, against an explicit registry (tests).
   static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def, const AnalysisRegistry& registry,
       InvalidStopWords invalidStopWords = InvalidStopWords::REJECT);
+
+  // Conservative definition equality within one registry, not behavioral equivalence.
+  bool sameDefinitionAs(const Analyzer& other) const {
+    return this == &other || canonical == other.canonical;
+  }
 
   std::unique_ptr<TokenChain> createChain() const;
 

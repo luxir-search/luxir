@@ -113,6 +113,10 @@ inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
 // A/B toggle: inline facet metrics take the per-document calculator calls
 // instead of keyed ord batches.
 inline bool disableKeyedInlineBatchesForTests = false;
+// A/B toggle: ordinal aggregate inputs use the per-document value evaluator.
+inline bool disableOrdinalAggregateBatchesForTests = false;
+// A/B toggle: ordinal batches go straight to HLL instead of exact ordinal storage.
+inline bool disableCardinalityOrdSetsForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE
@@ -178,6 +182,12 @@ inline int32_t fieldSortSeedBudgetPerMilleForTests = []() {
 // query and per-segment density policy admit it.
 inline bool disableTopKCountComposition =
     std::getenv("LUXIR_DISABLE_TOPK_COUNT_COMPOSITION") != nullptr;
+
+// A/B baseline for bounded hit counts. The default counts a bounded total
+// with an unscored pass that stops once the total passes the limit, and ranks
+// with competitive pruning from the first page.
+inline bool disableBoundedCountSplit =
+    std::getenv("LUXIR_DISABLE_BOUNDED_COUNT_SPLIT") != nullptr;
 
 // Test/bench control (LUXIR_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and

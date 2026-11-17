@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <stdexcept>
@@ -16,12 +17,17 @@
 
 namespace luxir {
 
-/// Process-scoped exclusive lock backed by a filesystem file. Acquisition is
-/// non-blocking: if another process (or open file description) already holds
-/// the lock, the constructor throws. The lock is released when the fd is closed,
-/// including on process exit or crash, so no stale-lock cleanup is needed.
+/// Admission lock backed by a filesystem file. Acquisition is non-blocking:
+/// a conflicting holder makes the constructor throw. Closing the fd releases
+/// the lock, including on process exit or crash, so no stale-lock cleanup is
+/// needed. Shared storage runs one node per process: on NFS, flock is emulated
+/// by process-scoped POSIX locks, so two holders in one process do not exclude
+/// each other and closing either releases both.
 class FileLock {
-  int fd_ = -1;
+public:
+  enum class Mode { EXCLUSIVE, SHARED };
+private:
+  int fd = -1;
 
   // Record who holds the lock, for humans inspecting the file. The flock is the
   // real enforcement; this content is best-effort and never disrupts locking.
@@ -37,46 +43,31 @@ class FileLock {
       std::string line = std::format("pid={} host={} started={:%Y-%m-%dT%H:%M:%SZ}\n",
                                      ::getpid(), host, now);
 
-      if (::ftruncate(fd_, 0) != 0) return;
-      if (::write(fd_, line.data(), line.size()) < 0) return;
+      if (::ftruncate(fd, 0) != 0) return;
+      if (::write(fd, line.data(), line.size()) < 0) return;
     } catch (...) {
       // best-effort diagnostic only
     }
   }
 
 public:
-  explicit FileLock(const std::filesystem::path& lockPath) {
-    fd_ = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd_ < 0) {
-      throw std::runtime_error(std::format("FileLock: failed to open {}: {}",
-                                           lockPath.string(),
-                                           std::system_category().message(errno)));
-    }
-
-    if (::flock(fd_, LOCK_EX | LOCK_NB) < 0) {
+  explicit FileLock(const std::filesystem::path& path, Mode mode = Mode::EXCLUSIVE) {
+    fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) throw std::runtime_error("FileLock: cannot open " + path.string() + ": " + strerror(errno));
+    if (::flock(fd, (mode == Mode::SHARED ? LOCK_SH : LOCK_EX) | LOCK_NB) < 0) {
       int error = errno;
-      ::close(fd_);
-      fd_ = -1;
-
+      ::close(fd);
       if (error == EWOULDBLOCK || error == EAGAIN) {
-        throw std::runtime_error(std::format(
-            "luxir: data directory {} is locked by another running instance "
-            "(write.lock held). Only one instance may write to a data directory.",
-            lockPath.parent_path().string()));
+        throw std::runtime_error("luxir: lock " + path.string() + " is held by another instance ("
+            + (mode == Mode::SHARED ? "shared" : "exclusive") + " admission refused)");
       }
-      throw std::runtime_error(std::format("FileLock: failed to lock {}: {}",
-                                           lockPath.string(),
-                                           std::system_category().message(error)));
+      throw std::runtime_error("FileLock: cannot lock " + path.string() + ": " + strerror(error));
     }
-
-    writeDiagnostic();
+    // A shared lock file has several holders; only an exclusive holder describes itself.
+    if (mode == Mode::EXCLUSIVE) writeDiagnostic();
   }
 
-  ~FileLock() {
-    if (fd_ >= 0) {
-      ::close(fd_);
-    }
-  }
+  ~FileLock() { ::close(fd); }
 
   FileLock(const FileLock&) = delete;
   FileLock& operator=(const FileLock&) = delete;

@@ -68,6 +68,16 @@ Rough hierarchy:
 [search]         # search defaults (hits, etc.)
 */
 
+void NodeConfig::validate() const {
+  if (id.empty()) throw std::invalid_argument("node.id must not be empty");
+  if (id.size() > 255) throw std::invalid_argument("node.id exceeds 255 bytes");
+  if (id == "." || id == "..") throw std::invalid_argument("node.id must not be '.' or '..'");
+  for (unsigned char c : id) {
+    if (c < 0x20 || c > 0x7e || c == '/' || c == '\\') {
+      throw std::invalid_argument("node.id must be printable ASCII without '/' or '\\\\'");
+    }
+  }
+}
 
 std::vector<std::string> ReplicationConfig::tenantFilter() const {
   std::vector<std::string> result;
@@ -103,7 +113,6 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
-  if (follower_id.size() > 255) throw std::invalid_argument("replication.follower-id exceeds 255 bytes");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -111,12 +120,12 @@ void ReplicationConfig::validate() const {
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
+  app.add_option("--node.id", node.id, "Node identity (default host:port, otherwise a random UUID)");
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
   app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
-  app.add_option("--replication.follower-id", replication.follower_id, "Name the source knows this follower by (default host:port)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -174,7 +183,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.retry_ms);
 
   // Names are validated against the registries when storage opens: options are added before plugins register.
-  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs; plugins may add more)")
+  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs, shared_fs; plugins may add more)")
       ->default_val(store.backend);
   app.add_option("--store.layer", store.layers,
                  "Storage layer wrapped around the backend (repeatable, innermost first; provided by plugins)")
@@ -208,6 +217,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Startup check of committed files: none, or full (size and xxh3 of every file)")
       ->default_val(store.verify_on_open)
       ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.retention-ms", store.retention_ms,
+                 "Keep superseded commits for this many milliseconds (0 disables retention)")
+      ->check(CLI::Range((int64_t)0, INT64_MAX / 1000))
+      ->default_str("0 on exclusive stores, 300000 on shared stores");
   app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
                  "Seconds between background checksum scrubs of published snapshots (0 = off)")
       ->default_val(store.scrub_interval_s);
@@ -271,6 +284,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.auto-parallel-min-work",
+                 search.auto_parallel_min_work,
+                 "Operator opt-in: run a max_parallel 0 request in parallel when its "
+                 "lists visit at least this many documents by index metadata (0 = off, default)")
+      ->default_val(search.auto_parallel_min_work)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
                  "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
@@ -326,6 +345,7 @@ void LuxirConfig::resolveRamBudgets() {
 }
 
 void LuxirConfig::normalize() {
+  if (!node.id.empty()) node.validate();
   replication.validate();
   resolveRamBudgets();
 

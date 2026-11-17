@@ -130,8 +130,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
-- **Cost-aware filter cache:** Favors filters that are expensive to rebuild
-  relative to their size, saving more computation per byte of cache.
+- **Cost-aware filter cache:** Ranks filters by rebuild cost per byte,
+  weighted by how often the filter has been used recently.
 - **Arena allocation:** Indexing runs on rollback-capable memory pools, and
   requests decode into arena-backed message objects with no per-field heap
   allocation on the way in.
@@ -155,6 +155,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Fields and templates can inherit settings with `parent`. The built-in
   `_name` and `_names` templates support people and titles:
   word search plus a whole-value variant for facets and sorting.
+- [Nested documents](guide/nested.md): lists of structured children (items,
+  variants, chunks) kept as their own rows, to any depth.
+  `items:(color:red AND size:L)` requires one item with both, a document
+  scores by its best child, and facets and other operations can run over the
+  child rows of the matching documents.
 - Field variants: one input value indexed under several representations
   (`author` for word search, `author__s` for exact facets and sorts), with
   per-operation default bindings so a bare field name does the right thing.
@@ -237,7 +242,13 @@ Anywhere a query goes, it can be a structured object or an expression string.
   (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
   `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
   and Elasticsearch-style `gauss_decay`, `exp_decay`, and `linear_decay`
-  decay functions over numeric, date, and geo values. `rescore` takes an
+  decay functions over numeric, date, and geo values. The same language has
+  bitwise operators and `%`, trigonometry and rounding, calendar parts of
+  dates, coordinates and distances between places, geohash and geotile keys,
+  hash functions for consistent sampling, `let` bindings, `$name` request
+  variables, `_score` as an alias of `score`, and typed field components such
+  as `loc.lat` and `ts.year` ([value expressions](guide/value-expressions.md)).
+  `rescore` takes an
   optional `min_score` cut-off (the `function_score` / `script_score`
   counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are

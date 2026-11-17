@@ -110,8 +110,8 @@ RangeFacetGrid::RangeFacetGrid(Kind kind, FieldType::Type type, TimeZone zone)
 
 RangeFacetGrid RangeFacetGrid::fixed(FieldType::Type type, int64_t gap, int64_t origin,
                                     TimeZone zone, DateUnit dateUnit, std::optional<int64_t> start) {
-  if (type != FieldType::Type::INT && type != FieldType::Type::DATE) {
-    throw RequestError("integer grid requires INT or DATE");
+  if (!FieldType::isNumericColumn(type) || type == FieldType::FLOAT || type == FieldType::DOUBLE) {
+    throw RequestError("integer grid requires an integer-lattice field");
   }
   if (gap <= 0) throw RequestError("range gap must be > 0");
   RangeFacetGrid result(Kind::FIXED, type, type == FieldType::Type::DATE ? zone : TimeZone::utc());

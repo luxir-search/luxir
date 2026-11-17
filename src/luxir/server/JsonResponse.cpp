@@ -271,16 +271,8 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
   } else if (auto* c = std::get_if<luxir::api::ColDouble>(&col.kind)) {
     if (i < c->v.size()) appendFloating(out, c->v[i]);
     else out += "null";
-  } else if (std::holds_alternative<luxir::api::ArrArrStr>(col.kind)) {
-    cell::arrStr(out, col, i);
-  } else if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) {
-    cell::arrInt<Int64Str>(out, col, i);
-  } else if (std::holds_alternative<luxir::api::ArrArrFloat>(col.kind)) {
-    cell::arrFlt(out, col, i);
-  } else if (std::holds_alternative<luxir::api::ArrArrDouble>(col.kind)) {
-    cell::arrDbl(out, col, i);
   } else {
-    out += "null";
+    resolveCellFn<Int64Str>(col)(out, col, i);
   }
 }
 
@@ -353,6 +345,8 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
         const auto& value = group.component[c].value;
         if (const auto* str = std::get_if<std::string_view>(&value)) appendJsonString(out, *str);
         else if (const auto* number = std::get_if<int64_t>(&value)) appendInt<Int64Str>(out, *number);
+        else if (const auto* boolean = std::get_if<bool>(&value)) out += *boolean ? "true" : "false";
+        else if (const auto* number = std::get_if<double>(&value)) appendFloating(out, *number);
         else out += "null";
       }
       if (tuple) out += ']';
@@ -500,6 +494,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     appendInt<Int64Str>(out, *docs.found);
     out += ',';
     if (docs.found_gte) out += R"("found_gte":true,)";
+    if (docs.found_estimated) out += R"("found_estimated":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -744,6 +739,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       marker += R"("found":)";
       appendInt<Int64Str>(marker, *docs.found);
       if (docs.found_gte) marker += R"(,"found_gte":true)";
+      if (docs.found_estimated) marker += R"(,"found_estimated":true)";
       first = false;
     }
     if (haveFoundDocs) {

@@ -73,6 +73,7 @@ struct SegmentInfo {
   std::span<const FileDescriptor> files;
   int32_t max_doc = 0;
   int32_t live_docs = 0;
+  std::optional<int32_t> merge_rows;
 };
 
 struct IndexInfo {

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+# Install the hosted runner's build tools, or print the toolchain in use.
+# The compiler major version here is part of the macOS dependency key.
+set -euo pipefail
+case ${1:?setup or identity} in
+  setup)
+    [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || exit 2
+    brew install gcc cmake ninja pkg-config oras
+    command -v gcc-16
+    ;;
+  identity)
+    echo "$(g++-16 --version | head -n 1); macOS $(sw_vers -productVersion); SDK $(xcrun --sdk macosx --show-sdk-version)"
+    ;;
+  *) exit 2 ;;
+esac

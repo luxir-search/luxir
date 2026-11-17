@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <stdexcept>
 #include "DocStream.h"
 #include "luxir/util/MemPool.h"
 
@@ -49,10 +50,12 @@ public:
       multiValued_ = true;
       // need to convert from a single value to a stream
       auto [ptr, streamAddr] = pool.allocateAddrs(sizeof(IntDeltaStream));  // IntDeltaStream is current 22 bytes, relatively heavyweight.
-      // The tag bit halves the pool's 4 GiB address space: this collector's
-      // pool must stay under 2 GiB (its per-flush scratch pools are far
-      // smaller in practice).
-      assert((streamAddr & 0x80000000u) == 0);
+      // The tag bit halves the pool's 4 GiB address space. A stream placed
+      // past 2 GiB would be tagged with its top bit cleared and later read
+      // 2 GiB lower, so fail the flush or merge instead of corrupting it.
+      if (streamAddr & 0x80000000u) {
+        throw std::length_error("OrdCollector exceeded its 2GiB stream addressability limit");
+      }
       stream = new (ptr) IntDeltaStream(pool);
       stream->addVal(pool, (int32_t)v);
       ords[docid] = (uint32_t)streamAddr | 0x80000000u;

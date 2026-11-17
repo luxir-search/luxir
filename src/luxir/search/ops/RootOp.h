@@ -19,7 +19,7 @@ public:
   // live documents, is unrestricted). Set by the parser.
   std::vector<SegmentMask> variantViable;
 
-  RootOp(SearchRequest& req) : SearchOp(req, "root") {
+  RootOp(SearchRequest& req) : SearchOp(req, req.reader, "root") {
   }
 
   bool needsWholePreparation() const override {
@@ -30,6 +30,17 @@ public:
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     domainVariants.releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
+  }
+
+  // Lists price their own matches. Any other top-level op works over the
+  // whole collection.
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    for (auto& [name, subOp] : subOps) {
+      if (subOp->ownsMatchDomain()) continue;
+      total = saturatingAdd(total, (size_t) view->maxDoc());
+    }
+    return total;
   }
 
   class Calc final : public SearchOp::Calculator {
@@ -100,7 +111,7 @@ public:
         return !prunesDomains
             || (variantMayMatch(variant, segnum) && !childOps[child]->segmentPruned((int32_t)segnum));
       };
-      const auto& segs = op.req.reader->segments();
+      const auto& segs = op.view->segments();
       std::vector<uint8_t> needed(segs.size(), 0);
       domains.reserve(segs.size());
       for (auto& seg : segs) {
@@ -108,15 +119,14 @@ public:
           needed[(size_t)seg.ord] = childNeeds(child, (size_t)seg.ord);
         }
         if (!needed[(size_t)seg.ord]) {
-          domains.push_back(DomainHandle::empty());
+          domains.push_back(DomainHandle::empty().scoped(seg));
           continue;
         }
         // Start with live docs. This establishes the PrepareContext domain
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
         // no deletes and no filters.
-        auto* liveDocs = seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
-        domains.push_back(DomainHandle::pinned(liveDocs, op.req.reader));
+        domains.push_back(DomainHandle::pinned(seg.liveDocSet(), op.view).scoped(seg));
       }
 
       if (root.domainVariants.empty()) {
@@ -124,7 +134,7 @@ public:
           auto* subCalc = subCalcs[child].get();
           return [this, subCalc, tg]() {
             Signal::emit("searchRootChildStart", subCalc);
-            subCalc->calcAll(tg, domains);
+            subCalc->acceptAll(tg, domains);
           };
         });
         return;
@@ -141,12 +151,12 @@ public:
       liveViews.reserve(domains.size());
       for (const auto& domain : domains) liveViews.push_back(domain.get());
       Query::Weight::PrepareContext prepareContext{
-        *op.req.reader,
+        *op.view,
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
         tg != nullptr, &op.req};
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
       auto release = scope_guard([&]() noexcept {
-        for (auto& segment : op.req.reader->segments()) {
+        for (auto& segment : op.view->segments()) {
           for (const auto& source : prepared) source.releaseSegmentState(segment);
         }
       });
@@ -178,7 +188,7 @@ public:
           domains.size(), std::vector<DomainHandle>(weights.size()));
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
         if (!needed[segnum]) continue;
-        auto& segment = op.req.reader->segments()[segnum];
+        auto& segment = op.view->segments()[segnum];
         std::string detail = "root segment " + std::to_string(segnum);
         reservations[segnum] = root.domainVariants.reserveProduction(
             op.req.memoryTracker, segment.maxDoc(), detail);
@@ -186,7 +196,7 @@ public:
             segnum, op.req.memoryTracker, detail);
         for (size_t source : resetExtraSources) {
           DomainHandle set = QueryPrep::materializeEffectiveFilter(
-              prepared[source], *op.req.reader, segment,
+              prepared[source], *op.view, segment,
               domains[segnum].get());
           if (set.get() != nullptr && set.isDeliverable()) {
             reservations[segnum]->grow(set.get()->ramBytesUsed());
@@ -206,7 +216,7 @@ public:
             continue;
           }
           if (!needed[segnum] || !variantMayMatch(variant, segnum)) {
-            eligibility[segnum][variant] = DomainHandle::empty();
+            eligibility[segnum][variant] = DomainHandle::empty().scoped(op.view->segments()[segnum]);
             continue;
           }
           std::vector<DomainHandle> parts;
@@ -222,9 +232,9 @@ public:
       auto preparedVariants = root.domainVariants.prepareResetVariants(
           prepared, eligibility,
           std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-          *op.req.reader, tg != nullptr, &op.req,
+          *op.view, tg != nullptr, &op.req,
           [&](size_t variant, size_t segnum) {
-            auto& segment = op.req.reader->segments()[segnum];
+            auto& segment = op.view->segments()[segnum];
             return root.domainVariants.reserveVariantPreparation(
                 op.req.memoryTracker, segment.maxDoc(),
                 "root variant " + std::to_string(variant)
@@ -235,10 +245,11 @@ public:
       produced.reserve(domains.size());
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
         if (!needed[segnum]) {
-          produced.emplace_back(root.domainVariants.variantCount(), DomainHandle::empty());
+          produced.emplace_back(root.domainVariants.variantCount(),
+                                  DomainHandle::empty().scoped(op.view->segments()[segnum]));
           continue;
         }
-        auto& segment = op.req.reader->segments()[segnum];
+        auto& segment = op.view->segments()[segnum];
         auto releaseSegment = scope_guard([&]() noexcept {
           for (const auto& source : prepared) source.releaseSegmentState(segment);
         });
@@ -249,7 +260,7 @@ public:
             return extraSets[segnum][source];
           }
           DomainHandle set = QueryPrep::materializeEffectiveFilter(
-              prepared[source], *op.req.reader, segment,
+              prepared[source], *op.view, segment,
               domains[segnum].get());
           if (set.get() != nullptr && set.isDeliverable()) {
             reservation->grow(set.get()->ramBytesUsed());
@@ -262,7 +273,7 @@ public:
         variants[0] = domains[segnum];
         for (size_t variant = 1; variant < variants.size(); variant++) {
           if (!variantMayMatch(variant, segnum)) {
-            variants[variant] = DomainHandle::empty();
+            variants[variant] = DomainHandle::empty().scoped(op.view->segments()[segnum]);
             continue;
           }
           if (preparedVariants.ready[variant] != 0) {
@@ -298,7 +309,7 @@ public:
         auto* subCalc = subCalcs[child].get();
         return [subCalc, tg, childDomains = std::move(childDomains)]() {
           Signal::emit("searchRootChildStart", subCalc);
-          subCalc->calcAll(tg, childDomains);
+          subCalc->acceptAll(tg, childDomains);
         };
       });
     }

@@ -79,8 +79,7 @@ TEST_F(AllQueryCapabilityShapeTest,
   ASSERT_EQ(1u, reader->segments().size());
   auto& sourceSegment = reader->segments()[0];
 
-  auto postings = std::shared_ptr<PostingsReader>(
-      &sourceSegment.postingsReader(), [](PostingsReader*) {});
+  auto core = sourceSegment.segmentCoreShared();
   Segment::SegmentInfo info{
     .seg_id = 0,
     .live_gen = 0,
@@ -91,8 +90,8 @@ TEST_F(AllQueryCapabilityShapeTest,
     .live_docs = 0,
   };
   Segment zeroSegment(
-      std::move(postings), std::shared_ptr<LiveDocs>{},
-      std::vector<std::shared_ptr<AuxReader>>{}, std::shared_ptr<const SegmentSummary>{}, info, 0, 0);
+      std::move(core), std::shared_ptr<LiveDocs>{},
+      std::vector<std::shared_ptr<AuxReader>>{}, info, 0, 0, nullptr);
   AllQuery::Supplier supplier(zeroSegment, 0.0f, false);
   MemPool pool;
 

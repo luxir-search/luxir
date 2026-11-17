@@ -21,6 +21,7 @@
 #include "luxir/index/CommitSnapshot.h"
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
+#include "luxir/query/Query.h"
 #include "luxir/query/ExecutionWarnings.h"
 #include "luxir/query/MultiTermBudget.h"
 #include "luxir/query/ExecutionProfile.h"
@@ -33,6 +34,7 @@ namespace luxir {
 
 class SearchEngine;
 class SearchResponse;
+class RowRelation;
 
 // Cumulative count of emitter pauses caused by reply() flow control.
 // Process-wide; read by tests and (eventually) server stats.
@@ -58,6 +60,12 @@ namespace build = luxir::api::build;
 // The top-level request for the SearchEngine.
 class Collection;
 class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
+  struct ScopedState {
+    std::shared_ptr<IndexReader> reader;
+    std::shared_ptr<FilterCache::UseRegistry> uses;
+    // Request-arena owned; the pair of paths fixes the direction of reduction.
+    std::map<std::pair<std::string, std::string>, RowRelation*> relations;
+  };
   friend class SearchEngine;
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
@@ -107,9 +115,18 @@ public:
   std::optional<TimeZone> timeZone;
   std::string timeZoneError;
   MemPool requestPool;
+private:
+  // Registries can retain request memory charges. Destroy them before the
+  // request pool and tracker, and before releasing their reader pins.
+  std::unique_ptr<std::map<std::string, ScopedState, std::less<>>> scopedStates;
+public:
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
+  // The engine chose the parallel lane for a max_parallel 0 request, so
+  // transports resume paused production inside the arena, as for -1.
+  bool autoParallel = false;
+  bool parallelLane() const noexcept { return maxParallel == -1 || autoParallel; }
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);
@@ -144,6 +161,15 @@ public:
                 std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());
 
   virtual ~SearchRequest();
+
+  // Parsing and returned fields pin each additional view once, under mutex.
+  // The map has no allocation until
+  // a request crosses a space boundary; registry identities never cross it.
+  const std::shared_ptr<IndexReader>& pinView(std::string_view path);
+  const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
+  RowRelation& ownershipRelation(IndexReader& many, IndexReader& one);
+  Query::PlanningContext* createPlanningContext(IndexReader& view);
+  size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }
 
   ExecutionProfileOpState* addExecutionProfileOp(std::string_view name) {
     if (!proto.profile) return nullptr;
@@ -181,7 +207,11 @@ public:
   };
 
   /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
-  /// replyComplete will be called when the response has actually been written and is no longer needed.
+  /// reply() takes ownership of `response` on every path and must not throw:
+  /// once it has run, the transport has called replyCallback(response), which
+  /// releases a non-final response's own arena and completes the request on
+  /// the last one. A producer cannot recover from an exception here because
+  /// it cannot tell whether that release already happened.
   virtual ReplyStatus reply(SearchResponse& response) = 0;
 
   /// Called by a streaming producer after reply() returned PAUSE.  The
