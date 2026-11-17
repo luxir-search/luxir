@@ -45,7 +45,7 @@ void NestedState::index(NestedPath& path, const IndexVal& val) {
   size_t index = 0;
   auto object = [&](const IndexVal& child) {
     auto* doc = std::get_if<api::Map>(&child.kind);
-    if (!doc) {
+    if (!doc && !coerce::isNull(child)) {
       throw DocumentError("Nested path '" + std::string(std::string_view(path.name)) + "' element "
           + std::to_string(index) + " requires an object");
     }
@@ -70,7 +70,7 @@ void NestedState::index(NestedPath& path, const IndexVal& val) {
     inverter.inputSpace = path.ordinal;
     active = &path;
     try {
-      path.fields.index(inverter, *doc, NestedPath::Names(inverter, path));
+      if (doc) path.fields.index(inverter, *doc, NestedPath::Names(inverter, path));
     } catch (const DocumentError& e) {
       throw DocumentError(fmt::format("Nested '{}' element {}: {}", std::string_view(path.name), index, e.what()), e.code);
     } catch (const RequestError& e) {

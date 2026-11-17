@@ -54,8 +54,10 @@ Send nested values as ordinary JSON, an object or an array of objects:
 - Each object creates one child row, including an empty object `{}`. A single
   object counts as one row.
 - Null, an empty array and an absent field create no rows.
-- A scalar or a non-object array element is a document error. Any error inside
-  a child rejects its whole root document.
+- A `null` element of an array is an empty child row, like `{}`, at every
+  depth. It is returned as `{}`.
+- A scalar, or an array element that is neither an object nor `null`, is a
+  document error. Any error inside a child rejects its whole root document.
 - Supply child keys inside their objects. A dotted key at the root
   (`"items.color": "red"`) cannot create a child row. `field_map` and
   `drop_unmapped` apply to root keys only.
