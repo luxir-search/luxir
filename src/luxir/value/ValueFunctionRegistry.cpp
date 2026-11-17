@@ -286,12 +286,9 @@ bool compareValues(ValueOpcode opcode, T a, T b) {
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::AND:
     case ValueOpcode::OR:
     case ValueOpcode::NOT:
@@ -321,8 +318,6 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
-      case ValueOpcode::EXP:
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::ADD:
@@ -332,7 +327,6 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -374,12 +368,9 @@ ScalarKernelValue<Int> evalUnaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -431,7 +422,6 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::DIV: output = a / b; break;
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
-      case ValueOpcode::POW: throw std::logic_error("pow uses its specialized kernel");
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::NEG:
@@ -439,9 +429,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -493,10 +481,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1050,8 +1035,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
-    case ValueOpcode::EXP:
     case ValueOpcode::NONE:
     case ValueOpcode::DEF:
     case ValueOpcode::ADD:
@@ -1061,7 +1044,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1171,10 +1153,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -1264,10 +1243,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1439,12 +1415,9 @@ ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds>
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::AND:
       case ValueOpcode::OR:
       case ValueOpcode::NOT:
