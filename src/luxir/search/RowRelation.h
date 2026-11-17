@@ -7,6 +7,25 @@
 
 namespace luxir {
 
+// How a family's matching rows reduce to its owner: a score and an inclusive
+// range for the number of matching rows. The first five kinds are the join's
+// score modes. A weight resolves NONE before a relation sees it: FIXED scores
+// every owner with the multiplier itself, and CONSTANT reads a uniform
+// child's exact score once per leaf.
+struct RowReduction {
+  enum Kind { NONE, MAXIMUM, MINIMUM, SUM, AVERAGE, CONSTANT, FIXED };
+  Kind kind = MAXIMUM;
+  int32_t min = 1;
+  int32_t max = std::numeric_limits<int32_t>::max();
+
+  bool operator==(const RowReduction&) const = default;
+  bool bounded() const { return min != 1 || max != std::numeric_limits<int32_t>::max(); }
+  bool accepts(int64_t count) const { return count >= min && count <= max; }
+  int64_t decidingCount() const {
+    return max == std::numeric_limits<int32_t>::max() ? min : (int64_t)max + 1;
+  }
+};
+
 // A leaf-aligned relation between views. Only the implementation knows whether
 // rows arrive in order or share physical storage.
 class RowRelation {
@@ -16,9 +35,6 @@ public:
   RequestMemTracker& memory;
 
   enum class Direction { EXPAND, PROJECT };
-  // A uniform child without a construction-time score quote supplies its
-  // exact per-leaf contribution before membership reduction starts.
-  enum class Reduction { NONE, MAXIMUM, CONSTANT };
 
   struct Mapping {
     RowRelation* relation = nullptr;
@@ -46,7 +62,7 @@ public:
   // Construction dispatch happens once per leaf. The returned supplier owns the
   // concrete mapping algorithm; no mapping dispatch is added to row iteration.
   virtual Query::ScorerSupplier* reduce(MemPool& pool, size_t leaf, Query::ScorerSupplier& input,
-      DocSet* domain, Reduction reduction, float multiplier) = 0;
+      DocSet* domain, RowReduction reduction, float multiplier) = 0;
   virtual DomainHandle expand(size_t leaf, DomainHandle domain) = 0;
   virtual DomainHandle project(size_t leaf, DomainHandle domain) = 0;
   virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const = 0;

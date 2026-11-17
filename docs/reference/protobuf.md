@@ -2558,7 +2558,9 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 |---|---|---|---|---|
 | <a id="field-luxir.toparentquery.path"></a>[`path`](#field-luxir.toparentquery.path) | 1 | `string` | singular |  |
 | <a id="field-luxir.toparentquery.query"></a>[`query`](#field-luxir.toparentquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
-| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | none (constant score) or max. Unset selects max. |
+| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | How matching child scores reduce to the owner's score: max (default), min, sum, avg, or none (the join contributes zero). |
+| <a id="field-luxir.toparentquery.min_children"></a>[`min_children`](#field-luxir.toparentquery.min_children) | 4 | `int32` | optional | Fewest matching children an owner needs. Unset = 1; must be &gt;= 1. |
+| <a id="field-luxir.toparentquery.max_children"></a>[`max_children`](#field-luxir.toparentquery.max_children) | 5 | `int32` | optional | Most matching children an owner may have. Unset = unbounded; must be &gt;= min\_children. |
 
 <a id="message-luxir.topdocs"></a>
 

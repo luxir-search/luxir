@@ -71,8 +71,8 @@ inline bool logicalConsumesDomain(const Query& query) {
 inline Query::ScoreProfile scoreProfile(const Query& query) {
   switch (query.getKind()) {
     case QueryKind::TO_PARENT:
-      return ((const ToParentQuery&)query).takesMaximum() ? Query::ScoreProfile::variable()
-          : Query::ScoreProfile::explicitUniform(1.0f);
+      return ((const ToParentQuery&)query).getReduction().kind != RowReduction::NONE ? Query::ScoreProfile::variable()
+          : Query::ScoreProfile::explicitUniform(0.0f);
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query).shapeScoreProfile();
     case QueryKind::BOOST: {

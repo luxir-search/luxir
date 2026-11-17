@@ -59,7 +59,7 @@ public:
     std::span<OwnershipShape::Cursor> cursors;
     OwnershipShape::Family current{-1, 0, 0};
 
-    OwnershipShape::Family descend(OwnershipShape::Family family) {
+    [[gnu::always_inline]] OwnershipShape::Family descend(OwnershipShape::Family family) {
       current = family;
       // The top family's range is in its immediate child space. Descend its
       // boundaries through the same cursors to get the full descendant range.

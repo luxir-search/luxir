@@ -826,7 +826,10 @@ in their own guides:
 A single-field leaf naming a descendant field implicitly uses to_parent with
 score max; each leaf joins independently. Wrap a Boolean child in
 `{"to_parent":{"path":"items","query":{...}}}` for a same-item query.
-Its optional `score` is `max` (default) or `none`. An exists query on a nested
+Its optional `score` is `max` (default), `min`, `sum`, `avg` or `none`
+(contributes zero), and optional `min_children` (default 1) and
+`max_children` (default unbounded) bound the number of matching children;
+see [Scoring](nested.md#scoring). An exists query on a nested
 path joins all rows of that path. Query strings additionally support nested
 field groups, such as `items:(color:red AND size:L)`.
 

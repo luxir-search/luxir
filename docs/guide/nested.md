@@ -136,8 +136,37 @@ path components are not supported.
 ### Scoring
 
 A document's score from a nested clause is the score of its best matching
-child (`score: "max"`, the default, and what implicit references use).
-`score: "none"` gives a constant score with the same matches.
+child. That is `score: "max"`, the default, and what implicit references and
+nested-path groups always use. The structured `to_parent` form takes the
+other reductions:
+
+| `score` | The document's score from the clause |
+| --- | --- |
+| `max` (default) | highest score among its matching children |
+| `min` | lowest score among its matching children |
+| `sum` | sum of its matching children's scores |
+| `avg` | average of its matching children's scores |
+| `none` | zero: the clause selects documents without ranking them |
+
+A boost on the join multiplies the reduced score. Every mode matches the same
+documents; a mode other than `max` needs the score of every matching child,
+so `max` is the cheapest ranked mode.
+
+`min_children` and `max_children` bound how many children must match:
+
+```json
+{"to_parent":{"path":"items","score":"avg","min_children":2,"max_children":5,
+              "query":{"match":{"field":"color","val":"red"}}}}
+```
+
+matches documents with two to five red items and scores each by the average
+over all of its red items. The defaults are 1 and unbounded. `min_children`
+must be at least 1; for documents with no matching child, negate the clause.
+
+A dotted path (`"path":"items.parts"`) reduces over all of the document's
+matching rows at that path, and its bounds count those rows. A join written
+inside a join reduces and counts level by level instead, which can give a
+different average or a different count.
 
 ### As a filter
 
@@ -313,6 +342,10 @@ named clause's matching rows. A `domain.filter` narrows either form further.
 To retrieve children independently of a matching clause, use `domain.to`;
 with no query those children are unscored and in row order.
 
+When the named clause is a join with `min_children` or `max_children`, the
+bounds decide which documents are hits and `from_match` still selects every
+matching child of each hit.
+
 See [Per-row operations](searching.md#per-row-operations) for controls,
 restrictions, formats and result-name rules.
 
@@ -347,8 +380,6 @@ of each child matter together.
 
 - Storing the submitted nested value verbatim.
 - Owner fields in sorts, facets, collapse keys and value expressions.
-- Score modes other than `max` and `none`, and bounds on the number of
-  matching children.
 - kNN counted in distinct documents.
 - Updating or addressing a single child.
 - `domain.to` paths that go up and then down.

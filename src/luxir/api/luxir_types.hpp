@@ -1135,6 +1135,8 @@ struct ToParentQuery {
   std::string_view path;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view score;
+  std::optional<int32_t> min_children;
+  std::optional<int32_t> max_children;
 };
 struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;

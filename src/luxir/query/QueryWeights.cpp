@@ -171,7 +171,8 @@ std::optional<float> ToParentQuery::uniformChildScore(Query& query, float multip
       return uniformChildScore(*((ForcePrepareQuery&)query).getChild(), multiplier);
     case QueryKind::TO_PARENT: {
       auto& join = (ToParentQuery&)query;
-      if (!join.maximum) return multiplier;
+      if (join.reduction.kind == RowReduction::NONE) return 0.0f;
+      if (join.reduction.kind == RowReduction::SUM) return std::nullopt;
       auto child = uniformChildScore(*join.child);
       return child ? std::optional<float>(*child * multiplier) : std::nullopt;
     }

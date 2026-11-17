@@ -66,7 +66,7 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
     std::string field = std::string(path) + ".n_i";
     NumericPredicateQuery numeric(field, 0, high);
     auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
-    auto* supplier = relation.reduce(pool, 0, *source, root->segments()[0].liveDocSet(), RowRelation::Reduction::NONE, 1.0f);
+    auto* supplier = relation.reduce(pool, 0, *source, root->segments()[0].liveDocSet(), RowReduction{RowReduction::FIXED}, 1.0f);
     auto planContext = Query::PlanContext::fromLeadCost(N / 17 + 1, Query::ExecutionUse::COUNT_WINDOWS);
     planContext.demand.span = N;
     planContext.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
@@ -173,7 +173,7 @@ TEST_F(JoinProbeTest, childProofProjectsEmptyZonesWithoutRejectingPossibleOwners
   OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
   NumericPredicateQuery numeric("items_nested.n_i", 0, 1);
   auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
-  auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowRelation::Reduction::NONE, 1.0f);
+  auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowReduction{RowReduction::FIXED}, 1.0f);
   auto planContext = Query::PlanContext::fromLeadCost(N, Query::ExecutionUse::COUNT_WINDOWS);
   planContext.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
   auto* plan = supplier->resolve(pool, planContext);

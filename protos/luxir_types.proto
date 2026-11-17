@@ -365,8 +365,14 @@ message Query {
 message ToParentQuery {
   string path = 1;
   Query query = 2;
-  // none (constant score) or max. Unset selects max.
+  // How matching child scores reduce to the owner's score: max (default),
+  // min, sum, avg, or none (the join contributes zero).
   string score = 3;
+  // Fewest matching children an owner needs. Unset = 1; must be >= 1.
+  optional int32 min_children = 4;
+  // Most matching children an owner may have. Unset = unbounded; must be
+  // >= min_children.
+  optional int32 max_children = 5;
 }
 
 message ExistsQuery {

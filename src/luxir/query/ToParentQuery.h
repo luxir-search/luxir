@@ -12,33 +12,36 @@ class ToParentQuery final : public Query {
   Query* child;
   PlanningContext& source;
   RowRelation& relation;
-  bool maximum;
+  RowReduction reduction;
 
   static std::optional<float> uniformChildScore(Query& child, float multiplier = 1.0f);
 
 public:
-  ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, bool maximum)
-      : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), maximum(maximum) {}
+  ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, RowReduction reduction)
+      : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), reduction(reduction) {}
 
   Query* getChild() const { return child; }
   std::string_view sourcePath() const { return source.topReader.path(); }
-  bool takesMaximum() const { return maximum; }
+  const RowReduction& getReduction() const { return reduction; }
   bool recoverableAsPredicate() const noexcept override { return child->recoverableAsPredicate(); }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = (const ToParentQuery&)other;
-    return maximum == rhs.maximum && source.topReader.path() == rhs.source.topReader.path()
+    return reduction == rhs.reduction && source.topReader.path() == rhs.source.topReader.path()
         && child->equals(*rhs.child);
   }
   uint64_t hashImpl() const override {
     return mixHash(mixHash(Query::hashImpl(), child->hash()),
-        mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()), maximum));
+        mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()),
+            mixHash((int)reduction.kind, mixHash(reduction.min, reduction.max))));
   }
   void validateLogicalImpl(PlanningContext&, float multiplier) const override {
-    child->validateLogical(source, maximum ? multiplier : 1.0f);
+    child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());
+    out.appendUInt64(reduction.min);
+    out.appendUInt64(reduction.max);
     auto scope = relation.appendFilterKey(out, context);
     FilterKeyBuilder childKey;
     auto childScope = child->appendFilterKey(childKey, source.filterKeyContext);
@@ -53,7 +56,7 @@ public:
     Query::Weight* child;
     FilterCache::Use* childUse;
     RowRelation& relation;
-    RowRelation::Reduction reduction;
+    RowReduction reduction;
     float multiplier;
 
     Query::ScorerSupplier* supplier(MemPool& pool, IndexReader::Segment& segment,
@@ -110,28 +113,34 @@ public:
     Weight(Query::Context& context, ToParentQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, query, flags), source(query.source.topReader),
           relation(query.relation),
-          reduction(query.maximum && (flags & NEED_SCORES) != 0 ? RowRelation::Reduction::MAXIMUM
-              : RowRelation::Reduction::NONE), multiplier(constantWhenScored(flags, multiplier)) {
+          reduction(query.reduction), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      auto constant = reduction == RowRelation::Reduction::MAXIMUM
+      if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
+        reduction.kind = RowReduction::FIXED;
+        this->multiplier = 0;
+      }
+      auto constant = reduction.kind != RowReduction::FIXED
+              && reduction.kind != RowReduction::SUM
           ? uniformChildScore(*query.child) : std::nullopt;
-      if (reduction == RowRelation::Reduction::MAXIMUM && constant) {
-        // Uniform max is membership plus the child's score, not score none.
-        // Keep the child's rounding before the join's multiplier.
+      if (constant) {
+        // Uniform reductions retain the child's rounding before the multiplier.
         this->multiplier = *constant * this->multiplier;
-        reduction = RowRelation::Reduction::NONE;
+        reduction.kind = RowReduction::FIXED;
       }
-      child = query.child->createWeight(*childContext, reduction == RowRelation::Reduction::MAXIMUM
-          ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
-      if (reduction == RowRelation::Reduction::MAXIMUM && child->isConstantScoring()) {
-        reduction = RowRelation::Reduction::CONSTANT;
-      }
+      int32_t childFlags = flags;
+      if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
+      else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
+      child = query.child->createWeight(*childContext, childFlags, 1.0f);
+      if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::SUM
+          && child->isConstantScoring()) reduction.kind = RowReduction::CONSTANT;
       // Every row of the path is not a set worth materializing or caching.
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
       traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       if (child->consumesDomain()) traits |= NEEDS_PREPARE;
-      if (reduction != RowRelation::Reduction::MAXIMUM) traits |= IS_CONSTANT_SCORING;
+      if (reduction.kind == RowReduction::FIXED || reduction.kind == RowReduction::CONSTANT) {
+        traits |= IS_CONSTANT_SCORING;
+      }
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
     }

@@ -81,6 +81,7 @@ protected:
       for (size_t i = 0; i < root.items.size(); i++) {
         if (i) out += ',';
         const auto& item = root.items[i];
+        if (item.tag < 0 && i % 2 == 0) { out += "null"; continue; }
         out += '{';
         if (item.tag >= 0) {
           out += "\"tag_i\":" + std::to_string(item.tag);
@@ -95,7 +96,7 @@ protected:
           out += ",\"parts_nested\":[";
           for (size_t p = 0; p < item.parts.size(); p++) {
             if (p) out += ',';
-            out += item.parts[p].empty() ? "{}" : "{\"material_s\":\"" + item.parts[p] + "\"}";
+            out += item.parts[p].empty() ? (p % 2 ? "{}" : "null") : "{\"material_s\":\"" + item.parts[p] + "\"}";
           }
           out += ']';
         }
@@ -271,6 +272,58 @@ protected:
     EXPECT_EQ(rootOwners, *(*grandchildren->ops.find("absolute"))->docList()->found);
   }
 
+  void checkReductions(const std::map<int64_t, float>& values,
+                       const std::map<int64_t, std::string>& tags, std::string_view text) {
+    auto order = localReq(helper.getSearchEngine());
+    order->topDocs().allQuery().fields({"id"}).limit(-1);
+    order->execute(1); ASSERT_OK(order);
+    std::map<std::string, size_t> ordinal;
+    for (const auto& doc : order->getDocs()) ordinal.emplace(std::get<std::string>(*find(doc, "id")), ordinal.size());
+    std::map<std::string, std::vector<float>> rows;
+    for (auto [tag, value] : values) rows[tags.at(tag)].push_back(value);
+    for (auto mode : {"max", "min", "sum", "avg", "none"}) {
+      int32_t minimum = 1 + (int32_t)(random() % 4);
+      int32_t maximum = random() % 2 ? minimum + (int32_t)(random() % 4) : INT32_MAX;
+      std::vector<std::pair<std::string, float>> expected;
+      for (const auto& [id, scores] : rows) {
+        if ((int64_t)scores.size() < minimum || (int64_t)scores.size() > maximum) continue;
+        float value = mode == std::string_view("min") ? *std::ranges::min_element(scores) : *std::ranges::max_element(scores);
+        if (mode == std::string_view("sum") || mode == std::string_view("avg")) {
+          double sum = 0; for (float score : scores) sum += score;
+          value = (float)(mode == std::string_view("avg") ? sum / (double)scores.size() : sum);
+        } else if (mode == std::string_view("none")) value = 0;
+        expected.emplace_back(id, value);
+      }
+      std::ranges::sort(expected, [&](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second > b.second : ordinal.at(a.first) < ordinal.at(b.first);
+      });
+      for (int64_t count : {(int64_t)0, (int64_t)1, (int64_t)expected.size(), (int64_t)expected.size()+1, (int64_t)-1}) {
+        for (int repeat = 0; repeat < 3; repeat++) {
+          SCOPED_TRACE(::testing::Message() << mode << '/' << minimum << '/' << maximum << '/' << count << '/' << repeat);
+          auto req = localReq(helper.getSearchEngine());
+          auto query = qb::toParent(req->mr, "items_nested", expr(text), mode);
+          auto& join = std::get<api::ToParentQuery>(query.kind);
+          join.min_children = minimum; join.max_children = maximum;
+          req->topDocs().getScores().countLimit(count).limit(repeat ? 100 : 4).fields({"id"}).rawQuery() = query;
+          req->execute(1); ASSERT_OK(req);
+          auto docs = req->getDocs();
+          ASSERT_EQ(std::min(expected.size(), repeat ? (size_t)100 : (size_t)4), docs.size());
+          if (!docs.empty()) {
+            auto scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
+            for (size_t i = 0; i < docs.size(); i++) {
+              EXPECT_EQ(expected[i].first, std::get<std::string>(*find(docs[i], "id")));
+              EXPECT_EQ(expected[i].second, scores[i]);
+            }
+          }
+          if (count) {
+            if (req->docList()->found_gte) { EXPECT_EQ(count, *req->docList()->found); EXPECT_GE(expected.size(), (size_t)count); }
+            else { EXPECT_EQ(expected.size(), *req->docList()->found); }
+          } else { EXPECT_FALSE(req->docList()->found.has_value()); }
+        }
+      }
+    }
+  }
+
   void checkScores(bool phrase) {
     std::map<int64_t, std::string> tags;
     for (const auto& root : model) if (root.live) for (const auto& item : root.items) {
@@ -284,6 +337,7 @@ protected:
         .rawOp().domain.emplace().to = "items_nested";
     child->execute(1); ASSERT_OK(child); EXPECT_EQ((int64_t)tags.size(), child->getMatchCount());
     std::map<std::string, float> best;
+    std::map<int64_t, float> orderedScores;
     size_t seen = 0;
     for (const auto* response : child->responses) {
       auto* value = response->proto.ops.find("q");
@@ -295,11 +349,13 @@ protected:
       auto scores = std::get<api::ColFloat>(columns.find("_score_")->kind).v;
       ASSERT_EQ(ids.size(), scores.size());
       for (size_t i = 0; i < ids.size(); i++) {
+        orderedScores.emplace(ids[i], scores[i]);
         ASSERT_TRUE(tags.contains(ids[i])); best[tags.at(ids[i])] = std::max(best[tags.at(ids[i])], scores[i]);
       }
       seen += ids.size();
     }
     EXPECT_EQ(tags.size(), seen);
+    if (!phrase) checkReductions(orderedScores, tags, text);
     for (int form = 0; form < 3; form++) {
       auto req = localReq(helper.getSearchEngine());
       auto& op = req->topDocs().getScores().countLimit().limit(-1).batchSize(4096).fields({"id"});

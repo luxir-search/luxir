@@ -461,7 +461,7 @@ luxir::Query* ProtobufQueryParser::parseExpr(
 }
 
 template <class Lower>
-Query* ProtobufQueryParser::inPath(std::string_view path, bool maximum, Lower&& lower) {
+Query* ProtobufQueryParser::inPath(std::string_view path, RowReduction reduction, Lower&& lower) {
   auto* req = context.view.owner();
   if (!req || !context.view.get()) throw RequestError("to_parent requires a searched reader");
   auto& destination = context.view.reader();
@@ -473,7 +473,7 @@ Query* ProtobufQueryParser::inPath(std::string_view path, bool maximum, Lower&& 
   auto restore = scope_guard([&]() noexcept { context.collapse = collapse; });
   context.collapse = nullptr;
   auto* child = lower();
-  return child ? pool.make<ToParentQuery>(child, *planning, relation, maximum) : nullptr;
+  return child ? pool.make<ToParentQuery>(child, *planning, relation, reduction) : nullptr;
 }
 
 template <class Leaf, class Lower>
@@ -489,11 +489,11 @@ Query* ProtobufQueryParser::parseLeaf(const Leaf& leaf, Lower&& lower) {
   const auto& target = context.fields.resolve(leaf.field, op, context.opName);
   if constexpr (std::is_same_v<Leaf, api::ExistsQuery>) {
     if (target.fieldType->type() == FieldType::NESTED) {
-      return inPath(target.physicalName, true, [&] { return pool.make<AllQuery>(); });
+      return inPath(target.physicalName, {RowReduction::MAXIMUM}, [&] { return pool.make<AllQuery>(); });
     }
   }
   if (target.path == context.fields.path()) return lower(target);
-  return inPath(target.path, true, [&] { return lower(target); });
+  return inPath(target.path, {RowReduction::MAXIMUM}, [&] { return lower(target); });
 }
 
 luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery& query) {
@@ -501,11 +501,19 @@ luxir::Query* ProtobufQueryParser::parseToParent(const luxir::api::ToParentQuery
     throw RequestError("to_parent requires a child query");
   }
   if (query.path.empty()) throw RequestError("to_parent requires a descendant path");
-  if (!query.score.empty() && query.score != "none" && query.score != "max") {
-    throw RequestError("to_parent score must be none or max");
-  }
+  RowReduction reduction{RowReduction::MAXIMUM};
+  if (query.score.empty() || query.score == "max") {}
+  else if (query.score == "none") reduction.kind = RowReduction::NONE;
+  else if (query.score == "min") reduction.kind = RowReduction::MINIMUM;
+  else if (query.score == "sum") reduction.kind = RowReduction::SUM;
+  else if (query.score == "avg") reduction.kind = RowReduction::AVERAGE;
+  else throw RequestError("to_parent score must be max, min, sum, avg or none");
+  reduction.min = query.min_children.value_or(1);
+  reduction.max = query.max_children.value_or(std::numeric_limits<int32_t>::max());
+  if (reduction.min < 1) throw RequestError("to_parent min_children must be >= 1");
+  if (reduction.max < reduction.min) throw RequestError("to_parent max_children must be >= min_children");
   const auto& path = context.fields.resolvePath(query.path);
-  return inPath(path.physicalName, query.score != "none", [&] { return parse(*query.query); });
+  return inPath(path.physicalName, reduction, [&] { return parse(*query.query); });
 }
 
 luxir::Query* ProtobufQueryParser::parseConstantScore(
@@ -663,7 +671,7 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
               + field.target->path + "'; use per_field or explicit to_parent queries");
         }
       }
-      return path == context.fields.path() ? lower() : inPath(path, true, lower);
+      return path == context.fields.path() ? lower() : inPath(path, {RowReduction::MAXIMUM}, lower);
     }
     case Mode::PER_FIELD: {
       auto clauses = pool.make_span<Query*>(resolved.size());
@@ -672,7 +680,7 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
         auto lower = [&] { return builder.createMultiMatchField(field, query.text, op, query.min_match,
             query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt); };
         const auto& path = field.target->path;
-        auto* clause = path == context.fields.path() ? lower() : inPath(path, true, lower);
+        auto* clause = path == context.fields.path() ? lower() : inPath(path, {RowReduction::MAXIMUM}, lower);
         if (clause) clauses[count++] = clause;
       }
       return count ? DisMaxQuery::make(pool, clauses.first(count), tie) : builder.matchNoDocs();

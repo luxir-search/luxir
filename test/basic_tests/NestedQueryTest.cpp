@@ -387,7 +387,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
     EXPECT_EQ(1, run->getMatchCount()); EXPECT_EQ(1, run->getMatchCount("filtered"));
     EXPECT_TRUE(containsDoc(run->getDocs(), flatdoc("id", "b")));
     if (mode == std::string_view("none")) {
-      EXPECT_FLOAT_EQ(1.0f, std::get<api::ColFloat>(run->docList()->columns.find("_score_")->kind).v[0]);
+      EXPECT_FLOAT_EQ(0.0f, std::get<api::ColFloat>(run->docList()->columns.find("_score_")->kind).v[0]);
     }
   }
   auto req = localReq(helper.getSearchEngine());
@@ -402,7 +402,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
     for (bool seek : {false, true}) {
       auto* input = weight->scorerSupplier(pool, child->segments()[0]);
       EXPECT_EQ(Query::ReportedTwoPhase::YES, input->describeScorer({}).reportedTwoPhase);
-      auto* supplier = relation.reduce(pool, 0, *input, nullptr, maximum ? RowRelation::Reduction::MAXIMUM : RowRelation::Reduction::NONE, 1.0f);
+      auto* supplier = relation.reduce(pool, 0, *input, nullptr, RowReduction{maximum ? RowReduction::MAXIMUM : RowReduction::FIXED}, 1.0f);
       auto* scorer = buildScorerForTests(pool, *supplier, 6);
       ASSERT_NE(nullptr, scorer); EXPECT_EQ(1, seek ? scorer->advance(1) : scorer->next());
       float score = scorer->score(); EXPECT_GT(score, 0);
