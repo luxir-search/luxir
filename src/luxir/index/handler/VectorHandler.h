@@ -62,6 +62,8 @@ protected:
   // Persist the valueRank -> docId map for multi-valued vector fields so the kNN
   // engine can group per-vector hits back to their owning document.
   bool writesValueDocMap() const override { return true; }
+  // Flat kNN scans read the values by range on lazy storage.
+  bool valuesFileApart() const override { return true; }
 
 public:
   void index(Inverter& inverter, const IndexVal& val) override {

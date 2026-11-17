@@ -83,6 +83,7 @@ private:
   // Files available for use, sorted so largest are at the back. Reusing the
   // largest keeps residual streams small enough to fold into file 0 at finish.
   std::vector<OutputStream*> freeFiles;
+  size_t retiredFiles = 0;  // large column streams released for good
   std::string segStr;
 
   // Actual RAM retained by filesystem delegating files is a separate forced
@@ -99,6 +100,7 @@ private:
     uint32_t fileNum;
     bool collapseProtected = false;
     bool collapsed = false;
+    bool retired = false;  // holds a large column apart (getColumnOutputStream)
   };
 
   struct FileRelocation {
@@ -191,43 +193,50 @@ private:
   // caller holds mutex
   void _reserveFiles(size_t numFiles) {
     while (freeFiles.size() < numFiles) {
-      uint32_t fnum = (uint32_t)files.size();
-      // TODO: in the future, if this does IO, we may not want to lock?
-      Directory::FileCreateOptions options;
-      options.ramDelegating = ramDelegatingFiles;
-      options.ramSpillBytes = RAM_SPILL_BYTES;
-      options.ramBytesChanged = [this](int64_t delta) noexcept {
-        adjustDelegatedRam(delta);
-      };
-      std::unique_ptr<File> file = directory.createFile(
-          Postings::getIndexFileName(segStr, fnum), std::move(options));
-      files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
-      files.back().out.setFile( files.back().file.get());
-      files.back().out.streamNumber = fnum;
-      // writing something at the start of the file acts as a sanity check, and also makes file locations of 0
-      // invalid (and thus distinguishable from default-initialized).
-      // TODO: think about embedding other info such as the segment id and file number?
-      files.back().out.writeBytes(Postings::LUXIR_HEADER);
       // insert at front of free list to maintain sorted order.
-      freeFiles.insert(freeFiles.begin(), &files.back().out);
+      freeFiles.insert(freeFiles.begin(), &_createFile());
     }
+  }
+
+  // caller holds mutex
+  OutputStream& _createFile() {
+    uint32_t fnum = (uint32_t)files.size();
+    // TODO: in the future, if this does IO, we may not want to lock?
+    Directory::FileCreateOptions options;
+    options.ramDelegating = ramDelegatingFiles;
+    options.ramSpillBytes = RAM_SPILL_BYTES;
+    options.ramBytesChanged = [this](int64_t delta) noexcept {
+      adjustDelegatedRam(delta);
+    };
+    std::unique_ptr<File> file = directory.createFile(
+        Postings::getIndexFileName(segStr, fnum), std::move(options));
+    files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
+    files.back().out.setFile( files.back().file.get());
+    files.back().out.streamNumber = fnum;
+    // writing something at the start of the file acts as a sanity check, and also makes file locations of 0
+    // invalid (and thus distinguishable from default-initialized).
+    // TODO: think about embedding other info such as the segment id and file number?
+    files.back().out.writeBytes(Postings::LUXIR_HEADER);
+    return files.back().out;
   }
 
 public:
   // Custom deleter that holds a reference to the factory (PostingsWriter) that was used to obtain it.
   class OutputStreamDeleter {
   public:
-    explicit OutputStreamDeleter(PostingsWriter* factory) : factory(factory) {}
+    explicit OutputStreamDeleter(PostingsWriter* factory, bool retire = false) : factory(factory), retire(retire) {}
     OutputStreamDeleter() : factory(nullptr) {}
 
     void operator()(OutputStream* os) const {
       if (os != nullptr) {
-        factory->releaseOutputStream(os);
+        if (retire) factory->retireOutputStream(os);
+        else factory->releaseOutputStream(os);
       }
     }
 
   private:
     PostingsWriter* factory;
+    bool retire = false;
   };
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
@@ -298,15 +307,54 @@ public:
     return os;
   }
 
+  // Thread-safe.  A stream for a column that queries read by range from lazy
+  // storage (vector values).  `fresh` starts a file of its own; otherwise it is
+  // the stream getOutputStream() would hand out.  Released, a stream that has
+  // reached RAM_SPILL_BYTES is retired rather than reused, so no later
+  // structure lands in its file: a reader of another field that takes its
+  // whole file would otherwise fetch all of the column with it.  Smaller
+  // streams return to the pool, so small segments keep their layout.
+  OutputStreamPtr getColumnOutputStream(bool fresh) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    _reserveFiles(1);  // file 0 holds the segment metadata; a fresh file is never it
+    OutputStream* os;
+    if (fresh) {
+      os = &_createFile();
+    } else {
+      os = freeFiles.back();
+      freeFiles.pop_back();
+    }
+    return OutputStreamPtr(os, OutputStreamDeleter(this, true));
+  }
+
+  // Thread-safe (called by OutputStreamDeleter from whichever thread drops the stream).
+  void retireOutputStream(OutputStream* os) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (os->size() < RAM_SPILL_BYTES) {
+      _releaseOutputStream(os);
+      return;
+    }
+    retiredFiles++;
+    files[os->streamNumber].retired = true;
+  }
+
   // Thread-safe (called by OutputStreamDeleter from whichever thread drops the stream).
   void releaseOutputStream(OutputStream* os) {
     const std::lock_guard<std::mutex> lock(mutex);
+    _releaseOutputStream(os);
+  }
+
+private:
+  // caller holds mutex
+  void _releaseOutputStream(OutputStream* os) {
     auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
       return a->size() < b->size();
     };
     auto it = std::upper_bound(freeFiles.begin(), freeFiles.end(), os, compareBySize);
     freeFiles.insert(it, os);
   }
+
+public:
 
   void releaseOutputStreams(std::span<OutputStreamPtr> streams) {
     for (auto& streamPtr : streams) {
@@ -359,7 +407,7 @@ public:
 
     // Make sure that there are no outstanding files.
     // Do this for non-debug mode as well?
-    assert(freeFiles.size() == files.size());
+    assert(freeFiles.size() + retiredFiles == files.size());
     Signal::emit("postingsBeforeCollapse", this);
     std::vector<uint32_t> survivorFileNums = collapseFiles();
     spaceDescriptors[0].maxDoc = maxDoc;
@@ -518,10 +566,22 @@ private:
       }
     }
 
-    OutputStream& target = files[0].out;
+    // A large column kept apart in file 0 must not receive the small streams
+    // (their readers take whole files): they fold into the first other file
+    // that is neither retired nor pinned, which then survives.
+    uint32_t targetNum = 0;
+    if (files[0].retired) {
+      targetNum = (uint32_t) files.size();
+      for (uint32_t fileNum = 1; fileNum < (uint32_t) files.size(); fileNum++) {
+        if (!files[fileNum].retired && !files[fileNum].collapseProtected && referenced[fileNum]) {
+          targetNum = fileNum;
+          break;
+        }
+      }
+    }
     for (uint32_t fileNum = 1; fileNum < (uint32_t) files.size(); fileNum++) {
       DataFile& source = files[fileNum];
-      if (source.collapseProtected) continue;
+      if (source.collapseProtected || source.retired || fileNum == targetNum) continue;
       if (!referenced[fileNum] && source.out.isRelocatable()
           && source.out.size() == Postings::LUXIR_HEADER.size()) {
         // Buffered bytes are discarded at destruction (FSFile never flushes on
@@ -530,10 +590,11 @@ private:
         relocations[fileNum] = {DROPPED_FILE, 0};
         continue;
       }
+      if (targetNum == (uint32_t) files.size()) continue;  // nothing to fold into
       uint64_t baseOffset = 0;
-      if (target.tryAppendRelocatable(source.out, MAX_ALIGN, baseOffset)) {
+      if (files[targetNum].out.tryAppendRelocatable(source.out, MAX_ALIGN, baseOffset)) {
         source.collapsed = true;
-        relocations[fileNum] = {0, baseOffset};
+        relocations[fileNum] = {targetNum, baseOffset};
       }
     }
 

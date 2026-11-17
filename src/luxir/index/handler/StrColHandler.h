@@ -171,6 +171,12 @@ protected:
   /// single-valued fields valueRank == docRank, so no map is ever written.
   virtual bool writesValueDocMap() const { return false; }
 
+  /// Whether a large value column keeps its segment file to itself
+  /// (PostingsWriter::getColumnOutputStream): queries read it by range from
+  /// lazy storage, and sharing a file with structures read whole would fetch
+  /// the column with them.
+  virtual bool valuesFileApart() const { return false; }
+
 private:
   void addValue(Inverter& inverter, std::string_view val) {
     int32_t valSize = (int32_t)val.size();
@@ -186,7 +192,8 @@ private:
       return bufferedValuesOut;
     }
     if (streamedValuesOut == nullptr) {
-      streamedValuesOut = inverter.getPostingsWriter().getOutputStream();
+      auto& writer = inverter.getPostingsWriter();
+      streamedValuesOut = valuesFileApart() ? writer.getColumnOutputStream(false) : writer.getOutputStream();
       streamedValuesLoc = streamedValuesOut->slocation();
     }
     return *streamedValuesOut;
@@ -228,7 +235,8 @@ public:
     // the output in finishIndexing(), before any field flush began.
     if (valueStorage == ValueStorage::BUFFERED) {
       bufferedValuesOut.flush(true);
-      OutputStreamPtr out = postingsWriter.getOutputStream();
+      OutputStreamPtr out = valuesFileApart() ? postingsWriter.getColumnOutputStream(false)
+                                              : postingsWriter.getOutputStream();
       fieldInfo.columnLoc = out->slocation();
       out->appendFile(valuesFile);
       // no metadata for the raw value bytes; columnMetaOff is the size of the column.

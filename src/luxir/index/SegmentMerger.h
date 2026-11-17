@@ -2207,8 +2207,17 @@ private:
 
     bool multiValued = (outputFieldInfo.flags & FieldType::MULTI_VALUED) != 0;
 
-    // Output stream for the concatenated value bytes.
-    OutputStreamPtr valuesOut = postingsWriter.getOutputStream();
+    // Output stream for the concatenated value bytes. A large vector column
+    // keeps its file to itself, as at indexing (StrColHandler::valuesFileApart):
+    // a fresh file, since the largest free stream may already hold other fields.
+    OutputStreamPtr valuesOut;
+    if (FieldType::storage(outputFieldInfo.type) == FieldType::Storage::VECTOR) {
+      uint64_t sourceBytes = 0;  // columnMetaOff is a source column's byte size
+      for (auto* f : sortedFields) if (f != nullptr) sourceBytes += (uint64_t)f->segFieldInfo.columnMetaOff;
+      valuesOut = postingsWriter.getColumnOutputStream(sourceBytes >= PostingsWriter::RAM_SPILL_BYTES);
+    } else {
+      valuesOut = postingsWriter.getOutputStream();
+    }
     outputFieldInfo.columnLoc = valuesOut->slocation();
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;
