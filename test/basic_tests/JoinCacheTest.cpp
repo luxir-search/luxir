@@ -164,14 +164,16 @@ TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReope
   EXPECT_EQ(11, count());
 }
 
-TEST_F(JoinCacheTest, childMembershipUsesTheOrdinarySourceCacheIndependentlyOfTheJoin) {
+TEST_F(JoinCacheTest, joinNeverBuildsItsChildMembershipForAnotherJoin) {
   EXPECT_EQ(6, count(0, false, 2));
   EXPECT_EQ(6, count(0, false, 2));
   auto warm = cache->counters();
-  // The composed join is cold; only its phrase source has been admitted.
+  // The composed join is cold. A join only borrows a resident child set and
+  // never builds one, so the first join left nothing for this one to hit.
   EXPECT_EQ(6, count(0, false, 3));
   EXPECT_EQ(warm.admissions, cache->counters().admissions);
-  EXPECT_GT(cache->counters().hits, warm.hits);
+  EXPECT_EQ(warm.builds, cache->counters().builds);
+  EXPECT_EQ(warm.hits, cache->counters().hits);
   cache->resize(0);
   EXPECT_EQ(6, count(0, false, 2));
   EXPECT_EQ(6, count(0, false, 3));
@@ -204,8 +206,9 @@ TEST_F(JoinCacheTest, ownerAdmissionDoesNotRequireAnAdmittedChildEntry) {
 TEST_F(JoinCacheTest, coreStableChildKeepsItsStricterScope) {
   EXPECT_EQ(12, count(0, false, 4));
   EXPECT_EQ(12, count(0, false, 4));
+  // Only the join's own membership is cached; its child is never built.
   auto entries = cache->dump(10, nullptr);
-  ASSERT_EQ(2u, entries.size());
+  ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) { EXPECT_EQ(FilterKeyScope::CORE_STABLE, entry.scope); }
   SkipStatsScope stats;
   EXPECT_EQ(12, count(0, false, 4));

@@ -109,6 +109,26 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
   EXPECT_EQ(1, SkipStats::wholeCountHits);
 }
 
+TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
+  // The relation verifies child rows lazily for the owners it visits, so a
+  // miss must not build a set over every row of the path, however often the
+  // same child recurs.
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  for (int round = 0; round < 4; round++) {
+    EXPECT_EQ(3, count("items.color:red"));
+    EXPECT_EQ(4, count("items.size:L"));
+    EXPECT_EQ(2, count("items.color:blue AND items.size:S"));
+  }
+  // Only the three whole-join keys may build, one value per segment each; a
+  // child set would add one more build per query.
+  EXPECT_EQ(3u, cache->counters().builds);
+  // A recurring child is only peeked at: no claim, no attempt.
+  EXPECT_EQ(3u, cache->counters().buildAttempts);
+  cache->validateForTest();
+}
+
 TEST_F(NestedQueryTest, uniformMaximumPreservesChildScoresAndExactBounds) {
   for (int kind = 0; kind < 6; kind++) {
     auto make = [&](auto& req) {

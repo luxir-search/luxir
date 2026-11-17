@@ -1157,7 +1157,11 @@ enum class FilterSupplierMode : uint8_t {
   // cached DocSet or uncached term postings while preserving the ordinary
   // dense cached-mask route. The caller supplies the sparse-density cutoff;
   // only the middle band stays uncached.
-  SPARSE_BATCH
+  SPARSE_BATCH,
+  // The caller has a lazy path that verifies only the candidates it visits, so
+  // building a full set for it costs more than it saves. Borrow a value that
+  // is already resident; never claim a build or own one.
+  RESIDENT_ONLY
 };
 
 inline bool disableFilterOwnForTests = false;
@@ -1179,6 +1183,7 @@ inline bool shouldOwnFilterValue(FilterSupplierMode mode, int64_t cost,
   switch (mode) {
     case FilterSupplierMode::DENSITY_ROUTED:
     case FilterSupplierMode::EXHAUSTIVE_CLAUSE:
+    case FilterSupplierMode::RESIDENT_ONLY:
       return false;
     case FilterSupplierMode::SPARSE_BATCH:
       return sparseBatchDensityInverse > 0
@@ -1235,13 +1240,16 @@ inline Query::ScorerSupplier* filterSupplier(
     return uncached;
   }
 
-  auto probe = use->probe((size_t) segment.ord);
+  auto probe = use->probe(
+      (size_t) segment.ord, mode != FilterSupplierMode::RESIDENT_ONLY);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     DocSet* docs = executionMode
             == Query::SupplierExecutionMode::RAW_MEMBERSHIP
         ? probe.docSet()
         : use->effectiveDocSet((size_t) segment.ord, reader);
     return targetPool.make<DocSetSupplier>(docs, segment);
+  } else if (mode == FilterSupplierMode::RESIDENT_ONLY) {
+    return uncached;  // ~Probe releases any build or request claim
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);

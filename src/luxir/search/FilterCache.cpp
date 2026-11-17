@@ -357,7 +357,7 @@ void FilterCache::Use::pinReaderValue(
   readerPinRequestOwned = requestOwned;
 }
 
-FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
+FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, bool claimBuild) {
   if (scope_ == FilterKeyScope::READER_STABLE
       || segmentOrd >= readerSegments.size()
       || segmentOrd >= requestSlotCount) {
@@ -418,6 +418,8 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
   if (value != nullptr) {
     return sharedHit(slot, std::move(value));
   }
+
+  if (!claimBuild) return bypass();
 
   if (!admitted || !allowsSegmentPopulation(slot->maxDoc)
       || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {

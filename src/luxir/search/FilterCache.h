@@ -404,7 +404,9 @@ public:
   public:
     ~Use();
 
-    Probe probe(size_t segmentOrd);
+    // claimBuild=false only borrows a resident value: a miss is a BYPASS that
+    // takes no build claim, counts no build attempt and spends no backoff.
+    Probe probe(size_t segmentOrd, bool claimBuild = true);
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg);
 
