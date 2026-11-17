@@ -122,8 +122,13 @@ protected:
   // Builds through the held files; `what` names the part in errors.
   template <class Open>
   std::shared_ptr<Value> getOrOpen(std::string_view what, Open&& open);
+  // Adds the reads a build of the part makes through `held`, for a fetch
+  // ahead of it, under filesMutex. Every held file whole by default: a part
+  // whose open reads only regions of large files declares those.
+  virtual void declareOpen(HeldFiles& held, ReadSet& reads) { held.declareReads(reads); }
 
 public:
+  virtual ~SegmentPart() = default;
   // The built value, or null when it is not built yet; never builds.
   std::shared_ptr<Value> peek() const noexcept { return cell.peek(); }
   // Whether a build found the part's bytes unreadable; it never retries.

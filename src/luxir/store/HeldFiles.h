@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -49,22 +50,51 @@ public:
     handles.push_back({std::string(name), std::move(handle), nullptr});
     return true;
   }
-  // Maps every held file and declares all of its bytes, for a fetch ahead of
-  // the open (file-level reads: the open reads each file by regions). The
-  // open then reads the same mappings. A file that fails to map is left out:
-  // the open maps it again and reports the failure.
-  void declareReads(ReadSet& reads) {
-    for (auto& held : handles) {
-      if (!held.file) {
-        try {
-          held.file = held.handle->map();
-        } catch (const std::exception&) {
-          continue;
-        }
-        if (!held.file) continue;
+  // The mapping of a held file, made now if need be and kept for openFile,
+  // so a fetch ahead of the open and the open read the same mapping. Null
+  // when the name is not held or fails to map: the open maps it again and
+  // reports the failure.
+  std::shared_ptr<InputFile> mapping(std::string_view name) {
+    auto* held = find(name);
+    if (!held) return nullptr;
+    if (!held->file) {
+      try {
+        held->file = held->handle->map();
+      } catch (const std::exception&) {
+        return nullptr;
       }
-      reads.push_back({held.file, {{0, (uint64_t)held.file->size()}}});
     }
+    return held->file;
+  }
+  // Declares `ranges` of a held file, clipped to its size, for a fetch ahead
+  // of the open; nothing when no range is left or the file does not map.
+  void declare(std::string_view name, std::vector<ByteRange> ranges, ReadSet& reads) {
+    auto file = mapping(name);
+    if (!file) return;
+    uint64_t size = (uint64_t)file->size();
+    size_t kept = 0;
+    for (const auto& range : ranges) {
+      if (range.offset >= size) continue;
+      ranges[kept++] = {range.offset, std::min(range.length, size - range.offset)};
+    }
+    ranges.resize(kept);
+    if (!ranges.empty()) reads.push_back({std::move(file), std::move(ranges)});
+  }
+  // Declares all of a held file.
+  void declareWhole(std::string_view name, ReadSet& reads) {
+    if (auto file = mapping(name)) reads.push_back({file, {{0, (uint64_t)file->size()}}});
+  }
+  // Declares every held file whole: for parts whose open reads all of their
+  // files (live docs, small overlays).
+  void declareReads(ReadSet& reads) {
+    for (auto& held : handles) declareWhole(held.name, reads);
+  }
+  // The names of the held files, valid while they are held.
+  std::vector<std::string_view> names() const {
+    std::vector<std::string_view> result;
+    result.reserve(handles.size());
+    for (const auto& held : handles) result.push_back(held.name);
+    return result;
   }
   bool empty() const noexcept { return handles.empty(); }
   size_t size() const noexcept { return handles.size(); }
