@@ -709,6 +709,33 @@ FilterKeyScope OwnershipRelation::appendFilterKey(FilterKeyBuilder& out, const F
   return FilterKeyScope::SEGMENT_STABLE;
 }
 
+namespace {
+
+// Separate functions: one loop's presence must not change how the other inlines.
+LUXIR_NOINLINE void addFamilies(const OwnershipMapper& mapper, DocSet& owners, DocSetBuilder& builder) {
+  owners.forEach([&](int32_t row) {
+    auto [first, end] = mapper.range(row);
+    builder.addRange(first, end);
+  });
+}
+
+// Consecutive owners have adjacent families, so a run of owners is one range.
+LUXIR_NOINLINE void addFamilyRuns(const OwnershipMapper& mapper, DocSet& owners, DocSetBuilder& builder) {
+  int32_t runFirst = 0, runEnd = 0;
+  auto addRun = [&] {
+    if (runFirst == runEnd) return;
+    auto [first, end] = mapper.range(runFirst, runEnd);
+    builder.addRange(first, end);
+  };
+  owners.forEach([&](int32_t row) {
+    if (row != runEnd) { addRun(); runFirst = row; }
+    runEnd = row + 1;
+  });
+  addRun();
+}
+
+} // namespace
+
 DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
   auto& source = one.segments()[leaf];
   auto& destination = many.segments()[leaf];
@@ -722,10 +749,11 @@ DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
   }
   DocSetBuilder builder(destination.maxDoc());
   if (mapper && domain.get()) {
-    domain.get()->forEach([&](int32_t row) {
-      auto [first, end] = mapper->range(row);
-      builder.addRange(first, end);
-    });
+    // hugin, random domains over 400K owners of 3M rows, 2026-11-17: tracking
+    // runs costs a filtered kNN 3% at half the owners and saves it 8% at
+    // three quarters and 27% at nine tenths.
+    if ((int64_t)domain.get()->card() * 3 >= (int64_t)source.maxDoc() * 2) addFamilyRuns(*mapper, *domain.get(), builder);
+    else addFamilies(*mapper, *domain.get(), builder);
   }
   return DomainVariantPlan::account(DomainHandle(builder.build()).scoped(destination), memory, "mapped domain");
 }
