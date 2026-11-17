@@ -463,13 +463,41 @@ each stored interval with the query interval. `relation` picks the test:
 {"range":{"field":"open_hours","gte":9,"lte":17,"relation":"contains"}}
 ```
 
-Bounds coerce like the field's endpoint type; date bounds round to the
-granule they name, as on a `date` field. An open query side is unbounded, and
-so is an open stored end: `{"gte":50}` contains every value from 50 up. A
-`match` on a range field, and `field:[a TO b]` in the
+Bounds follow the matching scalar type's range-query rules. For example,
+fractional long bounds round inward to integer endpoints; ingest requires
+integral long endpoints. Malformed bounds are errors even when another bound
+already makes the query empty. See [Range types](schema.md#range-types) for
+strict ingest validation and supported endpoint domains.
+
+A partial date names its whole granule: `gte: "2024-06"` includes June from
+its first millisecond and `lte: "2024-06"` through its last; `gt` and `lt`
+exclude the named granule. Luxir uses this rule at ingest too. Elasticsearch
+and OpenSearch differ: when they ingest a range field, a partial-date `lte`
+such as `"2024-06"` does not extend to the end of the month. Ingest uses UTC for dates without an explicit
+offset; query dates use the request's time zone and `now` follows the scalar
+`date` rules.
+
+An open query side and an open stored end are unbounded within the endpoint
+domain: `{"gte":50}` contains every value from 50 up. For doubles, open ends
+are `-Infinity` and `Infinity`, and explicit infinities at those ends are
+equivalent. NaN is an error. `gt: "Infinity"` and `lt: "-Infinity"` match
+nothing. Negative zero sorts below positive zero. Long and date open ends
+extend to the int64 limits.
+
+A `match` on a range field, and `field:[a TO b]` in the
 [query language](query-language.md), are `intersects` queries; `match` with
-one value finds the intervals containing it. `relation` is rejected on other
-field types.
+one value finds intervals containing it. Explicit field literals also work
+in `simple_query`. `multi_match` accepts explicitly named range fields in
+both modes, applies field weights, and skips literals that cannot coerce to
+an endpoint, as for numeric fields. Wildcard field selectors do not select
+range fields. `relation` is rejected on other field types unless it is
+`intersects`.
+
+Returned intervals omit open ends. Date endpoints follow the request's
+`date_iso`, `date_ms`, or `date_ns` output mode in ROWS and COLUMNS responses,
+with epoch milliseconds as the default. Multi-valued range fields, sort,
+facets, collapse, value expressions, and `any_of` on range fields are not
+supported.
 
 ## Constant score and boost
 

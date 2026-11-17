@@ -126,20 +126,43 @@ optional upper bound (`lte` or `lt`); a missing side is an open end:
 {"id": "promo-7", "valid": {"gte": "2024-06-01", "lt": "2024-07-01"}, "price": {"gte": 10.5, "lte": 20}}
 ```
 
-Endpoints coerce like the matching scalar type. An exclusive bound is stored
-as its inclusive neighbor (`{"gt": 5}` on `long_range` stores 6), and
-`date_range` bounds round to the granule they name, as date range queries do:
-`{"lte": "2024-06"}` ends on the last millisecond of June. A lower bound above
-the upper bound fails the document. Search results return each value as
-`{"gte": min, "lte": max}` (dates as epoch milliseconds), with an open end
-omitted.
+Ingest is strict about the endpoint type: `long_range` rejects fractional
+endpoints, and long or date endpoints outside the supported scalar domain
+fail the document. An exclusive bound moves one value inward (`{"gt": 5}` on
+`long_range` starts at 6). A lower bound above the upper bound, including an
+empty interval after exclusive bounds, fails the document.
 
-Range fields are single-valued, require `column` (the default), and do not
-support `stored` or `index: match`. `index: range` adds a points index over
-the endpoints; without it, queries scan the column. Query them with the
-[range query](query-reference.md#range-fields) and its `relation` (`intersects`,
-`contains`, or `within`). Sorting and faceting on range fields are not
-supported.
+Luxir treats a partial date as its whole granule at ingest: `{"gte": "2024-06"}`
+starts at the first millisecond of June and `{"lte": "2024-06"}` ends at its
+last millisecond. `gt` excludes the whole named granule, as does `lt`.
+Elasticsearch and OpenSearch differ: when they ingest a range field, a
+partial-date `lte` such as `"2024-06"` does not extend to the end of the month. Dates without an explicit
+offset are evaluated in UTC at ingest. `date_range` uses millisecond precision;
+ISO strings, epoch milliseconds, `now`, and date math follow the scalar
+`date` rules. Query bounds follow the scalar range-query coercion rules.
+
+For `double_range`, an open lower end is `-Infinity` and an open upper end is
+`Infinity`; explicit infinities at those ends have the same meaning. NaN is
+rejected at ingest and in queries. `gt: "Infinity"` or `lt: "-Infinity"` makes
+an empty interval. Negative and positive zero remain distinct, with `-0.0`
+below `+0.0`. Long and date open ends extend to the int64 limits.
+
+Search results return `{"gte": lower, "lte": upper}`, omitting open ends.
+Date endpoints follow the request's date output mode: epoch milliseconds by
+default, ISO strings with `date_iso`, milliseconds with `date_ms`, or
+nanoseconds with `date_ns`. This applies to both ROWS and COLUMNS responses.
+
+Range fields require `column` (the default) and support `index: "none"`
+(the default) or `index: "range"` for an optional query index. They do not
+support `stored` or `index: "match"`. Multi-valued range fields are not
+supported yet.
+
+The [range query](query-reference.md#range-fields) supports `intersects`,
+`contains`, and `within`. `match` finds intervals containing a point value;
+a partial date matches intervals overlapping its granule. `multi_match`
+accepts explicitly named range fields and field weights;
+wildcard field selectors do not select range fields. Sort, facets, collapse,
+value expressions, and `any_of` are not supported on range fields.
 
 ### `text` versus `string`
 

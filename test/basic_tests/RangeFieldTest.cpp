@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -502,6 +503,10 @@ TEST_F(RangeFieldTest, dateOutputModesAndReingest) {
       auto* found = std::get<api::Map>(value->kind).fields.find(key);
       return found ? &**found : nullptr;
     };
+    EXPECT_EQ(2, bound(0, "bkd", "gte")->asInt());
+    EXPECT_EQ(4, bound(0, "bkd", "lte")->asInt());
+    EXPECT_TRUE(std::signbit(bound(0, "price", "gte")->asDouble()));
+    EXPECT_DOUBLE_EQ(1.5, bound(0, "price", "lte")->asDouble());
     ASSERT_NE(nullptr, bound(0, "when", "gte"));
     if (std::string_view(mode) == "date_iso") {
       EXPECT_EQ("2024-01-01T00:00:00.000Z", std::get<std::string_view>(bound(0, "when", "gte")->kind));
@@ -639,5 +644,80 @@ TEST_F(RangeFieldTest, tryCoercionMatchesElements) {
       EXPECT_FALSE(other.tryCoerceIntWindow(bad, use, "other"));
       EXPECT_THROW(other.coerceIntWindow(bad, use, "other"), RequestError);
     }
+  }
+}
+
+TEST_F(RangeFieldTest, filterBesideKnn) {
+  SchemaBuilder schema;
+  auto& vector = schema.field("embedding");
+  vector.type = FieldClass::VECTOR;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper.collection());
+  ASSERT_TRUE(indexJson({
+    R"({"id":"excluded","embedding":[0,0],"bkd":{"gte":0,"lte":1},"col":{"gte":0,"lte":1}})",
+    R"({"id":"near","embedding":[1,0],"bkd":{"gte":10,"lte":20},"col":{"gte":10,"lte":20}})",
+    R"({"id":"far","embedding":[2,0],"bkd":{"gte":15,"lte":30},"col":{"gte":15,"lte":30}})"
+  }).success);
+  for (auto field : {"bkd", "col"}) {
+    EXPECT_EQ((Ids{"near"}), ids(fmt::format(R"({{"boolean":{{
+      "filter":[{{"range":{{"field":"{}","gte":17,"lte":17}}}}],
+      "required":[{{"knn":{{"field":"embedding","query":[0,0],"k":1,"exact":true}}}}]}}}})", field)));
+  }
+}
+
+TEST_F(RangeFieldTest, countOnlyWithAndWithoutDeletes) {
+  ASSERT_TRUE(indexJson({DOCS[0], DOCS[1], DOCS[2], DOCS[3], DOCS[4], DOCS[5]}).success);
+  for (int deleted = 0; deleted < 2; deleted++) {
+    for (auto [bounds, count] : {std::pair{R"("gte":18,"lte":22)", 3},
+                               std::pair{R"("gte":17,"lte":17)", 2},
+                               std::pair{R"("relation":"within")", 6}}) {
+      auto req = request(fmt::format(R"({{"query":{{"range":{{"field":"bkd",{}}}}},"limit":0,"count_limit":-1}})", bounds));
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ(count - deleted, req->getMatchCount());
+      EXPECT_TRUE(req->getDocs().empty());
+    }
+    if (!deleted) {
+      ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+    }
+  }
+}
+
+TEST_F(RangeFieldTest, nestedMissingValueAndDeletedOwner) {
+  SchemaBuilder schema;
+  schema.field("items").type = FieldClass::NESTED;
+  auto& span = schema.field("items.span");
+  span.type = FieldClass::LONG_RANGE;
+  span.index = IndexMode::RANGE;
+  schema.set(helper.collection());
+  ASSERT_TRUE(indexJson({
+    R"({"id":"a","items":[{"span":{"gte":10,"lte":20}},{}]})",
+    R"({"id":"b","items":{"span":{"gte":15,"lte":30}}})",
+    R"({"id":"missing","items":{}})"
+  }).success);
+  constexpr auto query = R"({"range":{"field":"items.span","gte":17,"lte":17}})";
+  EXPECT_EQ((Ids{"a", "b"}), ids(query));
+  ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Ids{"a"}), ids(query));
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  EXPECT_EQ((Ids{"a"}), ids(query));
+}
+
+TEST_F(RangeFieldTest, unsupportedOperations) {
+  ASSERT_TRUE(indexJson({DOCS[0]}).success);
+  for (auto json : {
+    R"({"query":"*:*","sort":"bkd asc"})",
+    R"({"query":"*:*","collapse":{"field":["bkd"]}})",
+    R"({"ops":{"f":{"field_facet":{"field":"bkd"}}}})",
+    R"({"ops":{"f":{"range_facet":{"field":"bkd","start":0,"end":10,"gap":1}}}})",
+    R"json({"ops":{"e":{"expr_op":{"expr":"min(bkd)"}}}})json",
+    R"({"query":{"any_of":{"field":"bkd","values":[17]}}})"}) {
+    SCOPED_TRACE(json);
+    auto req = request(json);
+    ASSERT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("bkd"));
+    EXPECT_NE(std::string::npos, req->errorMsg().find("not supported"));
   }
 }

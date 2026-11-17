@@ -615,8 +615,12 @@ message PluginQuery {
 // bounds follow the field's long_terms policy. Uses the field's value binding.
 //
 // Range fields (LONG_RANGE, DOUBLE_RANGE, DATE_RANGE) compare each stored
-// [min, max] interval with the query interval by `relation`. Bounds coerce
-// like the field's element type; an open side is unbounded.
+// [min, max] interval with the query interval by `relation`. Bounds use the
+// element's scalar range-query rules. Partial date bounds name their whole
+// granule. Open long/date ends extend to int64 limits; open double ends are
+// -Infinity and +Infinity. Explicit double infinities at those ends are
+// equivalent; NaN is rejected. Date endpoints in results follow date output
+// modes. Sort, facets, collapse, value expressions, and any_of are unsupported.
 message RangeQuery {
   string field = 1;
   Val gte = 2;   // lower bound, inclusive (>=)
@@ -2484,8 +2488,12 @@ message FieldDef {
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
     NESTED = 14;   // structural path of nested object rows
     // Single-valued intervals written as {"gte"|"gt": a, "lte"|"lt": b};
-    // either side may be omitted for an open end. index=range adds a 2-D
-    // points index over (min, max).
+    // either side may be omitted for an open end. Ingest rejects fractional
+    // long endpoints, out-of-domain endpoints, NaN, and empty intervals.
+    // Partial dates name their whole granule, in UTC without an explicit
+    // offset. index=range adds a query index; index=none is the default.
+    // match and explicit multi_match selectors are supported; wildcard field
+    // selectors do not select range fields. Multi-valued ranges are unsupported.
     LONG_RANGE = 18;   // int64 endpoints
     DOUBLE_RANGE = 19; // double endpoints
     DATE_RANGE = 20;   // DATE endpoints (epoch millis, ISO-8601 or date math)
