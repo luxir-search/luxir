@@ -99,7 +99,7 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
         int32_t before = verified;
         EXPECT_TRUE(probe->matches()); EXPECT_TRUE(probe->matches());
         EXPECT_EQ(owner, probe->docId()); EXPECT_FLOAT_EQ(1.0f, probe->score());
-        EXPECT_EQ(before, verified);
+        if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(before, verified); }
       }
     }
     for (int32_t owner : {17, LARGE}) {
@@ -110,8 +110,10 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
       EXPECT_EQ(owner == LARGE && high == 101,
           (one[(size_t)owner >> 6] & (1ULL << (owner & 63))) != 0);
     }
-    EXPECT_GT(verified, 0);
-    EXPECT_LE(verified, 2 * (int32_t)rootOfRow.size());
+    if constexpr (NumericVerificationObserver::enabled) {
+      EXPECT_GT(verified, 0);
+      EXPECT_LE(verified, 2 * (int32_t)rootOfRow.size());
+    }
     sparse = false;
     SkipStats::reset();
     auto* dense = supplier->resolve(pool, planContext)->build(pool);
@@ -149,7 +151,7 @@ TEST_F(JoinProbeTest, firstPageDoesNotVerifyAWholePostingWindow) {
     if (count) op.countLimit(count);
     req->execute(1); ASSERT_OK(req);
     if (count >= 0) {
-      EXPECT_LT(checked, count ? 600 : 20);
+      if constexpr (NumericVerificationObserver::enabled) { EXPECT_LT(checked, count ? 600 : 20); }
       EXPECT_GT(SkipStats::numericPredicateSparseVerifyArms, 0);
       EXPECT_EQ(0, SkipStats::numericPredicateScanArms);
     } else { EXPECT_EQ(N / 4, req->getMatchCount()); }

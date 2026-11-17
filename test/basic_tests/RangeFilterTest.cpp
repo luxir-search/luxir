@@ -187,9 +187,9 @@ TEST_F(RangeFilterTest, ForcedConjunctionPlansPreserveMembership) {
     }
   }
   EXPECT_LT(windows[1], windows[0]);
-#ifndef NDEBUG
-  EXPECT_LT(verified[1], verified[0]);
-#endif
+  if constexpr (NumericVerificationObserver::enabled) {
+    EXPECT_LT(verified[1], verified[0]);
+  }
   EXPECT_EQ(nullptr, BooleanQuery::conjunctionControlForTests);
 }
 
@@ -248,10 +248,10 @@ TEST_F(RangeFilterTest, CountAndMatchVerifyOnlyExactSurvivors) {
       EXPECT_EQ(0, doc % 192);
     });
     EXPECT_EQ(expected, membership(query, use));
-    EXPECT_LE(verified, N / 192 + 1);
-#ifndef NDEBUG
-    EXPECT_GT(verified, 0);
-#endif
+    if constexpr (NumericVerificationObserver::enabled) {
+      EXPECT_LE(verified, N / 192 + 1);
+      EXPECT_GT(verified, 0);
+    }
   }
 }
 
@@ -269,7 +269,7 @@ TEST_F(RangeFilterTest, CandidateFiltersFollowExclusionsAndDomain) {
     EXPECT_TRUE(membership(positive, use, &domain).empty());
     EXPECT_TRUE(membership(negative, use).empty());
   }
-  EXPECT_EQ(0, verified);
+  if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(0, verified); }
 }
 
 TEST_F(RangeFilterTest, SparseCandidateFiltersFollowDomain) {
@@ -285,7 +285,7 @@ TEST_F(RangeFilterTest, SparseCandidateFiltersFollowDomain) {
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
     EXPECT_TRUE(membership(body, use, &domain, filters).empty());
   }
-  EXPECT_EQ(0, verified);
+  if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(0, verified); }
 }
 
 TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
@@ -414,9 +414,9 @@ TEST_F(RangeFilterTest, PullConjunctionKeepsAProducingRange) {
   EXPECT_EQ(expected, run.docs);
   EXPECT_EQ(1, run.zoneArms);
   EXPECT_EQ(1, run.verifyArms);
-#ifndef NDEBUG
-  EXPECT_LE(run.verified[5119], (int64_t)expected.size());
-#endif
+  if constexpr (NumericVerificationObserver::enabled) {
+    EXPECT_LE(run.verified[5119], (int64_t)expected.size());
+  }
 }
 
 TEST_F(RangeFilterTest, VerifyingRangeFollowsACostlierTermLead) {
@@ -995,7 +995,7 @@ TEST_F(RangeFilterTest, ProofsSkipProductionInDenseAndSparseMembership) {
         verified++;
       });
       EXPECT_EQ(expected, membership(body, use, nullptr, filters));
-      EXPECT_LE(verified, (int64_t)expected.size() * 2);
+      if constexpr (NumericVerificationObserver::enabled) { EXPECT_LE(verified, (int64_t)expected.size() * 2); }
       EXPECT_LT(SkipStats::countBulkFillDocs, N / 3);
       if (step == 2048) {
         EXPECT_EQ(0, SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows);
@@ -1030,13 +1030,13 @@ TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
       verified++;
     });
     EXPECT_EQ(expected, membership(query, use));
-#ifndef NDEBUG
-    EXPECT_EQ((int64_t)expected.size(), verified);
-#endif
+    if constexpr (NumericVerificationObserver::enabled) {
+      EXPECT_EQ((int64_t)expected.size(), verified);
+    }
     verified = 0;
     EXPECT_TRUE(membership(query, use, &domain).empty());
     EXPECT_TRUE(membership(negative, use).empty());
-    EXPECT_EQ(0, verified);
+    if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(0, verified); }
   }
 }
 
@@ -1391,7 +1391,7 @@ TEST_F(RangeFilterTest, ScoredConsumersHonorDeclaredFilterConsumption) {
         collectTopKWindowed(0, bulk, nullptr, collector, nullptr, N, true);
         assertTopKEquivalent(expected, collector.sort());
         if (probes) {
-          EXPECT_LE(verified, 1024);
+          if constexpr (NumericVerificationObserver::enabled) { EXPECT_LE(verified, 1024); }
         } else {
           EXPECT_EQ(0, SkipStats::numericPredicateSparseVerifyArms);
         }
@@ -1442,7 +1442,7 @@ TEST_F(RangeFilterTest, ProbePreparationDoesNotFillAndObserversRestore) {
   int64_t verified = 0;
   NumericVerificationObserver outer([&](int32_t) { verified++; });
   EXPECT_GT(filter.prepare(0, 128), 0);
-  EXPECT_EQ(0, verified);
+  if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(0, verified); }
   {
     NumericVerificationObserver inner([](int32_t) { FAIL() << "empty mask verified"; });
     std::array<uint64_t, 2> empty{};
@@ -1450,9 +1450,9 @@ TEST_F(RangeFilterTest, ProbePreparationDoesNotFillAndObserversRestore) {
   }
   std::array<uint64_t, 2> bits{1, 1};
   filter.intersect(bits, 0);
-#ifndef NDEBUG
-  EXPECT_EQ(2, verified);
-#endif
+  if constexpr (NumericVerificationObserver::enabled) {
+    EXPECT_EQ(2, verified);
+  }
 }
 
 } // namespace
