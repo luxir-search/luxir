@@ -533,8 +533,8 @@ TEST_F(FieldVariantsQueryTest, columnCapabilitiesAndDynamicValueStats) {
     qb::sort(top, expression);
     req->execute(false);
     EXPECT_FALSE(req->ok());
-    EXPECT_NE(std::string::npos, req->errorMsg().find("no value column")) << req->errorMsg();
-    EXPECT_NE(std::string::npos, req->errorMsg().find("string variant")) << req->errorMsg();
+    EXPECT_NE(std::string::npos, req->errorMsg().find("value expression is not supported on text field")) << req->errorMsg();
+    EXPECT_NE(std::string::npos, req->errorMsg().find("use a string variant")) << req->errorMsg();
   }
   auto req = run(R"json({"ops":{
     "mean":{"expr_op":{"expr":"avg(book_number)"}},

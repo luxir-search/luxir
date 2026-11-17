@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
 #include "PostingsReader.h"
 #include "SegFieldInfo.h"
 #include "luxir/schema/FieldType.h"
@@ -28,11 +29,12 @@ public:
     // Field metadata lives in the catalog tail of file 0, which open fetched;
     // the rest of file 0 is not touched here. Metadata ends where the offsets
     // table begins; reads are checked against that bound.
-    const auto& catalog = postingsReader.catalog;
-    fieldIS = InputStream(catalog.ptr(0), catalog.ptr(postingsReader.fieldOffsetsLoc - postingsReader.catalogStart));
+    const auto& catalog = postingsReader.core().fieldCatalog();
+    const int64_t start = postingsReader.core().fieldCatalogStart();
+    fieldIS = InputStream(catalog.ptr(0), catalog.ptr(postingsReader.fieldOffsetsLoc - start));
     nFields = postingsReader.nFields;
     fieldOffsets = postingsReader.fieldOffsets;
-    fieldOffsetsLoc = postingsReader.fieldOffsetsLoc - postingsReader.catalogStart;
+    fieldOffsetsLoc = postingsReader.fieldOffsetsLoc - start;
   }
 
   FieldReader(PostingsReader& reader, int32_t ordinal) : FieldReader(reader) {

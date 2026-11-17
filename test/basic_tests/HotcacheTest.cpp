@@ -10,6 +10,7 @@
 #include "luxir/reader/Hotcache.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/index/PostingsWriter.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
@@ -116,7 +117,7 @@ public:
 void writeSegment(Directory& dir) {
   PostingsWriter writer(dir, 0, 1, 1);
   auto out = writer.getOutputStream();
-  auto& field = writer.addField("f");
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "f");
   field.type = FieldType::BIN;
   field.flags = FieldType::COLUMN_STORED;
   field.docsWithField = 1;
@@ -231,10 +232,11 @@ TEST_F(HotcacheSegmentTest, theHotcacheIsSortedAlignedAndSmall) {
 TEST_F(HotcacheSegmentTest, openingASegmentReadsNothingOutsideTheHotcache) {
   auto cache = writeHotcache();
   RecordingDirectory recording(*dir);
-  auto reader = PostingsReader::create(recording, segId, epoch);
-  EXPECT_EQ(1500, reader->maxDoc());
-  EXPECT_GT(reader->numFields(), 3);
-  ASSERT_NE(nullptr, reader->fieldInfo("a_un"));  // the field catalog is part of the open
+  auto core = SegmentCore::create(recording, segId, epoch);
+  PostingsReader& reader = core->rootReader();
+  EXPECT_EQ(1500, reader.maxDoc());
+  EXPECT_GT(reader.numFields(), 3);
+  ASSERT_NE(nullptr, reader.fieldInfo("a_un"));  // the field catalog is part of the open
   auto recorded = recording.recorded();
   EXPECT_FALSE(recorded.empty());
   for (const auto& [name, ranges] : recorded) {

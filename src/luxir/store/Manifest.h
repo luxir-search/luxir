@@ -93,6 +93,11 @@ struct Manifest {
     if (!info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
+    for (const auto& segment : info.segments) {
+      if (segment.merge_rows && *segment.merge_rows < segment.max_doc) {
+        throw std::runtime_error("Invalid segment merge row count");
+      }
+    }
     return info;
   }
 

@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -1008,7 +1009,7 @@ static void writeStoredSegment(RAMDir& dir, const StoredChunkFormat& format,
                                std::shared_ptr<const StoredCompressionDictionary> dictionary,
                                std::span<const std::string> docs, uint64_t segId = 1) {
   PostingsWriter postings(dir, segId, 1, (int32_t)docs.size());
-  StoredFieldsWriter stored(postings, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
+  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
   for (size_t doc = 0; doc < docs.size(); doc++) stored.addValue((int32_t)doc, "body", docs[doc]);
   stored.finish((int32_t)docs.size());
   postings.writeVersionRuns(VersionRunBuilder{});
@@ -1491,7 +1492,8 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     std::vector<std::string> docs(4096, "orphan");
     writeStoredSegment(dir, DICT_FORMAT, orphan, docs, 99);
     {
-      PostingsReader reader(dir, 99, 1);
+      SegmentCore readerCore(dir, 99, 1);
+      auto& reader = readerCore.rootReader();
       ASSERT_GT(defaultStored(reader)->chunkRegionBytes(), liveBytes);
     }
     {
@@ -1507,7 +1509,8 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     dir.clear(); // prepared dictionary must own bytes after segment mappings die
     RAMDir output;
     writeStoredSegment(output, DICT_FORMAT, pin, docs);
-    PostingsReader reader(output, 1, 1);
+    SegmentCore readerCore(output, 1, 1);
+    auto& reader = readerCore.rootReader();
     auto stored = defaultStored(reader);
     EXPECT_EQ(pin->bytes(), stored->dictionary());
     EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", "orphan"}}), readStored(*stored, 0).flat());
@@ -1535,7 +1538,8 @@ TEST_F(StoredFieldsTest, pinnedDictionaryRoundTrip) {
       RAMDir dir;
       writeStoredSegment(dir, format, std::move(prepared), docs);
       EXPECT_TRUE(pin.expired());
-      PostingsReader postings(dir, 1, 1);
+      SegmentCore postingsCore(dir, 1, 1);
+      auto& postings = postingsCore.rootReader();
       auto stored = defaultStored(postings);
       ASSERT_NE(nullptr, stored);
       EXPECT_EQ(trained, stored->dictionary());
@@ -1564,7 +1568,7 @@ TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
   auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
   RAMDir dir;
   PostingsWriter postings(dir, 1, 1);
-  StoredFieldsWriter stored(postings, "_stored_", DICT_FORMAT, prepared);
+  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, "_stored_", DICT_FORMAT, prepared);
   auto other = DICT_FORMAT;
   other.dictionaryBytes = 0;
   other.zstdLevel = 7;
@@ -1604,9 +1608,10 @@ TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
   RAMDir dir;
   std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
   writeStoredSegment(dir, DICT_FORMAT, {}, docs);
-  PostingsReader postings(dir, 1, 1);
+  SegmentCore postingsCore(dir, 1, 1);
+  auto& postings = postingsCore.rootReader();
   const auto* field = postings.fieldInfo("_stored_");
-  auto input = postings.getInputStream(field->columnLoc.filenum());
+  auto input = postings.core().getInputStream(field->columnLoc.filenum());
   const char* ptr = input.ptr((int64_t)field->columnLoc.offset() + field->columnMetaOff);
   const char* end = input.ptr(input.size());
   InputStream::readVlong(ptr, end);  // max chunk bytes
@@ -1616,7 +1621,8 @@ TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
   InputStream::readVint(ptr, end);  // max docs
   ASSERT_GE(end - ptr, 5);
   memcpy(const_cast<char*>(ptr), "\xff\xff\xff\xff\x0f", 5);  // UINT32_MAX
-  PostingsReader corrupt(dir, 1, 1);
+  SegmentCore corruptCore(dir, 1, 1);
+  auto& corrupt = corruptCore.rootReader();
   EXPECT_THROW(corrupt.fieldInfo("_stored_"), std::runtime_error);
   EXPECT_EQ(0u, corrupt.fieldCacheStats().entries);
 }
@@ -1629,7 +1635,8 @@ TEST_F(StoredFieldsTest, storedMetadataCacheSharedAndAccounted) {
   writeStoredSegment(dir, DICT_FORMAT, prepared, docs);
   auto before = fieldMetadataMemory.entryBytes.load();
   {
-    PostingsReader postings(dir, 1, 1);
+    SegmentCore postingsCore(dir, 1, 1);
+    auto& postings = postingsCore.rootReader();
     EXPECT_EQ(0u, postings.fieldCacheStats().entries);
     std::array<const PostingsReader::Field*, 8> fields{};
     std::barrier start(8);

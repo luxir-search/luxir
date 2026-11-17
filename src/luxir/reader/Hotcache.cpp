@@ -11,7 +11,7 @@
 #include <xxhash.h>
 
 #include "luxir/reader/Postings.h"
-#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/util/log.h"
 
 namespace luxir {
@@ -191,7 +191,7 @@ Hotcache Hotcache::record(Directory& dir, uint64_t segId, uint64_t creatorEpoch)
   RecordingDirectory recording(dir);
   {
     // Whatever the open touches is the hotcache; the reader goes away here.
-    auto reader = PostingsReader::create(recording, segId, creatorEpoch);
+    auto reader = SegmentCore::create(recording, segId, creatorEpoch);
     (void)reader;
   }
   std::string segStr = Postings::segmentKey(segId, creatorEpoch);
