@@ -286,12 +286,9 @@ bool compareValues(ValueOpcode opcode, T a, T b) {
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::AND:
     case ValueOpcode::OR:
     case ValueOpcode::NOT:
@@ -321,8 +318,6 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
-      case ValueOpcode::EXP:
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::ADD:
@@ -332,7 +327,6 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -374,12 +368,9 @@ ScalarKernelValue<Int> evalUnaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -431,7 +422,6 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::DIV: output = a / b; break;
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
-      case ValueOpcode::POW: throw std::logic_error("pow uses its specialized kernel");
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::NEG:
@@ -439,9 +429,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -493,10 +481,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -655,6 +640,10 @@ ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
   if (program.program.nodes[node.children[0]].type == ValueType::COLUMN_ONLY) {
     BoundStringColumn* column = program.nodes[node.children[0]].stringColumn;
+    if (program.nodes[node.children[0]].mapping) {
+      auto value = program.evalColumn(node.children[0], docid, score);
+      return ValueResult::integer(value.valid ? value.array.size : 0);
+    }
     if (column == nullptr || !column->cursor.seek(docid)) return ValueResult::integer(0);
     return ValueResult::integer(column->cursor.count());
   }
@@ -730,6 +719,7 @@ ValueResult evalReducerPoint(BoundValueProgram& program, const ValueNode& node,
   if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
   if (node.opcode != ValueOpcode::AVG
       && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+      && !program.program.nodes[first.array.node].source
       && program.nodes[first.array.node].column->multiSet()) {
     // A set column holds the doc's values ascending, so min is the
     // first present element and max the last (a NaN reads as missing).
@@ -740,6 +730,15 @@ ValueResult evalReducerPoint(BoundValueProgram& program, const ValueNode& node,
       if (next.valid) return promote(next, node.type);
     }
     return ValueResult::missing(node.type);
+  }
+  if (node.opcode != ValueOpcode::AVG && node.type == ValueType::INT64
+      && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN) {
+    auto& bound = program.nodes[first.array.node];
+    bool maximum = node.opcode == ValueOpcode::MAX;
+    int64_t raw = first.array.size >= NumColumnFormat::BULK_SIZE
+        ? bound.column->selectedRangeValue(bound.valueStart, bound.valueEnd, maximum, bound.bulkIterator->values())
+        : bound.column->selectedRangeValue(bound.valueStart, bound.valueEnd, maximum, bound.iterator->values());
+    return ValueResult::integer(raw);
   }
   ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
   double sum = 0.0;
@@ -1050,8 +1049,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
-    case ValueOpcode::EXP:
     case ValueOpcode::NONE:
     case ValueOpcode::DEF:
     case ValueOpcode::ADD:
@@ -1061,7 +1058,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1171,10 +1167,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -1264,10 +1257,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1439,12 +1429,9 @@ ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds>
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::AND:
       case ValueOpcode::OR:
       case ValueOpcode::NOT:
@@ -1950,6 +1937,10 @@ size_t nodeHash(const ValueProgram& program, const ValueNode& node) {
     add((uint8_t)node.columnType);
     add(node.columnMultiValued);
     add(node.columnIndexed);
+    if (node.source) {
+      add(node.ownerPath);
+      add(node.source->path());
+    }
   } else if (kind == ValueNodeKind::FUNCTION) {
     add(node.function);
     add((uint8_t)node.opcode);
@@ -1986,7 +1977,10 @@ bool nodeEqual(const ValueProgram& a, const ValueNode& left,
     case ValueNodeKind::COLUMN:
       return left.text == right.text && left.columnType == right.columnType
           && left.columnMultiValued == right.columnMultiValued
-          && left.columnIndexed == right.columnIndexed;
+          && left.columnIndexed == right.columnIndexed
+          && left.ownerPath == right.ownerPath
+          && (left.source == nullptr) == (right.source == nullptr)
+          && (!left.source || left.source->path() == right.source->path());
     case ValueNodeKind::FUNCTION:
       return left.function == right.function && left.opcode == right.opcode
           && left.childCount == right.childCount && left.intValue == right.intValue
@@ -2080,18 +2074,19 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                 : ValueBounds::observedInteger(segment.base,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
-      auto* fieldInfo = SegFieldInfo::column(fields[index].at(segment));
+      auto& source = node.source ? node.source->segments()[(size_t)segment.ord] : segment;
+      auto* fieldInfo = SegFieldInfo::column(fields[index].at(source));
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {
-        bound.stringColumn = pool.make<BoundStringColumn>(segment.postingsReader(), *fieldInfo);
+        bound.stringColumn = pool.make<BoundStringColumn>(source.postingsReader(), *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
-            fieldInfo->docsWithField < segment.maxDoc());
+            node.source || fieldInfo->docsWithField < source.maxDoc());
       } else {
-        bound.column.emplace(segment.postingsReader(), *fieldInfo);
+        bound.column.emplace(source.postingsReader(), *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
-        bool missing = bound.column->docsWithValue() < segment.maxDoc();
+        bool missing = node.source || bound.column->docsWithValue() < source.maxDoc();
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);
@@ -2116,6 +2111,13 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
           // cannot exclude those values to recover the non-NaN interval.
           bound.bounds = ValueBounds::unbounded(node.type, true);
         }
+      }
+      if (node.source && fieldInfo) {
+        assert(&source.segmentCore() == &segment.segmentCore());
+        OwnershipMapper mapper(segment.segmentCore(), node.ownerPath, node.source->path());
+        auto* shape = bound.stringColumn ? &bound.stringColumn->shape
+            : pool.make<ColumnShape>(source.postingsReader(), *fieldInfo);
+        bound.mapping = pool.make<BoundColumnRange>(pool, mapper, *shape);
       }
     }
   }
@@ -2208,6 +2210,17 @@ ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float
 ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   BoundValueNode& bound = nodes[index];
+  if (bound.mapping) {
+    if (bound.cachedDoc != docid) {
+      auto [first, end] = bound.mapping->range(docid);
+      bound.cachedDoc = docid;
+      bound.valueStart = first;
+      bound.valueEnd = end;
+      bound.cachedPresent = first < end;
+    }
+    return bound.cachedPresent ? ValueResult::arrayValue(node.type, index, docid, score, bound.valueEnd - bound.valueStart)
+        : ValueResult::missing(node.type);
+  }
   if (!bound.column) return ValueResult::missing(node.type);
   if (bound.cachedDoc != docid) {
     if (!bound.iterator || bound.iterator->docId() > docid) {
@@ -2412,7 +2425,11 @@ ValueResult BoundValueProgram::evalArrayElement(const ValueArrayRef& array, int6
   if (node.kind == ValueNodeKind::COLUMN) {
     BoundValueNode& bound = nodes[array.node];
     (void)evalColumn(array.node, array.docid, array.score);
-    int64_t raw = bound.iterator->values().valueAt(bound.valueStart + element);
+    // A small family uses points; a long contiguous value run amortizes a
+    // codec frame. The choice depends on values consumed, not owner density.
+    int64_t raw = node.source && array.size >= NumColumnFormat::BULK_SIZE
+        ? bound.bulkIterator->values().valueAt(bound.valueStart + element)
+        : bound.iterator->values().valueAt(bound.valueStart + element);
     if (node.columnType == FieldType::FLOAT) {
       double decoded = (double)sortableInt32ToFloat((int32_t)raw);
       if (std::isnan(decoded)) return ValueResult::missing(valueScalarType(node.type));

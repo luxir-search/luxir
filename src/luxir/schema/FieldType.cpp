@@ -70,7 +70,7 @@ void VectorFieldType::signatureProps(SignatureProps& out) const {
 
 std::string_view FieldType::typeName(Type type) {
   static constexpr std::string_view names[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip"
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip", "nested"
   };
   return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
 }
@@ -106,6 +106,8 @@ uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
     case DATE:
       DateFieldType::unitFromTypeFlags(typeFlags);
       return typeFlags;
+    case NESTED:
+      throw std::runtime_error("Nested paths cannot be persisted as fields");
     case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
     case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN: case IP:
       if (typeFlags == 0) return 0;

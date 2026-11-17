@@ -1392,6 +1392,13 @@ public:
     }
   }
 
+  void reset() requires (!Collapsed) {
+    pq.clear();
+    hitCount = 0;
+    needsSort = true;
+    for (auto& clause : clauses) clause.resetCache();
+  }
+
   int64_t totalHits() const {
     if constexpr (Admission::isDiversified) return groups->totalDocuments();
     return hitCount;

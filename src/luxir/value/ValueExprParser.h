@@ -18,6 +18,7 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/util/Cursor.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
@@ -34,6 +35,7 @@ struct ValueExprOptions {
   bool sortIntrinsics = true;
   FieldResolver* fieldResolver = nullptr;
   std::string_view opName = {};
+  ParseView* view = nullptr;
 };
 
 class ValueExprParser {
@@ -73,21 +75,16 @@ class ValueExprParser {
         literal.type = node.type;
         literal.nature = node.nature;
         literal.sourcePos = node.sourcePos;
-        literal.text = node.text;
-        if (node.opcode == ValueOpcode::NEG) {
+        // A constant's text is the exact decimal spelling it was written with,
+        // which survives negation and nothing else.
+        if (!result.valid) literal.text = node.text;
+        else if (node.opcode == ValueOpcode::NEG) {
           const auto& input = program.nodes[node.children[0]];
-          auto text = input.text;
-          if (input.kind == ValueNodeKind::CONSTANT && !text.empty()
-              && (value::lex::digit(text.front()) || text.front() == '.'
-                  || text.front() == '-' || text.front() == '+')) {
-            std::string signedText;
-            if (text.front() == '-') signedText = text.substr(1);
-            else {
-              if (text.front() == '+') text.remove_prefix(1);
-              signedText = "-";
-              signedText += text;
-            }
-            literal.text = program.copyString(signedText);
+          auto text = input.kind == ValueNodeKind::CONSTANT ? input.text : std::string_view{};
+          if (text.starts_with('-')) literal.text = text.substr(1);
+          else if (!text.empty()) {
+            if (text.front() == '+') text.remove_prefix(1);
+            literal.text = program.copyString("-" + std::string(text));
           }
         }
         literal.intValue = result.intValue;
@@ -335,7 +332,7 @@ private:
     ValueNode node;
     node.kind = ValueNodeKind::CONSTANT;
     node.sourcePos = pos;
-    node.text = program->copyString(literal.text);
+    if (!literal.hex) node.text = program->copyString(literal.text);
     if (literal.floating) {
       node.type = ValueType::DOUBLE;
       node.doubleValue = literal.doubleValue;
@@ -414,10 +411,22 @@ private:
   }
 
   uint32_t parseColumn(std::string_view name, size_t pos) {
+    // A dot after a nested path continues the field name; after any other
+    // field it introduces a type component.
+    if (cur->peek() == '.') {
+      std::string_view view = opts.fieldResolver ? opts.fieldResolver->path() : std::string_view{};
+      while (cur->peek() == '.' && opts.schema->isNestedPath(
+          view.empty() ? std::string(name) : Schema::qualify(view, name))) {
+        cur->advance();
+        auto component = value::lex::scanIdentifier(*cur);
+        if (component.empty()) fail(pos, "expected a field component after '.'");
+        name = program->copyString(fmt::format("{}.{}", name, component));
+      }
+    }
     ResolvedFieldHandle target;
     try {
       target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
-          : opts.schema->resolveFor(name, OpClass::VALUE);
+          : FieldResolver(*opts.schema).resolve(name, OpClass::VALUE, opts.opName);
     } catch (const RequestError& e) {
       fail(pos, e.what());
     }
@@ -427,8 +436,6 @@ private:
     if (cur->consume('.')) {
       componentPos = cur->position();
       std::string_view component = value::lex::scanIdentifier(*cur);
-      // Resolve real child fields here before type components when the schema
-      // supports nested documents. Leaf capability checks follow resolution.
       auto kind = field->type() == FieldType::DATE ? ValueFunction::Kind::DATE
           : field->type() == FieldType::GEO_POINT ? ValueFunction::Kind::GEO_POINT
           : ValueFunction::Kind::NUMERIC;
@@ -458,13 +465,23 @@ private:
     ValueNode node;
     node.kind = ValueNodeKind::COLUMN;
     node.columnType = field->type();
-    node.columnMultiValued = field->multiValued();
+    auto ownerPath = opts.fieldResolver ? opts.fieldResolver->path() : std::string_view{};
+    bool descendant = target.path != ownerPath;
+    if (descendant) {
+      if (!opts.view || !opts.view->get() || !opts.view->owner()) {
+        fail(pos, fmt::format("descendant field '{}' requires a searched reader", name));
+      }
+      auto scope = opts.view->scoped(target.path);
+      node.source = opts.view->get();
+      node.ownerPath = program->copyString(ownerPath);
+    }
+    node.columnMultiValued = field->multiValued() || descendant;
     node.columnIndexed = field->indexed();
     if (!numeric && !geo) {
       node.type = ValueType::COLUMN_ONLY;
     } else {
       bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-      node.type = field->multiValued()
+      node.type = node.columnMultiValued
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->valueNature();
@@ -530,31 +547,12 @@ private:
     if (!valueDecimal(resolved[field].nature) || resolved[field].type != ValueType::INT64) return;
     auto constant = constants.scalar(args[literal]);
     if (!constant || resolved[literal].nature != ValueNature::NUMBER) return;
-    const auto* source = &program->nodes[args[literal]];
-    bool negate = false;
-    while (source->kind == ValueNodeKind::FUNCTION && source->opcode == Op::NEG) {
-      negate = !negate;
-      source = &program->nodes[source->children[0]];
-    }
-    std::string signedLiteral;
+    // A written decimal literal compares by its exact spelling; any other
+    // constant compares by its value.
+    const ValueNode& source = program->nodes[args[literal]];
     api::Val literalValue;
-    auto numericText = source->text;
-    if (numericText.starts_with('-') || numericText.starts_with('+')) numericText.remove_prefix(1);
-    bool hex = numericText.starts_with("0x") || numericText.starts_with("0X");
-    if (source->kind == ValueNodeKind::CONSTANT && !source->text.empty() && !hex
-        && (value::lex::digit(source->text.front()) || source->text.front() == '.'
-            || source->text.front() == '-' || source->text.front() == '+')) {
-      auto text = source->text;
-      if (negate) {
-        if (text.front() == '-') text.remove_prefix(1);
-        else {
-          if (text.front() == '+') text.remove_prefix(1);
-          signedLiteral = "-" + std::string(text);
-          text = signedLiteral;
-        }
-      }
-      literalValue.kind = text;
-    } else if (constant->type == ValueType::INT64) literalValue.kind = constant->intValue;
+    if (source.kind == ValueNodeKind::CONSTANT && !source.text.empty()) literalValue.kind = source.text;
+    else if (constant->type == ValueType::INT64) literalValue.kind = constant->intValue;
     else literalValue.kind = constant->doubleValue;
     auto comparison = ValueFunctionRegistry::decimalComparison(function, valueDecimalScale(resolved[field].nature),
         literalValue, field == 1);
@@ -657,6 +655,8 @@ private:
       scale.intValue = valueDecimalScale(node.nature);
       auto scaleIndex = append(scale);
       node.kind = ValueNodeKind::FUNCTION;
+      node.source = nullptr;
+      node.ownerPath = {};
       node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
       node.function = ValueFunctionRegistry::decimalDecoder();
       node.opcode = ValueOpcode::NONE;
@@ -675,6 +675,11 @@ private:
       fail(value.sourcePos, fmt::format(
           "{} must be a scalar; reduce an array first, for example with min() or max()", what));
     }
+    return numericValue(node, what);
+  }
+
+  uint32_t numericValue(uint32_t node, std::string_view what) {
+    const ValueNode& value = program->nodes[node];
     if (value.type == ValueType::COLUMN_ONLY || value.nature == ValueNature::IP) {
       fail(value.sourcePos, fmt::format("{} must be numeric", what));
     }
@@ -693,7 +698,7 @@ private:
       if (argument == 0) {
         name = parseBindingName();
       } else if (argument == 1) {
-        value = numericScalar(grammar.parseExpression(), "the value of let()");
+        value = numericValue(grammar.parseExpression(), "the value of let()");
       } else {
         bindings.push_back({name, value});
         body = numericScalar(grammar.parseExpression(), "the body of let()");

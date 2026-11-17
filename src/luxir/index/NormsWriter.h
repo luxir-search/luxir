@@ -95,7 +95,7 @@ public:
                                PostingsWriter::IndexFieldInfo& fieldInfo,
                                const Stream& normBytes, DocStream& docsWithVal,
                                int32_t docsWithField) {
-    int32_t maxDoc = postingsWriter.getMaxDoc();
+    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
     assert(maxDoc >= docsWithField);
     assert(normBytes.size(pool) == docsWithField);
 
@@ -129,7 +129,7 @@ public:
                           const PreparedNorms& prepared, DocStream& docsWithVal) {
     int32_t maxDoc = prepared.maxDoc;
     int32_t docsWithField = prepared.docsWithField;
-    assert(maxDoc == postingsWriter.getMaxDoc());
+    assert(maxDoc == postingsWriter.getMaxDoc(fieldInfo.space));
     assert(maxDoc >= docsWithField);
 
     if (docsWithField == 0) {

@@ -9,6 +9,10 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   auto split = name.rfind("__");
   logicalName = name.substr(0, split);
   label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
+  if (type.type() == FieldType::NESTED) {
+    type.signatureProps(properties);
+    return;
+  }
   properties["multi"] = !type.multiValued() ? "false"
       : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";

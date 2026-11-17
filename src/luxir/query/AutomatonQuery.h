@@ -56,6 +56,8 @@ public:
         scanPlan(scanPlan),
         fittedPolicy(fittedPolicy) {}
 
+  bool hasScoredRewrite() const { return automatonKind == Kind::MATCH && caseInsensitive; }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
     return automatonKind == rhs.automatonKind && caseInsensitive == rhs.caseInsensitive

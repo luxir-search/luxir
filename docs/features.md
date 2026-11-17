@@ -155,6 +155,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Fields and templates can inherit settings with `parent`. The built-in
   `_name` and `_names` templates support people and titles:
   word search plus a whole-value variant for facets and sorting.
+- [Nested documents](guide/nested.md): lists of structured children (items,
+  variants, chunks) kept as their own rows, to any depth.
+  `items:(color:red AND size:L)` requires one item with both, a document
+  scores by its best child, and facets and other operations can run over the
+  child rows of the matching documents.
 - Field variants: one input value indexed under several representations
   (`author` for word search, `author__s` for exact facets and sorts), with
   per-operation default bindings so a bare field name does the right thing.

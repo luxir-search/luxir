@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Schema.h"
+#include "luxir/reader/Space.h"
 #include <algorithm>
 #include <memory_resource>
 #include "luxir/api/build.h"
@@ -67,6 +68,7 @@ struct ResolvedField {
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
+  bool reverseMap = true;
 };
 
 struct ResolvedOwnership {
@@ -100,11 +102,18 @@ bool Schema::validFieldName(std::string_view name) {
   constexpr size_t kMaxFieldNameBytes = 127;
   if (name == "_version_") return true;
   if (name.empty() || name.size() > kMaxFieldNameBytes || name.contains("__")) return false;
-  char c0 = name.front();
-  if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z'))) return false;
+  bool first = true;
   for (char c : name) {
-    if (!isIdChar(c)) return false;
+    if (c == '.') {
+      if (first) return false;
+      first = true;
+    } else {
+      if (first && !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+      if (!isIdChar(c)) return false;
+      first = false;
+    }
   }
+  if (first) return false;
   return true;
 }
 
@@ -292,6 +301,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.reverseMap = def.reverse_map.value_or(parentResolved.reverseMap);
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
                                               : parentResolved.geoIgnoreMalformed;
@@ -432,6 +442,15 @@ static void resolveOwnership(std::string_view name, const sv_entry_map& defMap,
 static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r) {
   const auto& def = entry.def;
   std::string name(entry.name);
+  if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored
+      || def.stored_resource || def.variants || def.defaults || def.analyzer || def.normalizer
+      || def.long_terms || def.unit || def.scale || def.dims || def.truncate_dims || def.metric
+      || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
+    throw SchemaError("Nested path cannot have value settings: " + name);
+  }
+  if (def.reverse_map && r.type != FieldClass::NESTED) {
+    throw SchemaError("reverse_map is only valid for nested fields (field: " + name + ")");
+  }
   if (analyzerSet(def) && r.type != FieldClass::TEXT) {
     throw SchemaError("analyzer is only valid for text fields (field: " + name + ")");
   }
@@ -525,6 +544,20 @@ struct FieldCompiler {
                                    const ResolvedOwnership& logical, bool derived = false) {
     if (!r.hasType) {
       throw SchemaError("Field '" + std::string(name) + "' has no type and no parent to inherit from");
+    }
+
+    if (r.type == FieldClass::NESTED) {
+      if (r.hasIndex || r.hasColumn || logical.hasMulti || logical.hasStored
+          || logical.hasStoredResource || logical.variants || logical.defaults
+          || r.analyzer || r.normalizer || r.longTerms || r.scale || r.dateUnit
+          || r.hasVectorDims || r.vectorTruncateDims || r.hasVectorMetric
+          || r.hasVectorNormalized || r.hasVectorNormalizeOnWrite || r.ann
+          || r.geoIgnoreMalformed || r.geoIgnoreZValue || derived) {
+        throw SchemaError("Nested path cannot have value settings: " + std::string(name));
+      }
+      auto type = std::make_shared<NestedFieldType>(name, r.reverseMap);
+      if (r.isTemplate) type->flags_ |= FieldType::ABSTRACT;
+      return type;
     }
 
     // Apply defaults based on type if properties were not explicitly set
@@ -755,6 +788,7 @@ struct FieldCompiler {
 };
 
 static LogicalField::Shape shapeFamily(FieldClass type) {
+  if (type == FieldClass::NESTED) return LogicalField::Shape::NESTED;
   if (type == FieldClass::VECTOR) return LogicalField::Shape::VECTOR;
   if (type == FieldClass::GEO_POINT) return LogicalField::Shape::GEO;
   return LogicalField::Shape::SCALAR;
@@ -1085,18 +1119,24 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     schema->fieldTypeMap[defaultName] = std::make_shared<StoredFieldType>(defaultName);
   }
 
+  for (const auto& e : entries) {
+    if (!e.isTemplate && !schema->findRoot(e.name).primary) {
+      throw SchemaError("Field path requires nested components: " + std::string(e.name));
+    }
+  }
   return schema;
 }
 
 
-Schema::RootField Schema::findRoot(std::string_view root) const {
-  if (!validFieldName(root)) return {};
+Schema::RootField Schema::findComponent(std::string_view root) const {
   auto entry = fieldTypeMap.find(root);
   if (entry != fieldTypeMap.end()) {
     if (entry->second->isAbstract() || entry->second->isDerived()) return {};
   } else {
     auto split = root.find_last_of('_');
-    if (split == std::string_view::npos || split == 0) return {};
+    auto dot = root.rfind('.');
+    if (split == std::string_view::npos || split == 0
+        || (dot != std::string_view::npos && split <= dot + 1)) return {};
     entry = fieldTypeMap.find(root.substr(split));
     if (entry == fieldTypeMap.end() || !entry->second->isAbstract()) return {};
   }
@@ -1113,9 +1153,42 @@ Schema::RootField Schema::findRoot(std::string_view root) const {
   return {&entry->second, owner};
 }
 
+Schema::RootField Schema::findRoot(std::string_view root) const {
+  if (!validFieldName(root)) return {};
+  size_t end = root.find('.');
+  while (end != std::string_view::npos) {
+    auto parent = findComponent(root.substr(0, end));
+    if (!parent.primary || (*parent.primary)->type() != FieldType::NESTED) return {};
+    end = root.find('.', end + 1);
+  }
+  return findComponent(root);
+}
+
+bool Schema::isNestedPath(std::string_view path) const {
+  auto root = findRoot(path);
+  return root.primary && (*root.primary)->type() == FieldType::NESTED;
+}
+
+void Schema::requirePath(std::string_view path) const {
+  if (path.empty()) return;
+  auto root = findRoot(path);
+  if (!root.primary || (*root.primary)->type() != FieldType::NESTED) {
+    throw RequestError("Nested path not found: " + std::string(path), "unknown_field");
+  }
+}
+
+std::string Schema::qualify(std::string_view path, std::string_view name) {
+  if (path.empty()) return std::string(name);
+  return std::string(path).append(".").append(name);
+}
+
 const std::shared_ptr<FieldType>* Schema::findPhysical(std::string_view name) const {
-  auto exact = fieldTypeMap.find(name);
-  if (exact != fieldTypeMap.end()) return exact->second->isAbstract() ? nullptr : &exact->second;
+  // Stored resources occupy the reserved namespace, outside logical paths.
+  if (name.starts_with('_') && name != "_version_") {
+    auto exact = fieldTypeMap.find(name);
+    return exact != fieldTypeMap.end() && dynamic_cast<StoredFieldType*>(exact->second.get())
+        ? &exact->second : nullptr;
+  }
   // Generated names are resolved root-first. Never suffix-match their tails.
   auto split = name.rfind("__");
   if (split == std::string_view::npos) return findRoot(name).primary;
@@ -1132,7 +1205,8 @@ static ResolvedFieldHandle handle(std::string_view root, std::string_view label,
   std::string physicalName(root);
   if (label != "self") physicalName.append("__").append(label);
   return {std::string(root), std::move(physicalName), &type,
-          label == "self" ? FieldRole::PRIMARY : FieldRole::VARIANT, owner};
+          label == "self" ? FieldRole::PRIMARY : FieldRole::VARIANT, owner,
+          std::string(spaceParentPath(root))};
 }
 
 ResolvedFieldHandle Schema::resolveInput(std::string_view docKey) const {
@@ -1156,6 +1230,11 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
+  if ((*root.primary)->type() == FieldType::NESTED
+      && op != OpClass::PRIMARY && op != OpClass::SEARCH && op != OpClass::EXISTS
+      && op != OpClass::RETRIEVE) {
+    throw RequestError("Nested path has no scalar value: " + std::string(rootName), "invalid_field");
+  }
   std::string_view label = "self";
   if (split != std::string_view::npos) {
     label = name.substr(split + 2);
@@ -1186,10 +1265,10 @@ FieldType* Schema::physical(std::string_view name) const {
 }
 
 std::vector<std::string> Schema::searchableFields(
-    std::span<const std::string_view> physicalNames) const {
+    std::span<const std::string_view> physicalNames, std::string_view path) const {
   std::set<std::string_view> roots;
   auto addRoot = [&](std::string_view name) {
-    if (name.empty() || name[0] == '_') return;
+    if (name.empty() || name[0] == '_' || spaceParentPath(name.substr(0, name.rfind("__"))) != path) return;
     roots.insert(name.substr(0, name.rfind("__")));
   };
   for (const auto& [name, type] : fieldTypeMap) addRoot(name);
@@ -1209,10 +1288,11 @@ std::vector<std::string> Schema::searchableFields(
       // A schema edit can retire an old dynamic root or make it too long.
       continue;
     }
-    if (termTarget(*target.fieldType)) names.emplace_back(root);
+    auto relative = path.empty() ? root : root.substr(path.size() + 1);
+    if (termTarget(*target.fieldType)) names.emplace_back(relative);
     if (target.owner) {
       for (const auto& [label, type] : target.owner->variants) {
-        if (termTarget(*type)) names.push_back(std::string(root) + "__" + label);
+        if (termTarget(*type)) names.push_back(std::string(relative) + "__" + label);
       }
     }
   }
@@ -1259,6 +1339,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
 
   // Dynamic suffix templates.  Type defaults cover index/column/stored; only
   // deviations are spelled out.  Multi-valued variants use the trailing "s".
+  add(templates, "_nested", FieldClass::NESTED);
   add(templates, "_s", FieldClass::STRING);
   add(templates, "_sc", FieldClass::STRING).index = IndexMode::NONE;
   add(templates, "_ss", FieldClass::STRING).multi = api::FieldDef::MultiMode::DEFAULT;

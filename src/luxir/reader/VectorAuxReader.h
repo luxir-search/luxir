@@ -300,6 +300,8 @@ class VectorAuxReader : public AuxReader {
   mutable RaBitQAmplitudes amplitudes;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
+  mutable std::mutex unitCountMutex;
+  mutable std::vector<std::pair<std::string, int64_t>> unitCounts;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -342,6 +344,16 @@ public:
         }
       }
     }
+  }
+
+  // Physical populations depend on the immutable source column and ownership,
+  // not on a query domain or a live-docs generation. One scalar per ancestor.
+  template <class Count> int64_t unitsWithValue(std::string_view ancestor, Count count) const {
+    std::lock_guard lock(unitCountMutex);
+    for (const auto& [path, units] : unitCounts) if (path == ancestor) return units;
+    int64_t units = count();
+    unitCounts.emplace_back(ancestor, units);
+    return units;
   }
 
   std::string_view getKind() const override { return KIND; }

@@ -572,3 +572,15 @@ level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
   field name, or a fragment of expression syntax.
 - Nesting depth is bounded per request, including expressions nested inside
   structured query nodes.
+
+
+## Groups on nested paths
+
+`items.color:red AND items.size:L` joins each clause separately (possibly
+matching different items). `items:(color:red AND size:L)` joins the group
+once, requiring the same item. Scalar-field groups still distribute their
+field over bare terms; a nested-path group establishes a view instead.
+`items:*` tests for at least one item row. Paths and field names are relative
+to the current view, so `items:(parts:(material:steel))` descends twice.
+See [Nested documents](nested.md) for structured equivalents, negation,
+filters, facets and Domain navigation.

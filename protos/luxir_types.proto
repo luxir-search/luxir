@@ -170,6 +170,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Operations evaluated on each returned row, with that row as incoming domain.
+  map<string, SearchOp> row_ops = 26;
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
@@ -329,6 +331,8 @@ message SortSpec {
 }
 
 message Query {
+  // A request-unique reference to this clause; does not affect query identity.
+  optional string name = 28;
   // An unset kind selects all documents, same as `all`.
   oneof kind {
     Match match = 1;                // selects all documents with a value match in the specified field
@@ -354,7 +358,21 @@ message Query {
     GeoPolygonQuery geo_polygon = 24; // selects GEO_POINT values inside any of several polygons
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
     PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
+    ToParentQuery to_parent = 27;   // reduces child matches onto their owners
   }
+}
+
+message ToParentQuery {
+  string path = 1;
+  Query query = 2;
+  // How matching child scores reduce to the owner's score: max (default),
+  // min, sum, avg, or none (the join contributes zero).
+  string score = 3;
+  // Fewest matching children an owner needs. Unset = 1; must be >= 1.
+  optional int32 min_children = 4;
+  // Most matching children an owner may have. Unset = unbounded; must be
+  // >= min_children.
+  optional int32 max_children = 5;
 }
 
 message ExistsQuery {
@@ -1020,6 +1038,10 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // In row_ops, select this named clause's matching descendant rows.
+  optional string from_match = 7;
+  // Relative descendant path, .. steps to ancestors, or / for root documents.
+  optional string to = 6;
   // If present, replaces the incoming domain with this query's matches
   // within live documents and the enclosing structural bucket identities.
   // If absent, inherits the incoming domain.
@@ -1949,6 +1971,8 @@ message FieldMetadataStats {
   uint64 entry_bytes = 7;
   uint64 names = 8;
   uint64 name_bytes = 9;
+  uint64 live_views = 10;
+  uint64 live_view_bytes = 11;
 }
 
 // Node memory: Luxir's own budgets and usage, and the process allocator's
@@ -2151,6 +2175,14 @@ message SegmentStats {
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
+  repeated RowSpaceStats spaces = 15; // non-root spaces; bytes already included in the segment
+}
+
+message RowSpaceStats {
+  string path = 1;
+  int32 max_doc = 2; // physical child rows, including rows of deleted roots
+  uint64 ends_bytes = 3; // payload, alignment and block directory
+  uint64 owners_bytes = 4; // zero when the reverse map is absent
 }
 
 message AuxStats {
@@ -2438,6 +2470,7 @@ message FieldDef {
     BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
     IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
+    NESTED = 14;   // structural path of nested object rows
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2559,6 +2592,10 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only. Store child-to-owner row lookups in segments written later.
+  // Unset inherits, else true. Changing it does not rewrite existing segments.
+  optional bool reverse_map = 30;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

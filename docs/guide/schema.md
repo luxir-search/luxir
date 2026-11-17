@@ -11,6 +11,7 @@ Choose a type based on how you want to search and use the values:
 
 | Type | Description and typical uses |
 |---|---|
+| `nested` | Structural object path; see [Nested documents](nested.md). Accepts an object, an array of objects, null or an empty array. |
 | `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
 | `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
@@ -210,6 +211,7 @@ The built-in templates are:
 
 | Suffix | Type and default behavior |
 |---|---|
+| `_nested` | Nested object path; structural, with no scalar value. |
 | `_s` | Indexed exact string with a column. |
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
@@ -380,6 +382,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `reverse_map` | `nested` only; defaults to `true`. Store each child row's owner in segments written from now on; see [Declaring nested paths](nested.md#declaring-nested-paths). |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
@@ -1066,3 +1069,28 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
+
+## Nested paths and qualified field names
+
+Declare nested paths and their fields by flat qualified names, for example
+`"items": "nested"` and `"items.color": "string"` in `fields`.
+Each intermediate component must be a nested path. Global suffix templates
+also work under paths: `lines_nested.color_s` needs no explicit declaration
+in the default schema. A nested path cannot declare scalar value settings,
+variants, indexing, columns or storage. Objects may contain nested paths
+recursively, up to 32 levels.
+
+A nested path's one setting is `reverse_map` (default `true`), described in
+[Declaring nested paths](nested.md#declaring-nested-paths). It can be changed
+on a live collection without reindexing.
+
+Dots separate path components. Each component starts with an ASCII letter
+and contains letters, digits or underscores. A physical name, including
+a generated `__variant` suffix, must fit in 127 bytes.
+
+Vector ANN overlays can be built on child fields using their qualified
+physical names, for example `vec.lines_nested.embedding_v`.
+
+Request field names are relative to their view: in the `items` view, `color`
+resolves to `items.color`. See [Nested documents](nested.md) for indexing,
+queries, operations on child rows, and limits.

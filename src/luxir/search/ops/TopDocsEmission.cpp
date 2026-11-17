@@ -74,7 +74,7 @@ void emitPage(const CollapsedPageSettings& settings,
       auto clauses = settings.headSort->clauses;
       if (clauses.empty()) clauses.emplace_back(SortClause::SCORE, SortField::DESC);
       headCollector = std::make_unique<FieldSortCollector>(
-          (int64_t)size, clauses, qr.req.reader.get(),
+          (int64_t)size, clauses, qr.view.get(),
           settings.getScores || settings.headSort->rankNeedsScores);
       heads.resize(size);
     }
@@ -87,7 +87,7 @@ void emitPage(const CollapsedPageSettings& settings,
     }
     auto produce = [&]<bool Identity>(size_t segnum, std::span<const CollapseKey> keys,
                        size_t begin, DocSet* eligibility, auto&& accept) {
-      auto& segment = qr.req.reader->segments()[segnum];
+      auto& segment = qr.view->segments()[segnum];
       auto release = scope_guard([&]() noexcept {
         if constexpr (!Identity) {
           if (settings.releaseSegment) settings.releaseSegment(qr, segment);
@@ -118,7 +118,7 @@ void emitPage(const CollapsedPageSettings& settings,
       }
     };
     if (settings.groupOps.empty()) {
-      if (ordinary) for (size_t segnum = 0; segnum < qr.req.reader->segments().size(); segnum++) {
+      if (ordinary) for (size_t segnum = 0; segnum < qr.view->segments().size(); segnum++) {
         produce.template operator()<false>(segnum, page->keys, 0,
             settings.domains[segnum].get(), [](size_t, int32_t) {});
       }
@@ -136,7 +136,7 @@ void emitPage(const CollapsedPageSettings& settings,
       // once per child/bucket. The executor bounds binding and domain state.
       auto domains = [&]<bool Identity>(size_t segnum, auto block,
                          const DomainHandle& eligibility, FacetBucketFeed feed) {
-        int32_t maxDoc = qr.req.reader->segments()[segnum].maxDoc();
+        int32_t maxDoc = qr.view->segments()[segnum].maxDoc();
         feedFacetBucketDomainChunks(maxDoc, block,
             FACET_BUCKET_DOMAIN_BYTES, feed, [&](auto chunk) {
               std::pmr::vector<std::pmr::vector<int32_t>> docs(&page->resource);
@@ -163,21 +163,21 @@ void emitPage(const CollapsedPageSettings& settings,
                 if constexpr (Identity) {
                   DocSetBuilder builder(maxDoc);
                   for (int32_t doc : members) builder.add(doc);
-                  result.emplace_back(builder.build());
+                  result.push_back(DomainHandle(builder.build()).scoped(qr.view->segments()[segnum]));
                 } else {
                   auto charge = std::make_shared<DomainVariantPlan::DomainCharge>(
                       qr.req.memoryTracker, sizeof(ArrDocSet) + members.size() * sizeof(int32_t),
                       "group bucket domain", "collapse member state");
                   result.push_back(DomainHandle(std::make_unique<ArrDocSet>(
                       std::vector<int32_t>(members.begin(), members.end())))
-                      .chargedWith(std::move(charge)));
+                      .scoped(qr.view->segments()[segnum]).chargedWith(std::move(charge)));
                 }
               }
               return result;
             });
       };
       FacetBucketBlockExecutor::execute<size_t>(calc, children, buckets,
-          *qr.req.reader, FacetBucketProducer::JOINT,
+          *qr.view, FacetBucketProducer::JOINT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             domains.template operator()<false>(segnum, block,
                 settings.domains[segnum], feed);
@@ -233,7 +233,7 @@ void emitPage(const CollapsedPageSettings& settings,
       if constexpr (!metricOrder) {
         if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
           emitCollapseRank(ranks[i - begin], settings.sort,
-              *qr.req.reader, rank.doc, rank.score, mr);
+              *qr.view, rank.doc, rank.score, mr);
         }
       }
     }
@@ -243,7 +243,7 @@ void emitPage(const CollapsedPageSettings& settings,
       else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
     }
   };
-  emitDocsResponse(qr.req, qr.flags, getDocList,
+  emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
     (int64_t)scoreDocs.size(),
     [scoreDocs, page, offset](int64_t i) {
       return page ? page->heads[(size_t)(i - offset)] : scoreDocs[(size_t)i].doc;
@@ -299,6 +299,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     };
     DocEmission emission = calc.underBucketSlot()
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
+    auto extra = qr.rowColumns();
 
     if (qr.diversify != nullptr) {
       fillDiversifyResponse(calc, *mergeableCollector);
@@ -310,7 +311,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     } else if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
       auto sortDocs = collector.sort();
-      emitDocsResponse(qr.req, qr.flags, getDocList,
+      emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
         (int64_t)sortDocs.size(),
         [sortDocs](int64_t i) { return sortDocs[i].doc; },
         [sortDocs](int64_t i) { return sortDocs[i].score; },
@@ -321,7 +322,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, false, false, {}, qr.decorators);
+        emission, {}, false, false, extra, qr.decorators);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -338,7 +339,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       } else if (foundGte) {
         found = qr.requirements.countLimit;
       }
-      emitDocsResponse(qr.req, qr.flags, getDocList,
+      emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },
@@ -349,7 +350,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte, foundEstimated, {}, qr.decorators);
+        emission, {}, foundGte, foundEstimated, extra, qr.decorators);
     }
   }
 

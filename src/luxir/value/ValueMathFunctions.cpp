@@ -145,7 +145,7 @@ ResolvedValue binaryArrayDoubleResolve(std::span<const ResolvedValue> args) {
 
 template <auto Fn, bool MapsArrays = false>
 struct Math2 {
-  static ValueResult apply(const ValueNode& node, ValueResult a, ValueResult b, int32_t docid) {
+  static ValueResult apply(const ValueNode& node, const ValueResult& a, const ValueResult& b, int32_t docid) {
     if (!a.valid || !b.valid) return ValueResult::missing(ValueType::DOUBLE);
     double out = Fn(numberOf(a), numberOf(b));
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
@@ -637,9 +637,9 @@ constexpr ValueFunction FUNCTIONS[] = {
     unary<LOG, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log", ValueOpcode::LOG),
     unary<LOG1P, Curve::INCREASING, -INF, INF, Domain::ABOVE_MINUS_ONE>("log1p", ValueOpcode::LOG1P),
     unary<SQRT, Curve::INCREASING, -INF, INF, Domain::NONNEGATIVE>("sqrt", ValueOpcode::SQRT),
-    unary<FLOOR>("floor", ValueOpcode::FLOOR),
-    unary<EXP>("exp", ValueOpcode::EXP),
-    binary<POW, true>("pow", ValueOpcode::POW, powBounds),
+    unary<FLOOR>("floor"),
+    unary<EXP>("exp"),
+    binary<POW, true>("pow", ValueOpcode::NONE, powBounds),
     unary<LOG2, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log2"),
     unary<LOG10, Curve::INCREASING, -INF, INF, Domain::POSITIVE>("log10"),
     unary<EXPM1, Curve::INCREASING, -1.0, INF>("expm1"),

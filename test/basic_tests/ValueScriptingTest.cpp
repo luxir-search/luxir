@@ -547,6 +547,10 @@ TEST_F(ValueScriptingTest, geoDistancesBetweenPoints) {
   auto plane = eval("plane_distance(10, 20, 10.01, 20.01)");
   auto arc = eval("arc_distance(10, 20, 10.01, 20.01)");
   EXPECT_NEAR(*arc[0], *plane[0], *arc[0] * 1e-3);
+  // Neighbors across the dateline are near, not a world apart.
+  auto planeWrap = eval("plane_distance(10, 179.995, 10.01, -179.995)");
+  auto arcWrap = eval("arc_distance(10, 179.995, 10.01, -179.995)");
+  EXPECT_NEAR(*arcWrap[0], *planeWrap[0], *arcWrap[0] * 1e-3);
   expectConstant("arc_distance(10, 20, 10, 20)", 0);
   expectConstant("arc_distance(0, 0, 0, 180)", std::numbers::pi * geo::EARTH_MEAN_RADIUS_METERS, 1e-3);
   // Bearings: east, north, south, west.
@@ -870,6 +874,8 @@ TEST_F(ValueScriptingTest, letScopeAndNameRules) {
   expectError("let(score, 1, score)", "cannot be used as a variable name");
   expectConstant("let(doc, 1, let(params, 2, doc + params))", 3);
   expectError("let(1, 1, 1)", "expected a variable name");
+  expectValues("let(a, vals_ds, sum(a))", {50, 70, std::nullopt, std::nullopt, std::nullopt});
+  expectValues("let(a, vals_ds, max(a)+max(a))", {80, 140, std::nullopt, std::nullopt, std::nullopt});
   expectError("let(a, vals_ds, a)", "must be a scalar");
   expectError("let(a, 1, vals_ds)", "must be a scalar");
   expectError("let(a, loc_p, a)", "GEO_POINT is not numeric");

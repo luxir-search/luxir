@@ -199,10 +199,10 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   EXPECT_EQ(ValueOpcode::ABS,
             parseAggregate(memory, *schema, "abs(sum(price_i))")
                 ->root().function->opcode);
-  EXPECT_EQ(ValueOpcode::FLOOR,
+  EXPECT_EQ("floor",
             parseAggregate(memory, *schema,
                            "floor(sum(price_i) / sum(foo_i))")
-                ->root().function->opcode);
+                ->root().function->name);
 
   AggregateProgram* nested =
       parseAggregate(memory, *schema, "avg(avg(prices_is))");

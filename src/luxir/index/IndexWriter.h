@@ -56,6 +56,7 @@ public:
     uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
+    int32_t mergeRows;         // largest physical row space, for merge sizing
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
@@ -69,12 +70,12 @@ public:
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
-    // The segment's open PostingsReader once the writer needed one (deletes, a merge, an overlay
+    // The segment's open core once the writer needed one (deletes, a merge, an overlay
     // build); kept until the segment is retired. Shared both ways with readers: filled from the
     // published IndexReader when that holds the segment, and handed to readers that open a
-    // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
-    // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    // snapshot this writer published (CommitSnapshot::openCores). Atomic: commit and merge
+    // threads fill it without a lock (IndexWriter::getSegmentCore).
+    std::atomic<std::shared_ptr<SegmentCore>> sharedSegmentCore = nullptr;
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
@@ -108,7 +109,13 @@ public:
 
     SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
       : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
-        maxDoc(nDocs), liveDocs(nDocs) {}
+        maxDoc(nDocs), liveDocs(nDocs), mergeRows(nDocs) {}
+
+    // Forced selection estimates child survival from the live root fraction.
+    int64_t estimatedLiveMergeRows() const {
+      if (mergeRows == maxDoc) return liveDocs;
+      return (int64_t)mergeRows * liveDocs / maxDoc;
+    }
 
     // Friendly name for logs that matches the segment filenames.
     std::string name() const {
@@ -235,16 +242,16 @@ public:
       }
     }
 
-    // TODO: deletes are not considered.  The level comes from maxDoc and a merge
+    // TODO: deletes are not considered.  The level comes from physical rows and a merge
     // needs mergeFactor segments at one level, so a mostly-deleted segment keeps
     // its level and its dead docs are reclaimed only once that level fills;
     // overwrite-heavy loads grow the index until then.
     //
     // Integer arithmetic: a floating-point log ratio rounds exact powers of the
     // merge factor (e.g. 100 docs for factor 10) down a level.
-    int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
+    int32_t _mergeLevelForRows(int32_t rows) const {
       int32_t level = 0;
-      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+      for (int64_t bound = mergeFactor; rows >= bound; bound *= mergeFactor) {
         level++;
       }
       return level;
@@ -253,7 +260,7 @@ public:
     // Reserve any merge-policy storage needed by _update(seg) before the
     // caller mutates segment ownership.  Call with indexMutex locked.
     void _prepareUpdate(SegInfo* seg) {
-      int32_t mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
+      int32_t mergeLevel = _mergeLevelForRows(seg->mergeRows);
       if (mergeLevel >= (int)levelCounts.size()) {
         levelCounts.resize(mergeLevel + 1);
       }
@@ -269,8 +276,8 @@ public:
       if (seg != nullptr) {
         segCount++;
 
-        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
-        seg->mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
+        // For MERGE_FACTOR 10, rows 0-9 = level 0, 10-99 = level 1, etc.
+        seg->mergeLevel = _mergeLevelForRows(seg->mergeRows);
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
         }
@@ -853,9 +860,9 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
-  // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
+  // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
-  std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   // Builds outstanding active names and matches new in-flight selectors on the
@@ -867,7 +874,7 @@ private:
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
-      PostingsReader& postingsReader,
+      SegmentCore& core,
       std::span<const std::string> overlayNames,
       const Schema& schema,
       VectorIndexBuilder::BuildSite buildSite,

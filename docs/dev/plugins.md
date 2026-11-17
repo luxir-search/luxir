@@ -189,6 +189,8 @@ to `top_docs`, `fusion` and the facets. On the wire a plugin op is the `plugin` 
 The maker receives a `PluginOpContext` while the request is parsed and returns a
 `SearchOp` subclass allocated with `luxir::arenaCreate` in `ctx.req.arena`:
 
+- `view` is the operation's scoped reader pin. Pass it to `SearchOp(req, view, name)`
+  and to document emission; the request's primary reader can be in another space.
 - `node()` returns the request's node by reference. Its `pluginState<T>(name)`
   accesses the same state that query makers and HTTP handlers see.
 - `parseQuery(...)` lowers and validates a query against the op's `planning()`
@@ -199,7 +201,7 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
   create its calculator under the op's own, dispatch it per segment and receive
   the merged collector.
 - `addSubs(op)` parses the nested ops into `op.subOps`. They run over whatever
-  domain the op hands their calculators (`calcAll` with one `DomainHandle` per
+  domain the op hands their calculators (`acceptAll` with one `DomainHandle` per
   segment; an empty set, never null, for a segment with no documents), and may not
   declare their own `domain`.
 

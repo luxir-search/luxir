@@ -42,6 +42,16 @@ sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
 one representation directly. See [default bindings for variants](schema.md#default-bindings-for-variants)
 and the [worked example](searching.md#field-bindings).
 
+## Clause names
+
+Any structured query object accepts an optional sibling `name`, unique within
+its request: `{"name":"recent","range":{"field":"answers.date","lte":"2012-04-08"}}`.
+A name references the subtree; it does not wrap it or change scores, equality,
+planning or cache keys. Expression strings have no name syntax, but the
+structured `expr` arm may be named. Row operations use `domain.from_match`
+to select a named clause's matching descendant rows. See
+[Per-row operations](searching.md#per-row-operations) for eligibility and errors.
+
 ## Match all and exists
 
 ```json
@@ -248,7 +258,7 @@ also set a `domain`:
 ```
 
 `domain.query` replaces the incoming document set with that query's matches
-across the collection. Without it, the operation inherits its incoming set.
+across the operation's view. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
 query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
@@ -783,6 +793,8 @@ grammar and the function-call subset.
 Vector and geographic queries use the same `Query` node and are documented
 in their own guides:
 
+- A child-field `knn` counts rows of the view where it is written; see
+  [Chunks and vectors](nested.md#chunks-and-vectors).
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
@@ -809,3 +821,22 @@ in their own guides:
 - Fuzzy expansion truncation at `max_expansions` is not reported in the response.
 - Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
   [Expansion limits](#expansion-limits).
+
+
+## Nested row queries and domains
+
+A single-field leaf naming a descendant field implicitly uses to_parent with
+score max; each leaf joins independently. Wrap a Boolean child in
+`{"to_parent":{"path":"items","query":{...}}}` for a same-item query.
+Its optional `score` is `max` (default), `min`, `sum`, `avg` or `none`
+(contributes zero), and optional `min_children` (default 1) and
+`max_children` (default unbounded) bound the number of matching children;
+see [Scoring](nested.md#scoring). An exists query on a nested
+path joins all rows of that path. Query strings additionally support nested
+field groups, such as `items:(color:red AND size:L)`.
+
+Operations move between views through `domain.to`: relative dotted descent,
+`..` or `../..` ascent, and `/` for root documents. Mixed upward/downward
+paths are reserved. Non-query field consumers must run in their field's own
+view. See [Nested documents](nested.md) for examples and the precise
+query/consumer distinction.
