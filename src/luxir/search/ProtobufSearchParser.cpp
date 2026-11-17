@@ -39,6 +39,7 @@
 
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/QueryShape.h"
+#include "luxir/query/KnnQuery.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/Overloaded.h"
@@ -1729,6 +1730,10 @@ public:
   }
 
   Query* descendantClause(Query* query, std::string& path) {
+    if (query->getKind() == QueryKind::KNN) {
+      path = ((KnnQuery*)query)->getSourcePath();
+      return query;
+    }
     if (query->getKind() == QueryKind::TO_PARENT) {
       auto& join = *(ToParentQuery*)query;
       path = join.sourcePath();

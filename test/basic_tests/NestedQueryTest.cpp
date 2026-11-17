@@ -242,8 +242,7 @@ TEST_F(NestedQueryTest, everySingleFieldLeafScopesBeforeLowering) {
       R"({"range":{"field":"$price","gte":100,"lte":500}})",
       R"({"geo_box":{"field":"$place","min_lat":-1,"max_lat":2,"min_lon":-1,"max_lon":2}})",
       R"({"geo_distance":{"field":"$place","lat":0,"lon":0,"radius_meters":200000}})",
-      R"({"geo_polygon":{"field":"$place","polygons":[{"points":[{"lat":-1,"lon":-1},{"lat":-1,"lon":2},{"lat":2,"lon":2},{"lat":2,"lon":-1},{"lat":-1,"lon":-1}]}]}})",
-      R"({"knn":{"field":"$embedding","query":[0,0],"k":1,"exact":true}})"}) {
+      R"({"geo_polygon":{"field":"$place","polygons":[{"points":[{"lat":-1,"lon":-1},{"lat":-1,"lon":2},{"lat":2,"lon":2},{"lat":2,"lon":-1},{"lat":-1,"lon":-1}]}]}})"}) {
     SCOPED_TRACE(json);
     auto req = localReq(helper.getSearchEngine());
     auto pos = json.find('$');

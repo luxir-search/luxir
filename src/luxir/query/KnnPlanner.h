@@ -75,11 +75,15 @@ struct KnnPlanner {
   struct Segment {
     int64_t vectors = 0, liveVectors = 0, docsWithValue = 0;
     int64_t eligibleDocs = 0, eligibleVectors = 0, domainSize = 0, maxDoc = 0;
+    int64_t unitsWithValue = -1, eligibleUnits = -1;
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0;
     Codec codec = Codec::FLAT;
     bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
     bool vectorsEstimated = false, pqPerListTable = false;
+
+    int64_t physicalUnits() const { return unitsWithValue < 0 ? docsWithValue : unitsWithValue; }
+    int64_t selectedUnits() const { return eligibleUnits < 0 ? eligibleDocs : eligibleUnits; }
   };
   struct Request {
     int64_t k = 0, boundedTarget = 0;
@@ -221,11 +225,11 @@ struct KnnPlanner {
     t.exact -= sign * p.exactCost; t.a += sign * p.a; t.b += sign * p.b;
     t.live += sign * s.liveVectors;
     t.eligibleVectors += sign * s.eligibleVectors;
-    t.eligibleDocs += sign * s.eligibleDocs;
-    t.exactDocs -= sign * s.eligibleDocs;
+    t.eligibleDocs += sign * s.selectedUnits();
+    t.exactDocs -= sign * s.selectedUnits();
     t.ivf += sign;
     if (s.bounded) {
-      t.boundedDocs += sign * s.eligibleDocs; t.boundedLive += sign * s.liveVectors;
+      t.boundedDocs += sign * s.selectedUnits(); t.boundedLive += sign * s.liveVectors;
       t.boundedDims += sign * (double)s.eligibleVectors * s.dims;
       t.boundedReads += sign * (double)s.eligibleVectors;
     } else {
@@ -279,9 +283,9 @@ struct KnnPlanner {
     int64_t docs = 0;
     for (size_t i = 0; i < segments.size(); i++) {
       const auto& s = segments[i];
-      t.exact += prices[i].exactCost; t.exactDocs += s.eligibleDocs;
+      t.exact += prices[i].exactCost; t.exactDocs += s.selectedUnits();
       if (canIvf(s) && s.bounded) {
-        vectorDims += (double)s.vectors * s.dims; vectors += (double)s.vectors; docs += s.docsWithValue;
+        vectorDims += (double)s.vectors * s.dims; vectors += (double)s.vectors; docs += s.physicalUnits();
       }
     }
     // One shared bounded pool. Freeze physical average reads/dimensions per

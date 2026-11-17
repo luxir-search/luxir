@@ -362,10 +362,36 @@ Text chunks are a natural use: `chunks_nested:(text_wl:"quick fox")` requires
 the phrase within one chunk, and words split across sibling chunks do not form
 a phrase.
 
-A kNN leaf on a child vector field selects the k nearest child rows, which may
-belong to fewer than k documents. Vector ANN indexes can be built on child
-fields using their qualified names, for example
-`vec.lines_nested.embedding_v`.
+A kNN clause's `k` counts rows of the view where the clause is written. At
+root, a child vector field selects distinct documents by their best child:
+
+```json
+{"query":{"knn":{"field":"chunks_nested.embedding_v","query":[1,0],"k":10}}}
+```
+
+Inside an explicit join, the same search selects child rows before the join
+reduces them, so it may match fewer than ten documents:
+
+```json
+{"query":{"to_parent":{"path":"chunks_nested","query":{
+  "knn":{"field":"embedding_v","query":[1,0],"k":10}}}}}
+```
+
+A list with `domain.to: chunks_nested` also counts child rows. At deeper paths,
+`k` counts roots, items or parts according to the view where the clause is
+written. Filters and deletes decide which rows of that view are eligible
+before the search, and an owner with no vectors is never a neighbor.
+
+An owner is scored like a document of a
+[multi-valued vector field](vector-search.md#define-a-vector-field): by its nearest
+child with `exact: true`, and by the nearest of its examined children in an
+approximate search. [Candidate budgets](vector-search.md#query-knobs) count
+owners where they count documents; with PQ or an explicit `refine_candidates`,
+one owner with thousands of near vectors can crowd the budget and leave fewer
+than `k` owners.
+
+Vector ANN indexes can be built on child fields using their qualified names,
+for example `vec.lines_nested.embedding_v`.
 
 Ordinary multi-valued vector fields already cover plain chunking, where a
 chunk is only a vector. Use nested rows when the text, vectors or other fields
@@ -387,6 +413,5 @@ of each child matter together.
 
 - Storing the submitted nested value verbatim.
 - Owner fields in sorts, facets, collapse keys and value expressions.
-- kNN counted in distinct documents.
 - Updating or addressing a single child.
 - `domain.to` paths that go up and then down.

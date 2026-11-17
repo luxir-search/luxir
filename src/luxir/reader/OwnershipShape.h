@@ -164,7 +164,14 @@ public:
 inline int32_t OwnershipShape::owner(int32_t child) const {
   assert(child >= 0 && child < nChildren);
   if (owners) return reverseOwner(child);
-  return Cursor(*this).owner(child).owner;
+  // No position to gallop from: bisect for the first end past the child.
+  int32_t low = 0, high = nParents - 1;
+  while (low < high) {
+    int32_t middle = low + (high - low) / 2;
+    if (ends.valueAt(middle) > child) high = middle;
+    else low = middle + 1;
+  }
+  return low;
 }
 
 } // namespace luxir

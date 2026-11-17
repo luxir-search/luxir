@@ -353,7 +353,12 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
     minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr,
-    similarity);
+    similarity, context.fields.path().empty() ? std::string_view{} : api::build::arenaStr(pool, context.fields.path()),
+    target.path.empty() ? std::string_view{} : api::build::arenaStr(pool, target.path), [&]() -> OwnershipRelation* {
+      if (target.path == context.fields.path() || !context.view.owner()) return nullptr;
+      auto& req = *context.view.owner();
+      return &req.ownershipRelation(*req.pinView(target.path), *context.view.get());
+    }());
 }
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(
@@ -492,6 +497,7 @@ Query* ProtobufQueryParser::parseLeaf(const Leaf& leaf, Lower&& lower) {
       return inPath(target.physicalName, {RowReduction::MAXIMUM}, [&] { return pool.make<AllQuery>(); });
     }
   }
+  if constexpr (std::is_same_v<Leaf, api::KnnQuery>) return lower(target);
   if (target.path == context.fields.path()) return lower(target);
   return inPath(target.path, {RowReduction::MAXIMUM}, [&] { return lower(target); });
 }

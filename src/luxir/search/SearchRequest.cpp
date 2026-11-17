@@ -31,7 +31,7 @@ const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader
   return scopedStates->find(scoped.path())->second.uses;
 }
 
-RowRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
+OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
   if (many.path() == one.path()) throw RequestError("domain transform requires different spaces");
   if (pinView(many.path()).get() != &many || pinView(one.path()).get() != &one) {
     throw RequestError("relation views must belong to this request");

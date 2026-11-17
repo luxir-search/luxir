@@ -793,6 +793,8 @@ grammar and the function-call subset.
 Vector and geographic queries use the same `Query` node and are documented
 in their own guides:
 
+- A child-field `knn` counts rows of the view where it is written; see
+  [Chunks and vectors](nested.md#chunks-and-vectors).
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
