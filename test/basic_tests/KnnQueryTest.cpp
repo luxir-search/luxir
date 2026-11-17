@@ -4897,6 +4897,7 @@ static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<f
     }
 
     faiss::InvertedLists::ScopedCodes codes(index.invlists, list);
+    std::vector<uint8_t> onesFactors(index.code_size, 0xff);
     auto check = [&](size_t row, float estimate) {
       const uint8_t* code = codes.get() + row * index.code_size;
       uint64_t dot = 0, popcount = 0;
@@ -4907,6 +4908,10 @@ static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<f
       auto counts = scorer.counts(code);
       ASSERT_EQ(dot, counts.dot);
       ASSERT_EQ(popcount, counts.popcount);
+      std::memcpy(onesFactors.data(), code, (d + 7) / 8);
+      auto maskedCounts = scorer.counts(onesFactors.data());
+      ASSERT_EQ(dot, maskedCounts.dot);
+      ASSERT_EQ(popcount, maskedCounts.popcount);
       float base, multiplier;
       std::memcpy(&base, code + (d + 7) / 8, sizeof(float));
       std::memcpy(&multiplier, code + (d + 7) / 8 + sizeof(float), sizeof(float));
@@ -4945,7 +4950,7 @@ TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    for (int32_t dims : {63, 100, 129, 384, 768, 1024, 1536}) {
+    for (int32_t dims : {1, 7, 8, 63, 96, 100, 129, 384, 500, 511, 512, 513, 520, 768, 1024, 1030, 1536}) {
       SCOPED_TRACE(::testing::Message() << (int)metric << '/' << dims);
       CollectionHelper h("main");
       h.clear();
@@ -4970,7 +4975,8 @@ TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
         compareRaBitQLists(*index, query, qb);
         compareRaBitQLists(*index, constant, qb, &zero);
         auto halfStep = zero;
-        halfStep[0] = 0.5f; halfStep[1] = (float)((1 << qb) - 1); // delta = 1.
+        halfStep[0] = 0.5f;
+        if (dims > 1) halfStep[1] = (float)((1 << qb) - 1); // delta = 1.
         compareRaBitQLists(*index, halfStep, qb, &zero);
         // Almost constant residuals amplify FAISS's SIMD cancellation beyond a
         // one-step difference. Keep this coverage against our scalar definition.

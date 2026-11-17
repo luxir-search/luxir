@@ -11,7 +11,7 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__AVX2__)
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512BW__) || defined(__AVX2__)
 #include <immintrin.h>
 #elif defined(__SSE4_1__)
 #include <smmintrin.h>
@@ -22,12 +22,18 @@
 namespace luxir {
 namespace {
 
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512BW__)
+constexpr size_t CHUNK_BYTES = 64;
+constexpr bool MASKED_CHUNKS = true;
+#else
+constexpr bool MASKED_CHUNKS = false;
 #if defined(__AVX2__)
 constexpr size_t CHUNK_BYTES = 32;
 #elif defined(__ARM_NEON)
 constexpr size_t CHUNK_BYTES = 16;
 #else
 constexpr size_t CHUNK_BYTES = 0;  // Hardware popcount over 64-bit words.
+#endif
 #endif
 
 constexpr size_t PREFETCH_ROWS = 6;
@@ -122,11 +128,46 @@ inline LUXIR_INLINE uint64_t transposeBits(uint64_t x) {
   return x ^ t ^ (t << 28);
 }
 
-#if defined(__AVX2__)
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512BW__)
+struct ChunkOps {
+  __mmask64 lastMask;
+
+  explicit ChunkOps(size_t codeBytes)
+      : lastMask(codeBytes % CHUNK_BYTES ? ((uint64_t)1 << (codeBytes % CHUNK_BYTES)) - 1 : ~(uint64_t)0) {}
+
+  template <int QB>
+  LUXIR_INLINE void score(const uint8_t* code, const uint8_t* planes, size_t chunks, uint64_t& dot, uint64_t& sum) const {
+    const __m512i* plane = (const __m512i*)planes;
+    __m512i weighted = _mm512_setzero_si512(), bits = _mm512_setzero_si512();
+    auto add = [&](__m512i row) LUXIR_INLINE {
+      __m512i acc = _mm512_setzero_si512();
+      for (int p = QB - 1; p >= 0; p--) {
+        __m512i count = _mm512_popcnt_epi64(_mm512_and_si512(row, _mm512_load_si512(plane + p)));
+        acc = _mm512_add_epi64(_mm512_add_epi64(acc, acc), count);
+      }
+      weighted = _mm512_add_epi64(weighted, acc);
+      bits = _mm512_add_epi64(bits, _mm512_popcnt_epi64(row));
+      plane += QB;
+    };
+    // Mask only the last chunk, which can run into the factor bytes or past the
+    // code: a masked load of every chunk costs 2x per code at 1536 dimensions.
+    for (size_t c = 0; c + 1 < chunks; c++) add(_mm512_loadu_si512(code + c * CHUNK_BYTES));
+    add(_mm512_maskz_loadu_epi8(lastMask, code + (chunks - 1) * CHUNK_BYTES));
+    // One reduction for both: dot in the even lanes, sum in the odd.
+    __m512i both = _mm512_add_epi64(_mm512_unpacklo_epi64(weighted, bits), _mm512_unpackhi_epi64(weighted, bits));
+    __m256i half = _mm256_add_epi64(_mm512_castsi512_si256(both), _mm512_extracti64x4_epi64(both, 1));
+    __m128i pair = _mm_add_epi64(_mm256_castsi256_si128(half), _mm256_extracti128_si256(half, 1));
+    dot = (uint64_t)_mm_cvtsi128_si64(pair);
+    sum = (uint64_t)_mm_extract_epi64(pair, 1);
+  }
+};
+#elif defined(__AVX2__)
 struct ChunkOps {
   __m256i lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
                                  0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
   __m256i low = _mm256_set1_epi8(0x0f);
+
+  explicit ChunkOps(size_t) {}
 
   LUXIR_INLINE __m256i popBytes(__m256i x) const {
     __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(x, low));
@@ -164,6 +205,8 @@ struct ChunkOps {
 };
 #elif defined(__ARM_NEON)
 struct ChunkOps {
+  explicit ChunkOps(size_t) {}
+
   static LUXIR_INLINE uint8x16_t horner(uint8x16_t code, const uint8_t* plane, int count) {
     uint8x16_t acc = vdupq_n_u8(0);
     for (int p = count - 1; p >= 0; p--) {
@@ -187,6 +230,8 @@ struct ChunkOps {
 };
 #else
 struct ChunkOps {
+  explicit ChunkOps(size_t) {}
+
   template <int QB>
   LUXIR_INLINE void score(const uint8_t*, const uint8_t*, size_t, uint64_t& dot, uint64_t& sum) const {
     dot = 0;
@@ -199,8 +244,10 @@ struct ChunkOps {
 
 RaBitQScorer::RaBitQScorer(int32_t dims, int32_t queryBits, bool innerProduct, const float* query)
     : query(query), dims((size_t)dims), codeBytes(((size_t)dims + 7) / 8),
-      chunks(CHUNK_BYTES == 0 ? 0 : codeBytes / std::max(CHUNK_BYTES, (size_t)1)),
-      tailWords((codeBytes - chunks * CHUNK_BYTES + 7) / 8), queryBits(queryBits), innerProduct(innerProduct),
+      chunks(CHUNK_BYTES == 0 ? 0 : (codeBytes + (MASKED_CHUNKS ? CHUNK_BYTES - 1 : 0))
+          / std::max(CHUNK_BYTES, (size_t)1)),
+      tailWords(MASKED_CHUNKS ? 0 : (codeBytes - chunks * CHUNK_BYTES + 7) / 8),
+      queryBits(queryBits), innerProduct(innerProduct),
       invSqrtDims(1.0f / std::sqrt((float)dims)), maxCode((float)((1 << queryBits) - 1)) {
   assert(dims > 0 && queryBits >= 1 && queryBits <= 8);
   constexpr size_t ALIGN = 64;
@@ -217,7 +264,7 @@ RaBitQScorer::RaBitQScorer(int32_t dims, int32_t queryBits, bool innerProduct, c
   if (innerProduct) factors.queryNormSqr = faiss::fvec_norm_L2sqr(query, this->dims);
 }
 
-// FAISS packs one bit at a time; this takes 8 (or, on AVX2, 32) dimensions at once.
+// FAISS packs one bit at a time; this takes 8, 32 or 64 dimensions at once.
 void RaBitQScorer::packPlanes() {
   const uint8_t* in = quantized;
   uint8_t* out = planes;
@@ -234,8 +281,19 @@ void RaBitQScorer::packPlanes() {
     out += qb * unit;
   };
   size_t left = dims;
-  for (size_t c = 0; c < chunks; c++, left -= CHUNK_BYTES * 8) {
-#if defined(__AVX2__)
+  for (size_t c = 0; c < chunks; c++, left = left > CHUNK_BYTES * 8 ? left - CHUNK_BYTES * 8 : 0) {
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512BW__)
+    // Only load groups that contain dimensions. Quantized is padded to 64
+    // dimensions, while the planes are padded to a whole 512-dimension chunk.
+    for (size_t batch = 0; batch < CHUNK_BYTES && batch * 8 < left; batch += 8, in += 64) {
+      __m512i q = _mm512_loadu_si512(in);
+      for (size_t p = 0; p < qb; p++) {
+        uint64_t mask = (uint64_t)_mm512_movepi8_mask(_mm512_slli_epi16(q, (int)(7 - p)));
+        std::memcpy(out + p * CHUNK_BYTES + batch, &mask, sizeof(mask));
+      }
+    }
+    out += qb * CHUNK_BYTES;
+#elif defined(__AVX2__)
     for (size_t batch = 0; batch < CHUNK_BYTES; batch += 4, in += 32) {
       __m256i q = _mm256_loadu_si256((const __m256i*)in);
       for (size_t p = 0; p < qb; p++) {
@@ -281,24 +339,26 @@ void RaBitQScorer::setList(const float* centroid) {
 
 template <int QB, class Ops>
 inline LUXIR_INLINE RaBitQScorer::Counts RaBitQScorer::countCode(const uint8_t* code, const Ops& ops) const {
-  // Only the last word can overlap the factor bytes. Planes are zero there.
-  const uint64_t lastMask = codeBytes % 8 == 0 ? ~(uint64_t)0 : ((uint64_t)1 << (codeBytes % 8 * 8)) - 1;
   uint64_t dot = 0, sum = 0;
   if constexpr (CHUNK_BYTES != 0) {
     if (chunks != 0) ops.template score<QB>(code, planes, chunks, dot, sum);
   }
-  const uint8_t* plane = planes + chunks * CHUNK_BYTES * QB;
-  for (size_t w = 0; w < tailWords; w++, plane += QB * sizeof(uint64_t)) {
-    uint64_t row = load64(code + chunks * CHUNK_BYTES + w * sizeof(uint64_t));
-    for (int p = 0; p < QB; p++)
-      dot += (uint64_t)std::popcount(row & load64(plane + (size_t)p * sizeof(uint64_t))) << p;
-    sum += (uint64_t)std::popcount(w + 1 == tailWords ? row & lastMask : row);
+  if constexpr (!MASKED_CHUNKS) {
+    // Only the last word can overlap the factor bytes. Planes are zero there.
+    const uint64_t lastMask = codeBytes % 8 == 0 ? ~(uint64_t)0 : ((uint64_t)1 << (codeBytes % 8 * 8)) - 1;
+    const uint8_t* plane = planes + chunks * CHUNK_BYTES * QB;
+    for (size_t w = 0; w < tailWords; w++, plane += QB * sizeof(uint64_t)) {
+      uint64_t row = load64(code + chunks * CHUNK_BYTES + w * sizeof(uint64_t));
+      for (int p = 0; p < QB; p++)
+        dot += (uint64_t)std::popcount(row & load64(plane + (size_t)p * sizeof(uint64_t))) << p;
+      sum += (uint64_t)std::popcount(w + 1 == tailWords ? row & lastMask : row);
+    }
   }
   return {dot, sum};
 }
 
 RaBitQScorer::Counts RaBitQScorer::counts(const uint8_t* code) const {
-  const ChunkOps ops;
+  const ChunkOps ops(codeBytes);
   switch (queryBits) {
     case 1: return countCode<1>(code, ops);
     case 2: return countCode<2>(code, ops);
@@ -314,7 +374,7 @@ RaBitQScorer::Counts RaBitQScorer::counts(const uint8_t* code) const {
 template <int QB, bool IP, bool Selected>
 LUXIR_NOINLINE void RaBitQScorer::scoreBlock(const uint8_t* codes, size_t codeSize, const uint16_t* rows,
                                              size_t count, float* LUXIR_RESTRICT out) const {
-  const ChunkOps ops;
+  const ChunkOps ops(codeBytes);
   const size_t binary = codeBytes;
   const float c1 = factors.c1, c2 = factors.c2, c34 = factors.c34;
   const float queryToCentroid = factors.queryToCentroidSqr, queryNorm = factors.queryNormSqr;

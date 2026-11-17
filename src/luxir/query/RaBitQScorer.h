@@ -42,7 +42,8 @@ private:
   Factors factors;
   // One allocation: residual floats, quantized bytes, then bit planes. Planes
   // group by position, not by plane: first `chunks` SIMD chunks of `queryBits`
-  // planes each, then `tailWords` 64-bit words of `queryBits` planes each.
+  // planes each, then `tailWords` 64-bit words of `queryBits` planes each. With
+  // masked loads, the final chunk can be partial and zero padded, with no tail.
   std::unique_ptr<uint8_t[]> storage;
   float* residual;
   uint8_t* quantized;
