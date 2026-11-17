@@ -18,12 +18,15 @@ struct SearchConfig;
 class SearchEngine {
   LuxirNode& node;
 
-  // Prepares the request, then executes it. With mayDefer, the reads that
-  // materializing its segments needs are fetched first (fetchAhead); when
-  // they do not complete inline, execution resumes on an arena worker once
-  // they finish, and no thread waits for them. ownTg is the task group run()
-  // made on its stack, which a deferred request leaves behind.
+  // Admits the request, plans it, then executes it. With mayDefer, two fetch
+  // rounds run ahead (fetchAhead): the term dictionaries that parsing seeks
+  // (declareTermReads), then what materializing the planned segments reads.
+  // When a round does not complete inline, the request resumes on an arena
+  // worker once it finishes, and no thread waits for it. ownTg is the task
+  // group run() made on its stack, which a deferred request leaves behind.
   void submitBody(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg);
+  // Parses and plans, then (after the materialize round) executes.
+  void plan(SearchRequest& req, bool mayDefer, oneapi::tbb::task_group* ownTg, std::shared_ptr<MetricScope> execution);
   // Fetches `reads` ahead of the work that needs them. False when they
   // completed inline (local files): the caller goes on. True when the request
   // was handed over: `resume` runs on an arena worker once they finish, with
@@ -43,6 +46,10 @@ class SearchEngine {
   // Runs submit() on an arena worker; -1's waits stay within the request.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
   RootOp* prepare(SearchRequest& req);
+  // prepare() in two steps: validate and acquire the reader and schema, then
+  // parse and plan (which seeks terms).
+  void admit(SearchRequest& req);
+  RootOp* parse(SearchRequest& req);
 
   /// get needed resources such as the index reader and schema
   void getResources(SearchRequest& req);
