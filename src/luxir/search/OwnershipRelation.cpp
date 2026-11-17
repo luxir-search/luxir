@@ -18,8 +18,13 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
   int32_t childDoc;
   int32_t current = -1;
   float value = 0;
+  ScoreBounds bounds;
   std::span<uint64_t> childBits;
   std::span<int64_t> boundaries;
+
+  int32_t advanceChild(int32_t target) {
+    return maximum ? child.advance(target) : child.advanceWindow(target, PostingsReader::END);
+  }
 
   void fillOwnerWindow(std::span<uint64_t> words, int32_t start, int32_t end) {
     auto run = boundaries.first((size_t)(end - start) + 1);
@@ -76,20 +81,50 @@ class OwnershipRelation::Scorer final : public Query::Scorer {
 
 public:
   Scorer(MemPool& pool, Query::Scorer& child, const OwnershipMapper& mapper,
-         DocSet* domain, int32_t ownerCount, bool maximum, float multiplier,
+         DocSet* domain, int32_t ownerCount, Reduction reduction, float multiplier,
          const Query::ScorerShape& childShape)
       : child(child), mapper(mapper), cursor(mapper, pool),
         domain(domain ? pool.make<QueryPrep::DocSetScorer>(domain, ownerCount) : nullptr),
-        ownerCount(ownerCount), maximum(maximum), multiplier(multiplier), childDoc(child.docId()),
-        childBits(!maximum && childShape.windowFillClause == Query::ClauseShape::DIRECT
+        ownerCount(ownerCount), maximum(reduction == Reduction::MAXIMUM), multiplier(multiplier), childDoc(child.docId()),
+        childBits(reduction != Reduction::MAXIMUM && childShape.windowFillClause == Query::ClauseShape::DIRECT
             ? pool.make_span<uint64_t>(DocsEnumMeta::L1_DOCS / 64) : std::span<uint64_t>{}),
-        boundaries(!maximum ? pool.make_span<int64_t>((size_t)std::min(ownerCount, DocsEnumMeta::L1_DOCS) + 1)
-            : std::span<int64_t>{}) {}
+        boundaries(reduction != Reduction::MAXIMUM ? pool.make_span<int64_t>((size_t)std::min(ownerCount, DocsEnumMeta::L1_DOCS) + 1)
+            : std::span<int64_t>{}) {
+    if (reduction == Reduction::CONSTANT) {
+      auto score = child.constantContribution();
+      if (!score) {
+        // The weight proved uniformity, but a compound may not quote its
+        // rounded sum. Read one deciding match through the bounded protocol.
+        childDoc = child.advanceWindow(0, PostingsReader::END);
+        if (childDoc == PostingsReader::END) this->ownerCount = 0;
+        else score = child.score();
+      }
+      this->multiplier = score.value_or(0.0f) * multiplier;
+    }
+    if (!maximum) bounds = ScoreBounds::exact(this->multiplier);
+    else if (multiplier == 0.0f) bounds = ScoreBounds::exact(0.0f);
+    else {
+      // Capture whole-child bounds before iteration. The child may already
+      // be beyond an owner's family when a parent asks for its score bound.
+      auto childBounds = child.getScoreBounds(PostingsReader::END);
+      bounds = {childBounds.lo * multiplier,
+                std::min(childBounds.hi, child.getMaxScore(PostingsReader::END)) * multiplier};
+    }
+  }
 
   int32_t docId() override { return current; }
   float score() override { return value; }
 
+  std::optional<float> constantContribution() const override {
+    return maximum ? std::nullopt : std::optional<float>(multiplier);
+  }
+  float getMaxScore(int32_t upTo) override { unused(upTo); return bounds.hi; }
+  float getMaxScoreForSetup(int32_t upTo) override { unused(upTo); return bounds.hi; }
+  ScoreBounds getScoreBounds(int32_t upTo) override { unused(upTo); return bounds; }
+  int32_t advanceShallowForSetup(int32_t target) override { unused(target); return PostingsReader::END; }
+
   void setMinCompetitiveScore(float floor) override {
+    if (!maximum && floor > multiplier) ownerCount = 0;
     if (maximum && multiplier > 0.0f) {
       child.setMinCompetitiveScore(Query::unscaleScoreFloor(floor, multiplier));
     }
@@ -107,7 +142,7 @@ public:
     if (target >= ownerCount) return current = PostingsReader::END;
     auto family = cursor.seek(target);
     int32_t doc = childDoc;
-    if (doc < family.first) doc = child.advance(family.first);
+    if (doc < family.first) doc = advanceChild(family.first);
     while (doc != PostingsReader::END) {
       // A child inside the sought family needs no lookup.
       if (doc >= family.end) family = cursor.owner(doc);
@@ -117,7 +152,7 @@ public:
         if (eligible != owner) {
           if (eligible >= ownerCount) return current = PostingsReader::END;
           family = cursor.seek(eligible);
-          doc = child.advance(family.first);
+          doc = advanceChild(family.first);
           continue;
         }
       }
@@ -157,9 +192,9 @@ public:
 
   void fillWindowBits(std::span<uint64_t> words, int32_t start, int32_t end) override {
     if (maximum) return Query::Scorer::fillWindowBits(words, start, end);
-    assert(start >= 0 && start <= end && end <= ownerCount);
     skipCount(SkipStats::countBulkFillCalls);
-    if (start == end) return;
+    if (start == end || ownerCount == 0) return;
+    assert(start >= 0 && start <= end && end <= ownerCount);
     current = end == ownerCount ? PostingsReader::END : end;
     for (int32_t first = start; first < end;) {
       int32_t limit = first + std::min(DocsEnumMeta::L1_DOCS, end - first);
@@ -179,7 +214,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
   DocSet* domain;
   int32_t ownerCount;
   int32_t childCount;
-  bool maximum;
+  Reduction reduction;
   float multiplier;
 
   // hugin, 5M structured roots, 2026-11-16: mapping a filled owner costs
@@ -198,7 +233,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
     Query::Scorer* buildScorer(MemPool& pool) override {
       auto* scorer = child.build(pool);
       return scorer ? pool.make<Scorer>(pool, *scorer, supplier.mapper, supplier.domain,
-          supplier.ownerCount, supplier.maximum, supplier.multiplier, child.shape()) : nullptr;
+          supplier.ownerCount, supplier.reduction, supplier.multiplier, child.shape()) : nullptr;
     }
 
   public:
@@ -248,7 +283,7 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
     shape.directDocSet = Query::DirectDocSetAccess::UNSUPPORTED;
     shape.membershipConsumption = context.membershipConsumption == Query::MembershipConsumption::EITHER
         ? Query::MembershipConsumption::WINDOWS : context.membershipConsumption;
-    if (maximum || ownerCount == 0) return shape;
+    if (reduction == Reduction::MAXIMUM || ownerCount == 0) return shape;
     const auto& demand = context.demand;
     double candidates = demand.expectedCandidates;
     if (candidates < 0) {
@@ -274,9 +309,9 @@ class OwnershipRelation::Supplier final : public Query::ScorerSupplier {
 
 public:
   Supplier(Query::ScorerSupplier& child, const OwnershipMapper& mapper,
-           DocSet* domain, int32_t ownerCount, int32_t childCount, bool maximum, float multiplier)
+           DocSet* domain, int32_t ownerCount, int32_t childCount, Reduction reduction, float multiplier)
       : child(child), mapper(mapper), domain(domain), ownerCount(ownerCount), childCount(childCount),
-        maximum(maximum), multiplier(multiplier) {}
+        reduction(reduction), multiplier(multiplier) {}
 
   int64_t cost() override { return std::min(child.cost(), (int64_t)ownerCount); }
 
@@ -311,9 +346,9 @@ OwnershipRelation::OwnershipRelation(IndexReader& many, IndexReader& one, Reques
 }
 
 Query::ScorerSupplier* OwnershipRelation::reduce(MemPool& pool, size_t leaf,
-    Query::ScorerSupplier& input, DocSet* domain, bool maximum, float multiplier) {
+    Query::ScorerSupplier& input, DocSet* domain, Reduction reduction, float multiplier) {
   return mappers[leaf] ? pool.make<Supplier>(input, *mappers[leaf], domain,
-      one.segments()[leaf].maxDoc(), many.segments()[leaf].maxDoc(), maximum, multiplier) : nullptr;
+      one.segments()[leaf].maxDoc(), many.segments()[leaf].maxDoc(), reduction, multiplier) : nullptr;
 }
 
 FilterKeyScope OwnershipRelation::appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext&) const {

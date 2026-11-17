@@ -16,6 +16,9 @@ public:
   RequestMemTracker& memory;
 
   enum class Direction { EXPAND, PROJECT };
+  // A uniform child without a construction-time score quote supplies its
+  // exact per-leaf contribution before membership reduction starts.
+  enum class Reduction { NONE, MAXIMUM, CONSTANT };
 
   struct Mapping {
     RowRelation* relation = nullptr;
@@ -43,7 +46,7 @@ public:
   // Construction dispatch happens once per leaf. The returned supplier owns the
   // concrete mapping algorithm; no mapping dispatch is added to row iteration.
   virtual Query::ScorerSupplier* reduce(MemPool& pool, size_t leaf, Query::ScorerSupplier& input,
-      DocSet* domain, bool maximum, float multiplier) = 0;
+      DocSet* domain, Reduction reduction, float multiplier) = 0;
   virtual DomainHandle expand(size_t leaf, DomainHandle domain) = 0;
   virtual DomainHandle project(size_t leaf, DomainHandle domain) = 0;
   virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const = 0;

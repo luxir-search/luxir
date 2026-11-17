@@ -120,6 +120,27 @@ TEST_F(JoinCacheTest, scoredRankingReusesUnscoredOwnerMembershipForItsCount) {
   EXPECT_GT(SkipStats::wholeTopKCountHits, 0);
 }
 
+TEST_F(JoinCacheTest, uniformMaximumUsesResidentChildMembershipAndKeepsItsScore) {
+  for (int pass = 0; pass < 3; pass++) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& op = req->topDocs().countLimit().limit(0);
+    op.rawQuery() = qb::phraseText(req->mr, "text_w", "deep common");
+    op.rawOp().domain.emplace().to = "items_nested.deep_nested";
+    req->execute(1); ASSERT_OK(req);
+    EXPECT_EQ(6, req->getMatchCount());
+  }
+  auto hits = cache->counters().hits;
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs().getScores().fields({"id"}).limit(3).rawQuery() = qb::boost(req->mr,
+      qb::toParent(req->mr, "items_nested.deep_nested", qb::constantScore(req->mr,
+          qb::phraseText(req->mr, "text_w", "deep common"), 1.0f)), 2.5f);
+  req->execute(1); ASSERT_OK(req);
+  EXPECT_GT(cache->counters().hits, hits);
+  auto scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
+  ASSERT_EQ(3u, scores.size());
+  for (auto score : scores) EXPECT_EQ(2.5f, score);
+}
+
 TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReopen) {
   EXPECT_EQ(1, count(1, false, 0, true));
   EXPECT_EQ(1, count(1, false, 0, true));

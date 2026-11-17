@@ -1140,7 +1140,7 @@ TEST_F(ScopedRowSpaceTest, noneReducerKeepsReadsStableAcrossNextAndAdvance) {
   auto* weight = all.createWeight(context, 0);
   for (bool seek : {false, true}) {
     auto* input = weight->scorerSupplier(pool, many->segments()[0]);
-    auto* supplier = relation.reduce(pool, 0, *input, nullptr, false, 2.0f);
+    auto* supplier = relation.reduce(pool, 0, *input, nullptr, RowRelation::Reduction::NONE, 2.0f);
     auto* scorer = buildScorerForTests(pool, *supplier, 4);
     ASSERT_NE(nullptr, scorer);
     EXPECT_EQ(0, scorer->next());

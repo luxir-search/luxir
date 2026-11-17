@@ -60,7 +60,7 @@ TEST_F(JoinWindowTest, exposureSelectsPullOrWindowedFilteredRanking) {
     auto* weight = term.createWeight(context, maximum ? Query::NEED_SCORES : 0);
     auto* source = weight->scorerSupplier(pool, many->segments()[0]);
     ASSERT_NE(nullptr, source);
-    auto* supplier = relation.reduce(pool, 0, *source, nullptr, maximum, 1.0f);
+    auto* supplier = relation.reduce(pool, 0, *source, nullptr, maximum ? RowRelation::Reduction::MAXIMUM : RowRelation::Reduction::NONE, 1.0f);
     for (int64_t candidates : {1, N}) {
       for (auto consumption : {Query::MembershipConsumption::EITHER, Query::MembershipConsumption::WINDOWS,
                                Query::MembershipConsumption::CANDIDATES}) {
@@ -194,7 +194,7 @@ TEST_F(JoinWindowTest, boundedFillsCrossFamiliesEmptyWindowsAndDeletedOwners) {
         auto* source = kind == 2 ? pool.make<QueryPrep::DocSetSupplier>(&cached, many->segments()[0])
             : queries[(size_t)kind]->createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
         ASSERT_NE(nullptr, source);
-        auto* supplier = relation.reduce(pool, 0, *source, live ? root->segments()[0].liveDocSet() : nullptr, false, 1.0f);
+        auto* supplier = relation.reduce(pool, 0, *source, live ? root->segments()[0].liveDocSet() : nullptr, RowRelation::Reduction::NONE, 1.0f);
         auto planContext = Query::PlanContext::fromLeadCost(N, Query::ExecutionUse::MATCH_WINDOWS);
         auto* scorer = supplier->resolve(pool, planContext)->build(pool);
         ASSERT_NE(nullptr, scorer);
@@ -274,7 +274,7 @@ TEST_F(JoinWindowTest, composedFillsStayBoundedAcrossLargeAndEmptyIntermediateFa
     for (auto* query : std::array<Query*, 3>{&term, &phrase, &all}) {
       auto* source = query->createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
       ASSERT_NE(nullptr, source);
-      auto* supplier = relation.reduce(pool, 0, *source, nullptr, false, 1.0f);
+      auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowRelation::Reduction::NONE, 1.0f);
       for (bool whole : {false, true}) {
         SCOPED_TRACE(::testing::Message() << pair << '/' << (int)query->getKind() << '/' << whole);
         auto* scorer = buildScorerForTests(pool, *supplier, one->maxDoc());

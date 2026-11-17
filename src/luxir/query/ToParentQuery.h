@@ -14,6 +14,8 @@ class ToParentQuery final : public Query {
   RowRelation& relation;
   bool maximum;
 
+  static std::optional<float> uniformChildScore(Query& child, float multiplier = 1.0f);
+
 public:
   ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, bool maximum)
       : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), maximum(maximum) {}
@@ -50,7 +52,7 @@ public:
     Query::Weight* child;
     FilterCache::Use* childUse;
     RowRelation& relation;
-    bool maximum;
+    RowRelation::Reduction reduction;
     float multiplier;
 
     Query::ScorerSupplier* supplier(MemPool& pool, IndexReader::Segment& segment,
@@ -67,7 +69,7 @@ public:
       if (!supplier) return nullptr;
       return relation.reduce(pool, (size_t)segment.ord, *supplier,
           mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : domain,
-          maximum && needsScores(), multiplier);
+          reduction, multiplier);
     }
 
     class Prepared final : public Query::Weight::PreparedWeight {
@@ -110,16 +112,29 @@ public:
     Weight(Query::Context& context, ToParentQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, query, flags), source(query.source.topReader),
           relation(query.relation),
-          maximum(query.maximum), multiplier(constantWhenScored(flags, multiplier)) {
+          reduction(query.maximum && (flags & NEED_SCORES) != 0 ? RowRelation::Reduction::MAXIMUM
+              : RowRelation::Reduction::NONE), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      child = query.child->createWeight(*childContext, maximum ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
+      auto constant = reduction == RowRelation::Reduction::MAXIMUM
+          ? uniformChildScore(*query.child) : std::nullopt;
+      if (reduction == RowRelation::Reduction::MAXIMUM && constant) {
+        // Uniform max is membership plus the child's score, not score none.
+        // Keep the child's rounding before the join's multiplier.
+        this->multiplier = *constant * this->multiplier;
+        reduction = RowRelation::Reduction::NONE;
+      }
+      child = query.child->createWeight(*childContext, reduction == RowRelation::Reduction::MAXIMUM
+          ? flags : flags & ~(ALLOW_PRUNING | NEED_SCORES), 1.0f);
+      if (reduction == RowRelation::Reduction::MAXIMUM && child->isConstantScoring()) {
+        reduction = RowRelation::Reduction::CONSTANT;
+      }
       // Every row of the path is not a set worth materializing or caching.
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
       traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       // Scored reduction keeps owner eligibility ahead of family scoring.
-      if (child->consumesDomain() || (maximum && needsScores())) traits |= NEEDS_PREPARE;
-      if (!maximum || !needsScores()) traits |= IS_CONSTANT_SCORING;
+      if (child->consumesDomain() || reduction == RowRelation::Reduction::MAXIMUM) traits |= NEEDS_PREPARE;
+      if (reduction != RowRelation::Reduction::MAXIMUM) traits |= IS_CONSTANT_SCORING;
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
     }

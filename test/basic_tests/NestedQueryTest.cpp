@@ -10,6 +10,7 @@
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/ToParentQuery.h"
+#include "luxir/query/ImpactsIndex.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/OwnershipRelation.h"
 
@@ -104,6 +105,96 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
   EXPECT_EQ(3, warmed->getMatchCount());
   EXPECT_GT(cache->counters().hits, hits);
   EXPECT_EQ(1, SkipStats::wholeCountHits);
+}
+
+TEST_F(NestedQueryTest, uniformMaximumPreservesChildScoresAndExactBounds) {
+  for (int kind = 0; kind < 6; kind++) {
+    auto make = [&](auto& req) {
+      auto& mr = req.mr;
+      auto all = qb::all();
+      if (kind == 0) return qb::range(mr, "price", qb::valI64(mr, 0), nullptr, qb::valI64(mr, 1000), nullptr);
+      if (kind == 1) return qb::exists(mr, "price");
+      if (kind == 2) return qb::constantScore(mr, qb::match(mr, "text", "quick"), 2.5f);
+      if (kind == 3) return qb::boost(mr, qb::exists(mr, "price"), 0.3f);
+      if (kind == 4) return qb::boost(mr, qb::boolean(mr, {
+          qb::constantScore(mr, all, 0.1f), qb::constantScore(mr, all, 0.2f)}), 1.3f);
+      return qb::all();
+    };
+    auto child = localReq(helper.getSearchEngine());
+    auto& op = child->topDocs().getScores().fields({"/id"}).limit(-1).countLimit();
+    op.rawOp().domain.emplace().to = "items";
+    op.rawQuery() = make(*child);
+    child->execute(1); ASSERT_OK(child);
+    auto ids = std::get<api::ColStr>(child->docList()->columns.at("/id").kind).v;
+    auto scores = std::get<api::ColFloat>(child->docList()->columns.at("_score_").kind).v;
+    std::map<std::string_view, float> expected;
+    for (size_t i = 0; i < ids.size(); i++) expected[ids[i]] = std::max(expected[ids[i]], scores[i]);
+    auto joined = localReq(helper.getSearchEngine());
+    joined->topDocs().getScores().fields({"id"}).limit(-1).countLimit().rawQuery() = qb::boost(joined->mr,
+        qb::toParent(joined->mr, "items", make(*joined)), 0.7f);
+    joined->execute(1); ASSERT_OK(joined);
+    auto owners = std::get<api::ColStr>(joined->docList()->columns.at("id").kind).v;
+    auto maxima = std::get<api::ColFloat>(joined->docList()->columns.at("_score_").kind).v;
+    ASSERT_EQ(expected.size(), owners.size());
+    for (size_t i = 0; i < owners.size(); i++) EXPECT_EQ(expected[owners[i]] * 0.7f, maxima[i]) << kind;
+
+    auto req = localReq(helper.getSearchEngine());
+    auto wire = qb::toParent(req->mr, "items", make(*req));
+    auto* tree = parse(*req, wire);
+    auto* planning = req->createPlanningContext(*req->reader);
+    tree->validateLogical(*planning);
+    auto* context = Query::Context::create(&req->arena, *planning);
+    auto* weight = tree->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    EXPECT_TRUE(weight->isConstantScoring());
+    EXPECT_FALSE(weight->needsPrepare());
+    MemPool pool;
+    auto* source = weight->scorerSupplier(pool, req->reader->segments()[0]);
+    ASSERT_NE(nullptr, source);
+    auto planContext = Query::PlanContext::fromLeadCost(1000, Query::ExecutionUse::MATCH_WINDOWS);
+    EXPECT_EQ(Query::ClauseShape::DIRECT, source->describeScorer(planContext).windowFillClause);
+    auto* scorer = source->resolve(pool, planContext)->build(pool);
+    ASSERT_NE(nullptr, scorer);
+    ASSERT_TRUE(scorer->constantContribution());
+    float constant = *scorer->constantContribution();
+    EXPECT_EQ(constant, scorer->getMaxScore(PostingsReader::END));
+    EXPECT_EQ(constant, scorer->getScoreBounds(PostingsReader::END).lo);
+    ASSERT_NE(PostingsReader::END, scorer->next());
+    EXPECT_EQ(constant, scorer->score());
+    scorer->setMinCompetitiveScore(std::nextafter(constant, std::numeric_limits<float>::infinity()));
+    EXPECT_EQ(constant, scorer->score());
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+}
+
+TEST_F(NestedQueryTest, maximumBoundsCoverEveryScoreAfterTheChildMoves) {
+  SearchOverridesGuard impacts(ImpactsIndex::forceEagerForTests);
+  ImpactsIndex::forceEagerForTests = true;
+  for (float boost : {0.0f, 0.3f, 2.5f}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto wire = qb::boost(req->mr, qb::toParent(req->mr, "items", qb::match(req->mr, "text", "quick")), boost);
+    auto* tree = parse(*req, wire);
+    auto* planning = req->createPlanningContext(*req->reader);
+    tree->validateLogical(*planning);
+    auto* context = Query::Context::create(&req->arena, *planning);
+    auto* weight = tree->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    Query::Weight::PrepareContext preparation{*req->reader, {}, false, nullptr, Query::SupplierExecutionMode::ORDINARY};
+    auto prepared = weight->prepare(preparation);
+    MemPool pool;
+    auto* source = prepared->scorerSupplier(pool, req->reader->segments()[0]);
+    ASSERT_NE(nullptr, source);
+    auto* scorer = source->resolve(pool, Query::PlanContext{})->build(pool);
+    ASSERT_NE(nullptr, scorer);
+    EXPECT_FALSE(scorer->constantContribution());
+    auto bound = scorer->getScoreBounds(PostingsReader::END);
+    EXPECT_TRUE(std::isfinite(bound.hi));
+    EXPECT_EQ(PostingsReader::END, scorer->advanceShallowForSetup(0));
+    while (scorer->next() != PostingsReader::END) {
+      EXPECT_LE(bound.lo, scorer->score());
+      EXPECT_GE(bound.hi, scorer->score());
+      EXPECT_EQ(bound.hi, scorer->getMaxScore(scorer->docId()));
+      EXPECT_EQ(bound.hi, scorer->getMaxScoreForSetup(scorer->docId()));
+    }
+  }
 }
 
 TEST_F(NestedQueryTest, perClauseAndSameItemNegationHaveDifferentMeanings) {
@@ -305,7 +396,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
     for (bool seek : {false, true}) {
       auto* input = weight->scorerSupplier(pool, child->segments()[0]);
       EXPECT_EQ(Query::ReportedTwoPhase::YES, input->describeScorer({}).reportedTwoPhase);
-      auto* supplier = relation.reduce(pool, 0, *input, nullptr, maximum, 1.0f);
+      auto* supplier = relation.reduce(pool, 0, *input, nullptr, maximum ? RowRelation::Reduction::MAXIMUM : RowRelation::Reduction::NONE, 1.0f);
       auto* scorer = buildScorerForTests(pool, *supplier, 6);
       ASSERT_NE(nullptr, scorer); EXPECT_EQ(1, seek ? scorer->advance(1) : scorer->next());
       float score = scorer->score(); EXPECT_GT(score, 0);

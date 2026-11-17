@@ -2115,18 +2115,23 @@ public:
               if (wholeMembershipResult.count > 0) {
                 Query::Scorer* scorer = nullptr;
                 DocSet* collectorFilter = domain;
-                if (wholeMembershipResult.docs.get() != nullptr) {
-                  scorer = QueryPrep::createDocSetScorer(
-                      poolGuard.pool(), wholeMembershipResult.docs.get(), seg,
-                      op.scoreProfile.value);
-                  collectorFilter = nullptr;
-                } else {
+                auto constant = op.scoreProfile.kind == Query::ScoreProfile::Kind::VARIABLE
+                    ? std::optional<float>{} : std::optional<float>{op.scoreProfile.value};
+                if (!constant || wholeMembershipResult.docs.get() == nullptr) {
                   auto* rankingSupplier = obtainMainSupplier();
                   if (rankingSupplier != nullptr) {
                     scorer = buildBoundedConstantScorer(
                         poolGuard.pool(), *rankingSupplier, collectorFilter,
                         scoreCollector->topCount);
+                    if (scorer != nullptr && !constant) constant = scorer->constantContribution();
                   }
+                }
+                // Execution can prove uniformity without a query-tree score
+                // quote. A resident membership set still needs that score.
+                if (wholeMembershipResult.docs.get() != nullptr && constant) {
+                  scorer = QueryPrep::createDocSetScorer(
+                      poolGuard.pool(), wholeMembershipResult.docs.get(), seg, *constant);
+                  collectorFilter = nullptr;
                 }
                 if (scorer != nullptr) {
                   ranked = collectFirstKConstant(

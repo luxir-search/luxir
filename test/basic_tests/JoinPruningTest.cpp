@@ -7,6 +7,7 @@
 #include "test/QueryBuild.h"
 #include "luxir/query/ImpactsIndex.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/search/ops/TopDocsReq.h"
 
 namespace luxir::test {
 namespace {
@@ -137,6 +138,124 @@ TEST_F(JoinPruningTest, maximumTopKMatchesExhaustiveWithBoostsDeletesAndBooleanC
             compare(exhaustive, run(helper, family, outer, reversed, 0.3f, 7, false));
           }
         }
+      }
+    }
+  }
+}
+
+TEST_F(JoinPruningTest, varyingRootScoresUseTheGenericBoundedCountPass) {
+  CollectionHelper helper("join_bounded_split");
+  index(helper, 3);
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 0});
+  auto run = [&](int64_t count) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("join_bounded_split");
+    auto& op = req->topDocs().getScores().limit(10).fields({"id"});
+    op.rawQuery() = qb::boolean(req->mr, {qb::match(req->mr, "body_w", "root"),
+        qb::toParent(req->mr, "chunks_nested", qb::exists(req->mr, "text_w"))});
+    if (count) op.countLimit(count);
+    req->execute(1); EXPECT_OK(req);
+    return req;
+  };
+  auto uncounted = run(0);
+  SkipStatsScope stats;
+  auto bounded = run(10);
+  EXPECT_EQ(10, bounded->getMatchCount());
+  EXPECT_TRUE(bounded->docList()->found_gte);
+  EXPECT_EQ(1, SkipStats::boundedCountSegments);
+  auto hits = [&](auto& req) {
+    std::vector<std::pair<std::string, float>> result;
+    auto names = std::get<api::ColStr>(req->docList()->columns.at("id").kind).v;
+    auto scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
+    for (size_t i = 0; i < names.size(); i++) result.emplace_back(names[i], scores[i]);
+    return result;
+  };
+  EXPECT_EQ(hits(uncounted), hits(bounded));
+  auto exact = run(-1);
+  EXPECT_EQ(6144, exact->getMatchCount());
+  EXPECT_EQ(hits(exact), hits(bounded));
+}
+
+TEST_F(JoinPruningTest, uniformChildNegationKeepsItsMembershipProtocolAcrossFamilies) {
+  CollectionHelper helper("join_uniform_negation");
+  CollectionHelper::UpdateBuilder input;
+  std::string first = R"({"id":"a","items_nested":[)";
+  for (int i = 0; i < 640; i++) {
+    if (i) first += ',';
+    first += i % 2 ? R"({"color_s":"blue"})" : R"({"color_s":"red"})";
+  }
+  first += "]}";
+  for (auto json : {first, std::string(R"({"id":"b","items_nested":{"color_s":"blue"}})")}) {
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("join_uniform_negation");
+  req->topDocs().exprQuery("items_nested:(NOT color_s:blue)").getScores().fields({"id"}).limit(-1).countLimit();
+  req->execute(1); ASSERT_OK(req);
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", "a")));
+}
+
+TEST_F(JoinPruningTest, uniformMaximumStopsAtThePageOrBoundedCount) {
+  constexpr int32_t N = 50000;
+  constexpr int32_t TOTAL = N * 9 / 10;
+  SearchOverridesGuard ranges(TopDocsReq::boundedCountRangeDocsForTests);
+  TopDocsReq::boundedCountRangeDocsForTests = DocsEnumMeta::L1_DOCS;
+  CollectionHelper helper("join_ties");
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 0});
+  CollectionHelper::UpdateBuilder input;
+  for (int32_t i = 0; i < N; i++) {
+    std::string json = "{\"id\":\"" + std::to_string(i) + "\",\"tag_s\":\"java\",\"answers_nested\":[";
+    int32_t count = i % 127 == 0 ? 31 : 2;
+    for (int32_t row = 0; row < count; row++) {
+      if (row) json += ',';
+      json += "{\"date_i\":" + std::string(i % 10 && row == 0 ? "0" : "100") + '}';
+    }
+    json += "]}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  auto run = [&](int64_t count, bool exactLimit = true) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("join_ties");
+    auto& op = req->topDocs().getScores().limit(10).fields({"id"}).exprQuery("tag_s:java AND answers_nested.date_i:[0 TO 10]");
+    if (exactLimit) op.countLimit(count);
+    req->execute(1); EXPECT_OK(req);
+    return req;
+  };
+  SkipStatsScope stats;
+  auto exact = run(-1);
+  ASSERT_EQ(TOTAL, exact->getMatchCount());
+  auto fullWork = SkipStats::docBlocksDecoded + SkipStats::countBulkFillBlocks;
+  EXPECT_GT(fullWork, 100);
+  const auto ids = std::get<api::ColStr>(exact->docList()->columns.at("id").kind).v;
+  const auto scores = std::get<api::ColFloat>(exact->docList()->columns.at("_score_").kind).v;
+  ASSERT_EQ(10u, ids.size());
+  for (size_t i = 0; i < ids.size(); i++) {
+    EXPECT_EQ(std::to_string(i < 9 ? i + 1 : 11), ids[i]);
+    EXPECT_EQ(scores[0], scores[i]);
+  }
+  for (int64_t limit : {(int64_t)0, (int64_t)1, (int64_t)10, (int64_t)10000, (int64_t)TOTAL - 1, (int64_t)TOTAL, (int64_t)TOTAL + 1, (int64_t)-1}) {
+    SCOPED_TRACE(limit);
+    SkipStats::reset();
+    auto result = run(limit, limit != 0);
+    auto names = std::get<api::ColStr>(result->docList()->columns.at("id").kind).v;
+    auto values = std::get<api::ColFloat>(result->docList()->columns.at("_score_").kind).v;
+    EXPECT_TRUE(std::ranges::equal(ids, names));
+    EXPECT_TRUE(std::ranges::equal(scores, values));
+    if (limit) {
+      if (result->docList()->found_gte) { EXPECT_EQ(limit, result->getMatchCount()); }
+      else { EXPECT_EQ(TOTAL, result->getMatchCount()); }
+      if (limit >= TOTAL || limit < 0) { EXPECT_FALSE(result->docList()->found_gte); }
+    }
+    auto work = SkipStats::docBlocksDecoded + SkipStats::countBulkFillBlocks;
+    if (limit >= 0 && limit <= 10000) {
+      EXPECT_LT(work, fullWork / 2);
+      if (limit == 0) { EXPECT_LT(work, 100); }
+      else {
+        EXPECT_EQ(1, SkipStats::boundedCountSegments);
+        EXPECT_EQ(1, SkipStats::boundedCountStops);
       }
     }
   }
